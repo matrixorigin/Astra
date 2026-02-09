@@ -37,7 +37,23 @@ This proposal defines the deployment architecture for mo-dev-agent, aligning wit
 - **Agents are consumers**: Business logic that uses event/context/memory capabilities
 - **Data is the asset**: Every interaction is versioned, traceable, and exportable
 
-### 2. Three-Layer Model (Memory–Prompt–Context)
+### 2. MatrixOne as "System Memory" (Not Just Database)
+
+**Core Philosophy**: "Everything persists in MatrixOne" is not a technology choice — it's the architectural soul.
+
+| Principle | Implementation | Why Critical |
+|-----------|----------------|--------------|
+| **Single Source of Truth** | All data assets (events/skills/prompts/docs) only in MatrixOne | Avoid dual-write inconsistency (DB + filesystem) |
+| **Time-Point Traceability** | All tables enable MatrixOne Git for Data (AS OF queries) | Replay precisely restores "then" skill code/prompt templates |
+| **Cache as Performance Only** | Local cache (memory/file) must be disposable and rebuildable | Service restart doesn't affect data integrity |
+| **Metadata as Asset** | Skills docs, prompt descriptions, workflow YAML all in DB | Satisfies audit/compliance/knowledge requirements |
+
+**Design Mantra**:
+> "When you say 'skill documentation in MatrixOne', you're not storing data — you're injecting traceable memory into the system."
+> 
+> "When you say 'cache is disposable', you're not compromising performance — you're defending the single source of truth."
+
+### 3. Three-Layer Model (Memory–Prompt–Context)
 
 | Layer | Role | Storage | Evolution |
 |-------|------|---------|-----------|
@@ -64,6 +80,22 @@ This proposal defines the deployment architecture for mo-dev-agent, aligning wit
 **Traceable Evolution**: Every extension has independent versioning + changelog; database records extension usage; answer "Why was this skill deprecated on 2026-03-01?"
 
 **Mechanized Deprecation**: Avoid "technical debt snowball" with explicit deprecation policies and migration guides.
+
+### 5. Cache Strategy: Performance Optimization, Not Data Source
+
+**Design Principle**: Cache must be **disposable and rebuildable** from MatrixOne at any time.
+
+| Scenario | Cache Usage | Rationale |
+|----------|-------------|-----------|
+| **Online Service** | ✅ LRU cache for hot skills/prompts | Reduce DB load (>95% hit rate target) |
+| **Replay** | ❌ Force bypass cache | Precise historical restoration; cache causes distortion |
+| **Sandbox Experiment** | ❌ Query MatrixOne AS OF | Experiments need isolated historical state |
+| **Service Restart** | ✅ Cache auto-rebuilds | No data loss risk (all data in MatrixOne) |
+
+**Implementation Guideline**:
+- Cache invalidation on write: When skill/prompt updated, clear cache entry
+- Replay queries use `as_of_timestamp` or `as_of_commit` parameters to bypass cache
+- Cache layer is **transparent**: Application logic never depends on cache existence
 
 ---
 
@@ -332,6 +364,69 @@ agents/examples/               # Example implementations
 
 ### Skills Architecture
 
+**Enhanced Database Design** (`skills_registry` table):
+
+The `skills_registry` table is the **single source of truth** for all skill definitions, including documentation and code.
+
+**Key Design Principles**:
+1. **Documentation as Data Asset**: Full Markdown documentation stored in `documentation` TEXT field
+2. **Code as Data Asset**: Small skills store code directly in `skill_code` TEXT field; large skills reference MatrixOne internal repo via `code_ref`
+3. **Git for Data Integration**: Every skill write generates `git_commit_hash` for precise time-point queries
+4. **Version Coexistence**: Primary key `(skill_id, version)` allows multiple versions to coexist
+
+**Schema** (conceptual, see design doc for full SQL):
+
+```sql
+CREATE TABLE skills_registry (
+  skill_id VARCHAR(64) NOT NULL,
+  version VARCHAR(20) NOT NULL,          -- Semantic versioning (v1.0.0)
+  git_commit_hash VARCHAR(64),           -- MatrixOne Git for Data commit hash
+  description TEXT NOT NULL,
+  documentation TEXT,                    -- Full Markdown docs (examples/params)
+  skill_code TEXT,                       -- Python code (small skills) or NULL
+  code_ref VARCHAR(255),                 -- Large codebases: MatrixOne internal repo path
+  input_schema JSON,
+  output_schema JSON,
+  tools_required JSON,                   -- Dependent tool IDs
+  safety_rules JSON,                     -- ["no_pii", "max_tokens=500"]
+  tags JSON,                             -- ["customer_service", "data_query"]
+  status VARCHAR(20) DEFAULT 'active',   -- active/deprecated/experimental
+  created_at TIMESTAMP,
+  updated_at TIMESTAMP,
+  PRIMARY KEY (skill_id, version)
+);
+```
+
+**New Table**: `skills_repos` (for large skill codebases)
+
+```sql
+CREATE TABLE skills_repos (
+  repo_id VARCHAR(64) PRIMARY KEY,
+  repo_name VARCHAR(100) NOT NULL,
+  repo_path VARCHAR(255) NOT NULL,       -- MatrixOne internal path "mo://skills/..."
+  description TEXT,
+  git_branch VARCHAR(100) DEFAULT 'main',
+  last_sync_at TIMESTAMP,
+  created_at TIMESTAMP
+);
+```
+
+**Value**: Large skill libraries (e.g., entire GitHub issue handling module) stored as MatrixOne internal repos; replay uses `repo_path + git_commit_hash` to restore exact code snapshot.
+
+**Enhanced Event Recording** (`conversation_events` table):
+
+```sql
+ALTER TABLE conversation_events 
+ADD COLUMN skill_used JSON COMMENT 'Replay key: [{"skill_id", "version", "git_commit_hash"}]';
+```
+
+**Example value**:
+```json
+[{"skill_id": "github_issue_create", "version": "1.2.0", "git_commit_hash": "a1b2c3d"}]
+```
+
+**Why Critical**: Replay reads `git_commit_hash` from event to 100% precisely restore skill code at that moment, avoiding "skill updated causing replay distortion".
+
 **Skill Base Class** (`core/skills/skill.py`):
 
 ```python
@@ -342,18 +437,102 @@ class Skill(BaseModel):
     """First-class skill representation"""
     skill_id: str
     version: str
+    git_commit_hash: Optional[str]  # For replay traceability
     description: str
+    documentation: Optional[str]    # Markdown docs from DB
+    skill_code: Optional[str]       # Python code from DB or None
+    code_ref: Optional[str]         # MatrixOne repo path for large skills
     input_schema: Dict  # JSON Schema
     output_schema: Dict
     tools: List[str]    # Dependent tool IDs (links to tools_registry)
     tags: List[str]     # Business tags ("customer_service", "data_query")
     safety_rules: List[str]  # Safety rules ("no_pii", "max_tokens=500")
-    
-    # Metadata for reproducibility
-    created_at: str
-    deprecated: Optional[str] = None  # Deprecation version
-    alternative: Optional[str] = None  # Replacement skill_id
+    status: str = "active"  # active/deprecated/experimental
 ```
+
+**Skill Registry** (`core/skills/registry.py`):
+
+**Design Principle**: MatrixOne is the **single source of truth**; cache is **disposable performance optimization**.
+
+```python
+class SkillRegistry:
+    def __init__(self, db_client: MatrixOneClient):
+        self.db = db_client
+        self.cache = LRUCache(maxsize=100)  # Cache only latest active versions
+    
+    def get_skill(self, skill_id: str, version: str = None, 
+                  as_of_timestamp: datetime = None,
+                  as_of_commit: str = None) -> Skill:
+        """
+        Core: All reads must go through MatrixOne; cache only accelerates.
+        
+        Args:
+            skill_id: Skill identifier
+            version: Specific version or None for latest
+            as_of_timestamp: For replay - query historical state
+            as_of_commit: For replay - query by git commit hash
+        """
+        # Replay scenario: MUST bypass cache for precise historical query
+        if as_of_timestamp or as_of_commit:
+            return self._query_historical(skill_id, as_of_timestamp, as_of_commit)
+        
+        # Online service: Try cache (but auto-fallback to DB on miss)
+        cache_key = f"{skill_id}:{version or 'latest'}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+        
+        skill = self._query_from_db(skill_id, version)
+        self.cache[cache_key] = skill
+        return skill
+    
+    def _query_historical(self, skill_id: str, 
+                         ts: datetime = None, 
+                         commit: str = None) -> Skill:
+        """
+        Key: Leverage MatrixOne AS OF queries for precise time-point restoration.
+        
+        MatrixOne Git for Data supports:
+        - AS OF TIMESTAMP 'YYYY-MM-DD HH:MM:SS'
+        - AS OF COMMIT 'commit_hash'
+        """
+        if commit:
+            # Precise commit-based query (from event.skill_used.git_commit_hash)
+            sql = f"""
+            SELECT * FROM skills_registry 
+            AS OF COMMIT '{commit}' 
+            WHERE skill_id = '{skill_id}'
+            """
+        else:
+            # Timestamp-based query
+            sql = f"""
+            SELECT * FROM skills_registry 
+            AS OF TIMESTAMP '{ts.isoformat()}' 
+            WHERE skill_id = '{skill_id}' 
+            ORDER BY version DESC LIMIT 1
+            """
+        return self.db.query_one(sql)  # Precisely restore historical version
+    
+    def register_skill(self, skill_def: dict) -> str:
+        """
+        Write to MatrixOne + trigger Git for Data commit.
+        
+        Returns:
+            git_commit_hash: For recording in conversation_events
+        """
+        commit_hash = self.db.insert_with_git_commit(
+            table="skills_registry",
+            data=skill_def,
+            message=f"Register skill {skill_def['skill_id']} v{skill_def['version']}"
+        )
+        # Invalidate cache
+        self.cache.pop(f"{skill_def['skill_id']}:latest", None)
+        return commit_hash
+```
+
+**Design Essence**:
+- **Cache is disposable**: Service restart clears cache, but functionality remains intact (all data rebuilds from MatrixOne)
+- **Replay forces cache bypass**: `as_of_timestamp` or `as_of_commit` parameters ensure 100% precise historical restoration
+- **Write is versioned**: `insert_with_git_commit` wraps MatrixOne Git for Data API
 
 **Skill Composition** (`core/skills/composer.py`):
 
@@ -388,12 +567,58 @@ def build_context(session_id: str, current_request: str) -> Context:
     
     # Inject into context_snapshot for reproducibility
     context_snapshot["skills_used"] = [
-        {"skill_id": s.skill_id, "version": s.version} 
+        {
+            "skill_id": s.skill_id, 
+            "version": s.version,
+            "git_commit_hash": s.git_commit_hash  # CRITICAL for replay
+        } 
         for s in filtered_skills
     ]
     
     return Context(prompt=rendered, skills=filtered_skills)
 ```
+
+**Replay Integration** (`core/replay/replayer.py`):
+
+**Design Goal**: "Ten years later, reproduce today's decision" = Use `git_commit_hash` from event → MatrixOne AS OF COMMIT → Precisely restore skill code → Sandbox execution → Output identical to original.
+
+```python
+def replay_event_chain(causal_chain_id: str):
+    """
+    Replay full causal chain with precise skill restoration.
+    
+    Key: Use git_commit_hash from events to restore exact historical skill code.
+    """
+    events = event_reader.get_chain(causal_chain_id)
+    
+    for event in events:
+        if event.type == "skill_call":
+            # Extract historical skill snapshot identifier from event
+            skill_ref = event.skill_used[0]  # {"skill_id":..., "git_commit_hash":...}
+            
+            # CRITICAL: Use git_commit_hash to query MatrixOne historical version
+            skill = skill_registry.get_skill(
+                skill_id=skill_ref["skill_id"],
+                as_of_commit=skill_ref["git_commit_hash"]  # MatrixOne AS OF COMMIT
+            )
+            
+            # Execute historical skill code (in sandbox)
+            result = sandbox_executor.run(skill.skill_code, event.input)
+            
+            # Verify: result should match event.output (byte-level identical)
+            assert result == event.output, "Replay divergence detected"
+```
+
+**Why This Satisfies Design Requirements**:
+
+| Requirement | Implementation | Verification |
+|-------------|----------------|--------------|
+| Everything in MatrixOne | ✅ Skills docs/code/events/prompts all in DB | `SELECT documentation FROM skills_registry WHERE skill_id='x'` |
+| Precise Replay | ✅ Events record `git_commit_hash` + AS OF COMMIT queries | Replay output byte-level identical to original |
+| Version Control | ✅ All tables enable Git for Data | `SHOW VERSIONS FOR TABLE skills_registry` |
+| Cache Safety | ✅ Replay forces cache bypass | Service restart doesn't affect replay results |
+| Audit Compliance | ✅ All changes tracked (who/when/what) | `SELECT * FROM skills_registry VERSION BETWEEN ...` |
+| "Ten Years Later" | ✅ Event+skill+prompt+context full-chain snapshot | Use 2026 event to replay, output identical to 2026 |
 
 ### Extension System Architecture
 
@@ -618,6 +843,89 @@ safety_rules:
 
 ---
 
+## Global Data Flow: MatrixOne as System Memory
+
+**Design Philosophy**: MatrixOne is not just a "database" — it's the **system memory substrate**. All state flows through it; cache is transparent performance optimization.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Skill Developer                               │
+└────────────────────┬────────────────────────────────────────────┘
+                     │ POST /skills (with documentation + code)
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              API: skills_registry endpoint                       │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  MatrixOne: Write to skills_registry + Git for Data commit      │
+│  → Generates git_commit_hash                                    │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ├─→ Return git_commit_hash to API
+                     │
+                     └─→ (Optional) Update LRU Cache
+                          [Dotted line: Cache is disposable]
+                     
+┌─────────────────────────────────────────────────────────────────┐
+│                    User Conversation                             │
+└────────────────────┬────────────────────────────────────────────┘
+                     │ POST /chat
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Context Builder (core/context/)                     │
+│  → Load skills from SkillRegistry                               │
+│  → Filter skills for current task                               │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Event Logger (core/events/)                         │
+│  → Write conversation_events with:                              │
+│    skill_used = [{"skill_id", "version", "git_commit_hash"}]    │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ▼
+                MatrixOne (Single Source of Truth)
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Replay Request                                │
+│  POST /replay?causal_chain_id=xyz                               │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Replayer (core/replay/)                             │
+│  1. Read events by causal_chain_id                              │
+│  2. Extract git_commit_hash from event.skill_used               │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  MatrixOne: AS OF COMMIT query                                  │
+│  SELECT * FROM skills_registry                                  │
+│  AS OF COMMIT 'git_commit_hash'                                 │
+│  → Precisely restore historical skill code                      │
+└────────────────────┬────────────────────────────────────────────┘
+                     │ [BYPASS CACHE - Critical for replay]
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              Sandbox Executor                                    │
+│  → Execute historical skill code                                │
+│  → Output byte-level identical to original                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Design Points**:
+1. **Solid lines**: Data flow through MatrixOne (mandatory)
+2. **Dotted lines**: Cache layer (optional, disposable)
+3. **Replay path**: Completely bypasses cache, queries MatrixOne AS OF COMMIT
+4. **Single source of truth**: All persistent state (skills, events, prompts) only in MatrixOne
+
+---
+
 ## Data Flow: End-to-End
 
 ```
@@ -697,17 +1005,27 @@ safety_rules:
 
 ### Phase 0: Foundation (Week 1-2)
 
-**Goal**: Database schema + event system
+**Goal**: Database schema + event system + MatrixOne Git for Data
 
 **Deliverables**:
-- [ ] Create tables: `conversation_events`, `sessions`, `prompt_templates`, `skills_registry`, `configs`, `tokens`, `repos`, `token_usage_log`, `memory_index_queue`
+- [ ] Create tables: `conversation_events`, `sessions`, `prompt_templates`, `skills_registry`, `skills_repos`, `configs`, `tokens`, `repos`, `token_usage_log`, `memory_index_queue`
+- [ ] **Enable MatrixOne Git for Data** on all core tables:
+  - [ ] `skills_registry` (for skill code/docs versioning)
+  - [ ] `prompt_templates` (for prompt versioning)
+  - [ ] `conversation_events` (for event history)
+  - [ ] `agent_configs` (for agent config versioning)
+- [ ] Add `git_commit_hash` column to `skills_registry`
+- [ ] Add `skill_used` JSON column to `conversation_events`
 - [ ] Implement `core/events/event_logger.py` (write events)
 - [ ] Implement `core/events/event_reader.py` (query by session/user/chain)
 - [ ] Implement `core/config/settings.py` (load from env)
 - [ ] Docker Compose: MatrixOne + Redis
-- [ ] `infra/scripts/init-db.sh` (execute CREATE statements)
+- [ ] `infra/scripts/init-db.sh` (execute CREATE statements + enable Git for Data)
 
-**Test**: Write and read events; verify `causal_chain_id` integrity
+**Test**: 
+- [ ] Write and read events; verify `causal_chain_id` integrity
+- [ ] Verify MatrixOne AS OF TIMESTAMP queries work on test data
+- [ ] Verify Git for Data commit generation on skill registration
 
 ### Phase 1: MVP Core (Week 3-4)
 
@@ -732,14 +1050,31 @@ safety_rules:
 
 ### Phase 1.5: Skills System (Week 5)
 
-**Goal**: Elevate skills to first-class citizens
+**Goal**: Elevate skills to first-class citizens with MatrixOne-first design
 
 **Deliverables**:
-- [ ] Implement `core/skills/skill.py` (Skill base class)
-- [ ] Implement `core/skills/registry.py` (load from skills_registry table)
+- [ ] Implement `core/skills/skill.py` (Skill base class with `git_commit_hash`)
+- [ ] Implement `core/skills/registry.py` with:
+  - [ ] `get_skill(as_of_timestamp=...)` for time-point queries
+  - [ ] `get_skill(as_of_commit=...)` for commit-based queries
+  - [ ] `register_skill()` with Git for Data commit generation
+  - [ ] LRU cache with explicit invalidation on writes
 - [ ] Implement `core/skills/composer.py` (skill composition: chain/parallel/conditional)
 - [ ] Implement `core/skills/filter.py` (enhanced dynamic filtering with LLM-assisted recommendation)
 - [ ] Implement `core/skills/validator.py` (pre-call validation: permissions/params)
+- [ ] Implement `core/extensions/manager.py` (ExtensionManager: load/register/hooks)
+- [ ] Implement `core/extensions/base.py` (Extension base class)
+- [ ] Create `extensions/` directory structure
+- [ ] Create `extensions/registry.json` (extension registry)
+- [ ] Create `extensions/TEMPLATE.md` (new extension template)
+- [ ] Modify `core/context/builder.py` to inject `skills_used` (with `git_commit_hash`) into `context_snapshot`
+
+**Test**:
+- [ ] `tests/unit/test_skill_composer.py` (verify skill composition logic)
+- [ ] `tests/unit/test_skill_filter.py` (verify filtering with/without LLM)
+- [ ] `tests/unit/test_skill_registry_cache.py` (verify cache bypass on replay queries)
+- [ ] `tests/integration/test_extension_loading.py` (load extension from yaml/py)
+- [ ] `tests/integration/test_skill_versioning.py` (verify AS OF COMMIT queries return correct historical skill)
 - [ ] Implement `core/extensions/manager.py` (ExtensionManager: load/register/hooks)
 - [ ] Implement `core/extensions/base.py` (Extension base class)
 - [ ] Create `extensions/` directory structure
@@ -904,27 +1239,62 @@ safety_rules:
 This architecture proposal:
 
 1. **Aligns with design documents**: Every module traces to specific sections in vision-and-mission.md and context-memory-session-and-tables.md
-2. **Prioritizes core innovations**: Event-centric design, replay, sandbox, Token Budget Manager, **Skills as first-class citizens**
+2. **Prioritizes core innovations**: 
+   - Event-centric design
+   - **MatrixOne as "System Memory"** (not just database)
+   - Conversation replay with byte-level precision
+   - Time-point sandbox
+   - Token Budget Manager
+   - **Skills as first-class data assets** (with Git for Data versioning)
 3. **Simplifies premature complexity**: Minimal agent roles in Phase 0-1; expand as needed
 4. **Enables data asset evolution**: Every interaction is traceable, analyzable, and trainable
 5. **Provides clear roadmap**: 5 phases over 15 weeks, with testable deliverables
 6. **Ensures architectural growth**: Extension system enables continuous absorption of industry best practices without core refactoring
 
-**Key Architectural Philosophy**:
+**Core Architectural Philosophies**:
 
-> "When tomorrow brings a disruptive practice, we can integrate it in 1 day, not refactor the entire system."
+> **"MatrixOne is not a database — it's the system memory substrate."**
+> 
+> When you say "skill documentation in MatrixOne", you're not storing data — you're injecting traceable memory into the system.
 
-This transforms mo-dev-agent from an "excellent system" into an **"industry practice incubator"** — not only absorbing best practices but defining the next-generation agent system evolution paradigm.
+> **"Cache is disposable; data truth is singular."**
+> 
+> When you say "cache is disposable", you're not compromising performance — you're defending the single source of truth.
+
+> **"Ten years later, reproduce today's decision."**
+> 
+> Event + `git_commit_hash` → MatrixOne AS OF COMMIT → Precise skill restoration → Sandbox execution → Output byte-level identical to original.
+
+> **"When tomorrow brings a disruptive practice, integrate it in 1 day, not refactor the entire system."**
+> 
+> Extension system transforms mo-dev-agent from "excellent system" into **"industry practice incubator"**.
+
+**Design Verification Matrix**:
+
+| Design Requirement | Implementation | Verification Method |
+|--------------------|----------------|---------------------|
+| Everything in MatrixOne | ✅ Skills docs/code/events/prompts all in DB | `SELECT documentation FROM skills_registry WHERE skill_id='x'` |
+| Precise Replay | ✅ Events record `git_commit_hash` + AS OF COMMIT queries | Replay output byte-level identical to original |
+| Version Control | ✅ All tables enable Git for Data | `SHOW VERSIONS FOR TABLE skills_registry` |
+| Cache Safety | ✅ Replay forces cache bypass | Service restart doesn't affect replay results |
+| Audit Compliance | ✅ All changes tracked (who/when/what) | `SELECT * FROM skills_registry VERSION BETWEEN ...` |
+| "Ten Years Later" | ✅ Event+skill+prompt+context full-chain snapshot | Use 2026 event to replay, output identical to 2026 |
 
 **Next Steps**:
 1. Review and approve this proposal
-2. Begin Phase 0 implementation (database schema + event system)
+2. Begin Phase 0 implementation:
+   - Database schema creation
+   - **Enable MatrixOne Git for Data** on core tables
+   - Event system with `causal_chain_id` and `skill_used` tracking
 3. Validate with `echo_agent.py` before expanding agent capabilities
-4. Create first example extension in Phase 1.5 to validate extension workflow
+4. Create first example skill in Phase 1.5 to validate:
+   - Skill registration with Git commit generation
+   - Event recording with `git_commit_hash`
+   - Replay with AS OF COMMIT query
 
 **Approval Required From**:
-- [ ] Architecture Lead
-- [ ] Data Engineering Lead
-- [ ] ML/Training Lead
-- [ ] Product Owner
-- [ ] DevOps/Platform Lead (for extension security review)
+- [ ] Architecture Lead (verify MatrixOne-first design)
+- [ ] Data Engineering Lead (verify Git for Data integration)
+- [ ] ML/Training Lead (verify training pipeline design)
+- [ ] Product Owner (verify roadmap alignment)
+- [ ] DevOps/Platform Lead (verify extension security + cache strategy)
