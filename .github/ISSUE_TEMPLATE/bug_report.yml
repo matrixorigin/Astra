@@ -1,0 +1,45 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "[Bug]: "
+labels: [kind/bug]
+
+body:
+  - type: checkboxes
+    attributes:
+      label: Is there an existing issue for the same bug?
+      description: Please check if an issue already exists.
+      options:
+        - label: I have checked the existing issues.
+          required: true
+  - type: input
+    attributes:
+      label: Environment (optional)
+      description: OS, runtime version, or other relevant info.
+      placeholder: e.g. macOS 14, Node 20
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Actual behavior
+      description: What happened.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+      description: What you expected.
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Steps to reproduce
+      description: Steps to reproduce the behavior.
+      render: Markdown
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Additional information
+      description: Logs, errors, or other context.
+    validations:
+      required: false

@@ -1,0 +1,16 @@
+name: Question
+description: Ask a question not covered by other templates
+title: "[Question]: "
+labels: [kind/question]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before asking, please search open/closed issues in this repo and check the README/docs.
+  - type: textarea
+    attributes:
+      label: Your question
+      description: A clear description of what you want to know.
+    validations:
+      required: true

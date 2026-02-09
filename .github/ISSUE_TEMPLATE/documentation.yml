@@ -1,0 +1,26 @@
+name: Documentation
+description: Report a docs problem or suggest new content
+title: "[Docs]: "
+labels: [kind/docs]
+
+body:
+  - type: checkboxes
+    attributes:
+      label: Is there an existing issue about this?
+      description: Please check if an issue already exists.
+      options:
+        - label: I have checked the existing issues.
+          required: true
+  - type: textarea
+    attributes:
+      label: Describe the issue
+      description: What's wrong or what content is missing.
+      render: Markdown
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Additional information
+      description: Links, screenshots, or other context.
+    validations:
+      required: false
