@@ -2,92 +2,101 @@
 
 ## Vision
 
-**A platform of digital employees** that observe, operate, test, and develop across code and test repositories—scaling routine engineering work without scaling headcount—while **every interaction becomes data**: stored, analyzed, and used to continuously improve agents, prompts, memory, and workflows.
+**A platform of intelligent digital employees** that act as virtual engineers, observing, operating, testing, developing, and evolving across code, test, and data repositories. These agents scale routine and complex engineering workflows without increasing headcount, while **every interaction generates high-quality data**: captured, versioned, analyzed, and leveraged to perpetually refine agents, prompts, memory structures, workflows, and even the underlying models. Deeply integrated with MatrixOne, this system transforms raw interactions into actionable insights, enabling self-evolution and producing robust, traceable engineering outputs that rival or surpass human-led processes.
 
 ## Mission
 
-Build an agent system that:
+Build an agentic system that:
 
-1. **Serves** like many engineers in parallel: watch repos and Actions, summarize PRs, run and interpret CI/regressions/benchmarks, create and deploy test configs, triage and fix bugs, and participate in review—all driven by **skills**, **rules**, and an LLM that understands natural language.
-2. **Trains** from its own service: conversation history, cross-session summaries, ratings, and task outcomes are **recorded and analyzed**; this data fuels **fine-tuning** (e.g. per-user or per-role models), **prompt/context/memory optimization**, and **retrospective comparison** of strategies—so serving and optimization are one loop.
-3. **Runs on a data engine**: all persistent state lives in **MatrixOne**, with deep use of **clone**, **Git for data**, **multimodal**, **HTAP**, **RBAC**, and **row-level access control**—so we both **accumulate** data and **consume** it safely and efficiently for analytics, tuning, and access control.
+1. **Serves as a scalable workforce**: Operate like an army of specialized engineers working in parallel—monitoring repositories and CI/CD pipelines, summarizing pull requests (PRs), diagnosing CI failures, regressions, and benchmarks, generating and deploying test configurations, triaging bugs, implementing fixes, and engaging in code reviews. All actions are powered by **modular skills**, **configurable rules**, and a multimodal LLM capable of understanding natural language, code, images, and data schemas, allowing users to issue commands like "Analyze this regression trend" or "Propose optimizations for this benchmark."
 
----
+2. **Evolves through self-training**: Every service interaction—from conversations to task executions—produces **recorded data** including histories, summaries, ratings, outcomes, and feedback. This data drives **continuous fine-tuning** (e.g., user-specific, role-based, or task-specialized models), **prompt engineering**, **context optimization**, **memory enhancements**, and **strategy retrospectives**, creating a closed-loop where serving fuels improvement without human intervention.
 
-## Technical foundations
-
-### Sandbox
-
-- **Safe execution** for code runs, tests, and tool calls: agents operate inside a **sandbox** so that arbitrary commands and file access are isolated and auditable.
-- Sandbox boundaries (e.g. workspace access, network, elevated permissions) are explicit and configurable, aligning with modern agent frameworks that treat execution safety as first-class.
-
-### Conversation history and multi-session context
-
-- **Conversation history** is first-class: every session is stored and available for retrieval and summarization.
-- **Cross-session summarization per user**: the system can aggregate and summarize one person’s activity across multiple sessions (e.g. “this user’s recurring questions,” “tasks completed over the last N sessions”), so context is not lost between sessions and can be used for personalization and better prompts.
-- History is **easy to record, query, and process**—part of the data-engineering story below.
-
-### Data engineering: record, analyze, use
-
-- **Record**: Every interaction, every task, every evaluation and score is storable (e.g. in MatrixOne): requests, responses, tool calls, outcomes, and human feedback.
-- **Analyze**: Data is queryable and analyzable—which prompts work, which memory operations help, which context parameters correlate with success—so we can compare runs, A/B test strategies, and retrospect.
-- **Use**: The same data supports:
-  - **Per-user (or per-role) fine-tuning**: e.g. a model tuned on one person’s multi-session conversations.
-  - **Prompt / context / memory optimization**: tuning prompts, context window usage, memory operations and parameters from historical performance and scores.
-  - **Small-model tuning**: training or adapting smaller models for specific tasks using the accumulated feedback.
-- **Periodic or automatic optimization**: workflows, memory policies, context assembly, and model choices can be updated on a schedule or triggered by analysis—so the system improves without manual intervention every time.
-
-### Storage and integration: MatrixOne
-
-- **All durable storage** is backed by **MatrixOne**, so one engine holds conversations, sessions, evaluations, configs, and derived datasets.
-- **Deep integration** with MatrixOne capabilities:
-  - **Clone**: efficient copy and branching of datasets for experiments and rollback.
-  - **Git for data**: version and diff data like code (e.g. prompt versions, memory snapshots).
-  - **Multimodal**: store and query text, embeddings, and other modalities in one place.
-  - **HTAP**: operational workloads (serving, writes) and analytical queries (aggregations, tuning analyses) on the same data.
-  - **RBAC and row-level access control**: secure, multi-tenant data so that per-user or per-team data is only visible to the right principals—critical when conversation and feedback data are sensitive.
-
-**Result**: Data is **precipitated** from service, then **consumed** for analytics, optimization, and access-controlled product features—a single data platform for both “run the agents” and “improve the agents.”
+3. **Powers on a unified data engine**: Anchor all persistent state in **MatrixOne**, harnessing its advanced features: **Git for data** (version prompts, memory snapshots, and datasets like code—branch, merge, diff, rollback), **data cloning**, **multimodal storage and querying**, **hybrid transactional-analytical processing (HTAP)**, **role-based access control (RBAC)**, and **fine-grained row-level security**. This ensures data is **accumulated securely**, **versioned transparently**, **queried efficiently**, and **consumed intelligently** for analytics, model tuning, agent personalization, and multi-tenant operations—turning the platform into a data-driven powerhouse for engineering excellence.
 
 ---
 
-## What digital employees do (capabilities)
+## Technical Foundations
 
-### Code repos and PRs
+### Sandboxed Execution Environment
 
-- Watch **code-repo Actions** (e.g. auto-close/merge rules, PR lifecycle, CI).
-- **On request**: summarize a PR (e.g. status, flaky CI, conflicts); with **human approval**, create an issue using **specified skills, templates, and rules** so each issue is consistent and traceable.
+- **Secure and isolated operations**: Agents execute code, tests, tool calls, and external integrations within a **hardened sandbox**, preventing unauthorized access to host systems, networks, or sensitive data. Execution isolation is paramount, with audit logs for every action to ensure traceability and compliance, in the spirit of modern agent frameworks (e.g., LangChain, CrewAI).
+- **Configurable boundaries**: Define per-agent or per-task policies for workspace access, API calls, network egress, and privilege escalation, aligning with zero-trust principles. Integration with containerization (e.g., Docker or Kubernetes pods) allows dynamic scaling while maintaining safety.
 
-### CI and regression repos
+### Conversation History and Multi-Session Intelligence
 
-- Watch **CI and regression repo Actions** (e.g. daily runs, scheduled jobs); surface failures **on demand** or in near real time.
-- **Link to observability**: point to **Loki** (logs) and **metrics**; generate a **temporary entry** (link or small dashboard) so employees can jump to the failing run.
-- **Issue when confirmed**: if a failure is confirmed as a real bug, create an issue (again with skills, templates, rules).
-- Agents behave as **virtual employees**: driven by **skills** and **rules**, using an **LLM** to interpret natural-language commands (“check today’s daily,” “summarize PR #123”) and decide what to do and how.
+- **Persistent session management**: Every interaction is stored as structured data (e.g., JSON logs with timestamps, user IDs, and embeddings), enabling seamless retrieval, search, and summarization across sessions.
+- **User-centric context aggregation**: Generate **per-user or per-team summaries** (e.g., "Recurring pain points in CI pipelines for this developer") using techniques inspired by moltbot-style hybrid memory (combining vector search over embeddings with keyword-based retrieval) and adaptive prompting. This ensures agents recall long-term context, personalize responses, and avoid redundant queries.
+- **Advanced memory architecture**: Employ hierarchical memory systems—short-term (in-session), medium-term (cross-session embeddings), and long-term (archived datasets)—optimized via RAG (Retrieval-Augmented Generation) for efficient recall, reducing hallucination and improving response accuracy.
 
-### Broader scope (observe, operate, test, develop)
+### Data Engineering Pipeline: Capture, Analyze, Optimize
 
-- **Observe**: repos, CI status, daily regressions, benchmark results, deployment and run status.
-- **Operate**: author and deploy test configs, trigger runs, deploy and monitor.
-- **Test**: run tests and benchmarks, interpret results.
-- **Develop**: discover and triage bugs, implement fixes, participate in review.
+- **Capture everything**: Log all elements of agent interactions—user queries, agent reasoning traces, tool invocations, outputs, errors, and human overrides—in a schema-agnostic format suitable for MatrixOne's multimodal capabilities. All of this is **versioned with Git for data**, so every experiment, prompt change, or memory snapshot can be branched, diffed, and rolled back like code.
+- **Analyze for insights**: Run SQL-based analytics, ML-driven pattern detection (e.g., via integrated tools like PySpark or TensorFlow), and A/B testing on historical data to identify high-performing prompts, memory strategies, or skill combinations. For instance, query "Which prompt variants reduced bug triage time by >20%?" to inform optimizations.
+- **Optimize and iterate**: Use analyzed data for:
+  - **Fine-tuning loops**: Automatically retrain LLMs or distill smaller models (e.g., using LoRA adapters) on domain-specific datasets, such as per-repo code patterns or user feedback.
+  - **Prompt and context refinement**: Dynamically adjust prompt templates, context windows, and token budgets based on performance metrics, incorporating techniques for multi-step reasoning.
+  - **Workflow automation**: Trigger periodic retraining or hyperparameter sweeps via scheduled jobs, ensuring the system evolves in real-time without downtime.
+- **Inspired by industry practice**: Blend moltbot-style memory-focused design with shared knowledge bases and data-from-usage feedback loops common in modern agent systems.
+
+### Core Storage and Integration: MatrixOne
+
+- **Centralized data hub**: All state—conversations, agent memories, evaluation scores, configurations, and derived analytics—resides in MatrixOne, eliminating silos and enabling atomic transactions across operational and analytical workloads.
+- **Leveraging MatrixOne features**:
+  - **Git for data** (first-class): Treat data like code—version prompts, memory snapshots, and datasets with **branch**, **merge**, **diff**, and **rollback**. Track changes over time (e.g., "What changed in this prompt between v1 and v2?"), reproduce any prior state, and collaborate on data assets with the same workflow engineers use for source code. This is central to traceability, experimentation, and safe iteration of agent configs and training data.
+  - **Cloning and branching**: Create instant, space-efficient copies of datasets for A/B testing agent versions or rollback to stable states; complements Git for data for large-table workflows.
+  - **Multimodal support**: Store and query diverse data types—text, code embeddings, images from CI dashboards, or even audio from voice commands—in unified tables.
+  - **HTAP efficiency**: Handle real-time writes (e.g., logging a new interaction) alongside complex queries (e.g., aggregating feedback scores across users) without replication lag.
+  - **Security-first access**: Implement RBAC for role-specific views (e.g., devs see only their data) and row-level controls to protect sensitive info like proprietary code snippets.
+- **Outcome**: A self-sustaining ecosystem where data "precipitates" from daily operations and is "distilled" into enhancements, fostering high-quality, reproducible engineering practices.
 
 ---
 
-## Feedback, memory, and continuous improvement
+## Capabilities of Digital Employees
 
-- **Service is training**: the process of serving is part of training; every interaction and task can be **evaluated and scored** (explicit or implicit), and feedback is stored.
-- **Context and memory engineering** are first-class: we invest in how context is assembled (prompt, retrieved memory, session summary) and how memory is updated and queried—in the spirit of **moltbot-style** memory (e.g. hybrid search over memory files and sessions) and **structured prompts** (clear sections for tooling, skills, workspace, sandbox).
-- **Optimization engine**: the feedback loop drives **regression quality**, **release decisions**, and **product iteration**—continuously improving both agent behavior and the engineering process.
-- **Current relevance**: this aligns with the broader trend of **agent memory**, **evaluation and scoring**, **data-centric AI**, and **RAG/retrieval**—treating “data from usage” as the main lever for improving agent systems.
+### Core Repo Management and PR Handling
+
+- **Proactive monitoring**: Agents "watch" GitHub Actions, Bitbucket pipelines, or custom repos for events like pushes, merges, or failures, providing real-time alerts or summaries.
+- **Interactive operations**: On command, summarize PRs with diff analysis, conflict resolution suggestions, or CI status breakdowns; auto-generate issues or fixes using templated skills (e.g., "Create a bug ticket with repro steps").
+- **Expanded skills**: Beyond basics, agents can refactor code, suggest architectural improvements, or integrate with IDEs like VS Code for live editing.
+
+### CI/CD, Regressions, and Benchmarking
+
+- **Observability integration**: Link to tools like Loki for logs, Prometheus for metrics, or Grafana for dashboards; auto-create ephemeral views for quick debugging.
+- **Automated triage and remediation**: Detect flaky tests, correlate failures with code changes, and propose fixes—escalating to humans only when confidence is low.
+- **Benchmark orchestration**: Run performance tests, interpret results (e.g., via statistical analysis), and optimize configs, ensuring scalability for large-scale repos.
+
+### Broad Agentic Scope: Observe, Operate, Test, Develop, Collaborate
+
+- **Observe**: Track repo health, deployment metrics, security scans, and external dependencies for holistic insights.
+- **Operate**: Deploy configs, trigger pipelines, manage environments, and orchestrate multi-repo workflows.
+- **Test**: Execute unit/integration/e2e tests, fuzzing, or chaos engineering; analyze coverage and suggest expansions.
+- **Develop**: Discover bugs via static analysis or anomaly detection, implement features with code generation, and iterate based on feedback.
+- **Collaborate**: Participate in reviews with constructive comments, follow team-specific rules, and even facilitate meetings via natural language summaries.
+- **Extensible skills**: Handle diverse tasks like API design, data pipeline optimization, or creative ideation (e.g., "Brainstorm microservices for this monolith"), with skills modularized for easy extension.
+
+### User Interaction and Customization
+
+- **Natural language interface**: Users from any repo can issue commands, queries, or requests for advice, with agents providing constructive, actionable responses.
+- **Skill library**: Draw from a library of pre-built skills (e.g., "Python refactoring" or "Kubernetes deployment") or allow users to define custom ones, fostering a community-driven ecosystem.
 
 ---
 
-## In short
+## Feedback, Memory, and Continuous Self-Evolution
 
-**mo-dev-agent** is a platform for **many digital employees** that:
+- **Integrated feedback loops**: Every task includes optional ratings, explicit feedback, or implicit signals (e.g., task completion time), stored for analysis.
+- **Advanced memory engineering**: Adopt moltbot-inspired hybrid systems (vector + keyword retrieval) for contextual recall, with collaborative filtering to share insights across agents where appropriate.
+- **Evolutionary optimization**: Use data to drive regressions (e.g., "Did this prompt change improve accuracy?"), release gating (e.g., deploy only if scores > threshold), and iterative product enhancements—aligning with data-centric AI and agent-evaluation trends.
+- **Traceability and auditability**: All actions are logged with provenance (e.g., "This fix derived from session #123"), enabling root-cause analysis and compliance.
+- **Self-evolution at scale**: Periodic workflows retrain or tune models on accumulated data, optimizing for efficiency (e.g., distilling to smaller SLMs for edge deployment), ensuring the platform improves with usage.
 
-- **Serve**: watch code and test repos, CI, and regressions; summarize PRs and create issues with skills/templates; surface failures and link to Loki/metrics; run tests and benchmarks; triage and fix bugs and join review—all via **sandboxed** execution, **skills**, **rules**, and an **LLM**.
-- **Use conversation and history well**: conversation history and **multi-session summaries per user** are stored and used for context and personalization.
-- **Treat data as the engine**: **record** every interaction and task, **analyze** to tune prompts, context, memory, and small models, and **retrospect** to compare strategies; **all storage in MatrixOne** with **clone**, **Git for data**, **multimodal**, **HTAP**, **RBAC**, and **row-level access control**.
-- **Improve continuously**: **periodic or automatic** optimization of workflows, memory, context, and models, so that serving and training are one loop and the system becomes the **engine** for regression, release, and iteration.
+---
+
+## In Short
+
+**mo-dev-agent** is a platform for **intelligent digital employees** that:
+
+- **Serve dynamically**: Monitor and manage code/test repos, CI pipelines, regressions, and benchmarks; summarize PRs, create issues/fixes with modular skills and rules; integrate observability tools; operate, test, develop, and collaborate—all via **sandboxed**, **LLM-powered** execution that handles natural language and multimodal inputs.
+- **Harness history intelligently**: Store and summarize **conversation histories** and **multi-session contexts** per user/team for personalization and continuity.
+- **Drive with data**: **Capture** interactions comprehensively, **analyze** for performance insights, and **optimize** prompts, memory, workflows, and models; fully bound to **MatrixOne** for **Git for data** (version and diff prompts, memory, and datasets like code), **cloning**, **multimodal querying**, **HTAP**, **RBAC**, and **row-level security**.
+- **Evolve autonomously**: Through **automatic fine-tuning**, **strategy retrospectives**, and **feedback-driven iterations**, the system self-improves, producing high-quality, traceable engineering artifacts while scaling to enterprise needs.
