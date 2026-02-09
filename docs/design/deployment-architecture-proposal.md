@@ -50,6 +50,20 @@ This proposal defines the deployment architecture for mo-dev-agent, aligning wit
 1. **Conversation Replay ("对话时光机")**: Reproduce any past decision via `causal_chain_id`
 2. **Time-Point Sandbox ("平行宇宙实验台")**: Test new prompts/skills on historical data with zero production impact
 3. **Continuous Evolution**: Feedback → Evaluation → Training → Improved Models
+4. **Extensible Skills System**: Skills as first-class citizens with versioning, composition, and marketplace support
+
+### 4. Architectural Growth Principles
+
+**Core Minimalism**: Core engine handles only event flow, context assembly, and extension dispatch. All business logic lives in extensions.
+
+**Explicit Extensions**: New practices must go through:
+- `extensions/` directory placement
+- `ExtensionManager` registration
+- Event hooks or config-driven integration
+
+**Traceable Evolution**: Every extension has independent versioning + changelog; database records extension usage; answer "Why was this skill deprecated on 2026-03-01?"
+
+**Mechanized Deprecation**: Avoid "technical debt snowball" with explicit deprecation policies and migration guides.
 
 ---
 
@@ -112,6 +126,19 @@ mo-dev-agent/                  # Project root
 │   │   ├── evaluator.py       # Evaluate sandbox results
 │   │   └── regression_gate.py # Auto-replay N chains before merge
 │   │
+│   ├── skills/                # 【KEY INNOVATION】Skills as first-class citizens
+│   │   ├── __init__.py
+│   │   ├── skill.py           # Skill base class (input/output/version/safety)
+│   │   ├── registry.py        # Load from skills_registry table
+│   │   ├── composer.py        # Skill composition (chain/parallel/conditional)
+│   │   ├── filter.py          # Enhanced dynamic filtering (LLM-assisted)
+│   │   └── validator.py       # Pre-call validation (permissions/params)
+│   │
+│   ├── extensions/            # Extension management system
+│   │   ├── __init__.py
+│   │   ├── manager.py         # ExtensionManager (load/register/hooks)
+│   │   └── base.py            # Extension base class
+│   │
 │   └── tools/                 # Tool registry (design §6)
 │       ├── __init__.py
 │       ├── base_tool.py
@@ -145,6 +172,29 @@ mo-dev-agent/                  # Project root
 │   │
 │   └── summary/               # Conversation summarization
 │       └── generator.py       # Generate session summaries
+│
+├── 📁 extensions/             # 【EXTENSIBILITY】All extension practices
+│   ├── README.md              # Extension integration guide
+│   ├── registry.json          # Extension registry (metadata)
+│   ├── TEMPLATE.md            # New extension template
+│   │
+│   ├── skills/                # Community/custom skills
+│   │   ├── github_issue_skill/
+│   │   │   ├── skill.yaml     # Metadata (depends on: [github_api, llm])
+│   │   │   ├── implementation.py
+│   │   │   └── test_skill.py
+│   │   └── sql_query_skill/
+│   │       ├── skill.yaml
+│   │       └── implementation.py
+│   │
+│   ├── workflows/             # Pre-built workflows (skill compositions)
+│   │   └── customer_refund_flow.yaml  # triage → order → payment
+│   │
+│   ├── analytics/             # New analytics practices
+│   │   └── skill_effectiveness.py  # Skill call success rate analysis
+│   │
+│   └── guardrails/            # New safety practices
+│       └── pii_detector.py    # PII detection guardrail
 │
 ├── 📁 api/                    # 【ACCESS LAYER】Multi-endpoint service
 │   ├── main.py                # FastAPI application
@@ -256,6 +306,318 @@ agents/examples/               # Example implementations
 
 ---
 
+## Skills System & Extension Architecture
+
+### Why Skills Need First-Class Status
+
+**Current Design's Implicit Skills**:
+
+| Design Element | Implicit Skills Capability | Limitation |
+|----------------|---------------------------|------------|
+| `core/tools/` | Tools as skills (LLM/GitHub API) | Only low-level execution units, lacks business semantics |
+| `skills_registry` table (design §4) | Skill metadata storage | No runtime skill composition/filtering logic |
+| `core/context/skill_filter.py` | Dynamic skill filtering | Skills not explicitly modeled as first-class citizens |
+
+**Industry Best Practices (2024)**:
+
+| Practice | Representative Solution | Core Value | Integration Point |
+|----------|------------------------|------------|-------------------|
+| **Skills as Code** | Semantic Kernel | Skills = versionable code units | `core/skills/` + Git management |
+| **Skill Composition** | LangChain LCEL | Chain/parallel/conditional composition | `core/skills/composer.py` |
+| **Skill Marketplace** | Dify Plugin Hub | Community skill reuse | `extensions/skills/` |
+| **Skill Versioning** | Microsoft AutoGen | A/B test skill effectiveness | Same level as `prompt_templates` |
+| **Skill Safety** | NVIDIA NeMo Guardrails | Skill call guardrails | Enhanced `core/tools/sandbox_executor.py` |
+| **Skill Discovery** | IBM Watsonx Orchestrate | LLM auto-recommends skills | Enhanced `core/skills/filter.py` |
+| **Multi-Modal Skills** | Google Vertex AI Agents | Text/image/audio skills | Skill metadata extension |
+
+### Skills Architecture
+
+**Skill Base Class** (`core/skills/skill.py`):
+
+```python
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+
+class Skill(BaseModel):
+    """First-class skill representation"""
+    skill_id: str
+    version: str
+    description: str
+    input_schema: Dict  # JSON Schema
+    output_schema: Dict
+    tools: List[str]    # Dependent tool IDs (links to tools_registry)
+    tags: List[str]     # Business tags ("customer_service", "data_query")
+    safety_rules: List[str]  # Safety rules ("no_pii", "max_tokens=500")
+    
+    # Metadata for reproducibility
+    created_at: str
+    deprecated: Optional[str] = None  # Deprecation version
+    alternative: Optional[str] = None  # Replacement skill_id
+```
+
+**Skill Composition** (`core/skills/composer.py`):
+
+```python
+class SkillComposer:
+    """Compose skills into workflows"""
+    
+    def compose(self, skills: List[Skill], logic: str = "sequential"):
+        """
+        Compose skills into workflow
+        
+        Args:
+            skills: List of skills to compose
+            logic: "sequential" | "parallel" | "conditional"
+        
+        Returns:
+            Workflow object with nodes and edges
+        """
+        pass
+```
+
+**Integration with Context Builder**:
+
+```python
+# core/context/builder.py modification
+def build_context(session_id: str, current_request: str) -> Context:
+    # Load available skills
+    skills = skill_registry.get_available_skills(session_context)
+    
+    # Filter skills (LLM-assisted or rule-based)
+    filtered_skills = skill_filter.filter(skills, current_request)
+    
+    # Inject into context_snapshot for reproducibility
+    context_snapshot["skills_used"] = [
+        {"skill_id": s.skill_id, "version": s.version} 
+        for s in filtered_skills
+    ]
+    
+    return Context(prompt=rendered, skills=filtered_skills)
+```
+
+### Extension System Architecture
+
+**Extension Manager** (`core/extensions/manager.py`):
+
+```python
+class ExtensionManager:
+    """Manage all extensions (skills/workflows/analytics/guardrails)"""
+    
+    def load_extension(self, path: str):
+        """
+        Dynamically load extension (no service restart)
+        
+        Supports:
+        - .yaml: Skill definitions
+        - .py: Plugin implementations
+        """
+        if path.endswith(".yaml"):
+            self._load_skill_from_yaml(path)
+        elif path.endswith(".py"):
+            self._load_plugin(path)
+    
+    def register_hook(self, event_type: str, callback: Callable):
+        """
+        Register event hooks for extensions
+        
+        Example: When event_type='skill_call', trigger PII detection
+        """
+        self._hooks[event_type].append(callback)
+    
+    def trigger_hooks(self, event_type: str, event: Event):
+        """Trigger all registered hooks for event type"""
+        for callback in self._hooks.get(event_type, []):
+            callback(event)
+```
+
+**Extension Registry** (`extensions/registry.json`):
+
+```json
+{
+  "version": "1.0",
+  "extensions": [
+    {
+      "id": "github_issue_skill",
+      "type": "skill",
+      "version": "1.0.0",
+      "path": "extensions/skills/github_issue_skill",
+      "dependencies": ["github_api", "llm"],
+      "status": "active",
+      "created_at": "2026-02-10"
+    },
+    {
+      "id": "pii_detector",
+      "type": "guardrail",
+      "version": "1.0.0",
+      "path": "extensions/guardrails/pii_detector.py",
+      "hooks": ["pre_llm_call", "post_tool_call"],
+      "status": "active"
+    }
+  ]
+}
+```
+
+**Extension Template** (`extensions/TEMPLATE.md`):
+
+```markdown
+# New Extension Integration Guide
+
+## 1. Placement
+- Skills: `extensions/skills/your_skill/`
+- Workflows: `extensions/workflows/your_workflow.yaml`
+- Analytics: `extensions/analytics/your_analyzer.py`
+- Guardrails: `extensions/guardrails/your_guardrail.py`
+
+## 2. Required Files
+- `README.md`: Description, usage, examples
+- `implementation.py` or `skill.yaml`: Core logic
+- `test_*.py`: Unit tests
+- Entry in `extensions/registry.json`
+
+## 3. Registration
+```json
+{
+  "id": "your_extension",
+  "type": "skill|workflow|analytics|guardrail",
+  "version": "1.0.0",
+  "path": "extensions/.../",
+  "dependencies": ["tool1", "tool2"],
+  "status": "active"
+}
+```
+
+## 4. Validation Workflow
+```bash
+make test-extension path=extensions/skills/your_skill
+make sandbox-validate extension=your_extension
+```
+
+## 5. Deprecation Policy
+When deprecating, add to implementation:
+```python
+@deprecated(since="v1.3", removal="v2.0", alternative="new_skill_v2")
+def old_skill(...):
+    pass
+```
+```
+
+### Extension Evolution Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. Discover New Practice (community/team)                       │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. Evaluate                                                      │
+│    High value → Create Extension PR                             │
+│    Experimental → Place in extensions/experimental/             │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 3. Automated Testing                                            │
+│    → Unit tests (test_*.py)                                     │
+│    → Integration tests                                          │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. Sandbox Validation                                           │
+│    → Replay historical chains with new extension                │
+│    → Measure quality delta                                      │
+│    → Check regression threshold                                 │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ├─ Pass → Merge to extensions/
+                     └─ Fail → Rollback + Archive
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 5. Documentation + Examples                                     │
+│    → Update README.md                                           │
+│    → Add usage examples                                         │
+└────────────────────┬────────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 6. Monitor Effectiveness                                        │
+│    → Track: call count, success rate, user satisfaction        │
+│    → Data meets bar → Promote to core module                   │
+│    → Data poor → Mark deprecated                               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Mechanisms**:
+
+| Mechanism | Purpose | Tool Support |
+|-----------|---------|--------------|
+| **Extension Registry** | Unified management of all extensions | `extensions/registry.json` |
+| **Sandbox Validation** | Zero-risk validation of new practices | Reuse `core/sandbox/` capability |
+| **Deprecation Policy** | Graceful retirement of old practices | `@deprecated` decorator + migration guide |
+| **Practice Scorecard** | Quantify practice value | Call count / user satisfaction / error rate |
+
+### Skill Effectiveness Closed Loop
+
+**New Table**: `skill_evaluations`
+
+```sql
+CREATE TABLE skill_evaluations (
+  evaluation_id VARCHAR(64) PRIMARY KEY,
+  skill_id VARCHAR(64) NOT NULL,
+  event_id VARCHAR(64) NOT NULL,  -- Links to conversation_events
+  success BOOLEAN,
+  latency_ms INT,
+  user_feedback TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_skill_eval ON skill_evaluations(skill_id, success);
+```
+
+**Analytics**: `extensions/analytics/skill_effectiveness.py`
+- Generate skill heatmap (success rate by skill)
+- Auto-downgrade low-performing skills (integrate with `skill_filter.py`)
+
+### Multi-Modal Skills Support
+
+**Skill Metadata Extension** (`extensions/skills/image_analysis/skill.yaml`):
+
+```yaml
+skill_id: image_analysis
+version: 1.0.0
+description: Analyze images and extract insights
+input_types:
+  - text
+  - image_url
+output_types:
+  - text
+  - bounding_boxes
+tools:
+  - gpt4v_client
+  - claude35_vision
+tags:
+  - vision
+  - multimodal
+safety_rules:
+  - no_pii_in_images
+  - max_image_size=10MB
+```
+
+**Tool Enhancement**: `core/tools/multimodal_client.py` (supports GPT-4V/Claude 3.5)
+
+### Defense Against "Practice Sprawl"
+
+| Risk | Mitigation Strategy |
+|------|---------------------|
+| **Extension Fragmentation** | Mandatory Extension Registry + tag classification (skills/workflows/guardrails) |
+| **Core Bloat** | Core engine only provides "extension points"; all practices default to `extensions/` |
+| **Version Conflicts** | Each extension declares dependency versions (`requires: core>=1.2.0`) |
+| **Security Vulnerabilities** | Extension sandbox execution (resource isolation + permission whitelist) |
+| **Documentation Gaps** | PR template enforces: README.md + examples + test cases |
+
+---
+
 ## Data Flow: End-to-End
 
 ```
@@ -282,9 +644,9 @@ agents/examples/               # Example implementations
 │ 4. Context Assembly (core/context/builder.py)                   │
 │    → Token Budget Manager allocates per-section caps            │
 │    → Prompt version routing (A/B test or active_latest)         │
+│    → Skill filtering (core/skills/filter.py)                    │
 │    → Load recent events (short-term memory)                     │
 │    → Optional: RAG retrieval (long-term memory)                 │
-│    → Dynamic skill filtering                                    │
 │    → Render prompt with sections                                │
 └────────────────────┬────────────────────────────────────────────┘
                      │
@@ -368,22 +730,46 @@ agents/examples/               # Example implementations
 - [ ] `tests/integration/test_causal_chain.py` (verify chain integrity)
 - [ ] `tests/e2e/test_simple_chat.py` (user query → LLM response)
 
-### Phase 2: Observability + Evaluation (Week 5-6)
+### Phase 1.5: Skills System (Week 5)
+
+**Goal**: Elevate skills to first-class citizens
+
+**Deliverables**:
+- [ ] Implement `core/skills/skill.py` (Skill base class)
+- [ ] Implement `core/skills/registry.py` (load from skills_registry table)
+- [ ] Implement `core/skills/composer.py` (skill composition: chain/parallel/conditional)
+- [ ] Implement `core/skills/filter.py` (enhanced dynamic filtering with LLM-assisted recommendation)
+- [ ] Implement `core/skills/validator.py` (pre-call validation: permissions/params)
+- [ ] Implement `core/extensions/manager.py` (ExtensionManager: load/register/hooks)
+- [ ] Implement `core/extensions/base.py` (Extension base class)
+- [ ] Create `extensions/` directory structure
+- [ ] Create `extensions/registry.json` (extension registry)
+- [ ] Create `extensions/TEMPLATE.md` (new extension template)
+- [ ] Modify `core/context/builder.py` to inject `skills_used` into `context_snapshot`
+
+**Test**:
+- [ ] `tests/unit/test_skill_composer.py` (verify skill composition logic)
+- [ ] `tests/unit/test_skill_filter.py` (verify filtering with/without LLM)
+- [ ] `tests/integration/test_extension_loading.py` (load extension from yaml/py)
+
+### Phase 2: Observability + Evaluation (Week 6-7)
 
 **Goal**: Metrics and feedback loop
 
 **Deliverables**:
-- [ ] Create tables: `event_evaluations`, `training_annotations`, `data_export_jobs`
+- [ ] Create tables: `event_evaluations`, `training_annotations`, `data_export_jobs`, `skill_evaluations`
 - [ ] Implement `analytics/events_analytics/quality_scorer.py` (auto-score events)
 - [ ] Implement `analytics/feedback/collector.py` (user thumbs up/down)
 - [ ] Implement `analytics/feedback/processor.py` (write to event_evaluations)
-- [ ] Add Prometheus metrics (context tokens, session count, retrieval latency)
+- [ ] Add Prometheus metrics (context tokens, session count, retrieval latency, skill success rate)
 - [ ] Implement `api/endpoints/analytics.py` (query quality scores)
+- [ ] Implement `extensions/analytics/skill_effectiveness.py` (skill heatmap)
 
 **Test**:
 - [ ] `tests/integration/test_feedback_loop.py` (user feedback → event_evaluations → training_eligible)
+- [ ] `tests/integration/test_skill_evaluation.py` (skill call → skill_evaluations)
 
-### Phase 3: Intelligence + Training Loop (Week 7-9)
+### Phase 3: Intelligence + Training Loop (Week 8-10)
 
 **Goal**: RAG + training pipeline
 
@@ -400,23 +786,28 @@ agents/examples/               # Example implementations
 - [ ] `tests/integration/test_rag.py` (retrieval timeout, fallback)
 - [ ] `tests/e2e/test_training_loop.py` (feedback → export → training data)
 
-### Phase 4: Experience + Analytics (Week 10-11)
+### Phase 4: Experience + Analytics (Week 11-12)
 
 **Goal**: Production-ready features
 
 **Deliverables**:
-- [ ] Implement `core/context/skill_filter.py` (dynamic skill filtering)
 - [ ] Implement session lifecycle (idle timeout, max_events enforcement)
 - [ ] Implement `core/prompt/version_router.py` A/B testing
 - [ ] Create table: `agent_configs` (versioned)
 - [ ] Implement pre-aggregated views (user_daily_stats)
 - [ ] Implement retention policy (archive old events)
+- [ ] Create example extensions:
+  - [ ] `extensions/skills/github_issue_skill/` (with skill.yaml + implementation.py)
+  - [ ] `extensions/workflows/customer_refund_flow.yaml`
+  - [ ] `extensions/guardrails/pii_detector.py`
+- [ ] Implement Makefile commands: `make test-extension`, `make sandbox-validate`
 
 **Test**:
 - [ ] `tests/unit/test_prompt_versioning.py` (A/B routing)
 - [ ] `tests/integration/test_session_lifecycle.py` (idle, max_events)
+- [ ] `tests/integration/test_extension_workflow.py` (load → validate → deploy extension)
 
-### Phase 5: Replay + Sandbox (Week 12-14)
+### Phase 5: Replay + Sandbox (Week 13-15)
 
 **Goal**: "Operating system level" capabilities
 
@@ -445,7 +836,9 @@ agents/examples/               # Example implementations
 | **Context Utilization** | <80% typical | Fraction of token budget used (leave headroom) |
 | **Training Loop Cycle** | <1 week | Evaluate → Export → Train (when automated) |
 | **Orphan Event Rate** | <1% | Events with no parent and not user_query |
-| **Sandbox Experiment Coverage** | Review periodically | % of prompt changes tested in sandbox before merge |
+| **Sandbox Experiment Coverage** | Review periodically | % of prompt/skill changes tested in sandbox before merge |
+| **Skill Success Rate** | >90% | Successful skill calls / total skill calls |
+| **Extension Adoption Rate** | Track monthly | New extensions added vs deprecated |
 
 ---
 
@@ -457,11 +850,18 @@ agents/examples/               # Example implementations
 | §1 Context Design | `core/context/builder.py` + Token Budget Manager |
 | §1.2 Token Budget Manager | `core/context/token_budget.py` |
 | §1.3 Context Assembly Flow | `core/context/builder.py` (stable interface) |
-| §1.4 Dynamic Skill Filtering | `core/context/skill_filter.py` |
+| §1.4 Dynamic Skill Filtering | `core/skills/filter.py` (enhanced) |
 | §1.6 Memory–Prompt–Context | `core/memory/`, `core/prompt/`, `core/context/` |
 | §2 Memory Design | `core/memory/short_term.py`, `medium_term.py`, `long_term.py` |
 | §2.6 Conversation Replay | `core/replay/` + `causal_chain_id` |
 | §3 Session Management | `api/endpoints/sessions.py` + `sessions` table |
+| §3.5 Time-Point Sandbox | `core/sandbox/` + Git for Data |
+| §4 Table Design | `infra/scripts/init-db.sh` (all tables including `skill_evaluations`) |
+| §4.7 Evaluation → Training Loop | `analytics/feedback/`, `analytics/training/` |
+| §5 Token Management | `tokens` table + resolution priority |
+| §6 Observability | Prometheus metrics in `api/main.py` |
+| **Skills as First-Class** | `core/skills/` + `skills_registry` table + `extensions/` |
+| **Extension System** | `core/extensions/manager.py` + `extensions/registry.json` |
 | §3.5 Time-Point Sandbox | `core/sandbox/` + Git for Data |
 | §4 Table Design | `infra/scripts/init-db.sh` (all tables) |
 | §4.7 Evaluation → Training Loop | `analytics/feedback/`, `analytics/training/` |
@@ -480,6 +880,10 @@ agents/examples/               # Example implementations
 | Causal chain break | Events written in order; monitor orphan events; alert |
 | Sandbox vector rebuild cost | Fallback: use current vector DB (not historically exact); document limitation |
 | MatrixOne Git for Data not ready | Fallback: table clone + time-point query (`AS OF TIMESTAMP`) |
+| **Extension fragmentation** | Mandatory Extension Registry + tag classification; enforce PR template |
+| **Core bloat from extensions** | Core engine only provides extension points; all practices default to `extensions/` |
+| **Skill version conflicts** | Each skill declares dependency versions (`requires: core>=1.2.0`) |
+| **Extension security vulnerabilities** | Extension sandbox execution (resource isolation + permission whitelist) |
 
 ---
 
@@ -490,6 +894,8 @@ agents/examples/               # Example implementations
 3. **Token budget defaults**: Confirm `context_max_tokens=8000` is appropriate for target models (GPT-4, Claude).
 4. **Agent complexity**: Should Phase 1 include `orchestrator.py` or defer to Phase 4?
 5. **Compliance (desensitization)**: Is `desensitized_content` column needed for MVP, or defer to later phase?
+6. **Extension governance**: Who approves new extensions? What's the review process for community contributions?
+7. **Skill marketplace**: Should we plan for external skill marketplace integration (e.g., Dify Plugin Hub)?
 
 ---
 
@@ -498,18 +904,27 @@ agents/examples/               # Example implementations
 This architecture proposal:
 
 1. **Aligns with design documents**: Every module traces to specific sections in vision-and-mission.md and context-memory-session-and-tables.md
-2. **Prioritizes core innovations**: Event-centric design, replay, sandbox, Token Budget Manager
+2. **Prioritizes core innovations**: Event-centric design, replay, sandbox, Token Budget Manager, **Skills as first-class citizens**
 3. **Simplifies premature complexity**: Minimal agent roles in Phase 0-1; expand as needed
 4. **Enables data asset evolution**: Every interaction is traceable, analyzable, and trainable
-5. **Provides clear roadmap**: 5 phases over 14 weeks, with testable deliverables
+5. **Provides clear roadmap**: 5 phases over 15 weeks, with testable deliverables
+6. **Ensures architectural growth**: Extension system enables continuous absorption of industry best practices without core refactoring
+
+**Key Architectural Philosophy**:
+
+> "When tomorrow brings a disruptive practice, we can integrate it in 1 day, not refactor the entire system."
+
+This transforms mo-dev-agent from an "excellent system" into an **"industry practice incubator"** — not only absorbing best practices but defining the next-generation agent system evolution paradigm.
 
 **Next Steps**:
 1. Review and approve this proposal
 2. Begin Phase 0 implementation (database schema + event system)
 3. Validate with `echo_agent.py` before expanding agent capabilities
+4. Create first example extension in Phase 1.5 to validate extension workflow
 
 **Approval Required From**:
 - [ ] Architecture Lead
 - [ ] Data Engineering Lead
 - [ ] ML/Training Lead
 - [ ] Product Owner
+- [ ] DevOps/Platform Lead (for extension security review)
