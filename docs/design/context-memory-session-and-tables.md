@@ -79,6 +79,53 @@ Sections are ordered so that **current task** and **retrieved memory** (when pre
 - **Config**: e.g. `context_max_tokens`, `context_current_task_min_tokens`, `context_history_max_tokens` in `configs`.
 - **Cost and stability**: Monitor **context token variance** (e.g. target &lt;10% fluctuation for similar sessions); **compression** (truncation + optional summarization) keeps usage within 20–30% of unconstrained growth. Model-agnostic abstraction (e.g. via configurable model id) avoids vendor lock-in.
 
+**Token Budget Allocation Algorithm**:
+
+Given `total_budget` (from `configs.context_max_tokens`, e.g. 8000 tokens):
+
+```
+allocate(total_budget, has_rag):
+  # Step 1: Reserve fixed sections
+  system_skills_cap  = min(configs.context_system_skills_max_tokens, total_budget * 0.15)  # e.g. 1200
+  current_task_min   = configs.context_current_task_min_tokens  # e.g. 800, hard floor
+
+  # Step 2: Reserve current task minimum
+  remaining = total_budget - system_skills_cap - current_task_min
+
+  # Step 3: Allocate RAG (if enabled)
+  if has_rag:
+    rag_cap = min(configs.context_rag_max_tokens, remaining * 0.30)  # e.g. max 1500
+    remaining -= rag_cap
+  else:
+    rag_cap = 0
+
+  # Step 4: Remaining goes to recent conversation
+  history_cap = remaining  # whatever is left
+
+  # Step 5: Current task gets its minimum + any unused from other sections
+  current_task_cap = current_task_min  # may grow if other sections underuse
+
+  return { system_skills_cap, current_task_cap, rag_cap, history_cap }
+```
+
+**Truncation rules** (applied during build_sections):
+- **System + skills**: If rendered text exceeds `system_skills_cap`, drop skills by lowest relevance score until within cap. Never truncate system identity.
+- **Current task**: If exceeds `current_task_cap`, truncate from the end with "... [truncated]" marker. Log warning.
+- **RAG**: If total retrieved chunks exceed `rag_cap`, drop lowest-similarity chunks first. Each chunk capped at `configs.context_rag_per_chunk_max_tokens` (e.g. 300).
+- **Recent conversation**: Load events newest-first; sum `token_usage.total` per event; stop when sum exceeds `history_cap`; drop oldest events that don't fit. If zero events fit, log warning and return "context too constrained" in metadata.
+- **Redistribution**: After all sections are built, if any section used less than its cap, the surplus is offered to `history_cap` (most likely to benefit from extra space).
+
+**Config defaults** (in `configs` table, scope_type=global):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `context_max_tokens` | 8000 | Total budget per LLM call |
+| `context_system_skills_max_tokens` | 1200 | Cap for system identity + skills list |
+| `context_current_task_min_tokens` | 800 | Hard floor for current user request |
+| `context_rag_max_tokens` | 1500 | Cap for retrieved memory chunks |
+| `context_rag_per_chunk_max_tokens` | 300 | Per-chunk cap |
+| `context_history_max_tokens` | (computed) | Remainder after other allocations |
+
 ### 1.3 Context Assembly Flow (Stable Interface)
 
 ```
@@ -89,7 +136,11 @@ build_context(session_id, current_request, options?) -> (context_string, metadat
 1. **Resolve session**: Load or create session; load recent **events** (ordered by created_at DESC) for this session — or for **cross-session** history, by `user_id` with `event_type IN ('user_query','llm_response')` and limit.
 2. **Allocate budget**: Token Budget Manager computes per-section caps from total budget.
 3. **Load config versions**: Load **prompt_templates** (active version for this agent) and **skills_registry** (versions for this agent); optionally **filter skills by current task** (see 1.4); build “Available skills” within skill-section budget.
-4. **Load memory** (when implemented): If RAG enabled, run retrieval with **timeout (e.g. 800ms)**; on timeout, proceed with empty “Retrieved memory” and record in metadata for monitoring.
+   - **Prompt version routing**: Select which template version via routing function:
+     - If `options.template_version` is set (explicit pin): use it. Reason: `"explicit_pin"`.
+     - If A/B experiment is active for this agent_id (from `configs`, key=`ab_test_{agent_id}`, value=`{versions:["v3","v4"], weights:[0.5,0.5], salt}`): `hash(session_id + salt)` → deterministic bucket → select version. Reason: `"ab_test:exp_id:bucket"`.
+     - Else: select row where `is_active=true AND effective_at <= now()`, latest `effective_at` wins. Reason: `"active_latest"`.
+   - **Recording**: Resolved `template_id@version` → `conversation_events.prompt_template_id`. Routing reason → `context_snapshot.routing_reason` (e.g. `"ab_test:exp_123:bucket_1"`). This ensures replay can determine "why v2 was used instead of v1".4. **Load memory** (when implemented): If RAG enabled, run retrieval with **timeout (e.g. 800ms)**; on timeout, proceed with empty “Retrieved memory” and record in metadata for monitoring.
 5. **Build sections**: For each section, pull from source (events, memory, config), apply truncation using token counts and caps.
 6. **Render prompt**: Use **prompt_templates** content (versioned); concatenate sections; support **hot-update and A/B** by template version.
 7. **Record snapshot**: Before/after LLM call, persist a **conversation_event** with **context_snapshot** = `{ prompt_template_id, skills_used: [id+version], history_events: [event_id], retrieved_chunks: [chunk_id] }` so the request is **100% reproducible**. Optionally include **injection_meta** (e.g. section order) in context_snapshot for audit.
@@ -105,6 +156,10 @@ build_context(session_id, current_request, options?) -> (context_string, metadat
   - **Lightweight**: Keyword or tag match (e.g. task contains “PR” → include `summarize_pr`, `create_issue`).
   - **Later**: Small classifier or LLM call to classify task and return allowed skill IDs.
 - **Fallback**: If no skills match or filtering is disabled, include all available skills (or a configurable default subset).
+- **Recording for reproducibility**: The filtering result is recorded in `context_snapshot` to ensure replay fidelity:
+  - `context_snapshot.skills_used`: Skills that passed the filter and were included in context (already defined).
+  - `context_snapshot.skills_filtered_out`: Skills that were available but excluded by the filter, with reason (e.g. `[{"id":"deploy_k8s","version":"v1","reason":"no_keyword_match"}]`). This enables debugging "why didn't the agent use skill X?" without guessing.
+  - `context_snapshot.skill_filter_method`: Which filter was applied (e.g. `"keyword"`, `"classifier_v2"`, `"none"`). If the filter method changes, historical snapshots still record what was used.
 
 ### 1.6 Memory, Prompt, and Context: Three-Layer Model
 
@@ -134,10 +189,178 @@ These hooks are **design points**; implementation can be async (queues, batch jo
 
 ### 1.7 Open Points (Refine Later)
 
+> **Note**: "Exact default token budgets" and "RAG chunks cap" are now defined in §1.2 Token Budget Allocation Algorithm. Remaining open point:
 - Exact default token budgets per section.
 - Multiple “context profiles” (minimal vs full) per call type.
 - Number of RAG chunks and per-chunk token cap.
 
+
+### 1.8 End-to-End Data Flow
+
+One user request, from ingress to LLM response, touching every component and table:
+
+```
+User Request (HTTP/CLI)
+  │
+  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 1. Session Resolution                                               │
+│    READ  sessions WHERE user_id=? AND status='active'               │
+│          ORDER BY last_active_at DESC LIMIT 1                       │
+│    If none → CREATE session (session_id, user_id, status='active')  │
+│    Output: session_id                                               │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 2. Event Persistence (user_query)                                   │
+│    WRITE  conversation_events                                       │
+│           event_type='user_query', content=request_text,            │
+│           causal_chain_id=event_id (chain starts here),             │
+│           parent_event_id=NULL                                      │
+│    UPDATE sessions SET last_event_id=?, event_count+=1,             │
+│           last_active_at=now()                                      │
+│    Output: user_event_id, causal_chain_id                           │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 3. Token Budget Allocation                                          │
+│    READ  configs WHERE key='context_max_tokens' (+ other caps)      │
+│    Run allocate(total_budget, has_rag) → per-section caps           │
+│    Output: { system_skills_cap, current_task_cap, rag_cap,          │
+│              history_cap }                                          │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 4. Prompt Version Routing                                           │
+│    READ  configs WHERE key='ab_test_{agent_id}' (if A/B active)     │
+│    READ  prompt_templates WHERE agent matches, resolve version      │
+│    Routing reason recorded: "active_latest"|"ab_test:..."|"pin"     │
+│    Output: template_id@version, routing_reason                      │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 5. Skill Filtering                                                  │
+│    READ  skills_registry WHERE agent matches                        │
+│    Filter by current_task (keyword/classifier)                      │
+│    Record: skills_used[], skills_filtered_out[], filter_method       │
+│    Truncate to system_skills_cap                                    │
+│    Output: filtered skill list                                      │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 6. Memory Retrieval (parallel where possible)                       │
+│                                                                     │
+│  6a. Short-term:                                                    │
+│      READ conversation_events WHERE session_id=?                    │
+│           ORDER BY created_at DESC                                  │
+│      Sum token_usage.total per event until history_cap exhausted    │
+│                                                                     │
+│  6b. Long-term (RAG, if enabled):                                   │
+│      CALL vector_store.search(query=current_task, user_id,          │
+│           top_k, timeout=800ms)                                     │
+│      On timeout → skip, record retrieval_hit=false                  │
+│      On success → READ conversation_events/memory_chunks            │
+│           by embedding_ref for text; truncate to rag_cap            │
+│                                                                     │
+│  6c. Medium-term (if available):                                    │
+│      READ sessions.summary or session_summaries WHERE user_id=?     │
+│                                                                     │
+│  Output: history_events[], retrieved_chunks[], summary_text?        │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 7. Context Assembly                                                 │
+│    Render prompt_template with sections:                            │
+│      [system_identity] + [skills_list] + [retrieved_memory]         │
+│      + [session_summary] + [recent_conversation] + [current_task]   │
+│    Apply per-section truncation from step 3 caps                    │
+│    Redistribute surplus tokens to history                           │
+│    Total tokens must <= context_max_tokens                          │
+│    Output: context_string, section_tokens{}                         │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 8. Event Persistence (llm_request) + Snapshot                       │
+│    WRITE  conversation_events                                       │
+│           event_type='llm_request',                                 │
+│           causal_chain_id (from step 2),                            │
+│           parent_event_id=user_event_id,                            │
+│           prompt_template_id=template_id@version,                   │
+│           llm_model_used, llm_params,                               │
+│           context_snapshot={                                        │
+│             prompt_template_id, routing_reason,                     │
+│             skills_used, skills_filtered_out, skill_filter_method,  │
+│             history_events: [event_ids],                            │
+│             retrieved_chunks: [chunk_ids],                          │
+│             section_tokens, total_tokens, truncated                 │
+│           }                                                         │
+│    Output: llm_request_event_id                                     │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 9. LLM Call                                                         │
+│    READ  tokens WHERE type='llm', resolve by priority               │
+│    CALL  LLM API (context_string, llm_params)                       │
+│    WRITE token_usage_log (token_id, success, error_code)            │
+│    On 401 → UPDATE tokens SET is_active=false; alert                │
+│    Output: llm_response_text, usage{prompt,completion,total}        │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 10. Event Persistence (llm_response)                                │
+│     WRITE conversation_events                                       │
+│           event_type='llm_response', content=response_text,         │
+│           token_usage=usage, causal_chain_id, llm_model_used,       │
+│           parent_event_id=llm_request_event_id                      │
+│     If response contains tool_calls → loop:                         │
+│       WRITE event_type='tool_call' (parent=llm_response)            │
+│       Execute tool                                                  │
+│       WRITE event_type='tool_result' (parent=tool_call,             │
+│             content={input,output,error_code})                      │
+│       → back to step 7 (re-assemble context with tool results)      │
+│     Output: final_response_event_id                                 │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 11. Post-Chain Hooks (async, non-blocking)                          │
+│     a. Quality scoring → set quality_score, training_eligible       │
+│     b. Memory extraction → enqueue to memory_index_queue            │
+│     c. Prompt signal → if negative feedback, log to                 │
+│        event_evaluations                                            │
+│     d. Session update → last_event_id, event_count                  │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │
+                           ▼
+              Return response to user
+```
+
+**Tables touched per request** (typical, no tool calls):
+
+| Step | Read | Write |
+|------|------|-------|
+| 1 | sessions | sessions (create if new) |
+| 2 | — | conversation_events, sessions |
+| 3 | configs | — |
+| 4 | configs, prompt_templates | — |
+| 5 | skills_registry | — |
+| 6 | conversation_events, vector_store (external) | — |
+| 7 | (in-memory assembly) | — |
+| 8 | — | conversation_events |
+| 9 | tokens | token_usage_log |
+| 10 | — | conversation_events (1-3 events) |
+| 11 | — | conversation_events (update), memory_index_queue |
+
+**Critical path latency** (steps 1-10 are synchronous): Session resolve + event writes + context assembly + LLM call. LLM call dominates; context assembly target < 50ms; event writes can be async-acked if needed.
 ---
 
 ## 2. Memory Design
@@ -184,6 +407,67 @@ To go beyond basic RAG and bounded short-term memory:
 - Embedding model and chunking strategy.
 - Retention and archival (when to summarize or drop old turns).
 - Per-user vs per-tenant isolation (align with RBAC).
+
+### 2.5.1 RAG Reproducibility Design
+
+The design goal ("ten years from now we can still precisely reproduce today's decision") requires that **RAG retrieval results are reproducible**. Since the vector store is external and mutable (models change, indexes rebuild), we need explicit mechanisms:
+
+**Problem**: `context_snapshot.retrieved_chunks` records **which** chunks were retrieved, but if the embedding model changes or the vector store is rebuilt, the same query may return different chunks. This breaks reproducibility.
+
+**Solution — three layers of defense**:
+
+1. **Snapshot the retrieval result, not just the ref** (Phase 1, mandatory):
+   - `context_snapshot.retrieved_chunks` stores not just `[chunk_id]` but `[{chunk_id, embedding_ref, text_hash, similarity_score}]`.
+   - `text_hash` (e.g. SHA-256 of the chunk text) allows verification: "is the chunk text still the same as when it was retrieved?"
+   - On replay, if the chunk text matches `text_hash`, the retrieval is reproducible. If not, log a **reproducibility_warning** in the replay result.
+
+2. **Version the embedding model** (Phase 3, when RAG is implemented):
+   - Add `embedding_model_id` (e.g. `"text-embedding-3-small-20240101"`) to:
+     - `memory_index_queue` (which model was used to embed this event)
+     - `conversation_events.metadata.rag.embedding_model_id` (which model was used for the query embedding at retrieval time)
+   - When the embedding model changes, **do not delete old vectors**. Instead:
+     - New events are embedded with the new model and stored with a new `embedding_model_id`.
+     - Old vectors remain queryable (if the vector store supports multi-model indexes) or are re-embedded in a background job.
+     - `context_snapshot` records the model used, so replay knows "this retrieval used model X".
+
+3. **Vector store snapshot strategy** (Phase 5, for sandbox):
+   - **Option A (preferred if vector store supports it)**: Use vector store's native snapshot/backup (e.g. Pinecone collections, Chroma persistence). Store snapshot ref in `sessions.vector_db_snapshot_id`.
+   - **Option B (fallback)**: Do not snapshot the vector store. Instead, on sandbox replay:
+     - Use `context_snapshot.retrieved_chunks` directly (the text and scores are already recorded).
+     - Skip the vector search step; inject the historical chunks into the context as if they were retrieved.
+     - Label the replay as `"vector_state=snapshot_from_context"` (not a live re-retrieval).
+   - **Option C (full rebuild)**: Replay `memory_index_queue` events up to timestamp T into a fresh vector store instance. Expensive but precise. Use only when Option A is unavailable and Option B is insufficient.
+
+**Decision matrix**:
+
+| Scenario | Strategy | Reproducibility | Cost |
+|----------|----------|----------------|------|
+| Normal replay (same model, same vectors) | Re-query vector store; verify via text_hash | Exact | Low |
+| Model changed since original | Use Option B (inject from snapshot) | Exact (context level) | Low |
+| Sandbox at T1 | Option A if available; else Option B | Exact or near-exact | Low-Medium |
+| Full audit / compliance | Option C (rebuild vector store at T1) | Exact (vector level) | High |
+
+**Summary table for session_summaries** (medium-term memory reproducibility):
+
+To ensure medium-term memory is also reproducible, session summaries must record their provenance:
+
+```sql
+CREATE TABLE session_summaries (
+  summary_id     VARCHAR(64) PRIMARY KEY,
+  session_id     VARCHAR(64) NOT NULL,
+  user_id        VARCHAR(64) NOT NULL,
+  summary_text   TEXT NOT NULL,
+  source_event_ids JSON NOT NULL,       -- which events were summarized
+  summarizer_model VARCHAR(64),         -- which model generated the summary
+  summarizer_params JSON,               -- e.g. {"temperature":0, "max_tokens":500}
+  token_count    INT,                   -- for budget allocation
+  created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_ss_session ON session_summaries(session_id, created_at DESC);
+CREATE INDEX idx_ss_user ON session_summaries(user_id, created_at DESC);
+```
+
+This ensures: (a) we know which events went into the summary, (b) we can regenerate it with the same model/params, (c) token_count enables budget allocation without re-tokenizing.
 
 ---
 
@@ -252,6 +536,67 @@ Replay API and tooling (e.g. “replay_session”, “replay_chain”) can be im
 3. **Idle**: Background job or on-next-request: if `now - last_active_at > session_idle_timeout_hours` (from configs, e.g. 24), set status=idle (or closed).
 4. **Recovery**: **GET /sessions/latest?user_id=...** returns the most recent session by last_active_at (or updated_at) for that user (and tenant). Client can use this when it has no session_id (e.g. after refresh) to “resume” the same thread.
 
+
+### 3.2.1 Session State Machine
+
+```
+                    first message
+         ┌──────────────────────────────┐
+         │                              ▼
+     (no session)                   [active]
+                                   /    |    \
+                     event_count  /     |     \  idle timeout
+                     >= max      /      |      \  (background job)
+                                ▼       |       ▼
+                           [closed]     |    [idle]
+                              ▲         |       │
+                              │         │       │  new message
+                              │         │       │  from same user
+                              │         │       ▼
+                              │         │   [active]  (reactivate)
+                              │         │
+                              │         └── manual close (API)
+                              │                │
+                              └────────────────┘
+```
+
+**Transition rules**:
+
+| From | To | Trigger | Action |
+|------|----|---------|--------|
+| (none) | active | First message from user | Create session; set status='active', event_count=0 |
+| active | active | New event | Update last_active_at, event_count, last_event_id |
+| active | closed | event_count >= max_events_per_session | Set status='closed'; optionally trigger summarization; return "Session limit reached" |
+| active | idle | now - last_active_at > session_idle_timeout_hours | Background job sets status='idle' |
+| active | closed | Manual close (API call) | Set status='closed' |
+| idle | active | New message from same user | Set status='active'; resume appending events |
+| idle | closed | Retention policy (e.g. idle > 7 days) | Background job sets status='closed'; trigger summarization |
+| closed | (terminal) | — | No new events accepted; read-only; eligible for archival |
+
+### 3.2.2 Concurrency and Multi-Device
+
+**Problem**: Same user may send messages from multiple devices or tabs simultaneously, or rapid-fire messages before the previous response completes.
+
+**Design**:
+
+- **One active session per user** (default policy): `GET /sessions/latest` returns the single active session. If a second device connects, it joins the same session. This is the simplest model and matches most CLI/chat use cases.
+- **Concurrent writes to same session**: Events are appended with `causal_chain_id` set at the user_query level. If two user_queries arrive concurrently for the same session:
+  - Each gets its own `causal_chain_id` (two independent chains).
+  - Both are valid events in the session; `created_at` ordering determines display order.
+  - The context assembly for each chain uses the session's events up to that point (read-your-own-writes consistency required).
+  - **Risk**: Two concurrent chains may produce conflicting tool actions. **Mitigation**: Application-level lock per session during chain execution (e.g. optimistic lock via `last_event_id` check-and-set). If lock fails, return "Another request is in progress" to the second caller.
+- **Multi-session per user** (optional, future): If needed (e.g. user wants parallel conversations), allow multiple active sessions per user. `GET /sessions/latest` returns the most recent; client can also specify `session_id` explicitly. Requires UI support.
+
+**Session recovery across devices**:
+
+```
+Client connects (no session_id in local state):
+  1. GET /sessions/latest?user_id=U123
+  2. If result.status == 'active' AND now - result.last_active_at < session_idle_timeout:
+       resume this session (use result.session_id)
+  3. Else:
+       create new session
+```
 ### 3.3 Config Knobs (in configs)
 
 - **session_idle_timeout_hours** (e.g. 24): For idle/close policy.
@@ -327,7 +672,7 @@ All tables in MatrixOne. Schema is **event-centric**: one unified event table (*
 | **token_usage_log**       | Audit: token_id, used_at, success, error_code. Async write. |
 | **token_rotation_jobs**   | Scheduled rotation. |
 | **memory_index_queue**    | RAG indexing queue: **event_id**, status, retry_count. |
-
+| **session_summaries**     | Medium-term memory: summary_text, source_event_ids, summarizer_model/params, token_count. Reproducible summaries. |
 Optional later: `session_summaries`, `data_retention_policy` (for partitioning/archival).
 
 ### 4.2 Column Definitions (Evolvable)
