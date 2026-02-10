@@ -29,8 +29,32 @@ make dev-up
 # 4. Initialize database
 make db-init
 
-# 5. Run tests
+# 5. Start using CLI
+mo-agent chat
+
+# Or run tests
 make test
+```
+
+## CLI Commands
+
+```bash
+# Interactive chat
+mo-agent chat --user-id alice
+
+# Manage skills
+mo-agent skill list
+mo-agent skill register skill.json
+
+# Manage sessions
+mo-agent session list
+mo-agent session show <session_id>
+
+# Replay conversations
+mo-agent replay <session_id>
+
+# Health check
+mo-agent health
 ```
 
 ## Usage Example

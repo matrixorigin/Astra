@@ -202,3 +202,31 @@ class CIStatusSkill(Skill):
         ]
 
         return CIStatusOutput(success=True, result=workflows, workflows=workflows)
+
+
+
+def register_builtin_skills(registry, db):
+    """Register all built-in skills."""
+    from core.skills.github_client import GitHubClient
+    
+    github = GitHubClient(db)
+    
+    skills = [
+        ("summarize_pr", "1.0.0", "Summarize a GitHub pull request", SummarizePRSkill(github)),
+        ("list_prs", "1.0.0", "List pull requests in a repository", ListPRsSkill(github)),
+        ("ci_status", "1.0.0", "Check CI/CD status for a repository", CIStatusSkill(github))
+    ]
+    
+    for name, version, description, skill_instance in skills:
+        try:
+            registry.register(
+                name=name,
+                version=version,
+                description=description,
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                implementation=f"core.skills.builtin.{skill_instance.__class__.__name__}"
+            )
+        except Exception:
+            # Skill already registered
+            pass
