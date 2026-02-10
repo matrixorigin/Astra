@@ -333,6 +333,20 @@ CREATE TABLE IF NOT EXISTS context_snapshots (
   INDEX idx_task_type (task_type)
 ) COMMENT='Context snapshots for debugging and replay';
 
+-- event_embeddings: Store text embeddings for semantic search
+CREATE TABLE IF NOT EXISTS event_embeddings (
+  event_id            VARCHAR(36) PRIMARY KEY,
+  embedding           VECF32(1024) NOT NULL COMMENT 'Embedding vector',
+  model_name          VARCHAR(64) NOT NULL DEFAULT 'text-embedding-3-small',
+  model_version       VARCHAR(32) NOT NULL DEFAULT '1.0',
+  metadata            JSON COMMENT 'Additional metadata',
+  created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  INDEX idx_model (model_name),
+  INDEX idx_created (created_at)
+) COMMENT='Event embeddings for semantic search';
+
 EOF
 
 echo ""

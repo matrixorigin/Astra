@@ -81,16 +81,31 @@ class Context:
 class ContextManager:
     """Orchestrate context selection and assembly."""
     
-    def __init__(self, db: Database, enable_snapshots: bool = False):
+    def __init__(
+        self,
+        db: Database,
+        enable_snapshots: bool = False,
+        embedding_provider: str = "mock"
+    ):
         """Initialize context manager.
         
         Args:
             db: Database connection
             enable_snapshots: Whether to save context snapshots (default: False)
+            embedding_provider: Embedding provider (openai, mock)
         """
         self.db = db
         self.enable_snapshots = enable_snapshots
-        logger.info(f"ContextManager initialized (snapshots={'enabled' if enable_snapshots else 'disabled'})")
+        
+        # Initialize embedding service
+        from core.context.embeddings import EmbeddingService
+        self.embeddings = EmbeddingService(db, provider=embedding_provider)
+        
+        logger.info(
+            f"ContextManager initialized "
+            f"(snapshots={'enabled' if enable_snapshots else 'disabled'}, "
+            f"embeddings={embedding_provider})"
+        )
     
     def build_context(
         self,
@@ -216,36 +231,51 @@ class ContextManager:
         candidates: List[Dict[str, Any]],
         session_id: str
     ) -> List[tuple[Dict[str, Any], float]]:
-        """Score candidates by relevance.
+        """Score candidates by relevance using L2_DISTANCE.
         
         Multi-signal scoring:
-        - Temporal: Recent events score higher
-        - Causal: Events in same chain score higher
-        - Keyword: Exact matches score higher
+        - Semantic: L2 distance (40%)
+        - Temporal: Recent events score higher (20%)
+        - Causal: Events in same chain score higher (30%)
+        - Keyword: Exact matches score higher (10%)
         """
-        scored = []
+        # Generate query embedding and search
+        query_embedding = self.embeddings.embed_text(query)
+        semantic_results = self.embeddings.search_similar(
+            query_embedding,
+            limit=len(candidates),
+            session_id=session_id
+        )
         
+        # Build distance map
+        distance_map = {r['event_id']: r['distance'] for r in semantic_results}
+        
+        scored = []
         for candidate in candidates:
-            # Simple scoring for MVP
-            score = 0.0
+            event_id = candidate['event_id']
             
-            # Temporal score (exponential decay)
+            # Semantic score (40%) - convert distance to similarity
+            distance = distance_map.get(event_id, 999.0)
+            semantic_score = (1.0 / (1.0 + distance)) * 0.4
+            
+            # Temporal score (20%) - exponential decay
             age_hours = (time.time() - candidate['created_at'].timestamp()) / 3600
-            temporal_score = 0.5 ** (age_hours / 24.0)  # Half-life of 24 hours
+            temporal_score = (0.5 ** (age_hours / 24.0)) * 0.2
             
-            # Keyword score (simple contains check)
+            # Causal score (30%) - placeholder
+            causal_score = 0.0 * 0.3
+            
+            # Keyword score (10%)
             query_lower = query.lower()
             content_lower = candidate['content'].lower()
-            keyword_score = 1.0 if query_lower in content_lower else 0.0
+            keyword_score = (1.0 if query_lower in content_lower else 0.0) * 0.1
             
-            # Weighted sum
-            score = 0.6 * temporal_score + 0.4 * keyword_score
-            
+            # Total score
+            score = semantic_score + temporal_score + causal_score + keyword_score
             scored.append((candidate, score))
         
         # Sort by score descending
         scored.sort(key=lambda x: x[1], reverse=True)
-        
         return scored
     
     def _select_within_budget(

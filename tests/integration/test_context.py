@@ -136,9 +136,9 @@ def test_context_manager_relevance_scoring(context_manager, session_with_events)
     event_ids = [e['event_id'] for e in context.selected_events]
     assert relevant_event.event_id in event_ids
     
-    # Verify it has high score (relaxed threshold for temporal decay)
+    # Verify it has high score (semantic + temporal + keyword)
     score = context.relevance_scores.get(relevant_event.event_id, 0)
-    assert score > 0.3  # Recent event should score reasonably high
+    assert score > 0.15  # Should have reasonable score from semantic similarity
 
 
 def test_context_snapshot_save_and_load(context_manager, session_with_events):
