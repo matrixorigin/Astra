@@ -368,3 +368,75 @@ class LLMClient:
             error_message=row.get("error_message"),
             created_at=row["created_at"],
         )
+
+
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str = "auto",
+        session_id: str = None
+    ) -> dict:
+        """Chat with native function calling support.
+        
+        This enables "一步到位" - LLM directly outputs function calls with parameters.
+        
+        Args:
+            messages: Conversation messages
+            tools: Tool definitions in OpenAI format
+            tool_choice: "auto" | "none" | {"type": "function", "function": {"name": "..."}}
+            session_id: Optional session ID for logging
+            
+        Returns:
+            Response with tool_calls if any
+        """
+        try:
+            provider = self.config.get("provider", "openai")
+            
+            if provider == "openai":
+                from openai import OpenAI
+                client = OpenAI(api_key=self.config.get("api_key"))
+                
+                response = client.chat.completions.create(
+                    model=self.config.get("model", "gpt-4"),
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice
+                )
+                
+                # Convert to dict
+                message = response.choices[0].message
+                result = {
+                    "content": message.content or "",
+                    "tool_calls": [],
+                    "usage": {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens
+                    }
+                }
+                
+                if message.tool_calls:
+                    result["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": tc.type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        }
+                        for tc in message.tool_calls
+                    ]
+                
+                logger.info(f"Function calling: {len(result['tool_calls'])} tools selected")
+                return result
+            
+            else:
+                # Fallback for providers without native function calling
+                logger.warning(f"Provider {provider} doesn't support native function calling")
+                return {"content": "", "tool_calls": []}
+                
+        except Exception as e:
+            from core.exceptions import LLMError
+            raise LLMError(f"Function calling failed: {e}", provider=provider)
