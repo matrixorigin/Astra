@@ -77,7 +77,7 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             try:
-                yield cursor  # type: ignore[misc]
+                yield cursor
             finally:
                 cursor.close()
 
