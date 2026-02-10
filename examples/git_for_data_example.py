@@ -6,7 +6,7 @@ Demonstrates snapshot, restore, and sandbox capabilities.
 from core.events.event_logger import EventLogger
 from core.events.session_manager import SessionManager
 from core.replay.time_machine import TimeMachine
-from core.sandbox.sandbox import Sandbox
+from core.sandbox import Sandbox
 from sdk import Database
 
 # Initialize
@@ -14,7 +14,7 @@ db = Database()
 session_mgr = SessionManager(db)
 logger = EventLogger(db)
 time_machine = TimeMachine(db)
-sandbox = Sandbox(db)
+sandbox = Sandbox(db=db)
 
 # Create initial state
 session = session_mgr.create_session(user_id="bob")
@@ -47,22 +47,19 @@ print("✓ Restored! Changes after checkpoint are gone.")
 
 # Run experiment in sandbox
 print("\n✓ Running experiment in sandbox...")
+sandbox_name = "sandbox_test"
+sandbox.create(sandbox_name)
 
+# Run experiment in sandbox
+db.execute(f"INSERT INTO {sandbox_name}.conversation_events (event_id, event_type, user_id, session_id, content, created_at) SELECT event_id, event_type, user_id, session_id, content, created_at FROM dev_agent.conversation_events LIMIT 1")
 
-def experiment():
-    """Experiment function."""
-    exp_event = logger.create_user_query(
-        user_id="bob",
-        session_id=session.session_id,
-        content="Experimental query",
-    )
-    return {"event_id": exp_event.event_id}
-
-
-result = sandbox.run_experiment("test", experiment, cleanup=True)
-print(f"✓ Experiment completed: {result['status']}")
+# Compare
+main_count = db.fetchone("SELECT COUNT(*) as count FROM dev_agent.conversation_events")["count"]
+sandbox_count = db.fetchone(f"SELECT COUNT(*) as count FROM {sandbox_name}.conversation_events")["count"]
+print(f"✓ Sandbox has {sandbox_count} events, main has {main_count} events")
 print("✓ Main timeline is preserved (sandbox changes are isolated)")
 
 # Cleanup
+sandbox.delete(sandbox_name)
 time_machine.git.drop_snapshot("my_checkpoint")
-print("\n✓ Cleaned up checkpoint")
+print("\n✓ Cleaned up sandbox and checkpoint")

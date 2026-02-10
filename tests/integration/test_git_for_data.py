@@ -8,7 +8,7 @@ from ulid import ULID
 
 from core.events.event_logger import EventLogger
 from core.replay.time_machine import TimeMachine
-from core.sandbox.sandbox import Sandbox
+from core.sandbox import Sandbox
 from sdk.database import Database
 from sdk.git_for_data import GitForData
 
@@ -40,7 +40,7 @@ def time_machine(db):
 @pytest.fixture
 def sandbox(db):
     """Sandbox fixture."""
-    return Sandbox(db)
+    return Sandbox(db=db)
 
 
 def test_snapshot_creation_and_listing(git):
@@ -102,26 +102,24 @@ def test_time_machine_checkpoint(time_machine, event_logger):
 
 def test_sandbox_creation(sandbox):
     """Test sandbox creation and deletion."""
-    sandbox_name = f"test_sandbox_{str(ULID())[:8]}".lower()
+    sandbox_name = f"sandbox_{str(ULID())[:8]}".lower()
 
     # Create sandbox
-    sb = sandbox.create_sandbox(sandbox_name, "Test sandbox")
-    assert sb["sandbox_name"] == sandbox_name
-    assert sb["status"] == "active"
+    sandbox.create(sandbox_name)
 
     # List sandboxes
-    sandboxes = sandbox.list_sandboxes()
-    sandbox_names = [s["snapshot_name"] for s in sandboxes]
-    assert sandbox_name in sandbox_names
+    sandboxes = sandbox.list()
+    assert any(s["sandbox_name"] == sandbox_name for s in sandboxes)
 
     # Delete sandbox
-    sandbox.delete_sandbox(sandbox_name)
+    sandbox.delete(sandbox_name)
 
 
-def test_sandbox_experiment(sandbox, event_logger):
+def test_sandbox_experiment(sandbox, event_logger, db):
     """Test running an experiment in a sandbox."""
     user_id = f"test_user_{ULID()}"
     session_id = f"test_session_{ULID()}"
+    sandbox_name = f"sandbox_{str(ULID())[:8]}".lower()
 
     # Create initial event
     initial_event = event_logger.create_user_query(
@@ -130,24 +128,24 @@ def test_sandbox_experiment(sandbox, event_logger):
         content="Before experiment",
     )
 
-    # Define experiment
-    def experiment():
-        event_logger.create_user_query(
-            user_id=user_id,
-            session_id=session_id,
-            content="During experiment",
-        )
-        return {"status": "completed"}
+    # Create sandbox (clones current state)
+    sandbox.create(sandbox_name)
 
-    # Run experiment
-    result = sandbox.run_experiment(
-        "test_experiment",
-        experiment,
-        cleanup=True,
+    # Add more events to main (after sandbox creation)
+    event_logger.create_user_query(
+        user_id=user_id,
+        session_id=session_id,
+        content="After sandbox creation",
     )
 
-    assert result["status"] == "success"
-    assert result["result"]["status"] == "completed"
+    # Verify isolation: main has more events than sandbox
+    main_count = db.fetchone("select count(*) as count from dev_agent.conversation_events")["count"]
+    sandbox_count = db.fetchone(f"select count(*) as count from {sandbox_name}.conversation_events")["count"]
+    
+    assert main_count > sandbox_count
+
+    # Cleanup
+    sandbox.delete(sandbox_name)
 
 
 def test_git_for_data_restore(git, event_logger, db):

@@ -186,6 +186,24 @@ CREATE TABLE IF NOT EXISTS memory_index_queue (
   INDEX idx_queue_status (status, created_at)
 ) COMMENT='RAG indexing queue (async worker)';
 
+-- sandbox_metadata: Sandbox lifecycle and metadata
+CREATE TABLE IF NOT EXISTS sandbox_metadata (
+  sandbox_name        VARCHAR(255) PRIMARY KEY,
+  description         TEXT,
+  created_by          VARCHAR(255),
+  created_at          TIMESTAMP(6) NOT NULL COMMENT 'Microsecond precision',
+  updated_at          TIMESTAMP(6) NOT NULL COMMENT 'Microsecond precision',
+  tags                JSON COMMENT 'e.g., ["experiment", "production"]',
+  status              VARCHAR(50) DEFAULT 'active' COMMENT 'active | archived | expired',
+  source_database     VARCHAR(255),
+  source_snapshot     VARCHAR(255),
+  
+  INDEX idx_sandbox_created_at (created_at),
+  INDEX idx_sandbox_updated_at (updated_at),
+  INDEX idx_sandbox_status (status),
+  INDEX idx_sandbox_created_by (created_by)
+) COMMENT='Sandbox metadata and lifecycle management';
+
 EOF
 
 echo ""
@@ -200,6 +218,7 @@ echo "  - configs (key-value config)"
 echo "  - tokens (secret management)"
 echo "  - event_evaluations (feedback loop)"
 echo "  - memory_index_queue (RAG pipeline)"
+echo "  - sandbox_metadata (sandbox lifecycle)"
 echo ""
 echo "Next steps:"
 echo "  1. Verify: make db-connect"

@@ -35,6 +35,7 @@ make test
 ```python
 from core.events.event_logger import EventLogger
 from core.events.session_manager import SessionManager
+from core.sandbox import Sandbox, Branch
 from sdk import Database
 
 # Initialize
@@ -61,6 +62,31 @@ llm_event = logger.create_llm_response(
     parent_event_id=user_event.event_id,
     causal_chain_id=user_event.causal_chain_id,
 )
+
+# Sandbox - isolated experiments
+sandbox = Sandbox(db=db, account="sys")  # Specify account
+sandbox.create("exp1", description="Test", created_by="alice")
+
+# Method 1: Switch to sandbox database
+sandbox.use("exp1")
+db.execute("SELECT * FROM events")  # Queries exp1.events
+
+# Method 2: Use explicit database name
+db.execute("SELECT * FROM exp1.events")
+
+# Manage sandbox
+sandbox.add_table("exp1", "conversation_events")  # Add specific table
+sandbox.checkpoint("exp1", "before_test")  # Create checkpoint
+sandbox.restore("exp1", "before_test")  # Restore using native RESTORE
+sandbox.list(pattern="%exp%")  # List with filter
+sandbox.delete("exp1")
+
+# Branch - Git-like data workflows
+branch = Branch(db=db)
+branch.create("events_exp", "conversation_events")
+diff = branch.diff("events_exp", "conversation_events", output="count")
+branch.merge("events_exp", "conversation_events", on_conflict="accept")
+branch.delete("events_exp")
 ```
 
 See [examples/](examples/) for more detailed examples.
@@ -79,9 +105,10 @@ See [examples/](examples/) for more detailed examples.
 - Custom metadata support
 
 ### 3. Git for Data
-- **Time Machine**: Create checkpoints and restore to any point in time
-- **Sandbox**: Run isolated experiments without affecting main timeline
-- **Snapshots**: Full database state capture and restore
+- **Time Machine**: Query data at any point in time (read-only)
+- **Sandbox**: Database-level isolation for experiments
+- **Branch**: Table-level Git-like workflows (create, diff, merge)
+- **Zero-copy CLONE**: Instant duplication with no storage overhead
 
 ## Architecture
 

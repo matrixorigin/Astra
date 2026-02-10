@@ -1,8 +1,6 @@
-"""Sandbox for isolated experiments.
+"""Sandbox for isolated experiments."""
 
-Provides isolated environments for testing and experimentation.
-"""
-
+from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
@@ -11,143 +9,257 @@ from sdk.git_for_data import GitForData
 
 
 class Sandbox:
-    """Sandbox for isolated experiments.
-    
-    Creates isolated environments using MatrixOne snapshots for
-    safe experimentation without affecting production data.
-    """
+    """Sandbox for isolated experiments with metadata management."""
 
-    def __init__(self, db: Optional[Database] = None) -> None:
-        """Initialize sandbox manager.
-        
-        Args:
-            db: Database instance. If None, creates a new one.
-        """
+    def __init__(
+        self, 
+        source_db: str = "dev_agent", 
+        account: str = "sys",
+        db: Optional[Database] = None
+    ):
+        self.source_db = source_db
+        self.account = account
         self.db = db or Database()
-        self.git = GitForData(db)
+        self.git = GitForData(self.db)
 
-    def create_sandbox(
-        self, sandbox_name: str, description: str = "", base_snapshot: Optional[str] = None
-    ) -> dict:
-        """Create a new sandbox environment.
+    def create(
+        self, 
+        name: str, 
+        description: str = "",
+        created_by: str = "system",
+        tags: Optional[list[str]] = None,
+        from_snapshot: Optional[str] = None
+    ) -> None:
+        """Create sandbox with metadata."""
+        import json
         
-        Args:
-            sandbox_name: Name for the sandbox
-            description: Optional description
-            base_snapshot: Optional base snapshot to start from
-            
-        Returns:
-            dict: Sandbox metadata
-        """
-        if base_snapshot:
-            # Restore from base snapshot first
-            self.git.restore_from_snapshot(base_snapshot)
-
-        # Create sandbox snapshot
-        snapshot = self.git.create_time_point_sandbox(sandbox_name, description)
-
-        return {
-            "sandbox_name": sandbox_name,
-            "timestamp": snapshot.get("timestamp"),
-            "description": description,
-            "base_snapshot": base_snapshot,
-            "status": "active",
-        }
-
-    def enter_sandbox(self, sandbox_name: str) -> None:
-        """Enter a sandbox environment.
+        self.db.execute(f"DROP DATABASE IF EXISTS {name}")
         
-        Args:
-            sandbox_name: Name of the sandbox to enter
-            
-        Note:
-            This restores the database to the sandbox state.
-            Create a checkpoint before entering if you want to return.
-        """
-        self.git.restore_from_snapshot(sandbox_name)
-
-    def exit_sandbox(self, return_to_snapshot: str) -> None:
-        """Exit sandbox and return to a previous state.
+        if from_snapshot:
+            self.db.execute(f"CREATE DATABASE {name} CLONE {self.source_db} {{SNAPSHOT = '{from_snapshot}'}}")
+        else:
+            self.db.execute(f"CREATE DATABASE {name} CLONE {self.source_db}")
         
-        Args:
-            return_to_snapshot: Snapshot to return to
-        """
-        self.git.restore_from_snapshot(return_to_snapshot)
-
-    def delete_sandbox(self, sandbox_name: str) -> None:
-        """Delete a sandbox.
+        # Store metadata with microsecond precision
+        tags_json = f"'{json.dumps(tags)}'" if tags else "NULL"
+        snapshot_val = f"'{from_snapshot}'" if from_snapshot else "NULL"
         
-        Args:
-            sandbox_name: Name of the sandbox to delete
-        """
-        self.git.drop_snapshot(sandbox_name)
+        self.db.execute(f"""
+            INSERT INTO sandbox_metadata 
+            (sandbox_name, description, created_by, created_at, updated_at, tags, source_database, source_snapshot, status)
+            VALUES ('{name}', '{description}', '{created_by}', CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6), 
+                    {tags_json}, '{self.source_db}', {snapshot_val}, 'active')
+        """)
 
-    def list_sandboxes(self) -> list[dict]:
-        """List all available sandboxes.
-        
-        Returns:
-            list[dict]: List of sandboxes
-        """
-        # All snapshots can be used as sandboxes
-        return self.git.list_snapshots()
+    def delete(self, name: str) -> None:
+        """Delete sandbox and its metadata."""
+        self.db.execute(f"DROP DATABASE IF EXISTS {name}")
+        self.db.execute(f"DELETE FROM sandbox_metadata WHERE sandbox_name = '{name}'")
 
-    def run_experiment(
+    def list(
         self,
-        experiment_name: str,
-        experiment_fn: callable,
-        cleanup: bool = True,
-    ) -> dict:
-        """Run an isolated experiment in a sandbox.
+        prefix: str = "sandbox_",
+        pattern: Optional[str] = None,
+        status: Optional[str] = None,
+        created_by: Optional[str] = None,
+        created_after: Optional[datetime] = None,
+        updated_after: Optional[datetime] = None,
+        tags: Optional[list[str]] = None,
+    ) -> list[dict]:
+        """List sandboxes with filtering.
         
         Args:
-            experiment_name: Name for the experiment
-            experiment_fn: Function to execute in sandbox
-            cleanup: Whether to cleanup sandbox after experiment
+            prefix: Name prefix filter
+            pattern: SQL LIKE pattern (e.g., "%exp%")
+            status: Filter by status (active, archived, expired)
+            created_by: Filter by creator
+            created_after: Filter by creation time
+            updated_after: Filter by update time
+            tags: Filter by tags (any match)
             
         Returns:
-            dict: Experiment results
-            
-        Example:
-            >>> def my_experiment():
-            ...     # Run some operations
-            ...     return {"result": "success"}
-            >>> 
-            >>> sandbox = Sandbox()
-            >>> result = sandbox.run_experiment("test_exp", my_experiment)
+            list[dict]: Sandbox metadata
         """
-        # Create checkpoint before experiment (with unique timestamp)
-        timestamp = str(int(datetime.now().timestamp()))
-        checkpoint_name = f"before_{experiment_name}_{timestamp}".lower()
-        self.git.create_snapshot(checkpoint_name)
-
-        # Create sandbox (sanitize name)
-        sandbox_name = f"sandbox_{experiment_name}_{timestamp}".lower()
-        self.create_sandbox(sandbox_name, f"Experiment: {experiment_name}")
-
-        try:
-            # Run experiment
-            result = experiment_fn()
-
-            return {
-                "experiment_name": experiment_name,
-                "sandbox_name": sandbox_name,
-                "status": "success",
-                "result": result,
-            }
-
-        except Exception as e:
-            return {
-                "experiment_name": experiment_name,
-                "sandbox_name": sandbox_name,
-                "status": "failed",
-                "error": str(e),
-            }
-
-        finally:
-            # Restore to checkpoint
-            self.git.restore_from_snapshot(checkpoint_name)
-
-            # Cleanup
-            if cleanup:
-                self.delete_sandbox(sandbox_name)
-                self.git.drop_snapshot(checkpoint_name)
+        query = "SELECT * FROM sandbox_metadata WHERE 1=1"
+        
+        if prefix:
+            query += f" AND sandbox_name LIKE '{prefix}%'"
+        
+        if pattern:
+            query += f" AND sandbox_name LIKE '{pattern}'"
+        
+        if status:
+            query += f" AND status = '{status}'"
+        
+        if created_by:
+            query += f" AND created_by = '{created_by}'"
+        
+        if created_after:
+            query += f" AND created_at > '{created_after.isoformat()}'"
+        
+        if updated_after:
+            query += f" AND updated_at > '{updated_after.isoformat()}'"
+        
+        if tags:
+            # JSON contains check (simplified)
+            for tag in tags:
+                query += f" AND tags LIKE '%{tag}%'"
+        
+        query += " ORDER BY created_at DESC"
+        
+        return self.db.fetchall(query)
+    
+    def update(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        tags: Optional[list[str]] = None,
+        status: Optional[str] = None,
+    ) -> None:
+        """Update sandbox metadata.
+        
+        Args:
+            name: Sandbox name
+            description: New description
+            tags: New tags
+            status: New status (active, archived, expired)
+        """
+        updates = []
+        
+        if description is not None:
+            updates.append(f"description = '{description}'")
+        
+        if tags is not None:
+            import json
+            tags_json = json.dumps(tags)
+            updates.append(f"tags = '{tags_json}'")
+        
+        if status is not None:
+            updates.append(f"status = '{status}'")
+        
+        if updates:
+            updates.append("updated_at = CURRENT_TIMESTAMP")
+            query = f"UPDATE sandbox_metadata SET {', '.join(updates)} WHERE sandbox_name = '{name}'"
+            self.db.execute(query)
+    
+    def use(self, sandbox: str) -> None:
+        """Switch to sandbox database."""
+        self.db.execute(f"USE {sandbox}")
+    
+    def clone_table(self, target: str, source: str, snapshot: Optional[str] = None) -> None:
+        """Clone table (zero-copy)."""
+        if snapshot:
+            self.db.execute(f'CREATE TABLE {target} CLONE {source}{{SNAPSHOT="{snapshot}"}}')
+        else:
+            self.db.execute(f"CREATE TABLE {target} CLONE {source}")
+    
+    def add_table(self, sandbox: str, table: str, from_snapshot: Optional[str] = None) -> None:
+        """Add table to sandbox."""
+        source = f"{self.source_db}.{table}"
+        target = f"{sandbox}.{table}"
+        self.clone_table(target, source, from_snapshot)
+        self._touch_metadata(sandbox)
+    
+    def remove_table(self, sandbox: str, table: str) -> None:
+        """Remove table from sandbox."""
+        self.db.execute(f"DROP TABLE IF EXISTS {sandbox}.{table}")
+        self._touch_metadata(sandbox)
+    
+    def list_tables(self, sandbox: str) -> list[str]:
+        """List tables in sandbox."""
+        rows = self.db.fetchall(f"SHOW TABLES FROM {sandbox}")
+        return [row[f"Tables_in_{sandbox}"] for row in rows]
+    
+    def info(self, sandbox: str) -> dict:
+        """Get sandbox info with metadata."""
+        # Get metadata
+        metadata = self.db.fetchone(f"SELECT * FROM sandbox_metadata WHERE sandbox_name = '{sandbox}'")
+        
+        # Get table info
+        tables = self.list_tables(sandbox)
+        table_info = []
+        for table in tables:
+            if table.startswith("_") or table == "sandbox_metadata":
+                continue
+            count = self.db.fetchone(f"SELECT COUNT(*) as count FROM {sandbox}.{table}")["count"]
+            table_info.append({"table": table, "rows": count})
+        
+        result = {
+            "sandbox_name": sandbox,
+            "table_count": len(tables),
+            "table_details": table_info,
+        }
+        
+        if metadata:
+            result.update(metadata)
+        
+        return result
+    
+    def checkpoint(self, sandbox: str, name: str, description: str = "") -> None:
+        """Create checkpoint for sandbox.
+        
+        Checkpoint timestamp must not exceed sandbox creation time.
+        """
+        # Get sandbox creation time
+        metadata = self.db.fetchone(f"SELECT created_at FROM sandbox_metadata WHERE sandbox_name = '{sandbox}'")
+        if not metadata:
+            raise ValueError(f"Sandbox {sandbox} not found")
+        
+        snapshot_name = f"{sandbox}_{name}"
+        self.git.create_snapshot(snapshot_name)
+        self._touch_metadata(sandbox)
+    
+    def list_checkpoints(self, sandbox: str) -> list[dict]:
+        """List checkpoints for sandbox with timestamps."""
+        snapshots = self.git.list_snapshots()
+        prefix = f"{sandbox}_"
+        
+        result = []
+        for s in snapshots:
+            if s["snapshot_name"].startswith(prefix):
+                result.append({
+                    "name": s["snapshot_name"].replace(prefix, ""),
+                    "full_name": s["snapshot_name"],
+                    "created_at": s.get("ts", ""),
+                })
+        return result
+    
+    def restore(self, sandbox: str, checkpoint: str) -> None:
+        """Restore sandbox to checkpoint using native RESTORE.
+        
+        Validates that checkpoint timestamp <= sandbox creation time.
+        """
+        # Get sandbox metadata
+        metadata = self.db.fetchone(f"SELECT created_at FROM sandbox_metadata WHERE sandbox_name = '{sandbox}'")
+        if not metadata:
+            raise ValueError(f"Sandbox {sandbox} not found")
+        
+        sandbox_created_at = metadata["created_at"]
+        snapshot_name = f"{sandbox}_{checkpoint}"
+        
+        # Get snapshot info
+        snapshots = self.git.list_snapshots()
+        snapshot_info = None
+        for s in snapshots:
+            if s["snapshot_name"] == snapshot_name:
+                snapshot_info = s
+                break
+        
+        if not snapshot_info:
+            raise ValueError(f"Checkpoint {checkpoint} not found")
+        
+        # Validate checkpoint time <= sandbox creation time
+        snapshot_ts = snapshot_info.get("ts", "")
+        if snapshot_ts and snapshot_ts > str(sandbox_created_at):
+            raise ValueError(
+                f"Cannot restore: checkpoint time ({snapshot_ts}) is after sandbox creation time ({sandbox_created_at})"
+            )
+        
+        # Use native RESTORE DATABASE
+        # Syntax: RESTORE ACCOUNT {account} DATABASE {sandbox} FROM SNAPSHOT {snapshot}
+        self.db.execute(f'RESTORE ACCOUNT {self.account} DATABASE {sandbox} FROM SNAPSHOT {snapshot_name}')
+        self._touch_metadata(sandbox)
+    
+    def _touch_metadata(self, sandbox: str) -> None:
+        """Update updated_at timestamp."""
+        self.db.execute(f"UPDATE sandbox_metadata SET updated_at = CURRENT_TIMESTAMP(6) WHERE sandbox_name = '{sandbox}'")

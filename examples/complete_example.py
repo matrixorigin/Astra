@@ -15,7 +15,7 @@ from core.events.event_logger import EventLogger
 from core.events.event_reader import EventReader
 from core.events.session_manager import SessionManager
 from core.replay.time_machine import TimeMachine
-from core.sandbox.sandbox import Sandbox
+from core.sandbox import Sandbox
 from sdk import Database, GitForData
 
 
@@ -38,7 +38,7 @@ def main() -> None:
     chain_mgr = CausalChainManager(db)
     git = GitForData(db)
     time_machine = TimeMachine(db)
-    sandbox = Sandbox(db)
+    sandbox = Sandbox(db=db)
 
     user_id = f"demo_user_{ULID()}"
 
