@@ -21,6 +21,9 @@ build/
 htmlcov/
 *.manifest
 
+# Poetry
+poetry.lock
+
 # Node
 node_modules/
 npm-debug.log*
@@ -51,3 +54,6 @@ logs/
 tmp/
 temp/
 .cache/
+
+# Docker volumes
+mo-data/
