@@ -79,6 +79,7 @@ Files changed: {pr['files_changed']}
                 "skill": self.name,
                 "skill_version": self.version,
                 "pr_number": input.pr_number,
+                "input": input.model_dump(),  # Store input for replay
             },
         )
 
