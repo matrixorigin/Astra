@@ -101,6 +101,10 @@ class ContextManager:
         from core.context.embeddings import EmbeddingService
         self.embeddings = EmbeddingService(db, provider=embedding_provider)
         
+        # Initialize prompt manager
+        from core.context.prompts import PromptManager
+        self.prompts = PromptManager(db)
+        
         logger.info(
             f"ContextManager initialized "
             f"(snapshots={'enabled' if enable_snapshots else 'disabled'}, "
@@ -370,14 +374,32 @@ class ContextManager:
         )
     
     def _get_system_prompt(self, task_type: TaskType) -> str:
-        """Get system prompt based on task type."""
-        prompts = {
-            TaskType.CODE_REVIEW: "You are an expert code reviewer. Focus on code quality, security, and best practices.",
-            TaskType.PLANNING: "You are a technical architect. Help plan and design solutions.",
-            TaskType.DEBUGGING: "You are a debugging expert. Help identify and fix issues.",
-            TaskType.GENERAL: "You are an intelligent development agent."
+        """Get system prompt based on task type from database.
+        
+        Falls back to hardcoded prompts if database lookup fails.
+        """
+        template_map = {
+            TaskType.CODE_REVIEW: 'system_code_review',
+            TaskType.PLANNING: 'system_planning',
+            TaskType.DEBUGGING: 'system_debugging',
+            TaskType.GENERAL: 'system_general'
         }
-        return prompts.get(task_type, prompts[TaskType.GENERAL])
+        
+        template_id = template_map.get(task_type, 'system_general')
+        
+        # Try to get from database first
+        try:
+            return self.prompts.get_prompt(template_id)
+        except Exception as e:
+            logger.warning(f"Failed to load prompt from DB: {e}, using fallback")
+            # Fallback to hardcoded
+            fallbacks = {
+                TaskType.CODE_REVIEW: "You are an expert code reviewer. Focus on code quality, security, and best practices.",
+                TaskType.PLANNING: "You are a technical architect. Help plan and design solutions.",
+                TaskType.DEBUGGING: "You are a debugging expert. Help identify and fix issues.",
+                TaskType.GENERAL: "You are an intelligent development agent."
+            }
+            return fallbacks.get(task_type, fallbacks[TaskType.GENERAL])
     
     def _get_skill_definitions(self, token_budget: int) -> List[Dict[str, Any]]:
         """Get available skill definitions within budget."""
