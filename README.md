@@ -5,16 +5,20 @@ Event-centric intelligent agent platform with conversation replay and time-point
 ## Quick Start
 
 ```bash
-# 1. Setup environment
+# 1. Create and activate virtual environment
+conda create -n dev-agent python=3.11
+conda activate dev-agent
+
+# 2. Setup environment
 make setup
 
-# 2. Start services (MatrixOne + Redis)
+# 3. Start services (MatrixOne + Redis)
 make dev-up
 
-# 3. Initialize database
+# 4. Initialize database
 make db-init
 
-# 4. Run tests
+# 5. Run tests
 make test
 ```
 

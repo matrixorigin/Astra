@@ -4,38 +4,51 @@
 
 - Python 3.10+
 - Docker and Docker Compose
-- Poetry (Python dependency manager)
+- Conda or Poetry (for virtual environment management)
 
 ## Initial Setup
 
-### 1. Install Poetry (if not already installed)
+### 1. Create Virtual Environment
+
+**Option A: Using Conda (Recommended)**
 
 ```bash
+# Create environment
+conda create -n dev-agent python=3.11
+
+# Activate environment
+conda activate dev-agent
+
+# Install dependencies
+cd /path/to/mo-dev-agent
+pip install -e .
+pip install pytest pytest-asyncio  # For testing
+```
+
+**Option B: Using Poetry**
+
+```bash
+# Install Poetry (if not already installed)
 curl -sSL https://install.python-poetry.org | python3 -
-```
 
-### 2. Create Virtual Environment
-
-Poetry will automatically create a virtual environment when you run:
-
-```bash
+# Install dependencies
 poetry install
+
+# Activate environment
+poetry shell
 ```
 
-Or manually create one:
+**Option C: Using Python venv**
 
 ```bash
-# Option A: Let Poetry manage it (recommended)
-poetry shell  # Activates the virtual environment
-
-# Option B: Use Python venv
 python3 -m venv .venv
 source .venv/bin/activate  # On Linux/Mac
 # .venv\Scripts\activate   # On Windows
 pip install -e .
+pip install pytest pytest-asyncio
 ```
 
-### 3. Setup Project
+### 2. Setup Project
 
 ```bash
 make setup
@@ -43,10 +56,10 @@ make setup
 
 This will:
 - Copy `.env.example` to `.env`
-- Install Python dependencies via Poetry
+- Install Python dependencies
 - Prompt you to review `.env` configuration
 
-### 4. Start Development Environment
+### 3. Start Development Environment
 
 ```bash
 # Start MatrixOne + Redis
