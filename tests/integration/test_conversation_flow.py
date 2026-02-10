@@ -4,7 +4,7 @@ Tests complete conversation flows with sessions and event chains.
 """
 
 import pytest
-from ulid import ULID
+from uuid_utils import uuid7
 
 from core.events.causal_chain import CausalChainManager
 from core.events.event_logger import EventLogger
@@ -49,7 +49,7 @@ def test_complete_conversation_flow(
     session_manager, event_logger, event_reader, causal_chain_manager
 ):
     """Test a complete conversation flow with session and events."""
-    user_id = f"test_user_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
 
     # 1. Create session
     session = session_manager.create_session(user_id=user_id)
@@ -116,7 +116,7 @@ def test_complete_conversation_flow(
 
 def test_multi_turn_conversation(session_manager, event_logger, causal_chain_manager):
     """Test a multi-turn conversation."""
-    user_id = f"test_user_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
     session = session_manager.create_session(user_id=user_id)
 
     # Turn 1
@@ -172,7 +172,7 @@ def test_multi_turn_conversation(session_manager, event_logger, causal_chain_man
 
 def test_get_user_sessions(session_manager):
     """Test retrieving user sessions."""
-    user_id = f"test_user_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
 
     # Create multiple sessions
     session_1 = session_manager.create_session(user_id=user_id)
@@ -191,8 +191,8 @@ def test_get_user_sessions(session_manager):
 
 def test_parent_child_relationships(event_logger, causal_chain_manager):
     """Test parent-child event relationships."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
 
     # Create parent event
     parent = event_logger.create_user_query(

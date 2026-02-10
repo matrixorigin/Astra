@@ -5,7 +5,7 @@ import time
 from datetime import UTC, datetime
 from typing import Optional
 
-from ulid import ULID
+from uuid_utils import uuid7
 
 from core.llm.models import (
     LLMCallLog,
@@ -56,7 +56,7 @@ class LLMClient:
 
         # Generate event_id if not provided
         if not event_id:
-            event_id = str(ULID())
+            event_id = str(uuid7())
 
         # Use config defaults if not specified
         model = model or self.config["model"]
@@ -279,7 +279,7 @@ class LLMClient:
         metadata: Optional[dict] = None,
     ) -> None:
         """Log LLM call to MatrixOne."""
-        log_id = str(ULID())
+        log_id = str(uuid7())
 
         if response:
             query = """

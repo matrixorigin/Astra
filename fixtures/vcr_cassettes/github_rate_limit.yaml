@@ -5,16 +5,16 @@ interactions:
       Accept:
       - '*/*'
       Accept-Encoding:
-      - gzip, deflate
+      - gzip, deflate, br, zstd
       Connection:
       - keep-alive
       User-Agent:
       - PyGithub/Python
     method: GET
-    uri: https://10.222.1.111:8080/rate_limit
+    uri: https://api.github.com/rate_limit
   response:
     body:
-      string: '{"resources":{"code_search":{"limit":60,"remaining":50,"reset":1770746366,"used":10,"resource":"code_search"},"core":{"limit":60,"remaining":50,"reset":1770746366,"used":10,"resource":"core"},"graphql":{"limit":0,"remaining":0,"reset":1770746705,"used":0,"resource":"graphql"},"integration_manifest":{"limit":5000,"remaining":5000,"reset":1770746705,"used":0,"resource":"integration_manifest"},"search":{"limit":10,"remaining":10,"reset":1770743165,"used":0,"resource":"search"}},"rate":{"limit":60,"remaining":50,"reset":1770746366,"used":10,"resource":"core"}}
+      string: '{"resources":{"code_search":{"limit":60,"remaining":56,"reset":1770749098,"used":4,"resource":"code_search"},"core":{"limit":60,"remaining":56,"reset":1770749098,"used":4,"resource":"core"},"graphql":{"limit":0,"remaining":0,"reset":1770749101,"used":0,"resource":"graphql"},"integration_manifest":{"limit":5000,"remaining":5000,"reset":1770749101,"used":0,"resource":"integration_manifest"},"search":{"limit":10,"remaining":10,"reset":1770745561,"used":0,"resource":"search"}},"rate":{"limit":60,"remaining":56,"reset":1770749098,"used":4,"resource":"core"}}
 
         '
     headers:
@@ -27,13 +27,13 @@ interactions:
       Cache-Control:
       - no-cache
       Content-Length:
-      - '563'
+      - '560'
       Content-Security-Policy:
       - default-src 'none'
       Content-Type:
       - application/json; charset=utf-8
       Date:
-      - Tue, 10 Feb 2026 17:05:05 GMT
+      - Tue, 10 Feb 2026 17:45:01 GMT
       Referrer-Policy:
       - origin-when-cross-origin, strict-origin-when-cross-origin
       X-Content-Type-Options:
@@ -43,17 +43,17 @@ interactions:
       X-GitHub-Media-Type:
       - github.v3; format=json
       X-GitHub-Request-Id:
-      - 8CAE:68E71:B28CE96:2FAD7067:698B6541
+      - E6B0:77DCF:38A9950:F44946F:698B6E9D
       X-RateLimit-Limit:
       - '60'
       X-RateLimit-Remaining:
-      - '50'
+      - '56'
       X-RateLimit-Reset:
-      - '1770746366'
+      - '1770749098'
       X-RateLimit-Resource:
       - core
       X-RateLimit-Used:
-      - '10'
+      - '4'
       X-XSS-Protection:
       - 1; mode=block
     status:

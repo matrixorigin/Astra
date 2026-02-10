@@ -4,7 +4,7 @@ Tests error conditions, boundary cases, and data integrity.
 """
 
 import pytest
-from ulid import ULID
+from uuid_utils import uuid7
 
 from core.events.causal_chain import CausalChainManager
 from core.events.event_logger import EventLogger
@@ -46,8 +46,8 @@ def causal_chain_manager(db):
 
 def test_event_with_full_metadata(event_logger, event_reader):
     """Test event with complete metadata and nested structures."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
 
     # Create event with full metadata
     event = event_logger.create_llm_response(
@@ -57,7 +57,7 @@ def test_event_with_full_metadata(event_logger, event_reader):
         agent_id="dev-agent",
         agent_version="0.1.0",
         parent_event_id=None,
-        causal_chain_id=str(ULID()),
+        causal_chain_id=str(uuid7()),
         llm_model_used="gpt-4-turbo",
         token_usage={
             "prompt": 1500,
@@ -103,8 +103,8 @@ def test_empty_causal_chain(causal_chain_manager):
 
 def test_large_event_content(event_logger, event_reader):
     """Test event with large content (simulating long conversations)."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
 
     # Create event with large content (10KB)
     large_content = "x" * 10000
@@ -124,9 +124,9 @@ def test_large_event_content(event_logger, event_reader):
 
 def test_long_causal_chain(event_logger, causal_chain_manager):
     """Test a long causal chain (10+ events)."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
-    causal_chain_id = str(ULID())
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
+    causal_chain_id = str(uuid7())
 
     # Create a chain of 10 events
     parent_id = None
@@ -155,9 +155,9 @@ def test_long_causal_chain(event_logger, causal_chain_manager):
 
 def test_chain_integrity_validation(event_logger, causal_chain_manager, db):
     """Test causal chain integrity validation with broken links."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
-    causal_chain_id = str(ULID())
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
+    causal_chain_id = str(uuid7())
 
     # Create valid chain
     event1 = event_logger.create_user_query(
@@ -176,7 +176,7 @@ def test_chain_integrity_validation(event_logger, causal_chain_manager, db):
     )
 
     # Manually break the chain by referencing non-existent parent
-    event3_id = str(ULID())
+    event3_id = str(uuid7())
     db.execute(
         """
         INSERT INTO conversation_events (
@@ -206,7 +206,7 @@ def test_chain_integrity_validation(event_logger, causal_chain_manager, db):
 
 def test_session_event_count_accuracy(session_manager, event_logger):
     """Test that session event count is accurately maintained."""
-    user_id = f"test_user_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
     session = session_manager.create_session(user_id=user_id)
 
     # Create 5 events
@@ -225,7 +225,7 @@ def test_session_event_count_accuracy(session_manager, event_logger):
 
 def test_concurrent_session_updates(session_manager, event_logger):
     """Test multiple rapid session updates."""
-    user_id = f"test_user_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
     session = session_manager.create_session(user_id=user_id)
 
     # Rapidly create and update
@@ -247,9 +247,9 @@ def test_concurrent_session_updates(session_manager, event_logger):
 
 def test_chain_summary_with_mixed_events(event_logger, causal_chain_manager):
     """Test chain summary with different event types."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
-    causal_chain_id = str(ULID())
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
+    causal_chain_id = str(uuid7())
 
     # Create mixed event types
     user_event = event_logger.create_user_query(
@@ -292,7 +292,7 @@ def test_chain_summary_with_mixed_events(event_logger, causal_chain_manager):
 
 def test_user_cross_session_events(event_logger, event_reader, session_manager):
     """Test querying user events across multiple sessions."""
-    user_id = f"test_user_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
 
     # Create 3 sessions with events
     for i in range(3):
@@ -311,7 +311,7 @@ def test_user_cross_session_events(event_logger, event_reader, session_manager):
 
 def test_session_metadata(session_manager):
     """Test session with custom metadata."""
-    user_id = f"test_user_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
     metadata = {
         "source": "web",
         "device": "desktop",

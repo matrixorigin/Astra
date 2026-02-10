@@ -61,6 +61,13 @@ class DatabaseError(AgentError):
         super().__init__(message, code="DATABASE_ERROR")
 
 
+class ContextError(AgentError):
+    """Context management error."""
+
+    def __init__(self, message: str):
+        super().__init__(message, code="CONTEXT_ERROR")
+
+
 class LLMError(AgentError):
     """LLM operation failed."""
 

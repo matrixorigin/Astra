@@ -133,10 +133,10 @@ async def test_e2e_skill_version_replay(db, registry, github, llm, logger, repla
     output_v1 = await skill_v1.execute(input_obj)
     
     # Log skill execution event (直接插入数据库)
-    from ulid import ULID
+    from uuid_utils import uuid7
     import json
     
-    event_id = str(ULID())
+    event_id = str(uuid7())
     db.execute(
         """
         INSERT INTO conversation_events (
@@ -210,12 +210,12 @@ async def test_replay_missing_skill_version(db, registry, github, llm, logger, r
     session_id = f"test_session_missing_{int(time.time() * 1000)}"
     
     # Create event with non-existent skill version (直接插入数据库)
-    from ulid import ULID
+    from uuid_utils import uuid7
     import json
     
     user_id = "test_user"
     
-    event_id = str(ULID())
+    event_id = str(uuid7())
     db.execute(
         """
         INSERT INTO conversation_events (
@@ -315,10 +315,10 @@ async def test_verify_reproducibility(db, registry, github, llm, logger, replay_
     output = await skill.execute(input_obj)
     
     # Log event (直接插入数据库)
-    from ulid import ULID
+    from uuid_utils import uuid7
     import json
     
-    event_id = str(ULID())
+    event_id = str(uuid7())
     db.execute(
         """
         INSERT INTO conversation_events (

@@ -144,6 +144,7 @@ See [examples/](examples/) for more detailed examples.
 - [Design Documents](docs/design/)
   - [Vision and Mission](docs/design/vision-and-mission.md)
   - [Skills-First Architecture](docs/design/skills-first-architecture.md) ⭐ Phase 2 design
+  - [Context Management](docs/design/context-management.md) ⭐ Phase 3 design
   - [Context, Memory, Session and Tables](docs/design/context-memory-session-and-tables.md)
   - [Deployment Architecture](docs/design/deployment-architecture-proposal.md)
   - [GitHub Integration](docs/design/github-integration.md) ⭐ Industry-leading

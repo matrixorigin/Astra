@@ -11,7 +11,7 @@ import json
 from datetime import UTC, datetime
 from typing import Optional
 
-from ulid import ULID
+from uuid_utils import uuid7
 
 from core.repos.token_models import Token, TokenType
 from sdk import Database
@@ -74,7 +74,7 @@ class TokenResolver:
         metadata: Optional[dict] = None,
     ) -> Token:
         """Create a new token."""
-        token_id = str(ULID())
+        token_id = str(uuid7())
         now = datetime.now(UTC)
 
         query = """

@@ -4,7 +4,7 @@ import json
 from datetime import UTC, datetime
 from typing import Optional
 
-from ulid import ULID
+from uuid_utils import uuid7
 
 from core.repos.models import AccessScope, OwnerType, Repo, RepoType
 from sdk import Database
@@ -28,7 +28,7 @@ class RepoRegistry:
         metadata: Optional[dict] = None,
     ) -> Repo:
         """Create a new repository."""
-        repo_id = str(ULID())
+        repo_id = str(uuid7())
         now = datetime.now(UTC)
 
         query = """

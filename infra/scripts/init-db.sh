@@ -295,6 +295,37 @@ CREATE TABLE IF NOT EXISTS llm_pricing (
   INDEX idx_effective (effective_from, effective_to)
 ) COMMENT='Historical LLM pricing for accurate cost calculation and replay';
 
+-- context_snapshots: Store assembled context for debugging and replay
+CREATE TABLE IF NOT EXISTS context_snapshots (
+  snapshot_id         VARCHAR(36) PRIMARY KEY COMMENT 'ULID',
+  session_id          VARCHAR(36) NOT NULL,
+  event_id            VARCHAR(36) COMMENT 'Event that triggered this context',
+  created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  
+  -- Context content
+  system_prompt       TEXT COMMENT 'System instructions',
+  skill_definitions   JSON COMMENT 'Available skills',
+  selected_events     JSON COMMENT 'Array of {event_id, score, reason}',
+  code_context        JSON COMMENT 'Code files/functions included',
+  documentation       JSON COMMENT 'Documentation sections included',
+  
+  -- Metadata
+  total_tokens        INT COMMENT 'Total tokens in assembled context',
+  token_budget        JSON COMMENT 'Budget breakdown by component',
+  assembly_time_ms    INT COMMENT 'Time to assemble context',
+  relevance_scores    JSON COMMENT 'Detailed scoring for each event',
+  task_type           VARCHAR(50) COMMENT 'code_review | planning | debugging | general',
+  
+  -- LLM call linkage
+  llm_request_id      VARCHAR(128) COMMENT 'LLM provider request ID',
+  llm_response_id     VARCHAR(128) COMMENT 'LLM provider response ID',
+  
+  INDEX idx_session (session_id),
+  INDEX idx_event (event_id),
+  INDEX idx_created (created_at),
+  INDEX idx_task_type (task_type)
+) COMMENT='Context snapshots for debugging and replay';
+
 EOF
 
 echo ""
@@ -314,6 +345,7 @@ echo "  - sandbox_metadata (sandbox lifecycle)"
 echo "  - github_operations (GitHub API audit log)"
 echo "  - llm_call_logs (LLM cost tracking)"
 echo "  - llm_pricing (historical LLM pricing)"
+echo "  - context_snapshots (context debugging and replay)"
 echo ""
 echo "Next steps:"
 echo "  1. Verify: make db-connect"

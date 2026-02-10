@@ -4,7 +4,7 @@ Tests event creation, logging, and retrieval.
 """
 
 import pytest
-from ulid import ULID
+from uuid_utils import uuid7
 
 from core.events.event_logger import EventLogger
 from core.events.event_reader import EventReader
@@ -32,8 +32,8 @@ def event_reader(db):
 
 def test_create_user_query(event_logger, event_reader):
     """Test creating and retrieving a user query event."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
     content = "How do I implement event logging?"
 
     # Create event
@@ -55,9 +55,9 @@ def test_create_user_query(event_logger, event_reader):
 
 def test_create_llm_response(event_logger, event_reader):
     """Test creating an LLM response event."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
-    causal_chain_id = str(ULID())
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
+    causal_chain_id = str(uuid7())
 
     # Create user query first
     user_event = event_logger.create_user_query(
@@ -99,8 +99,8 @@ def test_create_llm_response(event_logger, event_reader):
 
 def test_get_session_events(event_logger, event_reader):
     """Test retrieving all events for a session."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
 
     # Create multiple events
     event1 = event_logger.create_user_query(
@@ -121,9 +121,9 @@ def test_get_session_events(event_logger, event_reader):
 
 def test_get_causal_chain(event_logger, event_reader):
     """Test retrieving events in a causal chain."""
-    user_id = f"test_user_{ULID()}"
-    session_id = f"test_session_{ULID()}"
-    causal_chain_id = str(ULID())
+    user_id = f"test_user_{uuid7()}"
+    session_id = f"test_session_{uuid7()}"
+    causal_chain_id = str(uuid7())
 
     # Create a causal chain
     user_event = event_logger.create_user_query(

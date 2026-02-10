@@ -5,17 +5,17 @@ interactions:
       Accept:
       - '*/*'
       Accept-Encoding:
-      - gzip, deflate
+      - gzip, deflate, br, zstd
       Connection:
       - keep-alive
       User-Agent:
       - PyGithub/Python
     method: GET
-    uri: https://10.222.1.111:8080/repos/octocat/Hello-World
+    uri: https://api.github.com/repos/octocat/Hello-World
   response:
     body:
       string: '{"id":1296269,"node_id":"MDEwOlJlcG9zaXRvcnkxMjk2MjY5","name":"Hello-World","full_name":"octocat/Hello-World","private":false,"owner":{"login":"octocat","id":583231,"node_id":"MDQ6VXNlcjU4MzIzMQ==","avatar_url":"https://avatars.githubusercontent.com/u/583231?v=4","gravatar_id":"","url":"https://api.github.com/users/octocat","html_url":"https://github.com/octocat","followers_url":"https://api.github.com/users/octocat/followers","following_url":"https://api.github.com/users/octocat/following{/other_user}","gists_url":"https://api.github.com/users/octocat/gists{/gist_id}","starred_url":"https://api.github.com/users/octocat/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/octocat/subscriptions","organizations_url":"https://api.github.com/users/octocat/orgs","repos_url":"https://api.github.com/users/octocat/repos","events_url":"https://api.github.com/users/octocat/events{/privacy}","received_events_url":"https://api.github.com/users/octocat/received_events","type":"User","user_view_type":"public","site_admin":false},"html_url":"https://github.com/octocat/Hello-World","description":"My
-        first repository on GitHub!","fork":false,"url":"https://api.github.com/repos/octocat/Hello-World","forks_url":"https://api.github.com/repos/octocat/Hello-World/forks","keys_url":"https://api.github.com/repos/octocat/Hello-World/keys{/key_id}","collaborators_url":"https://api.github.com/repos/octocat/Hello-World/collaborators{/collaborator}","teams_url":"https://api.github.com/repos/octocat/Hello-World/teams","hooks_url":"https://api.github.com/repos/octocat/Hello-World/hooks","issue_events_url":"https://api.github.com/repos/octocat/Hello-World/issues/events{/number}","events_url":"https://api.github.com/repos/octocat/Hello-World/events","assignees_url":"https://api.github.com/repos/octocat/Hello-World/assignees{/user}","branches_url":"https://api.github.com/repos/octocat/Hello-World/branches{/branch}","tags_url":"https://api.github.com/repos/octocat/Hello-World/tags","blobs_url":"https://api.github.com/repos/octocat/Hello-World/git/blobs{/sha}","git_tags_url":"https://api.github.com/repos/octocat/Hello-World/git/tags{/sha}","git_refs_url":"https://api.github.com/repos/octocat/Hello-World/git/refs{/sha}","trees_url":"https://api.github.com/repos/octocat/Hello-World/git/trees{/sha}","statuses_url":"https://api.github.com/repos/octocat/Hello-World/statuses/{sha}","languages_url":"https://api.github.com/repos/octocat/Hello-World/languages","stargazers_url":"https://api.github.com/repos/octocat/Hello-World/stargazers","contributors_url":"https://api.github.com/repos/octocat/Hello-World/contributors","subscribers_url":"https://api.github.com/repos/octocat/Hello-World/subscribers","subscription_url":"https://api.github.com/repos/octocat/Hello-World/subscription","commits_url":"https://api.github.com/repos/octocat/Hello-World/commits{/sha}","git_commits_url":"https://api.github.com/repos/octocat/Hello-World/git/commits{/sha}","comments_url":"https://api.github.com/repos/octocat/Hello-World/comments{/number}","issue_comment_url":"https://api.github.com/repos/octocat/Hello-World/issues/comments{/number}","contents_url":"https://api.github.com/repos/octocat/Hello-World/contents/{+path}","compare_url":"https://api.github.com/repos/octocat/Hello-World/compare/{base}...{head}","merges_url":"https://api.github.com/repos/octocat/Hello-World/merges","archive_url":"https://api.github.com/repos/octocat/Hello-World/{archive_format}{/ref}","downloads_url":"https://api.github.com/repos/octocat/Hello-World/downloads","issues_url":"https://api.github.com/repos/octocat/Hello-World/issues{/number}","pulls_url":"https://api.github.com/repos/octocat/Hello-World/pulls{/number}","milestones_url":"https://api.github.com/repos/octocat/Hello-World/milestones{/number}","notifications_url":"https://api.github.com/repos/octocat/Hello-World/notifications{?since,all,participating}","labels_url":"https://api.github.com/repos/octocat/Hello-World/labels{/name}","releases_url":"https://api.github.com/repos/octocat/Hello-World/releases{/id}","deployments_url":"https://api.github.com/repos/octocat/Hello-World/deployments","created_at":"2011-01-26T19:01:12Z","updated_at":"2026-02-10T11:51:56Z","pushed_at":"2024-08-20T23:54:42Z","git_url":"git://github.com/octocat/Hello-World.git","ssh_url":"git@github.com:octocat/Hello-World.git","clone_url":"https://github.com/octocat/Hello-World.git","svn_url":"https://github.com/octocat/Hello-World","homepage":"","size":1,"stargazers_count":3490,"watchers_count":3490,"language":null,"has_issues":true,"has_projects":true,"has_downloads":true,"has_wiki":true,"has_pages":false,"has_discussions":false,"forks_count":5791,"mirror_url":null,"archived":false,"disabled":false,"open_issues_count":3347,"license":null,"allow_forking":true,"is_template":false,"web_commit_signoff_required":false,"topics":[],"visibility":"public","forks":5791,"open_issues":3347,"watchers":3490,"default_branch":"master","temp_clone_token":null,"network_count":5791,"subscribers_count":1729}'
+        first repository on GitHub!","fork":false,"url":"https://api.github.com/repos/octocat/Hello-World","forks_url":"https://api.github.com/repos/octocat/Hello-World/forks","keys_url":"https://api.github.com/repos/octocat/Hello-World/keys{/key_id}","collaborators_url":"https://api.github.com/repos/octocat/Hello-World/collaborators{/collaborator}","teams_url":"https://api.github.com/repos/octocat/Hello-World/teams","hooks_url":"https://api.github.com/repos/octocat/Hello-World/hooks","issue_events_url":"https://api.github.com/repos/octocat/Hello-World/issues/events{/number}","events_url":"https://api.github.com/repos/octocat/Hello-World/events","assignees_url":"https://api.github.com/repos/octocat/Hello-World/assignees{/user}","branches_url":"https://api.github.com/repos/octocat/Hello-World/branches{/branch}","tags_url":"https://api.github.com/repos/octocat/Hello-World/tags","blobs_url":"https://api.github.com/repos/octocat/Hello-World/git/blobs{/sha}","git_tags_url":"https://api.github.com/repos/octocat/Hello-World/git/tags{/sha}","git_refs_url":"https://api.github.com/repos/octocat/Hello-World/git/refs{/sha}","trees_url":"https://api.github.com/repos/octocat/Hello-World/git/trees{/sha}","statuses_url":"https://api.github.com/repos/octocat/Hello-World/statuses/{sha}","languages_url":"https://api.github.com/repos/octocat/Hello-World/languages","stargazers_url":"https://api.github.com/repos/octocat/Hello-World/stargazers","contributors_url":"https://api.github.com/repos/octocat/Hello-World/contributors","subscribers_url":"https://api.github.com/repos/octocat/Hello-World/subscribers","subscription_url":"https://api.github.com/repos/octocat/Hello-World/subscription","commits_url":"https://api.github.com/repos/octocat/Hello-World/commits{/sha}","git_commits_url":"https://api.github.com/repos/octocat/Hello-World/git/commits{/sha}","comments_url":"https://api.github.com/repos/octocat/Hello-World/comments{/number}","issue_comment_url":"https://api.github.com/repos/octocat/Hello-World/issues/comments{/number}","contents_url":"https://api.github.com/repos/octocat/Hello-World/contents/{+path}","compare_url":"https://api.github.com/repos/octocat/Hello-World/compare/{base}...{head}","merges_url":"https://api.github.com/repos/octocat/Hello-World/merges","archive_url":"https://api.github.com/repos/octocat/Hello-World/{archive_format}{/ref}","downloads_url":"https://api.github.com/repos/octocat/Hello-World/downloads","issues_url":"https://api.github.com/repos/octocat/Hello-World/issues{/number}","pulls_url":"https://api.github.com/repos/octocat/Hello-World/pulls{/number}","milestones_url":"https://api.github.com/repos/octocat/Hello-World/milestones{/number}","notifications_url":"https://api.github.com/repos/octocat/Hello-World/notifications{?since,all,participating}","labels_url":"https://api.github.com/repos/octocat/Hello-World/labels{/name}","releases_url":"https://api.github.com/repos/octocat/Hello-World/releases{/id}","deployments_url":"https://api.github.com/repos/octocat/Hello-World/deployments","created_at":"2011-01-26T19:01:12Z","updated_at":"2026-02-10T11:51:56Z","pushed_at":"2024-08-20T23:54:42Z","git_url":"git://github.com/octocat/Hello-World.git","ssh_url":"git@github.com:octocat/Hello-World.git","clone_url":"https://github.com/octocat/Hello-World.git","svn_url":"https://github.com/octocat/Hello-World","homepage":"","size":1,"stargazers_count":3490,"watchers_count":3490,"language":null,"has_issues":true,"has_projects":true,"has_downloads":true,"has_wiki":true,"has_pages":false,"has_discussions":false,"forks_count":5791,"mirror_url":null,"archived":false,"disabled":false,"open_issues_count":3348,"license":null,"allow_forking":true,"is_template":false,"web_commit_signoff_required":false,"topics":[],"visibility":"public","forks":5791,"open_issues":3348,"watchers":3490,"default_branch":"master","temp_clone_token":null,"network_count":5791,"subscribers_count":1729}'
     headers:
       Accept-Ranges:
       - bytes
@@ -33,9 +33,9 @@ interactions:
       Content-Type:
       - application/json; charset=utf-8
       Date:
-      - Tue, 10 Feb 2026 17:05:02 GMT
+      - Tue, 10 Feb 2026 17:44:58 GMT
       ETag:
-      - W/"db006561bd31c40c6716931ccff30c52edc5411b5d9d76f68fab7d22a06ff04d"
+      - W/"a7bf926b20bb2e7ef8a0a22609fc1d09d33ff202af2ea57a16ecfb69a4b7e61f"
       Last-Modified:
       - Tue, 10 Feb 2026 11:51:56 GMT
       Referrer-Policy:
@@ -53,17 +53,17 @@ interactions:
       X-GitHub-Media-Type:
       - github.v3; format=json
       X-GitHub-Request-Id:
-      - 8C9C:37F7CE:37C8020:EFDA67E:698B653E
+      - E686:1FEE1D:1D901A8:7EC7231:698B6E9A
       X-RateLimit-Limit:
       - '60'
       X-RateLimit-Remaining:
-      - '53'
+      - '59'
       X-RateLimit-Reset:
-      - '1770746366'
+      - '1770749098'
       X-RateLimit-Resource:
       - core
       X-RateLimit-Used:
-      - '7'
+      - '1'
       X-XSS-Protection:
       - '0'
       content-length:
@@ -79,13 +79,13 @@ interactions:
       Accept:
       - '*/*'
       Accept-Encoding:
-      - gzip, deflate
+      - gzip, deflate, br, zstd
       Connection:
       - keep-alive
       User-Agent:
       - PyGithub/Python
     method: GET
-    uri: https://10.222.1.111:8080/repos/octocat/Hello-World/pulls/1
+    uri: https://api.github.com/repos/octocat/Hello-World/pulls/1
   response:
     body:
       string: "{\n  \"url\": \"https://api.github.com/repos/octocat/Hello-World/pulls/1\",\n
@@ -222,8 +222,8 @@ interactions:
         on GitHub!\",\n      \"homepage\": \"\",\n      \"language\": null,\n      \"visibility\":
         \"public\",\n      \"is_template\": false,\n      \"topics\": [],\n      \"forks_count\":
         5791,\n      \"forks\": 5791,\n      \"stargazers_count\": 3490,\n      \"watchers_count\":
-        3490,\n      \"watchers\": 3490,\n      \"open_issues_count\": 3347,\n      \"open_issues\":
-        3347,\n      \"size\": 1,\n      \"default_branch\": \"master\",\n      \"has_issues\":
+        3490,\n      \"watchers\": 3490,\n      \"open_issues_count\": 3348,\n      \"open_issues\":
+        3348,\n      \"size\": 1,\n      \"default_branch\": \"master\",\n      \"has_issues\":
         true,\n      \"has_projects\": true,\n      \"has_wiki\": true,\n      \"has_pages\":
         false,\n      \"has_downloads\": true,\n      \"has_discussions\": false,\n
         \     \"pushed_at\": \"2024-08-20T23:54:42Z\",\n      \"created_at\": \"2011-01-26T19:01:12Z\",\n
@@ -317,9 +317,9 @@ interactions:
       Content-Type:
       - application/json; charset=utf-8
       Date:
-      - Tue, 10 Feb 2026 17:05:03 GMT
+      - Tue, 10 Feb 2026 17:44:59 GMT
       ETag:
-      - '"fabc192ef87aafd28fea98be2d88df5e399211839448766650158b04fb03f6bf"'
+      - '"619f775208ee91328d73cd354bfb89df8ab246e597dd7b00da34262ad0f3ff51"'
       Last-Modified:
       - Tue, 10 Feb 2026 04:04:44 GMT
       Referrer-Policy:
@@ -335,17 +335,17 @@ interactions:
       X-GitHub-Media-Type:
       - github.v3; format=json
       X-GitHub-Request-Id:
-      - 8C9C:37F7CE:37C85B0:EFDBEFF:698B653E
+      - E694:1AB464:A6031BD:2CB3D74A:698B6E9A
       X-RateLimit-Limit:
       - '60'
       X-RateLimit-Remaining:
-      - '52'
+      - '58'
       X-RateLimit-Reset:
-      - '1770746366'
+      - '1770749098'
       X-RateLimit-Resource:
       - core
       X-RateLimit-Used:
-      - '8'
+      - '2'
       X-XSS-Protection:
       - '0'
       x-github-api-version-selected:

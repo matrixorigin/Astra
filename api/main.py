@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, status, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, UTC
-from ulid import ULID
+from uuid_utils import uuid7
 
 from core.config import get_settings
 from core.logging_config import setup_logging, get_logger
@@ -54,7 +54,7 @@ if not settings.is_development():
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     """Add request ID to all requests."""
-    request_id = str(ULID())
+    request_id = str(uuid7())
     request.state.request_id = request_id
     
     logger.info(

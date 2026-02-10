@@ -15,12 +15,20 @@ from core.skills.github_client import GitHubClient
 from sdk import Database
 
 # VCR configuration
+def normalize_github_url(request):
+    """Normalize GitHub URLs to use api.github.com."""
+    # Replace enterprise GitHub URL with public GitHub
+    request.uri = request.uri.replace('10.222.1.111:8080', 'api.github.com')
+    request.uri = request.uri.replace('http://', 'https://')
+    return request
+
 vcr_config = vcr.VCR(
     cassette_library_dir=str(Path(__file__).parent.parent.parent / "fixtures" / "vcr_cassettes"),
     record_mode="once",  # Record once, then replay
     match_on=["uri", "method"],
     filter_headers=["authorization"],  # Don't record tokens
     decode_compressed_response=True,
+    before_record_request=normalize_github_url,
 )
 
 

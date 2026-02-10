@@ -5,7 +5,7 @@ Handles event creation and persistence to the database.
 
 import json
 
-from ulid import ULID
+from uuid_utils import uuid7
 
 from core.events.models import ConversationEvent, EventType
 from sdk.database import Database
@@ -104,7 +104,7 @@ class EventLogger:
             ConversationEvent: Created event
         """
         event = ConversationEvent(
-            event_id=str(ULID()),
+            event_id=str(uuid7()),
             user_id=user_id,
             session_id=session_id,
             agent_id=agent_id,
@@ -112,7 +112,7 @@ class EventLogger:
             event_type=EventType.USER_QUERY,
             content=content,
             parent_event_id=parent_event_id,
-            causal_chain_id=causal_chain_id or str(ULID()),
+            causal_chain_id=causal_chain_id or str(uuid7()),
         )
         self.log_event(event)
         return event
@@ -150,7 +150,7 @@ class EventLogger:
         from core.events.models import TokenUsage
 
         event = ConversationEvent(
-            event_id=str(ULID()),
+            event_id=str(uuid7()),
             user_id=user_id,
             session_id=session_id,
             agent_id=agent_id,

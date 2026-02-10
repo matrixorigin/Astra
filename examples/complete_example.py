@@ -7,7 +7,7 @@ This example shows:
 4. Git for Data (time machine and sandbox)
 """
 
-from ulid import ULID
+from uuid_utils import uuid7
 
 from core.events.causal_chain import CausalChainManager
 from core.events.event_logger import EventLogger
@@ -38,7 +38,7 @@ def main() -> None:
     time_machine = TimeMachine(db)
     sandbox = Sandbox(db=db)
 
-    user_id = f"demo_user_{ULID()}"
+    user_id = f"demo_user_{uuid7()}"
 
     # ========================================================================
     # Part 1: Basic Conversation Flow
@@ -127,7 +127,7 @@ def main() -> None:
     print_section("Part 4: Git for Data - Time Machine")
 
     # Create checkpoint
-    checkpoint_name = f"demo_checkpoint_{str(ULID())[:8]}".lower()
+    checkpoint_name = f"demo_checkpoint_{str(uuid7())[:8]}".lower()
     checkpoint = time_machine.create_checkpoint(
         checkpoint_name,
         "Checkpoint after initial conversation",
