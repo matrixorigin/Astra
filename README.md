@@ -159,3 +159,14 @@ See [docs/design/](docs/design/) for detailed architecture documentation.
 
 Run `make help` to see all available commands.
 
+### Code Quality
+```bash
+make check          # Run all static checks (lint + type-check)
+make lint           # Run ruff linter
+make lint-fix       # Auto-fix linting issues
+make type-check     # Run mypy type checker
+make format         # Format code
+```
+
+See [STATIC_CHECK_SETUP.md](STATIC_CHECK_SETUP.md) for detailed static checking documentation.
+

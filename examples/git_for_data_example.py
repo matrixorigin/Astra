@@ -51,11 +51,15 @@ sandbox_name = "sandbox_test"
 sandbox.create(sandbox_name)
 
 # Run experiment in sandbox
-db.execute(f"INSERT INTO {sandbox_name}.conversation_events (event_id, event_type, user_id, session_id, content, created_at) SELECT event_id, event_type, user_id, session_id, content, created_at FROM dev_agent.conversation_events LIMIT 1")
+db.execute(
+    f"INSERT INTO {sandbox_name}.conversation_events (event_id, event_type, user_id, session_id, content, created_at) SELECT event_id, event_type, user_id, session_id, content, created_at FROM dev_agent.conversation_events LIMIT 1"
+)
 
 # Compare
 main_count = db.fetchone("SELECT COUNT(*) as count FROM dev_agent.conversation_events")["count"]
-sandbox_count = db.fetchone(f"SELECT COUNT(*) as count FROM {sandbox_name}.conversation_events")["count"]
+sandbox_count = db.fetchone(f"SELECT COUNT(*) as count FROM {sandbox_name}.conversation_events")[
+    "count"
+]
 print(f"✓ Sandbox has {sandbox_count} events, main has {main_count} events")
 print("✓ Main timeline is preserved (sandbox changes are isolated)")
 

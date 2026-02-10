@@ -4,21 +4,20 @@ Provides methods to retrieve and query events from the database.
 """
 
 import json
-from typing import Optional
 
-from core.events.models import ConversationEvent, ContextSnapshot, TokenUsage
+from core.events.models import ContextSnapshot, ConversationEvent, TokenUsage
 from sdk.database import Database
 
 
 class EventReader:
     """Reader for conversation events.
-    
+
     Provides methods to query events by various criteria.
     """
 
-    def __init__(self, db: Optional[Database] = None) -> None:
+    def __init__(self, db: Database | None = None) -> None:
         """Initialize event reader.
-        
+
         Args:
             db: Database instance. If None, creates a new one.
         """
@@ -26,10 +25,10 @@ class EventReader:
 
     def _row_to_event(self, row: dict) -> ConversationEvent:
         """Convert database row to ConversationEvent.
-        
+
         Args:
             row: Database row as dictionary
-            
+
         Returns:
             ConversationEvent: Event object
         """
@@ -41,13 +40,9 @@ class EventReader:
             else None
         )
         token_usage = (
-            TokenUsage.model_validate_json(row["token_usage"])
-            if row.get("token_usage")
-            else None
+            TokenUsage.model_validate_json(row["token_usage"]) if row.get("token_usage") else None
         )
-        skills_snapshot = (
-            json.loads(row["skills_snapshot"]) if row.get("skills_snapshot") else None
-        )
+        skills_snapshot = json.loads(row["skills_snapshot"]) if row.get("skills_snapshot") else None
         llm_params = json.loads(row["llm_params"]) if row.get("llm_params") else None
 
         return ConversationEvent(
@@ -75,12 +70,12 @@ class EventReader:
             llm_params=llm_params,
         )
 
-    def get_event(self, event_id: str) -> Optional[ConversationEvent]:
+    def get_event(self, event_id: str) -> ConversationEvent | None:
         """Get a single event by ID.
-        
+
         Args:
             event_id: Event ID
-            
+
         Returns:
             Optional[ConversationEvent]: Event if found, None otherwise
         """
@@ -89,27 +84,27 @@ class EventReader:
         return self._row_to_event(row) if row else None
 
     def get_session_events(
-        self, session_id: str, limit: Optional[int] = None
+        self, session_id: str, limit: int | None = None
     ) -> list[ConversationEvent]:
         """Get all events for a session, ordered by creation time.
-        
+
         Args:
             session_id: Session ID
             limit: Maximum number of events to return
-            
+
         Returns:
             list[ConversationEvent]: List of events
         """
         # Select only needed columns
         columns = """
             event_id, user_id, session_id, agent_id, agent_version,
-            event_type, content, metadata, created_at, 
+            event_type, content, metadata, created_at,
             parent_event_id, causal_chain_id
         """
-        
+
         query = f"""
-            SELECT {columns} FROM conversation_events 
-            WHERE session_id = %s 
+            SELECT {columns} FROM conversation_events
+            WHERE session_id = %s
             ORDER BY created_at DESC
         """
         if limit:
@@ -118,27 +113,25 @@ class EventReader:
         rows = self.db.fetchall(query, (session_id,))
         return [self._row_to_event(row) for row in rows]
 
-    def get_user_events(
-        self, user_id: str, limit: Optional[int] = 100
-    ) -> list[ConversationEvent]:
+    def get_user_events(self, user_id: str, limit: int | None = 100) -> list[ConversationEvent]:
         """Get all events for a user across sessions.
-        
+
         Args:
             user_id: User ID
             limit: Maximum number of events to return (default: 100)
-            
+
         Returns:
             list[ConversationEvent]: List of events
         """
         columns = """
             event_id, user_id, session_id, agent_id, agent_version,
-            event_type, content, metadata, created_at, 
+            event_type, content, metadata, created_at,
             parent_event_id, causal_chain_id
         """
-        
+
         query = f"""
-            SELECT {columns} FROM conversation_events 
-            WHERE user_id = %s 
+            SELECT {columns} FROM conversation_events
+            WHERE user_id = %s
             ORDER BY created_at DESC
         """
         if limit:
@@ -149,16 +142,16 @@ class EventReader:
 
     def get_causal_chain(self, causal_chain_id: str) -> list[ConversationEvent]:
         """Get all events in a causal chain.
-        
+
         Args:
             causal_chain_id: Causal chain ID
-            
+
         Returns:
             list[ConversationEvent]: List of events in chronological order
         """
         query = """
-            SELECT * FROM conversation_events 
-            WHERE causal_chain_id = %s 
+            SELECT * FROM conversation_events
+            WHERE causal_chain_id = %s
             ORDER BY created_at ASC
         """
         rows = self.db.fetchall(query, (causal_chain_id,))

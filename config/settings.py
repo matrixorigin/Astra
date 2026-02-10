@@ -5,7 +5,6 @@ Follows 12-factor app principles for configuration management.
 """
 
 from functools import lru_cache
-from typing import Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -31,7 +30,7 @@ class Settings(BaseSettings):
     # Redis
     redis_host: str = Field(default="localhost", description="Redis host")
     redis_port: int = Field(default=6379, description="Redis port")
-    redis_password: Optional[str] = Field(default=None, description="Redis password")
+    redis_password: str | None = Field(default=None, description="Redis password")
 
     # Application
     app_env: str = Field(default="development", description="Environment")
@@ -55,7 +54,7 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     """Get cached settings instance.
-    
+
     Returns:
         Settings: Application settings
     """

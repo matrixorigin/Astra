@@ -72,20 +72,18 @@ def test_time_machine_checkpoint(time_machine, event_logger):
     checkpoint_name = f"test_checkpoint_{str(ULID())[:8]}".lower()
 
     # Create initial event
-    event1 = event_logger.create_user_query(
+    _event1 = event_logger.create_user_query(
         user_id=user_id,
         session_id=session_id,
         content="Initial query",
     )
 
     # Create checkpoint
-    checkpoint = time_machine.create_checkpoint(
-        checkpoint_name, "Test checkpoint"
-    )
+    checkpoint = time_machine.create_checkpoint(checkpoint_name, "Test checkpoint")
     assert checkpoint["checkpoint_name"] == checkpoint_name
 
     # Create another event after checkpoint
-    event2 = event_logger.create_user_query(
+    _event2 = event_logger.create_user_query(
         user_id=user_id,
         session_id=session_id,
         content="Query after checkpoint",
@@ -122,7 +120,7 @@ def test_sandbox_experiment(sandbox, event_logger, db):
     sandbox_name = f"sandbox_{str(ULID())[:8]}".lower()
 
     # Create initial event
-    initial_event = event_logger.create_user_query(
+    _initial_event = event_logger.create_user_query(
         user_id=user_id,
         session_id=session_id,
         content="Before experiment",
@@ -140,8 +138,10 @@ def test_sandbox_experiment(sandbox, event_logger, db):
 
     # Verify isolation: main has more events than sandbox
     main_count = db.fetchone("select count(*) as count from dev_agent.conversation_events")["count"]
-    sandbox_count = db.fetchone(f"select count(*) as count from {sandbox_name}.conversation_events")["count"]
-    
+    sandbox_count = db.fetchone(
+        f"select count(*) as count from {sandbox_name}.conversation_events"
+    )["count"]
+
     assert main_count > sandbox_count
 
     # Cleanup
@@ -159,7 +159,7 @@ def test_git_for_data_restore(git, event_logger, db):
         session_id="test_session",
         content="Original content",
     )
-    
+
     # Update event ID for testing
     db.execute(
         "UPDATE conversation_events SET event_id = %s WHERE event_id = %s",

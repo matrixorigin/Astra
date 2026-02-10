@@ -3,9 +3,9 @@
 Defines the data structures for conversation events following the event-centric design.
 """
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -32,27 +32,25 @@ class TokenUsage(BaseModel):
 
 class ContextSnapshot(BaseModel):
     """Context snapshot for reproducibility.
-    
+
     Captures the state needed to reproduce an LLM call.
     """
 
-    prompt_template_id: Optional[str] = Field(
+    prompt_template_id: str | None = Field(
         default=None, description="Prompt template ID and version"
     )
-    skills_used: Optional[list[str]] = Field(
+    skills_used: list[str] | None = Field(
         default=None, description="Skills used in this interaction"
     )
-    history_events: Optional[list[str]] = Field(
+    history_events: list[str] | None = Field(
         default=None, description="Event IDs included in context"
     )
-    retrieved_chunks: Optional[list[str]] = Field(
-        default=None, description="RAG chunk IDs retrieved"
-    )
+    retrieved_chunks: list[str] | None = Field(default=None, description="RAG chunk IDs retrieved")
 
 
 class ConversationEvent(BaseModel):
     """Conversation event model.
-    
+
     Represents a single atomic event in the conversation flow.
     Based on the event-centric design in context-memory-session-and-tables.md §4.1
     """
@@ -64,45 +62,35 @@ class ConversationEvent(BaseModel):
     agent_version: str = Field(description="Agent code/config version")
     event_type: EventType = Field(description="Event type")
     content: str = Field(description="Original content")
-    desensitized_content: Optional[str] = Field(
+    desensitized_content: str | None = Field(
         default=None, description="Desensitized version for compliance"
     )
-    metadata: Optional[dict[str, Any]] = Field(
+    metadata: dict[str, Any] | None = Field(
         default=None, description="Namespace convention: dev.*, chat.*, etc."
     )
-    context_snapshot: Optional[ContextSnapshot] = Field(
+    context_snapshot: ContextSnapshot | None = Field(
         default=None, description="Reproducibility snapshot"
     )
-    token_usage: Optional[TokenUsage] = Field(
-        default=None, description="Token usage statistics"
-    )
-    embedding_ref: Optional[str] = Field(
-        default=None, description="External vector store chunk ID"
-    )
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    prompt_template_id: Optional[str] = Field(
-        default=None, description="References prompt_templates"
-    )
-    skills_snapshot: Optional[list[dict[str, Any]]] = Field(
+    token_usage: TokenUsage | None = Field(default=None, description="Token usage statistics")
+    embedding_ref: str | None = Field(default=None, description="External vector store chunk ID")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    prompt_template_id: str | None = Field(default=None, description="References prompt_templates")
+    skills_snapshot: list[dict[str, Any]] | None = Field(
         default=None, description="Skills used with versions"
     )
-    quality_score: Optional[float] = Field(
-        default=None, description="System pre-score (0-5)"
-    )
+    quality_score: float | None = Field(default=None, description="System pre-score (0-5)")
     is_flagged: bool = Field(default=False, description="Flagged for review")
-    training_eligible: bool = Field(
-        default=False, description="Eligible for training pipeline"
-    )
-    parent_event_id: Optional[str] = Field(
+    training_eligible: bool = Field(default=False, description="Eligible for training pipeline")
+    parent_event_id: str | None = Field(
         default=None, description="Immediate prior event in causal chain"
     )
-    causal_chain_id: Optional[str] = Field(
+    causal_chain_id: str | None = Field(
         default=None, description="Groups one user query + full LLM/tool chain"
     )
-    llm_model_used: Optional[str] = Field(
+    llm_model_used: str | None = Field(
         default=None, description="Model identifier at inference time"
     )
-    llm_params: Optional[dict[str, Any]] = Field(
+    llm_params: dict[str, Any] | None = Field(
         default=None, description="LLM parameters (temperature, max_tokens, etc.)"
     )
 

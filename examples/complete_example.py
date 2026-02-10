@@ -9,14 +9,13 @@ This example shows:
 
 from ulid import ULID
 
-from config.settings import get_settings
 from core.events.causal_chain import CausalChainManager
 from core.events.event_logger import EventLogger
 from core.events.event_reader import EventReader
 from core.events.session_manager import SessionManager
 from core.replay.time_machine import TimeMachine
 from core.sandbox import Sandbox
-from sdk import Database, GitForData
+from sdk import Database
 
 
 def print_section(title: str) -> None:
@@ -36,7 +35,6 @@ def main() -> None:
     event_logger = EventLogger(db)
     event_reader = EventReader(db)
     chain_mgr = CausalChainManager(db)
-    git = GitForData(db)
     time_machine = TimeMachine(db)
     sandbox = Sandbox(db=db)
 
@@ -144,7 +142,7 @@ def main() -> None:
         content="What about error handling?",
     )
     session_mgr.update_session_activity(session.session_id, user_event_3.event_id)
-    print(f"✓ Added event after checkpoint")
+    print("✓ Added event after checkpoint")
 
     # List all checkpoints
     checkpoints = time_machine.list_checkpoints()

@@ -4,7 +4,6 @@ Handles event creation and persistence to the database.
 """
 
 import json
-from typing import Optional
 
 from ulid import ULID
 
@@ -14,13 +13,13 @@ from sdk.database import Database
 
 class EventLogger:
     """Logger for conversation events.
-    
+
     Provides methods to create and persist events following the event-centric design.
     """
 
-    def __init__(self, db: Optional[Database] = None) -> None:
+    def __init__(self, db: Database | None = None) -> None:
         """Initialize event logger.
-        
+
         Args:
             db: Database instance. If None, creates a new one.
         """
@@ -28,13 +27,13 @@ class EventLogger:
 
     def log_event(self, event: ConversationEvent) -> str:
         """Log a conversation event to the database.
-        
+
         Args:
             event: Event to log
-            
+
         Returns:
             str: Event ID
-            
+
         Raises:
             Exception: If database operation fails
         """
@@ -62,11 +61,7 @@ class EventLogger:
             event.content,
             event.desensitized_content,
             json.dumps(event.metadata) if event.metadata else None,
-            (
-                event.context_snapshot.model_dump_json()
-                if event.context_snapshot
-                else None
-            ),
+            (event.context_snapshot.model_dump_json() if event.context_snapshot else None),
             event.token_usage.model_dump_json() if event.token_usage else None,
             event.embedding_ref,
             event.created_at,
@@ -91,11 +86,11 @@ class EventLogger:
         content: str,
         agent_id: str = "dev-agent",
         agent_version: str = "0.1.0",
-        parent_event_id: Optional[str] = None,
-        causal_chain_id: Optional[str] = None,
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
     ) -> ConversationEvent:
         """Create and log a user query event.
-        
+
         Args:
             user_id: User identifier
             session_id: Session identifier
@@ -104,7 +99,7 @@ class EventLogger:
             agent_version: Agent version
             parent_event_id: Parent event ID in causal chain
             causal_chain_id: Causal chain identifier
-            
+
         Returns:
             ConversationEvent: Created event
         """
@@ -131,12 +126,12 @@ class EventLogger:
         agent_version: str,
         parent_event_id: str,
         causal_chain_id: str,
-        llm_model_used: Optional[str] = None,
-        token_usage: Optional[dict] = None,
-        llm_params: Optional[dict] = None,
+        llm_model_used: str | None = None,
+        token_usage: dict | None = None,
+        llm_params: dict | None = None,
     ) -> ConversationEvent:
         """Create and log an LLM response event.
-        
+
         Args:
             user_id: User identifier
             session_id: Session identifier
@@ -148,7 +143,7 @@ class EventLogger:
             llm_model_used: LLM model identifier
             token_usage: Token usage dict with prompt, completion, total
             llm_params: LLM parameters
-            
+
         Returns:
             ConversationEvent: Created event
         """

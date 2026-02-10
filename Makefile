@@ -31,8 +31,13 @@ help:
 	@echo "  make test-e2e           - Run end-to-end tests"
 	@echo ""
 	@echo "Code Quality:"
-	@echo "  make lint               - Run linters"
+	@echo "  make check              - Run all static checks (lint + format + type-check)"
+	@echo "  make ci                 - Run all CI checks (check + test)"
+	@echo "  make lint               - Run linters (ruff)"
+	@echo "  make lint-fix           - Run linters with auto-fix"
+	@echo "  make type-check         - Run type checker (mypy)"
 	@echo "  make format             - Format code"
+	@echo "  make format-check       - Check code formatting"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make setup && make dev-up && make db-init  # First time setup"
@@ -191,13 +196,42 @@ test-e2e:
 # Code Quality
 # ============================================================================
 
+# Check if poetry environment is set up
+.PHONY: check-env
+check-env:
+	@poetry --version >/dev/null 2>&1 || (echo "❌ Error: poetry not found. Install it first: https://python-poetry.org/docs/#installation" && exit 1)
+	@poetry run python --version >/dev/null 2>&1 || (echo "❌ Error: Poetry environment not set up. Run 'make install' first." && exit 1)
+
+.PHONY: check
+check: check-env lint format-check type-check
+	@echo "✅ All static checks passed!"
+
 .PHONY: lint
 lint:
 	@echo "Running linters..."
-	@ruff check .
-	@mypy sdk/ core/
+	@poetry run ruff check .
+
+.PHONY: lint-fix
+lint-fix:
+	@echo "Running linters with auto-fix..."
+	@poetry run ruff check --fix .
+
+.PHONY: type-check
+type-check:
+	@echo "Running type checker..."
+	@poetry run mypy sdk/ core/ api/
 
 .PHONY: format
 format:
 	@echo "Formatting code..."
-	@ruff format .
+	@poetry run ruff format .
+
+.PHONY: format-check
+format-check:
+	@echo "Checking code formatting..."
+	@poetry run ruff format --check .
+
+.PHONY: pre-commit
+.PHONY: ci
+ci: check test
+	@echo "✅ All CI checks passed!"

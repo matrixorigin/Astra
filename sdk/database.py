@@ -3,8 +3,8 @@
 Provides connection pooling and context managers for MatrixOne database operations.
 """
 
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Generator, Optional
 
 import pymysql
 from pymysql.connections import Connection
@@ -19,11 +19,11 @@ class Database:
     def __init__(self) -> None:
         """Initialize database manager."""
         self.settings = get_settings()
-        self._connection: Optional[Connection] = None
+        self._connection: Connection | None = None
 
     def _create_connection(self) -> Connection:
         """Create a new database connection.
-        
+
         Returns:
             Connection: PyMySQL connection object
         """
@@ -41,10 +41,10 @@ class Database:
     @contextmanager
     def get_connection(self) -> Generator[Connection, None, None]:
         """Get a database connection with automatic cleanup.
-        
+
         Yields:
             Connection: Database connection
-            
+
         Example:
             >>> db = Database()
             >>> with db.get_connection() as conn:
@@ -64,10 +64,10 @@ class Database:
     @contextmanager
     def get_cursor(self) -> Generator[DictCursor, None, None]:
         """Get a database cursor with automatic connection management.
-        
+
         Yields:
             DictCursor: Database cursor that returns results as dictionaries
-            
+
         Example:
             >>> db = Database()
             >>> with db.get_cursor() as cursor:
@@ -77,47 +77,50 @@ class Database:
         with self.get_connection() as conn:
             cursor = conn.cursor()
             try:
-                yield cursor
+                yield cursor  # type: ignore[misc]
             finally:
                 cursor.close()
 
-    def execute(self, query: str, params: Optional[tuple] = None) -> int:
+    def execute(self, query: str, params: tuple | None = None) -> int:
         """Execute a query and return affected rows.
-        
+
         Args:
             query: SQL query
             params: Query parameters
-            
+
         Returns:
             int: Number of affected rows
         """
         with self.get_cursor() as cursor:
-            return cursor.execute(query, params)
+            result = cursor.execute(query, params)
+            return int(result)
 
-    def fetchone(self, query: str, params: Optional[tuple] = None) -> Optional[dict]:
+    def fetchone(self, query: str, params: tuple | None = None) -> dict | None:
         """Execute a query and fetch one result.
-        
+
         Args:
             query: SQL query
             params: Query parameters
-            
+
         Returns:
             Optional[dict]: Query result as dictionary, or None
         """
         with self.get_cursor() as cursor:
             cursor.execute(query, params)
-            return cursor.fetchone()
+            result = cursor.fetchone()
+            return dict(result) if result else None
 
-    def fetchall(self, query: str, params: Optional[tuple] = None) -> list[dict]:
+    def fetchall(self, query: str, params: tuple | None = None) -> list[dict]:
         """Execute a query and fetch all results.
-        
+
         Args:
             query: SQL query
             params: Query parameters
-            
+
         Returns:
             list[dict]: Query results as list of dictionaries
         """
         with self.get_cursor() as cursor:
             cursor.execute(query, params)
-            return cursor.fetchall()
+            results = cursor.fetchall()
+            return [dict(row) for row in results]

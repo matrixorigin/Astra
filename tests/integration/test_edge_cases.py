@@ -9,7 +9,7 @@ from ulid import ULID
 from core.events.causal_chain import CausalChainManager
 from core.events.event_logger import EventLogger
 from core.events.event_reader import EventReader
-from core.events.models import EventType, TokenUsage
+from core.events.models import EventType
 from core.events.session_manager import SessionManager
 from sdk.database import Database
 
@@ -167,7 +167,7 @@ def test_chain_integrity_validation(event_logger, causal_chain_manager, db):
         causal_chain_id=causal_chain_id,
     )
 
-    event2 = event_logger.create_user_query(
+    _event2 = event_logger.create_user_query(
         user_id=user_id,
         session_id=session_id,
         content="Event 2",
@@ -270,7 +270,7 @@ def test_chain_summary_with_mixed_events(event_logger, causal_chain_manager):
         token_usage={"prompt": 100, "completion": 50, "total": 150},
     )
 
-    llm_event2 = event_logger.create_llm_response(
+    _llm_event2 = event_logger.create_llm_response(
         user_id=user_id,
         session_id=session_id,
         content="LLM response 2",

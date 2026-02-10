@@ -3,8 +3,6 @@
 Provides high-level comparison of agent performance, not just data differences.
 """
 
-from typing import Optional
-
 from core.events.causal_chain import CausalChainManager
 from core.events.event_reader import EventReader
 from sdk.database import Database
@@ -12,14 +10,14 @@ from sdk.database import Database
 
 class SemanticDiff:
     """Semantic difference analyzer for agent behaviors.
-    
+
     Compares agent decisions, token usage, and execution paths
     rather than just raw data differences.
     """
 
-    def __init__(self, db: Optional[Database] = None) -> None:
+    def __init__(self, db: Database | None = None) -> None:
         """Initialize semantic diff analyzer.
-        
+
         Args:
             db: Database instance. If None, creates a new one.
         """
@@ -27,15 +25,13 @@ class SemanticDiff:
         self.reader = EventReader(db)
         self.chain_mgr = CausalChainManager(db)
 
-    def compare_sessions(
-        self, session_id1: str, session_id2: str
-    ) -> dict:
+    def compare_sessions(self, session_id1: str, session_id2: str) -> dict:
         """Compare two sessions semantically.
-        
+
         Args:
             session_id1: First session ID
             session_id2: Second session ID
-            
+
         Returns:
             dict: Semantic comparison results
         """
@@ -65,16 +61,14 @@ class SemanticDiff:
             "summary": self._generate_summary(token_diff, path_diff, type_diff),
         }
 
-    def compare_checkpoints(
-        self, checkpoint1: str, checkpoint2: str, session_id: str
-    ) -> dict:
+    def compare_checkpoints(self, checkpoint1: str, checkpoint2: str, session_id: str) -> dict:
         """Compare agent behavior at two different checkpoints.
-        
+
         Args:
             checkpoint1: First checkpoint name
             checkpoint2: Second checkpoint name
             session_id: Session to compare
-            
+
         Returns:
             dict: Semantic comparison at two time points
         """
@@ -135,8 +129,8 @@ class SemanticDiff:
     def _compare_decision_paths(self, events1: list, events2: list) -> dict:
         """Compare decision paths (causal chains)."""
         # Get unique causal chains
-        chains1 = set(e.causal_chain_id for e in events1 if e.causal_chain_id)
-        chains2 = set(e.causal_chain_id for e in events2 if e.causal_chain_id)
+        chains1 = {e.causal_chain_id for e in events1 if e.causal_chain_id}
+        chains2 = {e.causal_chain_id for e in events2 if e.causal_chain_id}
 
         # Count events per chain
         chain_lengths1 = {}
@@ -149,12 +143,8 @@ class SemanticDiff:
             chain_events = [e for e in events2 if e.causal_chain_id == chain_id]
             chain_lengths2[chain_id] = len(chain_events)
 
-        avg_length1 = (
-            sum(chain_lengths1.values()) / len(chain_lengths1) if chain_lengths1 else 0
-        )
-        avg_length2 = (
-            sum(chain_lengths2.values()) / len(chain_lengths2) if chain_lengths2 else 0
-        )
+        avg_length1 = sum(chain_lengths1.values()) / len(chain_lengths1) if chain_lengths1 else 0
+        avg_length2 = sum(chain_lengths2.values()) / len(chain_lengths2) if chain_lengths2 else 0
 
         return {
             "chain_count": {
@@ -167,9 +157,7 @@ class SemanticDiff:
                 "session2": avg_length2,
                 "diff": avg_length2 - avg_length1,
             },
-            "complexity_change": (
-                "increased" if avg_length2 > avg_length1 else "decreased"
-            ),
+            "complexity_change": ("increased" if avg_length2 > avg_length1 else "decreased"),
         }
 
     def _compare_event_types(self, events1: list, events2: list) -> dict:
@@ -210,9 +198,7 @@ class SemanticDiff:
             "quality_change": "improved" if avg2 > avg1 else "degraded",
         }
 
-    def _generate_summary(
-        self, token_diff: dict, path_diff: dict, type_diff: dict
-    ) -> str:
+    def _generate_summary(self, token_diff: dict, path_diff: dict, type_diff: dict) -> str:
         """Generate human-readable summary."""
         token_change = token_diff["total"]["diff"]
         chain_change = path_diff["chain_count"]["diff"]

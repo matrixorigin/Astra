@@ -37,9 +37,7 @@ def test_create_user_query(event_logger, event_reader):
     content = "How do I implement event logging?"
 
     # Create event
-    event = event_logger.create_user_query(
-        user_id=user_id, session_id=session_id, content=content
-    )
+    event = event_logger.create_user_query(user_id=user_id, session_id=session_id, content=content)
 
     assert event.event_id is not None
     assert event.user_id == user_id

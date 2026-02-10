@@ -1,0 +1,75 @@
+name: Static Checks
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry install
+      - name: Run ruff
+        run: poetry run ruff check .
+      - name: Check formatting
+        run: poetry run ruff format --check .
+
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry install
+      - name: Run mypy
+        run: poetry run mypy sdk/ core/ api/
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:latest
+        ports:
+          - 6001:6001
+        options: >-
+          --health-cmd "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install poetry
+          poetry install
+      - name: Wait for MatrixOne
+        run: |
+          for i in {1..30}; do
+            if mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' 2>/dev/null; then
+              echo "MatrixOne is ready"
+              break
+            fi
+            echo "Waiting for MatrixOne... ($i/30)"
+            sleep 2
+          done
+      - name: Initialize database
+        run: poetry run python scripts/init_db.py
+      - name: Run tests
+        run: poetry run pytest tests/ -v

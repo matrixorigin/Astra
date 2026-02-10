@@ -1,20 +1,20 @@
 """Branch manager for Git-like data workflows."""
 
-from typing import Optional
-
 from sdk.database import Database
 
 
 class Branch:
     """Branch manager using MatrixOne's data branch."""
 
-    def __init__(self, database: str = "dev_agent", db: Optional[Database] = None):
+    def __init__(self, database: str = "dev_agent", db: Database | None = None):
         self.database = database
         self.db = db or Database()
 
-    def create(self, name: str, source: str, snapshot: Optional[str] = None, is_database: bool = False) -> None:
+    def create(
+        self, name: str, source: str, snapshot: str | None = None, is_database: bool = False
+    ) -> None:
         """Create branch.
-        
+
         Args:
             name: Branch name
             source: Source table/database name
@@ -22,16 +22,24 @@ class Branch:
             is_database: True for database branch, False for table branch
         """
         entity = "database" if is_database else "table"
-        
+
         if snapshot:
-            self.db.execute(f'data branch create {entity} {name} from {source}{{snapshot="{snapshot}"}}')
+            self.db.execute(
+                f'data branch create {entity} {name} from {source}{{snapshot="{snapshot}"}}'
+            )
         else:
             self.db.execute(f"data branch create {entity} {name} from {source}")
 
-    def diff(self, target: str, source: str, output: str = "default", 
-             target_snapshot: Optional[str] = None, source_snapshot: Optional[str] = None) -> list[dict]:
+    def diff(
+        self,
+        target: str,
+        source: str,
+        output: str = "default",
+        target_snapshot: str | None = None,
+        source_snapshot: str | None = None,
+    ) -> list[dict]:
         """Diff two tables.
-        
+
         Args:
             target: Target table
             source: Source table
@@ -41,19 +49,19 @@ class Branch:
         """
         t = f'{target}{{snapshot="{target_snapshot}"}}' if target_snapshot else target
         s = f'{source}{{snapshot="{source_snapshot}"}}' if source_snapshot else source
-        
+
         if output == "count":
             query = f"data branch diff {t} against {s} output count"
         elif output == "default":
             query = f"data branch diff {t} against {s}"
         else:
             query = f"data branch diff {t} against {s} output file '{output}'"
-        
+
         return self.db.fetchall(query)
 
     def merge(self, source: str, target: str, on_conflict: str = "error") -> None:
         """Merge source into target.
-        
+
         Args:
             source: Source table
             target: Target table
@@ -68,7 +76,7 @@ class Branch:
 
     def delete(self, name: str, is_database: bool = False) -> None:
         """Delete branch.
-        
+
         Args:
             name: Branch name
             is_database: True for database branch, False for table branch

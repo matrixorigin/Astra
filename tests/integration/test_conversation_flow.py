@@ -176,7 +176,7 @@ def test_get_user_sessions(session_manager):
 
     # Create multiple sessions
     session_1 = session_manager.create_session(user_id=user_id)
-    session_2 = session_manager.create_session(user_id=user_id)
+    _session_2 = session_manager.create_session(user_id=user_id)
     session_manager.close_session(session_1.session_id)
 
     # Get all sessions
@@ -184,9 +184,7 @@ def test_get_user_sessions(session_manager):
     assert len(all_sessions) >= 2
 
     # Get only active sessions
-    active_sessions = session_manager.get_user_sessions(
-        user_id, status=SessionStatus.ACTIVE
-    )
+    active_sessions = session_manager.get_user_sessions(user_id, status=SessionStatus.ACTIVE)
     assert len(active_sessions) >= 1
     assert all(s.status == SessionStatus.ACTIVE for s in active_sessions)
 
