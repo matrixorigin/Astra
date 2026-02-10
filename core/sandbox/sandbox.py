@@ -52,9 +52,42 @@ class Sandbox:
         """)
 
     def delete(self, name: str) -> None:
-        """Delete sandbox and its metadata."""
-        self.db.execute(f"DROP DATABASE IF EXISTS {name}")
+        """Delete sandbox, its snapshots, and metadata atomically.
+        
+        Deletion order (for safety):
+        1. Delete metadata first (mark as deleted)
+        2. Delete snapshots (best effort, continue on error)
+        3. Drop database (atomic operation)
+        
+        If database drop fails, metadata is already deleted, preventing
+        the sandbox from being used even if database still exists.
+        
+        Args:
+            name: Sandbox database name
+        """
+        # Step 1: Delete metadata first (atomic, marks sandbox as deleted)
+        # This prevents the sandbox from being used even if later steps fail
         self.db.execute(f"DELETE FROM sandbox_metadata WHERE sandbox_name = '{name}'")
+        
+        # Step 2: Delete all snapshots (best effort)
+        # Continue even if some snapshots fail to delete
+        try:
+            snapshots = self.git.list_snapshots()
+            prefix = f"{name}_"
+            for s in snapshots:
+                if s["snapshot_name"].startswith(prefix):
+                    try:
+                        self.git.drop_snapshot(s["snapshot_name"])
+                    except Exception as e:
+                        # Log but continue - don't fail entire delete for snapshot errors
+                        print(f"Warning: Failed to delete snapshot {s['snapshot_name']}: {e}")
+        except Exception as e:
+            # If listing snapshots fails, continue to database deletion
+            print(f"Warning: Failed to list snapshots for cleanup: {e}")
+        
+        # Step 3: Drop database (atomic operation by MatrixOne)
+        # This is the final step - if it fails, sandbox is already marked deleted
+        self.db.execute(f"DROP DATABASE IF EXISTS {name}")
 
     def list(
         self,
@@ -195,7 +228,7 @@ class Sandbox:
         
         return result
     
-    def checkpoint(self, sandbox: str, name: str, description: str = "") -> None:
+    def snapshot(self, sandbox: str, name: str, description: str = "") -> None:
         """Create checkpoint for sandbox.
         
         Checkpoint timestamp must not exceed sandbox creation time.
@@ -209,7 +242,7 @@ class Sandbox:
         self.git.create_snapshot(snapshot_name)
         self._touch_metadata(sandbox)
     
-    def list_checkpoints(self, sandbox: str) -> list[dict]:
+    def list_snapshots(self, sandbox: str) -> list[dict]:
         """List checkpoints for sandbox with timestamps."""
         snapshots = self.git.list_snapshots()
         prefix = f"{sandbox}_"

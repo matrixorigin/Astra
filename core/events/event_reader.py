@@ -100,8 +100,15 @@ class EventReader:
         Returns:
             list[ConversationEvent]: List of events
         """
-        query = """
-            SELECT * FROM conversation_events 
+        # Select only needed columns
+        columns = """
+            event_id, user_id, session_id, agent_id, agent_version,
+            event_type, content, metadata, created_at, 
+            parent_event_id, causal_chain_id
+        """
+        
+        query = f"""
+            SELECT {columns} FROM conversation_events 
             WHERE session_id = %s 
             ORDER BY created_at DESC
         """
@@ -112,19 +119,25 @@ class EventReader:
         return [self._row_to_event(row) for row in rows]
 
     def get_user_events(
-        self, user_id: str, limit: Optional[int] = None
+        self, user_id: str, limit: Optional[int] = 100
     ) -> list[ConversationEvent]:
         """Get all events for a user across sessions.
         
         Args:
             user_id: User ID
-            limit: Maximum number of events to return
+            limit: Maximum number of events to return (default: 100)
             
         Returns:
             list[ConversationEvent]: List of events
         """
-        query = """
-            SELECT * FROM conversation_events 
+        columns = """
+            event_id, user_id, session_id, agent_id, agent_version,
+            event_type, content, metadata, created_at, 
+            parent_event_id, causal_chain_id
+        """
+        
+        query = f"""
+            SELECT {columns} FROM conversation_events 
             WHERE user_id = %s 
             ORDER BY created_at DESC
         """

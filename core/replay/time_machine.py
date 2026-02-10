@@ -59,7 +59,11 @@ class TimeMachine:
         self.git.restore_from_snapshot(checkpoint_name)
 
     def get_events_at_checkpoint(
-        self, checkpoint_name: str, session_id: Optional[str] = None
+        self, 
+        checkpoint_name: str, 
+        session_id: Optional[str] = None,
+        limit: int = 100,
+        columns: Optional[list[str]] = None
     ) -> list[ConversationEvent]:
         """Get events as they were at a checkpoint.
         
@@ -69,6 +73,8 @@ class TimeMachine:
         Args:
             checkpoint_name: Name of the checkpoint
             session_id: Optional session filter
+            limit: Maximum number of events to return (default: 100)
+            columns: Optional list of columns to select (default: all needed columns)
             
         Returns:
             list[ConversationEvent]: Events at that point in time
@@ -77,19 +83,29 @@ class TimeMachine:
             This is a read-only operation using {SNAPSHOT = 'name'} syntax.
             The current state is never affected.
         """
+        # Select only needed columns to avoid large data transfer
+        if columns is None:
+            columns = [
+                'event_id', 'user_id', 'session_id', 'agent_id', 'agent_version',
+                'event_type', 'content', 'metadata', 'created_at', 
+                'parent_event_id', 'causal_chain_id'
+            ]
+        
+        cols = ', '.join(columns)
+        
         if session_id:
             query = f"""
-                SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
+                SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
                 WHERE session_id = %s
                 ORDER BY created_at DESC
+                LIMIT {limit}
             """
             rows = self.db.fetchall(query, (session_id,))
         else:
-            # Get recent events (limit to avoid large queries)
             query = f"""
-                SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
+                SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
                 ORDER BY created_at DESC 
-                LIMIT 100
+                LIMIT {limit}
             """
             rows = self.db.fetchall(query)
 

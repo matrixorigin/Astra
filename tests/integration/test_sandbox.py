@@ -148,34 +148,38 @@ def test_sandbox_info(sandbox, db):
     sandbox.delete(name)
 
 
-def test_sandbox_checkpoint(sandbox, db):
-    """Test sandbox checkpoint."""
+def test_sandbox_snapshot(sandbox, db):
+    """Test sandbox snapshot and restore."""
     name = f"sandbox_{str(ULID())[:8]}".lower()
     
     # Create sandbox
-    sandbox.create(name, description="Test checkpoint")
+    sandbox.create(name, description="Test snapshot")
     
-    # Create checkpoint
-    sandbox.checkpoint(name, "cp1")
+    # Create snapshot
+    sandbox.snapshot(name, "snap1")
     
-    # List checkpoints
-    checkpoints = sandbox.list_checkpoints(name)
-    assert len(checkpoints) > 0
-    assert any(cp["name"] == "cp1" for cp in checkpoints)
+    # List snapshots
+    snapshots = sandbox.list_snapshots(name)
+    assert len(snapshots) > 0
+    assert any(s["name"] == "snap1" for s in snapshots)
     
     # Modify sandbox
     db.execute(f"DROP TABLE IF EXISTS {name}.conversation_events")
     
     # Restore
-    sandbox.restore(name, "cp1")
+    sandbox.restore(name, "snap1")
     
     # Verify restored
     tables = sandbox.list_tables(name)
     assert "conversation_events" in tables
     
-    # Cleanup
+    # Delete sandbox (should also delete snapshots)
     sandbox.delete(name)
-    sandbox.git.drop_snapshot(f"{name}_cp1")
+    
+    # Verify snapshots are deleted
+    all_snapshots = sandbox.git.list_snapshots()
+    assert not any(s["snapshot_name"].startswith(f"{name}_") for s in all_snapshots)
+
 
 
 def test_use_sandbox(sandbox, db):
