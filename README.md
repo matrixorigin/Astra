@@ -140,6 +140,13 @@ See [examples/](examples/) for more detailed examples.
 
 - [Development Guide](docs/development.md)
 - [Design Documents](docs/design/)
+  - [Vision and Mission](docs/design/vision-and-mission.md)
+  - [Context, Memory, Session and Tables](docs/design/context-memory-session-and-tables.md)
+  - [Deployment Architecture](docs/design/deployment-architecture-proposal.md)
+  - [GitHub Integration](docs/design/github-integration.md) ⭐ Industry-leading
+  - [LLM Integration](docs/design/llm-integration.md) ⭐ Production-ready
+  - [Git for Data Features](docs/design/git-for-data-features.md)
+  - [Concurrency Model](docs/design/concurrency-model.md)
 - [Examples](examples/)
 
 ## Testing

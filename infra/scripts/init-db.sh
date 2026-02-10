@@ -248,6 +248,44 @@ CREATE TABLE IF NOT EXISTS github_operations (
   INDEX idx_dry_run (is_dry_run)
 ) COMMENT='GitHub API operation audit log for replay and compliance';
 
+-- llm_call_logs: LLM API call logs for cost tracking
+CREATE TABLE IF NOT EXISTS llm_call_logs (
+  log_id              VARCHAR(64) PRIMARY KEY,
+  event_id            VARCHAR(64) NOT NULL COMMENT 'Link to conversation_events',
+  user_id             VARCHAR(255) NOT NULL,
+  provider            VARCHAR(50) NOT NULL COMMENT 'openai | groq | anthropic',
+  model               VARCHAR(100) NOT NULL,
+  tokens_prompt       INT NOT NULL,
+  tokens_completion   INT NOT NULL,
+  tokens_total        INT NOT NULL,
+  cost_usd            DECIMAL(10, 6) NOT NULL COMMENT 'Estimated cost in USD',
+  latency_ms          INT NOT NULL,
+  status              VARCHAR(50) NOT NULL COMMENT 'success | failed',
+  error_message       TEXT,
+  created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  metadata            JSON,
+  
+  INDEX idx_event_id (event_id),
+  INDEX idx_user_id (user_id, created_at),
+  INDEX idx_provider (provider),
+  INDEX idx_status (status)
+) COMMENT='LLM API call logs for cost tracking and analysis';
+
+-- llm_pricing: Historical LLM pricing for accurate cost replay
+CREATE TABLE IF NOT EXISTS llm_pricing (
+  pricing_id          VARCHAR(64) PRIMARY KEY,
+  provider            VARCHAR(50) NOT NULL COMMENT 'openai | groq | anthropic',
+  model               VARCHAR(100) NOT NULL,
+  price_per_1k_prompt DECIMAL(10, 6) NOT NULL COMMENT 'Price per 1K prompt tokens',
+  price_per_1k_completion DECIMAL(10, 6) NOT NULL COMMENT 'Price per 1K completion tokens',
+  effective_from      TIMESTAMP NOT NULL COMMENT 'Pricing effective start time',
+  effective_to        TIMESTAMP COMMENT 'Pricing effective end time (NULL = current)',
+  created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  
+  INDEX idx_provider_model (provider, model),
+  INDEX idx_effective (effective_from, effective_to)
+) COMMENT='Historical LLM pricing for accurate cost calculation and replay';
+
 EOF
 
 echo ""
@@ -265,6 +303,8 @@ echo "  - memory_index_queue (RAG pipeline)"
 echo "  - repos (multi-repository management)"
 echo "  - sandbox_metadata (sandbox lifecycle)"
 echo "  - github_operations (GitHub API audit log)"
+echo "  - llm_call_logs (LLM cost tracking)"
+echo "  - llm_pricing (historical LLM pricing)"
 echo ""
 echo "Next steps:"
 echo "  1. Verify: make db-connect"
