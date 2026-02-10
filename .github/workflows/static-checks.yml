@@ -74,6 +74,12 @@ jobs:
           echo "✗ MatrixOne failed to start"
           exit 1
       - name: Initialize database
-        run: poetry run python scripts/init_db.py
+        run: bash infra/scripts/init-db.sh
+        env:
+          MATRIXONE_HOST: 127.0.0.1
+          MATRIXONE_PORT: 6001
+          MATRIXONE_USER: root
+          MATRIXONE_PASSWORD: "111"
+          MATRIXONE_DATABASE: dev_agent
       - name: Run tests
         run: poetry run pytest tests/ -v
