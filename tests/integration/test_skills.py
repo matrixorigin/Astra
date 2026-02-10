@@ -139,7 +139,28 @@ async def test_summarize_pr_skill(db, llm, github, monkeypatch):
             cost_usd=0.002,
         )
     
+    # Mock GitHub API calls
+    async def mock_get_pr(repo_id, pr_number):
+        return {
+            "number": pr_number,
+            "title": f"PR #{pr_number}",
+            "body": "This is a test PR",
+            "state": "open",
+            "files_changed": 5,
+            "additions": 120,
+            "deletions": 30,
+            "user": "test_user",
+            "created_at": "2026-02-10T00:00:00Z",
+            "updated_at": "2026-02-10T00:00:00Z",
+            "html_url": f"https://github.com/owner/repo/pull/{pr_number}",
+        }
+    
+    async def mock_get_pr_diff(repo_id, pr_number):
+        return "diff --git a/file.py b/file.py\n+added line\n-removed line"
+    
     monkeypatch.setattr(llm, "chat", mock_chat)
+    monkeypatch.setattr(github, "get_pr", mock_get_pr)
+    monkeypatch.setattr(github, "get_pr_diff", mock_get_pr_diff)
     
     skill = SummarizePRSkill(db, llm, github)
 
@@ -161,8 +182,24 @@ async def test_summarize_pr_skill(db, llm, github, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_list_prs_skill(db, github):
+async def test_list_prs_skill(db, github, monkeypatch):
     """Test list_prs skill execution"""
+    # Mock GitHub API call
+    async def mock_list_prs(repo_id, state, limit):
+        return [
+            {
+                "number": i,
+                "title": f"PR #{i}",
+                "user": "user",
+                "state": state,
+                "created_at": "2026-02-10T00:00:00Z",
+                "html_url": f"https://github.com/owner/repo/pull/{i}",
+            }
+            for i in range(1, limit + 1)
+        ]
+    
+    monkeypatch.setattr(github, "list_prs", mock_list_prs)
+    
     skill = ListPRsSkill(db, github)
 
     input_data = {
@@ -182,8 +219,23 @@ async def test_list_prs_skill(db, github):
 
 
 @pytest.mark.asyncio
-async def test_ci_status_skill(db, github):
+async def test_ci_status_skill(db, github, monkeypatch):
     """Test ci_status skill execution"""
+    # Mock GitHub API call
+    async def mock_list_workflow_runs(repo_id, limit):
+        return [
+            {
+                "name": f"Workflow {i}",
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": f"https://github.com/owner/repo/actions/runs/{i}",
+                "created_at": "2026-02-10T00:00:00Z",
+            }
+            for i in range(1, limit + 1)
+        ]
+    
+    monkeypatch.setattr(github, "list_workflow_runs", mock_list_workflow_runs)
+    
     skill = CIStatusSkill(db, github)
 
     input_data = {

@@ -5,15 +5,19 @@ from typing import Optional
 from sdk import Database
 from core.skills import SkillRegistry
 from core.events.event_logger import EventLogger
+from core.logging_config import get_logger
+from core.exceptions import ReplayError, SkillNotFoundError
+
+logger = get_logger(__name__)
 
 
 class ReplayEngine:
     """Replay conversations with exact skill versions from the past"""
 
-    def __init__(self, db: Database, registry: SkillRegistry, logger: EventLogger):
+    def __init__(self, db: Database, registry: SkillRegistry, logger_instance: EventLogger):
         self.db = db
         self.registry = registry
-        self.logger = logger
+        self.logger_instance = logger_instance
 
     async def replay_conversation(
         self, session_id: str, replay_timestamp: Optional[str] = None
@@ -26,40 +30,55 @@ class ReplayEngine:
 
         Returns:
             dict with replay results
+            
+        Raises:
+            ReplayError: If replay fails
         """
-        # 1. Fetch events
-        query = """
-            SELECT event_id, event_type, content, skill_name, skill_version, 
-                   created_at, metadata
-            FROM conversation_events
-            WHERE session_id = %s
-        """
-        params = [session_id]
+        logger.info(f"Starting replay for session: {session_id}")
+        
+        try:
+            # 1. Fetch events
+            query = """
+                SELECT event_id, event_type, content, skill_name, skill_version, 
+                       created_at, metadata
+                FROM conversation_events
+                WHERE session_id = %s
+            """
+            params = [session_id]
 
-        if replay_timestamp:
-            query += " AND created_at <= %s"
-            params.append(replay_timestamp)
+            if replay_timestamp:
+                query += " AND created_at <= %s"
+                params.append(replay_timestamp)
 
-        query += " ORDER BY created_at"
+            query += " ORDER BY created_at"
 
-        events = self.db.fetchall(query, tuple(params))
+            events = self.db.fetchall(query, tuple(params))
 
-        if not events:
-            return {"success": False, "error": f"No events found for session {session_id}"}
+            if not events:
+                logger.warning(f"No events found for session {session_id}")
+                raise ReplayError(f"No events found for session {session_id}", session_id=session_id)
 
-        # 2. Replay each skill execution event
-        results = []
-        for event in events:
-            if event["event_type"] == "skill_exec" and event["skill_name"]:
-                result = await self._replay_skill_execution(event)
-                results.append(result)
+            # 2. Replay each skill execution event
+            results = []
+            for event in events:
+                if event["event_type"] == "skill_exec" and event["skill_name"]:
+                    result = await self._replay_skill_execution(event)
+                    results.append(result)
 
-        return {
-            "success": True,
-            "session_id": session_id,
-            "events_replayed": len(results),
-            "results": results,
-        }
+            logger.info(f"Replay completed for session {session_id}: {len(results)} events replayed")
+            
+            return {
+                "success": True,
+                "session_id": session_id,
+                "events_replayed": len(results),
+                "results": results,
+            }
+            
+        except ReplayError:
+            raise
+        except Exception as e:
+            logger.error(f"Replay failed for session {session_id}: {e}", exc_info=True)
+            raise ReplayError(f"Replay failed: {e}", session_id=session_id)
 
     async def _replay_skill_execution(self, event: dict) -> dict:
         """Replay a single skill execution.
@@ -73,15 +92,18 @@ class ReplayEngine:
         skill_name = event["skill_name"]
         skill_version = event["skill_version"]
 
-        # 1. Load skill version from registry
-        skill = self.registry.get(skill_name, version=skill_version)
+        logger.debug(f"Replaying skill: {skill_name}@{skill_version}")
 
-        if not skill:
+        # 1. Load skill version from registry
+        try:
+            skill = self.registry.get(skill_name, version=skill_version)
+        except SkillNotFoundError as e:
+            logger.warning(f"Skill not found during replay: {skill_name}@{skill_version}")
             return {
                 "success": False,
                 "event_id": event["event_id"],
                 "skill": f"{skill_name}@{skill_version}",
-                "error": f"Skill {skill_name}@{skill_version} not found in registry",
+                "error": str(e),
                 "note": "Skill may have been deleted or not loaded",
             }
 
@@ -90,6 +112,7 @@ class ReplayEngine:
         original_input = metadata.get("input", {})
 
         if not original_input:
+            logger.warning(f"Original input not found in event {event['event_id']}")
             return {
                 "success": False,
                 "event_id": event["event_id"],
@@ -102,6 +125,8 @@ class ReplayEngine:
             input_obj = skill.validate_input(original_input)
             output = await skill.execute(input_obj)
 
+            logger.info(f"Successfully replayed skill: {skill_name}@{skill_version}")
+            
             return {
                 "success": True,
                 "event_id": event["event_id"],
@@ -112,6 +137,7 @@ class ReplayEngine:
             }
 
         except Exception as e:
+            logger.error(f"Skill execution failed during replay: {skill_name}@{skill_version}: {e}")
             return {
                 "success": False,
                 "event_id": event["event_id"],

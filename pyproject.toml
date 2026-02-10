@@ -16,6 +16,9 @@ python-dotenv = "^1.0.0"
 redis = "^5.0.1"
 fastapi = "^0.109.0"
 uvicorn = {extras = ["standard"], version = "^0.27.0"}
+PyGithub = "^2.1.1"
+prometheus-client = "^0.19.0"
+PyJWT = "^2.8.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"

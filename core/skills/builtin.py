@@ -139,7 +139,7 @@ class ListPRsSkill(Skill):
             {
                 "number": pr["number"],
                 "title": pr["title"],
-                "author": pr["user"]["login"],
+                "author": pr["user"],
                 "created_at": pr["created_at"],
                 "url": pr["html_url"],
             }

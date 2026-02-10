@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE__HOST=matrixone
+      - DATABASE__PORT=6001
+      - DATABASE__DATABASE=mo_dev_agent_prod
+    env_file:
+      - .env.production
+    depends_on:
+      - matrixone
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    networks:
+      - app-network
+
+  matrixone:
+    image: matrixorigin/matrixone:latest
+    ports:
+      - "6001:6001"
+    volumes:
+      - mo-data:/var/lib/matrixone
+    environment:
+      - MO_HOST=0.0.0.0
+    restart: unless-stopped
+    networks:
+      - app-network
+
+volumes:
+  mo-data:
+
+networks:
+  app-network:
+    driver: bridge

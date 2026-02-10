@@ -5,7 +5,11 @@ import hashlib
 import inspect
 from typing import Optional
 from sdk import Database
+from core.logging_config import get_logger
+from core.exceptions import SkillNotFoundError, DatabaseError
 from .base import Skill, AccessScope
+
+logger = get_logger(__name__)
 
 
 class SkillRegistry:
@@ -17,61 +21,81 @@ class SkillRegistry:
 
     def register(self, skill: Skill, is_active: bool = True) -> None:
         """Register a skill version"""
+        logger.info(f"Registering skill: {skill.name}@{skill.version}")
 
-        # 1. Deactivate old versions if this is active
-        if is_active:
+        try:
+            # 1. Deactivate old versions if this is active
+            if is_active:
+                self.db.execute(
+                    """
+                    UPDATE skills_registry 
+                    SET is_active = 0
+                    WHERE skill_name = %s
+                """,
+                    (skill.name,),
+                )
+
+            # 2. Compute code hash
+            code_hash = self._compute_code_hash(skill)
+
+            # 3. Insert new version
             self.db.execute(
                 """
-                UPDATE skills_registry 
-                SET is_active = 0
-                WHERE skill_name = %s
+                INSERT INTO skills_registry 
+                (skill_id, skill_name, version, description, requirements, 
+                 code_hash, is_active, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
+                ON DUPLICATE KEY UPDATE
+                    description = VALUES(description),
+                    requirements = VALUES(requirements),
+                    code_hash = VALUES(code_hash),
+                    is_active = VALUES(is_active),
+                    updated_at = CURRENT_TIMESTAMP
             """,
-                (skill.name,),
+                (
+                    f"{skill.name}@{skill.version}",
+                    skill.name,
+                    skill.version,
+                    skill.description,
+                    json.dumps(skill.requirements.model_dump()),
+                    code_hash,
+                    1 if is_active else 0,
+                ),
             )
 
-        # 2. Compute code hash
-        code_hash = self._compute_code_hash(skill)
+            # 4. Store in memory
+            key = f"{skill.name}@{skill.version}"
+            self._skills[key] = skill
+            if is_active:
+                self._skills[skill.name] = skill  # Shortcut to active version
 
-        # 3. Insert new version
-        self.db.execute(
-            """
-            INSERT INTO skills_registry 
-            (skill_id, skill_name, version, description, requirements, 
-             code_hash, is_active, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
-            ON DUPLICATE KEY UPDATE
-                description = VALUES(description),
-                requirements = VALUES(requirements),
-                code_hash = VALUES(code_hash),
-                is_active = VALUES(is_active),
-                updated_at = CURRENT_TIMESTAMP
-        """,
-            (
-                f"{skill.name}@{skill.version}",
-                skill.name,
-                skill.version,
-                skill.description,
-                json.dumps(skill.requirements.model_dump()),
-                code_hash,
-                1 if is_active else 0,
-            ),
-        )
+            logger.info(f"Successfully registered skill: {skill.name}@{skill.version}")
 
-        # 4. Store in memory
-        key = f"{skill.name}@{skill.version}"
-        self._skills[key] = skill
-        if is_active:
-            self._skills[skill.name] = skill  # Shortcut to active version
+        except Exception as e:
+            logger.error(f"Failed to register skill {skill.name}@{skill.version}: {e}")
+            raise DatabaseError(f"Failed to register skill: {e}")
 
     def get(self, skill_name: str, version: str = None) -> Optional[Skill]:
-        """Get skill by name and optional version"""
+        """Get skill by name and optional version
+        
+        Raises:
+            SkillNotFoundError: If skill not found
+        """
         if version:
-            return self._skills.get(f"{skill_name}@{version}")
+            skill = self._skills.get(f"{skill_name}@{version}")
         else:
-            return self._skills.get(skill_name)  # Active version
+            skill = self._skills.get(skill_name)  # Active version
+        
+        if skill is None:
+            logger.warning(f"Skill not found: {skill_name}@{version or 'active'}")
+            raise SkillNotFoundError(skill_name, version)
+        
+        return skill
 
     def list_available(self, repo_id: int) -> list[Skill]:
         """List skills available for a repo"""
+        logger.debug(f"Listing available skills for repo {repo_id}")
+        
         # Query repo type and access scope
         repo = self.db.fetchone(
             """
@@ -82,6 +106,7 @@ class SkillRegistry:
         )
 
         if not repo:
+            logger.warning(f"Repo not found: {repo_id}")
             return []
 
         # Filter skills by requirements
@@ -97,6 +122,7 @@ class SkillRegistry:
             ):
                 available.append(skill)
 
+        logger.debug(f"Found {len(available)} available skills for repo {repo_id}")
         return available
 
     def _has_access(self, current: str, required: str) -> bool:
