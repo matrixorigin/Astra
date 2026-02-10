@@ -250,20 +250,36 @@ class ContextManager:
         # Build distance map
         distance_map = {r['event_id']: r['distance'] for r in semantic_results}
         
+        # Get recent causal chains (last 5 chains in session)
+        recent_chains = self.db.fetchall("""
+            SELECT causal_chain_id, MAX(created_at) as last_time
+            FROM conversation_events
+            WHERE session_id = %s
+            GROUP BY causal_chain_id
+            ORDER BY last_time DESC
+            LIMIT 5
+        """, (session_id,))
+        recent_chain_ids = {row['causal_chain_id'] for row in recent_chains}
+        
         scored = []
         for candidate in candidates:
             event_id = candidate['event_id']
             
-            # Semantic score (40%) - convert distance to similarity
+            # Semantic score (40%)
             distance = distance_map.get(event_id, 999.0)
             semantic_score = (1.0 / (1.0 + distance)) * 0.4
             
-            # Temporal score (20%) - exponential decay
+            # Temporal score (20%)
             age_hours = (time.time() - candidate['created_at'].timestamp()) / 3600
             temporal_score = (0.5 ** (age_hours / 24.0)) * 0.2
             
-            # Causal score (30%) - placeholder
-            causal_score = 0.0 * 0.3
+            # Causal score (30%)
+            chain_id = candidate.get('causal_chain_id')
+            if chain_id and chain_id in recent_chain_ids:
+                # In recent causal chain - high score
+                causal_score = 1.0 * 0.3
+            else:
+                causal_score = 0.0
             
             # Keyword score (10%)
             query_lower = query.lower()
@@ -313,7 +329,10 @@ class ContextManager:
         assembly_time_ms: int
     ) -> Context:
         """Assemble final context."""
-        system_prompt = "You are an intelligent development agent."
+        system_prompt = self._get_system_prompt(task_type)
+        
+        # Load skill definitions from registry
+        skill_definitions = self._get_skill_definitions(budget['skills'])
         
         selected_events = [
             {
@@ -325,6 +344,11 @@ class ContextManager:
             for s in selected
         ]
         
+        # Load code context for code-related tasks
+        code_context = []
+        if task_type in [TaskType.CODE_REVIEW, TaskType.DEBUGGING]:
+            code_context = self._get_code_context(selected_events, budget['code'])
+        
         total_tokens = sum(s['tokens'] for s in selected) + budget['system']
         
         relevance_scores = {
@@ -334,9 +358,9 @@ class ContextManager:
         
         return Context(
             system_prompt=system_prompt,
-            skill_definitions=[],
+            skill_definitions=skill_definitions,
             selected_events=selected_events,
-            code_context=[],
+            code_context=code_context,
             documentation=[],
             total_tokens=total_tokens,
             token_budget=budget,
@@ -344,6 +368,70 @@ class ContextManager:
             relevance_scores=relevance_scores,
             task_type=task_type
         )
+    
+    def _get_system_prompt(self, task_type: TaskType) -> str:
+        """Get system prompt based on task type."""
+        prompts = {
+            TaskType.CODE_REVIEW: "You are an expert code reviewer. Focus on code quality, security, and best practices.",
+            TaskType.PLANNING: "You are a technical architect. Help plan and design solutions.",
+            TaskType.DEBUGGING: "You are a debugging expert. Help identify and fix issues.",
+            TaskType.GENERAL: "You are an intelligent development agent."
+        }
+        return prompts.get(task_type, prompts[TaskType.GENERAL])
+    
+    def _get_skill_definitions(self, token_budget: int) -> List[Dict[str, Any]]:
+        """Get available skill definitions within budget."""
+        skills = self.db.fetchall("""
+            SELECT skill_name, version, description, category, subcategory
+            FROM skills_registry
+            WHERE is_active = 1
+            ORDER BY priority DESC
+            LIMIT 10
+        """)
+        
+        return [
+            {
+                'name': s['skill_name'],
+                'version': s['version'],
+                'description': s['description'],
+                'category': s.get('category', 'general')
+            }
+            for s in skills
+        ]
+    
+    def _get_code_context(
+        self,
+        selected_events: List[Dict[str, Any]],
+        token_budget: int
+    ) -> List[Dict[str, Any]]:
+        """Extract code context from events and repos.
+        
+        Strategy:
+        1. Extract file paths mentioned in events
+        2. Get repo info from session
+        3. Return file summaries
+        """
+        code_files = []
+        
+        # Extract file paths from event content
+        import re
+        file_pattern = r'[\w/]+\.(py|js|go|java|rs|cpp|c|h)'
+        
+        for event in selected_events[:5]:  # Check recent 5 events
+            content = event.get('content', '')
+            matches = re.findall(file_pattern, content)
+            
+            for match in matches:
+                if len(code_files) >= 5:  # Limit to 5 files
+                    break
+                
+                code_files.append({
+                    'file': match,
+                    'mentioned_in': event['event_id'],
+                    'summary': f"File mentioned in conversation: {match}"
+                })
+        
+        return code_files
     
     def save_snapshot(
         self,
