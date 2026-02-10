@@ -6,10 +6,12 @@ Event-centric intelligent agent platform with conversation replay and time-point
 
 - **Event-Centric Architecture**: All conversations stored as atomic events with full causality tracking
 - **Session Management**: Complete conversation lifecycle management
-- **Multi-Repo Management**: Register and manage multiple repositories (code, CI, tester, docs) with per-repo tokens
-- **Git for Data**: Time-travel queries and isolated sandbox experiments using MatrixOne snapshots
+- **Multi-Repo Management**: Register and manage multiple repositories with per-repo tokens
+- **Skill System**: Versioned, declarative skills with full replay capability
+- **Git for Data**: Time-travel queries and isolated sandbox experiments
+- **Production-Ready**: Logging, auth, rate limiting, monitoring, Docker support
 - **Type-Safe**: 100% type annotations with Pydantic validation
-- **Production-Ready**: Comprehensive test coverage (56 tests)
+- **Comprehensive Testing**: 79 tests with VCR-recorded real API responses
 
 ## Quick Start
 
@@ -138,9 +140,10 @@ See [examples/](examples/) for more detailed examples.
 
 ## Documentation
 
-- [Development Guide](docs/development.md)
+- [Development Guide](docs/development.md) - Production setup, testing, deployment
 - [Design Documents](docs/design/)
   - [Vision and Mission](docs/design/vision-and-mission.md)
+  - [Skills-First Architecture](docs/design/skills-first-architecture.md) ⭐ Phase 2 design
   - [Context, Memory, Session and Tables](docs/design/context-memory-session-and-tables.md)
   - [Deployment Architecture](docs/design/deployment-architecture-proposal.md)
   - [GitHub Integration](docs/design/github-integration.md) ⭐ Industry-leading
@@ -160,7 +163,39 @@ make test-unit          # Unit tests
 make test-integration   # Integration tests
 ```
 
-Current test coverage: **56 tests, 100% passing**
+Current test coverage: **79 tests, 100% passing**
+
+---
+
+## Production Deployment
+
+### Quick Deploy
+
+```bash
+# 1. Configure
+cp .env.production.example .env.production
+# Edit with your secrets
+
+# 2. Deploy
+docker-compose -f docker-compose.prod.yml up -d
+
+# 3. Verify
+curl http://localhost:8000/health
+```
+
+### Features
+
+- ✅ Structured logging (JSON)
+- ✅ API authentication (API Key + JWT)
+- ✅ Rate limiting (60 req/min)
+- ✅ Health checks (3 endpoints)
+- ✅ Prometheus metrics
+- ✅ Docker support
+- ✅ Environment-based configuration
+
+See [Development Guide](docs/development.md) for details.
+
+---
 
 ## Project Status
 

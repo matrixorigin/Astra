@@ -9,6 +9,7 @@ help:
 	@echo "Environment Setup:"
 	@echo "  make setup              - Initial project setup (copy .env, install deps)"
 	@echo "  make install            - Install Python dependencies"
+	@echo "  make lock               - Update dependency lock file (poetry.lock)"
 	@echo ""
 	@echo "Development Environment:"
 	@echo "  make dev-up             - Start MatrixOne + Redis"
@@ -71,6 +72,16 @@ install:
 		poetry install; \
 	else \
 		pip install -e .; \
+	fi
+
+.PHONY: lock
+lock:
+	@echo "Updating dependency lock file..."
+	@if command -v poetry >/dev/null 2>&1; then \
+		poetry lock; \
+		echo "✅ poetry.lock updated"; \
+	else \
+		echo "⚠️  Poetry not found, skipping lock (pip doesn't use lock files)"; \
 	fi
 
 # ============================================================================

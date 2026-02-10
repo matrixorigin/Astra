@@ -18,15 +18,15 @@ logger = get_logger(__name__)
 class GitHubClient:
     """Wrapper for GitHub API calls with error handling and rate limiting."""
 
-    def __init__(self, db: Database, token: str = None):
+    def __init__(self, db: Database, token: str = None, base_url: str = "https://api.github.com"):
         self.db = db
         self.token = token or settings.github_token
         
         if not self.token:
             logger.warning("GitHub token not configured, using unauthenticated access")
-            self.client = Github()
+            self.client = Github(base_url=base_url)
         else:
-            self.client = Github(self.token)
+            self.client = Github(login_or_token=self.token, base_url=base_url)
         
         logger.info("GitHub client initialized")
 

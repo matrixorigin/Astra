@@ -57,3 +57,7 @@ temp/
 
 # Docker volumes
 mo-data/
+
+# VCR cassettes (optional - commit them for CI)
+# fixtures/vcr_cassettes/*.yaml
+
