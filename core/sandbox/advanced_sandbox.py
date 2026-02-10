@@ -1,0 +1,276 @@
+"""Advanced Sandbox using MatrixOne Git for Data capabilities.
+
+Leverages CLONE, Snapshot, and PITR for efficient isolated experiments.
+"""
+
+from datetime import datetime
+from typing import Optional
+
+from sdk.database import Database
+from sdk.git_for_data import GitForData
+
+
+class AdvancedSandbox:
+    """Advanced sandbox using MatrixOne's Git for Data features.
+    
+    Provides multiple isolation strategies:
+    1. Database Clone - Zero-copy database duplication
+    2. Snapshot-based - Point-in-time isolation
+    3. PITR-based - Continuous time-travel capability
+    """
+
+    def __init__(
+        self,
+        source_database: str = "dev_agent",
+        db: Optional[Database] = None,
+    ) -> None:
+        """Initialize advanced sandbox.
+        
+        Args:
+            source_database: Source database name
+            db: Database instance. If None, creates a new one.
+        """
+        self.source_database = source_database
+        self.db = db or Database()
+        self.git = GitForData(db)
+
+    def create_clone_sandbox(
+        self, sandbox_name: str, from_snapshot: Optional[str] = None
+    ) -> dict:
+        """Create a sandbox using database clone (zero-copy).
+        
+        This is the most efficient method - uses MatrixOne's zero-copy clone.
+        
+        Args:
+            sandbox_name: Name for the sandbox database
+            from_snapshot: Optional snapshot to clone from
+            
+        Returns:
+            dict: Sandbox metadata
+            
+        Example:
+            >>> sandbox = AdvancedSandbox()
+            >>> sb = sandbox.create_clone_sandbox("exp_sandbox")
+            >>> # Work in exp_sandbox database
+            >>> sandbox.drop_clone_sandbox("exp_sandbox")
+        """
+        # Drop if exists
+        self.drop_clone_sandbox(sandbox_name)
+        
+        if from_snapshot:
+            # Clone from specific snapshot
+            query = f"""
+                CREATE DATABASE {sandbox_name} 
+                CLONE {self.source_database} 
+                {{SNAPSHOT = '{from_snapshot}'}}
+            """
+        else:
+            # Clone current state (zero-copy)
+            query = f"CREATE DATABASE {sandbox_name} CLONE {self.source_database}"
+
+        self.db.execute(query)
+
+        return {
+            "sandbox_name": sandbox_name,
+            "sandbox_type": "clone",
+            "source_database": self.source_database,
+            "from_snapshot": from_snapshot,
+            "created_at": datetime.now(),
+        }
+
+    def drop_clone_sandbox(self, sandbox_name: str) -> None:
+        """Drop a cloned sandbox database.
+        
+        Args:
+            sandbox_name: Sandbox database name
+        """
+        query = f"DROP DATABASE IF EXISTS {sandbox_name}"
+        self.db.execute(query)
+
+    def list_databases(self) -> list[str]:
+        """List all databases (including sandboxes).
+        
+        Returns:
+            list[str]: Database names
+        """
+        query = "SHOW DATABASES"
+        rows = self.db.fetchall(query)
+        return [row["Database"] for row in rows]
+
+    def create_pitr_enabled_sandbox(
+        self, sandbox_name: str, retention_hours: int = 1
+    ) -> dict:
+        """Create a sandbox with PITR (Point-in-Time Recovery) enabled.
+        
+        This allows time-travel within the sandbox.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            retention_hours: How long to retain history (hours)
+            
+        Returns:
+            dict: Sandbox metadata with PITR info
+        """
+        # Create clone sandbox
+        sandbox_info = self.create_clone_sandbox(sandbox_name)
+
+        # Enable PITR for the sandbox database
+        pitr_name = f"pitr_{sandbox_name}"
+        query = f"CREATE PITR {pitr_name} FOR DATABASE {sandbox_name} RANGE {retention_hours} 'h'"
+        self.db.execute(query)
+
+        sandbox_info.update(
+            {
+                "pitr_enabled": True,
+                "pitr_name": pitr_name,
+                "retention_hours": retention_hours,
+            }
+        )
+
+        return sandbox_info
+
+    def restore_sandbox_to_timestamp(
+        self, sandbox_name: str, pitr_name: str, target_time: str
+    ) -> None:
+        """Restore a sandbox database to a specific timestamp.
+        
+        Requires PITR to be enabled on the sandbox.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            pitr_name: PITR name
+            target_time: Target timestamp (format: 'YYYY-MM-DD HH:MM:SS')
+        """
+        query = f"""
+            RESTORE DATABASE {sandbox_name} 
+            FROM PITR {pitr_name} 
+            TIMESTAMP '{target_time}'
+        """
+        self.db.execute(query)
+
+    def query_sandbox_at_snapshot(
+        self, sandbox_name: str, table_name: str, snapshot_name: str
+    ) -> list[dict]:
+        """Query sandbox data at a specific snapshot (read-only).
+        
+        Args:
+            sandbox_name: Sandbox database name
+            table_name: Table name
+            snapshot_name: Snapshot name
+            
+        Returns:
+            list[dict]: Query results
+        """
+        query = f"""
+            SELECT * FROM {sandbox_name}.{table_name} 
+            {{SNAPSHOT = '{snapshot_name}'}}
+        """
+        return self.db.fetchall(query)
+
+    def run_isolated_experiment(
+        self,
+        experiment_name: str,
+        experiment_fn: callable,
+        cleanup: bool = True,
+        from_snapshot: Optional[str] = None,
+    ) -> dict:
+        """Run an experiment in an isolated cloned sandbox.
+        
+        This is the recommended way to run experiments - uses zero-copy clone.
+        
+        Args:
+            experiment_name: Experiment name
+            experiment_fn: Function to execute (receives sandbox_name as parameter)
+            cleanup: Whether to cleanup sandbox after experiment
+            from_snapshot: Optional snapshot to start from
+            
+        Returns:
+            dict: Experiment results
+            
+        Example:
+            >>> def my_experiment(sandbox_name):
+            ...     # Use sandbox_name database for operations
+            ...     db.execute(f"USE {sandbox_name}")
+            ...     # ... do experiments ...
+            ...     return {"status": "success"}
+            >>> 
+            >>> sandbox = AdvancedSandbox()
+            >>> result = sandbox.run_isolated_experiment("test", my_experiment)
+        """
+        # Generate unique sandbox name
+        timestamp = str(int(datetime.now().timestamp()))
+        sandbox_name = f"sandbox_{experiment_name}_{timestamp}".lower()
+
+        try:
+            # Create clone sandbox (zero-copy, fast)
+            sandbox_info = self.create_clone_sandbox(sandbox_name, from_snapshot)
+
+            # Run experiment
+            result = experiment_fn(sandbox_name)
+
+            return {
+                "experiment_name": experiment_name,
+                "sandbox_name": sandbox_name,
+                "status": "success",
+                "result": result,
+                "sandbox_info": sandbox_info,
+            }
+
+        except Exception as e:
+            return {
+                "experiment_name": experiment_name,
+                "sandbox_name": sandbox_name,
+                "status": "failed",
+                "error": str(e),
+            }
+
+        finally:
+            # Cleanup
+            if cleanup:
+                self.drop_clone_sandbox(sandbox_name)
+
+    def compare_sandbox_with_main(
+        self, sandbox_name: str, table_name: str
+    ) -> dict:
+        """Compare data between sandbox and main database.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            table_name: Table name to compare
+            
+        Returns:
+            dict: Comparison results
+        """
+        # Count in main database
+        main_query = f"SELECT COUNT(*) as count FROM {self.source_database}.{table_name}"
+        main_count = self.db.fetchone(main_query)["count"]
+
+        # Count in sandbox
+        sandbox_query = f"SELECT COUNT(*) as count FROM {sandbox_name}.{table_name}"
+        sandbox_count = self.db.fetchone(sandbox_query)["count"]
+
+        return {
+            "table": table_name,
+            "main_count": main_count,
+            "sandbox_count": sandbox_count,
+            "difference": sandbox_count - main_count,
+        }
+
+    def create_snapshot_for_sandbox(self, sandbox_name: str, snapshot_name: str) -> dict:
+        """Create a snapshot of a sandbox database.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            snapshot_name: Snapshot name
+            
+        Returns:
+            dict: Snapshot metadata
+        """
+        query = f"CREATE SNAPSHOT {snapshot_name} FOR DATABASE {sandbox_name}"
+        self.db.execute(query)
+
+        return {
+            "snapshot_name": snapshot_name,
+            "sandbox_name": sandbox_name,
+            "created_at": datetime.now(),
+        }

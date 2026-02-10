@@ -70,6 +70,53 @@ class GitForData:
             for row in rows
         ]
 
+    def query_at_snapshot(
+        self, query: str, snapshot_name: str, params: Optional[tuple] = None
+    ) -> list[dict]:
+        """Execute a query at a specific snapshot (time-travel query).
+        
+        This is a READ-ONLY operation that doesn't affect the current state.
+        Uses MatrixOne's {SNAPSHOT = 'name'} syntax.
+        
+        Args:
+            query: SQL query (must be SELECT)
+            snapshot_name: Snapshot to query
+            params: Optional query parameters
+            
+        Returns:
+            list[dict]: Query results
+            
+        Example:
+            >>> git = GitForData()
+            >>> results = git.query_at_snapshot(
+            ...     "SELECT * FROM conversation_events WHERE session_id = %s",
+            ...     "my_checkpoint",
+            ...     ("session_123",)
+            ... )
+        """
+        # Inject snapshot syntax into query
+        # Replace FROM table with FROM table {SNAPSHOT = 'name'}
+        snapshot_clause = f"{{SNAPSHOT = '{snapshot_name}'}}"
+        
+        # Simple injection: add after first FROM clause
+        # Note: This is a simplified implementation
+        # Production code should use proper SQL parsing
+        if "FROM" in query.upper():
+            parts = query.split()
+            result_parts = []
+            for i, part in enumerate(parts):
+                result_parts.append(part)
+                if part.upper() == "FROM" and i + 1 < len(parts):
+                    result_parts.append(parts[i + 1])
+                    result_parts.append(snapshot_clause)
+                    result_parts.extend(parts[i + 2:])
+                    break
+            modified_query = " ".join(result_parts)
+        else:
+            modified_query = query
+        
+        return self.db.fetchall(modified_query, params)
+
     def restore_from_snapshot(
         self, snapshot_name: str, account: str = "sys"
     ) -> None:

@@ -63,7 +63,8 @@ class TimeMachine:
     ) -> list[ConversationEvent]:
         """Get events as they were at a checkpoint.
         
-        This creates a temporary restore to query historical state.
+        This uses MatrixOne's time-travel query feature (READ-ONLY).
+        No database restore is performed, safe for production use.
         
         Args:
             checkpoint_name: Name of the checkpoint
@@ -73,35 +74,26 @@ class TimeMachine:
             list[ConversationEvent]: Events at that point in time
             
         Note:
-            This is a read-only operation. The current state is preserved.
+            This is a read-only operation using {SNAPSHOT = 'name'} syntax.
+            The current state is never affected.
         """
-        # Create a temporary snapshot of current state
-        temp_snapshot = f"temp_current_{datetime.now().timestamp()}"
-        self.git.create_snapshot(temp_snapshot)
+        if session_id:
+            query = f"""
+                SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
+                WHERE session_id = %s
+                ORDER BY created_at DESC
+            """
+            rows = self.db.fetchall(query, (session_id,))
+        else:
+            # Get recent events (limit to avoid large queries)
+            query = f"""
+                SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
+                ORDER BY created_at DESC 
+                LIMIT 100
+            """
+            rows = self.db.fetchall(query)
 
-        try:
-            # Restore to checkpoint
-            self.git.restore_from_snapshot(checkpoint_name)
-
-            # Query events
-            if session_id:
-                events = self.reader.get_session_events(session_id)
-            else:
-                # Get recent events (limit to avoid large queries)
-                query = """
-                    SELECT * FROM conversation_events 
-                    ORDER BY created_at DESC 
-                    LIMIT 100
-                """
-                rows = self.db.fetchall(query)
-                events = [self.reader._row_to_event(row) for row in rows]
-
-            return events
-
-        finally:
-            # Restore to current state
-            self.git.restore_from_snapshot(temp_snapshot)
-            self.git.drop_snapshot(temp_snapshot)
+        return [self.reader._row_to_event(row) for row in rows]
 
     def list_checkpoints(self) -> list[dict]:
         """List all available checkpoints.
