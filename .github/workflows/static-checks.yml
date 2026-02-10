@@ -44,12 +44,8 @@ jobs:
         image: matrixorigin/matrixone:latest
         ports:
           - 6001:6001
-        options: >-
-          --health-cmd "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 30s
+        env:
+          MO_HOST: "0.0.0.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -65,15 +61,17 @@ jobs:
           poetry install
       - name: Wait for MatrixOne
         run: |
-          for i in {1..30}; do
+          echo "Waiting for MatrixOne to start..."
+          sleep 15
+          for i in {1..10}; do
             if mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' 2>/dev/null; then
-              echo "MatrixOne is ready"
+              echo "✓ MatrixOne is ready"
               exit 0
             fi
-            echo "Waiting for MatrixOne... ($i/30)"
+            echo "Attempt $i/10..."
             sleep 2
           done
-          echo "MatrixOne failed to start"
+          echo "✗ MatrixOne failed to start"
           exit 1
       - name: Initialize database
         run: poetry run python scripts/init_db.py

@@ -75,7 +75,7 @@ class Database:
             ...     result = cursor.fetchone()
         """
         with self.get_connection() as conn:
-            cursor = conn.cursor()
+            cursor: DictCursor = conn.cursor()  # type: ignore[assignment]
             try:
                 yield cursor
             finally:
