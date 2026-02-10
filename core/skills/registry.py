@@ -19,8 +19,29 @@ class SkillRegistry:
         self.db = db
         self._skills: dict[str, Skill] = {}  # skill_name@version -> Skill
 
-    def register(self, skill: Skill, is_active: bool = True) -> None:
-        """Register a skill version"""
+    def register(
+        self,
+        skill: Skill,
+        is_active: bool = True,
+        category: str = "general",
+        subcategory: str = "default",
+        triggers: list = None,
+        dependencies: list = None,
+        priority: int = 5,
+        cost_estimate: str = "medium"
+    ) -> None:
+        """Register a skill version with metadata.
+        
+        Args:
+            skill: Skill instance
+            is_active: Whether this version is active
+            category: Skill category (github/code/docs)
+            subcategory: Skill subcategory
+            triggers: Trigger keywords for selection
+            dependencies: Dependent skill names
+            priority: Priority (1-10)
+            cost_estimate: Cost estimate (low/medium/high)
+        """
         logger.info(f"Registering skill: {skill.name}@{skill.version}")
 
         try:
@@ -38,18 +59,25 @@ class SkillRegistry:
             # 2. Compute code hash
             code_hash = self._compute_code_hash(skill)
 
-            # 3. Insert new version
+            # 3. Insert new version with metadata
             self.db.execute(
                 """
                 INSERT INTO skills_registry 
                 (skill_id, skill_name, version, description, requirements, 
-                 code_hash, is_active, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
+                 code_hash, is_active, status, category, subcategory,
+                 triggers, dependencies, priority, cost_estimate)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     description = VALUES(description),
                     requirements = VALUES(requirements),
                     code_hash = VALUES(code_hash),
                     is_active = VALUES(is_active),
+                    category = VALUES(category),
+                    subcategory = VALUES(subcategory),
+                    triggers = VALUES(triggers),
+                    dependencies = VALUES(dependencies),
+                    priority = VALUES(priority),
+                    cost_estimate = VALUES(cost_estimate),
                     updated_at = CURRENT_TIMESTAMP
             """,
                 (
@@ -60,6 +88,12 @@ class SkillRegistry:
                     json.dumps(skill.requirements.model_dump()),
                     code_hash,
                     1 if is_active else 0,
+                    category,
+                    subcategory,
+                    json.dumps(triggers or []),
+                    json.dumps(dependencies or []),
+                    priority,
+                    cost_estimate
                 ),
             )
 
@@ -69,7 +103,7 @@ class SkillRegistry:
             if is_active:
                 self._skills[skill.name] = skill  # Shortcut to active version
 
-            logger.info(f"Successfully registered skill: {skill.name}@{skill.version}")
+            logger.info(f"Successfully registered skill: {skill.name}@{skill.version} (category={category}, priority={priority})")
 
         except Exception as e:
             logger.error(f"Failed to register skill {skill.name}@{skill.version}: {e}")

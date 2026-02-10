@@ -128,6 +128,12 @@ CREATE TABLE IF NOT EXISTS skills_registry (
   tools_required      JSON COMMENT 'Dependent tool IDs',
   safety_rules        JSON COMMENT '["no_pii", "max_tokens=500"]',
   tags                JSON COMMENT '["customer_service", "data_query"]',
+  category            VARCHAR(64) DEFAULT 'general' COMMENT 'Skill category (github, code, docs, etc.)',
+  subcategory         VARCHAR(64) DEFAULT 'default' COMMENT 'Skill subcategory',
+  triggers            JSON COMMENT 'Keyword triggers for skill selection',
+  dependencies        JSON COMMENT 'Dependent skill names',
+  priority            INT DEFAULT 5 COMMENT 'Selection priority (1-10)',
+  cost_estimate       VARCHAR(20) DEFAULT 'medium' COMMENT 'low | medium | high',
   is_active           BOOLEAN DEFAULT TRUE COMMENT 'Current active version',
   status              VARCHAR(20) DEFAULT 'active' COMMENT 'active | deprecated | experimental',
   created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -135,7 +141,8 @@ CREATE TABLE IF NOT EXISTS skills_registry (
   
   PRIMARY KEY (skill_id, version),
   UNIQUE KEY idx_skill_name_version (skill_name, version),
-  INDEX idx_skill_active (skill_name, is_active)
+  INDEX idx_skill_active (skill_name, is_active),
+  INDEX idx_skill_category (category, subcategory)
 ) COMMENT='Versioned skill definitions (first-class citizens)';
 
 -- configs: Key-value configuration

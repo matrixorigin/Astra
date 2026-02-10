@@ -16,7 +16,44 @@ from sdk import Database
 @pytest.fixture
 def db():
     """Mock database."""
-    return Mock(spec=Database)
+    mock_db = Mock(spec=Database)
+    # Mock fetchall to return skill data
+    mock_db.fetchall.return_value = [
+        {
+            'skill_name': 'code_review',
+            'version': '1.0.0',
+            'description': 'Review code changes in PR',
+            'category': 'github',
+            'subcategory': 'pr_management',
+            'triggers': '["review", "code review"]',
+            'dependencies': '[]',
+            'priority': 8,
+            'cost_estimate': 'medium'
+        },
+        {
+            'skill_name': 'summarize_pr',
+            'version': '1.0.0',
+            'description': 'Summarize a GitHub PR',
+            'category': 'github',
+            'subcategory': 'pr_management',
+            'triggers': '["summarize", "summary"]',
+            'dependencies': '[]',
+            'priority': 6,
+            'cost_estimate': 'low'
+        },
+        {
+            'skill_name': 'search_code',
+            'version': '1.0.0',
+            'description': 'Search code in repository',
+            'category': 'code',
+            'subcategory': 'analysis',
+            'triggers': '["search", "find"]',
+            'dependencies': '[]',
+            'priority': 6,
+            'cost_estimate': 'low'
+        }
+    ]
+    return mock_db
 
 
 @pytest.fixture

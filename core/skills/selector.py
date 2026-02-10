@@ -32,77 +32,38 @@ class SkillSelector:
         self._load_skills()
     
     def _load_skills(self):
-        """Load skills with metadata."""
-        # For MVP, hardcode skill metadata
-        # TODO: Load from database or config file
-        self.skills = {
-            "summarize_pr": SkillMetadata(
-                name="summarize_pr",
-                version="1.0.0",
-                description="Summarize a GitHub PR",
-                category="github",
-                subcategory="pr_management",
-                triggers=["summarize", "summary", "pr", "pull request"],
-                dependencies=[],
-                priority=6,
-                cost_estimate="low"
-            ),
-            "list_prs": SkillMetadata(
-                name="list_prs",
-                version="1.0.0",
-                description="List PRs in repository",
-                category="github",
-                subcategory="pr_management",
-                triggers=["list", "show", "prs", "pull requests"],
-                dependencies=[],
-                priority=5,
-                cost_estimate="low"
-            ),
-            "code_review": SkillMetadata(
-                name="code_review",
-                version="1.0.0",
-                description="Review code changes in PR",
-                category="github",
-                subcategory="pr_management",
-                triggers=["review", "code review", "check"],
-                dependencies=[],
-                priority=8,
-                cost_estimate="medium"
-            ),
-            "ci_status": SkillMetadata(
-                name="ci_status",
-                version="1.0.0",
-                description="Check CI/CD status",
-                category="github",
-                subcategory="ci_cd",
-                triggers=["ci", "build", "workflow", "status"],
-                dependencies=[],
-                priority=7,
-                cost_estimate="low"
-            ),
-            "analyze_bug": SkillMetadata(
-                name="analyze_bug",
-                version="1.0.0",
-                description="Analyze bug reports",
-                category="github",
-                subcategory="issue_management",
-                triggers=["bug", "issue", "error", "analyze"],
-                dependencies=["search_code"],
-                priority=7,
-                cost_estimate="high"
-            ),
-            "search_code": SkillMetadata(
-                name="search_code",
-                version="1.0.0",
-                description="Search code in repository",
-                category="code",
-                subcategory="analysis",
-                triggers=["search", "find", "code"],
-                dependencies=[],
-                priority=6,
-                cost_estimate="low"
+        """Load skills with metadata from database."""
+        self.skills = {}
+        
+        # Load from database
+        rows = self.db.fetchall("""
+            SELECT skill_name, version, description, category, subcategory,
+                   triggers, dependencies, priority, cost_estimate, is_active
+            FROM skills_registry
+            WHERE is_active = 1
+        """)
+        
+        for row in rows:
+            # Parse JSON fields
+            import json
+            triggers = json.loads(row['triggers']) if row.get('triggers') else []
+            dependencies = json.loads(row['dependencies']) if row.get('dependencies') else []
+            
+            skill = SkillMetadata(
+                name=row['skill_name'],
+                version=row['version'],
+                description=row['description'],
+                category=row.get('category', 'general'),
+                subcategory=row.get('subcategory', 'default'),
+                triggers=triggers,
+                dependencies=dependencies,
+                priority=row.get('priority', 5),
+                cost_estimate=row.get('cost_estimate', 'medium')
             )
-        }
+            
+            self.skills[skill.name] = skill
+        
+        logger.info(f"Loaded {len(self.skills)} skills from database")
     
     def select_skills(
         self,

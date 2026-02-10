@@ -82,10 +82,45 @@ class ModernSkillSelector:
     def _skill_to_tool_schema(self, skill: SkillMetadata) -> Dict[str, Any]:
         """Convert skill metadata to OpenAI tool schema.
         
-        This enables native function calling.
+        Auto-generates schema from skill's input model (Pydantic).
         """
-        # Define parameter schemas based on skill
-        param_schemas = {
+        # Try to load skill class and extract schema
+        try:
+            # Get skill from registry
+            from core.skills.registry import SkillRegistry
+            registry = SkillRegistry(self.db)
+            skill_instance = registry.get(skill.name)
+            
+            if skill_instance and hasattr(skill_instance, 'input_schema'):
+                # Use Pydantic model's schema
+                input_model = skill_instance.input_schema
+                if hasattr(input_model, 'model_json_schema'):
+                    # Pydantic v2
+                    parameters = input_model.model_json_schema()
+                elif hasattr(input_model, 'schema'):
+                    # Pydantic v1
+                    parameters = input_model.schema()
+                else:
+                    parameters = self._get_default_schema(skill.name)
+            else:
+                parameters = self._get_default_schema(skill.name)
+        
+        except Exception as e:
+            logger.warning(f"Failed to auto-generate schema for {skill.name}: {e}")
+            parameters = self._get_default_schema(skill.name)
+        
+        return {
+            "type": "function",
+            "function": {
+                "name": skill.name,
+                "description": skill.description,
+                "parameters": parameters
+            }
+        }
+    
+    def _get_default_schema(self, skill_name: str) -> Dict[str, Any]:
+        """Get default schema for known skills (fallback)."""
+        schemas = {
             "summarize_pr": {
                 "type": "object",
                 "properties": {
@@ -147,20 +182,11 @@ class ModernSkillSelector:
             }
         }
         
-        parameters = param_schemas.get(skill.name, {
+        return schemas.get(skill_name, {
             "type": "object",
             "properties": {},
             "required": []
         })
-        
-        return {
-            "type": "function",
-            "function": {
-                "name": skill.name,
-                "description": skill.description,
-                "parameters": parameters
-            }
-        }
     
     def _fallback_to_rules(
         self,
