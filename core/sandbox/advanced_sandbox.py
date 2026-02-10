@@ -274,3 +274,312 @@ class AdvancedSandbox:
             "sandbox_name": sandbox_name,
             "created_at": datetime.now(),
         }
+
+    # ========================================================================
+    # Table-level Operations (P0)
+    # ========================================================================
+
+    def clone_table_to_sandbox(
+        self, sandbox_name: str, table_name: str, new_table_name: Optional[str] = None
+    ) -> dict:
+        """Clone a specific table from main database to sandbox.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            table_name: Table name in main database
+            new_table_name: Optional new name in sandbox (default: same name)
+            
+        Returns:
+            dict: Clone operation metadata
+        """
+        target_name = new_table_name or table_name
+        query = f"""
+            CREATE TABLE {sandbox_name}.{target_name} 
+            CLONE {self.source_database}.{table_name}
+        """
+        self.db.execute(query)
+
+        return {
+            "sandbox_name": sandbox_name,
+            "source_table": f"{self.source_database}.{table_name}",
+            "target_table": f"{sandbox_name}.{target_name}",
+            "operation": "clone_table",
+            "created_at": datetime.now(),
+        }
+
+    def add_table_to_sandbox(
+        self,
+        sandbox_name: str,
+        table_name: str,
+        from_snapshot: Optional[str] = None,
+        new_table_name: Optional[str] = None,
+    ) -> dict:
+        """Add a table to existing sandbox (from snapshot or current state).
+        
+        Args:
+            sandbox_name: Sandbox database name
+            table_name: Table name to add
+            from_snapshot: Optional snapshot to clone from
+            new_table_name: Optional new name in sandbox
+            
+        Returns:
+            dict: Operation metadata
+        """
+        target_name = new_table_name or table_name
+
+        if from_snapshot:
+            query = f"""
+                CREATE TABLE {sandbox_name}.{target_name} 
+                CLONE {self.source_database}.{table_name}
+                {{SNAPSHOT = '{from_snapshot}'}}
+            """
+        else:
+            query = f"""
+                CREATE TABLE {sandbox_name}.{target_name} 
+                CLONE {self.source_database}.{table_name}
+            """
+
+        self.db.execute(query)
+
+        return {
+            "sandbox_name": sandbox_name,
+            "table_name": target_name,
+            "from_snapshot": from_snapshot,
+            "operation": "add_table",
+            "created_at": datetime.now(),
+        }
+
+    def remove_table_from_sandbox(self, sandbox_name: str, table_name: str) -> None:
+        """Remove a table from sandbox.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            table_name: Table name to remove
+        """
+        query = f"DROP TABLE IF EXISTS {sandbox_name}.{table_name}"
+        self.db.execute(query)
+
+    def list_sandbox_tables(self, sandbox_name: str) -> list[str]:
+        """List all tables in a sandbox.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            
+        Returns:
+            list[str]: Table names
+        """
+        query = f"SHOW TABLES FROM {sandbox_name}"
+        rows = self.db.fetchall(query)
+        return [row[f"Tables_in_{sandbox_name}"] for row in rows]
+
+    # ========================================================================
+    # Sandbox Management (P0)
+    # ========================================================================
+
+    def list_sandboxes(
+        self, prefix: str = "sandbox_", include_metadata: bool = False
+    ) -> list[dict]:
+        """List all sandbox databases.
+        
+        Args:
+            prefix: Sandbox name prefix to filter
+            include_metadata: Whether to include detailed metadata
+            
+        Returns:
+            list[dict]: Sandbox information
+        """
+        databases = self.list_databases()
+        sandboxes = [db for db in databases if db.startswith(prefix)]
+
+        if not include_metadata:
+            return [{"sandbox_name": name} for name in sandboxes]
+
+        # Get detailed info for each sandbox
+        result = []
+        for sandbox_name in sandboxes:
+            info = self.get_sandbox_info(sandbox_name)
+            result.append(info)
+
+        return result
+
+    def get_sandbox_info(self, sandbox_name: str) -> dict:
+        """Get detailed information about a sandbox.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            
+        Returns:
+            dict: Sandbox metadata
+        """
+        # Get table count
+        tables = self.list_sandbox_tables(sandbox_name)
+
+        # Get row counts for each table
+        table_info = []
+        for table in tables:
+            count_query = f"SELECT COUNT(*) as count FROM {sandbox_name}.{table}"
+            count = self.db.fetchone(count_query)["count"]
+            table_info.append({"table": table, "row_count": count})
+
+        return {
+            "sandbox_name": sandbox_name,
+            "table_count": len(tables),
+            "tables": table_info,
+            "source_database": self.source_database,
+        }
+
+    def update_sandbox_metadata(
+        self, sandbox_name: str, description: str, tags: Optional[list[str]] = None
+    ) -> dict:
+        """Update sandbox metadata (description and tags).
+        
+        Note: This stores metadata in a special metadata table.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            description: Sandbox description
+            tags: Optional tags
+            
+        Returns:
+            dict: Updated metadata
+        """
+        # Create metadata table if not exists
+        self.db.execute(f"""
+            CREATE TABLE IF NOT EXISTS {sandbox_name}._sandbox_metadata (
+                meta_key VARCHAR(255),
+                meta_value TEXT,
+                updated_at TIMESTAMP,
+                PRIMARY KEY (meta_key)
+            )
+        """)
+
+        # Update description
+        self.db.execute(
+            f"""
+            REPLACE INTO {sandbox_name}._sandbox_metadata (meta_key, meta_value, updated_at)
+            VALUES ('description', %s, CURRENT_TIMESTAMP)
+            """,
+            (description,),
+        )
+
+        # Update tags
+        if tags:
+            import json
+
+            tags_json = json.dumps(tags)
+            self.db.execute(
+                f"""
+                REPLACE INTO {sandbox_name}._sandbox_metadata (meta_key, meta_value, updated_at)
+                VALUES ('tags', %s, CURRENT_TIMESTAMP)
+                """,
+                (tags_json,),
+            )
+
+        return {
+            "sandbox_name": sandbox_name,
+            "description": description,
+            "tags": tags,
+            "updated_at": datetime.now(),
+        }
+
+    def get_sandbox_metadata(self, sandbox_name: str) -> dict:
+        """Get sandbox metadata.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            
+        Returns:
+            dict: Metadata
+        """
+        try:
+            rows = self.db.fetchall(
+                f"SELECT meta_key, meta_value FROM {sandbox_name}._sandbox_metadata"
+            )
+            metadata = {row["meta_key"]: row["meta_value"] for row in rows}
+
+            # Parse tags if exists
+            if "tags" in metadata:
+                import json
+
+                metadata["tags"] = json.loads(metadata["tags"])
+
+            return metadata
+        except Exception:
+            return {}
+
+    # ========================================================================
+    # Sandbox History (P0)
+    # ========================================================================
+
+    def create_sandbox_checkpoint(
+        self, sandbox_name: str, checkpoint_name: str, description: str = ""
+    ) -> dict:
+        """Create a checkpoint for a sandbox.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            checkpoint_name: Checkpoint name
+            description: Optional description
+            
+        Returns:
+            dict: Checkpoint metadata
+        """
+        query = f"CREATE SNAPSHOT {checkpoint_name} FOR DATABASE {sandbox_name}"
+        self.db.execute(query)
+
+        # Store checkpoint metadata
+        self.db.execute(f"""
+            CREATE TABLE IF NOT EXISTS {sandbox_name}._sandbox_checkpoints (
+                checkpoint_name VARCHAR(255) PRIMARY KEY,
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        self.db.execute(
+            f"""
+            INSERT INTO {sandbox_name}._sandbox_checkpoints 
+            (checkpoint_name, description) VALUES (%s, %s)
+            """,
+            (checkpoint_name, description),
+        )
+
+        return {
+            "sandbox_name": sandbox_name,
+            "checkpoint_name": checkpoint_name,
+            "description": description,
+            "created_at": datetime.now(),
+        }
+
+    def list_sandbox_checkpoints(self, sandbox_name: str) -> list[dict]:
+        """List all checkpoints for a sandbox.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            
+        Returns:
+            list[dict]: Checkpoint list
+        """
+        try:
+            rows = self.db.fetchall(
+                f"""
+                SELECT checkpoint_name, description, created_at 
+                FROM {sandbox_name}._sandbox_checkpoints
+                ORDER BY created_at DESC
+                """
+            )
+            return [dict(row) for row in rows]
+        except Exception:
+            return []
+
+    def restore_sandbox_to_checkpoint(
+        self, sandbox_name: str, checkpoint_name: str
+    ) -> None:
+        """Restore sandbox to a checkpoint.
+        
+        Args:
+            sandbox_name: Sandbox database name
+            checkpoint_name: Checkpoint name
+        """
+        query = f"RESTORE DATABASE {sandbox_name} FROM SNAPSHOT {checkpoint_name}"
+        self.db.execute(query)
