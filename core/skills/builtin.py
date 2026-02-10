@@ -205,28 +205,67 @@ class CIStatusSkill(Skill):
 
 
 
-def register_builtin_skills(registry, db):
-    """Register all built-in skills."""
+def register_builtin_skills(registry, db, llm=None, github=None):
+    """Register all built-in skills.
+    
+    Args:
+        registry: SkillRegistry instance
+        db: Database instance
+        llm: Optional LLMClient instance
+        github: Optional GitHubClient instance
+    """
     from core.skills.github_client import GitHubClient
+    from core.llm import LLMClient
     
-    github = GitHubClient(db)
+    # Initialize clients if not provided
+    if github is None:
+        github = GitHubClient(db)
+    if llm is None:
+        llm = LLMClient(db)
     
+    # Register skills with metadata
     skills = [
-        ("summarize_pr", "1.0.0", "Summarize a GitHub pull request", SummarizePRSkill(github)),
-        ("list_prs", "1.0.0", "List pull requests in a repository", ListPRsSkill(github)),
-        ("ci_status", "1.0.0", "Check CI/CD status for a repository", CIStatusSkill(github))
+        (
+            SummarizePRSkill(db, llm, github),
+            "github",
+            "pr_management",
+            ["summarize", "summary", "pr", "pull request"],
+            [],
+            8,
+            "medium"
+        ),
+        (
+            ListPRsSkill(db, github),
+            "github",
+            "pr_management",
+            ["list", "show", "prs", "pull requests"],
+            [],
+            5,
+            "low"
+        ),
+        (
+            CIStatusSkill(db, github),
+            "github",
+            "ci_cd",
+            ["ci", "build", "workflow", "status"],
+            [],
+            7,
+            "low"
+        )
     ]
     
-    for name, version, description, skill_instance in skills:
+    for skill, category, subcategory, triggers, dependencies, priority, cost in skills:
         try:
             registry.register(
-                name=name,
-                version=version,
-                description=description,
-                input_schema={"type": "object"},
-                output_schema={"type": "object"},
-                implementation=f"core.skills.builtin.{skill_instance.__class__.__name__}"
+                skill=skill,
+                is_active=True,
+                category=category,
+                subcategory=subcategory,
+                triggers=triggers,
+                dependencies=dependencies,
+                priority=priority,
+                cost_estimate=cost
             )
-        except Exception:
-            # Skill already registered
-            pass
+            logger.info(f"Registered {skill.name}@{skill.version}")
+        except Exception as e:
+            logger.warning(f"Failed to register {skill.name}: {e}")
