@@ -44,13 +44,19 @@ class LLMClient:
     def chat(
         self,
         messages: list[LLMMessage],
-        event_id: str,
         user_id: str,
+        session_id: str = None,
+        event_id: str = None,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
+        metadata: Optional[dict] = None,
     ) -> LLMResponse:
         """Send chat request to LLM."""
         start_time = time.time()
+
+        # Generate event_id if not provided
+        if not event_id:
+            event_id = str(ULID())
 
         # Use config defaults if not specified
         model = model or self.config["model"]
@@ -79,6 +85,7 @@ class LLMClient:
                 provider=provider,
                 response=response,
                 status="success",
+                metadata=metadata,
             )
 
             return response
@@ -93,6 +100,7 @@ class LLMClient:
                 status="failed",
                 error_message=str(e),
                 latency_ms=latency_ms,
+                metadata=metadata,
             )
             raise
 
@@ -268,6 +276,7 @@ class LLMClient:
         status: str,
         error_message: Optional[str] = None,
         latency_ms: int = 0,
+        metadata: Optional[dict] = None,
     ) -> None:
         """Log LLM call to MatrixOne."""
         log_id = str(ULID())
@@ -277,8 +286,8 @@ class LLMClient:
                 INSERT INTO llm_call_logs (
                     log_id, event_id, user_id, provider, model,
                     tokens_prompt, tokens_completion, tokens_total,
-                    cost_usd, latency_ms, status, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    cost_usd, latency_ms, status, metadata, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             self.db.execute(
                 query,
@@ -294,6 +303,7 @@ class LLMClient:
                     response.cost_usd,
                     response.latency_ms,
                     status,
+                    json.dumps(metadata) if metadata else None,
                     datetime.now(UTC),
                 ),
             )
@@ -302,8 +312,8 @@ class LLMClient:
                 INSERT INTO llm_call_logs (
                     log_id, event_id, user_id, provider, model,
                     tokens_prompt, tokens_completion, tokens_total,
-                    cost_usd, latency_ms, status, error_message, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    cost_usd, latency_ms, status, error_message, metadata, created_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
             self.db.execute(
                 query,
@@ -320,6 +330,7 @@ class LLMClient:
                     latency_ms,
                     status,
                     error_message,
+                    json.dumps(metadata) if metadata else None,
                     datetime.now(UTC),
                 ),
             )

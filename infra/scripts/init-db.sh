@@ -70,11 +70,14 @@ CREATE TABLE IF NOT EXISTS conversation_events (
   causal_chain_id     VARCHAR(64) COMMENT 'Groups one user query + full LLM/tool chain',
   llm_model_used      VARCHAR(50) COMMENT 'Model identifier at inference time',
   llm_params          JSON COMMENT 'e.g., {"temperature":0.7, "max_tokens":1024}',
+  skill_name          VARCHAR(255) COMMENT 'Skill name if this is a skill execution event',
+  skill_version       VARCHAR(32) COMMENT 'Skill version for replay reproducibility',
   
   INDEX idx_ce_user_time (user_id, created_at),
   INDEX idx_ce_session (session_id, created_at DESC),
   INDEX idx_ce_training (training_eligible, quality_score DESC),
-  INDEX idx_causal_chain (causal_chain_id, created_at)
+  INDEX idx_causal_chain (causal_chain_id, created_at),
+  INDEX idx_skill_exec (skill_name, skill_version, created_at)
 ) COMMENT='Event-centric conversation data (single source of truth)';
 
 -- sessions: Conversation scope and lifecycle
@@ -111,22 +114,28 @@ CREATE TABLE IF NOT EXISTS prompt_templates (
 -- skills_registry: Versioned skill definitions
 CREATE TABLE IF NOT EXISTS skills_registry (
   skill_id            VARCHAR(64) NOT NULL,
-  version             VARCHAR(20) NOT NULL COMMENT 'Semantic versioning (v1.0.0)',
+  skill_name          VARCHAR(255) NOT NULL COMMENT 'Human-readable skill name',
+  version             VARCHAR(20) NOT NULL COMMENT 'Semantic versioning (1.0.0)',
   git_commit_hash     VARCHAR(64) COMMENT 'MatrixOne Git for Data commit hash',
   description         TEXT NOT NULL,
   documentation       TEXT COMMENT 'Full Markdown docs (examples/params)',
+  requirements        JSON COMMENT 'Skill requirements: repo_types, min_access, llm_required',
   skill_code          TEXT COMMENT 'Python code (small skills) or NULL',
   code_ref            VARCHAR(255) COMMENT 'Large codebases: MatrixOne internal repo path',
+  code_hash           VARCHAR(64) COMMENT 'SHA256 hash of skill code for verification',
   input_schema        JSON,
   output_schema       JSON,
   tools_required      JSON COMMENT 'Dependent tool IDs',
   safety_rules        JSON COMMENT '["no_pii", "max_tokens=500"]',
   tags                JSON COMMENT '["customer_service", "data_query"]',
+  is_active           BOOLEAN DEFAULT TRUE COMMENT 'Current active version',
   status              VARCHAR(20) DEFAULT 'active' COMMENT 'active | deprecated | experimental',
   created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   
-  PRIMARY KEY (skill_id, version)
+  PRIMARY KEY (skill_id, version),
+  UNIQUE KEY idx_skill_name_version (skill_name, version),
+  INDEX idx_skill_active (skill_name, is_active)
 ) COMMENT='Versioned skill definitions (first-class citizens)';
 
 -- configs: Key-value configuration
