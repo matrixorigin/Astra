@@ -186,6 +186,28 @@ CREATE TABLE IF NOT EXISTS memory_index_queue (
   INDEX idx_queue_status (status, created_at)
 ) COMMENT='RAG indexing queue (async worker)';
 
+-- repos: Multi-repository management
+CREATE TABLE IF NOT EXISTS repos (
+  repo_id             VARCHAR(64) PRIMARY KEY,
+  repo_url            VARCHAR(500) NOT NULL COMMENT 'Full GitHub URL',
+  repo_type           VARCHAR(50) NOT NULL COMMENT 'code | ci | tester | docs',
+  owner_id            VARCHAR(255) NOT NULL COMMENT 'user_id or tenant_id',
+  owner_type          VARCHAR(50) NOT NULL COMMENT 'user | tenant',
+  repo_group          VARCHAR(255) COMMENT 'Logical grouping (e.g., matrixone-project)',
+  token_id            VARCHAR(64) COMMENT 'Reference to tokens table (NULL = use priority fallback)',
+  access_scope        VARCHAR(50) NOT NULL COMMENT 'read | write | admin',
+  metadata            JSON COMMENT '{"default_branch":"main", "ci_paths":[], "test_paths":[]}',
+  is_active           BOOLEAN DEFAULT TRUE,
+  created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  UNIQUE KEY idx_repo_url_owner (repo_url, owner_id),
+  INDEX idx_owner (owner_id, owner_type),
+  INDEX idx_repo_type (repo_type),
+  INDEX idx_repo_group (repo_group),
+  INDEX idx_token (token_id)
+) COMMENT='Multi-repository management with per-repo tokens';
+
 -- sandbox_metadata: Sandbox lifecycle and metadata
 CREATE TABLE IF NOT EXISTS sandbox_metadata (
   sandbox_name        VARCHAR(255) PRIMARY KEY,
@@ -204,6 +226,28 @@ CREATE TABLE IF NOT EXISTS sandbox_metadata (
   INDEX idx_sandbox_created_by (created_by)
 ) COMMENT='Sandbox metadata and lifecycle management';
 
+-- github_operations: GitHub API operation audit log
+CREATE TABLE IF NOT EXISTS github_operations (
+  operation_id        VARCHAR(64) PRIMARY KEY,
+  event_id            VARCHAR(64) NOT NULL COMMENT 'Link to conversation_events',
+  repo_id             VARCHAR(64) NOT NULL,
+  operation_type      VARCHAR(100) NOT NULL COMMENT 'submit_pr_review | merge_pr | create_issue',
+  operation_params    JSON NOT NULL COMMENT 'Operation parameters',
+  token_id            VARCHAR(64) NOT NULL,
+  is_dry_run          BOOLEAN DEFAULT FALSE COMMENT 'Distinguish simulation from real execution',
+  status              VARCHAR(50) NOT NULL COMMENT 'success | failed | pending',
+  response_code       INT,
+  response_body       JSON,
+  error_message       TEXT,
+  executed_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  duration_ms         INT,
+  
+  INDEX idx_event_id (event_id),
+  INDEX idx_repo_id (repo_id, executed_at),
+  INDEX idx_status (status),
+  INDEX idx_dry_run (is_dry_run)
+) COMMENT='GitHub API operation audit log for replay and compliance';
+
 EOF
 
 echo ""
@@ -218,7 +262,9 @@ echo "  - configs (key-value config)"
 echo "  - tokens (secret management)"
 echo "  - event_evaluations (feedback loop)"
 echo "  - memory_index_queue (RAG pipeline)"
+echo "  - repos (multi-repository management)"
 echo "  - sandbox_metadata (sandbox lifecycle)"
+echo "  - github_operations (GitHub API audit log)"
 echo ""
 echo "Next steps:"
 echo "  1. Verify: make db-connect"

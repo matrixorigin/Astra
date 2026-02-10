@@ -6,9 +6,10 @@ Event-centric intelligent agent platform with conversation replay and time-point
 
 - **Event-Centric Architecture**: All conversations stored as atomic events with full causality tracking
 - **Session Management**: Complete conversation lifecycle management
+- **Multi-Repo Management**: Register and manage multiple repositories (code, CI, tester, docs) with per-repo tokens
 - **Git for Data**: Time-travel queries and isolated sandbox experiments using MatrixOne snapshots
 - **Type-Safe**: 100% type annotations with Pydantic validation
-- **Production-Ready**: Comprehensive test coverage (25+ tests)
+- **Production-Ready**: Comprehensive test coverage (56 tests)
 
 ## Quick Start
 
@@ -36,6 +37,7 @@ make test
 from core.events.event_logger import EventLogger
 from core.events.session_manager import SessionManager
 from core.sandbox import Sandbox, Branch
+from core.repos import RepoRegistry, RepoType, AccessScope, OwnerType
 from sdk import Database
 
 # Initialize
@@ -61,6 +63,17 @@ llm_event = logger.create_llm_response(
     agent_version="0.1.0",
     parent_event_id=user_event.event_id,
     causal_chain_id=user_event.causal_chain_id,
+)
+
+# Multi-repo management
+registry = RepoRegistry(db)
+repo = registry.create(
+    repo_url="https://github.com/matrixorigin/matrixone",
+    repo_type=RepoType.CODE,
+    owner_id="team_matrixone",
+    owner_type=OwnerType.TENANT,
+    access_scope=AccessScope.WRITE,
+    metadata={"default_branch": "main"}
 )
 
 # Sandbox - isolated experiments
@@ -104,7 +117,13 @@ See [examples/](examples/) for more detailed examples.
 - Event counting and tracking
 - Custom metadata support
 
-### 3. Git for Data
+### 3. Multi-Repo Management
+- Register multiple repositories (code, CI, tester, docs)
+- Per-repo token management
+- Owner-based access control (user/tenant)
+- Flexible metadata storage
+
+### 4. Git for Data
 - **Time Machine**: Query data at any point in time (read-only)
 - **Sandbox**: Database-level isolation for experiments
 - **Branch**: Table-level Git-like workflows (create, diff, merge)
@@ -134,7 +153,7 @@ make test-unit          # Unit tests
 make test-integration   # Integration tests
 ```
 
-Current test coverage: **25 tests, 100% passing**
+Current test coverage: **56 tests, 100% passing**
 
 ## Project Status
 
