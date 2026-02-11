@@ -15,12 +15,10 @@ class TestAgentRegistry(unittest.TestCase):
     def test_register_agent(self):
         """Test registering an agent profile."""
         profile = AgentProfile(
-            agent_id="test_agent",
-            system_prompt="Test prompt",
-            skill_filter=["skill1"]
+            agent_id="test_agent", system_prompt="Test prompt", skill_filter=["skill1"]
         )
         self.registry.register(profile)
-        
+
         retrieved = self.registry.get("test_agent")
         self.assertIsNotNone(retrieved)
         self.assertEqual(retrieved.agent_id, "test_agent")
@@ -34,7 +32,7 @@ class TestAgentRegistry(unittest.TestCase):
         """Test listing all agents."""
         self.registry.register(AgentProfile(agent_id="agent1", system_prompt="p1"))
         self.registry.register(AgentProfile(agent_id="agent2", system_prompt="p2"))
-        
+
         agents = self.registry.list_agents()
         self.assertEqual(len(agents), 2)
 
@@ -42,7 +40,7 @@ class TestAgentRegistry(unittest.TestCase):
         """Test unregistering an agent."""
         self.registry.register(AgentProfile(agent_id="test", system_prompt="p"))
         result = self.registry.unregister("test")
-        
+
         self.assertTrue(result)
         self.assertIsNone(self.registry.get("test"))
 
@@ -52,20 +50,21 @@ class TestDelegateTaskSkill(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self.registry = AgentRegistry()
-        self.registry.register(AgentProfile(
-            agent_id="code_reviewer",
-            system_prompt="You are a code reviewer.",
-            skill_filter=["analyze_code"]
-        ))
-        
+        self.registry.register(
+            AgentProfile(
+                agent_id="code_reviewer",
+                system_prompt="You are a code reviewer.",
+                skill_filter=["analyze_code"],
+            )
+        )
+
         # Mock chat_loop_factory
         self.mock_loop = AsyncMock()
         self.mock_loop.run_step = AsyncMock(return_value="Review result")
         self.loop_factory = MagicMock(return_value=self.mock_loop)
-        
+
         self.skill = DelegateTaskSkill(
-            agent_registry=self.registry,
-            chat_loop_factory=self.loop_factory
+            agent_registry=self.registry, chat_loop_factory=self.loop_factory
         )
 
     async def test_execute_valid_agent(self):
@@ -74,11 +73,11 @@ class TestDelegateTaskSkill(unittest.IsolatedAsyncioTestCase):
             agent_id="code_reviewer",
             task="Review this PR",
             session_id="session_1",
-            user_id="user_1"
+            user_id="user_1",
         )
-        
+
         result = await self.skill.execute(input_data)
-        
+
         self.assertTrue(result.success)
         self.assertEqual(result.agent_id, "code_reviewer")
         self.assertEqual(result.result, "Review result")
@@ -90,11 +89,11 @@ class TestDelegateTaskSkill(unittest.IsolatedAsyncioTestCase):
             agent_id="nonexistent_agent",
             task="Review this PR",
             session_id="session_1",
-            user_id="user_1"
+            user_id="user_1",
         )
-        
+
         result = await self.skill.execute(input_data)
-        
+
         self.assertFalse(result.success)
         self.assertIn("not found", result.result)
 
@@ -105,15 +104,15 @@ class TestDelegateTaskSkill(unittest.IsolatedAsyncioTestCase):
             task="Review this PR",
             context="Additional context",
             session_id="session_1",
-            user_id="user_1"
+            user_id="user_1",
         )
-        
+
         result = await self.skill.execute(input_data)
-        
+
         self.assertTrue(result.success)
         # Verify the loop was created with the correct system prompt
         self.loop_factory.assert_called_once_with(system_prompt="You are a code reviewer.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

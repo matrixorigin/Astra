@@ -3,8 +3,14 @@
 from typing import Any
 
 from core.skills.base import (
-    Skill, SkillInput, SkillOutput, SkillRequirement, 
-    RepoType, AccessScope, SideEffectCategory, SideEffectProfile
+    Skill,
+    SkillInput,
+    SkillOutput,
+    SkillRequirement,
+    RepoType,
+    AccessScope,
+    SideEffectCategory,
+    SideEffectProfile,
 )
 from core.logging_config import get_logger
 from core.events.models import StreamEvent, StreamEventType
@@ -39,13 +45,9 @@ class DelegateTaskSkill(Skill):
     version: str = "1.0.0"
     description: str = "Delegate a task to another agent for execution"
     requirements: SkillRequirement = SkillRequirement(
-        repo_types=[RepoType.CODE, RepoType.DOCS],
-        min_access=AccessScope.READ,
-        llm_required=True
+        repo_types=[RepoType.CODE, RepoType.DOCS], min_access=AccessScope.READ, llm_required=True
     )
-    side_effect_profile = SideEffectProfile(
-        category=SideEffectCategory.READ
-    )
+    side_effect_profile = SideEffectProfile(category=SideEffectCategory.READ)
 
     def __init__(self, agent_registry, chat_loop_factory):
         """Initialize delegation skill.
@@ -62,7 +64,7 @@ class DelegateTaskSkill(Skill):
         # Extract session_id and user_id from input or use defaults
         session_id = input_data.get("session_id", "default_session")
         user_id = input_data.get("user_id", "default_user")
-        
+
         return DelegateTaskInput(
             agent_id=input_data.get("agent_id", ""),
             task=input_data.get("task", ""),

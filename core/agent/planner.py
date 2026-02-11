@@ -90,7 +90,9 @@ def get_plan_constraints() -> PlanConstraints:
         max_steps=int(os.getenv("MAX_PLAN_STEPS", "10")),
         max_revisions=int(os.getenv("MAX_PLAN_REVISIONS", "3")),
         timeout_seconds=int(os.getenv("PLAN_TIMEOUT_SECONDS", "300")),
-        cost_budget_usd=float(os.getenv("PLAN_COST_BUDGET_USD", "0")) if os.getenv("PLAN_COST_BUDGET_USD") else None,
+        cost_budget_usd=float(os.getenv("PLAN_COST_BUDGET_USD", "0"))
+        if os.getenv("PLAN_COST_BUDGET_USD")
+        else None,
         sandbox_required=os.getenv("PLAN_SANDBOX_REQUIRED", "false").lower() == "true",
     )
 
@@ -104,7 +106,7 @@ class Planner:
 
     async def create_plan(self, goal: str, context: str = "") -> Plan:
         """Ask LLM to decompose goal into steps.
-        
+
         Returns Plan Pydantic model with validation.
         """
         system_prompt = f"""You are a planning assistant. Your task is to break down complex goals into executable steps.
@@ -188,18 +190,15 @@ Output format (JSON):
                 constraints=self.constraints.model_dump(),
             )
 
-    async def reflect(
-        self, plan: Plan, step_results: list[dict]
-    ) -> tuple[str, Plan | None]:
+    async def reflect(self, plan: Plan, step_results: list[dict]) -> tuple[str, Plan | None]:
         """Evaluate progress and decide whether to revise plan.
-        
+
         Returns: (assessment, revised_plan_or_None)
         """
         # Build reflection prompt
         plan_summary = f"Goal: {plan.goal}\nSteps: {len(plan.steps)}"
         results_summary = "\n".join(
-            f"  - {r['step_id']}: {r.get('result', 'N/A')}"
-            for r in step_results
+            f"  - {r['step_id']}: {r.get('result', 'N/A')}" for r in step_results
         )
 
         system_prompt = f"""You are a planning assistant reviewing progress.
@@ -249,9 +248,7 @@ Output format (JSON):
             if review.get("should_revise", False) and review.get("revised_steps"):
                 # Validate and create revised Plan model
                 try:
-                    revised_steps = [
-                        PlanStep(**s) for s in review["revised_steps"]
-                    ]
+                    revised_steps = [PlanStep(**s) for s in review["revised_steps"]]
                     revised_plan = Plan(
                         plan_id=f"{plan.plan_id}_rev_{len([s for s in plan.steps if s.status == PlanStatus.REVISED]) + 1}",
                         goal=plan.goal,
@@ -272,9 +269,7 @@ Output format (JSON):
 
     def get_next_steps(self, plan: Plan) -> list[PlanStep]:
         """Return steps whose dependencies are all completed."""
-        completed_ids = {
-            s.step_id for s in plan.steps if s.status == PlanStatus.COMPLETED
-        }
+        completed_ids = {s.step_id for s in plan.steps if s.status == PlanStatus.COMPLETED}
 
         next_steps = []
         for step in plan.steps:
@@ -288,7 +283,7 @@ Output format (JSON):
 
     def check_constraints(self, plan: Plan) -> tuple[bool, str | None]:
         """Check if plan violates any constraints.
-        
+
         Returns: (is_valid, error_message)
         """
         if len(plan.steps) > self.constraints.max_steps:

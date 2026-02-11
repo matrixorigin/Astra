@@ -28,10 +28,10 @@ class SkillRegistry:
         triggers: list = None,
         dependencies: list = None,
         priority: int = 5,
-        cost_estimate: str = "medium"
+        cost_estimate: str = "medium",
     ) -> None:
         """Register a skill version with metadata.
-        
+
         Args:
             skill: Skill instance
             is_active: Whether this version is active
@@ -95,7 +95,7 @@ class SkillRegistry:
                     json.dumps(dependencies or []),
                     priority,
                     cost_estimate,
-                    skill.side_effect_profile.category.value
+                    skill.side_effect_profile.category.value,
                 ),
             )
 
@@ -105,7 +105,9 @@ class SkillRegistry:
             if is_active:
                 self._skills[skill.name] = skill  # Shortcut to active version
 
-            logger.info(f"Successfully registered skill: {skill.name}@{skill.version} (category={category}, priority={priority})")
+            logger.info(
+                f"Successfully registered skill: {skill.name}@{skill.version} (category={category}, priority={priority})"
+            )
 
         except Exception as e:
             logger.error(f"Failed to register skill {skill.name}@{skill.version}: {e}")
@@ -113,7 +115,7 @@ class SkillRegistry:
 
     def get(self, skill_name: str, version: str = None) -> Optional[Skill]:
         """Get skill by name and optional version
-        
+
         Raises:
             SkillNotFoundError: If skill not found
         """
@@ -121,17 +123,17 @@ class SkillRegistry:
             skill = self._skills.get(f"{skill_name}@{version}")
         else:
             skill = self._skills.get(skill_name)  # Active version
-        
+
         if skill is None:
             logger.warning(f"Skill not found: {skill_name}@{version or 'active'}")
             raise SkillNotFoundError(skill_name, version)
-        
+
         return skill
 
     def list_available(self, repo_id: int) -> list[Skill]:
         """List skills available for a repo"""
         logger.debug(f"Listing available skills for repo {repo_id}")
-        
+
         # Query repo type and access scope
         repo = self.db.fetchone(
             """
@@ -153,9 +155,7 @@ class SkillRegistry:
 
             if repo["repo_type"] in [
                 rt.value for rt in skill.requirements.repo_types
-            ] and self._has_access(
-                repo["access_scope"], skill.requirements.min_access.value
-            ):
+            ] and self._has_access(repo["access_scope"], skill.requirements.min_access.value):
                 available.append(skill)
 
         logger.debug(f"Found {len(available)} available skills for repo {repo_id}")

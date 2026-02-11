@@ -70,9 +70,7 @@ def test_get_by_url(registry, db):
         access_scope=AccessScope.ADMIN,
     )
 
-    retrieved = registry.get_by_url(
-        "https://github.com/matrixorigin/mo-ci", "user_123"
-    )
+    retrieved = registry.get_by_url("https://github.com/matrixorigin/mo-ci", "user_123")
     assert retrieved is not None
     assert retrieved.repo_id == repo.repo_id
 

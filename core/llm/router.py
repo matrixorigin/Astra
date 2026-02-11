@@ -28,12 +28,14 @@ class ModelConfig(BaseModel):
 
 # ── Routing Strategies (#1 MoE, #2 Pluggable) ─────────────────
 
+
 class RoutingStrategy(ABC):
     """Pluggable routing strategy interface."""
 
     @abstractmethod
-    def select(self, model: str, registry: "ModelRegistry",
-               task_hint: str | None = None) -> list[ModelConfig]:
+    def select(
+        self, model: str, registry: "ModelRegistry", task_hint: str | None = None
+    ) -> list[ModelConfig]:
         """Return ordered list of models to try (primary + fallbacks)."""
         ...
 
@@ -99,42 +101,100 @@ class CostOptimizedStrategy(RoutingStrategy):
 # ── Model Registry ─────────────────────────────────────────────
 
 DEFAULT_MODELS: list[ModelConfig] = [
-    ModelConfig(model_name="gpt-4o", provider=LLMProvider.OPENAI,
-                context_window=128000, price_per_1k_prompt=0.0025,
-                price_per_1k_completion=0.01, rpm_limit=500, tpm_limit=150000,
-                fallback_to="gpt-4o-mini", tags=["code", "reasoning"]),
-    ModelConfig(model_name="gpt-4o-mini", provider=LLMProvider.OPENAI,
-                context_window=128000, price_per_1k_prompt=0.00015,
-                price_per_1k_completion=0.0006, rpm_limit=1000, tpm_limit=200000,
-                tags=["fast", "cheap"]),
-    ModelConfig(model_name="gpt-4", provider=LLMProvider.OPENAI,
-                context_window=8192, price_per_1k_prompt=0.03,
-                price_per_1k_completion=0.06, rpm_limit=200, tpm_limit=40000,
-                fallback_to="gpt-4o", tags=["reasoning"]),
-    ModelConfig(model_name="gpt-4-turbo", provider=LLMProvider.OPENAI,
-                context_window=128000, price_per_1k_prompt=0.01,
-                price_per_1k_completion=0.03, rpm_limit=500, tpm_limit=150000,
-                fallback_to="gpt-4o", tags=["reasoning"]),
-    ModelConfig(model_name="gpt-3.5-turbo", provider=LLMProvider.OPENAI,
-                context_window=16385, price_per_1k_prompt=0.0005,
-                price_per_1k_completion=0.0015, rpm_limit=1000, tpm_limit=200000,
-                tags=["fast", "cheap"]),
-    ModelConfig(model_name="llama3-70b", provider=LLMProvider.GROQ,
-                context_window=8192, price_per_1k_prompt=0.0007,
-                price_per_1k_completion=0.0008, rpm_limit=30, tpm_limit=6000,
-                fallback_to="gpt-4o-mini", tags=["fast"]),
-    ModelConfig(model_name="mixtral-8x7b", provider=LLMProvider.GROQ,
-                context_window=32768, price_per_1k_prompt=0.0003,
-                price_per_1k_completion=0.0003, rpm_limit=30, tpm_limit=5000,
-                tags=["fast", "cheap"]),
-    ModelConfig(model_name="claude-3-5-sonnet-20241022", provider=LLMProvider.ANTHROPIC,
-                context_window=200000, price_per_1k_prompt=0.003,
-                price_per_1k_completion=0.015, rpm_limit=50, tpm_limit=40000,
-                tags=["code", "reasoning"]),
-    ModelConfig(model_name="claude-3-haiku-20240307", provider=LLMProvider.ANTHROPIC,
-                context_window=200000, price_per_1k_prompt=0.00025,
-                price_per_1k_completion=0.00125, rpm_limit=100, tpm_limit=50000,
-                tags=["fast", "cheap"]),
+    ModelConfig(
+        model_name="gpt-4o",
+        provider=LLMProvider.OPENAI,
+        context_window=128000,
+        price_per_1k_prompt=0.0025,
+        price_per_1k_completion=0.01,
+        rpm_limit=500,
+        tpm_limit=150000,
+        fallback_to="gpt-4o-mini",
+        tags=["code", "reasoning"],
+    ),
+    ModelConfig(
+        model_name="gpt-4o-mini",
+        provider=LLMProvider.OPENAI,
+        context_window=128000,
+        price_per_1k_prompt=0.00015,
+        price_per_1k_completion=0.0006,
+        rpm_limit=1000,
+        tpm_limit=200000,
+        tags=["fast", "cheap"],
+    ),
+    ModelConfig(
+        model_name="gpt-4",
+        provider=LLMProvider.OPENAI,
+        context_window=8192,
+        price_per_1k_prompt=0.03,
+        price_per_1k_completion=0.06,
+        rpm_limit=200,
+        tpm_limit=40000,
+        fallback_to="gpt-4o",
+        tags=["reasoning"],
+    ),
+    ModelConfig(
+        model_name="gpt-4-turbo",
+        provider=LLMProvider.OPENAI,
+        context_window=128000,
+        price_per_1k_prompt=0.01,
+        price_per_1k_completion=0.03,
+        rpm_limit=500,
+        tpm_limit=150000,
+        fallback_to="gpt-4o",
+        tags=["reasoning"],
+    ),
+    ModelConfig(
+        model_name="gpt-3.5-turbo",
+        provider=LLMProvider.OPENAI,
+        context_window=16385,
+        price_per_1k_prompt=0.0005,
+        price_per_1k_completion=0.0015,
+        rpm_limit=1000,
+        tpm_limit=200000,
+        tags=["fast", "cheap"],
+    ),
+    ModelConfig(
+        model_name="llama3-70b",
+        provider=LLMProvider.GROQ,
+        context_window=8192,
+        price_per_1k_prompt=0.0007,
+        price_per_1k_completion=0.0008,
+        rpm_limit=30,
+        tpm_limit=6000,
+        fallback_to="gpt-4o-mini",
+        tags=["fast"],
+    ),
+    ModelConfig(
+        model_name="mixtral-8x7b",
+        provider=LLMProvider.GROQ,
+        context_window=32768,
+        price_per_1k_prompt=0.0003,
+        price_per_1k_completion=0.0003,
+        rpm_limit=30,
+        tpm_limit=5000,
+        tags=["fast", "cheap"],
+    ),
+    ModelConfig(
+        model_name="claude-3-5-sonnet-20241022",
+        provider=LLMProvider.ANTHROPIC,
+        context_window=200000,
+        price_per_1k_prompt=0.003,
+        price_per_1k_completion=0.015,
+        rpm_limit=50,
+        tpm_limit=40000,
+        tags=["code", "reasoning"],
+    ),
+    ModelConfig(
+        model_name="claude-3-haiku-20240307",
+        provider=LLMProvider.ANTHROPIC,
+        context_window=200000,
+        price_per_1k_prompt=0.00025,
+        price_per_1k_completion=0.00125,
+        rpm_limit=100,
+        tpm_limit=50000,
+        tags=["fast", "cheap"],
+    ),
 ]
 
 
@@ -143,7 +203,7 @@ class ModelRegistry:
 
     def __init__(self, use_defaults: bool = True):
         """Initialize model registry.
-        
+
         Args:
             use_defaults: If True, load DEFAULT_MODELS. Set to False in production
                          to enforce strict database-based access control.
@@ -155,7 +215,7 @@ class ModelRegistry:
 
     def load_from_db(self, db, user_id: str | None = None, tenant_id: str | None = None):
         """Load model registry with scope-based access control.
-        
+
         Priority: user > tenant > global
         """
         try:
@@ -164,29 +224,32 @@ class ModelRegistry:
                 row = db.fetchone(
                     "SELECT value FROM configs WHERE key_name = 'model_registry' "
                     "AND scope_type = 'user' AND scope_id = %s LIMIT 1",
-                    (user_id,))
+                    (user_id,),
+                )
                 if row:
                     for c in json.loads(row["value"]):
                         mc = ModelConfig(**c)
                         self._models[mc.model_name] = mc
                     return
-            
+
             # Try tenant scope
             if tenant_id:
                 row = db.fetchone(
                     "SELECT value FROM configs WHERE key_name = 'model_registry' "
                     "AND scope_type = 'tenant' AND scope_id = %s LIMIT 1",
-                    (tenant_id,))
+                    (tenant_id,),
+                )
                 if row:
                     for c in json.loads(row["value"]):
                         mc = ModelConfig(**c)
                         self._models[mc.model_name] = mc
                     return
-            
+
             # Fallback to global scope
             row = db.fetchone(
                 "SELECT value FROM configs WHERE key_name = 'model_registry' "
-                "AND scope_type = 'global' LIMIT 1")
+                "AND scope_type = 'global' LIMIT 1"
+            )
             if row:
                 for c in json.loads(row["value"]):
                     mc = ModelConfig(**c)
@@ -196,7 +259,7 @@ class ModelRegistry:
 
     def get(self, model_name: str) -> ModelConfig | None:
         return self._models.get(model_name)
-    
+
     def list_models(self) -> list[ModelConfig]:
         """List all models (active and inactive)."""
         return list(self._models.values())
@@ -217,14 +280,20 @@ class ModelRegistry:
 
 # ── ModelRouter (composes registry + strategy) ─────────────────
 
+
 class ModelRouter:
     """Routes model requests using pluggable strategy."""
 
-    def __init__(self, db=None, strategy: RoutingStrategy | None = None, 
-                 user_id: str | None = None, tenant_id: str | None = None,
-                 use_defaults: bool = True):
+    def __init__(
+        self,
+        db=None,
+        strategy: RoutingStrategy | None = None,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
+        use_defaults: bool = True,
+    ):
         """Initialize model router.
-        
+
         Args:
             use_defaults: If True, load DEFAULT_MODELS as fallback. Set to False
                          in production to enforce strict scope-based access control.
@@ -247,8 +316,10 @@ class ModelRouter:
         cfg = self.registry.get(model_name)
         if not cfg:
             return 0.0
-        cost = (tokens_prompt * cfg.price_per_1k_prompt / 1000
-                + tokens_completion * cfg.price_per_1k_completion / 1000)
+        cost = (
+            tokens_prompt * cfg.price_per_1k_prompt / 1000
+            + tokens_completion * cfg.price_per_1k_completion / 1000
+        )
         return round(cost, 6)
 
     def estimate_cost(self, model_name: str, estimated_tokens: int) -> float:

@@ -20,18 +20,22 @@ def db():
         (
             "llm_config",
             "llm_config",
-            json.dumps({
-                "provider": "openai",
-                "model": "gpt-4",
-                "temperature": 0.7,
-                "max_tokens": 2000,
-            }),
-            json.dumps({
-                "provider": "openai",
-                "model": "gpt-4",
-                "temperature": 0.7,
-                "max_tokens": 2000,
-            }),
+            json.dumps(
+                {
+                    "provider": "openai",
+                    "model": "gpt-4",
+                    "temperature": 0.7,
+                    "max_tokens": 2000,
+                }
+            ),
+            json.dumps(
+                {
+                    "provider": "openai",
+                    "model": "gpt-4",
+                    "temperature": 0.7,
+                    "max_tokens": 2000,
+                }
+            ),
         ),
     )
     yield db

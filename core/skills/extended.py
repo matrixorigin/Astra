@@ -10,29 +10,30 @@ from sdk import Database
 # Code Review Skill
 # ============================================================================
 
+
 class CodeReviewInput(SkillInput):
     pr_number: int
     focus: str = "all"
 
+
 class CodeReviewOutput(SkillOutput):
     review: Dict[str, Any]
+
 
 class CodeReviewSkill(Skill):
     name = "code_review"
     version = "1.0.0"
     description = "Review code changes in a pull request"
     requirements = SkillRequirement(
-        repo_types=[RepoType.CODE],
-        min_access=AccessScope.READ,
-        llm_required=False
+        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
     )
     input_schema = CodeReviewInput
     output_schema = CodeReviewOutput
-    
+
     def __init__(self, db: Database, github: GitHubClient):
         self.db = db
         self.github = github
-    
+
     def execute(self, input: CodeReviewInput) -> CodeReviewOutput:
         pr = self.github.get_pr(input.repo_id, input.pr_number)
         review = {
@@ -41,7 +42,7 @@ class CodeReviewSkill(Skill):
             "additions": pr.get("additions", 0),
             "deletions": pr.get("deletions", 0),
             "focus": input.focus,
-            "suggestions": []
+            "suggestions": [],
         }
         if review["additions"] > 500:
             review["suggestions"].append("Large PR - consider splitting")
@@ -52,35 +53,32 @@ class CodeReviewSkill(Skill):
 # Search Code Skill
 # ============================================================================
 
+
 class SearchCodeInput(SkillInput):
     query: str
     file_pattern: str = "*"
 
+
 class SearchCodeOutput(SkillOutput):
     results: List[Dict[str, Any]]
+
 
 class SearchCodeSkill(Skill):
     name = "search_code"
     version = "1.0.0"
     description = "Search code in repository"
     requirements = SkillRequirement(
-        repo_types=[RepoType.CODE],
-        min_access=AccessScope.READ,
-        llm_required=False
+        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
     )
     input_schema = SearchCodeInput
     output_schema = SearchCodeOutput
-    
+
     def __init__(self, db: Database, github: GitHubClient):
         self.db = db
         self.github = github
-    
+
     def execute(self, input: SearchCodeInput) -> SearchCodeOutput:
-        results = [{
-            "file": "example.py",
-            "line": 42,
-            "content": f"Match for: {input.query}"
-        }]
+        results = [{"file": "example.py", "line": 42, "content": f"Match for: {input.query}"}]
         return SearchCodeOutput(success=True, result=results, results=results)
 
 
@@ -88,29 +86,30 @@ class SearchCodeSkill(Skill):
 # Generate Tests Skill
 # ============================================================================
 
+
 class GenerateTestsInput(SkillInput):
     file_path: str
     function_name: str
 
+
 class GenerateTestsOutput(SkillOutput):
     test_code: str
+
 
 class GenerateTestsSkill(Skill):
     name = "generate_tests"
     version = "1.0.0"
     description = "Generate unit tests for code"
     requirements = SkillRequirement(
-        repo_types=[RepoType.CODE],
-        min_access=AccessScope.READ,
-        llm_required=True
+        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=True
     )
     input_schema = GenerateTestsInput
     output_schema = GenerateTestsOutput
-    
+
     def __init__(self, db: Database, github: GitHubClient):
         self.db = db
         self.github = github
-    
+
     def execute(self, input: GenerateTestsInput) -> GenerateTestsOutput:
         test_code = f"def test_{input.function_name}():\n    pass"
         return GenerateTestsOutput(success=True, result=test_code, test_code=test_code)
@@ -120,33 +119,34 @@ class GenerateTestsSkill(Skill):
 # Analyze Bug Skill
 # ============================================================================
 
+
 class AnalyzeBugInput(SkillInput):
     issue_number: int
 
+
 class AnalyzeBugOutput(SkillOutput):
     analysis: Dict[str, Any]
+
 
 class AnalyzeBugSkill(Skill):
     name = "analyze_bug"
     version = "1.0.0"
     description = "Analyze bug reports and suggest fixes"
     requirements = SkillRequirement(
-        repo_types=[RepoType.CODE],
-        min_access=AccessScope.READ,
-        llm_required=True
+        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=True
     )
     input_schema = AnalyzeBugInput
     output_schema = AnalyzeBugOutput
-    
+
     def __init__(self, db: Database, github: GitHubClient):
         self.db = db
         self.github = github
-    
+
     def execute(self, input: AnalyzeBugInput) -> AnalyzeBugOutput:
         analysis = {
             "issue_number": input.issue_number,
             "severity": "medium",
-            "suggested_fix": "Investigate further"
+            "suggested_fix": "Investigate further",
         }
         return AnalyzeBugOutput(success=True, result=analysis, analysis=analysis)
 
@@ -155,20 +155,45 @@ class AnalyzeBugSkill(Skill):
 # Registration Helper
 # ============================================================================
 
+
 def register_extended_skills(registry, db, github=None):
     """Register all extended skills."""
     from core.skills.github_client import GitHubClient
-    
+
     if github is None:
         github = GitHubClient(db)
-    
+
     skills = [
-        (CodeReviewSkill(db, github), "github", "pr_management", ["review", "code review"], [], 8, "medium"),
+        (
+            CodeReviewSkill(db, github),
+            "github",
+            "pr_management",
+            ["review", "code review"],
+            [],
+            8,
+            "medium",
+        ),
         (SearchCodeSkill(db, github), "code", "analysis", ["search", "find", "code"], [], 6, "low"),
-        (GenerateTestsSkill(db, github), "code", "testing", ["test", "generate", "unit test"], ["search_code"], 7, "high"),
-        (AnalyzeBugSkill(db, github), "github", "issue_management", ["bug", "issue", "analyze"], ["search_code"], 7, "high"),
+        (
+            GenerateTestsSkill(db, github),
+            "code",
+            "testing",
+            ["test", "generate", "unit test"],
+            ["search_code"],
+            7,
+            "high",
+        ),
+        (
+            AnalyzeBugSkill(db, github),
+            "github",
+            "issue_management",
+            ["bug", "issue", "analyze"],
+            ["search_code"],
+            7,
+            "high",
+        ),
     ]
-    
+
     for skill, category, subcategory, triggers, dependencies, priority, cost in skills:
         try:
             registry.register(
@@ -179,7 +204,7 @@ def register_extended_skills(registry, db, github=None):
                 triggers=triggers,
                 dependencies=dependencies,
                 priority=priority,
-                cost_estimate=cost
+                cost_estimate=cost,
             )
         except Exception as e:
             pass  # Already registered

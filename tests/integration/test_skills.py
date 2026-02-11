@@ -50,9 +50,7 @@ def test_skill_registry_register(db, registry, llm, github):
     assert registry.get("summarize_pr").version == "1.0.0"
 
     # Check database
-    row = db.fetchone(
-        "SELECT * FROM skills_registry WHERE skill_name = %s", ("summarize_pr",)
-    )
+    row = db.fetchone("SELECT * FROM skills_registry WHERE skill_name = %s", ("summarize_pr",))
     assert row is not None
     assert row["version"] == "1.0.0"
     assert row["is_active"] in (1, True, "true")  # Handle different DB return types
@@ -97,7 +95,12 @@ def test_skill_registry_list_available(db, registry, llm, github):
     registry.register(CIStatusSkill(db, github))
 
     # Create a CODE repo with unique URL
-    from core.repos import RepoRegistry, RepoType as RepoTypeEnum, AccessScope as AccessScopeEnum, OwnerType
+    from core.repos import (
+        RepoRegistry,
+        RepoType as RepoTypeEnum,
+        AccessScope as AccessScopeEnum,
+        OwnerType,
+    )
     import time
 
     repo_registry = RepoRegistry(db)
@@ -126,7 +129,7 @@ async def test_summarize_pr_skill(db, llm, github, monkeypatch):
     """Test summarize_pr skill execution"""
     # Mock LLM response
     from core.llm.models import LLMResponse, LLMProvider
-    
+
     async def mock_chat(*args, **kwargs):
         return LLMResponse(
             content="This PR adds a new feature",
@@ -138,7 +141,7 @@ async def test_summarize_pr_skill(db, llm, github, monkeypatch):
             latency_ms=1000,
             cost_usd=0.002,
         )
-    
+
     # Mock GitHub API calls
     async def mock_get_pr(repo_id, pr_number):
         return {
@@ -154,14 +157,14 @@ async def test_summarize_pr_skill(db, llm, github, monkeypatch):
             "updated_at": "2026-02-10T00:00:00Z",
             "html_url": f"https://github.com/owner/repo/pull/{pr_number}",
         }
-    
+
     async def mock_get_pr_diff(repo_id, pr_number):
         return "diff --git a/file.py b/file.py\n+added line\n-removed line"
-    
+
     monkeypatch.setattr(llm, "chat", mock_chat)
     monkeypatch.setattr(github, "get_pr", mock_get_pr)
     monkeypatch.setattr(github, "get_pr_diff", mock_get_pr_diff)
-    
+
     skill = SummarizePRSkill(db, llm, github)
 
     input_data = {
@@ -184,6 +187,7 @@ async def test_summarize_pr_skill(db, llm, github, monkeypatch):
 @pytest.mark.asyncio
 async def test_list_prs_skill(db, github, monkeypatch):
     """Test list_prs skill execution"""
+
     # Mock GitHub API call
     async def mock_list_prs(repo_id, state, limit):
         return [
@@ -197,9 +201,9 @@ async def test_list_prs_skill(db, github, monkeypatch):
             }
             for i in range(1, limit + 1)
         ]
-    
+
     monkeypatch.setattr(github, "list_prs", mock_list_prs)
-    
+
     skill = ListPRsSkill(db, github)
 
     input_data = {
@@ -221,6 +225,7 @@ async def test_list_prs_skill(db, github, monkeypatch):
 @pytest.mark.asyncio
 async def test_ci_status_skill(db, github, monkeypatch):
     """Test ci_status skill execution"""
+
     # Mock GitHub API call
     async def mock_list_workflow_runs(repo_id, limit):
         return [
@@ -233,9 +238,9 @@ async def test_ci_status_skill(db, github, monkeypatch):
             }
             for i in range(1, limit + 1)
         ]
-    
+
     monkeypatch.setattr(github, "list_workflow_runs", mock_list_workflow_runs)
-    
+
     skill = CIStatusSkill(db, github)
 
     input_data = {

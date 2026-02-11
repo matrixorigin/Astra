@@ -87,8 +87,9 @@ class RateLimiter:
         self._rpm_buckets[model] = TokenBucket(rpm)
         self._tpm_buckets[model] = TokenBucket(tpm)
 
-    def configure_breaker(self, provider: str, failure_threshold: int = 5,
-                          recovery_timeout: float = 60.0):
+    def configure_breaker(
+        self, provider: str, failure_threshold: int = 5, recovery_timeout: float = 60.0
+    ):
         self._breakers[provider] = CircuitBreaker(failure_threshold, recovery_timeout)
 
     def get_breaker(self, provider: str) -> CircuitBreaker:
@@ -109,8 +110,9 @@ class RateLimiter:
             return False
         return True
 
-    def wait_and_acquire(self, model: str, estimated_tokens: int = 1,
-                         timeout: float = 30.0) -> bool:
+    def wait_and_acquire(
+        self, model: str, estimated_tokens: int = 1, timeout: float = 30.0
+    ) -> bool:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.acquire(model, estimated_tokens):

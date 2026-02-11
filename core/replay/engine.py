@@ -30,12 +30,12 @@ class ReplayEngine:
 
         Returns:
             dict with replay results
-            
+
         Raises:
             ReplayError: If replay fails
         """
         logger.info(f"Starting replay for session: {session_id}")
-        
+
         try:
             # 1. Fetch events
             query = """
@@ -56,7 +56,9 @@ class ReplayEngine:
 
             if not events:
                 logger.warning(f"No events found for session {session_id}")
-                raise ReplayError(f"No events found for session {session_id}", session_id=session_id)
+                raise ReplayError(
+                    f"No events found for session {session_id}", session_id=session_id
+                )
 
             # 2. Replay each skill execution event
             results = []
@@ -65,15 +67,17 @@ class ReplayEngine:
                     result = await self._replay_skill_execution(event)
                     results.append(result)
 
-            logger.info(f"Replay completed for session {session_id}: {len(results)} events replayed")
-            
+            logger.info(
+                f"Replay completed for session {session_id}: {len(results)} events replayed"
+            )
+
             return {
                 "success": True,
                 "session_id": session_id,
                 "events_replayed": len(results),
                 "results": results,
             }
-            
+
         except ReplayError:
             raise
         except Exception as e:
@@ -126,7 +130,7 @@ class ReplayEngine:
             output = await skill.execute(input_obj)
 
             logger.info(f"Successfully replayed skill: {skill_name}@{skill_version}")
-            
+
             return {
                 "success": True,
                 "event_id": event["event_id"],
@@ -179,9 +183,7 @@ class ReplayEngine:
                 skill_key = f"{event['skill_name']}@{event['skill_version']}"
 
                 if skill_key not in skill_versions_checked:
-                    skill = self.registry.get(
-                        event["skill_name"], version=event["skill_version"]
-                    )
+                    skill = self.registry.get(event["skill_name"], version=event["skill_version"])
                     if not skill:
                         issues.append(
                             {

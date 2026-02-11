@@ -8,6 +8,7 @@ from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+
 class AgentExecutor:
     """Executes skills safely using the ToolMockingLayer."""
 
@@ -18,25 +19,25 @@ class AgentExecutor:
         self.mock_layer = ToolMockingLayer(mode, db)
 
     def execute_skill(
-        self, 
-        skill_name: str, 
-        params: Dict[str, Any], 
+        self,
+        skill_name: str,
+        params: Dict[str, Any],
         session_id: str,
-        parent_event_id: Optional[str] = None
+        parent_event_id: Optional[str] = None,
     ) -> Any:
         """Execute a single skill safely.
-        
+
         Args:
             skill_name: Name of the skill to execute.
             params: Parameters for the skill.
             session_id: The current session ID.
             parent_event_id: The ID of the parent event (e.g. user message).
-            
+
         Returns:
             The result of the skill execution.
         """
         logger.info(f"Executing skill: {skill_name} with params: {params}")
-        
+
         # 1. Get skill from registry
         skill = self.registry.get(skill_name)
         if not skill:
@@ -45,10 +46,7 @@ class AgentExecutor:
         # 2. Execute via Mocking Layer (handles side-effect isolation)
         try:
             result = self.mock_layer.execute(
-                skill=skill,
-                params=params,
-                session_id=session_id,
-                parent_event_id=parent_event_id
+                skill=skill, params=params, session_id=session_id, parent_event_id=parent_event_id
             )
             return result
         except Exception as e:

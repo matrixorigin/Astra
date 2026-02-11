@@ -32,7 +32,7 @@ class TestNeedsPlanning(unittest.TestCase):
         # Exactly 200 characters
         query_200 = "a" * 200
         self.assertFalse(_needs_planning(query_200))
-        
+
         # 201 characters
         query_201 = "a" * 201
         self.assertTrue(_needs_planning(query_201))
@@ -45,55 +45,32 @@ class TestMergeToolCallFragments(unittest.TestCase):
         """Test merging a single fragment."""
         fragments = []
         new_fragments = [
-            {
-                "id": "call_1",
-                "function": {"name": "test", "arguments": '{"key": "value"}'}
-            }
+            {"id": "call_1", "function": {"name": "test", "arguments": '{"key": "value"}'}}
         ]
-        
+
         result = _merge_tool_call_fragments(fragments, new_fragments)
-        
+
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["id"], "call_1")
         self.assertEqual(result[0]["function"]["name"], "test")
 
     def test_merge_multiple_fragments(self):
         """Test merging multiple fragments for same call."""
-        fragments = [
-            {
-                "id": "call_1",
-                "function": {"name": "test", "arguments": '{"key": "val'}
-            }
-        ]
-        new_fragments = [
-            {
-                "id": "call_1",
-                "function": {"name": "test", "arguments": 'ue"}'}
-            }
-        ]
-        
+        fragments = [{"id": "call_1", "function": {"name": "test", "arguments": '{"key": "val'}}]
+        new_fragments = [{"id": "call_1", "function": {"name": "test", "arguments": 'ue"}'}}]
+
         result = _merge_tool_call_fragments(fragments, new_fragments)
-        
+
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["function"]["arguments"], '{"key": "value"}')
 
     def test_merge_different_calls(self):
         """Test merging fragments for different tool calls."""
-        fragments = [
-            {
-                "id": "call_1",
-                "function": {"name": "tool1", "arguments": '{"a": 1}'}
-            }
-        ]
-        new_fragments = [
-            {
-                "id": "call_2",
-                "function": {"name": "tool2", "arguments": '{"b": 2}'}
-            }
-        ]
-        
+        fragments = [{"id": "call_1", "function": {"name": "tool1", "arguments": '{"a": 1}'}}]
+        new_fragments = [{"id": "call_2", "function": {"name": "tool2", "arguments": '{"b": 2}'}}]
+
         result = _merge_tool_call_fragments(fragments, new_fragments)
-        
+
         self.assertEqual(len(result), 2)
         names = [r["function"]["name"] for r in result]
         self.assertIn("tool1", names)
@@ -117,9 +94,9 @@ class TestPlannerGetNextSteps(unittest.TestCase):
                 PlanStep(step_id="step_2", description="Step 2"),
             ],
         )
-        
+
         next_steps = self.planner.get_next_steps(plan)
-        
+
         self.assertEqual(len(next_steps), 2)
 
     def test_get_next_steps_with_completed(self):
@@ -132,9 +109,9 @@ class TestPlannerGetNextSteps(unittest.TestCase):
                 PlanStep(step_id="step_2", description="Step 2", status=PlanStatus.PENDING),
             ],
         )
-        
+
         next_steps = self.planner.get_next_steps(plan)
-        
+
         self.assertEqual(len(next_steps), 1)
         self.assertEqual(next_steps[0].step_id, "step_2")
 
@@ -145,13 +122,23 @@ class TestPlannerGetNextSteps(unittest.TestCase):
             goal="Test",
             steps=[
                 PlanStep(step_id="step_1", description="Step 1", status=PlanStatus.COMPLETED),
-                PlanStep(step_id="step_2", description="Step 2", depends_on=["step_1"], status=PlanStatus.PENDING),
-                PlanStep(step_id="step_3", description="Step 3", depends_on=["step_2"], status=PlanStatus.PENDING),
+                PlanStep(
+                    step_id="step_2",
+                    description="Step 2",
+                    depends_on=["step_1"],
+                    status=PlanStatus.PENDING,
+                ),
+                PlanStep(
+                    step_id="step_3",
+                    description="Step 3",
+                    depends_on=["step_2"],
+                    status=PlanStatus.PENDING,
+                ),
             ],
         )
-        
+
         next_steps = self.planner.get_next_steps(plan)
-        
+
         # Only step_2 should be next (step_3 depends on step_2)
         self.assertEqual(len(next_steps), 1)
         self.assertEqual(next_steps[0].step_id, "step_2")
@@ -174,9 +161,9 @@ class TestPlannerCheckConstraints(unittest.TestCase):
                 PlanStep(step_id="step_2", description="Step 2"),
             ],
         )
-        
+
         is_valid, error = self.planner.check_constraints(plan)
-        
+
         self.assertTrue(is_valid)
         self.assertIsNone(error)
 
@@ -187,13 +174,13 @@ class TestPlannerCheckConstraints(unittest.TestCase):
             goal="Test",
             steps=[PlanStep(step_id=f"step_{i}", description=f"Step {i}") for i in range(15)],
         )
-        
+
         is_valid, error = self.planner.check_constraints(plan)
-        
+
         self.assertFalse(is_valid)
         self.assertIn("15 steps", error)
         self.assertIn("max is 10", error)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

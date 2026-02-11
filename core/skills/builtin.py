@@ -71,9 +71,9 @@ class SummarizePRSkill(Skill):
         # 2. Build prompt
         prompt = f"""Summarize this PR concisely:
 
-Title: {pr['title']}
-Description: {pr['body']}
-Files changed: {pr['files_changed']}
+Title: {pr["title"]}
+Description: {pr["body"]}
+Files changed: {pr["files_changed"]}
 """
         if input.include_diff:
             diff = await self.github.get_pr_diff(input.repo_id, input.pr_number)
@@ -221,9 +221,11 @@ class CIStatusSkill(Skill):
         return CIStatusOutput(success=True, result=workflows, workflows=workflows)
 
 
-def register_builtin_skills(registry, db, llm=None, github=None, agent_registry=None, chat_loop_factory=None):
+def register_builtin_skills(
+    registry, db, llm=None, github=None, agent_registry=None, chat_loop_factory=None
+):
     """Register all built-in skills.
-    
+
     Args:
         registry: SkillRegistry instance
         db: Database instance
@@ -235,13 +237,13 @@ def register_builtin_skills(registry, db, llm=None, github=None, agent_registry=
     from core.skills.github_client import GitHubClient
     from core.llm import LLMClient
     from core.skills.delegation import DelegateTaskSkill
-    
+
     # Initialize clients if not provided
     if github is None:
         github = GitHubClient(db)
     if llm is None:
         llm = LLMClient(db)
-    
+
     # Register skills with metadata
     skills = [
         (
@@ -251,7 +253,7 @@ def register_builtin_skills(registry, db, llm=None, github=None, agent_registry=
             ["summarize", "summary", "pr", "pull request"],
             [],
             8,
-            "medium"
+            "medium",
         ),
         (
             ListPRsSkill(db, github),
@@ -260,7 +262,7 @@ def register_builtin_skills(registry, db, llm=None, github=None, agent_registry=
             ["list", "show", "prs", "pull requests"],
             [],
             5,
-            "low"
+            "low",
         ),
         (
             CIStatusSkill(db, github),
@@ -269,10 +271,10 @@ def register_builtin_skills(registry, db, llm=None, github=None, agent_registry=
             ["ci", "build", "workflow", "status"],
             [],
             7,
-            "low"
-        )
+            "low",
+        ),
     ]
-    
+
     for skill, category, subcategory, triggers, dependencies, priority, cost in skills:
         try:
             registry.register(
@@ -283,18 +285,17 @@ def register_builtin_skills(registry, db, llm=None, github=None, agent_registry=
                 triggers=triggers,
                 dependencies=dependencies,
                 priority=priority,
-                cost_estimate=cost
+                cost_estimate=cost,
             )
             logger.info(f"Registered {skill.name}@{skill.version}")
         except Exception as e:
             logger.warning(f"Failed to register {skill.name}: {e}")
-    
+
     # Register delegation skill for multi-agent collaboration
     if agent_registry and chat_loop_factory:
         try:
             delegation_skill = DelegateTaskSkill(
-                agent_registry=agent_registry,
-                chat_loop_factory=chat_loop_factory
+                agent_registry=agent_registry, chat_loop_factory=chat_loop_factory
             )
             registry.register(
                 skill=delegation_skill,
@@ -304,7 +305,7 @@ def register_builtin_skills(registry, db, llm=None, github=None, agent_registry=
                 triggers=["delegate", "assign", "task", "agent"],
                 dependencies=[],
                 priority=10,
-                cost_estimate="low"
+                cost_estimate="low",
             )
             logger.info(f"Registered {delegation_skill.name}@{delegation_skill.version}")
         except Exception as e:

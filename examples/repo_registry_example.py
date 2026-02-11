@@ -93,9 +93,7 @@ print(f"✓ Updated metadata: {updated_repo.metadata}")
 
 # 7. Get repository by URL
 print("\n7. Get repository by URL")
-found_repo = registry.get_by_url(
-    "https://github.com/matrixorigin/matrixone", "team_matrixone"
-)
+found_repo = registry.get_by_url("https://github.com/matrixorigin/matrixone", "team_matrixone")
 if found_repo:
     print(f"✓ Found: {found_repo.repo_url}")
     print(f"  Owner: {found_repo.owner_id}")

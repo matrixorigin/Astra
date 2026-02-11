@@ -15,6 +15,7 @@ from core.rate_limit import rate_limiter
 # Conditional import for metrics
 try:
     from core.metrics import metrics_endpoint
+
     METRICS_ENABLED = True
 except ImportError:
     METRICS_ENABLED = False
@@ -56,20 +57,20 @@ async def add_request_id(request: Request, call_next):
     """Add request ID to all requests."""
     request_id = str(uuid7())
     request.state.request_id = request_id
-    
+
     logger.info(
         f"Request started: {request.method} {request.url.path}",
         extra={"request_id": request_id},
     )
-    
+
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
-    
+
     logger.info(
         f"Request completed: {request.method} {request.url.path} - {response.status_code}",
         extra={"request_id": request_id},
     )
-    
+
     return response
 
 
@@ -78,12 +79,12 @@ async def add_request_id(request: Request, call_next):
 async def authentication_error_handler(request: Request, exc: AuthenticationError):
     """Handle authentication errors."""
     request_id = getattr(request.state, "request_id", "unknown")
-    
+
     logger.warning(
         f"Authentication error: {exc.message}",
         extra={"request_id": request_id},
     )
-    
+
     return JSONResponse(
         status_code=status.HTTP_401_UNAUTHORIZED,
         content={
@@ -98,12 +99,12 @@ async def authentication_error_handler(request: Request, exc: AuthenticationErro
 async def authorization_error_handler(request: Request, exc: AuthorizationError):
     """Handle authorization errors."""
     request_id = getattr(request.state, "request_id", "unknown")
-    
+
     logger.warning(
         f"Authorization error: {exc.message}",
         extra={"request_id": request_id},
     )
-    
+
     return JSONResponse(
         status_code=status.HTTP_403_FORBIDDEN,
         content={
@@ -118,13 +119,13 @@ async def authorization_error_handler(request: Request, exc: AuthorizationError)
 async def agent_error_handler(request: Request, exc: AgentError):
     """Handle AgentError exceptions."""
     request_id = getattr(request.state, "request_id", "unknown")
-    
+
     logger.error(
         f"Agent error: {exc.message}",
         extra={"request_id": request_id, "error_code": exc.code},
         exc_info=True,
     )
-    
+
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
         content={
@@ -139,13 +140,13 @@ async def agent_error_handler(request: Request, exc: AgentError):
 async def global_exception_handler(request: Request, exc: Exception):
     """Handle all unhandled exceptions."""
     request_id = getattr(request.state, "request_id", "unknown")
-    
+
     logger.error(
         f"Unhandled exception: {str(exc)}",
         extra={"request_id": request_id},
         exc_info=True,
     )
-    
+
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
@@ -172,12 +173,12 @@ async def health_check():
 async def readiness_check():
     """Readiness check - verify dependencies."""
     from sdk import Database
-    
+
     checks = {
         "database": "unknown",
         "timestamp": datetime.now(UTC).isoformat(),
     }
-    
+
     # Check database
     try:
         db = Database()
@@ -190,7 +191,7 @@ async def readiness_check():
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"status": "not_ready", "checks": checks},
         )
-    
+
     return {"status": "ready", "checks": checks}
 
 
@@ -221,7 +222,7 @@ async def root():
 @app.get("/api/protected", tags=["API"])
 async def protected_endpoint(user_info: dict = Depends(api_key_auth.verify)):
     """Protected endpoint requiring API key.
-    
+
     Example:
         curl -H "X-API-Key: your-key" http://localhost:8000/api/protected
     """
@@ -236,7 +237,7 @@ async def protected_endpoint(user_info: dict = Depends(api_key_auth.verify)):
 @app.post("/api/token", tags=["API"])
 async def create_token(user_id: str, permissions: list[str] = None):
     """Create JWT token.
-    
+
     Example:
         curl -X POST "http://localhost:8000/api/token?user_id=alice&permissions=read&permissions=write"
     """
@@ -250,6 +251,7 @@ async def create_token(user_id: str, permissions: list[str] = None):
 
 # Metrics endpoint
 if METRICS_ENABLED and settings.monitoring.enable_metrics:
+
     @app.get("/metrics", tags=["Monitoring"])
     async def metrics():
         """Prometheus metrics endpoint."""
@@ -258,7 +260,7 @@ if METRICS_ENABLED and settings.monitoring.enable_metrics:
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         "api.main:app",
         host=settings.host,

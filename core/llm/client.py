@@ -22,17 +22,23 @@ logger = logging.getLogger(__name__)
 
 class BudgetExceededError(Exception):
     """Raised when estimated cost exceeds remaining budget."""
+
     pass
 
 
 class LLMClient:
     """LLM client with routing, rate limiting, circuit breaker, budget control, and logging."""
 
-    def __init__(self, db: Optional[Database] = None, user_id: str | None = None, 
-                 tenant_id: str | None = None, use_default_models: bool = True,
-                 scope_context: dict | None = None) -> None:
+    def __init__(
+        self,
+        db: Optional[Database] = None,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
+        use_default_models: bool = True,
+        scope_context: dict | None = None,
+    ) -> None:
         """Initialize LLM client.
-        
+
         Args:
             use_default_models: If True, use DEFAULT_MODELS as fallback. Set to False
                                in production to enforce strict scope-based access control.
@@ -44,52 +50,58 @@ class LLMClient:
         self.tenant_id = tenant_id
         self.use_default_models = use_default_models
         self.scope_context = scope_context or {}
-        
+
         # Initialize scope resolver
         if user_id and tenant_id:
             scope_chain = ScopeChainBuilder.dev_agent(
                 user_id=user_id,
                 account_id=tenant_id,
-                repo=self.scope_context.get('repo'),
-                project=self.scope_context.get('project')
+                repo=self.scope_context.get("repo"),
+                project=self.scope_context.get("project"),
             )
             self.scope_resolver = ScopeResolver(self.db, scope_chain)
         else:
             self.scope_resolver = None
-        
+
         self._providers: dict[LLMProvider, BaseProvider] = {}
-        self.router = ModelRouter(db=self.db, user_id=user_id, tenant_id=tenant_id,
-                                  use_defaults=use_default_models)
+        self.router = ModelRouter(
+            db=self.db, user_id=user_id, tenant_id=tenant_id, use_defaults=use_default_models
+        )
         self.rate_limiter = RateLimiter()
         self.token_resolver = TokenResolver(db=self.db)
         self._load_config()
         self._init_providers()
         self._init_rate_limits()
-    
-    def set_user_context(self, user_id: str | None = None, tenant_id: str | None = None,
-                        scope_context: dict | None = None):
+
+    def set_user_context(
+        self,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
+        scope_context: dict | None = None,
+    ):
         """Update user context for scope-based access control.
-        
+
         Args:
             scope_context: Optional scope context, e.g., {'repo': 'matrixone', 'project': 'backend'}
         """
         self.user_id = user_id
         self.tenant_id = tenant_id
         self.scope_context = scope_context or {}
-        
+
         # Rebuild scope resolver
         if user_id and tenant_id:
             scope_chain = ScopeChainBuilder.dev_agent(
                 user_id=user_id,
                 account_id=tenant_id,
-                repo=scope_context.get('repo'),
-                project=scope_context.get('project')
+                repo=scope_context.get("repo"),
+                project=scope_context.get("project"),
             )
             self.scope_resolver = ScopeResolver(self.db, scope_chain)
-        
+
         # Reload router with new context
-        self.router = ModelRouter(db=self.db, user_id=user_id, tenant_id=tenant_id,
-                                  use_defaults=self.use_default_models)
+        self.router = ModelRouter(
+            db=self.db, user_id=user_id, tenant_id=tenant_id, use_defaults=self.use_default_models
+        )
         # Re-initialize providers with new API keys
         self._init_providers()
 
@@ -100,7 +112,8 @@ class LLMClient:
         config = None
         try:
             row = self.db.fetchone(
-                "SELECT value FROM configs WHERE key_name = 'llm_config' LIMIT 1")
+                "SELECT value FROM configs WHERE key_name = 'llm_config' LIMIT 1"
+            )
             if row:
                 config = json.loads(row["value"])
         except Exception:
@@ -128,7 +141,13 @@ class LLMClient:
     def _init_providers(self) -> None:
         """Initialize provider clients once (connection pooling)."""
         for provider_name, cls, extra in [
-            ("openai", OpenAIProvider, lambda k: {"base_url": self.config.get("openai_base_url") or os.getenv("OPENAI_BASE_URL")}),
+            (
+                "openai",
+                OpenAIProvider,
+                lambda k: {
+                    "base_url": self.config.get("openai_base_url") or os.getenv("OPENAI_BASE_URL")
+                },
+            ),
             ("groq", GroqProvider, lambda k: {}),
             ("anthropic", AnthropicProvider, lambda k: {}),
         ]:
@@ -146,44 +165,44 @@ class LLMClient:
 
     def _get_api_key(self, provider: str) -> str | None:
         """Get API key with scope-based resolution.
-        
+
         Priority: scope_resolver > user > tenant > config/env
         """
         # 1. Try ScopeResolver (supports extended scopes like repo/project)
         if self.scope_resolver:
-            token = self.scope_resolver.resolve_token('llm', provider)
+            token = self.scope_resolver.resolve_token("llm", provider)
             if token:
-                return token.get('encrypted_value') or token.get('secret_ref')
-        
+                return token.get("encrypted_value") or token.get("secret_ref")
+
         # 2. Fallback to TokenResolver (user/tenant scope only)
         if self.user_id or self.tenant_id:
             token = self._resolve_llm_token(provider)
             if token:
                 return token.encrypted_value or token.secret_ref
-        
+
         # 3. Fallback to config
         key = self.config.get(f"{provider}_api_key")
         if key:
             return key
-        
+
         # 4. Fallback to environment variable
         key = os.getenv(f"{provider.upper()}_API_KEY")
         if key:
             return key
-        
+
         # 5. Fallback to configs table (global)
         try:
             row = self.db.fetchone(
-                "SELECT value FROM configs WHERE key_name = %s "
-                "AND scope_type = 'global' LIMIT 1",
-                (f"{provider}_api_key",))
+                "SELECT value FROM configs WHERE key_name = %s AND scope_type = 'global' LIMIT 1",
+                (f"{provider}_api_key",),
+            )
             if row:
                 return row["value"]
         except Exception:
             pass
-        
+
         return None
-    
+
     def _resolve_llm_token(self, provider: str):
         """Resolve LLM token using TokenResolver logic."""
         # 1. User-scoped token
@@ -197,7 +216,7 @@ class LLMClient:
             result = self.db.fetchone(query, (provider, self.user_id))
             if result:
                 return self._token_from_row(result)
-        
+
         # 2. Tenant-scoped token
         if self.tenant_id:
             query = """
@@ -209,17 +228,18 @@ class LLMClient:
             result = self.db.fetchone(query, (provider, self.tenant_id))
             if result:
                 return self._token_from_row(result)
-        
+
         return None
-    
+
     def _token_from_row(self, row):
         """Convert DB row to simple token object."""
         from types import SimpleNamespace
+
         return SimpleNamespace(
             token_id=row["token_id"],
             provider=row["provider"],
             encrypted_value=row.get("encrypted_value"),
-            secret_ref=row.get("secret_ref")
+            secret_ref=row.get("secret_ref"),
         )
 
     def _init_rate_limits(self) -> None:
@@ -235,7 +255,7 @@ class LLMClient:
             if self.tenant_id:
                 scope_info.append(f"tenant '{self.tenant_id}'")
             scope_str = " for " + " and ".join(scope_info) if scope_info else ""
-            
+
             raise ValueError(
                 f"Provider '{p.value}' is not configured{scope_str}.\n"
                 f"Please set the API key using one of:\n"
@@ -258,18 +278,19 @@ class LLMClient:
         if self._total_spend_usd + estimated_cost > budget:
             raise BudgetExceededError(
                 f"Estimated cost ${estimated_cost:.4f} would exceed budget "
-                f"(spent ${self._total_spend_usd:.4f} of ${budget:.2f})")
+                f"(spent ${self._total_spend_usd:.4f} of ${budget:.2f})"
+            )
 
     def _record_spend(self, cost: float):
         self._total_spend_usd += cost
 
     # ── Core dispatch with circuit breaker (#6) ────────────────────
-    
+
     def _check_model_permission(self, model: str):
         """Check if current user has permission to use the model."""
         available_models = self.router.list_models()
         model_names = [m.model_name for m in available_models]
-        
+
         if model not in model_names:
             # Build detailed error message
             scope_info = []
@@ -277,14 +298,14 @@ class LLMClient:
                 scope_info.append(f"user '{self.user_id}'")
             if self.tenant_id:
                 scope_info.append(f"tenant '{self.tenant_id}'")
-            
+
             scope_str = " and ".join(scope_info) if scope_info else "current scope"
-            
+
             error_msg = [
                 f"Model '{model}' is not available for {scope_str}.",
-                f"\nAvailable models ({len(model_names)}):"
+                f"\nAvailable models ({len(model_names)}):",
             ]
-            
+
             # Group by provider for better readability
             by_provider = {}
             for m in available_models:
@@ -292,13 +313,13 @@ class LLMClient:
                 if provider not in by_provider:
                     by_provider[provider] = []
                 by_provider[provider].append(m.model_name)
-            
+
             for provider, models in sorted(by_provider.items()):
                 error_msg.append(f"  {provider}: {', '.join(models)}")
-            
+
             if not model_names:
                 error_msg.append("\nNo models configured. Please contact your administrator.")
-            
+
             raise PermissionError("\n".join(error_msg))
 
     def _dispatch(self, model: str, fn_name: str, task_hint: str | None = None, **kwargs):
@@ -309,18 +330,23 @@ class LLMClient:
         """
         # Check permission before routing
         self._check_model_permission(model)
-        
+
         chain = self.router.route(model, task_hint=task_hint)
         if not chain:
             # Unknown model — try direct with default provider
-            chain = [ModelConfig(model_name=model,
-                                 provider=LLMProvider(self.config.get("provider", "openai")))]
+            chain = [
+                ModelConfig(
+                    model_name=model, provider=LLMProvider(self.config.get("provider", "openai"))
+                )
+            ]
 
         last_error = None
         for model_cfg in chain:
             breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
             if not breaker.allow_request():
-                logger.warning(f"Circuit open for {model_cfg.provider.value}, skipping {model_cfg.model_name}")
+                logger.warning(
+                    f"Circuit open for {model_cfg.provider.value}, skipping {model_cfg.model_name}"
+                )
                 continue
 
             try:
@@ -362,20 +388,33 @@ class LLMClient:
 
         try:
             response, model_cfg = self._dispatch(
-                model, "complete", task_hint=task_hint,
-                messages=msg_dicts, temperature=temp, max_tokens=max_tok)
+                model,
+                "complete",
+                task_hint=task_hint,
+                messages=msg_dicts,
+                temperature=temp,
+                max_tokens=max_tok,
+            )
             response.latency_ms = int((time.time() - start) * 1000)
             response.cost_usd = self.router.calculate_cost(
-                model_cfg.model_name, response.tokens_prompt, response.tokens_completion)
+                model_cfg.model_name, response.tokens_prompt, response.tokens_completion
+            )
             self._record_spend(response.cost_usd)
-            self._log_call(event_id, user_id, model_cfg.provider, response, "success",
-                           metadata=metadata)
+            self._log_call(
+                event_id, user_id, model_cfg.provider, response, "success", metadata=metadata
+            )
             return response
         except Exception as e:
-            self._log_call(event_id, user_id,
-                           LLMProvider(self.config.get("provider", "openai")),
-                           None, "failed", error_message=str(e),
-                           latency_ms=int((time.time() - start) * 1000), metadata=metadata)
+            self._log_call(
+                event_id,
+                user_id,
+                LLMProvider(self.config.get("provider", "openai")),
+                None,
+                "failed",
+                error_message=str(e),
+                latency_ms=int((time.time() - start) * 1000),
+                metadata=metadata,
+            )
             raise
 
     def chat_with_tools(
@@ -394,9 +433,15 @@ class LLMClient:
         max_tok = self.config.get("max_tokens")
 
         result, _ = self._dispatch(
-            model, "complete_with_tools", task_hint=task_hint,
-            messages=messages, tools=tools, tool_choice=tool_choice,
-            temperature=temp, max_tokens=max_tok)
+            model,
+            "complete_with_tools",
+            task_hint=task_hint,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            temperature=temp,
+            max_tokens=max_tok,
+        )
         return result
 
     async def chat_stream(
@@ -417,8 +462,11 @@ class LLMClient:
 
         chain = self.router.route(model, task_hint=task_hint)
         if not chain:
-            chain = [ModelConfig(model_name=model,
-                                 provider=LLMProvider(self.config.get("provider", "openai")))]
+            chain = [
+                ModelConfig(
+                    model_name=model, provider=LLMProvider(self.config.get("provider", "openai"))
+                )
+            ]
 
         for model_cfg in chain:
             breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
@@ -441,16 +489,25 @@ class LLMClient:
                 breaker.record_success()
                 latency = int((time.time() - start) * 1000)
                 cost = self.router.calculate_cost(
-                    model_cfg.model_name, usage["prompt"], usage["completion"])
+                    model_cfg.model_name, usage["prompt"], usage["completion"]
+                )
                 self._record_spend(cost)
-                self._log_call(trace_id, user_id, model_cfg.provider,
-                               LLMResponse(content="[streamed]", model=model_cfg.model_name,
-                                           provider=model_cfg.provider,
-                                           tokens_prompt=usage["prompt"],
-                                           tokens_completion=usage["completion"],
-                                           tokens_total=usage["prompt"] + usage["completion"],
-                                           latency_ms=latency, cost_usd=cost),
-                               "success")
+                self._log_call(
+                    trace_id,
+                    user_id,
+                    model_cfg.provider,
+                    LLMResponse(
+                        content="[streamed]",
+                        model=model_cfg.model_name,
+                        provider=model_cfg.provider,
+                        tokens_prompt=usage["prompt"],
+                        tokens_completion=usage["completion"],
+                        tokens_total=usage["prompt"] + usage["completion"],
+                        latency_ms=latency,
+                        cost_usd=cost,
+                    ),
+                    "success",
+                )
                 return
             except Exception as e:
                 breaker.record_failure()
@@ -475,8 +532,11 @@ class LLMClient:
 
         chain = self.router.route(model, task_hint=task_hint)
         if not chain:
-            chain = [ModelConfig(model_name=model,
-                                 provider=LLMProvider(self.config.get("provider", "openai")))]
+            chain = [
+                ModelConfig(
+                    model_name=model, provider=LLMProvider(self.config.get("provider", "openai"))
+                )
+            ]
 
         for model_cfg in chain:
             breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
@@ -501,8 +561,17 @@ class LLMClient:
 
     # ── Logging (#5 可观测性 & 回溯) ──────────────────────────────
 
-    def _log_call(self, event_id, user_id, provider, response, status,
-                  error_message=None, latency_ms=0, metadata=None):
+    def _log_call(
+        self,
+        event_id,
+        user_id,
+        provider,
+        response,
+        status,
+        error_message=None,
+        latency_ms=0,
+        metadata=None,
+    ):
         log_id = str(uuid7())
         try:
             if response:
@@ -512,10 +581,22 @@ class LLMClient:
                         tokens_prompt, tokens_completion, tokens_total,
                         cost_usd, latency_ms, status, metadata, created_at
                     ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (log_id, event_id, user_id, provider.value, response.model,
-                     response.tokens_prompt, response.tokens_completion, response.tokens_total,
-                     response.cost_usd, response.latency_ms, status,
-                     json.dumps(metadata) if metadata else None, datetime.now(UTC)))
+                    (
+                        log_id,
+                        event_id,
+                        user_id,
+                        provider.value,
+                        response.model,
+                        response.tokens_prompt,
+                        response.tokens_completion,
+                        response.tokens_total,
+                        response.cost_usd,
+                        response.latency_ms,
+                        status,
+                        json.dumps(metadata) if metadata else None,
+                        datetime.now(UTC),
+                    ),
+                )
             else:
                 self.db.execute(
                     """INSERT INTO llm_call_logs (
@@ -523,9 +604,23 @@ class LLMClient:
                         tokens_prompt, tokens_completion, tokens_total,
                         cost_usd, latency_ms, status, error_message, metadata, created_at
                     ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (log_id, event_id, user_id, provider.value, "unknown",
-                     0, 0, 0, 0.0, latency_ms, status, error_message,
-                     json.dumps(metadata) if metadata else None, datetime.now(UTC)))
+                    (
+                        log_id,
+                        event_id,
+                        user_id,
+                        provider.value,
+                        "unknown",
+                        0,
+                        0,
+                        0,
+                        0.0,
+                        latency_ms,
+                        status,
+                        error_message,
+                        json.dumps(metadata) if metadata else None,
+                        datetime.now(UTC),
+                    ),
+                )
         except Exception as e:
             logger.error(f"Failed to log LLM call: {e}")
 
@@ -533,22 +628,35 @@ class LLMClient:
         if event_id:
             results = self.db.fetchall(
                 "SELECT * FROM llm_call_logs WHERE event_id = %s ORDER BY created_at DESC",
-                (event_id,))
+                (event_id,),
+            )
         elif user_id:
             results = self.db.fetchall(
                 "SELECT * FROM llm_call_logs WHERE user_id = %s ORDER BY created_at DESC LIMIT 100",
-                (user_id,))
+                (user_id,),
+            )
         else:
             results = self.db.fetchall(
-                "SELECT * FROM llm_call_logs ORDER BY created_at DESC LIMIT 100")
-        return [LLMCallLog(
-            log_id=r["log_id"], event_id=r["event_id"], user_id=r["user_id"],
-            provider=LLMProvider(r["provider"]), model=r["model"],
-            tokens_prompt=r["tokens_prompt"], tokens_completion=r["tokens_completion"],
-            tokens_total=r["tokens_total"], cost_usd=float(r["cost_usd"]),
-            latency_ms=r["latency_ms"], status=r["status"],
-            error_message=r.get("error_message"), created_at=r["created_at"])
-            for r in results]
+                "SELECT * FROM llm_call_logs ORDER BY created_at DESC LIMIT 100"
+            )
+        return [
+            LLMCallLog(
+                log_id=r["log_id"],
+                event_id=r["event_id"],
+                user_id=r["user_id"],
+                provider=LLMProvider(r["provider"]),
+                model=r["model"],
+                tokens_prompt=r["tokens_prompt"],
+                tokens_completion=r["tokens_completion"],
+                tokens_total=r["tokens_total"],
+                cost_usd=float(r["cost_usd"]),
+                latency_ms=r["latency_ms"],
+                status=r["status"],
+                error_message=r.get("error_message"),
+                created_at=r["created_at"],
+            )
+            for r in results
+        ]
 
     @property
     def total_spend(self) -> float:

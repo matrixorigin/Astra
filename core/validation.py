@@ -21,7 +21,7 @@ class QueryRequest(BaseModel):
         """Validate query content."""
         # Remove excessive whitespace
         v = " ".join(v.split())
-        
+
         # Check for SQL injection patterns (basic)
         dangerous_patterns = [
             r";\s*DROP\s+TABLE",
@@ -29,11 +29,11 @@ class QueryRequest(BaseModel):
             r";\s*UPDATE\s+.*\s+SET",
             r"UNION\s+SELECT",
         ]
-        
+
         for pattern in dangerous_patterns:
             if re.search(pattern, v, re.IGNORECASE):
                 raise ValueError("Query contains potentially dangerous content")
-        
+
         return v
 
 
@@ -51,6 +51,7 @@ class SkillExecutionRequest(BaseModel):
         """Validate parameters size."""
         # Limit parameter size to prevent DoS
         import json
+
         param_size = len(json.dumps(v))
         if param_size > 100000:  # 100KB
             raise ValueError("Parameters too large (max 100KB)")
@@ -59,35 +60,35 @@ class SkillExecutionRequest(BaseModel):
 
 def sanitize_string(value: str, max_length: int = 1000) -> str:
     """Sanitize string input.
-    
+
     Args:
         value: Input string
         max_length: Maximum allowed length
-        
+
     Returns:
         Sanitized string
     """
     # Truncate
     value = value[:max_length]
-    
+
     # Remove null bytes
     value = value.replace("\x00", "")
-    
+
     # Remove control characters except newline and tab
     value = "".join(char for char in value if char in "\n\t" or not char.iscntrl())
-    
+
     return value
 
 
 def validate_repo_id(repo_id: int) -> int:
     """Validate repository ID.
-    
+
     Args:
         repo_id: Repository ID
-        
+
     Returns:
         Validated repo ID
-        
+
     Raises:
         ValueError: If invalid
     """
@@ -100,21 +101,21 @@ def validate_repo_id(repo_id: int) -> int:
 
 def validate_session_id(session_id: str) -> str:
     """Validate session ID format.
-    
+
     Args:
         session_id: Session ID
-        
+
     Returns:
         Validated session ID
-        
+
     Raises:
         ValueError: If invalid
     """
     # Allow alphanumeric, dash, underscore
     if not re.match(r"^[a-zA-Z0-9_-]+$", session_id):
         raise ValueError("Invalid session ID format")
-    
+
     if len(session_id) > 255:
         raise ValueError("Session ID too long")
-    
+
     return session_id

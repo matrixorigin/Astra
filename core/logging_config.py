@@ -53,9 +53,7 @@ def setup_logging(level: str = "INFO", json_format: bool = True) -> None:
         handler.setFormatter(JSONFormatter())
     else:
         handler.setFormatter(
-            logging.Formatter(
-                "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-            )
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         )
 
     # Configure root logger

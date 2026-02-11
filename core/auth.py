@@ -21,7 +21,7 @@ class APIKeyAuth:
 
     def _load_api_keys(self) -> dict[str, dict]:
         """Load API keys from database or config.
-        
+
         In production, load from database with user info.
         For now, use environment variable.
         """
@@ -29,19 +29,21 @@ class APIKeyAuth:
         # For now, accept any key in development
         if settings.is_development():
             return {"dev-key": {"user_id": "dev_user", "permissions": ["read", "write"]}}
-        
+
         # In production, this should query database
         return {}
 
-    async def verify(self, api_key: Optional[str] = Header(None, alias=settings.security.api_key_header)) -> dict:
+    async def verify(
+        self, api_key: Optional[str] = Header(None, alias=settings.security.api_key_header)
+    ) -> dict:
         """Verify API key.
-        
+
         Args:
             api_key: API key from header
-            
+
         Returns:
             User info dict
-            
+
         Raises:
             AuthenticationError: If authentication fails
         """
@@ -73,11 +75,11 @@ class JWTAuth:
 
     def create_token(self, user_id: str, permissions: list[str] = None) -> str:
         """Create JWT token.
-        
+
         Args:
             user_id: User identifier
             permissions: User permissions
-            
+
         Returns:
             JWT token string
         """
@@ -102,13 +104,13 @@ class JWTAuth:
 
     async def verify(self, authorization: Optional[str] = Header(None)) -> dict:
         """Verify JWT token.
-        
+
         Args:
             authorization: Authorization header (Bearer <token>)
-            
+
         Returns:
             Token payload
-            
+
         Raises:
             AuthenticationError: If authentication fails
         """
@@ -126,7 +128,7 @@ class JWTAuth:
                 settings.security.jwt_secret,
                 algorithms=[settings.security.jwt_algorithm],
             )
-            
+
             logger.info(f"Authenticated user via JWT: {payload['user_id']}")
             return payload
 
@@ -140,20 +142,20 @@ class JWTAuth:
 
 def require_permission(required_permission: str):
     """Decorator to require specific permission.
-    
+
     Args:
         required_permission: Required permission (e.g., "write", "admin")
     """
+
     def decorator(user_info: dict):
         permissions = user_info.get("permissions", [])
         if required_permission not in permissions:
             logger.warning(
                 f"User {user_info.get('user_id')} missing permission: {required_permission}"
             )
-            raise AuthorizationError(
-                f"Missing required permission: {required_permission}"
-            )
+            raise AuthorizationError(f"Missing required permission: {required_permission}")
         return user_info
+
     return decorator
 
 

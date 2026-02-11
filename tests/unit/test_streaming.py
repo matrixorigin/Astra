@@ -17,7 +17,7 @@ class TestStreamEventModel(unittest.TestCase):
             event_id="event_1",
             causal_chain_id="chain_1",
         )
-        
+
         self.assertEqual(event.event_type, StreamEventType.TEXT_DELTA)
         self.assertEqual(event.data["chunk"], "Hello")
         self.assertEqual(event.event_id, "event_1")
@@ -44,7 +44,7 @@ class TestStreamEventModel(unittest.TestCase):
             StreamEventType.AGENT_PROGRESS,
             StreamEventType.AGENT_COMPLETED,
         ]
-        
+
         self.assertEqual(len(event_types), 18)
 
 
@@ -65,15 +65,15 @@ class TestEventLoggerStream(unittest.TestCase):
             parent_event_id="parent_1",
             causal_chain_id="chain_1",
         )
-        
+
         self.assertIsNotNone(event.event_id)
         self.assertEqual(event.user_id, "user_1")
         self.assertEqual(event.session_id, "session_1")
         self.assertEqual(event.event_type, "stream_text_delta")
-        
+
         # Verify database was called
         self.db.execute.assert_called_once()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

@@ -31,7 +31,7 @@ class SecurityError(Exception):
 
 class ResultStorage(Protocol):
     """Protocol for pluggable result storage backends.
-    
+
     Implementations can store results in:
     - Database (default)
     - S3/Object storage (for large results)
@@ -98,8 +98,7 @@ class ToolMockingLayer:
                 )
                 if recorded is not None:
                     logger.info(
-                        f"Replay: Using recorded result for {skill.name} "
-                        f"(session={session_id})"
+                        f"Replay: Using recorded result for {skill.name} (session={session_id})"
                     )
                     return recorded
                 else:
@@ -207,7 +206,7 @@ class ToolMockingLayer:
 
         Note: This assumes the event already exists (created by EventLogger).
         We only UPDATE the metadata with skill_result.
-        
+
         ⚠️  WARNING: Large results may exceed JSON field limits. Consider:
         - Truncating large results
         - Storing in separate table
@@ -276,13 +275,13 @@ class ToolMockingLayer:
         Compute deterministic hash of parameters.
 
         Used for matching recorded results with current execution.
-        
+
         ⚠️  LIMITATION: Uses json.dumps(sort_keys=True) for determinism.
         This works for most cases but has edge cases:
         - Nested dicts with non-string keys
         - Custom objects without proper serialization
         - Float precision differences
-        
+
         For 99% of skill params (flat dicts with primitives), this is sufficient.
         If hash collisions become an issue, consider:
         - Using canonical JSON (e.g., python-canonicaljson)

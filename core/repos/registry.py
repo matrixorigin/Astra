@@ -85,9 +85,7 @@ class RepoRegistry:
             return None
         return self._to_model(result)
 
-    def list_by_owner(
-        self, owner_id: str, repo_type: Optional[RepoType] = None
-    ) -> list[Repo]:
+    def list_by_owner(self, owner_id: str, repo_type: Optional[RepoType] = None) -> list[Repo]:
         """List repositories by owner."""
         if repo_type:
             query = """

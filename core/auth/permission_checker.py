@@ -6,10 +6,10 @@ from sdk import Database
 
 class PermissionChecker:
     """Check user permissions using MatrixOne RBAC."""
-    
+
     def __init__(self, db: Database):
         self.db = db
-    
+
     def has_role(self, user_id: str, role_name: str) -> bool:
         """Check if user has a specific role."""
         query = """
@@ -20,48 +20,48 @@ class PermissionChecker:
         WHERE u.user_name = %s AND r.role_name = %s
         """
         row = self.db.fetchone(query, (user_id, role_name))
-        return row and row['cnt'] > 0
-    
+        return row and row["cnt"] > 0
+
     def is_admin(self, user_id: str) -> bool:
         """Check if user is mo_agent_admin."""
-        return self.has_role(user_id, 'mo_agent_admin')
-    
+        return self.has_role(user_id, "mo_agent_admin")
+
     def is_user(self, user_id: str) -> bool:
         """Check if user is mo_agent_user."""
-        return self.has_role(user_id, 'mo_agent_user')
-    
+        return self.has_role(user_id, "mo_agent_user")
+
     def can_manage_models(self, user_id: str, scope: str, scope_id: Optional[str] = None) -> bool:
         """Check if user can manage models at given scope."""
         # Admin can manage all scopes
         if self.is_admin(user_id):
             return True
-        
+
         # Regular users can only manage their own user-scoped models
-        if scope == 'user' and scope_id == user_id:
+        if scope == "user" and scope_id == user_id:
             return self.is_user(user_id)
-        
+
         return False
-    
+
     def can_manage_skills(self, user_id: str, scope: str, scope_id: Optional[str] = None) -> bool:
         """Check if user can manage skills at given scope."""
         # Admin can manage global and account scopes
         if self.is_admin(user_id):
-            return scope in ['global', 'account']
-        
+            return scope in ["global", "account"]
+
         # Regular users can manage their own user-scoped skills
-        if scope == 'user' and scope_id == user_id:
+        if scope == "user" and scope_id == user_id:
             return self.is_user(user_id)
-        
+
         return False
-    
+
     def can_view_audit_logs(self, user_id: str, target_user: Optional[str] = None) -> bool:
         """Check if user can view audit logs."""
         # Admin can view all logs
         if self.is_admin(user_id):
             return True
-        
+
         # Users can view their own logs
         if target_user == user_id:
             return self.is_user(user_id)
-        
+
         return False

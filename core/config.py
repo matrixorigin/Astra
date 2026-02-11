@@ -131,9 +131,7 @@ class Settings(BaseSettings):
             if settings.environment == Environment.PRODUCTION:
                 settings.debug = False
                 settings.log_level = "WARNING"
-                settings.security.allowed_origins = [
-                    "https://app.example.com"
-                ]  # TODO: Configure
+                settings.security.allowed_origins = ["https://app.example.com"]  # TODO: Configure
                 settings.monitoring.enable_tracing = True
 
             # Staging-specific overrides

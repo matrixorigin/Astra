@@ -81,9 +81,7 @@ def test_resolve_tenant_default_token(resolver, db):
     )
 
     # Resolve (no user token, fallback to tenant)
-    resolved = resolver.resolve_repo_token(
-        user_id="user_without_token", tenant_id="tenant_789"
-    )
+    resolved = resolver.resolve_repo_token(user_id="user_without_token", tenant_id="tenant_789")
     assert resolved is not None
     assert resolved.token_id == token.token_id
     assert resolved.scope_tenant_id == "tenant_789"

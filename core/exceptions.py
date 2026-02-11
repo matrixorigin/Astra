@@ -42,7 +42,9 @@ class SkillValidationError(SkillError):
     """Skill input validation failed."""
 
     def __init__(self, skill_name: str, message: str):
-        super().__init__(f"Skill '{skill_name}' validation failed: {message}", skill_name=skill_name)
+        super().__init__(
+            f"Skill '{skill_name}' validation failed: {message}", skill_name=skill_name
+        )
         self.code = "SKILL_VALIDATION_ERROR"
 
 

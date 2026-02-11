@@ -20,6 +20,7 @@ logger = get_logger(__name__)
 
 class TaskType(str, Enum):
     """Task types for context optimization."""
+
     CODE_REVIEW = "code_review"
     PLANNING = "planning"
     DEBUGGING = "debugging"
@@ -29,6 +30,7 @@ class TaskType(str, Enum):
 @dataclass
 class ContextFragment:
     """A piece of context with metadata."""
+
     content: str
     tokens: int
     source: str  # 'event' | 'code' | 'doc' | 'skill'
@@ -39,56 +41,54 @@ class ContextFragment:
 @dataclass
 class Context:
     """Assembled context ready for LLM."""
+
     system_prompt: str
     skill_definitions: List[Dict[str, Any]]
     selected_events: List[Dict[str, Any]]
     code_context: List[Dict[str, Any]]
     documentation: List[Dict[str, Any]]
-    
+
     total_tokens: int
     token_budget: Dict[str, int]
     assembly_time_ms: int
     relevance_scores: Dict[str, float]
     task_type: TaskType
-    
+
     def to_prompt(self) -> str:
         """Convert context to LLM prompt."""
         parts = [self.system_prompt]
-        
+
         if self.skill_definitions:
             parts.append("\n## Available Skills\n")
             for skill in self.skill_definitions:
                 parts.append(f"- {skill['name']}: {skill['description']}")
-        
+
         if self.selected_events:
             parts.append("\n## Conversation History\n")
             for event in self.selected_events:
                 parts.append(f"[{event['event_type']}] {event['content']}")
-        
+
         if self.code_context:
             parts.append("\n## Code Context\n")
             for code in self.code_context:
                 parts.append(f"File: {code['file']}\n```\n{code['content']}\n```")
-        
+
         if self.documentation:
             parts.append("\n## Documentation\n")
             for doc in self.documentation:
-                parts.append(doc['content'])
-        
+                parts.append(doc["content"])
+
         return "\n".join(parts)
 
 
 class ContextManager:
     """Orchestrate context selection and assembly."""
-    
+
     def __init__(
-        self,
-        db: Database,
-        enable_snapshots: bool = False,
-        embedding_provider: str = "mock"
+        self, db: Database, enable_snapshots: bool = False, embedding_provider: str = "mock"
     ):
         """Initialize context manager.
-        
+
         Args:
             db: Database connection
             enable_snapshots: Whether to save context snapshots (default: False)
@@ -96,80 +96,77 @@ class ContextManager:
         """
         self.db = db
         self.enable_snapshots = enable_snapshots
-        
+
         # Initialize embedding service
         from core.context.embeddings import EmbeddingService
+
         self.embeddings = EmbeddingService(db, provider=embedding_provider)
-        
+
         # Initialize prompt manager
         from core.context.prompts import PromptManager
+
         self.prompts = PromptManager(db)
-        
+
         logger.info(
             f"ContextManager initialized "
             f"(snapshots={'enabled' if enable_snapshots else 'disabled'}, "
             f"embeddings={embedding_provider})"
         )
-    
+
     def build_context(
         self,
         session_id: str,
         query: str,
         max_tokens: int = 8000,
-        task_type: TaskType = TaskType.GENERAL
+        task_type: TaskType = TaskType.GENERAL,
     ) -> Context:
         """Build optimal context for current query.
-        
+
         Args:
             session_id: Current session
             query: User query
             max_tokens: Maximum tokens allowed
             task_type: Type of task for optimization
-            
+
         Returns:
             Assembled context
         """
         start_time = time.time()
-        
+
         try:
             # 1. Allocate token budget
             budget = self._allocate_budget(max_tokens, task_type)
             logger.debug(f"Token budget allocated: {budget}")
-            
+
             # 2. Retrieve candidates
             candidates = self._retrieve_candidates(session_id, query)
             logger.debug(f"Retrieved {len(candidates)} candidate events")
-            
+
             # 3. Score and rank
             scored = self._score_candidates(query, candidates, session_id)
             logger.debug(f"Scored {len(scored)} candidates")
-            
+
             # 4. Select within budget
             selected = self._select_within_budget(scored, budget)
-            
+
             # 5. Assemble context
             context = self._assemble_context(
-                selected, budget, task_type,
-                assembly_time_ms=int((time.time() - start_time) * 1000)
+                selected, budget, task_type, assembly_time_ms=int((time.time() - start_time) * 1000)
             )
-            
+
             logger.info(
                 f"Context built: {context.total_tokens} tokens, "
                 f"{len(context.selected_events)} events, "
                 f"{context.assembly_time_ms}ms"
             )
-            
+
             return context
-            
+
         except Exception as e:
             logger.error(f"Failed to build context: {e}")
             raise ContextError(f"Context assembly failed: {e}")
-    
-    def _allocate_budget(
-        self,
-        total_tokens: int,
-        task_type: TaskType
-    ) -> Dict[str, int]:
+
+    def _allocate_budget(self, total_tokens: int, task_type: TaskType) -> Dict[str, int]:
         """Allocate token budget based on task type."""
         allocations = {
             TaskType.CODE_REVIEW: {
@@ -178,7 +175,7 @@ class ContextManager:
                 "history": int(total_tokens * 0.2),
                 "code": int(total_tokens * 0.6),
                 "docs": int(total_tokens * 0.1),
-                "reserve": 500
+                "reserve": 500,
             },
             TaskType.PLANNING: {
                 "system": 500,
@@ -186,7 +183,7 @@ class ContextManager:
                 "history": int(total_tokens * 0.6),
                 "code": int(total_tokens * 0.2),
                 "docs": int(total_tokens * 0.1),
-                "reserve": 500
+                "reserve": 500,
             },
             TaskType.DEBUGGING: {
                 "system": 500,
@@ -194,7 +191,7 @@ class ContextManager:
                 "history": int(total_tokens * 0.2),
                 "code": int(total_tokens * 0.4),
                 "docs": int(total_tokens * 0.1),
-                "reserve": 500
+                "reserve": 500,
             },
             TaskType.GENERAL: {
                 "system": 500,
@@ -202,17 +199,13 @@ class ContextManager:
                 "history": int(total_tokens * 0.5),
                 "code": int(total_tokens * 0.2),
                 "docs": int(total_tokens * 0.1),
-                "reserve": 500
-            }
+                "reserve": 500,
+            },
         }
-        
+
         return allocations[task_type]
-    
-    def _retrieve_candidates(
-        self,
-        session_id: str,
-        query: str
-    ) -> List[Dict[str, Any]]:
+
+    def _retrieve_candidates(self, session_id: str, query: str) -> List[Dict[str, Any]]:
         """Retrieve candidate events for context."""
         # Get recent events from current session
         events = self.db.fetchall(
@@ -224,19 +217,16 @@ class ContextManager:
             ORDER BY created_at DESC
             LIMIT 100
             """,
-            (session_id,)
+            (session_id,),
         )
-        
+
         return [dict(e) for e in events]
-    
+
     def _score_candidates(
-        self,
-        query: str,
-        candidates: List[Dict[str, Any]],
-        session_id: str
+        self, query: str, candidates: List[Dict[str, Any]], session_id: str
     ) -> List[tuple[Dict[str, Any], float]]:
         """Score candidates by relevance using L2_DISTANCE.
-        
+
         Multi-signal scoring:
         - Semantic: L2 distance (40%)
         - Temporal: Recent events score higher (20%)
@@ -246,120 +236,112 @@ class ContextManager:
         # Generate query embedding and search
         query_embedding = self.embeddings.embed_text(query)
         semantic_results = self.embeddings.search_similar(
-            query_embedding,
-            limit=len(candidates),
-            session_id=session_id
+            query_embedding, limit=len(candidates), session_id=session_id
         )
-        
+
         # Build distance map
-        distance_map = {r['event_id']: r['distance'] for r in semantic_results}
-        
+        distance_map = {r["event_id"]: r["distance"] for r in semantic_results}
+
         # Get recent causal chains (last 5 chains in session)
-        recent_chains = self.db.fetchall("""
+        recent_chains = self.db.fetchall(
+            """
             SELECT causal_chain_id, MAX(created_at) as last_time
             FROM conversation_events
             WHERE session_id = %s
             GROUP BY causal_chain_id
             ORDER BY last_time DESC
             LIMIT 5
-        """, (session_id,))
-        recent_chain_ids = {row['causal_chain_id'] for row in recent_chains}
-        
+        """,
+            (session_id,),
+        )
+        recent_chain_ids = {row["causal_chain_id"] for row in recent_chains}
+
         scored = []
         for candidate in candidates:
-            event_id = candidate['event_id']
-            
+            event_id = candidate["event_id"]
+
             # Semantic score (40%)
             distance = distance_map.get(event_id, 999.0)
             semantic_score = (1.0 / (1.0 + distance)) * 0.4
-            
+
             # Temporal score (20%)
-            age_hours = (time.time() - candidate['created_at'].timestamp()) / 3600
+            age_hours = (time.time() - candidate["created_at"].timestamp()) / 3600
             temporal_score = (0.5 ** (age_hours / 24.0)) * 0.2
-            
+
             # Causal score (30%)
-            chain_id = candidate.get('causal_chain_id')
+            chain_id = candidate.get("causal_chain_id")
             if chain_id and chain_id in recent_chain_ids:
                 # In recent causal chain - high score
                 causal_score = 1.0 * 0.3
             else:
                 causal_score = 0.0
-            
+
             # Keyword score (10%)
             query_lower = query.lower()
-            content_lower = candidate['content'].lower()
+            content_lower = candidate["content"].lower()
             keyword_score = (1.0 if query_lower in content_lower else 0.0) * 0.1
-            
+
             # Total score
             score = semantic_score + temporal_score + causal_score + keyword_score
             scored.append((candidate, score))
-        
+
         # Sort by score descending
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
-    
+
     def _select_within_budget(
-        self,
-        scored: List[tuple[Dict[str, Any], float]],
-        budget: Dict[str, int]
+        self, scored: List[tuple[Dict[str, Any], float]], budget: Dict[str, int]
     ) -> List[Dict[str, Any]]:
         """Select top events within token budget."""
         selected = []
         tokens_used = 0
-        history_budget = budget['history']
-        
+        history_budget = budget["history"]
+
         for event, score in scored:
             # Estimate tokens (rough: 1 token ≈ 4 chars)
-            event_tokens = len(event['content']) // 4
-            
+            event_tokens = len(event["content"]) // 4
+
             if tokens_used + event_tokens <= history_budget:
-                selected.append({
-                    'event': event,
-                    'score': score,
-                    'tokens': event_tokens
-                })
+                selected.append({"event": event, "score": score, "tokens": event_tokens})
                 tokens_used += event_tokens
             else:
                 break
-        
+
         logger.debug(f"Selected {len(selected)} events using {tokens_used} tokens")
         return selected
-    
+
     def _assemble_context(
         self,
         selected: List[Dict[str, Any]],
         budget: Dict[str, int],
         task_type: TaskType,
-        assembly_time_ms: int
+        assembly_time_ms: int,
     ) -> Context:
         """Assemble final context."""
         system_prompt = self._get_system_prompt(task_type)
-        
+
         # Load skill definitions from registry
-        skill_definitions = self._get_skill_definitions(budget['skills'])
-        
+        skill_definitions = self._get_skill_definitions(budget["skills"])
+
         selected_events = [
             {
-                'event_id': s['event']['event_id'],
-                'event_type': s['event']['event_type'],
-                'content': s['event']['content'],
-                'score': s['score']
+                "event_id": s["event"]["event_id"],
+                "event_type": s["event"]["event_type"],
+                "content": s["event"]["content"],
+                "score": s["score"],
             }
             for s in selected
         ]
-        
+
         # Load code context for code-related tasks
         code_context = []
         if task_type in [TaskType.CODE_REVIEW, TaskType.DEBUGGING]:
-            code_context = self._get_code_context(selected_events, budget['code'])
-        
-        total_tokens = sum(s['tokens'] for s in selected) + budget['system']
-        
-        relevance_scores = {
-            s['event']['event_id']: s['score']
-            for s in selected
-        }
-        
+            code_context = self._get_code_context(selected_events, budget["code"])
+
+        total_tokens = sum(s["tokens"] for s in selected) + budget["system"]
+
+        relevance_scores = {s["event"]["event_id"]: s["score"] for s in selected}
+
         return Context(
             system_prompt=system_prompt,
             skill_definitions=skill_definitions,
@@ -370,23 +352,23 @@ class ContextManager:
             token_budget=budget,
             assembly_time_ms=assembly_time_ms,
             relevance_scores=relevance_scores,
-            task_type=task_type
+            task_type=task_type,
         )
-    
+
     def _get_system_prompt(self, task_type: TaskType) -> str:
         """Get system prompt based on task type from database.
-        
+
         Falls back to hardcoded prompts if database lookup fails.
         """
         template_map = {
-            TaskType.CODE_REVIEW: 'system_code_review',
-            TaskType.PLANNING: 'system_planning',
-            TaskType.DEBUGGING: 'system_debugging',
-            TaskType.GENERAL: 'system_general'
+            TaskType.CODE_REVIEW: "system_code_review",
+            TaskType.PLANNING: "system_planning",
+            TaskType.DEBUGGING: "system_debugging",
+            TaskType.GENERAL: "system_general",
         }
-        
-        template_id = template_map.get(task_type, 'system_general')
-        
+
+        template_id = template_map.get(task_type, "system_general")
+
         # Try to get from database first
         try:
             return self.prompts.get_prompt(template_id)
@@ -397,10 +379,10 @@ class ContextManager:
                 TaskType.CODE_REVIEW: "You are an expert code reviewer. Focus on code quality, security, and best practices.",
                 TaskType.PLANNING: "You are a technical architect. Help plan and design solutions.",
                 TaskType.DEBUGGING: "You are a debugging expert. Help identify and fix issues.",
-                TaskType.GENERAL: "You are an intelligent development agent."
+                TaskType.GENERAL: "You are an intelligent development agent.",
             }
             return fallbacks.get(task_type, fallbacks[TaskType.GENERAL])
-    
+
     def _get_skill_definitions(self, token_budget: int) -> List[Dict[str, Any]]:
         """Get available skill definitions within budget."""
         skills = self.db.fetchall("""
@@ -410,73 +392,71 @@ class ContextManager:
             ORDER BY priority DESC
             LIMIT 10
         """)
-        
+
         return [
             {
-                'name': s['skill_name'],
-                'version': s['version'],
-                'description': s['description'],
-                'category': s.get('category', 'general')
+                "name": s["skill_name"],
+                "version": s["version"],
+                "description": s["description"],
+                "category": s.get("category", "general"),
             }
             for s in skills
         ]
-    
+
     def _get_code_context(
-        self,
-        selected_events: List[Dict[str, Any]],
-        token_budget: int
+        self, selected_events: List[Dict[str, Any]], token_budget: int
     ) -> List[Dict[str, Any]]:
         """Extract code context from events and repos.
-        
+
         Strategy:
         1. Extract file paths mentioned in events
         2. Get repo info from session
         3. Return file summaries
         """
         code_files = []
-        
+
         # Extract file paths from event content
         import re
-        file_pattern = r'[\w/]+\.(py|js|go|java|rs|cpp|c|h)'
-        
+
+        file_pattern = r"[\w/]+\.(py|js|go|java|rs|cpp|c|h)"
+
         for event in selected_events[:5]:  # Check recent 5 events
-            content = event.get('content', '')
+            content = event.get("content", "")
             matches = re.findall(file_pattern, content)
-            
+
             for match in matches:
                 if len(code_files) >= 5:  # Limit to 5 files
                     break
-                
-                code_files.append({
-                    'file': match,
-                    'mentioned_in': event['event_id'],
-                    'summary': f"File mentioned in conversation: {match}"
-                })
-        
+
+                code_files.append(
+                    {
+                        "file": match,
+                        "mentioned_in": event["event_id"],
+                        "summary": f"File mentioned in conversation: {match}",
+                    }
+                )
+
         return code_files
-    
+
     def save_snapshot(
-        self,
-        context: Context,
-        session_id: str,
-        event_id: Optional[str] = None
+        self, context: Context, session_id: str, event_id: Optional[str] = None
     ) -> Optional[str]:
         """Save context snapshot to database.
-        
+
         Only saves if snapshots are enabled.
-        
+
         Returns:
             snapshot_id or None if snapshots disabled
         """
         if not self.enable_snapshots:
             logger.debug("Context snapshots disabled, skipping save")
             return None
-        
+
         from uuid_utils import uuid7
         import json
-        
+
         snapshot_id = str(uuid7())
-        
+
         self.db.execute(
             """
             INSERT INTO context_snapshots (
@@ -488,7 +468,9 @@ class ContextManager:
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
-                snapshot_id, session_id, event_id,
+                snapshot_id,
+                session_id,
+                event_id,
                 context.system_prompt,
                 json.dumps(context.skill_definitions),
                 json.dumps(context.selected_events),
@@ -498,42 +480,65 @@ class ContextManager:
                 json.dumps(context.token_budget),
                 context.assembly_time_ms,
                 json.dumps(context.relevance_scores),
-                context.task_type.value
-            )
+                context.task_type.value,
+            ),
         )
-        
+
         logger.info(f"Context snapshot saved: {snapshot_id}")
         return snapshot_id
-    
+
     def load_snapshot(self, snapshot_id: str) -> Context:
         """Load context snapshot from database."""
         import json
-        
+
         row = self.db.fetchone(
-            "SELECT * FROM context_snapshots WHERE snapshot_id = %s",
-            (snapshot_id,)
+            "SELECT * FROM context_snapshots WHERE snapshot_id = %s", (snapshot_id,)
         )
-        
+
         if not row:
             raise ContextError(f"Snapshot not found: {snapshot_id}")
-        
+
         # Parse JSON fields
-        skill_definitions = json.loads(row['skill_definitions']) if isinstance(row['skill_definitions'], str) else row['skill_definitions']
-        selected_events = json.loads(row['selected_events']) if isinstance(row['selected_events'], str) else row['selected_events']
-        code_context = json.loads(row['code_context']) if isinstance(row['code_context'], str) else row['code_context']
-        documentation = json.loads(row['documentation']) if isinstance(row['documentation'], str) else row['documentation']
-        token_budget = json.loads(row['token_budget']) if isinstance(row['token_budget'], str) else row['token_budget']
-        relevance_scores = json.loads(row['relevance_scores']) if isinstance(row['relevance_scores'], str) else row['relevance_scores']
-        
+        skill_definitions = (
+            json.loads(row["skill_definitions"])
+            if isinstance(row["skill_definitions"], str)
+            else row["skill_definitions"]
+        )
+        selected_events = (
+            json.loads(row["selected_events"])
+            if isinstance(row["selected_events"], str)
+            else row["selected_events"]
+        )
+        code_context = (
+            json.loads(row["code_context"])
+            if isinstance(row["code_context"], str)
+            else row["code_context"]
+        )
+        documentation = (
+            json.loads(row["documentation"])
+            if isinstance(row["documentation"], str)
+            else row["documentation"]
+        )
+        token_budget = (
+            json.loads(row["token_budget"])
+            if isinstance(row["token_budget"], str)
+            else row["token_budget"]
+        )
+        relevance_scores = (
+            json.loads(row["relevance_scores"])
+            if isinstance(row["relevance_scores"], str)
+            else row["relevance_scores"]
+        )
+
         return Context(
-            system_prompt=row['system_prompt'],
+            system_prompt=row["system_prompt"],
             skill_definitions=skill_definitions or [],
             selected_events=selected_events or [],
             code_context=code_context or [],
             documentation=documentation or [],
-            total_tokens=row['total_tokens'],
+            total_tokens=row["total_tokens"],
             token_budget=token_budget,
-            assembly_time_ms=row['assembly_time_ms'],
+            assembly_time_ms=row["assembly_time_ms"],
             relevance_scores=relevance_scores,
-            task_type=TaskType(row['task_type'])
+            task_type=TaskType(row["task_type"]),
         )

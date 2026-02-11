@@ -7,10 +7,10 @@ from pydantic import BaseModel
 class AgentProfile(BaseModel):
     """Profile for an agent."""
 
-    agent_id: str                        # e.g. "code_reviewer", "security_auditor"
-    system_prompt: str                   # Role-specific instructions
+    agent_id: str  # e.g. "code_reviewer", "security_auditor"
+    system_prompt: str  # Role-specific instructions
     skill_filter: List[str] | None = None  # Limit available skills
-    model: str | None = None             # Optional model override
+    model: str | None = None  # Optional model override
 
 
 class AgentRegistry:

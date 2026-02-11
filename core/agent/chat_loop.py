@@ -21,35 +21,51 @@ def _needs_planning(user_input: str) -> bool:
     """Check if user input needs planning based on heuristics."""
     # Keywords that indicate multi-step tasks
     planning_keywords = [
-        "分析并", "分析和", "分析以及", "分析与",
-        "修复并", "修复和", "修复以及", "修复与",
-        "完成", "实现", "创建", "设置", "建立",
-        "帮我", "请帮我", "请帮我完成",
-        "多步", "多个步骤", "分步", "逐步",
-        "首先", "然后", "接着", "最后",
+        "分析并",
+        "分析和",
+        "分析以及",
+        "分析与",
+        "修复并",
+        "修复和",
+        "修复以及",
+        "修复与",
+        "完成",
+        "实现",
+        "创建",
+        "设置",
+        "建立",
+        "帮我",
+        "请帮我",
+        "请帮我完成",
+        "多步",
+        "多个步骤",
+        "分步",
+        "逐步",
+        "首先",
+        "然后",
+        "接着",
+        "最后",
     ]
-    
+
     # Check if query is long enough (likely complex)
     if len(user_input) > 200:
         return True
-    
+
     # Check for planning keywords
     for keyword in planning_keywords:
         if keyword in user_input:
             return True
-    
+
     return False
 
 
-def _merge_tool_call_fragments(
-    fragments: list[dict], new_fragments: list[dict]
-) -> list[dict]:
+def _merge_tool_call_fragments(fragments: list[dict], new_fragments: list[dict]) -> list[dict]:
     """Merge tool call fragments from streaming responses.
-    
+
     OpenAI streams tool_calls in fragments. This accumulates them.
     """
     merged = {fc["id"]: fc.copy() for fc in fragments}
-    
+
     for new_fc in new_fragments:
         fc_id = new_fc["id"]
         if fc_id not in merged:
@@ -61,7 +77,7 @@ def _merge_tool_call_fragments(
                     merged[fc_id]["function"]["arguments"] += new_fc["function"]["arguments"]
                 else:
                     merged[fc_id]["function"] = new_fc["function"].copy()
-    
+
     return list(merged.values())
 
 
@@ -129,12 +145,19 @@ class ChatLoop:
         if not tools_schema:
             # No tools available — plain chat
             response = self.llm.chat(
-                messages=[LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages],
+                messages=[
+                    LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages
+                ],
                 user_id=user_id,
                 session_id=session_id,
             )
-            self._log_response(user_id, session_id, response.content,
-                               user_event.event_id, user_event.causal_chain_id)
+            self._log_response(
+                user_id,
+                session_id,
+                response.content,
+                user_event.event_id,
+                user_event.causal_chain_id,
+            )
             return response.content
 
         # 4. Multi-turn tool use loop
@@ -150,12 +173,20 @@ class ChatLoop:
             if not tool_calls:
                 # LLM produced a final text answer — done
                 final_content = llm_result.get("content", "")
-                self._log_response(user_id, session_id, final_content,
-                                   user_event.event_id, user_event.causal_chain_id)
+                self._log_response(
+                    user_id,
+                    session_id,
+                    final_content,
+                    user_event.event_id,
+                    user_event.causal_chain_id,
+                )
                 return final_content
 
             # Append the assistant message (with tool_calls) to the chain
-            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": llm_result.get("content") or ""}
+            assistant_msg: Dict[str, Any] = {
+                "role": "assistant",
+                "content": llm_result.get("content") or "",
+            }
             assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
 
@@ -174,30 +205,37 @@ class ChatLoop:
                         session_id=session_id,
                         parent_event_id=user_event.event_id,
                     )
-                    result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
+                    result_str = (
+                        json.dumps(result, default=str) if not isinstance(result, str) else result
+                    )
                 except Exception as e:
                     logger.error(f"Skill {fn_name} failed: {e}")
                     result_str = json.dumps({"error": str(e)})
 
                 # Append tool result in OpenAI protocol format
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "content": result_str,
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": result_str,
+                    }
+                )
 
         # Exhausted rounds — ask LLM for a final answer without tools
-        messages.append({
-            "role": "system",
-            "content": "Please provide your final answer based on the tool results above.",
-        })
+        messages.append(
+            {
+                "role": "system",
+                "content": "Please provide your final answer based on the tool results above.",
+            }
+        )
         response = self.llm.chat(
             messages=[LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages],
             user_id=user_id,
             session_id=session_id,
         )
-        self._log_response(user_id, session_id, response.content,
-                           user_event.event_id, user_event.causal_chain_id)
+        self._log_response(
+            user_id, session_id, response.content, user_event.event_id, user_event.causal_chain_id
+        )
         return response.content
 
     async def run_step_stream(
@@ -209,7 +247,7 @@ class ChatLoop:
         max_candidates: int = 5,
     ) -> AsyncIterator[StreamEvent]:
         """Stream events as the agent processes a request.
-        
+
         Yields StreamEvent objects for real-time output.
         """
         # 1. Log user query event
@@ -261,7 +299,7 @@ class ChatLoop:
                     event_id=text_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
-            
+
             text_done_event = self.event_logger.create_stream_event(
                 user_id=user_id,
                 session_id=session_id,
@@ -276,7 +314,7 @@ class ChatLoop:
                 event_id=text_done_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
             )
-            
+
             run_finished_event = self.event_logger.create_stream_event(
                 user_id=user_id,
                 session_id=session_id,
@@ -334,9 +372,10 @@ class ChatLoop:
                     event_id=text_done_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
-                self._log_response(user_id, session_id, full_text,
-                                   user_event.event_id, user_event.causal_chain_id)
-                
+                self._log_response(
+                    user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id
+                )
+
                 run_finished_event = self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
@@ -371,7 +410,7 @@ class ChatLoop:
                     event_id=tool_start_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
-                
+
                 # Handle delegation skill specially for multi-agent
                 if fn_name == "delegate_task":
                     params = json.loads(tc["function"]["arguments"])
@@ -406,8 +445,10 @@ class ChatLoop:
                         session_id=session_id,
                         parent_event_id=user_event.event_id,
                     )
-                    result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
-                
+                    result_str = (
+                        json.dumps(result, default=str) if not isinstance(result, str) else result
+                    )
+
                 tool_result_event = self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
@@ -425,10 +466,12 @@ class ChatLoop:
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 
         # Exhausted rounds — ask LLM for a final answer without tools
-        messages.append({
-            "role": "system",
-            "content": "Please provide your final answer based on the tool results above.",
-        })
+        messages.append(
+            {
+                "role": "system",
+                "content": "Please provide your final answer based on the tool results above.",
+            }
+        )
         full_text = ""
         async for chunk in self.llm.chat_stream(messages, user_id, session_id):
             full_text += chunk
@@ -438,8 +481,9 @@ class ChatLoop:
                 event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
             )
-        self._log_response(user_id, session_id, full_text,
-                           user_event.event_id, user_event.causal_chain_id)
+        self._log_response(
+            user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id
+        )
         yield StreamEvent(
             event_type=StreamEventType.RUN_FINISHED,
             data={},
@@ -456,7 +500,7 @@ class ChatLoop:
         max_candidates: int = 5,
     ) -> AsyncIterator[StreamEvent]:
         """PAOR: Plan → Act → Observe → Reflect loop.
-        
+
         For complex tasks that need multi-step planning.
         """
         planner = Planner(self.llm)
@@ -464,7 +508,7 @@ class ChatLoop:
 
         # P: Plan
         plan = await planner.create_plan(goal=user_input, context=str(context))
-        
+
         # Check constraints
         is_valid, error_msg = planner.check_constraints(plan)
         if not is_valid:
@@ -473,7 +517,7 @@ class ChatLoop:
                 data={"error": error_msg},
             )
             return
-        
+
         # Log plan created event
         self.event_logger.create_stream_event(
             user_id=user_id,
@@ -481,7 +525,7 @@ class ChatLoop:
             event_type="stream_plan_created",
             content=plan.model_dump_json(),
         )
-        
+
         yield StreamEvent(
             event_type=StreamEventType.PLAN_CREATED,
             data={"plan": plan.model_dump()},
@@ -501,7 +545,9 @@ class ChatLoop:
             if len(plan.steps) > constraints.max_steps:
                 yield StreamEvent(
                     event_type=StreamEventType.RUN_ERROR,
-                    data={"error": f"Step count {len(plan.steps)} exceeds max {constraints.max_steps}"},
+                    data={
+                        "error": f"Step count {len(plan.steps)} exceeds max {constraints.max_steps}"
+                    },
                 )
                 return
 
@@ -511,7 +557,7 @@ class ChatLoop:
                     event_type=StreamEventType.PLAN_STEP_START,
                     data={"step": step.step_id},
                 )
-                
+
                 # Execute step using existing skill execution
                 skill_name = step.skill_hint
                 if skill_name:
@@ -524,11 +570,11 @@ class ChatLoop:
                 else:
                     # Use plain chat for step execution
                     result = "Step executed"
-                
+
                 step.status = "completed"
                 step.result = str(result)
                 step_results.append({"step_id": step.step_id, "result": result})
-                
+
                 yield StreamEvent(
                     event_type=StreamEventType.PLAN_STEP_DONE,
                     data={"step": step.step_id, "result": str(result)},
@@ -562,11 +608,15 @@ class ChatLoop:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _build_messages(self, user_input: str, context: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _build_messages(
+        self, user_input: str, context: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
         """Build the initial messages list, injecting context if available."""
         messages: List[Dict[str, Any]] = []
 
-        system_parts = ["You are a development assistant. Use the available tools to help the user."]
+        system_parts = [
+            "You are a development assistant. Use the available tools to help the user."
+        ]
 
         if context:
             if context.get("system_prompt"):
@@ -583,8 +633,14 @@ class ChatLoop:
         messages.append({"role": "user", "content": user_input})
         return messages
 
-    def _log_response(self, user_id: str, session_id: str, content: str,
-                      parent_event_id: str, causal_chain_id: str) -> None:
+    def _log_response(
+        self,
+        user_id: str,
+        session_id: str,
+        content: str,
+        parent_event_id: str,
+        causal_chain_id: str,
+    ) -> None:
         """Log the final agent response as an event."""
         self.event_logger.create_llm_response(
             user_id=user_id,

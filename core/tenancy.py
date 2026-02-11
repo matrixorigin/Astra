@@ -13,6 +13,7 @@ logger = get_logger(__name__)
 
 class TenantStatus(str, Enum):
     """Tenant status."""
+
     ACTIVE = "active"
     SUSPENDED = "suspended"
     TRIAL = "trial"
@@ -21,6 +22,7 @@ class TenantStatus(str, Enum):
 @dataclass
 class Tenant:
     """Tenant information."""
+
     tenant_id: str
     name: str
     status: TenantStatus
@@ -33,86 +35,99 @@ class Tenant:
 
 class TenantManager:
     """Manage multi-tenant isolation."""
-    
+
     def __init__(self, db: Database):
         self.db = db
-    
+
     def create_tenant(
         self,
         name: str,
         max_users: int = 100,
         max_sessions_per_day: int = 1000,
-        max_llm_cost_per_day: float = 100.0
+        max_llm_cost_per_day: float = 100.0,
     ) -> Tenant:
         """Create new tenant."""
         from uuid_utils import uuid7
-        
+
         tenant_id = str(uuid7())
-        
-        self.db.execute("""
+
+        self.db.execute(
+            """
             INSERT INTO tenants (
                 tenant_id, name, status, max_users,
                 max_sessions_per_day, max_llm_cost_per_day
             ) VALUES (%s, %s, %s, %s, %s, %s)
-        """, (
-            tenant_id, name, TenantStatus.ACTIVE.value,
-            max_users, max_sessions_per_day, max_llm_cost_per_day
-        ))
-        
+        """,
+            (
+                tenant_id,
+                name,
+                TenantStatus.ACTIVE.value,
+                max_users,
+                max_sessions_per_day,
+                max_llm_cost_per_day,
+            ),
+        )
+
         logger.info(f"Created tenant: {tenant_id} ({name})")
-        
+
         return self.get_tenant(tenant_id)
-    
+
     def get_tenant(self, tenant_id: str) -> Optional[Tenant]:
         """Get tenant by ID."""
-        row = self.db.fetchone(
-            "SELECT * FROM tenants WHERE tenant_id = %s",
-            (tenant_id,)
-        )
-        
+        row = self.db.fetchone("SELECT * FROM tenants WHERE tenant_id = %s", (tenant_id,))
+
         if not row:
             return None
-        
+
         return Tenant(
-            tenant_id=row['tenant_id'],
-            name=row['name'],
-            status=TenantStatus(row['status']),
-            max_users=row['max_users'],
-            max_sessions_per_day=row['max_sessions_per_day'],
-            max_llm_cost_per_day=row['max_llm_cost_per_day'],
-            created_at=str(row['created_at']),
-            metadata=row.get('metadata', {})
+            tenant_id=row["tenant_id"],
+            name=row["name"],
+            status=TenantStatus(row["status"]),
+            max_users=row["max_users"],
+            max_sessions_per_day=row["max_sessions_per_day"],
+            max_llm_cost_per_day=row["max_llm_cost_per_day"],
+            created_at=str(row["created_at"]),
+            metadata=row.get("metadata", {}),
         )
-    
+
     def check_quota(self, tenant_id: str) -> dict:
         """Check tenant quota usage."""
         tenant = self.get_tenant(tenant_id)
         if not tenant:
             raise AuthenticationError(f"Tenant not found: {tenant_id}")
-        
+
         # Check daily sessions
-        sessions_today = self.db.fetchone("""
+        sessions_today = self.db.fetchone(
+            """
             SELECT COUNT(*) as count
             FROM sessions
             WHERE tenant_id = %s
             AND DATE(created_at) = CURDATE()
-        """, (tenant_id,))['count']
-        
+        """,
+            (tenant_id,),
+        )["count"]
+
         # Check daily LLM cost
-        cost_today = self.db.fetchone("""
+        cost_today = self.db.fetchone(
+            """
             SELECT COALESCE(SUM(cost), 0) as total
             FROM llm_call_logs
             WHERE tenant_id = %s
             AND DATE(created_at) = CURDATE()
-        """, (tenant_id,))['total']
-        
+        """,
+            (tenant_id,),
+        )["total"]
+
         # Check user count
-        user_count = self.db.fetchone("""
+        user_count = self.db.fetchone(
+            """
             SELECT COUNT(DISTINCT user_id) as count
             FROM sessions
             WHERE tenant_id = %s
-        """, (tenant_id,))['count']
-        
+        """,
+            (tenant_id,),
+        )["count"]
+
         return {
             "sessions_today": sessions_today,
             "sessions_limit": tenant.max_sessions_per_day,
@@ -122,19 +137,19 @@ class TenantManager:
             "cost_remaining": max(0, tenant.max_llm_cost_per_day - float(cost_today)),
             "users": user_count,
             "users_limit": tenant.max_users,
-            "status": tenant.status.value
+            "status": tenant.status.value,
         }
-    
+
     def enforce_quota(self, tenant_id: str):
         """Enforce tenant quotas."""
         quota = self.check_quota(tenant_id)
-        
+
         if quota["sessions_remaining"] <= 0:
             raise AuthenticationError("Daily session quota exceeded")
-        
+
         if quota["cost_remaining"] <= 0:
             raise AuthenticationError("Daily cost quota exceeded")
-        
+
         if quota["users"] >= quota["users_limit"]:
             raise AuthenticationError("User limit reached")
 

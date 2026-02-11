@@ -112,7 +112,7 @@ class EventLogger:
             mapped_event_type = EventType(event_type)
         except ValueError:
             mapped_event_type = EventType.SYSTEM_MESSAGE
-        
+
         event = ConversationEvent(
             event_id=str(uuid7()),
             user_id=user_id,

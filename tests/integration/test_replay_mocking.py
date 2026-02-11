@@ -155,9 +155,7 @@ def setup_recorded_result(db, session_id):
     yield _setup
 
     # Cleanup
-    db.execute(
-        "DELETE FROM conversation_events WHERE session_id = %s", (session_id,)
-    )
+    db.execute("DELETE FROM conversation_events WHERE session_id = %s", (session_id,))
 
 
 # ============================================================================
