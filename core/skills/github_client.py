@@ -1,7 +1,7 @@
 """GitHub client wrapper for skills."""
 
 from typing import Optional
-from github import Github, GithubException
+from github import Github, Auth, GithubException
 from github.PullRequest import PullRequest
 from github.WorkflowRun import WorkflowRun
 import time
@@ -33,7 +33,7 @@ class GitHubClient:
             logger.warning("GitHub token not configured, using unauthenticated access")
             self.client = Github(base_url=base_url)
         else:
-            self.client = Github(login_or_token=self.token, base_url=base_url)
+            self.client = Github(auth=Auth.Token(token=self.token), base_url=base_url)
         
         logger.info(f"GitHub client initialized (base_url={base_url})")
 

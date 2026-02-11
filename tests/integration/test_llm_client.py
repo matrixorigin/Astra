@@ -112,9 +112,8 @@ def test_chat_error_logging(client, db):
 
 def test_calculate_cost(client):
     """Test cost calculation."""
-    cost = client._calculate_cost(
-        provider=LLMProvider.OPENAI,
-        model="gpt-4",
+    cost = client.router.calculate_cost(
+        model_name="gpt-4",
         tokens_prompt=1000,
         tokens_completion=500,
     )
