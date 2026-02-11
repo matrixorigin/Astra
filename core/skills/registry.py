@@ -65,8 +65,8 @@ class SkillRegistry:
                 INSERT INTO skills_registry 
                 (skill_id, skill_name, version, description, requirements, 
                  code_hash, is_active, status, category, subcategory,
-                 triggers, dependencies, priority, cost_estimate)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s)
+                 triggers, dependencies, priority, cost_estimate, side_effect_category)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     description = VALUES(description),
                     requirements = VALUES(requirements),
@@ -78,6 +78,7 @@ class SkillRegistry:
                     dependencies = VALUES(dependencies),
                     priority = VALUES(priority),
                     cost_estimate = VALUES(cost_estimate),
+                    side_effect_category = VALUES(side_effect_category),
                     updated_at = CURRENT_TIMESTAMP
             """,
                 (
@@ -93,7 +94,8 @@ class SkillRegistry:
                     json.dumps(triggers or []),
                     json.dumps(dependencies or []),
                     priority,
-                    cost_estimate
+                    cost_estimate,
+                    skill.side_effect_profile.category.value
                 ),
             )
 

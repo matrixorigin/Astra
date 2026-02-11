@@ -27,6 +27,22 @@ class AccessScope(str, Enum):
     ADMIN = "admin"
 
 
+class SideEffectCategory(str, Enum):
+    """Side-effect categories for replay safety"""
+
+    READ = "read"  # Safe to replay, no external changes
+    WRITE = "write"  # Has side-effects, must use recorded results
+    DESTRUCTIVE = "destructive"  # Dangerous, blocked in replay mode
+
+
+class SideEffectProfile(BaseModel):
+    """Side-effect profile for a skill"""
+
+    category: SideEffectCategory
+    external_apis: list[str] = []  # e.g., ["github", "llm"]
+    mock_strategy: str = "recorded"  # How to mock in replay mode
+
+
 class SkillRequirement(BaseModel):
     """What a skill needs to run"""
 
@@ -59,6 +75,9 @@ class Skill(ABC):
     version: str  # Semantic versioning (1.0.0)
     description: str
     requirements: SkillRequirement
+    side_effect_profile: SideEffectProfile = SideEffectProfile(
+        category=SideEffectCategory.READ
+    )  # Default to READ (safe)
 
     @abstractmethod
     def validate_input(self, input_data: dict) -> SkillInput:

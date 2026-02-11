@@ -1,5 +1,6 @@
 """Built-in skills for mo-dev-agent."""
 
+import logging
 from pydantic import BaseModel
 from core.skills.base import (
     Skill,
@@ -8,10 +9,14 @@ from core.skills.base import (
     SkillRequirement,
     RepoType,
     AccessScope,
+    SideEffectCategory,
+    SideEffectProfile,
 )
 from core.skills.github_client import GitHubClient
 from core.llm import LLMClient
 from sdk import Database
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -43,6 +48,10 @@ class SummarizePRSkill(Skill):
     description = "Summarize a GitHub PR with LLM analysis"
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=True
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ,
+        external_apis=["github", "llm"],
     )
 
     def __init__(self, db: Database, llm: LLMClient, github: GitHubClient):
@@ -122,6 +131,10 @@ class ListPRsSkill(Skill):
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
     )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ,
+        external_apis=["github"],
+    )
 
     def __init__(self, db: Database, github: GitHubClient):
         self.db = db
@@ -176,6 +189,10 @@ class CIStatusSkill(Skill):
         repo_types=[RepoType.CI, RepoType.CODE],
         min_access=AccessScope.READ,
         llm_required=False,
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ,
+        external_apis=["github"],
     )
 
     def __init__(self, db: Database, github: GitHubClient):

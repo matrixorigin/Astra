@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS skills_registry (
   dependencies        JSON COMMENT 'Dependent skill names',
   priority            INT DEFAULT 5 COMMENT 'Selection priority (1-10)',
   cost_estimate       VARCHAR(20) DEFAULT 'medium' COMMENT 'low | medium | high',
+  side_effect_category VARCHAR(16) DEFAULT 'read' COMMENT 'read | write | destructive (for replay safety)',
   is_active           BOOLEAN DEFAULT TRUE COMMENT 'Current active version',
   status              VARCHAR(20) DEFAULT 'active' COMMENT 'active | deprecated | experimental',
   created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
