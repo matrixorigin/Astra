@@ -401,10 +401,185 @@ LLM 直接输出: code_review(pr_id="repo/123", pr_number=123, focus="performanc
 一步到位！
 ```
 
-### Phase 3 (Future) - 智能选择
-   - 学习用户偏好
-   - 自动调整优先级
-   - 成本优化
+### Phase 3 (Breakthrough) ⭐⭐⭐⭐⭐ - 架构突破
+**Auditable Skill Selection (业界首创)**
+
+利用 Git for Data + Event Sourcing + Sandbox 实现业界没有的能力：
+
+#### 1. 可审计的选择过程
+```python
+# 每次选择都是可审计的事件
+event = auditable_selector.select_with_validation(
+    query="Review PR #123",
+    session_id=session_id
+)
+
+# 完整审计追踪
+print(event.context_snapshot)  # 数据快照 ID
+print(event.selected_skills)   # 选择了哪些 skills
+print(event.selection_reasoning)  # 为什么选择
+print(event.candidate_scores)  # 所有候选的分数
+
+# 时间旅行调试 - 回溯任意历史选择
+db.execute(f"SELECT * FROM events {{SNAPSHOT = '{event.context_snapshot}'}}")
+# 看到选择器当时看到的完全相同的数据状态
+```
+
+**业界对比**：
+- ❌ 业界：选择过程不可追溯，选错了不知道为什么
+- ✅ 我们：每次选择绑定数据快照，可以时间旅行回溯
+
+#### 2. Sandbox 预验证（选择前验证）
+```python
+# 在 sandbox 中预先验证候选 skills
+event = auditable_selector.select_with_validation(
+    query="Review PR #123",
+    validate_in_sandbox=True  # 关键创新
+)
+
+# 内部流程：
+# 1. 获取 5 个候选 skills
+# 2. 为每个候选创建独立 sandbox
+# 3. 在 sandbox 中试运行（dry-run）
+# 4. 测量成功率、延迟、成本
+# 5. 选择 Pareto 最优的执行
+```
+
+**业界对比**：
+- ❌ 业界：选择后直接执行，选错了才知道
+- ✅ 我们：选择前在隔离环境验证，选最优的执行
+
+#### 3. 自动从失败中学习
+```python
+# 自动分析历史失败，学习正确选择
+learner = SelfImprovingSelector(db, llm)
+stats = learner.learn_from_failures(days=7)
+
+# 内部流程：
+# 1. 查询最近 7 天的失败案例（低评分、执行失败）
+# 2. 时间旅行到失败时的状态（使用 snapshot）
+# 3. 在 sandbox 中测试替代 skills
+# 4. 找到成功的替代方案
+# 5. 记录学习：query_pattern -> wrong_skills -> correct_skills
+
+print(stats)
+# {
+#   "failures_analyzed": 23,
+#   "corrections_found": 18,
+#   "learnings_added": 12
+# }
+
+# 下次遇到类似查询，自动应用学习
+corrected = learner.apply_learnings(query, candidates)
+```
+
+**业界对比**：
+- ❌ 业界：依赖人工标注 + 离线训练
+- ✅ 我们：自动从失败中学习，在 sandbox 中验证改进
+
+#### 4. 回归门禁（防止退化）
+```python
+# 每次选择器改进都自动回归测试
+gate = SkillSelectionRegressionGate(db, llm)
+result = gate.validate_selector_change(
+    new_selector=new_selector,
+    old_selector=old_selector,
+    selector_version="v2.1.0"
+)
+
+# 内部流程：
+# 1. 获取黄金测试集（高评分历史查询）
+# 2. 在 sandbox 中对比新旧选择器
+# 3. 时间旅行到每个查询的原始状态
+# 4. 测量新旧选择器的表现
+# 5. 如果退化超过 5%，拒绝部署
+
+print(result)
+# {
+#   "verdict": "PASS",
+#   "improvement_pct": 12.3,
+#   "new_score": 0.87,
+#   "old_score": 0.78
+# }
+```
+
+**业界对比**：
+- ❌ 业界：skill selection 改进没有质量门禁
+- ✅ 我们：每次改进自动回归测试，防止退化
+
+#### 5. 基于真实数据的成本优化
+```python
+# 查询历史真实成本数据
+cost_stats = db.execute("""
+    SELECT 
+        skill_name,
+        AVG(execution_time_ms) as avg_time,
+        AVG(tokens_used) as avg_tokens,
+        AVG(cost_usd) as avg_cost,
+        AVG(quality_score) as avg_quality
+    FROM skill_executions
+    WHERE created_at > NOW() - INTERVAL 7 DAY
+    GROUP BY skill_name
+""")
+
+# 构建 Pareto frontier（基于真实数据）
+selected = cost_aware_selector.select_with_cost_optimization(
+    query="Review PR #123",
+    budget=0.05  # $0.05 预算
+)
+
+# 在预算内选择质量最高的组合
+```
+
+**业界对比**：
+- ❌ 业界：成本是静态标签 `cost_estimate: medium`
+- ✅ 我们：基于真实执行数据动态优化成本
+
+---
+
+## 架构优势总结
+
+| 能力 | 业界方案 | mo-agent-engine 方案 | 突破等级 |
+|------|---------|---------------------|---------|
+| **可审计性** | ❌ 无法回溯决策依据 | ✅ 每次选择绑定数据快照 | ⭐⭐⭐⭐⭐ |
+| **验证机制** | ❌ 选错了才知道 | ✅ Sandbox 中预验证 | ⭐⭐⭐⭐⭐ |
+| **自动改进** | ⚠️ 依赖人工标注 | ✅ 从历史失败自动学习 | ⭐⭐⭐⭐⭐ |
+| **回归防护** | ❌ 无质量门禁 | ✅ 自动回归测试 | ⭐⭐⭐⭐⭐ |
+| **成本优化** | ⚠️ 静态估算 | ✅ 基于真实数据优化 | ⭐⭐⭐⭐☆ |
+| **时间旅行调试** | ❌ 不支持 | ✅ 回溯任意历史选择 | ⭐⭐⭐⭐⭐ |
+
+---
+
+## 为什么这是突破性的？
+
+### 业界的根本问题
+1. **不可审计** - 选择过程是黑盒，选错了不知道为什么
+2. **不可验证** - 只能事后发现错误，无法预防
+3. **不可改进** - 依赖人工标注，改进周期长
+
+### 我们的解决方案
+利用 **Git for Data** 的独特能力：
+- **Snapshot** → 每次选择绑定数据快照 → 可审计
+- **Sandbox** → 选择前在隔离环境验证 → 可验证
+- **Time-Travel** → 回溯历史失败并测试修正 → 可改进
+
+这些能力是 **mo-agent-engine 独有的**，业界没有类似架构。
+
+---
+
+## 实现状态
+
+### ✅ 已实现（Phase 3）
+- `AuditableSkillSelector` - 可审计的选择器
+- `SelfImprovingSelector` - 自我改进的选择器
+- `SkillSelectionRegressionGate` - 回归门禁
+- 完整的审计追踪表结构
+
+### 🚧 待完善
+- Semantic embedding retrieval（向量检索）
+- Schema validation（参数验证）
+- Real-time cost tracking（实时成本追踪）
+- Production deployment（生产部署）
 
 ## Sandbox-as-CI for Skill Changes
 

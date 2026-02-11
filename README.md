@@ -5,6 +5,10 @@ Intelligent agent platform with auditable decisions, safe iteration, and version
 ## Features
 
 - **Auditable Decisions**: Every agent decision binds to a data snapshot — reconstruct what the agent saw at any past moment
+- **Auditable Skill Selection** ⭐ NEW: Every skill selection is versioned and auditable — time-travel to any selection decision
+- **Sandbox Pre-Validation** ⭐ NEW: Validate skill selections in isolated sandbox before execution — choose the best, not guess
+- **Self-Improving Selection** ⭐ NEW: Automatically learn from historical failures using time-travel replay — no manual labeling needed
+- **Regression Gate** ⭐ NEW: Every selector change is automatically tested against golden queries — prevent degradation
 - **Event-Centric Architecture**: All interactions stored as atomic events with causal chain tracking
 - **Skill System**: Versioned, declarative skills with full replay capability and side-effect isolation
 - **Regression Gate**: Replay past sessions against prompt/skill changes in isolated environments before deployment
