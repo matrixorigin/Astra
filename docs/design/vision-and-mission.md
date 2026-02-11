@@ -70,6 +70,127 @@ MatrixOne provides all three natively through its Git for Data capabilities. Thi
 
 ## Core Architecture
 
+### The Agent OS Model
+
+mo-dev-agent is not an agent framework — it is an **Agent Operating System**. The distinction matters:
+
+- A **framework** provides libraries for building agents (LangChain, CrewAI)
+- An **OS** provides infrastructure that makes all agents on it inherently more capable
+
+Every agent running on this OS automatically gets: auditable decisions, safe experimentation, time-travel debugging, and cost control. These aren't features the agent developer implements — they're platform guarantees.
+
+### Three-Layer Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      USER AGENTS (Apps)                         │
+│  Code Review Agent · CI Diagnosis Agent · Data Analysis Agent   │
+│  ─ User-facing functionality                                    │
+│  ─ Defined by: system_prompt + skill_set + model                │
+│  ─ Developers build these                                       │
+├─────────────────────────────────────────────────────────────────┤
+│                    SYSTEM AGENTS (Daemons)                       │
+│  Regression Agent · Audit Agent · Tuning Agent · Eval Agent     │
+│  ─ Platform health & quality maintenance                        │
+│  ─ Pre-installed, run automatically on triggers                 │
+│  ─ Same execution model as User Agents (ChatLoop + Skills)      │
+│  ─ Have elevated permissions (access Time Travel, Sandbox APIs) │
+├─────────────────────────────────────────────────────────────────┤
+│                  PLATFORM CAPABILITIES (Kernel)                  │
+│  Event Bus · Context/Memory · Sandbox · Time Travel · LLM       │
+│  Client · Streaming · Skill Registry · Planning Engine          │
+│  ─ NOT agents — these are APIs that agents call                 │
+│  ─ Powered by MatrixOne (intentional tight coupling)            │
+│  ─ Interface extraction deferred until multi-tenant deployment  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                    ┌─────────┴─────────┐
+                    │    MatrixOne      │
+                    │  (Data Layer)     │
+                    │  Time Travel ·    │
+                    │  Zero-Copy Branch │
+                    │  HTAP · RBAC      │
+                    └───────────────────┘
+```
+
+**Why this layering matters**:
+- "Hallucination Firewall" is a **Platform Capability** (verification API), not an agent. But "Audit Agent" is a **System Agent** that calls the firewall API to audit past decisions.
+- "Regression Gate" is a **Platform Capability** (sandbox + replay API). But "Regression Agent" is a **System Agent** that triggers the gate on every skill/prompt change.
+- "Code Review" is a **User Agent** — it uses Platform Capabilities (context, memory, streaming) but doesn't know about sandbox or time-travel.
+
+This separation means: adding a new User Agent requires zero platform code. You define a system prompt, pick skills, and register it.
+
+### Unified Execution Model: How Agents Connect
+
+Every agent — user or system — runs the same execution loop. The question is how they compose:
+
+```
+User Request
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Orchestrator Agent (ChatLoop)                               │
+│                                                              │
+│  1. Classify: simple task or complex goal?                   │
+│     ├─ Simple → direct skill execution (single ChatLoop)     │
+│     └─ Complex → enter PAOR loop ↓                           │
+│                                                              │
+│  2. PLAN: generate structured plan                           │
+│     └─ Each step is either:                                  │
+│        ├─ Skill call (execute directly)                      │
+│        └─ Delegation (spawn child agent) ──────────────┐     │
+│                                                        │     │
+│  3. ACT: execute next step(s)                          │     │
+│     ├─ Direct steps: call skill via AgentExecutor      │     │
+│     └─ Delegated steps: spawn child ChatLoop(s) ───────┤     │
+│                                                        │     │
+│  4. OBSERVE: check results (from events)               │     │
+│                                                        │     │
+│  5. REFLECT: continue / revise / escalate / done       │     │
+│     └─ If revise → back to PLAN                        │     │
+│                                                        │     │
+│  6. SYNTHESIZE: combine all results → final response   │     │
+└──────────────────────────────────────────────────────────┘
+                         │                           │
+              ┌──────────┘                           │
+              ▼                                      ▼
+    ┌──────────────────┐                ┌──────────────────┐
+    │  Code Agent       │                │  CI Agent         │
+    │  (child ChatLoop) │                │  (child ChatLoop) │
+    │  own skills,      │                │  own skills,      │
+    │  own streaming,   │                │  own streaming,   │
+    │  own sandbox      │                │  own sandbox      │
+    └────────┬─────────┘                └────────┬─────────┘
+             │                                   │
+             ▼                                   ▼
+    ┌─────────────────────────────────────────────────────┐
+    │          conversation_events (Event Blackboard)      │
+    │  All delegation, results, reflections are events     │
+    │  Linked by causal_chain_id → full audit trail        │
+    │  Time-travel queryable → debug any point             │
+    └─────────────────────────────────────────────────────┘
+             │
+             ▼
+    ┌─────────────────────────────────────────────────────┐
+    │          Streaming Multiplexer                        │
+    │  Merges all agent streams → single output to user    │
+    │  Each chunk tagged with agent_id                     │
+    │  User sees parallel progress in real-time            │
+    └─────────────────────────────────────────────────────┘
+```
+
+**Key design decisions**:
+
+1. **Delegation = spawning a child ChatLoop**, not a function call. The child agent has its own system prompt, skills, model, and streaming. It's a full agent, not a subroutine.
+
+2. **The Event Blackboard is the only coordination mechanism.** Parent and child agents never share memory. The orchestrator reads child results from `conversation_events`. This makes the entire workflow replayable.
+
+3. **Streaming is multiplexed, not sequential.** When 3 agents run in parallel, the user sees all 3 progressing. Each `StreamEvent` carries `agent_id` so the UI can render per-agent progress.
+
+4. **Planning and multi-agent are orthogonal but composable.** A plan step can delegate to an agent. An agent can itself plan. This is recursive — an orchestrator plans, delegates to a code agent, which plans its own sub-steps. Depth is bounded by `PlanConstraints`.
+
+5. **System Agents use the same execution model.** The Regression Agent is just a ChatLoop with `system_prompt="You are a regression testing agent..."`, skills `[replay_session, create_sandbox, compute_quality_delta]`, and a trigger (skill/prompt change event). No special runtime.
+
 ### Deterministic Boundary Control
 
 LLM outputs are inherently non-deterministic. But agent *decisions* don't have to be black boxes. If we version-control every input to the decision:
@@ -97,6 +218,15 @@ This enables:
 - **Lineage**: Trace any output back to its data origins
 - **Audit**: Complete provenance for every agent action
 
+In multi-agent workflows, the causal chain extends across agents:
+```
+user_query → orchestrator_plan → delegation(code_agent) → code_agent_tool_call → code_agent_result → orchestrator_synthesis
+     ↑              ↑                    ↑                        ↑                      ↑                    ↑
+  chain_001     chain_001            chain_001                chain_001              chain_001            chain_001
+```
+
+One `causal_chain_id` links the entire workflow. Time-travel to any point.
+
 ### Skills as Versioned Capabilities
 
 Skills are not functions — they are **versioned, declarative capabilities** with:
@@ -113,11 +243,65 @@ Memory (infinite, persistent) → Selection → Prompt (finite, curated) → LLM
 
 The intelligence is in selection: choosing what to show the LLM from potentially years of accumulated data, within a fixed token budget.
 
+### MatrixOne: Intentional Tight Coupling
+
+MatrixOne is not a pluggable database choice — it is the architectural foundation. The core value propositions (time-travel, zero-copy branching, snapshot-consistent verification) are **architecturally impossible** on Postgres + Pinecone + S3.
+
+Current stance:
+- **Code directly calls MatrixOne SQL** — no abstraction layer
+- **Interface extraction deferred** until multi-tenant deployment requires separating "our MO" from "user's MO"
+- **This is a strategic advantage**, not technical debt — the tight coupling enables capabilities no other agent platform can offer
+
+---
+
+## Platform Capabilities (Kernel)
+
+These are APIs available to all agents. They are NOT agents themselves.
+
+| Capability | What It Provides | Powered By |
+|---|---|---|
+| **Event Bus** | Atomic event logging, causal chains, cross-session queries | `conversation_events` table |
+| **Context/Memory** | Three-layer selection (Memory→Prompt→Context) | MatrixOne + embedding refs |
+| **Sandbox** | Zero-copy isolated environments for experimentation | MatrixOne CLONE/SNAPSHOT |
+| **Time Travel** | Query any historical data state | MatrixOne `{SNAPSHOT = ...}` |
+| **LLM Client** | Multi-provider routing, circuit breaker, budget control | OpenAI/Groq/Anthropic adapters |
+| **Streaming** | AG-UI protocol event stream, transport-agnostic | SSE/WebSocket/stdout |
+| **Skill Registry** | Versioned skill management, side-effect profiles | `skills_registry` table |
+| **Planning Engine** | PAOR loop, hierarchical decomposition, plan versioning | Planner + ChatLoop |
+| **Hallucination Firewall** | Snapshot-consistent claim verification | Time Travel + LLM |
+| **Regression Gate** | Automated quality gate for changes | Sandbox + Replay |
+| **Cost Control** | Pre-call estimation, budget enforcement | LLM Client + `llm_call_logs` |
+
+## System Agents (Daemons)
+
+Pre-installed agents that maintain platform health. Same execution model as user agents (ChatLoop + Skills), but with elevated permissions and automatic triggers.
+
+| Agent | Trigger | What It Does | Platform APIs Used |
+|---|---|---|---|
+| **Regression Agent** | Skill/prompt change event | Replay golden sessions in sandbox, compute quality delta, pass/fail gate | Sandbox, Replay, Regression Gate |
+| **Audit Agent** | Periodic / on-demand | Verify past decisions against current knowledge, flag inconsistencies | Time Travel, Hallucination Firewall |
+| **Tuning Agent** | Quality score threshold | Analyze low-scoring interactions, propose prompt improvements | Memory, Context, Prompt Evolution |
+| **Eval Agent** | New training data batch | Validate dataset quality, detect contamination, compute metrics | Time Travel, Training Pipeline |
+
+System Agents are defined the same way as User Agents — `AgentProfile` with `system_prompt` + `skill_filter`. The only difference is they have access to platform-level skills (e.g., `create_sandbox`, `replay_session`) that User Agents don't.
+
+## User Agents (Apps)
+
+User-facing agents that solve domain problems. They use Platform Capabilities transparently — every decision is automatically auditable, every interaction is replayable, without the agent developer doing anything special.
+
+Examples:
+- **Code Review Agent**: skills = `[code_read, code_diff, code_comment]`
+- **CI Diagnosis Agent**: skills = `[ci_get_logs, ci_trigger, code_search]`
+- **Data Analysis Agent**: skills = `[sql_query, chart_generate, data_export]`
+- **Security Audit Agent**: skills = `[dep_scan, code_search, cve_lookup]`
+
+Adding a new User Agent = define `AgentProfile` (system_prompt + skills + model). Zero platform code changes.
+
 ---
 
 ## Innovation Layer
 
-These capabilities go beyond standard agent frameworks. Each addresses a real production need:
+These are Platform Capabilities that go beyond standard agent frameworks. Each addresses a real production need:
 
 ### Hallucination Firewall
 
@@ -200,28 +384,35 @@ Event system, session management, skill framework, basic sandbox, side-effect is
 - Prompt evolution pipeline (branch-based A/B testing with quality gates)
 - Knowledge regression detection
 
-### Phase 4: Real-Time Experience
-- Streaming output (AG-UI protocol, structured event stream over SSE/WebSocket/stdout)
+### Phase 4: Real-Time Experience ✅ (Streaming Implemented)
+- ✅ Streaming output (AG-UI protocol, structured event stream)
+- ✅ Multi-turn tool call streaming with accumulation
 - User intervention mid-execution (cancel, redirect, approve/reject gates)
-- Streaming audit trail (every streamed chunk is a persisted, replayable event)
 
-### Phase 5: Autonomous Agents
-- Autonomous planning (Plan-Act-Observe-Reflect loop with hierarchical decomposition)
-- Plan versioning and cross-session persistence
-- Multi-agent collaboration (event blackboard coordination, delegation-as-skill)
-- Parallel fan-out, pipeline, and adversarial review patterns
+### Phase 5: Autonomous Agents ✅ (Planning + Multi-Agent Skeleton Implemented)
+- ✅ PAOR loop for single-session planning
+- ✅ Agent registry and profile system
+- Multi-agent orchestration (delegation-as-skill, fan-out/fan-in)
+- Stream multiplexing across parallel agents
 - Plan dry-run in sandbox branches
+- Cross-session plan persistence
 
-### Phase 6: Data Intelligence
+### Phase 6: System Agents
+- Regression Agent (auto-trigger on skill/prompt change)
+- Audit Agent (periodic decision verification)
+- Tuning Agent (prompt optimization from quality signals)
+- Eval Agent (training data validation)
+
+### Phase 7: Data Intelligence
 - Training data pipeline with versioned snapshots and lineage
 - Event lineage graph with contamination detection
 - Cost-aware execution with historical prediction
 
-### Phase 7: Platform Scale
+### Phase 8: Platform Scale
+- Control Plane / Data Plane separation
 - Multi-tenant agent instances (MatrixOne account-level isolation)
 - Skill/prompt marketplace with branch-based trial
 - Snapshot-scoped permissions
-- Visual workflow editor (TODO — design pending)
 - Enterprise deployment (RBAC, row-level security, monitoring)
 
 ---
@@ -234,4 +425,9 @@ We don't compete on "smarter LLM" or "more tools." We compete on **trust infrast
 - Every change is **testable** — regression gates before deployment, not after complaints
 - Every data dependency is **versioned** — from knowledge base to training data to prompts
 
-This requires data capabilities (time-travel, zero-copy branching, HTAP, causal event chains) that are native to MatrixOne and architecturally impossible to retrofit onto traditional database stacks. The platform we build turns these data capabilities into agent capabilities that solve real production adoption blockers.
+This is an **Agent Operating System**, not a framework:
+- **Platform Capabilities** (kernel): Event Bus, Sandbox, Time Travel, Streaming, Planning — APIs that all agents inherit
+- **System Agents** (daemons): Regression, Audit, Tuning — maintain platform health automatically
+- **User Agents** (apps): Code Review, CI Diagnosis, Data Analysis — user-facing, zero platform code to add
+
+The tight coupling with MatrixOne is the strategic moat. Time-travel, zero-copy branching, HTAP, and causal event chains are architecturally impossible to retrofit onto traditional database stacks. The platform turns these data capabilities into agent capabilities that no other platform can offer.
