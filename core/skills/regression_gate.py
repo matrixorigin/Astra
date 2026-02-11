@@ -8,7 +8,6 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
-import numpy as np
 from uuid_utils import uuid7
 
 from core.logging_config import get_logger
@@ -100,8 +99,8 @@ class SkillSelectionRegressionGate:
             old_results = self._test_selector(old_selector, golden_queries, sandbox_name)
 
             # Step 4: Compare results
-            new_avg = np.mean([r["score"] for r in new_results])
-            old_avg = np.mean([r["score"] for r in old_results])
+            new_avg = sum(r["score"] for r in new_results) / len(new_results) if new_results else 0
+            old_avg = sum(r["score"] for r in old_results) / len(old_results) if old_results else 0
             improvement = (new_avg - old_avg) / old_avg if old_avg > 0 else 0
 
             # Step 5: Make verdict

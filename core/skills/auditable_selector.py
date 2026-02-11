@@ -210,7 +210,7 @@ class AuditableSkillSelector:
         rows = self.db.execute(
             """
             SELECT skill_name, version, description, category, 
-                   subcategory, triggers, priority, cost_estimate
+                   subcategory, triggers, dependencies, priority, cost_estimate
             FROM skills_registry
             WHERE is_active = 1
         """
@@ -226,6 +226,7 @@ class AuditableSkillSelector:
                     category=row.get("category", "general"),
                     subcategory=row.get("subcategory", "default"),
                     triggers=json.loads(row.get("triggers", "[]")),
+                    dependencies=json.loads(row.get("dependencies", "[]")),
                     priority=row.get("priority", 5),
                     cost_estimate=row.get("cost_estimate", "medium"),
                 )
