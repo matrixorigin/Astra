@@ -79,6 +79,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+markers = [
+    "integration: marks tests as integration tests (require database setup)",
+]
 
 [build-system]
 requires = ["poetry-core"]

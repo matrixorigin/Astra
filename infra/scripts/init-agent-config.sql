@@ -3,16 +3,15 @@
 
 -- Create agent_config database
 CREATE DATABASE IF NOT EXISTS agent_config;
-USE agent_config;
 
 -- Model registry with extensible scope support
-CREATE TABLE IF NOT EXISTS model_registry (
+CREATE TABLE IF NOT EXISTS agent_config.model_registry (
   config_id           VARCHAR(64) PRIMARY KEY,
   scope_type          VARCHAR(32) NOT NULL COMMENT 'global|account|user|project|repo|region|environment...',
   scope_id            VARCHAR(255) COMMENT 'NULL for global, or specific ID',
   model_name          VARCHAR(255) NOT NULL,
   provider            VARCHAR(64) NOT NULL COMMENT 'openai|anthropic|groq',
-  config_json         JSON NOT NULL COMMENT 'Model configuration',
+  config_json         TEXT NOT NULL COMMENT 'Model configuration',
   created_by          VARCHAR(255) NOT NULL,
   created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -23,14 +22,14 @@ CREATE TABLE IF NOT EXISTS model_registry (
 ) COMMENT='Model registry with scope-based access control';
 
 -- Skills registry with extensible scope support
-CREATE TABLE IF NOT EXISTS skills_registry (
+CREATE TABLE IF NOT EXISTS agent_config.skills_registry (
   skill_id            VARCHAR(64) PRIMARY KEY,
   skill_name          VARCHAR(255) NOT NULL,
   scope_type          VARCHAR(32) NOT NULL COMMENT 'global|account|user',
   scope_id            VARCHAR(255) COMMENT 'NULL for global, account_id or user_id',
   skill_type          VARCHAR(64) NOT NULL COMMENT 'builtin|python|sql|external',
   description         TEXT,
-  parameters_schema   JSON COMMENT 'JSON Schema for parameters',
+  parameters_schema   TEXT COMMENT 'JSON Schema for parameters',
   implementation      TEXT COMMENT 'Code or reference',
   is_active           BOOLEAN DEFAULT TRUE,
   created_by          VARCHAR(255) NOT NULL,
@@ -44,7 +43,7 @@ CREATE TABLE IF NOT EXISTS skills_registry (
 ) COMMENT='Skills registry with scope-based access control';
 
 -- API tokens with extensible scope support
-CREATE TABLE IF NOT EXISTS api_tokens (
+CREATE TABLE IF NOT EXISTS agent_config.api_tokens (
   token_id            VARCHAR(64) PRIMARY KEY,
   token_type          VARCHAR(32) NOT NULL COMMENT 'llm|repo',
   provider            VARCHAR(64) NOT NULL COMMENT 'openai|anthropic|groq|github',
@@ -62,7 +61,7 @@ CREATE TABLE IF NOT EXISTS api_tokens (
 ) COMMENT='API tokens with scope-based access control';
 
 -- Audit logs for all administrative operations
-CREATE TABLE IF NOT EXISTS audit_logs (
+CREATE TABLE IF NOT EXISTS agent_config.audit_logs (
   log_id              VARCHAR(64) PRIMARY KEY,
   user_id             VARCHAR(255) NOT NULL,
   action              VARCHAR(64) NOT NULL COMMENT 'create_model|update_model|delete_model|create_skill...',
@@ -70,8 +69,8 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   resource_id         VARCHAR(255),
   scope_type          VARCHAR(32),
   scope_id            VARCHAR(255),
-  old_value           JSON COMMENT 'Before change',
-  new_value           JSON COMMENT 'After change',
+  old_value           TEXT COMMENT 'Before change',
+  new_value           TEXT COMMENT 'After change',
   status              VARCHAR(32) DEFAULT 'success' COMMENT 'success|failed|denied',
   error_message       TEXT,
   created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -83,7 +82,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 ) COMMENT='Audit trail for all administrative operations';
 
 -- Insert default global models
-INSERT INTO model_registry (config_id, scope_type, scope_id, model_name, provider, config_json, created_by) VALUES
+INSERT INTO agent_config.model_registry (config_id, scope_type, scope_id, model_name, provider, config_json, created_by) VALUES
 ('model_global_gpt4o', 'global', NULL, 'gpt-4o', 'openai', 
  '{"context_window": 128000, "price_per_1k_prompt": 0.0025, "price_per_1k_completion": 0.01, "rpm_limit": 500, "tpm_limit": 150000}', 
  'system'),
@@ -94,12 +93,7 @@ INSERT INTO model_registry (config_id, scope_type, scope_id, model_name, provide
  '{"context_window": 200000, "price_per_1k_prompt": 0.003, "price_per_1k_completion": 0.015, "rpm_limit": 50, "tpm_limit": 40000}',
  'system');
 
--- Grant permissions to mo_agent_user role
--- Users can read all configs but only write to user-scoped skills
-GRANT SELECT ON agent_config.* TO mo_agent_user;
-GRANT INSERT, UPDATE, DELETE ON agent_config.skills_registry TO mo_agent_user;
-
--- Grant full permissions to mo_agent_admin role
-GRANT ALL ON agent_config.* TO mo_agent_admin;
+-- Note: GRANT statements should be run after roles are created
+-- See init-rbac.sql for role creation and privilege grants
 
 SELECT 'Agent configuration database initialized successfully' AS status;

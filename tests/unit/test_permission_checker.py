@@ -15,7 +15,7 @@ class MockDB:
         }
     
     def fetchone(self, query, params=None):
-        if 'mo_role_grant' in query:
+        if 'mo_user_grant' in query or 'mo_role_grant' in query:
             user_id, role_name = params
             if user_id in self.roles and role_name in self.roles[user_id]:
                 return {'cnt': 1}

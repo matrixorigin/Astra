@@ -93,7 +93,7 @@ def model_add(ctx, model_name, provider, scope, scope_id, context_window,
         db.execute(
             """
             INSERT INTO agent_config.model_registry 
-            (config_id, scope_type, scope_id, model_name, provider, config, created_by, created_at)
+            (config_id, scope_type, scope_id, model_name, provider, config_json, created_by, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (config_id, scope, scope_id, model_name, provider, json.dumps(config), user, datetime.now())
@@ -212,7 +212,7 @@ def model_list(ctx, scope, scope_id):
     click.echo("=" * 80)
     
     for m in models:
-        config = json.loads(m['config'])
+        config = json.loads(m['config_json'])
         click.echo(f"✓ {m['model_name']}")
         click.echo(f"   Provider: {m['provider']}")
         click.echo(f"   Scope: {m['scope_type']}" + (f" ({m['scope_id']})" if m['scope_id'] else ""))
@@ -253,7 +253,7 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
         db.execute(
             """
             INSERT INTO agent_config.api_tokens 
-            (token_id, token_type, provider, scope_type, scope_id, token_value, is_active, created_by, created_at)
+            (token_id, token_type, provider, scope_type, scope_id, encrypted_value, is_active, created_by, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s)
             """,
             (token_id, token_type, provider, scope, scope_id, token_value, user, datetime.now())

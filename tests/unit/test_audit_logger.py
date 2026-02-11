@@ -13,14 +13,16 @@ class MockDB:
     
     def execute(self, query, params=None):
         if 'INSERT INTO agent_config.audit_logs' in query:
+            # New schema: log_id, user_id, action, resource_type, resource_id, new_value, status, created_at
             self.logs.append({
-                'user_id': params[0],
-                'action': params[1],
-                'resource_type': params[2],
-                'resource_id': params[3],
-                'details': params[4],
-                'status': params[5],
-                'created_at': params[6]
+                'log_id': params[0],
+                'user_id': params[1],
+                'action': params[2],
+                'resource_type': params[3],
+                'resource_id': params[4],
+                'details': params[5],  # stored in new_value column
+                'status': params[6],
+                'created_at': params[7]
             })
     
     def fetchall(self, query, params=None):

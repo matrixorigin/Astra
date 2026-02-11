@@ -22,13 +22,18 @@ class AuditLogger:
         status: str = 'success'
     ):
         """Log an admin operation."""
+        # Generate log_id
+        import uuid
+        log_id = f"log_{uuid.uuid4().hex[:16]}"
+        
         self.db.execute(
             """
             INSERT INTO agent_config.audit_logs 
-            (user_id, action, resource_type, resource_id, details, status, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            (log_id, user_id, action, resource_type, resource_id, new_value, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
+                log_id,
                 user_id,
                 action,
                 resource_type,

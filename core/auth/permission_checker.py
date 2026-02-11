@@ -14,9 +14,9 @@ class PermissionChecker:
         """Check if user has a specific role."""
         query = """
         SELECT COUNT(*) as cnt
-        FROM mo_catalog.mo_role_grant rg
-        JOIN mo_catalog.mo_user u ON rg.grantee_id = u.user_id
-        JOIN mo_catalog.mo_role r ON rg.granted_id = r.role_id
+        FROM mo_catalog.mo_user_grant ug
+        JOIN mo_catalog.mo_user u ON ug.user_id = u.user_id
+        JOIN mo_catalog.mo_role r ON ug.role_id = r.role_id
         WHERE u.user_name = %s AND r.role_name = %s
         """
         row = self.db.fetchone(query, (user_id, role_name))
