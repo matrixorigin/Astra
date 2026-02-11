@@ -9,7 +9,7 @@ that is:
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any
 
@@ -170,7 +170,7 @@ class AuditableSkillSelector:
             session_id=session_id,
             user_query=query,
             context_snapshot=snapshot_id,
-            available_skills=[s.model_dump() for s in available_skills],
+            available_skills=[asdict(s) for s in available_skills],
             selected_skills=selected_skills,
             selection_method=selection_method,
             selection_reasoning=reasoning,
@@ -207,7 +207,7 @@ class AuditableSkillSelector:
 
     def _get_available_skills(self) -> list[SkillMetadata]:
         """Get all available skills at this moment."""
-        rows = self.db.execute(
+        rows = self.db.fetchall(
             """
             SELECT skill_name, version, description, category, 
                    subcategory, triggers, dependencies, priority, cost_estimate
@@ -362,7 +362,7 @@ class AuditableSkillSelector:
             session_id=session_id,
             user_query=query,
             context_snapshot=snapshot_id,
-            available_skills=[s.model_dump() for s in available_skills],
+            available_skills=[asdict(s) for s in available_skills],
             selected_skills=[],
             selection_method="none",
             selection_reasoning="No suitable skills found",
@@ -463,7 +463,7 @@ class AuditableSkillSelector:
         query += " ORDER BY created_at DESC LIMIT %s"
         params.append(limit)
 
-        rows = self.db.execute(query, tuple(params))
+        rows = self.db.fetchall(query, tuple(params))
 
         events = []
         for row in rows:

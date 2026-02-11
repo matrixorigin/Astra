@@ -169,10 +169,11 @@ async def demo_regression_gate():
 
     print(f"\n✅ Gate result:")
     print(f"   Verdict: {result['verdict']}")
-    print(f"   Test queries: {result['test_queries_count']}")
-    print(f"   New selector score: {result['new_selector_avg_score']:.2f}")
-    print(f"   Old selector score: {result['old_selector_avg_score']:.2f}")
-    print(f"   Improvement: {result['improvement_pct']:.1f}%")
+    if result['verdict'] != 'SKIP':
+        print(f"   Test queries: {result['test_queries_count']}")
+        print(f"   New selector score: {result['new_selector_avg_score']:.2f}")
+        print(f"   Old selector score: {result['old_selector_avg_score']:.2f}")
+        print(f"   Improvement: {result['improvement_pct']:.1f}%")
     print(f"   Reason: {result['reason']}")
 
     if result["verdict"] == "PASS":

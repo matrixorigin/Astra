@@ -39,7 +39,7 @@ class SelfImprovingSelector:
             """
             CREATE TABLE IF NOT EXISTS skill_selection_learnings (
                 learning_id VARCHAR(36) PRIMARY KEY,
-                query_pattern TEXT NOT NULL,
+                query_pattern VARCHAR(255) NOT NULL,
                 wrong_skills JSON NOT NULL,
                 correct_skills JSON NOT NULL,
                 improvement_score DECIMAL(5, 2),
@@ -48,7 +48,7 @@ class SelfImprovingSelector:
                 learned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 applied_count INT DEFAULT 0,
                 last_applied_at TIMESTAMP,
-                INDEX idx_pattern (query_pattern(100)),
+                INDEX idx_pattern (query_pattern),
                 INDEX idx_confidence (confidence)
             )
         """
@@ -116,7 +116,7 @@ class SelfImprovingSelector:
         """Get recent selection failures (low user feedback or execution failure)."""
         cutoff = datetime.utcnow() - timedelta(days=days)
 
-        rows = self.db.execute(
+        rows = self.db.fetchall(
             """
             SELECT * FROM skill_selection_events
             WHERE created_at > %s
@@ -387,7 +387,7 @@ class SelfImprovingSelector:
 
     def get_learning_stats(self) -> dict[str, Any]:
         """Get statistics about learned corrections."""
-        stats = self.db.execute(
+        stats = self.db.fetchall(
             """
             SELECT 
                 COUNT(*) as total_learnings,
@@ -398,7 +398,7 @@ class SelfImprovingSelector:
         """
         )[0]
 
-        high_confidence = self.db.execute(
+        high_confidence = self.db.fetchall(
             """
             SELECT COUNT(*) as count
             FROM skill_selection_learnings

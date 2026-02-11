@@ -141,7 +141,7 @@ class SkillSelectionRegressionGate:
         """Get golden queries (high user feedback, successful execution)."""
         cutoff = datetime.utcnow() - timedelta(days=30)
 
-        rows = self.db.execute(
+        rows = self.db.fetchall(
             """
             SELECT * FROM skill_selection_events
             WHERE created_at > %s
@@ -269,7 +269,7 @@ class SkillSelectionRegressionGate:
 
     def get_gate_history(self, limit: int = 20) -> list[dict[str, Any]]:
         """Get gate execution history."""
-        rows = self.db.execute(
+        rows = self.db.fetchall(
             """
             SELECT * FROM selector_gate_results
             ORDER BY tested_at DESC
@@ -297,7 +297,7 @@ class SkillSelectionRegressionGate:
 
     def get_gate_stats(self) -> dict[str, Any]:
         """Get gate statistics."""
-        stats = self.db.execute(
+        stats = self.db.fetchall(
             """
             SELECT 
                 COUNT(*) as total_gates,
