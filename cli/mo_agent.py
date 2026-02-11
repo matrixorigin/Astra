@@ -15,6 +15,11 @@ from core.llm.client import LLMClient
 from core.context import ContextManager, TaskType
 from core.skills.registry import SkillRegistry
 from core.skills.builtin import register_builtin_skills
+from core.agent.selector import AgentSkillSelector
+from core.agent.executor import AgentExecutor
+from core.agent.chat_loop import ChatLoop
+from core.skills.mocking import MockMode
+import asyncio
 
 
 @click.group()
@@ -27,9 +32,10 @@ def cli():
 @cli.command()
 @click.option('--user-id', default='cli_user', help='User identifier')
 @click.option('--model', default='gpt-4', help='LLM model to use')
-def chat(user_id, model):
+@click.option('--mode', type=click.Choice(['production', 'replay']), default='production', help='Execution mode')
+def chat(user_id, model, mode):
     """Start interactive chat session."""
-    click.echo("🤖 mo-agent interactive chat")
+    click.echo(f"🤖 mo-agent interactive chat (Mode: {mode})")
     click.echo("=" * 50)
     
     # Initialize
@@ -37,12 +43,26 @@ def chat(user_id, model):
     session_mgr = SessionManager(db)
     logger = EventLogger(db)
     llm_client = LLMClient(db, provider='openai', model=model)
-    context_mgr = ContextManager(db)
+    # context_mgr = ContextManager(db) # ChatLoop might handle context?
     
     # Register skills
     skill_registry = SkillRegistry(db)
     register_builtin_skills(skill_registry, db)
     
+    # Agent Components
+    selector = AgentSkillSelector(db, llm_client)
+    executor = AgentExecutor(
+        db=db, 
+        registry=skill_registry, 
+        mode=MockMode(mode)
+    )
+    chat_loop = ChatLoop(
+        selector=selector, 
+        executor=executor, 
+        llm_client=llm_client,
+        event_logger=logger
+    )
+
     # Create session
     session = session_mgr.create_session(user_id=user_id)
     click.echo(f"Session: {session.session_id}")
@@ -56,34 +76,23 @@ def chat(user_id, model):
             if user_input.lower() in ['exit', 'quit']:
                 break
             
-            # Log user query
-            user_event = logger.create_user_query(
-                user_id=user_id,
-                session_id=session.session_id,
-                content=user_input
-            )
-            
-            # Build context
-            context = context_mgr.build_context(
-                session_id=session.session_id,
-                query=user_input,
-                max_tokens=4000,
-                task_type=TaskType.GENERAL
-            )
-            
-            # Get LLM response
+            # Run Chat Loop Step
             click.echo("Agent> ", nl=False)
-            response = llm_client.chat(
-                session_id=session.session_id,
-                messages=[{"role": "user", "content": context.to_prompt()}],
-                parent_event_id=user_event.event_id
-            )
             
-            click.echo(response['content'])
+            # Run async loop
+            response = asyncio.run(chat_loop.run_step(
+                user_input=user_input, 
+                session_id=session.session_id,
+                user_id=user_id
+            ))
+            
+            click.echo(response)
             click.echo()
             
     except KeyboardInterrupt:
         click.echo("\n\nSession interrupted")
+    except Exception as e:
+        click.echo(f"\nError: {e}")
     finally:
         # Close session
         session_mgr.close_session(session.session_id)

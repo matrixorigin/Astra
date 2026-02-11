@@ -104,6 +104,43 @@ class LLMClient:
             )
             raise
 
+    def chat_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str = "auto",
+        model: Optional[str] = None,
+    ) -> dict:
+        """Send chat request with tools to LLM (OpenAI only)."""
+        # Simple implementation for OpenAI
+        try:
+            import openai
+        except ImportError:
+            raise ImportError("openai package not installed.")
+
+        # Get API key
+        api_key = self.config.get("openai_api_key") or self.db.fetchone(
+            "SELECT value FROM configs WHERE key_name = 'openai_api_key' LIMIT 1"
+        )
+        if api_key and isinstance(api_key, dict):
+            api_key = api_key["value"]
+
+        client = openai.OpenAI(api_key=api_key)
+        
+        model = model or self.config["model"]
+        
+        # Call OpenAI
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice
+        )
+        
+        # Return dict representation of the message
+        # This allows accessing .get('tool_calls')
+        return response.choices[0].message.model_dump()
+
     def _call_provider(
         self, provider: LLMProvider, request: LLMRequest
     ) -> LLMResponse:

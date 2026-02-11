@@ -1,0 +1,134 @@
+"""Integration tests for Agent Architecture."""
+
+import unittest
+from unittest.mock import MagicMock, patch
+import asyncio
+from core.agent.selector import AgentSkillSelector
+from core.agent.executor import AgentExecutor
+from core.agent.chat_loop import ChatLoop
+from core.skills.mocking import MockMode
+from core.skills.base import (
+    Skill, 
+    SideEffectProfile, 
+    SideEffectCategory, 
+    SkillRequirement, 
+    RepoType, 
+    AccessScope,
+    SkillInput,
+    SkillOutput
+)
+
+class MockInput(SkillInput):
+    param: str = "default"
+
+class MockSkill(Skill):
+    name: str = "test_skill"
+    version: str = "1.0.0"
+    description: str = "Test skill"
+    requirements: SkillRequirement = SkillRequirement(
+        repo_types=[RepoType.CODE],
+        min_access=AccessScope.READ
+    )
+    side_effect_profile: SideEffectProfile = SideEffectProfile(
+        category=SideEffectCategory.READ
+    )
+
+    def validate_input(self, input_data: dict) -> SkillInput:
+        # Simple mock validation
+        # In real world, we would validate user_id/session_id
+        return MockInput(
+            user_id=input_data.get('user_id', 'test_user'),
+            session_id=input_data.get('session_id', 'test_session'),
+            param=input_data.get('param', 'default')
+        )
+
+    async def execute(self, input: SkillInput) -> SkillOutput:
+        return SkillOutput(success=True, result=f"Executed with {input.param}")
+
+class TestAgentArchitecture(unittest.TestCase):
+    def setUp(self):
+        self.db = MagicMock()
+        self.registry = MagicMock()
+        self.llm_client = MagicMock()
+        self.event_logger = MagicMock()
+        self.event_logger.create_user_query.return_value.event_id = "user_event_1"
+        
+        # Setup Registry to return our mock skill
+        self.mock_skill = MockSkill()
+        self.registry.get.return_value = self.mock_skill
+        
+        self.selector = AgentSkillSelector(self.db, self.llm_client)
+        self.executor = AgentExecutor(self.db, self.registry, MockMode.PRODUCTION)
+        self.chat_loop = ChatLoop(
+            selector=self.selector, 
+            executor=self.executor, 
+            llm_client=self.llm_client,
+            event_logger=self.event_logger
+        )
+
+    def test_selector_delegation(self):
+        """Test that selector delegates to ModernSkillSelector."""
+        with patch('core.agent.selector.ModernSkillSelector') as MockModernSelector:
+            selector = AgentSkillSelector(self.db, self.llm_client)
+            selector.select_skills("query", {})
+            MockModernSelector.return_value.select_and_execute.assert_called_with("query", {}, 5)
+
+    def test_executor_execution(self):
+        """Test that executor uses ToolMockingLayer."""
+        # We need to mock ToolMockingLayer because it might do DB calls or validation
+        with patch('core.agent.executor.ToolMockingLayer') as MockLayer:
+            executor = AgentExecutor(self.db, self.registry, MockMode.PRODUCTION)
+            mock_layer_instance = MockLayer.return_value
+            
+            executor.execute_skill("test_skill", {"param": "value"}, "session_1")
+            
+            self.registry.get.assert_called_with("test_skill")
+            mock_layer_instance.execute.assert_called_once()
+
+    def test_chat_loop_flow(self):
+        """Test the full chat loop flow."""
+        # Mock selector to return a tool call
+        self.selector.select_skills = MagicMock(return_value=[
+            {
+                "function": {
+                    "name": "test_skill",
+                    "arguments": '{"param": "value"}'
+                }
+            }
+        ])
+        
+        # Mock executor to return a result
+        # Note: execute_skill returns what ToolMockingLayer returns.
+        # ToolMockingLayer.execute returns Any.
+        # If the skill returns SkillOutput, execute_skill returns SkillOutput.
+        self.executor.execute_skill = MagicMock(return_value=SkillOutput(success=True, result="Skill Result"))
+        
+        # Mock LLM to return final response
+        mock_response = MagicMock()
+        mock_response.content = "Final Answer"
+        self.llm_client.chat.return_value = mock_response
+
+        # Run loop
+        result = asyncio.run(self.chat_loop.run_step("User Input", "session_1", "user_1"))
+        
+        # Verify
+        self.event_logger.create_user_query.assert_called_with(
+            user_id="user_1",
+            session_id="session_1",
+            content="User Input"
+        )
+        self.selector.select_skills.assert_called_with(
+            query="User Input", 
+            context=None,
+            max_candidates=5
+        )
+        self.executor.execute_skill.assert_called_with(
+            skill_name="test_skill",
+            params={"param": "value"},
+            session_id="session_1",
+            parent_event_id="user_event_1"
+        )
+        self.assertEqual(result, "Final Answer")
+
+if __name__ == '__main__':
+    unittest.main()
