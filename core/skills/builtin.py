@@ -221,8 +221,7 @@ class CIStatusSkill(Skill):
         return CIStatusOutput(success=True, result=workflows, workflows=workflows)
 
 
-
-def register_builtin_skills(registry, db, llm=None, github=None):
+def register_builtin_skills(registry, db, llm=None, github=None, agent_registry=None, chat_loop_factory=None):
     """Register all built-in skills.
     
     Args:
@@ -230,9 +229,12 @@ def register_builtin_skills(registry, db, llm=None, github=None):
         db: Database instance
         llm: Optional LLMClient instance
         github: Optional GitHubClient instance
+        agent_registry: Optional AgentRegistry for multi-agent delegation
+        chat_loop_factory: Optional factory for creating ChatLoop instances
     """
     from core.skills.github_client import GitHubClient
     from core.llm import LLMClient
+    from core.skills.delegation import DelegateTaskSkill
     
     # Initialize clients if not provided
     if github is None:
@@ -286,3 +288,24 @@ def register_builtin_skills(registry, db, llm=None, github=None):
             logger.info(f"Registered {skill.name}@{skill.version}")
         except Exception as e:
             logger.warning(f"Failed to register {skill.name}: {e}")
+    
+    # Register delegation skill for multi-agent collaboration
+    if agent_registry and chat_loop_factory:
+        try:
+            delegation_skill = DelegateTaskSkill(
+                agent_registry=agent_registry,
+                chat_loop_factory=chat_loop_factory
+            )
+            registry.register(
+                skill=delegation_skill,
+                is_active=True,
+                category="multi_agent",
+                subcategory="coordination",
+                triggers=["delegate", "assign", "task", "agent"],
+                dependencies=[],
+                priority=10,
+                cost_estimate="low"
+            )
+            logger.info(f"Registered {delegation_skill.name}@{delegation_skill.version}")
+        except Exception as e:
+            logger.warning(f"Failed to register delegation skill: {e}")
