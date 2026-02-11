@@ -10,7 +10,8 @@ if [ -f .env ]; then
 fi
 
 # Database connection parameters
-DB_HOST=${MATRIXONE_HOST:-localhost}
+# Force 127.0.0.1 instead of localhost to avoid Unix socket on macOS
+DB_HOST=${MATRIXONE_HOST:-127.0.0.1}
 DB_PORT=${MATRIXONE_PORT:-6001}
 DB_USER=${MATRIXONE_USER:-root}
 DB_PASS=${MATRIXONE_PASSWORD:-111}
@@ -21,22 +22,26 @@ echo "Host: $DB_HOST:$DB_PORT"
 echo "Database: $DB_NAME"
 echo ""
 
-# MySQL connection options (try multiple SSL variants)
+# MySQL connection options
 MYSQL_BASE="-h$DB_HOST -P$DB_PORT -u$DB_USER -p$DB_PASS"
 
-# Try to create database (try different SSL options)
-if mysql $MYSQL_BASE -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;" 2>/dev/null; then
+# Test connection (suppress warnings but check exit code)
+if mysql $MYSQL_BASE -e "SELECT 1" >/dev/null 2>&1; then
     MYSQL_OPTS="$MYSQL_BASE"
-elif mysql $MYSQL_BASE --skip-ssl -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;" 2>/dev/null; then
-    echo "Using --skip-ssl"
+    echo "✓ Connected to database"
+elif mysql $MYSQL_BASE --skip-ssl -e "SELECT 1" >/dev/null 2>&1; then
+    echo "✓ Connected with --skip-ssl"
     MYSQL_OPTS="$MYSQL_BASE --skip-ssl"
-elif mysql $MYSQL_BASE --skip_ssl -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;" 2>/dev/null; then
-    echo "Using --skip_ssl (underscore)"
+elif mysql $MYSQL_BASE --skip_ssl -e "SELECT 1" >/dev/null 2>&1; then
+    echo "✓ Connected with --skip_ssl (underscore)"
     MYSQL_OPTS="$MYSQL_BASE --skip_ssl"
 else
     echo "❌ Failed to connect to database. Please check connection parameters."
     exit 1
 fi
+
+# Create database
+mysql $MYSQL_OPTS -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;" 2>&1 | grep -v "Warning" || true
 
 # Execute SQL schema
 mysql $MYSQL_OPTS "$DB_NAME" <<'EOF'

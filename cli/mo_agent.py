@@ -54,8 +54,13 @@ def chat(user_id, model, mode):
     llm_client = LLMClient(db)
     context_mgr = ContextManager(db)
 
-    # Agent Components
-    selector = AgentSkillSelector(db, llm_client)
+    # Create session first (needed for auditable selector)
+    session = session_mgr.create_session(user_id=user_id)
+    click.echo(f"Session: {session.session_id}")
+    click.echo("Type 'exit' or 'quit' to end session\n")
+
+    # Agent Components (with session_id for auditable selection)
+    selector = AgentSkillSelector(db, llm_client, auditable=True, session_id=session.session_id)
     executor = AgentExecutor(
         db=db,
         registry=None,  # Will be set after skill registration
@@ -93,10 +98,10 @@ def chat(user_id, model, mode):
         )
     )
 
-    # Create chat_loop_factory for delegation
+    # Create chat_loop_factory for delegation (also with auditable selector)
     def create_chat_loop(system_prompt=None):
         return ChatLoop(
-            selector=AgentSkillSelector(db, llm_client),
+            selector=AgentSkillSelector(db, llm_client, auditable=True, session_id=session.session_id),
             executor=AgentExecutor(db=db, registry=SkillRegistry(db), mode=MockMode(mode)),
             llm_client=llm_client,
             event_logger=EventLogger(db),
@@ -110,11 +115,6 @@ def chat(user_id, model, mode):
 
     # Update executor with registered skills
     executor.registry = skill_registry
-
-    # Create session
-    session = session_mgr.create_session(user_id=user_id)
-    click.echo(f"Session: {session.session_id}")
-    click.echo("Type 'exit' or 'quit' to end session\n")
 
     # Set user context for LLM client (for scope-based access control)
     llm_client.set_user_context(user_id=user_id)
@@ -231,6 +231,152 @@ def skill_register(skill_file):
 
     click.echo(f"✅ Skill registered: {skill_data['name']} v{skill_data['version']}")
     click.echo(f"   Skill ID: {skill_id}")
+
+
+@skill.command("learn")
+@click.option("--days", default=7, help="Look back N days for failures")
+def skill_learn(days):
+    """Learn from historical skill selection failures."""
+    from core.llm.client import LLMClient
+    from core.skills.self_improving_selector import SelfImprovingSelector
+    
+    click.echo(f"🧠 Learning from failures (last {days} days)...")
+    
+    db = Database()
+    llm_client = LLMClient(db)
+    learner = SelfImprovingSelector(db, llm_client)
+    
+    try:
+        stats = learner.learn_from_failures(days=days)
+        
+        click.echo("\n✅ Learning completed:")
+        click.echo(f"   Failures analyzed: {stats['failures_analyzed']}")
+        click.echo(f"   Corrections found: {stats['corrections_found']}")
+        click.echo(f"   Learnings added: {stats['learnings_added']}")
+        
+        learning_stats = learner.get_learning_stats()
+        click.echo(f"\n📊 Total learnings: {learning_stats['total_learnings']}")
+        click.echo(f"   Avg confidence: {learning_stats['avg_confidence']:.2f}")
+        click.echo(f"   High confidence: {learning_stats['high_confidence_learnings']}")
+        
+    except Exception as e:
+        click.echo(f"❌ Learning failed: {e}", err=True)
+        raise click.Abort()
+
+
+@skill.command("gate")
+@click.argument("version")
+@click.option("--min-improvement", default=-0.05, help="Minimum improvement threshold")
+def skill_gate(version, min_improvement):
+    """Run regression gate for skill selector changes."""
+    from core.llm.client import LLMClient
+    from core.skills.auditable_selector import AuditableSkillSelector
+    from core.skills.regression_gate import SkillSelectionRegressionGate
+    
+    click.echo(f"🚪 Running regression gate for selector {version}...")
+    
+    db = Database()
+    llm_client = LLMClient(db)
+    gate = SkillSelectionRegressionGate(db, llm_client)
+    
+    old_selector = AuditableSkillSelector(db, llm_client)
+    new_selector = AuditableSkillSelector(db, llm_client)
+    
+    try:
+        result = gate.validate_selector_change(
+            new_selector=new_selector,
+            old_selector=old_selector,
+            selector_version=version,
+            min_improvement=min_improvement,
+        )
+        
+        click.echo(f"\n{'✅' if result['verdict'] == 'PASS' else '❌'} {result['verdict']}")
+        click.echo(f"   Test queries: {result['test_queries_count']}")
+        click.echo(f"   New score: {result['new_selector_avg_score']:.2f}")
+        click.echo(f"   Old score: {result['old_selector_avg_score']:.2f}")
+        click.echo(f"   Improvement: {result['improvement_pct']:.1f}%")
+        
+        if result['verdict'] != 'PASS':
+            raise click.Abort()
+            
+    except Exception as e:
+        click.echo(f"❌ Gate failed: {e}", err=True)
+        raise click.Abort()
+
+
+@skill.command("history")
+@click.option("--session", help="Filter by session ID")
+@click.option("--limit", default=20, help="Number of records to show")
+def skill_history(session, limit):
+    """View skill selection history with audit trail."""
+    from core.llm.client import LLMClient
+    from core.skills.auditable_selector import AuditableSkillSelector
+    
+    db = Database()
+    llm_client = LLMClient(db)
+    selector = AuditableSkillSelector(db, llm_client)
+    
+    try:
+        events = selector.get_selection_history(session_id=session, limit=limit)
+        
+        if not events:
+            click.echo("No selection history found")
+            return
+        
+        click.echo(f"\n📜 Skill Selection History ({len(events)} records)")
+        click.echo("=" * 80)
+        
+        for event in events:
+            click.echo(f"\n🔍 {event.event_id[:8]}... | {event.created_at}")
+            click.echo(f"   Query: {event.user_query[:60]}...")
+            click.echo(f"   Selected: {', '.join(event.selected_skills)}")
+            click.echo(f"   Method: {event.selection_method}")
+            
+            if event.execution_success is not None:
+                status = "✅" if event.execution_success else "❌"
+                click.echo(f"   Execution: {status}")
+            
+            if event.user_feedback_score:
+                stars = "⭐" * event.user_feedback_score
+                click.echo(f"   Feedback: {stars} ({event.user_feedback_score}/5)")
+                
+    except Exception as e:
+        click.echo(f"❌ Failed to get history: {e}", err=True)
+        raise click.Abort()
+
+
+@skill.command("stats")
+def skill_stats():
+    """Show skill selection learning statistics."""
+    from core.llm.client import LLMClient
+    from core.skills.regression_gate import SkillSelectionRegressionGate
+    from core.skills.self_improving_selector import SelfImprovingSelector
+    
+    db = Database()
+    llm_client = LLMClient(db)
+    
+    learner = SelfImprovingSelector(db, llm_client)
+    learning_stats = learner.get_learning_stats()
+    
+    gate = SkillSelectionRegressionGate(db, llm_client)
+    gate_stats = gate.get_gate_stats()
+    
+    click.echo("\n📊 Skill Selection Statistics")
+    click.echo("=" * 80)
+    
+    click.echo("\n🧠 Learning:")
+    click.echo(f"   Total learnings: {learning_stats['total_learnings']}")
+    click.echo(f"   Avg confidence: {learning_stats['avg_confidence']:.2f}")
+    click.echo(f"   Total evidence: {learning_stats['total_evidence']}")
+    click.echo(f"   Total applications: {learning_stats['total_applications']}")
+    click.echo(f"   High confidence: {learning_stats['high_confidence_learnings']}")
+    
+    click.echo("\n🚪 Regression Gates:")
+    click.echo(f"   Total gates: {gate_stats['total_gates']}")
+    click.echo(f"   Passed: {gate_stats['passed']}")
+    click.echo(f"   Failed: {gate_stats['failed']}")
+    click.echo(f"   Pass rate: {gate_stats['pass_rate']:.1%}")
+    click.echo(f"   Avg improvement: {gate_stats['avg_improvement_pct']:.1f}%")
 
 
 @cli.group()
