@@ -14,6 +14,7 @@ from core.llm.providers import BaseProvider, OpenAIProvider, GroqProvider, Anthr
 from core.llm.router import ModelRouter, ModelConfig
 from core.llm.rate_limiter import RateLimiter
 from core.repos.token_resolver import TokenResolver
+from core.scope.scope_resolver import ScopeResolver, ScopeChainBuilder
 from sdk import Database
 
 logger = logging.getLogger(__name__)
@@ -28,17 +29,34 @@ class LLMClient:
     """LLM client with routing, rate limiting, circuit breaker, budget control, and logging."""
 
     def __init__(self, db: Optional[Database] = None, user_id: str | None = None, 
-                 tenant_id: str | None = None, use_default_models: bool = True) -> None:
+                 tenant_id: str | None = None, use_default_models: bool = True,
+                 scope_context: dict | None = None) -> None:
         """Initialize LLM client.
         
         Args:
             use_default_models: If True, use DEFAULT_MODELS as fallback. Set to False
                                in production to enforce strict scope-based access control.
+            scope_context: Optional scope context for resolver, e.g.,
+                          {'repo': 'matrixone', 'project': 'backend'}
         """
         self.db = db or Database()
         self.user_id = user_id
         self.tenant_id = tenant_id
         self.use_default_models = use_default_models
+        self.scope_context = scope_context or {}
+        
+        # Initialize scope resolver
+        if user_id and tenant_id:
+            scope_chain = ScopeChainBuilder.dev_agent(
+                user_id=user_id,
+                account_id=tenant_id,
+                repo=self.scope_context.get('repo'),
+                project=self.scope_context.get('project')
+            )
+            self.scope_resolver = ScopeResolver(self.db, scope_chain)
+        else:
+            self.scope_resolver = None
+        
         self._providers: dict[LLMProvider, BaseProvider] = {}
         self.router = ModelRouter(db=self.db, user_id=user_id, tenant_id=tenant_id,
                                   use_defaults=use_default_models)
@@ -48,10 +66,27 @@ class LLMClient:
         self._init_providers()
         self._init_rate_limits()
     
-    def set_user_context(self, user_id: str | None = None, tenant_id: str | None = None):
-        """Update user context for scope-based access control."""
+    def set_user_context(self, user_id: str | None = None, tenant_id: str | None = None,
+                        scope_context: dict | None = None):
+        """Update user context for scope-based access control.
+        
+        Args:
+            scope_context: Optional scope context, e.g., {'repo': 'matrixone', 'project': 'backend'}
+        """
         self.user_id = user_id
         self.tenant_id = tenant_id
+        self.scope_context = scope_context or {}
+        
+        # Rebuild scope resolver
+        if user_id and tenant_id:
+            scope_chain = ScopeChainBuilder.dev_agent(
+                user_id=user_id,
+                account_id=tenant_id,
+                repo=scope_context.get('repo'),
+                project=scope_context.get('project')
+            )
+            self.scope_resolver = ScopeResolver(self.db, scope_chain)
+        
         # Reload router with new context
         self.router = ModelRouter(db=self.db, user_id=user_id, tenant_id=tenant_id,
                                   use_defaults=self.use_default_models)
@@ -112,26 +147,31 @@ class LLMClient:
     def _get_api_key(self, provider: str) -> str | None:
         """Get API key with scope-based resolution.
         
-        Priority: user > tenant > config/env
+        Priority: scope_resolver > user > tenant > config/env
         """
-        # 1. Try TokenResolver (user/tenant scope)
+        # 1. Try ScopeResolver (supports extended scopes like repo/project)
+        if self.scope_resolver:
+            token = self.scope_resolver.resolve_token('llm', provider)
+            if token:
+                return token.get('encrypted_value') or token.get('secret_ref')
+        
+        # 2. Fallback to TokenResolver (user/tenant scope only)
         if self.user_id or self.tenant_id:
             token = self._resolve_llm_token(provider)
             if token:
-                # Decrypt if needed (simplified - assumes plaintext for now)
                 return token.encrypted_value or token.secret_ref
         
-        # 2. Fallback to config
+        # 3. Fallback to config
         key = self.config.get(f"{provider}_api_key")
         if key:
             return key
         
-        # 3. Fallback to environment variable
+        # 4. Fallback to environment variable
         key = os.getenv(f"{provider.upper()}_API_KEY")
         if key:
             return key
         
-        # 4. Fallback to configs table (global)
+        # 5. Fallback to configs table (global)
         try:
             row = self.db.fetchone(
                 "SELECT value FROM configs WHERE key_name = %s "
