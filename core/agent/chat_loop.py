@@ -30,7 +30,7 @@ def _needs_planning(user_input: str) -> bool:
     ]
     
     # Check if query is long enough (likely complex)
-    if len(user_input) > 100:
+    if len(user_input) > 200:
         return True
     
     # Check for planning keywords
@@ -509,7 +509,7 @@ class ChatLoop:
                 break
 
             # Check step count constraint
-            if len(plan["steps"]) > constraints.max_steps:
+            if len(plan.steps) > constraints.max_steps:
                 yield StreamEvent(
                     event_type=StreamEventType.RUN_ERROR,
                     data={"error": f"Step count {len(plan['steps'])} exceeds max {constraints.max_steps}"},
@@ -517,18 +517,18 @@ class ChatLoop:
                 return
 
             for step in next_steps:
-                step["status"] = "in_progress"
+                step.status = "in_progress"
                 yield StreamEvent(
                     event_type=StreamEventType.PLAN_STEP_START,
-                    data={"step": step["step_id"]},
+                    data={"step": step.step_id},
                 )
                 
                 # Execute step using existing skill execution
-                skill_name = step.get("skill_hint")
+                skill_name = step.skill_hint
                 if skill_name:
                     result = self.executor.execute_skill(
                         skill_name=skill_name,
-                        params={"input": step["description"]},
+                        params={"input": step.description},
                         session_id=session_id,
                         parent_event_id=None,
                     )
@@ -536,24 +536,24 @@ class ChatLoop:
                     # Use plain chat for step execution
                     result = "Step executed"
                 
-                step["status"] = "completed"
-                step["result"] = str(result)
-                step_results.append({"step_id": step["step_id"], "result": result})
+                step.status = "completed"
+                step.result = str(result)
+                step_results.append({"step_id": step.step_id, "result": result})
                 
                 yield StreamEvent(
                     event_type=StreamEventType.PLAN_STEP_DONE,
-                    data={"step": step["step_id"], "result": str(result)},
+                    data={"step": step.step_id, "result": str(result)},
                 )
 
             # O: Observe — check if all done
-            all_completed = all(s.get("status") == "completed" for s in plan["steps"])
+            all_completed = all(s.status == "completed" for s in plan.steps)
             if all_completed:
                 break
 
             # R: Reflect — should we revise?
             assessment, revised_plan = await planner.reflect(plan, step_results)
-            if revised_plan and revised_plan.get("revised_steps"):
-                plan["steps"] = revised_plan["revised_steps"]
+            if revised_plan and revised_plan is not None:
+                plan.steps = revised_plan["revised_steps"]
                 yield StreamEvent(
                     event_type=StreamEventType.PLAN_REVISED,
                     data={"plan": plan},

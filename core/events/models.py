@@ -28,6 +28,26 @@ class EventType(str, Enum):
     PLAN_REVISED = "plan_revised"
     PLAN_REFLECTION = "plan_reflection"
 
+    # Streaming events
+    STREAM_RUN_STARTED = "stream_run_started"
+    STREAM_RUN_FINISHED = "stream_run_finished"
+    STREAM_RUN_ERROR = "stream_run_error"
+    STREAM_TEXT_DELTA = "stream_text_delta"
+    STREAM_TEXT_DONE = "stream_text_done"
+    STREAM_THINKING_DELTA = "stream_thinking_delta"
+    STREAM_THINKING_DONE = "stream_thinking_done"
+    STREAM_TOOL_CALL_START = "stream_tool_call_start"
+    STREAM_TOOL_CALL_ARGS = "stream_tool_call_args"
+    STREAM_TOOL_CALL_END = "stream_tool_call_end"
+    STREAM_TOOL_RESULT = "stream_tool_result"
+    STREAM_PLAN_CREATED = "stream_plan_created"
+    STREAM_PLAN_STEP_START = "stream_plan_step_start"
+    STREAM_PLAN_STEP_DONE = "stream_plan_step_done"
+    STREAM_PLAN_REVISED = "stream_plan_revised"
+    STREAM_AGENT_DELEGATED = "stream_agent_delegated"
+    STREAM_AGENT_PROGRESS = "stream_agent_progress"
+    STREAM_AGENT_COMPLETED = "stream_agent_completed"
+
 
 class StreamEventType(str, Enum):
     """Stream event types for real-time output.
@@ -74,6 +94,20 @@ class StreamEvent(BaseModel):
 
     event_type: StreamEventType
     data: dict[str, Any] = Field(default_factory=dict)
+    event_id: str | None = None
+    causal_chain_id: str | None = None
+    agent_id: str | None = None
+
+
+class StreamEventLog(BaseModel):
+    """Stream event for logging to conversation_events table.
+
+    Uses EventType enum for compatibility with existing schema.
+    """
+
+    event_type: EventType  # Must be valid EventType enum value
+    content: str  # JSON string of stream data
+    metadata: dict[str, Any] | None = None
     event_id: str | None = None
     causal_chain_id: str | None = None
     agent_id: str | None = None

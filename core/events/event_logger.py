@@ -96,7 +96,7 @@ class EventLogger:
         Args:
             user_id: User identifier
             session_id: Session identifier
-            event_type: Stream event type (e.g., text_delta, tool_call_start)
+            event_type: Stream event type (e.g., stream_text_delta)
             content: Event content (JSON string)
             agent_id: Agent identifier
             agent_version: Agent version
@@ -107,17 +107,43 @@ class EventLogger:
         Returns:
             ConversationEvent: Created event
         """
+        # Map stream event types to valid EventType enum values
+        # Use SYSTEM_MESSAGE for streaming events since they're system-generated
+        event_type_map = {
+            "stream_run_started": EventType.SYSTEM_MESSAGE,
+            "stream_run_finished": EventType.SYSTEM_MESSAGE,
+            "stream_run_error": EventType.SYSTEM_MESSAGE,
+            "stream_text_delta": EventType.SYSTEM_MESSAGE,
+            "stream_text_done": EventType.SYSTEM_MESSAGE,
+            "stream_thinking_delta": EventType.SYSTEM_MESSAGE,
+            "stream_thinking_done": EventType.SYSTEM_MESSAGE,
+            "stream_tool_call_start": EventType.SYSTEM_MESSAGE,
+            "stream_tool_call_args": EventType.SYSTEM_MESSAGE,
+            "stream_tool_call_end": EventType.SYSTEM_MESSAGE,
+            "stream_tool_result": EventType.SYSTEM_MESSAGE,
+            "stream_plan_created": EventType.SYSTEM_MESSAGE,
+            "stream_plan_step_start": EventType.SYSTEM_MESSAGE,
+            "stream_plan_step_done": EventType.SYSTEM_MESSAGE,
+            "stream_plan_revised": EventType.SYSTEM_MESSAGE,
+            "stream_agent_delegated": EventType.SYSTEM_MESSAGE,
+            "stream_agent_progress": EventType.SYSTEM_MESSAGE,
+            "stream_agent_completed": EventType.SYSTEM_MESSAGE,
+        }
+        
+        # Map to valid EventType, default to SYSTEM_MESSAGE
+        mapped_event_type = event_type_map.get(event_type, EventType.SYSTEM_MESSAGE)
+        
         event = ConversationEvent(
             event_id=str(uuid7()),
             user_id=user_id,
             session_id=session_id,
             agent_id=agent_id,
             agent_version=agent_version,
-            event_type=event_type,
+            event_type=mapped_event_type,
             content=content,
             parent_event_id=parent_event_id,
             causal_chain_id=causal_chain_id or str(uuid7()),
-            metadata=metadata,
+            metadata=metadata or {"stream_event_type": event_type},
         )
         self.log_event(event)
         return event
