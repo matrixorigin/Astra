@@ -5,7 +5,7 @@ against golden queries using Git for Data snapshots.
 """
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from uuid_utils import uuid7
@@ -86,7 +86,9 @@ class SkillSelectionRegressionGate:
             }
 
         # Step 2: Create sandbox for testing
-        sandbox_name = f"gate_{selector_version}_{gate_id[:8]}"
+        # Replace dots in version to avoid SQL syntax errors
+        safe_version = selector_version.replace(".", "_")
+        sandbox_name = f"gate_{safe_version}_{gate_id[:8]}"
         self.sandbox.create(
             sandbox_name,
             description=f"Regression gate for {selector_version}",
@@ -139,7 +141,7 @@ class SkillSelectionRegressionGate:
 
     def _get_golden_queries(self, limit: int = 100) -> list[SkillSelectionEvent]:
         """Get golden queries (high user feedback, successful execution)."""
-        cutoff = datetime.utcnow() - timedelta(days=30)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
 
         rows = self.db.fetchall(
             """

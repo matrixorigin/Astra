@@ -61,8 +61,11 @@ def self_improving(db, mock_llm, selector):
 class TestSelfImprovingSelector:
     """Core functionality tests."""
 
-    def test_learn_from_failures_no_failures(self, self_improving):
+    def test_learn_from_failures_no_failures(self, self_improving, db):
         """Test with no failures."""
+        # Clear all failures
+        db.execute("DELETE FROM skill_selection_events WHERE user_feedback_score < 3")
+        
         result = self_improving.learn_from_failures(days=30)
         
         assert result["failures_analyzed"] == 0

@@ -5,7 +5,7 @@ using Git for Data's time-travel capabilities.
 """
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from uuid_utils import uuid7
@@ -114,7 +114,7 @@ class SelfImprovingSelector:
 
     def _get_recent_failures(self, days: int) -> list[SkillSelectionEvent]:
         """Get recent selection failures (low user feedback or execution failure)."""
-        cutoff = datetime.utcnow() - timedelta(days=days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
         rows = self.db.fetchall(
             """

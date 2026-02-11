@@ -10,7 +10,7 @@ that is:
 
 import json
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from uuid_utils import uuid7
@@ -175,7 +175,7 @@ class AuditableSkillSelector:
             selection_method=selection_method,
             selection_reasoning=reasoning,
             candidate_scores=candidate_scores,
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
 
         # Step 6: Persist event
@@ -203,7 +203,7 @@ class AuditableSkillSelector:
         except Exception as e:
             logger.error(f"Failed to create snapshot: {e}")
             # Fallback to timestamp-based identifier
-            return f"snapshot_{datetime.utcnow().isoformat()}"
+            return f"snapshot_{datetime.now(timezone.utc).isoformat()}"
 
     def _get_available_skills(self) -> list[SkillMetadata]:
         """Get all available skills at this moment."""
@@ -367,7 +367,7 @@ class AuditableSkillSelector:
             selection_method="none",
             selection_reasoning="No suitable skills found",
             candidate_scores={},
-            created_at=datetime.utcnow(),
+            created_at=datetime.now(timezone.utc),
         )
 
     def _save_event(self, event: SkillSelectionEvent):

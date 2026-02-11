@@ -52,8 +52,11 @@ def selector(db, mock_llm):
 class TestSkillSelectionRegressionGate:
     """Core functionality tests."""
 
-    def test_validate_no_golden_queries(self, gate, selector):
+    def test_validate_no_golden_queries(self, gate, selector, db):
         """Test with no golden queries."""
+        # Clear any existing golden queries
+        db.execute("DELETE FROM skill_selection_events WHERE user_feedback_score >= 4")
+        
         result = gate.validate_selector_change(
             new_selector=selector,
             old_selector=selector,
