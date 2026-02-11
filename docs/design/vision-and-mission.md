@@ -1,137 +1,237 @@
 # Vision and Mission
 
+## The Problems We Solve
+
+AI agents are entering production across engineering, data, and operations teams. But as they move from demos to real workloads, five problems consistently block adoption:
+
+### 1. Agent Decisions Are Black Boxes
+
+An agent recommends a code fix, triages a bug, or merges a PR. Three months later, someone asks: "Why did the agent do that?" No one can answer. The data the agent saw has changed. The prompt has been updated. The context window is gone. There is no way to reconstruct the decision.
+
+This is a dealbreaker for regulated industries (finance, healthcare, legal) and any team that needs to trust agent outputs.
+
+### 2. Prompt and Skill Iteration Is Guesswork
+
+Teams change prompts and deploy. Did it break existing cases? No one knows until users complain. There's no regression testing for prompt changes — no way to replay past conversations against a new prompt and measure quality delta before shipping.
+
+The result: teams either iterate too slowly (afraid to break things) or too recklessly (ship and pray).
+
+### 3. Knowledge Updates Silently Invalidate Past Answers
+
+RAG systems retrieve from a knowledge base. The knowledge base gets updated. But answers generated from the old version are still cached, still referenced, still trusted. No mechanism exists to detect which past outputs are now inconsistent with current knowledge.
+
+This is the "silent rot" problem — the system degrades without anyone noticing.
+
+### 4. Experimentation on Real Data Is Prohibitively Expensive
+
+To test a new agent strategy on production data, you need to copy the database. For large datasets, this takes hours and significant storage. Most teams skip it and test on toy data instead, then discover problems in production.
+
+### 5. Training Data Lineage Is Missing
+
+Teams extract fine-tuning datasets from agent interactions. But they can't answer: "Was the source data correct when this training example was generated?" or "Does my test set overlap with training data from three versions ago?" Data quality is unverifiable.
+
+---
+
 ## Vision
 
-**A platform of intelligent digital employees** that act as virtual engineers, observing, operating, testing, developing, and evolving across code, test, and data repositories. These agents achieve **Deterministic Agent through Data Versioning**—where Git for Data serves as the architectural spine controlling the deterministic boundary of every agent decision. Agent Decision = LLM(versioned_prompt, versioned_skill, versioned_context_snapshot, versioned_memory, fixed_llm_params). When 4 of 5 inputs are precisely controlled through data versioning, LLM non-determinism is constrained to a minimal range. **Every interaction generates high-quality data**: captured, versioned, analyzed, and leveraged to perpetually refine agents, prompts, memory structures, workflows, and even the underlying models. This system transforms raw interactions into actionable insights, enabling self-evolution and producing robust, traceable engineering outputs that rival or surpass human-led processes.
+**An intelligent agent platform where decisions are reproducible, iterations are safe, and data quality is provable.**
+
+We build agents that engineering and data teams can actually trust in production — not because the LLM is perfect, but because every decision is traceable, every change is testable, and every data dependency is versioned.
+
+```
+Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state, llm_params)
+
+Control the inputs → constrain the non-determinism → audit the outputs.
+```
 
 ## Mission
 
-Build an agentic system that:
+Build an agentic platform that solves the five adoption blockers:
 
-1. **Serves as a scalable workforce**: Operate like an army of specialized engineers working in parallel—monitoring repositories and CI/CD pipelines, summarizing pull requests (PRs), diagnosing CI failures, regressions, and benchmarks, generating and deploying test configurations, triaging bugs, implementing fixes, and engaging in code reviews. All actions are powered by **modular skills**, **configurable rules**, and a multimodal LLM capable of understanding natural language, code, images, and data schemas, allowing users to issue commands like "Analyze this regression trend" or "Propose optimizations for this benchmark."
+| Problem | Solution | How |
+|---|---|---|
+| Decisions are black boxes | **Decision Audit Trail** | Every decision binds to a data snapshot; reconstruct the exact input state at any future time |
+| Prompt iteration is guesswork | **Regression Gate** | Replay past sessions against new prompts in isolated environments; merge only when quality improves |
+| Knowledge rot is invisible | **Knowledge Regression Detection** | When knowledge changes, automatically identify and re-evaluate affected past outputs |
+| Experimentation is expensive | **Zero-Cost Branching** | Create full production data copies in milliseconds with zero storage overhead |
+| Training data lineage is missing | **Versioned Data Pipeline** | Every training example traces back to its source interaction and the data state at that time |
 
-2. **Evolves through self-training**: Every service interaction—from conversations to task executions—produces **recorded data** including histories, summaries, ratings, outcomes, and feedback. This data drives **continuous fine-tuning** (e.g., user-specific, role-based, or task-specialized models), **prompt engineering**, **context optimization**, **memory enhancements**, and **strategy retrospectives**, creating a closed-loop where serving fuels improvement without human intervention.
+### Why This Requires a Different Data Layer
 
-3. **Powers on a unified data engine**: Anchor all persistent state in **MatrixOne**, harnessing its advanced features: **Git for data** (version prompts, memory snapshots, and datasets like code—branch, merge, diff, rollback), **data cloning**, **multimodal storage and querying**, **hybrid transactional-analytical processing (HTAP)**, **role-based access control (RBAC)**, and **fine-grained row-level security**. This ensures data is **accumulated securely**, **versioned transparently**, **queried efficiently**, and **consumed intelligently** for analytics, model tuning, agent personalization, and multi-tenant operations—turning the platform into a data-driven powerhouse for engineering excellence.
+These solutions share a common requirement: **the ability to query historical data states, branch data cheaply, and track causal relationships natively**. This is not achievable by bolting features onto a traditional database:
+
+- Time-travel queries require storage engine support (not log replay)
+- Zero-copy branching requires copy-on-write at the storage layer
+- Causal event chains require HTAP (transactional writes + analytical queries on the same data)
+
+MatrixOne provides all three natively through its Git for Data capabilities. This is why we build on MatrixOne — not as a branding exercise, but because the problems we solve are architecturally impossible on a Postgres + Pinecone + S3 stack.
 
 ---
 
-## Core Innovations
+## Core Architecture
 
-### Deterministic Agent through Data Versioning
-Every agent decision's inputs are version-controlled via Git for Data snapshots/branches. This is not 'approximate reproduction' but 'deterministic boundary control'.
+### Deterministic Boundary Control
+
+LLM outputs are inherently non-deterministic. But agent *decisions* don't have to be black boxes. If we version-control every input to the decision:
+
+- **Prompt** → versioned in `prompt_templates` table
+- **Skill** → versioned with semantic versioning
+- **Context snapshot** → bound to a database snapshot timestamp
+- **Memory state** → queryable at any historical point
+- **LLM parameters** → recorded per invocation
+
+Then for any past decision, we can reconstruct: "Given these exact inputs, the LLM produced this output." The LLM itself is the only uncontrolled variable — and that's a much smaller audit surface than "we have no idea what happened."
+
+### Event-Centric Design
+
+Every interaction flows through `conversation_events` with causal chain tracking:
+
+```
+user_query → skill_selection → skill_execution → llm_response
+     ↑              ↑                ↑                ↑
+  event_id    parent_event_id   causal_chain_id   snapshot_ts
+```
+
+This enables:
+- **Replay**: Re-execute any conversation with original or modified inputs
+- **Lineage**: Trace any output back to its data origins
+- **Audit**: Complete provenance for every agent action
+
+### Skills as Versioned Capabilities
+
+Skills are not functions — they are **versioned, declarative capabilities** with:
+- Declared requirements (repo type, permissions, parameters)
+- Framework-enforced safety (permissions checked before execution)
+- Full lifecycle management (register, version, deprecate)
+- Side-effect isolation (mock mode for replay, sandbox for testing)
+
+### Three-Layer Context Model
+
+```
+Memory (infinite, persistent) → Selection → Prompt (finite, curated) → LLM → Context (active, ephemeral)
+```
+
+The intelligence is in selection: choosing what to show the LLM from potentially years of accumulated data, within a fixed token budget.
+
+---
+
+## Innovation Layer
+
+These capabilities go beyond standard agent frameworks. Each addresses a real production need:
 
 ### Hallucination Firewall
-Real-time fact verification using Git for Data's time-travel queries. Verify LLM claims against the same data snapshot the LLM saw, ensuring verification and generation operate on identical data state.
 
-### Cost-Aware Branching
-Use historical cost data to predict execution cost before spending. Block or suggest alternatives when budget would be exceeded.
+**Problem**: LLM generates claims that contradict the data it was given.
+**Solution**: Extract verifiable claims from responses, verify against the same data snapshot the LLM saw, block delivery if contradictions found.
+**Why it needs data versioning**: Verification must use the *same* data state as generation. If data changed between generation and verification, you get false positives/negatives.
 
-### Data-Versioned Prompt Evolution
-Every prompt change is a data branch. Experiments run in isolation, with full lineage, diffable, mergeable only when quality improves.
+### Regression Gate (Sandbox-as-CI)
 
-### Event Lineage Graph
-Full upstream/downstream traceability for every data point using recursive causal chain queries. Enables contamination detection in training data.
+**Problem**: Prompt/skill changes might break existing good behavior.
+**Solution**: Before any change is deployed, automatically replay golden sessions in a snapshot-isolated environment. Compute quality delta. Reject if regression exceeds threshold.
+**Why it needs zero-copy branching**: Running regression tests on full production data must be instant and free, otherwise teams won't do it.
 
-### Snapshot-Scoped Permissions
-Permissions bound to data versions, not just operations. Controls who can see which historical state.
+### Knowledge Regression Detection
 
-### Sandbox-as-CI
-Every skill/prompt change automatically triggers isolated regression testing in a data sandbox before merge.
+**Problem**: Knowledge base updates silently invalidate past answers.
+**Solution**: When knowledge changes, identify past decisions that depended on the old version. Re-evaluate in a branch with updated knowledge. Flag regressions.
+**Why it needs time-travel + branching**: You need to query "what did the agent see then" (time-travel) and "what would it see now" (branch), then compare.
 
----
+### Prompt Evolution Pipeline
 
-## Technical Foundations
+**Problem**: Prompt engineering is trial-and-error with no scientific method.
+**Solution**: Every prompt change creates a data branch. Run experiments in isolation. Measure quality. Merge only when improvement is statistically significant.
+**Why it needs branching**: Each experiment needs full production data without interfering with production or other experiments.
 
-### Sandboxed Execution Environment
+### Training Data Pipeline
 
-- **Secure and isolated operations**: Agents execute code, tests, tool calls, and external integrations within a **hardened sandbox**, preventing unauthorized access to host systems, networks, or sensitive data. Execution isolation is paramount, with audit logs for every action to ensure traceability and compliance, in the spirit of modern agent frameworks (e.g., LangChain, CrewAI).
-- **Configurable boundaries**: Define per-agent or per-task policies for workspace access, API calls, network egress, and privilege escalation, aligning with zero-trust principles. Integration with containerization (e.g., Docker or Kubernetes pods) allows dynamic scaling while maintaining safety.
+**Problem**: Fine-tuning data quality is unverifiable.
+**Solution**: Build datasets from high-quality events. Every dataset is a named snapshot. Trace each example to its source. Detect contamination across versions.
+**Why it needs snapshots + lineage**: Reproducible training requires exact dataset versioning. Contamination detection requires cross-version lineage queries.
 
-### Conversation History and Multi-Session Intelligence
+### Cost-Aware Execution
 
-- **Persistent session management**: Every interaction is stored as structured data (e.g., JSON logs with timestamps, user IDs, and embeddings), enabling seamless retrieval, search, and summarization across sessions.
-- **User-centric context aggregation**: Generate **per-user or per-team summaries** (e.g., "Recurring pain points in CI pipelines for this developer") using techniques inspired by moltbot-style hybrid memory (combining vector search over embeddings with keyword-based retrieval) and adaptive prompting. This ensures agents recall long-term context, personalize responses, and avoid redundant queries.
-- **Advanced memory architecture**: Employ hierarchical memory systems—short-term (in-session), medium-term (cross-session embeddings), and long-term (archived datasets)—optimized via RAG (Retrieval-Augmented Generation) for efficient recall, reducing hallucination and improving response accuracy.
-
-### Data Engineering Pipeline: Capture, Analyze, Optimize
-
-- **Capture everything**: Log all elements of agent interactions—user queries, agent reasoning traces, tool invocations, outputs, errors, and human overrides—in a schema-agnostic format suitable for MatrixOne's multimodal capabilities. All of this is **versioned with Git for data**, so every experiment, prompt change, or memory snapshot can be branched, diffed, and rolled back like code.
-- **Analyze for insights**: Run SQL-based analytics, ML-driven pattern detection (e.g., via integrated tools like PySpark or TensorFlow), and A/B testing on historical data to identify high-performing prompts, memory strategies, or skill combinations. For instance, query "Which prompt variants reduced bug triage time by >20%?" to inform optimizations.
-- **Optimize and iterate**: Use analyzed data for:
-  - **Fine-tuning loops**: Automatically retrain LLMs or distill smaller models (e.g., using LoRA adapters) on domain-specific datasets, such as per-repo code patterns or user feedback.
-  - **Prompt and context refinement**: Dynamically adjust prompt templates, context windows, and token budgets based on performance metrics, incorporating techniques for multi-step reasoning.
-  - **Workflow automation**: Trigger periodic retraining or hyperparameter sweeps via scheduled jobs, ensuring the system evolves in real-time without downtime.
-  - **Training data versioning**: Every training dataset is a named snapshot. Data scientists can diff datasets across versions, detect contamination via lineage tracking, and reproduce any training run by referencing the exact snapshot used.
-- **Inspired by industry practice**: Blend moltbot-style memory-focused design with shared knowledge bases and data-from-usage feedback loops common in modern agent systems.
-
-### Core Storage and Integration: MatrixOne
-
-- **Centralized data hub**: All state—conversations, agent memories, evaluation scores, configurations, and derived analytics—resides in MatrixOne, eliminating silos and enabling atomic transactions across operational and analytical workloads.
-- **Git for Data is the architectural spine**: Git for Data is not an optional feature—it is the architectural spine. Every agent decision flows through versioned data: prompts are branched and merged like code, context snapshots are immutable checkpoints, training datasets are versioned artifacts, and regression tests run against snapshot-isolated environments. This transforms MatrixOne from a storage layer into the deterministic control plane for AI agent behavior.
-- **Leveraging MatrixOne features**:
-  - **Git for data** (first-class): Treat data like code—version prompts, memory snapshots, and datasets with **branch**, **merge**, **diff**, and **rollback**. Track changes over time (e.g., "What changed in this prompt between v1 and v2?"), reproduce any prior state, and collaborate on data assets with the same workflow engineers use for source code. This is central to traceability, experimentation, and safe iteration of agent configs and training data.
-  - **Cloning and branching**: Create instant, space-efficient copies of datasets for A/B testing agent versions or rollback to stable states; complements Git for data for large-table workflows.
-  - **Multimodal support**: Store and query diverse data types—text, code embeddings, images from CI dashboards, or even audio from voice commands—in unified tables.
-  - **HTAP efficiency**: Handle real-time writes (e.g., logging a new interaction) alongside complex queries (e.g., aggregating feedback scores across users) without replication lag.
-  - **Security-first access**: Implement RBAC for role-specific views (e.g., devs see only their data) and row-level controls to protect sensitive info like proprietary code snippets.
-- **Outcome**: A self-sustaining ecosystem where data "precipitates" from daily operations and is "distilled" into enhancements, fostering high-quality, reproducible engineering practices.
+**Problem**: LLM costs are unpredictable and can spike.
+**Solution**: Query historical cost data to predict execution cost before spending. Block or suggest alternatives when budget would be exceeded.
+**Why it needs historical queries**: Accurate cost prediction requires querying actual historical cost patterns, not estimates.
 
 ---
 
-## Capabilities of Digital Employees
+## Capabilities by Audience
 
-### Core Repo Management and PR Handling
+### For Engineering Teams
+- Intelligent agent with multi-turn tool use and conversation memory
+- Monitor, summarize, and triage across multiple repositories
+- CI/CD failure diagnosis, regression detection, benchmark tracking
+- Modular skill system — extend with custom skills
 
-- **Proactive monitoring**: Agents "watch" GitHub Actions, Bitbucket pipelines, or custom repos for events like pushes, merges, or failures, providing real-time alerts or summaries.
-- **Interactive operations**: On command, summarize PRs with diff analysis, conflict resolution suggestions, or CI status breakdowns; auto-generate issues or fixes using templated skills (e.g., "Create a bug ticket with repro steps").
-- **Expanded skills**: Beyond basics, agents can refactor code, suggest architectural improvements, or integrate with IDEs like VS Code for live editing.
+### For Data Engineers
+- Versioned prompts, skills, knowledge, and training data — all as data, not files
+- Dataset lineage from training example back to source interaction
+- Contamination detection across dataset versions
+- Reproducible training pipelines via exact snapshot references
 
-### CI/CD, Regressions, and Benchmarking
+### For Platform Teams
+- Zero-overhead experimentation on production data
+- Automated regression gates for every prompt/skill change
+- Cost prediction and budget enforcement
+- Multi-tenant isolation with shared skill libraries
 
-- **Observability integration**: Link to tools like Loki for logs, Prometheus for metrics, or Grafana for dashboards; auto-create ephemeral views for quick debugging.
-- **Automated triage and remediation**: Detect flaky tests, correlate failures with code changes, and propose fixes—escalating to humans only when confidence is low.
-- **Benchmark orchestration**: Run performance tests, interpret results (e.g., via statistical analysis), and optimize configs, ensuring scalability for large-scale repos.
-
-### Broad Agentic Scope: Observe, Operate, Test, Develop, Collaborate
-
-- **Observe**: Track repo health, deployment metrics, security scans, and external dependencies for holistic insights.
-- **Operate**: Deploy configs, trigger pipelines, manage environments, and orchestrate multi-repo workflows.
-- **Test**: Execute unit/integration/e2e tests, fuzzing, or chaos engineering; analyze coverage and suggest expansions.
-- **Develop**: Discover bugs via static analysis or anomaly detection, implement features with code generation, and iterate based on feedback.
-- **Collaborate**: Participate in reviews with constructive comments, follow team-specific rules, and even facilitate meetings via natural language summaries.
-- **Extensible skills**: Handle diverse tasks like API design, data pipeline optimization, or creative ideation (e.g., "Brainstorm microservices for this monolith"), with skills modularized for easy extension.
-
-### User Interaction and Customization
-
-- **Natural language interface**: Users from any repo can issue commands, queries, or requests for advice, with agents providing constructive, actionable responses.
-- **Skill library**: Draw from a library of pre-built skills (e.g., "Python refactoring" or "Kubernetes deployment") or allow users to define custom ones, fostering a community-driven ecosystem.
+### For Compliance & Audit
+- Decision reconstruction via data snapshot time-travel
+- Immutable event trail with causal chains
+- Snapshot-scoped access control
+- Full provenance for every agent output
 
 ---
 
-## Feedback, Memory, and Continuous Self-Evolution
+## Evolution Roadmap
 
-- **Integrated feedback loops**: Every task includes optional ratings, explicit feedback, or implicit signals (e.g., task completion time), stored for analysis.
-- **Advanced memory engineering**: Adopt moltbot-inspired hybrid systems (vector + keyword retrieval) for contextual recall, with collaborative filtering to share insights across agents where appropriate.
-- **Evolutionary optimization**: Use data to drive regressions (e.g., "Did this prompt change improve accuracy?"), release gating (e.g., deploy only if scores > threshold), and iterative product enhancements—aligning with data-centric AI and agent-evaluation trends.
-- **Regression Gate**: Before any prompt/skill version is merged to production, automatically replay golden sessions in a snapshot-isolated sandbox. Compute quality delta. Reject merge if regression exceeds threshold. This replaces manual spot-checks with automated, data-versioned quality gates.
-- **Traceability and auditability**: All actions are logged with provenance (e.g., "This fix derived from session #123"), enabling root-cause analysis and compliance.
-- **Self-evolution at scale**: Periodic workflows retrain or tune models on accumulated data, optimizing for efficiency (e.g., distilling to smaller SLMs for edge deployment), ensuring the platform improves with usage.
+### Phase 1: Foundation ✅ (Current)
+Event system, session management, skill framework, basic sandbox, side-effect isolation.
+
+### Phase 2: Decision Trust
+- Decision audit trail (snapshot_ts binding on every decision event)
+- Hallucination firewall (snapshot-consistent claim verification)
+- Multi-turn tool use with full message chain preservation
+
+### Phase 3: Safe Iteration
+- Regression gate (zero-copy branch → replay golden sessions → quality delta → merge/reject)
+- Prompt evolution pipeline (branch-based A/B testing with quality gates)
+- Knowledge regression detection
+
+### Phase 4: Real-Time Experience
+- Streaming output (AG-UI protocol, structured event stream over SSE/WebSocket/stdout)
+- User intervention mid-execution (cancel, redirect, approve/reject gates)
+- Streaming audit trail (every streamed chunk is a persisted, replayable event)
+
+### Phase 5: Autonomous Agents
+- Autonomous planning (Plan-Act-Observe-Reflect loop with hierarchical decomposition)
+- Plan versioning and cross-session persistence
+- Multi-agent collaboration (event blackboard coordination, delegation-as-skill)
+- Parallel fan-out, pipeline, and adversarial review patterns
+- Plan dry-run in sandbox branches
+
+### Phase 6: Data Intelligence
+- Training data pipeline with versioned snapshots and lineage
+- Event lineage graph with contamination detection
+- Cost-aware execution with historical prediction
+
+### Phase 7: Platform Scale
+- Multi-tenant agent instances (MatrixOne account-level isolation)
+- Skill/prompt marketplace with branch-based trial
+- Snapshot-scoped permissions
+- Visual workflow editor (TODO — design pending)
+- Enterprise deployment (RBAC, row-level security, monitoring)
 
 ---
 
 ## In Short
 
-**mo-dev-agent** is a platform for **intelligent digital employees** that:
+We don't compete on "smarter LLM" or "more tools." We compete on **trust infrastructure for AI agents**:
 
-- **Serve dynamically**: Monitor and manage code/test repos, CI pipelines, regressions, and benchmarks; summarize PRs, create issues/fixes with modular skills and rules; integrate observability tools; operate, test, develop, and collaborate—all via **sandboxed**, **LLM-powered** execution that handles natural language and multimodal inputs.
-- **Achieve deterministic control**: Through **Deterministic Agent through Data Versioning**, where Git for Data serves as the architectural spine controlling agent decision boundaries.
-- **Prevent hallucinations**: Via **Hallucination Firewall** using time-travel queries to verify LLM claims against identical data snapshots.
-- **Control costs**: Through **Cost-Aware Branching** that predicts and blocks budget-exceeding operations.
-- **Version everything**: **Data-Versioned Prompt Evolution** treats every prompt change as a data branch with full lineage.
-- **Track lineage**: **Event Lineage Graph** provides full upstream/downstream traceability for contamination detection.
-- **Secure historically**: **Snapshot-Scoped Permissions** bind access control to data versions.
-- **Test automatically**: **Sandbox-as-CI** triggers isolated regression testing before any merge.
-- **Harness history intelligently**: Store and summarize **conversation histories** and **multi-session contexts** per user/team for personalization and continuity.
-- **Drive with data**: **Capture** interactions comprehensively, **analyze** for performance insights, and **optimize** prompts, memory, workflows, and models; fully bound to **MatrixOne** for **Git for data** (version and diff prompts, memory, and datasets like code), **cloning**, **multimodal querying**, **HTAP**, **RBAC**, and **row-level security**.
-- **Evolve autonomously**: Through **automatic fine-tuning**, **strategy retrospectives**, **Regression Gates**, and **feedback-driven iterations**, the system self-improves, producing high-quality, traceable engineering artifacts while scaling to enterprise needs.
+- Every decision is **auditable** — reconstruct what the agent saw, not just what it did
+- Every change is **testable** — regression gates before deployment, not after complaints
+- Every data dependency is **versioned** — from knowledge base to training data to prompts
+
+This requires data capabilities (time-travel, zero-copy branching, HTAP, causal event chains) that are native to MatrixOne and architecturally impossible to retrofit onto traditional database stacks. The platform we build turns these data capabilities into agent capabilities that solve real production adoption blockers.

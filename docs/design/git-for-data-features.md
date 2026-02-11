@@ -1,20 +1,20 @@
 # Git for Data Features - Complete Design
 
-## 0. Design Philosophy: Git for Data as Architectural Spine
+## 0. Why Git for Data?
 
-Git for Data is not an optional feature—it is the **architectural spine** of mo-dev-agent. Every agent decision flows through versioned data:
+Agent platforms face problems that traditional databases cannot solve:
 
-| Capability | Git for Data Role |
-|---|---|
-| **Prompt Evolution** | Each prompt change is a data branch; merge only when quality improves |
-| **Hallucination Firewall** | Verify LLM claims against the same snapshot the LLM saw |
-| **Cost Prediction** | Query historical cost data at any time point for accurate estimation |
-| **Regression Gate** | Replay golden sessions against snapshot-isolated environments |
-| **Training Data** | Every dataset is a named snapshot; diff/compare across versions |
-| **Data Lineage** | Trace any output back through causal chains to its data origin |
-| **Permission Control** | Bind access rights to specific data versions, not just operations |
+| Production Problem | Required Data Capability | Why Traditional DBs Fail |
+|---|---|---|
+| "Why did the agent decide that 3 months ago?" | Query the exact data state at decision time | No time-travel queries; manual snapshots don't scale |
+| "Will this prompt change break existing cases?" | Run regression tests on full production data instantly | Copying production DB takes hours and significant storage |
+| "Which past answers broke when knowledge updated?" | Compare agent behavior across two data versions | No zero-copy branching; can't cheaply create two environments |
+| "Is my training data contaminated?" | Trace data lineage across dataset versions | No native causal chain queries across snapshots |
+| "Who accessed which version of the data?" | Bind permissions to data versions, not just tables | Access control is row/table scoped, not version-scoped |
 
-Agent Decision = LLM(prompt@version, skill@version, context@snapshot, memory@branch, llm_params). When 4 of 5 inputs are precisely version-controlled, LLM non-determinism is constrained to a minimal, auditable range. This is **deterministic boundary control**.
+Git for Data (time-travel queries, zero-copy branching, snapshots, PITR) solves these at the storage engine level. This is why it serves as the architectural spine — not as a feature showcase, but because the problems demand it.
+
+Each agent decision binds to versioned inputs: `f(prompt@version, skill@version, context@snapshot, memory@state, llm_params)`. When 4 of 5 inputs are version-controlled, LLM non-determinism is constrained to a minimal, auditable range.
 
 ## 1. Time Machine
 

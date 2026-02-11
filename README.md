@@ -1,22 +1,23 @@
 # mo-dev-agent
 
-Event-centric intelligent agent platform with conversation replay and time-point sandbox capabilities.
+Intelligent agent platform with auditable decisions, safe iteration, and versioned data lineage.
 
 ## Features
 
-- **Event-Centric Architecture**: All conversations stored as atomic events with full causality tracking
-- **Session Management**: Complete conversation lifecycle management
+- **Auditable Decisions**: Every agent decision binds to a data snapshot — reconstruct what the agent saw at any past moment
+- **Event-Centric Architecture**: All interactions stored as atomic events with causal chain tracking
+- **Skill System**: Versioned, declarative skills with full replay capability and side-effect isolation
+- **Regression Gate**: Replay past sessions against prompt/skill changes in isolated environments before deployment
+- **Knowledge Regression Detection**: Automatically identify past outputs invalidated by knowledge updates
+- **Zero-Cost Experimentation**: Branch production data in milliseconds for testing — zero storage overhead
+- **Hallucination Firewall**: Verify LLM claims against the same data snapshot the LLM saw
+- **Training Data Pipeline**: Versioned datasets with full lineage from training example to source interaction
+- **Cost-Aware Execution**: Predict costs from historical data before spending
+- **Session Management**: Complete conversation lifecycle with cross-session context
 - **Multi-Repo Management**: Register and manage multiple repositories with per-repo tokens
-- **Skill System**: Versioned, declarative skills with full replay capability
-- **Git for Data**: Time-travel queries and isolated sandbox experiments
 - **Production-Ready**: Logging, auth, rate limiting, monitoring, Docker support
 - **Type-Safe**: 100% type annotations with Pydantic validation
 - **Comprehensive Testing**: 79 tests with VCR-recorded real API responses
-- **Hallucination Firewall**: Verify LLM claims against versioned data snapshots before delivery
-- **Cost-Aware Branching**: Predict execution cost from historical data before spending
-- **Regression Gate**: Automated quality gates for every skill/prompt change
-- **Training Data Pipeline**: Versioned datasets with full lineage tracking
-- **Event Lineage**: Full upstream/downstream traceability for every data point
 
 ## Quick Start
 
@@ -139,44 +140,59 @@ See [examples/](examples/) for more detailed examples.
 
 ### 1. Event System
 - Atomic event logging with full metadata
-- Causal chain tracking
+- Causal chain tracking across multi-turn tool use
 - Cross-session queries
 - Event integrity validation
 
 ### 2. Session Management
 - Session lifecycle (create, update, close)
 - Event counting and tracking
-- Custom metadata support
+- Cross-session context with relevance-based retrieval
 
-### 3. Multi-Repo Management
-- Register multiple repositories (code, CI, tester, docs)
-- Per-repo token management
-- Owner-based access control (user/tenant)
-- Flexible metadata storage
+### 3. Skill System
+- Versioned, declarative skills with lifecycle management
+- Framework-enforced permissions and requirements
+- Side-effect isolation (mock mode for replay)
+- Multi-turn tool use with full message chain
 
-### 4. Git for Data
-- **Time Machine**: Query data at any point in time (read-only)
-- **Sandbox**: Database-level isolation for experiments
-- **Branch**: Table-level Git-like workflows (create, diff, merge)
-- **Zero-copy CLONE**: Instant duplication with no storage overhead
+### 4. Data Versioning (Git for Data)
+- **Decision Audit**: Every decision binds to a data snapshot — query the exact state the agent saw
+- **Zero-Cost Branching**: Instant full-data copies for experiments, zero storage overhead
+- **Sandbox Isolation**: Database-level isolation for safe experimentation
+- **Time-Travel Queries**: Read-only queries at any historical point
 
-### 5. Innovation Layer
-- **Hallucination Firewall**: Snapshot-consistent fact verification before response delivery
-- **Cost-Aware Branching**: Historical cost prediction, budget enforcement, cheaper alternatives
-- **Regression Gate (Sandbox-as-CI)**: Automated testing of every skill/prompt change in isolated snapshots
-- **Prompt Evolution Pipeline**: Branch-based prompt experimentation with quality-gated merging
-- **Training Data Pipeline**: Versioned datasets from high-quality events, contamination detection
-- **Event Lineage Graph**: Recursive causal chain tracing, data contamination detection
-- **Snapshot-Scoped Permissions**: Access control bound to data versions
+### 5. Quality & Safety
+- **Regression Gate**: Replay past sessions against changes in isolated environments before deployment
+- **Hallucination Firewall**: Verify LLM claims against the same snapshot the LLM saw
+- **Knowledge Regression Detection**: Identify past outputs invalidated by knowledge updates
+- **Training Data Pipeline**: Versioned datasets with lineage and contamination detection
+- **Cost-Aware Execution**: Predict costs from historical data before spending
+
+### 6. Multi-Agent Collaboration (Design)
+- Event blackboard coordination — all inter-agent communication through auditable events
+- Delegation-as-skill — orchestrator delegates to specialists using existing skill infrastructure
+- Fan-out/fan-in, pipeline, adversarial review patterns
+- Multi-agent replay with same audit guarantees as single-agent
+
+### 7. Autonomous Planning (Design)
+- Plan-Act-Observe-Reflect loop with hierarchical task decomposition
+- Plan versioning — every revision is an event, time-travel to any plan state
+- Cross-session plan persistence for long-horizon goals
+- Plan dry-run in sandbox branches before production execution
+
+### 8. Streaming Output (Design)
+- AG-UI protocol aligned structured event stream
+- Transport-agnostic: SSE, WebSocket, stdout (CLI)
+- Every streamed chunk is a persisted, replayable event
+- Multi-agent stream multiplexing with per-agent progress
 
 ## Architecture
 
-- **Event-Centric**: Single source of truth for all conversation data
-- **MatrixOne**: Hyper-converged database with Git for Data capabilities
-- **Type-Safe**: Pydantic models for all data structures
-- **Testable**: Comprehensive unit and integration tests
-- **Deterministic Boundary Control**: Agent Decision = f(versioned inputs); Git for Data controls 4 of 5 inputs
-- **Innovation Layer**: Hallucination firewall, cost prediction, regression gates, training pipeline
+- **Event-centric**: All state flows through `conversation_events` with causal chains
+- **Three-layer context**: Memory (infinite) → Selection → Prompt (finite) → LLM
+- **Deterministic boundary control**: Version 4 of 5 decision inputs; constrain LLM non-determinism
+- **MatrixOne**: Time-travel, zero-copy branching, HTAP — the data layer that makes audit/regression/lineage possible
+- **Type-safe**: Pydantic models throughout, 100% type annotations
 
 ## Documentation
 
@@ -188,13 +204,16 @@ See [examples/](examples/) for more detailed examples.
   - [Context, Memory, Session and Tables](docs/design/context-memory-session-and-tables.md)
   - [Replay, Sandbox, Evaluation & Evolution](docs/design/replay-sandbox-evaluation-automation.md) ⭐ Engineering validation
   - [Side-Effect Isolation](docs/design/replay-sandbox-evaluation-automation.md#1-side-effect-isolation-critical) ⭐ Critical safety
+  - [Multi-Agent Collaboration](docs/design/multi-agent-collaboration.md) ⭐ Event blackboard coordination
+  - [Autonomous Planning](docs/design/autonomous-planning.md) ⭐ Plan-Act-Observe-Reflect
+  - [Streaming Output](docs/design/streaming-output.md) ⭐ AG-UI protocol alignment
   - [Deployment Architecture](docs/design/deployment-architecture-proposal.md)
-  - [GitHub Integration](docs/design/github-integration.md) ⭐ Industry-leading
-  - [LLM Integration](docs/design/llm-integration.md) ⭐ Production-ready
+  - [GitHub Integration](docs/design/github-integration.md)
+  - [LLM Integration](docs/design/llm-integration.md)
   - [Git for Data Features](docs/design/git-for-data-features.md)
   - [Concurrency Model](docs/design/concurrency-model.md)
-  - [Hallucination Firewall](docs/design/git-for-data-features.md#5-hallucination-firewall) ⭐ Innovation
-  - [Training Data Pipeline](docs/design/git-for-data-features.md#8-training-data-pipeline) ⭐ Data Science
+  - [Hallucination Firewall](docs/design/git-for-data-features.md#5-hallucination-firewall)
+  - [Training Data Pipeline](docs/design/git-for-data-features.md#8-training-data-pipeline)
 - [Examples](examples/)
 
 ## Testing
@@ -244,18 +263,12 @@ See [Development Guide](docs/development.md) for details.
 
 ## Project Status
 
-✅ MVP Complete - Core functionality implemented and tested:
+✅ MVP Complete — Core functionality implemented and tested:
 - Event system with causal chain tracking
-- Session management
+- Session management with cross-session context
+- Skill system with versioning and side-effect isolation
 - Git for Data integration (time machine + sandbox)
-- Comprehensive test coverage
-
-## Architecture
-
-- **Event-centric design**: All state flows through `conversation_events`
-- **Git for Data**: Time-travel queries and zero-copy branching
-- **Three-layer model**: Memory → Prompt → Context
-- **Reproducibility**: "Ten years later, reproduce today's decision"
+- 79 tests, 100% passing
 
 ## Development
 
