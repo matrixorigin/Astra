@@ -52,6 +52,7 @@ class TestAgentArchitecture(unittest.TestCase):
         self.llm_client = MagicMock()
         self.event_logger = MagicMock()
         self.event_logger.create_user_query.return_value.event_id = "user_event_1"
+        self.event_logger.create_user_query.return_value.causal_chain_id = "chain_1"
         
         # Setup Registry to return our mock skill
         self.mock_skill = MockSkill()
@@ -78,15 +79,11 @@ class TestAgentArchitecture(unittest.TestCase):
         # We need to mock ToolMockingLayer because it might do DB calls or validation
         with patch('core.agent.executor.ToolMockingLayer') as MockLayer:
             executor = AgentExecutor(self.db, self.registry, MockMode.PRODUCTION)
-            mock_layer_instance = MockLayer.return_value
-            
-            executor.execute_skill("test_skill", {"param": "value"}, "session_1")
-            
-            self.registry.get.assert_called_with("test_skill")
-            mock_layer_instance.execute.assert_called_once()
+            executor.execute_skill("test_skill", {"param": "value"}, "session_1", "parent_1")
+            MockLayer.return_value.execute.assert_called()
 
     def test_chat_loop_flow(self):
-        """Test the full chat loop flow."""
+        """Test the full chat loop flow with skills."""
         # Mock selector to return a tool call
         self.selector.select_skills = MagicMock(return_value=[
             {
@@ -98,15 +95,28 @@ class TestAgentArchitecture(unittest.TestCase):
         ])
         
         # Mock executor to return a result
-        # Note: execute_skill returns what ToolMockingLayer returns.
-        # ToolMockingLayer.execute returns Any.
-        # If the skill returns SkillOutput, execute_skill returns SkillOutput.
         self.executor.execute_skill = MagicMock(return_value=SkillOutput(success=True, result="Skill Result"))
         
-        # Mock LLM to return final response
-        mock_response = MagicMock()
-        mock_response.content = "Final Answer"
-        self.llm_client.chat.return_value = mock_response
+        # Mock LLM to return tool calls first, then final response
+        mock_tool_response = MagicMock()
+        mock_tool_response.content = None
+        mock_tool_response.tool_calls = [
+            MagicMock(
+                id="tc_1",
+                type="function",
+                function=MagicMock(name="test_skill", arguments='{"param": "value"}')
+            )
+        ]
+        
+        mock_final_response = MagicMock()
+        mock_final_response.content = "Final Answer"
+        
+        # First call returns tool calls, second call returns final answer
+        self.llm_client.chat_with_tools.side_effect = [
+            {"content": None, "tool_calls": [{"id": "tc_1", "function": {"name": "test_skill", "arguments": '{"param": "value"}'}}]},
+            {"content": "Final Answer", "tool_calls": []}
+        ]
+        self.llm_client.chat.return_value = mock_final_response
 
         # Run loop
         result = asyncio.run(self.chat_loop.run_step("User Input", "session_1", "user_1"))

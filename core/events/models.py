@@ -21,6 +21,63 @@ class EventType(str, Enum):
     SYSTEM_MESSAGE = "system_message"
     MULTI_AGENT_MESSAGE = "multi_agent_message"
 
+    # Planning events
+    PLAN_CREATED = "plan_created"
+    PLAN_STEP_START = "plan_step_start"
+    PLAN_STEP_DONE = "plan_step_done"
+    PLAN_REVISED = "plan_revised"
+    PLAN_REFLECTION = "plan_reflection"
+
+
+class StreamEventType(str, Enum):
+    """Stream event types for real-time output.
+
+    Follows AG-UI protocol conventions for streaming agent interactions.
+    """
+
+    # Lifecycle
+    RUN_STARTED = "run_started"
+    RUN_FINISHED = "run_finished"
+    RUN_ERROR = "run_error"
+
+    # Text generation
+    TEXT_DELTA = "text_delta"
+    TEXT_DONE = "text_done"
+
+    # Thinking / reasoning (for reasoning models)
+    THINKING_DELTA = "thinking_delta"
+    THINKING_DONE = "thinking_done"
+
+    # Tool use
+    TOOL_CALL_START = "tool_call_start"
+    TOOL_CALL_ARGS = "tool_call_args"
+    TOOL_CALL_END = "tool_call_end"
+    TOOL_RESULT = "tool_result"
+
+    # Planning
+    PLAN_CREATED = "plan_created"
+    PLAN_STEP_START = "plan_step_start"
+    PLAN_STEP_DONE = "plan_step_done"
+    PLAN_REVISED = "plan_revised"
+
+    # Multi-agent
+    AGENT_DELEGATED = "agent_delegated"
+    AGENT_PROGRESS = "agent_progress"
+    AGENT_COMPLETED = "agent_completed"
+
+
+class StreamEvent(BaseModel):
+    """Stream event for real-time output.
+
+    Each streamed chunk is also a logged event for auditability.
+    """
+
+    event_type: StreamEventType
+    data: dict[str, Any] = Field(default_factory=dict)
+    event_id: str | None = None
+    causal_chain_id: str | None = None
+    agent_id: str | None = None
+
 
 class TokenUsage(BaseModel):
     """Token usage statistics."""

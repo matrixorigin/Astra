@@ -19,6 +19,7 @@ from core.agent.selector import AgentSkillSelector
 from core.agent.executor import AgentExecutor
 from core.agent.chat_loop import ChatLoop
 from core.skills.mocking import MockMode
+from core.events.models import StreamEventType
 import asyncio
 
 
@@ -92,15 +93,26 @@ def chat(user_id, model, mode):
             except Exception:
                 context_dict = None
             
-            # Run async loop
-            response = asyncio.run(chat_loop.run_step(
-                user_input=user_input, 
-                session_id=session.session_id,
-                user_id=user_id,
-                context=context_dict,
-            ))
+            # Run async loop with streaming
+            async def _stream_response():
+                async for event in chat_loop.run_step_stream(
+                    user_input=user_input,
+                    session_id=session.session_id,
+                    user_id=user_id,
+                    context=context_dict,
+                ):
+                    if event.event_type == StreamEventType.TEXT_DELTA:
+                        click.echo(event.data.get("chunk", ""), nl=False)
+                    elif event.event_type == StreamEventType.THINKING_DELTA:
+                        click.echo(f"\n  🤔 {event.data.get('chunk', '')}", nl=False)
+                    elif event.event_type == StreamEventType.TOOL_CALL_START:
+                        click.echo(f"\n  🔧 {event.data.get('tool', 'unknown')}...", nl=False)
+                    elif event.event_type == StreamEventType.TOOL_RESULT:
+                        click.echo(" ✓", nl=False)
+                    elif event.event_type == StreamEventType.RUN_FINISHED:
+                        click.echo()  # Final newline
             
-            click.echo(response)
+            asyncio.run(_stream_response())
             click.echo()
             
     except KeyboardInterrupt:

@@ -141,6 +141,107 @@ class LLMClient:
         # This allows accessing .get('tool_calls')
         return response.choices[0].message.model_dump()
 
+    async def chat_stream(
+        self,
+        messages: list[dict],
+        user_id: str,
+        session_id: str | None = None,
+        model: str | None = None,
+    ):
+        """Yield text chunks as they arrive from LLM."""
+        try:
+            import openai
+        except ImportError:
+            raise ImportError("openai package not installed.")
+
+        api_key = self.config.get("openai_api_key") or self.db.fetchone(
+            "SELECT value FROM configs WHERE key_name = 'openai_api_key' LIMIT 1"
+        )
+        if api_key and isinstance(api_key, dict):
+            api_key = api_key["value"]
+
+        client = openai.OpenAI(api_key=api_key)
+        model = model or self.config["model"]
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=True,
+        )
+        for chunk in response:
+            delta = chunk.choices[0].delta
+            if delta.content:
+                yield delta.content
+
+    async def chat_with_tools_stream(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str = "auto",
+        model: str | None = None,
+    ):
+        """Yield tool calls and text chunks during function calling.
+        
+        Yields dicts with 'type' key: 'text' or 'tool_call'.
+        For tool_call, accumulates fragments until complete.
+        """
+        try:
+            import openai
+        except ImportError:
+            raise ImportError("openai package not installed.")
+
+        api_key = self.config.get("openai_api_key") or self.db.fetchone(
+            "SELECT value FROM configs WHERE key_name = 'openai_api_key' LIMIT 1"
+        )
+        if api_key and isinstance(api_key, dict):
+            api_key = api_key["value"]
+
+        client = openai.OpenAI(api_key=api_key)
+        model = model or self.config["model"]
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            stream=True,
+        )
+        
+        # Accumulate tool call fragments
+        tool_call_buffer: dict[str, dict] = {}
+        
+        for chunk in response:
+            delta = chunk.choices[0].delta
+            
+            if delta.content:
+                yield {"type": "text", "content": delta.content}
+            
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    tc_id = tc.id
+                    if tc_id not in tool_call_buffer:
+                        tool_call_buffer[tc_id] = {
+                            "id": tc_id,
+                            "type": tc.type or "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    
+                    if tc.function and tc.function.name:
+                        tool_call_buffer[tc_id]["function"]["name"] = tc.function.name
+                    if tc.function and tc.function.arguments:
+                        tool_call_buffer[tc_id]["function"]["arguments"] += tc.function.arguments
+                    
+                    # Yield when function name is complete (indicates start)
+                    if tc.function and tc.function.name and len(tc.function.name) > 0:
+                        yield {
+                            "type": "tool_call",
+                            "data": tool_call_buffer[tc_id],
+                        }
+        
+        # Yield all accumulated tool calls
+        for tc in tool_call_buffer.values():
+            yield {"type": "tool_call", "data": tc}
+
     def _call_provider(
         self, provider: LLMProvider, request: LLMRequest
     ) -> LLMResponse:
