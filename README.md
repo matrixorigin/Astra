@@ -44,9 +44,15 @@ make test
 
 ## CLI Commands
 
+### mo-agent (User CLI)
+
 ```bash
 # Interactive chat
 mo-agent chat --user-id alice
+
+# View models
+mo-agent model list
+mo-agent model show gpt-4
 
 # Manage skills
 mo-agent skill list
@@ -58,6 +64,30 @@ mo-agent session show <session_id>
 
 # Replay conversations
 mo-agent replay <session_id>
+
+# Health check
+mo-agent health
+```
+
+### mo-admin (Admin CLI)
+
+```bash
+# Initialize system
+mo-admin init
+
+# Manage models
+mo-admin model add gpt-4 openai --scope global
+mo-admin model add claude-3 anthropic --scope account --scope-id acme
+mo-admin model list
+mo-admin model remove gpt-4 --scope global
+
+# Manage API tokens
+mo-admin token create --type llm --provider openai --scope global
+mo-admin token list
+
+# View audit logs
+mo-admin audit logs --user alice --since 2026-02-01
+```
 
 # Health check
 mo-agent health

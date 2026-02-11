@@ -24,6 +24,7 @@ click = "^8.1.0"
 
 [tool.poetry.scripts]
 mo-agent = "cli.mo_agent:cli"
+mo-admin = "cli.mo_admin:cli"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"

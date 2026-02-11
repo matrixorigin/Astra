@@ -379,9 +379,13 @@ See [permission-checker.md](./admin-user-management/permission-checker.md) for d
 - [ ] Implement audit commands
 
 ### Phase 3: mo-agent Permission Restrictions (Week 3)
-- [ ] Remove `mo-agent model add/update/remove` commands
-- [ ] Add permission checks to all operations
-- [ ] Update documentation
+- [x] Remove `mo-agent model add/update/remove` commands
+- [x] Add permission checks to all operations
+- [x] Create `PermissionChecker` using MatrixOne RBAC
+- [x] Create `AuditLogger` for tracking operations
+- [x] Implement `mo-admin` CLI with model/token/audit commands
+- [x] Update documentation
+- [x] Add tests (13 new tests, 116 total passing)
 
 ### Phase 4: Testing & Documentation (Week 4)
 - [ ] Integration tests
