@@ -402,7 +402,11 @@ class LLMClient:
             self._log_call(
                 event_id, user_id, model_cfg.provider, response, "success", metadata=metadata
             )
-            return response
+            return (
+                LLMResponse(**response.model_dump())
+                if isinstance(response, LLMResponse)
+                else response
+            )
         except Exception as e:
             self._log_call(
                 event_id,

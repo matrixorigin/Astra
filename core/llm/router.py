@@ -3,6 +3,7 @@
 import json
 import logging
 from abc import ABC, abstractmethod
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -92,8 +93,8 @@ class TaskBasedStrategy(RoutingStrategy):
 class CostOptimizedStrategy(RoutingStrategy):
     """Route to cheapest model first, with fallback to more expensive ones."""
 
-    def select(self, model, registry, task_hint=None) -> list[ModelConfig]:
-        models = registry.list_active()
+    def select(self, model: str, registry: Any, task_hint: str | None = None) -> list[ModelConfig]:
+        models: list[ModelConfig] = registry.list_active()
         models.sort(key=lambda m: m.price_per_1k_prompt + m.price_per_1k_completion)
         return models
 

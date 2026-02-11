@@ -71,7 +71,8 @@ class EmbeddingService:
                 input=text,
                 dimensions=self.DIMENSION,  # Request specific dimension
             )
-            return response.data[0].embedding
+            embedding: list[float] = response.data[0].embedding
+            return embedding
         except Exception as e:
             logger.error(f"OpenAI embedding failed: {e}")
             return self._embed_mock(text)

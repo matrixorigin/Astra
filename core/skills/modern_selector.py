@@ -73,7 +73,7 @@ class ModernSkillSelector:
             )
 
             # Extract tool calls
-            tool_calls = response.get("tool_calls", [])
+            tool_calls: list[dict[str, Any]] = response.get("tool_calls", [])
 
             logger.info(
                 f"LLM selected {len(tool_calls)} tools: {[t['function']['name'] for t in tool_calls]}"

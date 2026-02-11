@@ -24,7 +24,7 @@ class TokenBucket:
                 return True
             return False
 
-    def _refill(self):
+    def _refill(self) -> None:
         now = time.monotonic()
         elapsed = now - self.last_refill
         self.tokens = min(self.capacity, self.tokens + elapsed * (self.capacity / 60.0))
@@ -61,12 +61,12 @@ class CircuitBreaker:
             return True  # allow one probe request
         return False  # open — reject
 
-    def record_success(self):
+    def record_success(self) -> None:
         with self._lock:
             self._failures = 0
             self._state = "closed"
 
-    def record_failure(self):
+    def record_failure(self) -> None:
         with self._lock:
             self._failures += 1
             self._last_failure_time = time.monotonic()

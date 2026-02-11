@@ -70,9 +70,9 @@ class PromptManager:
         # Substitute variables
         if variables:
             for key, value in variables.items():
-                content = content.replace(f"{{{key}}}", value)
+                content = content.replace(f"{{{key}}}", str(value))
 
-        return content
+        return str(content)
 
     def register_prompt(
         self, template_id: str, version: str, content: str, is_active: bool = True

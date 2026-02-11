@@ -136,7 +136,8 @@ class SkillSelector:
 
     def get_skill_by_name(self, name: str) -> SkillMetadata | None:
         """Get skill metadata by name."""
-        return self.skills.get(name)
+        skill = self.skills.get(name)
+        return skill if isinstance(skill, SkillMetadata) else None
 
     def list_skills_by_category(self, category: str) -> list[SkillMetadata]:
         """List skills in a category."""
