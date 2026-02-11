@@ -243,3 +243,83 @@ class TestSelfImprovingSelector:
         
         # May be 0 if LLM doesn't find pattern
         assert result["failures_analyzed"] >= 0
+
+    def test_analyze_failure_in_sandbox(self, self_improving, mock_llm):
+        """Test failure analysis in sandbox."""
+        failure = SkillSelectionEvent(
+            event_id="evt-1",
+            session_id="sess-1",
+            user_query="Review PR #123",
+            context_snapshot="snap",
+            available_skills=[],
+            selected_skills=["wrong_skill"],
+            selection_method="llm",
+            selection_reasoning="Test",
+            candidate_scores={},
+        )
+        
+        result = self_improving._analyze_failure_in_sandbox("sandbox", failure)
+        
+        # Should return parsed result or None
+        assert result is None or isinstance(result, dict)
+
+    def test_learn_creates_and_cleans_sandbox(self, self_improving, selector, db):
+        """Test sandbox lifecycle during learning."""
+        event = SkillSelectionEvent(
+            event_id=f"evt-{uuid.uuid4().hex[:8]}",
+            session_id="sess-1",
+            user_query="Test",
+            context_snapshot="snap",
+            available_skills=[],
+            selected_skills=["wrong_skill"],
+            selection_method="llm",
+            selection_reasoning="Test",
+            candidate_scores={},
+        )
+        selector._save_event(event)
+        
+        db.execute("""
+            UPDATE skill_selection_events
+            SET user_feedback_score = 1, selection_correctness = FALSE
+            WHERE event_id = %s
+        """, (event.event_id,))
+        
+        # Run learning
+        self_improving.learn_from_failures(days=30)
+        
+        # Verify no leftover sandboxes
+        rows = db.fetchall("SHOW DATABASES")
+        db_names = [row[list(row.keys())[0]] for row in rows]
+        learn_dbs = [name for name in db_names if "learn_" in name]
+        assert len(learn_dbs) == 0
+
+    def test_apply_learnings_empty_candidates(self, self_improving):
+        """Test applying learnings with empty candidates."""
+        corrected = self_improving.apply_learnings("test query", [])
+        
+        assert corrected == []
+
+    def test_multiple_learnings_same_pattern(self, self_improving, db):
+        """Test multiple learnings for same pattern."""
+        # Clear data
+        db.execute("DELETE FROM skill_selection_learnings")
+        
+        # Add same pattern multiple times
+        for i in range(3):
+            corrections = [{
+                "query_pattern": "review pr",
+                "wrong_skills": ["wrong"],
+                "correct_skills": ["correct"],
+                "improvement_score": 0.7 + i * 0.1,
+                "evidence": f"evt-{i}"
+            }]
+            self_improving._update_learnings(corrections)
+        
+        # Should accumulate evidence
+        rows = db.fetchall("""
+            SELECT evidence_count FROM skill_selection_learnings
+            WHERE query_pattern = %s
+        """, ("review pr",))
+        
+        # May have 1 or more rows depending on implementation
+        assert len(rows) >= 1

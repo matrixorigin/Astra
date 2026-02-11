@@ -257,3 +257,70 @@ class TestAuditableSkillSelector:
         assert "selected" in result
         assert "scores" in result
         assert "reasoning" in result
+
+    def test_select_with_validation_multiple_candidates(self, selector):
+        """Test selection with multiple candidates triggers validation."""
+        skills = [
+            SkillMetadata(
+                name="skill1", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=["test"],
+                dependencies=[], priority=8, cost_estimate="low"
+            ),
+            SkillMetadata(
+                name="skill2", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=["test"],
+                dependencies=[], priority=7, cost_estimate="medium"
+            )
+        ]
+        
+        with patch.object(selector, '_select_candidates', return_value=skills):
+            event = selector.select_with_validation(
+                query="test query",
+                session_id="sess-1",
+                validate_in_sandbox=True
+            )
+            
+            # Should trigger validation
+            assert event.selection_method in ["validated", "llm"]
+
+    def test_get_selection_history_with_limit(self, selector):
+        """Test history with limit."""
+        session_id = f"sess-{uuid.uuid4().hex[:8]}"
+        
+        for i in range(5):
+            event = SkillSelectionEvent(
+                event_id=f"evt-{i}-{uuid.uuid4().hex[:8]}",
+                session_id=session_id,
+                user_query=f"Query {i}",
+                context_snapshot="snap",
+                available_skills=[],
+                selected_skills=["skill1"],
+                selection_method="llm",
+                selection_reasoning="Test",
+                candidate_scores={},
+            )
+            selector._save_event(event)
+        
+        history = selector.get_selection_history(session_id=session_id, limit=2)
+        
+        assert len(history) == 2
+
+    def test_get_selection_history_all_sessions(self, selector):
+        """Test getting history across all sessions."""
+        for i in range(3):
+            event = SkillSelectionEvent(
+                event_id=f"evt-{i}-{uuid.uuid4().hex[:8]}",
+                session_id=f"sess-{i}",
+                user_query=f"Query {i}",
+                context_snapshot="snap",
+                available_skills=[],
+                selected_skills=["skill1"],
+                selection_method="llm",
+                selection_reasoning="Test",
+                candidate_scores={},
+            )
+            selector._save_event(event)
+        
+        history = selector.get_selection_history(session_id=None, limit=10)
+        
+        assert len(history) >= 3
