@@ -35,7 +35,7 @@ class SelfImprovingSelector:
 
     def _ensure_tables(self):
         """Ensure learning tables exist."""
-        self.db.execute(
+        self.db.fetchall(
             """
             CREATE TABLE IF NOT EXISTS skill_selection_learnings (
                 learning_id VARCHAR(36) PRIMARY KEY,
@@ -167,7 +167,7 @@ class SelfImprovingSelector:
         try:
             # Step 1: Time-travel to failure state
             # Query data as it was at failure time
-            self.db.execute(f"USE {sandbox_name}")
+            self.db.fetchall(f"USE {sandbox_name}")
 
             # Get available skills at that time
             available_skills = failure.available_skills
@@ -205,7 +205,7 @@ class SelfImprovingSelector:
 
         finally:
             # Switch back to main database
-            self.db.execute(f"USE {self.db.database}")
+            self.db.fetchall(f"USE {self.db.database}")
 
     def _generate_alternatives(
         self, query: str, available_skills: list[dict], wrong_skills: list[str]
@@ -265,7 +265,7 @@ class SelfImprovingSelector:
 
         for correction in corrections:
             # Check if similar learning exists
-            existing = self.db.execute(
+            existing = self.db.fetchall(
                 """
                 SELECT learning_id, evidence_count, improvement_score
                 FROM skill_selection_learnings
@@ -281,12 +281,12 @@ class SelfImprovingSelector:
                 learning = existing[0]
                 new_count = learning["evidence_count"] + 1
                 new_score = (
-                    learning["improvement_score"] * learning["evidence_count"]
+                    float(learning["improvement_score"]) * learning["evidence_count"]
                     + correction["improvement_score"]
                 ) / new_count
                 confidence = min(0.99, new_count / 10.0)  # Max confidence at 10 examples
 
-                self.db.execute(
+                self.db.fetchall(
                     """
                     UPDATE skill_selection_learnings
                     SET evidence_count = %s,
@@ -301,7 +301,7 @@ class SelfImprovingSelector:
                 learning_id = str(uuid7())
                 confidence = 0.1  # Low confidence with single example
 
-                self.db.execute(
+                self.db.fetchall(
                     """
                     INSERT INTO skill_selection_learnings (
                         learning_id, query_pattern, wrong_skills, correct_skills,
@@ -338,7 +338,7 @@ class SelfImprovingSelector:
         pattern = self._extract_query_pattern(query)
 
         # Find matching learnings
-        learnings = self.db.execute(
+        learnings = self.db.fetchall(
             """
             SELECT wrong_skills, correct_skills, confidence
             FROM skill_selection_learnings
@@ -373,7 +373,7 @@ class SelfImprovingSelector:
                 corrected.extend([s for s in correct if s not in corrected])
 
                 # Record application
-                self.db.execute(
+                self.db.fetchall(
                     """
                     UPDATE skill_selection_learnings
                     SET applied_count = applied_count + 1,

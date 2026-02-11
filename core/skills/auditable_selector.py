@@ -498,3 +498,26 @@ class AuditableSkillSelector:
             )
 
         return events
+
+    def select_and_execute(
+        self, query: str, context: dict | None = None, max_candidates: int = 5
+    ) -> list[dict]:
+        """Compatibility method for ModernSkillSelector interface."""
+        event = self.select_with_validation(
+            query=query,
+            session_id=context.get("session_id") if context else None,
+            validate_in_sandbox=False,
+        )
+        
+        # Return tool calls format for compatibility
+        if event.selected_skills:
+            return [
+                {
+                    "function": {
+                        "name": skill,
+                        "arguments": "{}"
+                    }
+                }
+                for skill in event.selected_skills
+            ]
+        return []

@@ -34,7 +34,7 @@ class SkillSelectionRegressionGate:
 
     def _ensure_tables(self):
         """Ensure gate results table exists."""
-        self.db.execute(
+        self.db.fetchall(
             """
             CREATE TABLE IF NOT EXISTS selector_gate_results (
                 gate_id VARCHAR(36) PRIMARY KEY,
@@ -247,7 +247,7 @@ class SkillSelectionRegressionGate:
 
     def _save_gate_result(self, result: dict[str, Any]):
         """Save gate result to database."""
-        self.db.execute(
+        self.db.fetchall(
             """
             INSERT INTO selector_gate_results (
                 gate_id, selector_version, test_queries_count,
