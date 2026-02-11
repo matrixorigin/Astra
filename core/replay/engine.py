@@ -1,12 +1,12 @@
 """Replay engine for reproducing conversations with exact skill versions."""
 
 import json
-from typing import Optional
-from sdk import Database
-from core.skills import SkillRegistry
+
 from core.events.event_logger import EventLogger
-from core.logging_config import get_logger
 from core.exceptions import ReplayError, SkillNotFoundError
+from core.logging_config import get_logger
+from core.skills import SkillRegistry
+from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -20,7 +20,7 @@ class ReplayEngine:
         self.logger_instance = logger_instance
 
     async def replay_conversation(
-        self, session_id: str, replay_timestamp: Optional[str] = None
+        self, session_id: str, replay_timestamp: str | None = None
     ) -> dict:
         """Replay a conversation using skills from that time.
 
@@ -39,7 +39,7 @@ class ReplayEngine:
         try:
             # 1. Fetch events
             query = """
-                SELECT event_id, event_type, content, skill_name, skill_version, 
+                SELECT event_id, event_type, content, skill_name, skill_version,
                        created_at, metadata
                 FROM conversation_events
                 WHERE session_id = %s
@@ -82,7 +82,7 @@ class ReplayEngine:
             raise
         except Exception as e:
             logger.error(f"Replay failed for session {session_id}: {e}", exc_info=True)
-            raise ReplayError(f"Replay failed: {e}", session_id=session_id)
+            raise ReplayError(f"Replay failed: {e}", session_id=session_id) from e
 
     async def _replay_skill_execution(self, event: dict) -> dict:
         """Replay a single skill execution.
@@ -126,6 +126,13 @@ class ReplayEngine:
 
         # 3. Execute skill with original input
         try:
+            if not skill:
+                return {
+                    "success": False,
+                    "event_id": event["event_id"],
+                    "skill": f"{skill_name}@{skill_version}",
+                    "error": "Skill not found",
+                }
             input_obj = skill.validate_input(original_input)
             output = await skill.execute(input_obj)
 
@@ -165,7 +172,7 @@ class ReplayEngine:
         """
         events = self.db.fetchall(
             """
-            SELECT event_id, event_type, skill_name, skill_version, 
+            SELECT event_id, event_type, skill_name, skill_version,
                    created_at, metadata
             FROM conversation_events
             WHERE session_id = %s

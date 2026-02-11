@@ -1,13 +1,14 @@
 """End-to-end replay test: Time travel with skill versioning."""
 
 import pytest
+
+from core.events.event_logger import EventLogger
+from core.llm import LLMClient
+from core.llm.models import LLMProvider, LLMResponse
+from core.replay import ReplayEngine
 from core.skills import SkillRegistry
 from core.skills.builtin import SummarizePRSkill
 from core.skills.github_client import GitHubClient
-from core.llm import LLMClient
-from core.llm.models import LLMResponse, LLMProvider
-from core.events.event_logger import EventLogger
-from core.replay import ReplayEngine
 from sdk import Database
 
 
@@ -136,8 +137,9 @@ async def test_e2e_skill_version_replay(
     output_v1 = await skill_v1.execute(input_obj)
 
     # Log skill execution event (直接插入数据库)
-    from uuid_utils import uuid7
     import json
+
+    from uuid_utils import uuid7
 
     event_id = str(uuid7())
     db.execute(
@@ -200,10 +202,10 @@ async def test_e2e_skill_version_replay(
     assert len(verification["issues"]) == 0
 
     print("\n✅ E2E Replay Test Passed!")
-    print(f"   - Executed skill v1.0.0")
-    print(f"   - Upgraded to v1.1.0")
-    print(f"   - Replayed with v1.0.0 (not v1.1.0)")
-    print(f"   - Reproducibility verified")
+    print("   - Executed skill v1.0.0")
+    print("   - Upgraded to v1.1.0")
+    print("   - Replayed with v1.0.0 (not v1.1.0)")
+    print("   - Reproducibility verified")
 
 
 @pytest.mark.asyncio
@@ -216,8 +218,9 @@ async def test_replay_missing_skill_version(db, registry, github, llm, logger, r
     session_id = f"test_session_missing_{int(time.time() * 1000)}"
 
     # Create event with non-existent skill version (直接插入数据库)
-    from uuid_utils import uuid7
     import json
+
+    from uuid_utils import uuid7
 
     user_id = "test_user"
 
@@ -326,8 +329,9 @@ async def test_verify_reproducibility(
     output = await skill.execute(input_obj)
 
     # Log event (直接插入数据库)
-    from uuid_utils import uuid7
     import json
+
+    from uuid_utils import uuid7
 
     event_id = str(uuid7())
     db.execute(

@@ -3,10 +3,12 @@
 import threading
 import time
 from queue import Queue
-from typing import List, Dict, Any
+from typing import Any
 
-from sdk import Database
 from core.logging_config import get_logger
+from sdk import Database
+
+logger = get_logger(__name__)
 
 logger = get_logger(__name__)
 
@@ -26,11 +28,11 @@ class BatchEventWriter:
         self.batch_size = batch_size
         self.flush_interval = flush_interval
 
-        self._queue = Queue()
-        self._buffer: List[Dict[str, Any]] = []
+        self._queue: Queue[dict[str, Any]] = Queue()
+        self._buffer: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._running = False
-        self._thread = None
+        self._thread: threading.Thread | None = None
         self._last_flush = time.time()
 
     def start(self):
@@ -51,7 +53,7 @@ class BatchEventWriter:
         self._flush()
         logger.info("Batch event writer stopped")
 
-    def write_event(self, event: Dict[str, Any]):
+    def write_event(self, event: dict[str, Any]):
         """Queue event for batch writing."""
         self._queue.put(event)
 
@@ -99,7 +101,7 @@ class BatchEventWriter:
             for event in events:
                 self._queue.put(event)
 
-    def _batch_insert(self, events: List[Dict[str, Any]]):
+    def _batch_insert(self, events: list[dict[str, Any]]):
         """Insert events in batch."""
         if not events:
             return
@@ -141,7 +143,7 @@ class BatchEventWriter:
 _writer = None
 
 
-def get_batch_writer(db: Database = None):
+def get_batch_writer(db: Database | None = None) -> BatchEventWriter | None:
     """Get global batch writer instance."""
     global _writer
     if _writer is None and db:

@@ -1,6 +1,7 @@
 """Tests for embedding service."""
 
 import pytest
+
 from core.context.embeddings import EmbeddingService
 from sdk import Database
 
@@ -68,9 +69,10 @@ def test_cosine_similarity(db):
     """Test L2 distance calculation."""
     service = EmbeddingService(db, provider="mock")
 
+    import time
+
     from core.events.event_logger import EventLogger
     from core.events.session_manager import SessionManager
-    import time
 
     session_mgr = SessionManager(db)
     logger = EventLogger(db)
@@ -106,9 +108,10 @@ def test_search_similar(db):
     """Test semantic search using L2_DISTANCE."""
     service = EmbeddingService(db, provider="mock")
 
+    import time
+
     from core.events.event_logger import EventLogger
     from core.events.session_manager import SessionManager
-    import time
 
     session_mgr = SessionManager(db)
     logger = EventLogger(db)
@@ -152,10 +155,10 @@ def test_search_with_json_extract_filter(db):
     """Test semantic search with JSON_EXTRACT metadata filtering."""
     service = EmbeddingService(db, provider="mock")
 
+    import time
+
     from core.events.event_logger import EventLogger
     from core.events.session_manager import SessionManager
-    import time
-    import json
 
     session_mgr = SessionManager(db)
     logger = EventLogger(db)

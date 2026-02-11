@@ -5,20 +5,18 @@ This demo shows how the ToolMockingLayer prevents dangerous operations
 during replay while allowing safe read operations.
 """
 
-import json
-from core.skills.mocking import ToolMockingLayer, MockMode, SecurityError
 from core.skills.base import (
+    AccessScope,
+    RepoType,
+    SideEffectCategory,
+    SideEffectProfile,
     Skill,
     SkillInput,
     SkillOutput,
     SkillRequirement,
-    RepoType,
-    AccessScope,
-    SideEffectCategory,
-    SideEffectProfile,
 )
+from core.skills.mocking import MockMode, SecurityError, ToolMockingLayer
 from sdk import Database
-
 
 # ============================================================================
 # Demo Skills

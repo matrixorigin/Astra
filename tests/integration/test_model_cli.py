@@ -2,6 +2,7 @@
 
 import pytest
 from click.testing import CliRunner
+
 from cli.mo_agent import cli
 from sdk import Database
 

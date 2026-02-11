@@ -1,19 +1,16 @@
 """Delegation skill for multi-agent collaboration."""
 
-from typing import Any
-
+from core.logging_config import get_logger
 from core.skills.base import (
+    AccessScope,
+    RepoType,
+    SideEffectCategory,
+    SideEffectProfile,
     Skill,
     SkillInput,
     SkillOutput,
     SkillRequirement,
-    RepoType,
-    AccessScope,
-    SideEffectCategory,
-    SideEffectProfile,
 )
-from core.logging_config import get_logger
-from core.events.models import StreamEvent, StreamEventType
 
 logger = get_logger(__name__)
 

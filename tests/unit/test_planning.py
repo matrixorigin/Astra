@@ -1,13 +1,14 @@
 """Unit tests for autonomous planning functionality."""
 
 import unittest
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock
+
 from core.agent.planner import (
-    Planner,
     Plan,
-    PlanStep,
-    PlanStatus,
     PlanConstraints,
+    Planner,
+    PlanStatus,
+    PlanStep,
     get_plan_constraints,
 )
 

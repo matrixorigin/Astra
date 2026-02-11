@@ -1,7 +1,7 @@
 """Prometheus metrics for monitoring."""
 
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from core.config import get_settings
 
@@ -31,7 +31,7 @@ llm_calls_total = Counter("llm_calls_total", "Total LLM API calls", ["provider",
 llm_tokens_total = Counter(
     "llm_tokens_total",
     "Total LLM tokens used",
-    ["provider", "model", "type"],  # type: prompt or completion
+    ["provider", "model", "type"],  # prompt or completion
 )
 
 llm_cost_usd_total = Counter("llm_cost_usd_total", "Total LLM cost in USD", ["provider", "model"])
@@ -53,6 +53,6 @@ rate_limit_exceeded_total = Counter(
 )
 
 
-async def metrics_endpoint():
+async def metrics_endpoint() -> Response:
     """Prometheus metrics endpoint."""
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)

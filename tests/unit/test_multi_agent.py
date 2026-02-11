@@ -1,9 +1,10 @@
 """Unit tests for multi-agent collaboration features."""
 
 import unittest
-from unittest.mock import MagicMock, AsyncMock
-from core.agent.agent_registry import AgentRegistry, AgentProfile
-from core.skills.delegation import DelegateTaskSkill, DelegateTaskInput, DelegateTaskOutput
+from unittest.mock import AsyncMock, MagicMock
+
+from core.agent.agent_registry import AgentProfile, AgentRegistry
+from core.skills.delegation import DelegateTaskInput, DelegateTaskSkill
 
 
 class TestAgentRegistry(unittest.TestCase):

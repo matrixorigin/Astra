@@ -1,15 +1,16 @@
 """FastAPI application with health checks and error handling."""
 
-from fastapi import FastAPI, Request, status, Depends
-from fastapi.responses import JSONResponse
+from datetime import datetime, timezone
+
+from fastapi import Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, UTC
+from fastapi.responses import JSONResponse
 from uuid_utils import uuid7
 
-from core.config import get_settings
-from core.logging_config import setup_logging, get_logger
-from core.exceptions import AgentError, AuthenticationError, AuthorizationError
 from core.auth import api_key_auth, jwt_auth
+from core.config import get_settings
+from core.exceptions import AgentError, AuthenticationError, AuthorizationError
+from core.logging_config import get_logger, setup_logging
 from core.rate_limit import rate_limiter
 
 # Conditional import for metrics
@@ -142,7 +143,7 @@ async def global_exception_handler(request: Request, exc: Exception):
     request_id = getattr(request.state, "request_id", "unknown")
 
     logger.error(
-        f"Unhandled exception: {str(exc)}",
+        f"Unhandled exception: {exc!s}",
         extra={"request_id": request_id},
         exc_info=True,
     )
@@ -165,7 +166,7 @@ async def health_check():
         "status": "healthy",
         "version": settings.version,
         "environment": settings.environment,
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -176,7 +177,7 @@ async def readiness_check():
 
     checks = {
         "database": "unknown",
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     # Check database
@@ -200,7 +201,7 @@ async def liveness_check():
     """Liveness check - verify app is running."""
     return {
         "status": "alive",
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -235,7 +236,7 @@ async def protected_endpoint(user_info: dict = Depends(api_key_auth.verify)):
 
 # JWT token endpoint
 @app.post("/api/token", tags=["API"])
-async def create_token(user_id: str, permissions: list[str] = None):
+async def create_token(user_id: str, permissions: list[str] | None = None):
     """Create JWT token.
 
     Example:

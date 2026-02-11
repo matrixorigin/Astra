@@ -1,10 +1,11 @@
 """Agent skill execution logic with side-effect isolation."""
 
-from typing import Dict, Any, Optional
-from sdk import Database
-from core.skills.registry import SkillRegistry
-from core.skills.mocking import ToolMockingLayer, MockMode
+from typing import Any
+
 from core.logging_config import get_logger
+from core.skills.mocking import MockMode, ToolMockingLayer
+from core.skills.registry import SkillRegistry
+from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -21,9 +22,9 @@ class AgentExecutor:
     def execute_skill(
         self,
         skill_name: str,
-        params: Dict[str, Any],
+        params: dict[str, Any],
         session_id: str,
-        parent_event_id: Optional[str] = None,
+        parent_event_id: str | None = None,
     ) -> Any:
         """Execute a single skill safely.
 

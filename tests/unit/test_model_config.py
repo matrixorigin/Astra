@@ -1,10 +1,10 @@
 """Test model configuration and dynamic model management."""
 
-import json
 import pytest
-from core.llm.router import ModelRouter, ModelConfig, ModelRegistry
-from core.llm.models import LLMProvider
+
 from core.llm.client import LLMClient
+from core.llm.models import LLMProvider
+from core.llm.router import ModelConfig, ModelRegistry, ModelRouter
 
 
 class MockDB:
@@ -21,10 +21,9 @@ class MockDB:
                 # Check if query matches
                 if "scope_type = 'global'" in query and config.get("scope_type") == "global":
                     return config
-                elif "scope_type = 'user'" in query and config.get("scope_type") == "user":
-                    if params and config.get("scope_id") == params[0]:
-                        return config
-                elif "scope_type = 'tenant'" in query and config.get("scope_type") == "tenant":
+                elif ("scope_type = 'user'" in query and config.get("scope_type") == "user") or (
+                    "scope_type = 'tenant'" in query and config.get("scope_type") == "tenant"
+                ):
                     if params and config.get("scope_id") == params[0]:
                         return config
         return None

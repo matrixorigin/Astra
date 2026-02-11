@@ -1,11 +1,10 @@
 """Skill selection and orchestration."""
 
-from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-import re
+from typing import Any
 
-from sdk import Database
 from core.logging_config import get_logger
+from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -19,8 +18,8 @@ class SkillMetadata:
     description: str
     category: str
     subcategory: str
-    triggers: List[str]
-    dependencies: List[str]
+    triggers: list[str]
+    dependencies: list[str]
     priority: int
     cost_estimate: str
 
@@ -67,7 +66,7 @@ class SkillSelector:
 
         logger.info(f"Loaded {len(self.skills)} skills from database")
 
-    def select_skills(self, query: str, max_skills: int = 3) -> List[SkillMetadata]:
+    def select_skills(self, query: str, max_skills: int = 3) -> list[SkillMetadata]:
         """Select relevant skills based on query.
 
         Args:
@@ -121,10 +120,10 @@ class SkillSelector:
 
         return score
 
-    def _resolve_dependencies(self, skills: List[SkillMetadata]) -> List[SkillMetadata]:
+    def _resolve_dependencies(self, skills: list[SkillMetadata]) -> list[SkillMetadata]:
         """Resolve skill dependencies."""
         result = list(skills)
-        added = set(s.name for s in skills)
+        added = {s.name for s in skills}
 
         for skill in skills:
             for dep_name in skill.dependencies:
@@ -135,11 +134,11 @@ class SkillSelector:
 
         return result
 
-    def get_skill_by_name(self, name: str) -> Optional[SkillMetadata]:
+    def get_skill_by_name(self, name: str) -> SkillMetadata | None:
         """Get skill metadata by name."""
         return self.skills.get(name)
 
-    def list_skills_by_category(self, category: str) -> List[SkillMetadata]:
+    def list_skills_by_category(self, category: str) -> list[SkillMetadata]:
         """List skills in a category."""
         return [s for s in self.skills.values() if s.category == category]
 
@@ -151,9 +150,7 @@ class SkillOrchestrator:
         self.db = db
         self.selector = SkillSelector(db)
 
-    def plan_execution(
-        self, query: str, context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    def plan_execution(self, query: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Plan skill execution for query.
 
         Args:
@@ -189,7 +186,7 @@ class SkillOrchestrator:
 
         return plan
 
-    def _estimate_total_cost(self, skills: List[SkillMetadata]) -> str:
+    def _estimate_total_cost(self, skills: list[SkillMetadata]) -> str:
         """Estimate total cost of skill execution."""
         cost_map = {"low": 1, "medium": 2, "high": 3}
         total = sum(cost_map.get(s.cost_estimate, 1) for s in skills)

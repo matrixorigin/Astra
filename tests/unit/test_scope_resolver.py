@@ -1,7 +1,8 @@
 """Test scope-based configuration resolver."""
 
 import pytest
-from core.scope.scope_resolver import ScopeResolver, ScopeChainBuilder
+
+from core.scope.scope_resolver import ScopeChainBuilder, ScopeResolver
 
 
 class MockDB:
@@ -20,9 +21,8 @@ class MockDB:
                     if len(params) == 2:
                         if model["scope_id"] is None:
                             return model
-                    elif len(params) == 3:
-                        if model["scope_id"] == params[2]:
-                            return model
+                    elif len(params) == 3 and model["scope_id"] == params[2]:
+                        return model
 
         # Mock token query
         if "api_tokens" in query:
@@ -35,9 +35,8 @@ class MockDB:
                     if len(params) == 3:
                         if token["scope_id"] is None:
                             return token
-                    elif len(params) == 4:
-                        if token["scope_id"] == params[3]:
-                            return token
+                    elif len(params) == 4 and token["scope_id"] == params[3]:
+                        return token
 
         return None
 
@@ -50,9 +49,8 @@ class MockDB:
                     if len(params) == 1:
                         if model["scope_id"] is None:
                             results.append(model)
-                    elif len(params) == 2:
-                        if model["scope_id"] == params[1]:
-                            results.append(model)
+                    elif len(params) == 2 and model["scope_id"] == params[1]:
+                        results.append(model)
             return results
 
         # Mock skill list
@@ -63,9 +61,8 @@ class MockDB:
                     if len(params) == 1:
                         if skill["scope_id"] is None:
                             results.append(skill)
-                    elif len(params) == 2:
-                        if skill["scope_id"] == params[1]:
-                            results.append(skill)
+                    elif len(params) == 2 and skill["scope_id"] == params[1]:
+                        results.append(skill)
             return results
 
         return []

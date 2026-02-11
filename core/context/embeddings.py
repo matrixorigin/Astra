@@ -3,11 +3,11 @@
 Provides text embedding generation and similarity search.
 """
 
-from typing import List, Dict, Any, Optional
 import json
+from typing import Any
 
-from sdk import Database
 from core.logging_config import get_logger
+from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -49,7 +49,7 @@ class EmbeddingService:
         if self.provider == "mock":
             logger.info("Using mock embeddings (hash-based)")
 
-    def embed_text(self, text: str) -> List[float]:
+    def embed_text(self, text: str) -> list[float]:
         """Generate embedding for text.
 
         Args:
@@ -63,7 +63,7 @@ class EmbeddingService:
         else:
             return self._embed_mock(text)
 
-    def _embed_openai(self, text: str) -> List[float]:
+    def _embed_openai(self, text: str) -> list[float]:
         """Generate OpenAI embedding."""
         try:
             response = self.client.embeddings.create(
@@ -76,7 +76,7 @@ class EmbeddingService:
             logger.error(f"OpenAI embedding failed: {e}")
             return self._embed_mock(text)
 
-    def _embed_mock(self, text: str) -> List[float]:
+    def _embed_mock(self, text: str) -> list[float]:
         """Generate mock embedding (deterministic hash-based)."""
         import hashlib
 
@@ -96,7 +96,7 @@ class EmbeddingService:
         return vector[: self.DIMENSION]
 
     def store_embedding(
-        self, event_id: str, embedding: List[float], metadata: Optional[Dict[str, Any]] = None
+        self, event_id: str, embedding: list[float], metadata: dict[str, Any] | None = None
     ):
         """Store embedding in database.
 
@@ -114,7 +114,7 @@ class EmbeddingService:
 
         self.db.execute(
             """
-            INSERT INTO event_embeddings 
+            INSERT INTO event_embeddings
             (event_id, embedding, model_name, model_version, metadata)
             VALUES (%s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
@@ -129,11 +129,11 @@ class EmbeddingService:
 
     def search_similar(
         self,
-        query_embedding: List[float],
+        query_embedding: list[float],
         limit: int = 10,
-        session_id: Optional[str] = None,
-        filters: Optional[Dict[str, Any]] = None,
-    ) -> List[Dict[str, Any]]:
+        session_id: str | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         """Search for similar events using L2_DISTANCE.
 
         Args:
@@ -175,7 +175,7 @@ class EmbeddingService:
 
         # Use MatrixOne's native L2_DISTANCE function
         query = f"""
-            SELECT 
+            SELECT
                 e.event_id,
                 e.session_id,
                 e.content,
@@ -190,5 +190,5 @@ class EmbeddingService:
             LIMIT %s
         """
 
-        params = [vec_str, vec_str] + params + [limit]
-        return self.db.fetchall(query, params)
+        params_list: list[str | int] = [vec_str, vec_str, *params, limit]
+        return self.db.fetchall(query, tuple(params_list))

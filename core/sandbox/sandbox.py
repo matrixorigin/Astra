@@ -1,18 +1,21 @@
 """Sandbox for isolated experiments."""
 
 from __future__ import annotations
-from datetime import datetime
-from typing import Optional
+
+from typing import TYPE_CHECKING
 
 from sdk.database import Database
 from sdk.git_for_data import GitForData
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 
 class Sandbox:
     """Sandbox for isolated experiments with metadata management."""
 
     def __init__(
-        self, source_db: str = "dev_agent", account: str = "sys", db: Optional[Database] = None
+        self, source_db: str = "dev_agent", account: str = "sys", db: Database | None = None
     ):
         self.source_db = source_db
         self.account = account
@@ -24,8 +27,8 @@ class Sandbox:
         name: str,
         description: str = "",
         created_by: str = "system",
-        tags: Optional[list[str]] = None,
-        from_snapshot: Optional[str] = None,
+        tags: list[str] | None = None,
+        from_snapshot: str | None = None,
     ) -> None:
         """Create sandbox with metadata."""
         import json
@@ -44,9 +47,9 @@ class Sandbox:
         snapshot_val = f"'{from_snapshot}'" if from_snapshot else "NULL"
 
         self.db.execute(f"""
-            INSERT INTO sandbox_metadata 
+            INSERT INTO sandbox_metadata
             (sandbox_name, description, created_by, created_at, updated_at, tags, source_database, source_snapshot, status)
-            VALUES ('{name}', '{description}', '{created_by}', CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6), 
+            VALUES ('{name}', '{description}', '{created_by}', CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6),
                     {tags_json}, '{self.source_db}', {snapshot_val}, 'active')
         """)
 
@@ -79,16 +82,16 @@ class Sandbox:
         # Delete metadata
         self.db.execute(f"DELETE FROM sandbox_metadata WHERE sandbox_name = '{name}'")
 
-    def list(
+    def list_sandboxes(
         self,
         prefix: str = "sandbox_",
-        pattern: Optional[str] = None,
-        status: Optional[str] = None,
-        created_by: Optional[str] = None,
-        created_after: Optional[datetime] = None,
-        updated_after: Optional[datetime] = None,
-        tags: Optional[list[str]] = None,
-    ) -> list[dict]:
+        pattern: str | None = None,
+        status: str | None = None,
+        created_by: str | None = None,
+        created_after: datetime | None = None,
+        updated_after: datetime | None = None,
+        tags: list[str] | None = None,
+    ) -> list[dict[str, str]]:
         """List sandboxes with filtering.
 
         Args:
@@ -135,9 +138,9 @@ class Sandbox:
     def update(
         self,
         name: str,
-        description: Optional[str] = None,
-        tags: Optional[list[str]] = None,
-        status: Optional[str] = None,
+        description: str | None = None,
+        tags: list[str] | None = None,
+        status: str | None = None,
     ) -> None:
         """Update sandbox metadata.
 
@@ -172,14 +175,14 @@ class Sandbox:
         """Switch to sandbox database."""
         self.db.execute(f"USE {sandbox}")
 
-    def clone_table(self, target: str, source: str, snapshot: Optional[str] = None) -> None:
+    def clone_table(self, target: str, source: str, snapshot: str | None = None) -> None:
         """Clone table (zero-copy)."""
         if snapshot:
             self.db.execute(f'CREATE TABLE {target} CLONE {source}{{SNAPSHOT="{snapshot}"}}')
         else:
             self.db.execute(f"CREATE TABLE {target} CLONE {source}")
 
-    def add_table(self, sandbox: str, table: str, from_snapshot: Optional[str] = None) -> None:
+    def add_table(self, sandbox: str, table: str, from_snapshot: str | None = None) -> None:
         """Add table to sandbox."""
         source = f"{self.source_db}.{table}"
         target = f"{sandbox}.{table}"
@@ -209,7 +212,8 @@ class Sandbox:
         for table in tables:
             if table.startswith("_") or table == "sandbox_metadata":
                 continue
-            count = self.db.fetchone(f"SELECT COUNT(*) as count FROM {sandbox}.{table}")["count"]
+            count_row = self.db.fetchone(f"SELECT COUNT(*) as count FROM {sandbox}.{table}")
+            count = count_row.get("count", 0) if count_row else 0
             table_info.append({"table": table, "rows": count})
 
         result = {
@@ -264,6 +268,8 @@ class Sandbox:
             >>> # [{"name": "before_test", "full_name": "exp1_before_test", "created_at": "..."}]
         """
         all_snapshots = self.git.list_snapshots()
+        if not all_snapshots:
+            return []
         prefix = f"{sandbox}_"
 
         result = []

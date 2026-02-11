@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """mo-agent CLI - Command-line interface for mo-dev-agent."""
 
-import click
 import sys
 from pathlib import Path
+
+import click
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from sdk import Database
-from core.events.session_manager import SessionManager
-from core.events.event_logger import EventLogger
-from core.llm.client import LLMClient
-from core.context import ContextManager, TaskType
-from core.skills.registry import SkillRegistry
-from core.skills.builtin import register_builtin_skills
-from core.agent.selector import AgentSkillSelector
-from core.agent.executor import AgentExecutor
-from core.agent.chat_loop import ChatLoop
-from core.skills.mocking import MockMode
-from core.events.models import StreamEventType
-from core.llm.router import ModelConfig
-from core.llm.models import LLMProvider
 import asyncio
 import json
+
+from core.agent.chat_loop import ChatLoop
+from core.agent.executor import AgentExecutor
+from core.agent.selector import AgentSkillSelector
+from core.context import ContextManager
+from core.events.event_logger import EventLogger
+from core.events.models import StreamEventType
+from core.events.session_manager import SessionManager
+from core.llm.client import LLMClient
+from core.skills.builtin import register_builtin_skills
+from core.skills.mocking import MockMode
+from core.skills.registry import SkillRegistry
+from sdk import Database
 
 
 @click.group()
@@ -66,7 +66,7 @@ def chat(user_id, model, mode):
     )
 
     # Create agent registry with example agents
-    from core.agent.agent_registry import AgentRegistry, AgentProfile
+    from core.agent.agent_registry import AgentProfile, AgentRegistry
 
     agent_registry = AgentRegistry()
 
@@ -213,7 +213,6 @@ def skill_list(active_only):
 @click.argument("skill_file", type=click.Path(exists=True))
 def skill_register(skill_file):
     """Register a new skill from file."""
-    import json
 
     db = Database()
     registry = SkillRegistry(db)
@@ -317,8 +316,9 @@ def model_show(model_name, user_id, tenant_id):
 @click.option("--output", type=click.Choice(["text", "json"]), default="text")
 def replay(session_id, output):
     """Replay a conversation session."""
-    from core.replay.engine import ReplayEngine
     import json as json_lib
+
+    from core.replay.engine import ReplayEngine
 
     db = Database()
     replay_engine = ReplayEngine(db)

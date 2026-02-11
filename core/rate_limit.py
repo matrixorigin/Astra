@@ -1,9 +1,9 @@
 """Rate limiting middleware."""
 
 import time
-from typing import Dict, Tuple
-from fastapi import Request, HTTPException, status
 from collections import defaultdict
+
+from fastapi import HTTPException, Request, status
 
 from core.config import get_settings
 from core.logging_config import get_logger
@@ -18,16 +18,16 @@ class RateLimiter:
     In production, use Redis for distributed rate limiting.
     """
 
-    def __init__(self, requests_per_minute: int = None):
+    def __init__(self, requests_per_minute: int | None = None):
         self.requests_per_minute = requests_per_minute or settings.security.rate_limit_per_minute
-        self.requests: Dict[str, list[float]] = defaultdict(list)
+        self.requests: dict[str, list[float]] = defaultdict(list)
 
     def _clean_old_requests(self, key: str, now: float) -> None:
         """Remove requests older than 1 minute."""
         cutoff = now - 60
         self.requests[key] = [req_time for req_time in self.requests[key] if req_time > cutoff]
 
-    def check_rate_limit(self, key: str) -> Tuple[bool, int]:
+    def check_rate_limit(self, key: str) -> tuple[bool, int]:
         """Check if request is within rate limit.
 
         Args:
@@ -58,7 +58,7 @@ class RateLimiter:
         """Rate limiting middleware."""
         # Get rate limit key (user_id or IP)
         user_id = getattr(request.state, "user_id", None)
-        key = user_id or request.client.host
+        key = user_id or (request.client.host if request.client else "unknown")
 
         # Check rate limit
         allowed, remaining = self.check_rate_limit(key)

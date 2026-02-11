@@ -11,6 +11,7 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
+
 import pymysql
 from pymysql.cursors import DictCursor
 
@@ -32,7 +33,7 @@ def run_sql_file(conn, sql_file: Path, autocommit: bool = False) -> bool:
         original_autocommit = conn.get_autocommit()
         conn.autocommit(autocommit)
 
-        with open(sql_file, "r") as f:
+        with open(sql_file) as f:
             sql_content = f.read()
 
         # Remove comments

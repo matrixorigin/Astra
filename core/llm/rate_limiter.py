@@ -1,8 +1,8 @@
 """Rate limiter with token buckets and circuit breaker."""
 
-import time
 import logging
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -83,13 +83,13 @@ class RateLimiter:
         self._tpm_buckets: dict[str, TokenBucket] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
 
-    def configure(self, model: str, rpm: int, tpm: int):
+    def configure(self, model: str, rpm: int, tpm: int) -> None:
         self._rpm_buckets[model] = TokenBucket(rpm)
         self._tpm_buckets[model] = TokenBucket(tpm)
 
     def configure_breaker(
         self, provider: str, failure_threshold: int = 5, recovery_timeout: float = 60.0
-    ):
+    ) -> None:
         self._breakers[provider] = CircuitBreaker(failure_threshold, recovery_timeout)
 
     def get_breaker(self, provider: str) -> CircuitBreaker:

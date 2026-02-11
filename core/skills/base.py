@@ -5,9 +5,13 @@ and full lifecycle management.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
-from pydantic import BaseModel
 from enum import Enum
+from typing import Any, Generic, TypeVar
+
+from pydantic import BaseModel
+
+InputT = TypeVar("InputT", bound="SkillInput")
+OutputT = TypeVar("OutputT", bound="SkillOutput")
 
 
 class RepoType(str, Enum):
@@ -54,7 +58,7 @@ class SkillRequirement(BaseModel):
 class SkillInput(BaseModel):
     """Base class for skill inputs"""
 
-    repo_id: Optional[int] = None  # Resolved by framework
+    repo_id: int | None = None  # Resolved by framework
     user_id: str
     session_id: str
 
@@ -64,11 +68,11 @@ class SkillOutput(BaseModel):
 
     success: bool
     result: Any
-    error: Optional[str] = None
+    error: str | None = None
     cost: float = 0.0  # LLM cost if applicable
 
 
-class Skill(ABC):
+class Skill(ABC, Generic[InputT, OutputT]):
     """Base class for all skills"""
 
     name: str
@@ -80,11 +84,11 @@ class Skill(ABC):
     )  # Default to READ (safe)
 
     @abstractmethod
-    def validate_input(self, input_data: dict) -> SkillInput:
+    def validate_input(self, input_data: dict) -> InputT:
         """Validate and parse input"""
         pass
 
     @abstractmethod
-    async def execute(self, input: SkillInput) -> SkillOutput:
+    async def execute(self, input: InputT) -> OutputT:
         """Execute the skill"""
         pass

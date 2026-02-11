@@ -1,8 +1,9 @@
 """Integration test for scope-based configuration."""
 
 import pytest
+
 from core.llm.client import LLMClient
-from core.scope.scope_resolver import ScopeResolver, ScopeChainBuilder
+from core.scope.scope_resolver import ScopeChainBuilder, ScopeResolver
 
 
 class MockDB:
@@ -52,9 +53,8 @@ class MockDB:
                     if len(params) == 3:
                         if token["scope_id"] is None:
                             return token
-                    elif len(params) == 4:
-                        if token["scope_id"] == params[3]:
-                            return token
+                    elif len(params) == 4 and token["scope_id"] == params[3]:
+                        return token
 
         # Mock config query
         if "configs" in query and "key_name" in query:
@@ -97,7 +97,7 @@ def test_scope_based_token_resolution():
 
 def test_scope_chain_builder_integration():
     """Test different scope chain builders."""
-    db = MockDB()
+    MockDB()
 
     # Dev Agent scenario
     chain = ScopeChainBuilder.dev_agent(

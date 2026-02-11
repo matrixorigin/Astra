@@ -5,13 +5,14 @@ This module intercepts skill executions and provides two modes:
 - REPLAY: Return recorded results without re-execution
 """
 
-import json
 import hashlib
+import json
 import logging
 from enum import Enum
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
+
+from core.skills.base import SideEffectCategory, Skill
 from sdk import Database
-from core.skills.base import Skill, SideEffectCategory
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ class ToolMockingLayer:
         self,
         mode: MockMode,
         db: Database,
-        result_storage: Optional[ResultStorage] = None,
+        result_storage: ResultStorage | None = None,
     ):
         self.mode = mode
         self.db = db
@@ -66,7 +67,7 @@ class ToolMockingLayer:
         skill: Skill,
         params: dict,
         session_id: str,
-        parent_event_id: Optional[str] = None,
+        parent_event_id: str | None = None,
     ) -> Any:
         """
         Execute skill with mocking logic.
@@ -124,8 +125,8 @@ class ToolMockingLayer:
         skill_name: str,
         params: dict,
         session_id: str,
-        parent_event_id: Optional[str],
-    ) -> Optional[Any]:
+        parent_event_id: str | None,
+    ) -> Any | None:
         """
         Query recorded skill result from conversation_events.
 
@@ -199,7 +200,7 @@ class ToolMockingLayer:
         params: dict,
         result: Any,
         session_id: str,
-        parent_event_id: Optional[str],
+        parent_event_id: str | None,
     ) -> None:
         """
         Record skill result in conversation_events metadata.

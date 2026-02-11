@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """mo-admin CLI - Administrative interface for mo-dev-agent."""
 
-import click
-import sys
 import json
-from pathlib import Path
+import sys
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+
+import click
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from sdk import Database
-from core.auth.permission_checker import PermissionChecker
 from core.auth.audit_logger import AuditLogger
-from core.llm.router import ModelConfig
+from core.auth.permission_checker import PermissionChecker
 from core.llm.models import LLMProvider
+from sdk import Database
 
 
 @click.group()
@@ -104,7 +103,7 @@ def model_add(
         # Insert into model_registry
         db.execute(
             """
-            INSERT INTO agent_config.model_registry 
+            INSERT INTO agent_config.model_registry
             (config_id, scope_type, scope_id, model_name, provider, config_json, created_by, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
@@ -161,7 +160,7 @@ def model_remove(ctx, model_name, scope, scope_id, force):
     try:
         # Check if model exists
         query = """
-        SELECT * FROM agent_config.model_registry 
+        SELECT * FROM agent_config.model_registry
         WHERE model_name = %s AND scope_type = %s
         """
         params = [model_name, scope]
@@ -186,7 +185,7 @@ def model_remove(ctx, model_name, scope, scope_id, force):
 
         # Delete
         db.execute(
-            f"DELETE FROM agent_config.model_registry WHERE config_id = %s", (row["config_id"],)
+            "DELETE FROM agent_config.model_registry WHERE config_id = %s", (row["config_id"],)
         )
 
         # Audit log
@@ -270,7 +269,7 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
 
     # Permission check
     if not checker.is_admin(user):
-        click.echo(f"❌ Permission denied: only admins can create tokens")
+        click.echo("❌ Permission denied: only admins can create tokens")
         sys.exit(1)
 
     try:
@@ -280,7 +279,7 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
         # Insert
         db.execute(
             """
-            INSERT INTO agent_config.api_tokens 
+            INSERT INTO agent_config.api_tokens
             (token_id, token_type, provider, scope_type, scope_id, encrypted_value, is_active, created_by, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s)
             """,
@@ -290,7 +289,7 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
         # Audit log
         audit.log_token_create(user, token_type, provider, scope)
 
-        click.echo(f"✅ Token created successfully")
+        click.echo("✅ Token created successfully")
         click.echo(f"   Token ID: {token_id}")
     except Exception as e:
         click.echo(f"❌ Failed to create token: {e}")
@@ -363,7 +362,7 @@ def audit_logs(ctx, user_id, action, resource_type, since, limit):
 
     # Permission check
     if not checker.can_view_audit_logs(user, user_id):
-        click.echo(f"❌ Permission denied: cannot view audit logs")
+        click.echo("❌ Permission denied: cannot view audit logs")
         sys.exit(1)
 
     audit_logger = AuditLogger(db)

@@ -1,10 +1,10 @@
 """Extended skills - properly inheriting from Skill base class."""
 
-from typing import Dict, Any, List
-from core.skills.base import Skill, SkillInput, SkillOutput, SkillRequirement, RepoType, AccessScope
+from typing import Any
+
+from core.skills.base import AccessScope, RepoType, Skill, SkillInput, SkillOutput, SkillRequirement
 from core.skills.github_client import GitHubClient
 from sdk import Database
-
 
 # ============================================================================
 # Code Review Skill
@@ -17,7 +17,7 @@ class CodeReviewInput(SkillInput):
 
 
 class CodeReviewOutput(SkillOutput):
-    review: Dict[str, Any]
+    review: dict[str, Any]
 
 
 class CodeReviewSkill(Skill):
@@ -34,7 +34,7 @@ class CodeReviewSkill(Skill):
         self.db = db
         self.github = github
 
-    def execute(self, input: CodeReviewInput) -> CodeReviewOutput:
+    def execute(self, input: CodeReviewInput) -> CodeReviewOutput:  # type: ignore[override]
         pr = self.github.get_pr(input.repo_id, input.pr_number)
         review = {
             "pr_number": input.pr_number,
@@ -60,7 +60,7 @@ class SearchCodeInput(SkillInput):
 
 
 class SearchCodeOutput(SkillOutput):
-    results: List[Dict[str, Any]]
+    results: list[dict[str, Any]]
 
 
 class SearchCodeSkill(Skill):
@@ -125,7 +125,7 @@ class AnalyzeBugInput(SkillInput):
 
 
 class AnalyzeBugOutput(SkillOutput):
-    analysis: Dict[str, Any]
+    analysis: dict[str, Any]
 
 
 class AnalyzeBugSkill(Skill):
@@ -206,5 +206,5 @@ def register_extended_skills(registry, db, github=None):
                 priority=priority,
                 cost_estimate=cost,
             )
-        except Exception as e:
+        except Exception:
             pass  # Already registered

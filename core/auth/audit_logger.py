@@ -1,8 +1,9 @@
 """Audit logger for tracking admin operations."""
 
-from datetime import datetime
-from typing import Optional, Dict, Any
 import json
+from datetime import datetime
+from typing import Any
+
 from sdk import Database
 
 
@@ -18,7 +19,7 @@ class AuditLogger:
         action: str,
         resource_type: str,
         resource_id: str,
-        details: Optional[Dict[str, Any]] = None,
+        details: dict[str, Any] | None = None,
         status: str = "success",
     ):
         """Log an admin operation."""
@@ -29,7 +30,7 @@ class AuditLogger:
 
         self.db.execute(
             """
-            INSERT INTO agent_config.audit_logs 
+            INSERT INTO agent_config.audit_logs
             (log_id, user_id, action, resource_type, resource_id, new_value, status, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
@@ -45,9 +46,7 @@ class AuditLogger:
             ),
         )
 
-    def log_model_add(
-        self, user_id: str, model_name: str, scope: str, scope_id: Optional[str] = None
-    ):
+    def log_model_add(self, user_id: str, model_name: str, scope: str, scope_id: str | None = None):
         """Log model addition."""
         self.log(
             user_id=user_id,
@@ -58,7 +57,7 @@ class AuditLogger:
         )
 
     def log_model_remove(
-        self, user_id: str, model_name: str, scope: str, scope_id: Optional[str] = None
+        self, user_id: str, model_name: str, scope: str, scope_id: str | None = None
     ):
         """Log model removal."""
         self.log(
@@ -69,7 +68,7 @@ class AuditLogger:
             details={"scope": scope, "scope_id": scope_id},
         )
 
-    def log_model_update(self, user_id: str, model_name: str, changes: Dict[str, Any]):
+    def log_model_update(self, user_id: str, model_name: str, changes: dict[str, Any]):
         """Log model update."""
         self.log(
             user_id=user_id,
@@ -101,10 +100,10 @@ class AuditLogger:
 
     def get_logs(
         self,
-        user_id: Optional[str] = None,
-        action: Optional[str] = None,
-        resource_type: Optional[str] = None,
-        since: Optional[datetime] = None,
+        user_id: str | None = None,
+        action: str | None = None,
+        resource_type: str | None = None,
+        since: datetime | None = None,
         limit: int = 100,
     ):
         """Query audit logs."""
@@ -125,7 +124,7 @@ class AuditLogger:
 
         if since:
             conditions.append("created_at >= %s")
-            params.append(since)
+            params.append(since.isoformat() if isinstance(since, datetime) else since)
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 

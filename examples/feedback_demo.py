@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Demo: Prompt feedback collection and analysis."""
 
+from core.context.prompts import PromptFeedback, PromptManager
 from sdk import Database
-from core.context.prompts import PromptManager, PromptFeedback
 
 
 def demo_feedback_collection():
@@ -20,7 +20,7 @@ def demo_feedback_collection():
     print("-" * 60)
 
     existing = db.fetchone("""
-        SELECT * FROM prompt_templates 
+        SELECT * FROM prompt_templates
         WHERE template_id = 'system_code_review' AND version = '1.0'
     """)
 

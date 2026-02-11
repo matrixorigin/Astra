@@ -1,13 +1,13 @@
 """API authentication and authorization."""
 
-from typing import Optional
-from fastapi import Header, HTTPException, status
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, timedelta, timezone
+
 import jwt
+from fastapi import Header
 
 from core.config import get_settings
-from core.logging_config import get_logger
 from core.exceptions import AuthenticationError, AuthorizationError
+from core.logging_config import get_logger
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -34,7 +34,7 @@ class APIKeyAuth:
         return {}
 
     async def verify(
-        self, api_key: Optional[str] = Header(None, alias=settings.security.api_key_header)
+        self, api_key: str | None = Header(None, alias=settings.security.api_key_header)
     ) -> dict:
         """Verify API key.
 
@@ -53,13 +53,13 @@ class APIKeyAuth:
 
         # Development mode: accept any key
         if settings.is_development():
-            logger.debug(f"Development mode: accepting API key")
+            logger.debug("Development mode: accepting API key")
             return {"user_id": "dev_user", "permissions": ["read", "write"]}
 
         # Production mode: validate key
         user_info = self.valid_keys.get(api_key)
         if not user_info:
-            logger.warning(f"Invalid API key")
+            logger.warning("Invalid API key")
             raise AuthenticationError("Invalid API key")
 
         logger.info(f"Authenticated user: {user_info['user_id']}")
@@ -73,7 +73,7 @@ class JWTAuth:
         if not settings.security.jwt_secret:
             logger.warning("JWT secret not configured")
 
-    def create_token(self, user_id: str, permissions: list[str] = None) -> str:
+    def create_token(self, user_id: str, permissions: list[str] | None = None) -> str:
         """Create JWT token.
 
         Args:
@@ -89,8 +89,8 @@ class JWTAuth:
         payload = {
             "user_id": user_id,
             "permissions": permissions or [],
-            "exp": datetime.now(UTC) + timedelta(seconds=settings.security.jwt_expiration),
-            "iat": datetime.now(UTC),
+            "exp": datetime.now(timezone.utc) + timedelta(seconds=settings.security.jwt_expiration),
+            "iat": datetime.now(timezone.utc),
         }
 
         token = jwt.encode(
@@ -102,7 +102,7 @@ class JWTAuth:
         logger.info(f"Created JWT token for user: {user_id}")
         return token
 
-    async def verify(self, authorization: Optional[str] = Header(None)) -> dict:
+    async def verify(self, authorization: str | None = Header(None)) -> dict:
         """Verify JWT token.
 
         Args:
@@ -134,10 +134,10 @@ class JWTAuth:
 
         except jwt.ExpiredSignatureError:
             logger.warning("JWT token expired")
-            raise AuthenticationError("Token expired")
+            raise AuthenticationError("Token expired") from None
         except jwt.InvalidTokenError as e:
             logger.warning(f"Invalid JWT token: {e}")
-            raise AuthenticationError("Invalid token")
+            raise AuthenticationError("Invalid token") from e
 
 
 def require_permission(required_permission: str):

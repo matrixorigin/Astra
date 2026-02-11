@@ -6,14 +6,14 @@ Implements intelligent context selection and assembly based on:
 - Task-aware optimization
 """
 
-from typing import List, Dict, Any, Optional
+import time
 from dataclasses import dataclass
 from enum import Enum
-import time
+from typing import Any
 
-from sdk import Database
-from core.logging_config import get_logger
 from core.exceptions import ContextError
+from core.logging_config import get_logger
+from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -35,7 +35,7 @@ class ContextFragment:
     tokens: int
     source: str  # 'event' | 'code' | 'doc' | 'skill'
     relevance_score: float
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
 
 
 @dataclass
@@ -43,15 +43,15 @@ class Context:
     """Assembled context ready for LLM."""
 
     system_prompt: str
-    skill_definitions: List[Dict[str, Any]]
-    selected_events: List[Dict[str, Any]]
-    code_context: List[Dict[str, Any]]
-    documentation: List[Dict[str, Any]]
+    skill_definitions: list[dict[str, Any]]
+    selected_events: list[dict[str, Any]]
+    code_context: list[dict[str, Any]]
+    documentation: list[dict[str, Any]]
 
     total_tokens: int
-    token_budget: Dict[str, int]
+    token_budget: dict[str, int]
     assembly_time_ms: int
-    relevance_scores: Dict[str, float]
+    relevance_scores: dict[str, float]
     task_type: TaskType
 
     def to_prompt(self) -> str:
@@ -164,9 +164,9 @@ class ContextManager:
 
         except Exception as e:
             logger.error(f"Failed to build context: {e}")
-            raise ContextError(f"Context assembly failed: {e}")
+            raise ContextError(f"Context assembly failed: {e}") from e
 
-    def _allocate_budget(self, total_tokens: int, task_type: TaskType) -> Dict[str, int]:
+    def _allocate_budget(self, total_tokens: int, task_type: TaskType) -> dict[str, int]:
         """Allocate token budget based on task type."""
         allocations = {
             TaskType.CODE_REVIEW: {
@@ -205,7 +205,7 @@ class ContextManager:
 
         return allocations[task_type]
 
-    def _retrieve_candidates(self, session_id: str, query: str) -> List[Dict[str, Any]]:
+    def _retrieve_candidates(self, session_id: str, query: str) -> list[dict[str, Any]]:
         """Retrieve candidate events for context."""
         # Get recent events from current session
         events = self.db.fetchall(
@@ -223,8 +223,8 @@ class ContextManager:
         return [dict(e) for e in events]
 
     def _score_candidates(
-        self, query: str, candidates: List[Dict[str, Any]], session_id: str
-    ) -> List[tuple[Dict[str, Any], float]]:
+        self, query: str, candidates: list[dict[str, Any]], session_id: str
+    ) -> list[tuple[dict[str, Any], float]]:
         """Score candidates by relevance using L2_DISTANCE.
 
         Multi-signal scoring:
@@ -290,8 +290,8 @@ class ContextManager:
         return scored
 
     def _select_within_budget(
-        self, scored: List[tuple[Dict[str, Any], float]], budget: Dict[str, int]
-    ) -> List[Dict[str, Any]]:
+        self, scored: list[tuple[dict[str, Any], float]], budget: dict[str, int]
+    ) -> list[dict[str, Any]]:
         """Select top events within token budget."""
         selected = []
         tokens_used = 0
@@ -312,8 +312,8 @@ class ContextManager:
 
     def _assemble_context(
         self,
-        selected: List[Dict[str, Any]],
-        budget: Dict[str, int],
+        selected: list[dict[str, Any]],
+        budget: dict[str, int],
         task_type: TaskType,
         assembly_time_ms: int,
     ) -> Context:
@@ -383,7 +383,7 @@ class ContextManager:
             }
             return fallbacks.get(task_type, fallbacks[TaskType.GENERAL])
 
-    def _get_skill_definitions(self, token_budget: int) -> List[Dict[str, Any]]:
+    def _get_skill_definitions(self, token_budget: int) -> list[dict[str, Any]]:
         """Get available skill definitions within budget."""
         skills = self.db.fetchall("""
             SELECT skill_name, version, description, category, subcategory
@@ -404,8 +404,8 @@ class ContextManager:
         ]
 
     def _get_code_context(
-        self, selected_events: List[Dict[str, Any]], token_budget: int
-    ) -> List[Dict[str, Any]]:
+        self, selected_events: list[dict[str, Any]], token_budget: int
+    ) -> list[dict[str, Any]]:
         """Extract code context from events and repos.
 
         Strategy:
@@ -413,7 +413,7 @@ class ContextManager:
         2. Get repo info from session
         3. Return file summaries
         """
-        code_files = []
+        code_files: list[dict[str, str]] = []
 
         # Extract file paths from event content
         import re
@@ -439,8 +439,8 @@ class ContextManager:
         return code_files
 
     def save_snapshot(
-        self, context: Context, session_id: str, event_id: Optional[str] = None
-    ) -> Optional[str]:
+        self, context: Context, session_id: str, event_id: str | None = None
+    ) -> str | None:
         """Save context snapshot to database.
 
         Only saves if snapshots are enabled.
@@ -452,8 +452,9 @@ class ContextManager:
             logger.debug("Context snapshots disabled, skipping save")
             return None
 
-        from uuid_utils import uuid7
         import json
+
+        from uuid_utils import uuid7
 
         snapshot_id = str(uuid7())
 

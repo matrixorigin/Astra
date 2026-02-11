@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Initialize default prompt templates in database."""
 
-from sdk import Database
 from core.context.prompts import init_default_prompts
+from sdk import Database
 
 if __name__ == "__main__":
     db = Database()

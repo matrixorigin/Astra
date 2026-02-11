@@ -22,11 +22,11 @@ def test_create_and_delete(sandbox):
     name = f"sandbox_{str(uuid7())[:8]}".lower()
 
     sandbox.create(name, description="Test sandbox")
-    sandboxes = sandbox.list()
+    sandboxes = sandbox.list_sandboxes()
     assert any(s["sandbox_name"] == name for s in sandboxes)
 
     sandbox.delete(name)
-    sandboxes = sandbox.list()
+    sandboxes = sandbox.list_sandboxes()
     assert not any(s["sandbox_name"] == name for s in sandboxes)
 
 
@@ -37,11 +37,11 @@ def test_list_with_filter(sandbox):
     sandbox.create("sandbox_prod_test2")
 
     # List all
-    all_sandboxes = sandbox.list()
+    all_sandboxes = sandbox.list_sandboxes()
     assert len(all_sandboxes) >= 2
 
     # Filter by pattern
-    exp_sandboxes = sandbox.list(pattern="%exp%")
+    exp_sandboxes = sandbox.list_sandboxes(pattern="%exp%")
     assert any("exp" in s["sandbox_name"] for s in exp_sandboxes)
 
     # Cleanup
@@ -62,7 +62,7 @@ def test_create_from_snapshot(sandbox, db):
     name = f"sandbox_{str(uuid7()).replace('-', '_')}"
     sandbox.create(name, from_snapshot=snap_name)
 
-    sandboxes = sandbox.list()
+    sandboxes = sandbox.list_sandboxes()
     assert any(s["sandbox_name"] == name for s in sandboxes)
 
     sandbox.delete(name)

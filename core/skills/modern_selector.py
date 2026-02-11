@@ -1,11 +1,11 @@
 """Modern skill selector with native LLM function calling."""
 
-from typing import List, Dict, Any, Optional
 import json
+from typing import Any
 
-from sdk import Database
-from core.skills.selector import SkillSelector, SkillMetadata
 from core.logging_config import get_logger
+from core.skills.selector import SkillMetadata, SkillSelector
+from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -22,7 +22,7 @@ class ModernSkillSelector:
         self,
         query: str,
         max_candidates: int = 5,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return OpenAI tool schemas for candidate skills (no LLM call)."""
         candidates = self.rule_selector.select_skills(query, max_skills=max_candidates)
         if not candidates:
@@ -30,8 +30,8 @@ class ModernSkillSelector:
         return [self._skill_to_tool_schema(skill) for skill in candidates]
 
     def select_and_execute(
-        self, query: str, context: Optional[Dict[str, Any]] = None, max_candidates: int = 5
-    ) -> List[Dict[str, Any]]:
+        self, query: str, context: dict[str, Any] | None = None, max_candidates: int = 5
+    ) -> list[dict[str, Any]]:
         """Select skills and extract parameters using native function calling.
 
         This is the "灵魂升华" - LLM directly outputs function calls with parameters.
@@ -86,7 +86,7 @@ class ModernSkillSelector:
             # Fallback to rule-based
             return self._fallback_to_rules(candidates, query)
 
-    def _skill_to_tool_schema(self, skill: SkillMetadata) -> Dict[str, Any]:
+    def _skill_to_tool_schema(self, skill: SkillMetadata) -> dict[str, Any]:
         """Convert skill metadata to OpenAI tool schema.
 
         Auto-generates schema from skill's input model (Pydantic).
@@ -126,7 +126,7 @@ class ModernSkillSelector:
             },
         }
 
-    def _get_default_schema(self, skill_name: str) -> Dict[str, Any]:
+    def _get_default_schema(self, skill_name: str) -> dict[str, Any]:
         """Get default schema for known skills (fallback)."""
         schemas = {
             "summarize_pr": {
@@ -193,8 +193,8 @@ class ModernSkillSelector:
         return schemas.get(skill_name, {"type": "object", "properties": {}, "required": []})
 
     def _fallback_to_rules(
-        self, candidates: List[SkillMetadata], query: str
-    ) -> List[Dict[str, Any]]:
+        self, candidates: list[SkillMetadata], query: str
+    ) -> list[dict[str, Any]]:
         """Fallback to rule-based selection if function calling fails."""
         logger.warning("Falling back to rule-based selection")
 
@@ -224,7 +224,7 @@ class ModelRouter:
             "default": {"model": "gpt-4", "style": "balanced", "temperature": 0.3},
         }
 
-    def route(self, skill: SkillMetadata, query: str) -> Dict[str, Any]:
+    def route(self, skill: SkillMetadata, query: str) -> dict[str, Any]:
         """Route to appropriate model based on skill category.
 
         Args:
@@ -281,8 +281,8 @@ class AdaptiveSkillOrchestrator:
         self.llm = llm_client
 
     async def execute_query(
-        self, query: str, session_id: str, user_preferences: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+        self, query: str, session_id: str, user_preferences: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Execute query with adaptive model routing.
 
         Args:
@@ -335,19 +335,19 @@ class AdaptiveSkillOrchestrator:
         return {
             "response": final_response,
             "skills_used": [r["skill"] for r in results],
-            "models_used": list(set(r["model"] for r in results)),
+            "models_used": list({r["model"] for r in results}),
             "skill_results": results,
         }
 
     async def _execute_skill(
-        self, skill_name: str, arguments: Dict[str, Any], model_config: Dict[str, Any]
+        self, skill_name: str, arguments: dict[str, Any], model_config: dict[str, Any]
     ) -> Any:
         """Execute a skill with given arguments."""
         # This would call the actual skill implementation
         # For now, return mock result
         return {"status": "success", "data": f"Executed {skill_name} with {arguments}"}
 
-    def _synthesize_response(self, query: str, results: List[Dict[str, Any]]) -> str:
+    def _synthesize_response(self, query: str, results: list[dict[str, Any]]) -> str:
         """Synthesize final response from skill results."""
         if not results:
             return "No results available."

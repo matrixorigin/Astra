@@ -6,10 +6,11 @@ To re-record: delete fixtures/vcr_cassettes/*.yaml and run tests.
 Set GITHUB_TOKEN environment variable for real API calls.
 """
 
-import pytest
-import vcr
 import os
 from pathlib import Path
+
+import pytest
+import vcr
 
 from core.skills.github_client import GitHubClient
 from sdk import Database
@@ -52,7 +53,7 @@ async def test_real_github_get_pr(github_client):
     """Test getting a real PR from GitHub (octocat/Hello-World)."""
     # Use GitHub's official test repository
     # First, we need to add it to our database
-    from core.repos import RepoRegistry, RepoType, AccessScope, OwnerType
+    from core.repos import AccessScope, OwnerType, RepoRegistry, RepoType
 
     registry = RepoRegistry(github_client.db)
 
@@ -91,7 +92,7 @@ async def test_real_github_get_pr(github_client):
 @vcr_config.use_cassette("github_list_prs.yaml")
 async def test_real_github_list_prs(github_client):
     """Test listing real PRs from GitHub."""
-    from core.repos import RepoRegistry, RepoType, AccessScope, OwnerType
+    from core.repos import AccessScope, OwnerType, RepoRegistry, RepoType
 
     registry = RepoRegistry(github_client.db)
 

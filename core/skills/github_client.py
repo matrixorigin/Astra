@@ -1,15 +1,11 @@
 """GitHub client wrapper for skills."""
 
-from typing import Optional
-from github import Github, Auth, GithubException
-from github.PullRequest import PullRequest
-from github.WorkflowRun import WorkflowRun
-import time
+from github import Auth, Github, GithubException
 
-from sdk import Database
 from core.config import get_settings
-from core.logging_config import get_logger
 from core.exceptions import GitHubError, GitHubRateLimitError
+from core.logging_config import get_logger
+from sdk import Database
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -18,7 +14,7 @@ logger = get_logger(__name__)
 class GitHubClient:
     """Wrapper for GitHub API calls with error handling and rate limiting."""
 
-    def __init__(self, db: Database, token: str = None, base_url: str = None):
+    def __init__(self, db: Database, token: str | None = None, base_url: str | None = None):
         self.db = db
         self.token = token or settings.github_token
 
@@ -62,13 +58,13 @@ class GitHubClient:
             if e.status == 404:
                 raise GitHubError(
                     f"Repository {repo_full_name} not found on GitHub", status_code=404
-                )
+                ) from e
             elif e.status == 403:
-                raise GitHubRateLimitError()
+                raise GitHubRateLimitError() from e
             else:
                 raise GitHubError(
                     f"GitHub API error: {e.data.get('message', str(e))}", status_code=e.status
-                )
+                ) from e
 
     async def get_pr(self, repo_id: int, pr_number: int) -> dict:
         """Fetch PR details from GitHub.
@@ -105,13 +101,13 @@ class GitHubClient:
 
         except GithubException as e:
             if e.status == 404:
-                raise GitHubError(f"PR #{pr_number} not found", status_code=404)
+                raise GitHubError(f"PR #{pr_number} not found", status_code=404) from e
             elif e.status == 403:
-                raise GitHubRateLimitError()
+                raise GitHubRateLimitError() from e
             else:
                 raise GitHubError(
                     f"Failed to fetch PR: {e.data.get('message', str(e))}", status_code=e.status
-                )
+                ) from e
 
     async def get_pr_diff(self, repo_id: int, pr_number: int) -> str:
         """Fetch PR diff.
@@ -142,10 +138,10 @@ class GitHubClient:
 
         except GithubException as e:
             if e.status == 403:
-                raise GitHubRateLimitError()
+                raise GitHubRateLimitError() from e
             raise GitHubError(
                 f"Failed to fetch diff: {e.data.get('message', str(e))}", status_code=e.status
-            )
+            ) from e
 
     async def list_prs(self, repo_id: int, state: str = "open", limit: int = 10) -> list[dict]:
         """List PRs in a repo.
@@ -184,10 +180,10 @@ class GitHubClient:
 
         except GithubException as e:
             if e.status == 403:
-                raise GitHubRateLimitError()
+                raise GitHubRateLimitError() from e
             raise GitHubError(
                 f"Failed to list PRs: {e.data.get('message', str(e))}", status_code=e.status
-            )
+            ) from e
 
     async def list_workflow_runs(self, repo_id: int, limit: int = 5) -> list[dict]:
         """List workflow runs.
@@ -224,10 +220,10 @@ class GitHubClient:
 
         except GithubException as e:
             if e.status == 403:
-                raise GitHubRateLimitError()
+                raise GitHubRateLimitError() from e
             raise GitHubError(
                 f"Failed to list workflows: {e.data.get('message', str(e))}", status_code=e.status
-            )
+            ) from e
 
     def get_rate_limit(self) -> dict:
         """Get current rate limit status.
@@ -238,10 +234,14 @@ class GitHubClient:
         try:
             rate_limit = self.client.get_rate_limit()
 
+            core_limit = getattr(rate_limit, "core", None)
+            if not core_limit:
+                return {"limit": 0, "remaining": 0, "reset": None}
+
             return {
-                "limit": rate_limit.core.limit,
-                "remaining": rate_limit.core.remaining,
-                "reset": rate_limit.core.reset.isoformat() if rate_limit.core.reset else None,
+                "limit": core_limit.limit,
+                "remaining": core_limit.remaining,
+                "reset": core_limit.reset.isoformat() if core_limit.reset else None,
             }
         except Exception as e:
             logger.error(f"Failed to get rate limit: {e}")

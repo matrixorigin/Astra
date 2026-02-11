@@ -1,10 +1,11 @@
 """Tests for modern skill selector with native function calling."""
 
-import pytest
-from unittest.mock import Mock, MagicMock
 import json
+from unittest.mock import Mock
 
-from core.skills.modern_selector import ModernSkillSelector, ModelRouter, AdaptiveSkillOrchestrator
+import pytest
+
+from core.skills.modern_selector import AdaptiveSkillOrchestrator, ModelRouter, ModernSkillSelector
 from core.skills.selector import SkillMetadata
 from sdk import Database
 

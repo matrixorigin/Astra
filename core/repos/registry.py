@@ -1,8 +1,7 @@
 """Repository registry service."""
 
 import json
-from datetime import UTC, datetime
-from typing import Optional
+from datetime import datetime, timezone
 
 from uuid_utils import uuid7
 
@@ -13,7 +12,7 @@ from sdk import Database
 class RepoRegistry:
     """Repository registry for multi-repo management."""
 
-    def __init__(self, db: Optional[Database] = None) -> None:
+    def __init__(self, db: Database | None = None) -> None:
         self.db = db or Database()
 
     def create(
@@ -23,13 +22,13 @@ class RepoRegistry:
         owner_id: str,
         owner_type: OwnerType,
         access_scope: AccessScope,
-        repo_group: Optional[str] = None,
-        token_id: Optional[str] = None,
-        metadata: Optional[dict] = None,
+        repo_group: str | None = None,
+        token_id: str | None = None,
+        metadata: dict | None = None,
     ) -> Repo:
         """Create a new repository."""
         repo_id = str(uuid7())
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
 
         query = """
             INSERT INTO repos (
@@ -69,7 +68,7 @@ class RepoRegistry:
             updated_at=now,
         )
 
-    def get(self, repo_id: str) -> Optional[Repo]:
+    def get(self, repo_id: str) -> Repo | None:
         """Get repository by ID."""
         query = "SELECT * FROM repos WHERE repo_id = %s"
         result = self.db.fetchone(query, (repo_id,))
@@ -77,7 +76,7 @@ class RepoRegistry:
             return None
         return self._to_model(result)
 
-    def get_by_url(self, repo_url: str, owner_id: str) -> Optional[Repo]:
+    def get_by_url(self, repo_url: str, owner_id: str) -> Repo | None:
         """Get repository by URL and owner."""
         query = "SELECT * FROM repos WHERE repo_url = %s AND owner_id = %s"
         result = self.db.fetchone(query, (repo_url, owner_id))
@@ -85,18 +84,18 @@ class RepoRegistry:
             return None
         return self._to_model(result)
 
-    def list_by_owner(self, owner_id: str, repo_type: Optional[RepoType] = None) -> list[Repo]:
+    def list_by_owner(self, owner_id: str, repo_type: RepoType | None = None) -> list[Repo]:
         """List repositories by owner."""
         if repo_type:
             query = """
-                SELECT * FROM repos 
+                SELECT * FROM repos
                 WHERE owner_id = %s AND repo_type = %s AND is_active = TRUE
                 ORDER BY created_at DESC
             """
             results = self.db.fetchall(query, (owner_id, repo_type.value))
         else:
             query = """
-                SELECT * FROM repos 
+                SELECT * FROM repos
                 WHERE owner_id = %s AND is_active = TRUE
                 ORDER BY created_at DESC
             """
@@ -107,7 +106,7 @@ class RepoRegistry:
     def list_by_group(self, repo_group: str) -> list[Repo]:
         """List repositories by group."""
         query = """
-            SELECT * FROM repos 
+            SELECT * FROM repos
             WHERE repo_group = %s AND is_active = TRUE
             ORDER BY repo_type, created_at DESC
         """
@@ -117,29 +116,29 @@ class RepoRegistry:
     def update_token(self, repo_id: str, token_id: str) -> None:
         """Update repository token."""
         query = """
-            UPDATE repos 
+            UPDATE repos
             SET token_id = %s, updated_at = %s
             WHERE repo_id = %s
         """
-        self.db.execute(query, (token_id, datetime.now(UTC), repo_id))
+        self.db.execute(query, (token_id, datetime.now(timezone.utc), repo_id))
 
     def update_metadata(self, repo_id: str, metadata: dict) -> None:
         """Update repository metadata."""
         query = """
-            UPDATE repos 
+            UPDATE repos
             SET metadata = %s, updated_at = %s
             WHERE repo_id = %s
         """
-        self.db.execute(query, (json.dumps(metadata), datetime.now(UTC), repo_id))
+        self.db.execute(query, (json.dumps(metadata), datetime.now(timezone.utc), repo_id))
 
     def deactivate(self, repo_id: str) -> None:
         """Deactivate repository."""
         query = """
-            UPDATE repos 
+            UPDATE repos
             SET is_active = FALSE, updated_at = %s
             WHERE repo_id = %s
         """
-        self.db.execute(query, (datetime.now(UTC), repo_id))
+        self.db.execute(query, (datetime.now(timezone.utc), repo_id))
 
     def delete(self, repo_id: str) -> None:
         """Delete repository."""

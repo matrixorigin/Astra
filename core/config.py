@@ -1,13 +1,13 @@
 """Configuration management with environment support."""
 
 import os
-from typing import Any, Optional
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from enum import Enum
 
-from core.logging_config import get_logger
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 from core.exceptions import ConfigurationError
+from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
@@ -48,7 +48,7 @@ class SecurityConfig(BaseModel):
     """Security configuration."""
 
     api_key_header: str = Field(default="X-API-Key")
-    jwt_secret: Optional[str] = Field(default=None)
+    jwt_secret: str | None = Field(default=None)
     jwt_algorithm: str = Field(default="HS256")
     jwt_expiration: int = Field(default=3600)  # seconds
     rate_limit_per_minute: int = Field(default=60)
@@ -93,9 +93,9 @@ class Settings(BaseSettings):
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
 
     # Secrets (loaded from environment or secrets manager)
-    openai_api_key: Optional[str] = Field(default=None)
-    groq_api_key: Optional[str] = Field(default=None)
-    github_token: Optional[str] = Field(default=None)
+    openai_api_key: str | None = Field(default=None)
+    groq_api_key: str | None = Field(default=None)
+    github_token: str | None = Field(default=None)
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -106,7 +106,7 @@ class Settings(BaseSettings):
     )
 
     @classmethod
-    def load(cls, env: Optional[str] = None) -> "Settings":
+    def load(cls, env: str | None = None) -> "Settings":
         """Load settings for environment.
 
         Args:
@@ -153,7 +153,7 @@ class Settings(BaseSettings):
 
         except Exception as e:
             logger.error(f"Failed to load configuration: {e}")
-            raise ConfigurationError(f"Failed to load configuration: {e}")
+            raise ConfigurationError(f"Failed to load configuration: {e}") from e
 
     def _validate_production_secrets(self) -> None:
         """Validate required secrets in production."""
@@ -190,7 +190,7 @@ class Settings(BaseSettings):
 
 
 # Global settings instance
-_settings: Optional[Settings] = None
+_settings: Settings | None = None
 
 
 def get_settings() -> Settings:
@@ -205,7 +205,7 @@ def get_settings() -> Settings:
     return _settings
 
 
-def reload_settings(env: Optional[str] = None) -> Settings:
+def reload_settings(env: str | None = None) -> Settings:
     """Reload settings.
 
     Args:

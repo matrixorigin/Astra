@@ -1,21 +1,22 @@
 """Integration tests for Side-Effect Isolation (Replay Mocking)."""
 
-import pytest
 import json
-from unittest.mock import Mock, patch
-from core.skills.mocking import ToolMockingLayer, MockMode, SecurityError
+from unittest.mock import patch
+
+import pytest
+
 from core.skills.base import (
+    AccessScope,
+    RepoType,
+    SideEffectCategory,
+    SideEffectProfile,
     Skill,
     SkillInput,
     SkillOutput,
     SkillRequirement,
-    RepoType,
-    AccessScope,
-    SideEffectCategory,
-    SideEffectProfile,
 )
+from core.skills.mocking import MockMode, SecurityError, ToolMockingLayer
 from sdk import Database
-
 
 # ============================================================================
 # Mock Skills for Testing
@@ -135,7 +136,7 @@ def setup_recorded_result(db, session_id):
         db.execute(
             """
             INSERT INTO conversation_events
-            (event_id, user_id, session_id, agent_id, agent_version, 
+            (event_id, user_id, session_id, agent_id, agent_version,
              event_type, content, skill_name, metadata, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
         """,
@@ -253,7 +254,7 @@ def test_params_hash_matching(db, session_id, setup_recorded_result):
     params2 = {"user_id": "test", "session_id": session_id, "value": 456}
     with patch.object(skill, "execute") as mock_execute:
         mock_execute.return_value = SkillOutput(success=True, result="New execution")
-        result2 = mock_layer.execute(skill, params2, session_id)
+        mock_layer.execute(skill, params2, session_id)
         mock_execute.assert_called_once()
 
 
@@ -269,7 +270,7 @@ def test_dangerous_fallback_warning(db, session_id, caplog):
     params = {"user_id": "test", "session_id": session_id}
 
     # No recorded result, should log dangerous warning
-    result = mock_layer.execute(skill, params, session_id)
+    mock_layer.execute(skill, params, session_id)
 
     # Check warning was logged
     assert any("DANGEROUS" in record.message for record in caplog.records)

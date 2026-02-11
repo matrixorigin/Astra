@@ -1,8 +1,9 @@
 """Prompt template management with versioning and dynamic updates."""
 
-from typing import Optional, Dict, List, Any
-from sdk import Database
+from typing import Any
+
 from core.logging_config import get_logger
+from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -12,13 +13,13 @@ class PromptManager:
 
     def __init__(self, db: Database):
         self.db = db
-        self._cache = {}  # Simple in-memory cache
+        self._cache: dict[str, Any] = {}  # Simple in-memory cache
 
     def get_prompt(
         self,
         template_id: str,
-        version: Optional[str] = None,
-        variables: Optional[Dict[str, str]] = None,
+        version: str | None = None,
+        variables: dict[str, str] | None = None,
     ) -> str:
         """Get prompt template by ID and version.
 
@@ -219,8 +220,8 @@ class PromptFeedback:
         prompt_version: str,
         llm_request_id: str,
         user_rating: int,
-        user_comment: Optional[str] = None,
-        metadata: Optional[Dict[str, str]] = None,
+        user_comment: str | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> str:
         """Record user feedback for a prompt.
 
@@ -235,8 +236,9 @@ class PromptFeedback:
         Returns:
             feedback_id
         """
-        from uuid_utils import uuid7
         import json
+
+        from uuid_utils import uuid7
 
         if not 1 <= user_rating <= 5:
             raise ValueError(f"Rating must be 1-5, got {user_rating}")
@@ -267,19 +269,19 @@ class PromptFeedback:
         return feedback_id
 
     def get_feedback_stats(
-        self, prompt_template_id: str, prompt_version: Optional[str] = None
-    ) -> Dict[str, Any]:
+        self, prompt_template_id: str, prompt_version: str | None = None
+    ) -> dict[str, Any]:
         """Get feedback statistics for a prompt."""
         if prompt_version:
             where_clause = "WHERE prompt_template_id = %s AND prompt_version = %s"
-            params = (prompt_template_id, prompt_version)
+            params: tuple[str, ...] = (prompt_template_id, prompt_version)
         else:
             where_clause = "WHERE prompt_template_id = %s"
             params = (prompt_template_id,)
 
         stats_row = self.db.fetchone(
             f"""
-            SELECT 
+            SELECT
                 COUNT(*) as total_count,
                 AVG(rating) as avg_rating,
                 MIN(rating) as min_rating,
@@ -302,20 +304,22 @@ class PromptFeedback:
         )
 
         return {
-            "total_count": stats_row["total_count"],
-            "avg_rating": float(stats_row["avg_rating"]) if stats_row["avg_rating"] else 0.0,
-            "min_rating": stats_row["min_rating"],
-            "max_rating": stats_row["max_rating"],
+            "total_count": stats_row.get("total_count", 0) if stats_row else 0,
+            "avg_rating": float(stats_row.get("avg_rating", 0))
+            if stats_row and stats_row.get("avg_rating")
+            else 0.0,
+            "min_rating": stats_row.get("min_rating", 0) if stats_row else 0,
+            "max_rating": stats_row.get("max_rating", 0) if stats_row else 0,
             "distribution": {row["rating"]: row["count"] for row in distribution},
         }
 
     def get_low_score_cases(
         self, prompt_template_id: str, threshold: int = 2, limit: int = 100
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Get low-scoring feedback cases for analysis."""
         rows = self.db.fetchall(
             """
-            SELECT 
+            SELECT
                 feedback_id,
                 prompt_version,
                 llm_request_id,
@@ -335,7 +339,7 @@ class PromptFeedback:
 
     def compare_versions(
         self, prompt_template_id: str, version_a: str, version_b: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Compare feedback between two prompt versions."""
         stats_a = self.get_feedback_stats(prompt_template_id, version_a)
         stats_b = self.get_feedback_stats(prompt_template_id, version_b)

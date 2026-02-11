@@ -8,8 +8,7 @@ Implements the token resolution priority from design doc:
 """
 
 import json
-from datetime import UTC, datetime
-from typing import Optional
+from datetime import datetime, timezone
 
 from uuid_utils import uuid7
 
@@ -20,16 +19,16 @@ from sdk import Database
 class TokenResolver:
     """Token resolution service."""
 
-    def __init__(self, db: Optional[Database] = None) -> None:
+    def __init__(self, db: Database | None = None) -> None:
         self.db = db or Database()
 
     def resolve_repo_token(
         self,
         user_id: str,
-        tenant_id: Optional[str] = None,
-        repo_url: Optional[str] = None,
-        repo_id: Optional[str] = None,
-    ) -> Optional[Token]:
+        tenant_id: str | None = None,
+        repo_url: str | None = None,
+        repo_id: str | None = None,
+    ) -> Token | None:
         """Resolve repo token with priority fallback.
 
         Priority:
@@ -65,17 +64,17 @@ class TokenResolver:
         self,
         token_type: TokenType,
         provider: str,
-        secret_ref: Optional[str] = None,
-        encrypted_value: Optional[str] = None,
-        scope_user_id: Optional[str] = None,
-        scope_tenant_id: Optional[str] = None,
-        scope_repo: Optional[str] = None,
-        expires_at: Optional[datetime] = None,
-        metadata: Optional[dict] = None,
+        secret_ref: str | None = None,
+        encrypted_value: str | None = None,
+        scope_user_id: str | None = None,
+        scope_tenant_id: str | None = None,
+        scope_repo: str | None = None,
+        expires_at: datetime | None = None,
+        metadata: dict | None = None,
     ) -> Token:
         """Create a new token."""
         token_id = str(uuid7())
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
 
         query = """
             INSERT INTO tokens (
@@ -117,7 +116,7 @@ class TokenResolver:
             metadata=metadata or {},
         )
 
-    def get_token(self, token_id: str) -> Optional[Token]:
+    def get_token(self, token_id: str) -> Token | None:
         """Get token by ID."""
         query = "SELECT * FROM tokens WHERE token_id = %s"
         result = self.db.fetchone(query, (token_id,))
@@ -131,8 +130,8 @@ class TokenResolver:
         self.db.execute(query, (token_id,))
 
     def _get_repo_specific_token(
-        self, repo_id: Optional[str], repo_url: Optional[str], user_id: str
-    ) -> Optional[Token]:
+        self, repo_id: str | None, repo_url: str | None, user_id: str
+    ) -> Token | None:
         """Get repo-specific token from repos table."""
         if repo_id:
             query = """
@@ -153,7 +152,7 @@ class TokenResolver:
 
         return self._to_model(result) if result else None
 
-    def _get_user_default_token(self, user_id: str) -> Optional[Token]:
+    def _get_user_default_token(self, user_id: str) -> Token | None:
         """Get user default token (no scope_repo)."""
         query = """
             SELECT * FROM tokens
@@ -167,7 +166,7 @@ class TokenResolver:
         result = self.db.fetchone(query, (user_id,))
         return self._to_model(result) if result else None
 
-    def _get_tenant_default_token(self, tenant_id: str) -> Optional[Token]:
+    def _get_tenant_default_token(self, tenant_id: str) -> Token | None:
         """Get tenant default token (no scope_repo)."""
         query = """
             SELECT * FROM tokens
@@ -181,7 +180,7 @@ class TokenResolver:
         result = self.db.fetchone(query, (tenant_id,))
         return self._to_model(result) if result else None
 
-    def _get_global_token(self) -> Optional[Token]:
+    def _get_global_token(self) -> Token | None:
         """Get global fallback token."""
         query = """
             SELECT * FROM tokens

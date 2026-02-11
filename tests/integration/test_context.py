@@ -1,6 +1,7 @@
 """Integration tests for Context Management (Phase 3)."""
 
 import pytest
+
 from core.context import ContextManager, TaskType
 from core.events.event_logger import EventLogger
 from core.events.session_manager import SessionManager
@@ -62,7 +63,7 @@ def session_with_events(db):
 
 def test_context_manager_build_context(context_manager, session_with_events):
     """Test building context from session events."""
-    session, events = session_with_events
+    session, _events = session_with_events
 
     # Build context
     context = context_manager.build_context(
@@ -115,7 +116,7 @@ def test_context_manager_task_aware_allocation(context_manager, session_with_eve
 
 def test_context_manager_relevance_scoring(context_manager, session_with_events):
     """Test relevance scoring prioritizes relevant events."""
-    session, events = session_with_events
+    session, _events = session_with_events
 
     # Add a highly relevant event
     logger = EventLogger(context_manager.db)
@@ -142,7 +143,7 @@ def test_context_manager_relevance_scoring(context_manager, session_with_events)
 
 def test_context_snapshot_save_and_load(context_manager, session_with_events):
     """Test saving and loading context snapshots."""
-    session, events = session_with_events
+    session, _events = session_with_events
 
     # Build context
     context = context_manager.build_context(

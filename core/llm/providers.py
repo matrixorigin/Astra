@@ -1,9 +1,10 @@
 """LLM provider adapters with connection pooling and retry."""
 
-import time
 import logging
+import time
 from abc import ABC, abstractmethod
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from core.llm.models import LLMProvider, LLMResponse
 
@@ -24,10 +25,7 @@ def _should_retry(error: Exception) -> bool:
     }
     if any(r in err_name for r in retryable):
         return True
-    for code in (429, 500, 502, 503, 504):
-        if str(code) in str(error):
-            return True
-    return False
+    return any(str(code) in str(error) for code in (429, 500, 502, 503, 504))
 
 
 class BaseProvider(ABC):
@@ -358,7 +356,15 @@ class AnthropicProvider(BaseProvider):
             usage = stream.get_final_message().usage
             yield {"type": "usage", "prompt": usage.input_tokens, "completion": usage.output_tokens}
 
-    def complete_with_tools(self, messages, tools, model, tool_choice, temperature, max_tokens):
+    def complete_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        model: str,
+        tool_choice: str,
+        temperature: float,
+        max_tokens: int | None,
+    ) -> dict[str, Any]:
         system, msgs = self._split_system(messages)
         # Convert OpenAI tool format → Anthropic tool format
         anthropic_tools = [self._convert_tool(t) for t in tools]
@@ -412,10 +418,9 @@ class AnthropicProvider(BaseProvider):
             max_tokens=max_tokens or 2000,
         ) as stream:
             for event in stream:
-                if hasattr(event, "type"):
-                    if event.type == "content_block_delta":
-                        if hasattr(event.delta, "text"):
-                            yield {"type": "text", "content": event.delta.text}
+                if hasattr(event, "type") and event.type == "content_block_delta":
+                    if hasattr(event.delta, "text"):
+                        yield {"type": "text", "content": event.delta.text}
             # After stream, extract tool calls from final message
             msg = stream.get_final_message()
             for block in msg.content:

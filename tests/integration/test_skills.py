@@ -1,18 +1,13 @@
 """Tests for skill framework."""
 
 import pytest
+
+from core.llm import LLMClient
 from core.skills import (
     SkillRegistry,
-    Skill,
-    SkillInput,
-    SkillOutput,
-    SkillRequirement,
-    RepoType,
-    AccessScope,
 )
-from core.skills.builtin import SummarizePRSkill, ListPRsSkill, CIStatusSkill
+from core.skills.builtin import CIStatusSkill, ListPRsSkill, SummarizePRSkill
 from core.skills.github_client import GitHubClient
-from core.llm import LLMClient
 from sdk import Database
 
 
@@ -95,13 +90,18 @@ def test_skill_registry_list_available(db, registry, llm, github):
     registry.register(CIStatusSkill(db, github))
 
     # Create a CODE repo with unique URL
-    from core.repos import (
-        RepoRegistry,
-        RepoType as RepoTypeEnum,
-        AccessScope as AccessScopeEnum,
-        OwnerType,
-    )
     import time
+
+    from core.repos import (
+        AccessScope as AccessScopeEnum,
+    )
+    from core.repos import (
+        OwnerType,
+        RepoRegistry,
+    )
+    from core.repos import (
+        RepoType as RepoTypeEnum,
+    )
 
     repo_registry = RepoRegistry(db)
     repo = repo_registry.create(
@@ -128,7 +128,7 @@ def test_skill_registry_list_available(db, registry, llm, github):
 async def test_summarize_pr_skill(db, llm, github, monkeypatch):
     """Test summarize_pr skill execution"""
     # Mock LLM response
-    from core.llm.models import LLMResponse, LLMProvider
+    from core.llm.models import LLMProvider, LLMResponse
 
     async def mock_chat(*args, **kwargs):
         return LLMResponse(

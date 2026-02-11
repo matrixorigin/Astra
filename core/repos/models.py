@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -39,8 +39,8 @@ class Repo(BaseModel):
     repo_type: RepoType
     owner_id: str
     owner_type: OwnerType
-    repo_group: Optional[str] = None
-    token_id: Optional[str] = None
+    repo_group: str | None = None
+    token_id: str | None = None
     access_scope: AccessScope
     metadata: dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True

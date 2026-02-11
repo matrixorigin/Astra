@@ -1,10 +1,10 @@
 """Input validation utilities."""
 
 import re
+import unicodedata
 from typing import Any
-from pydantic import BaseModel, Field, field_validator
 
-from core.exceptions import SkillValidationError
+from pydantic import BaseModel, Field, field_validator
 
 
 class QueryRequest(BaseModel):
@@ -75,7 +75,9 @@ def sanitize_string(value: str, max_length: int = 1000) -> str:
     value = value.replace("\x00", "")
 
     # Remove control characters except newline and tab
-    value = "".join(char for char in value if char in "\n\t" or not char.iscntrl())
+    value = "".join(
+        char for char in value if char in "\n\t" or unicodedata.category(char)[0] != "C"
+    )
 
     return value
 

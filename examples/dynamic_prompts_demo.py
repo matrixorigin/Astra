@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Demo: Dynamic prompt modification without restart."""
 
-from sdk import Database
-from core.context.prompts import PromptManager
 from core.context.manager import ContextManager, TaskType
+from core.context.prompts import PromptManager
+from sdk import Database
 
 
 def demo_dynamic_prompts():

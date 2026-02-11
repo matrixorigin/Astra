@@ -1,5 +1,5 @@
 """Context management package."""
 
-from core.context.manager import ContextManager, Context, TaskType, ContextFragment
+from core.context.manager import Context, ContextFragment, ContextManager, TaskType
 
-__all__ = ["ContextManager", "Context", "TaskType", "ContextFragment"]
+__all__ = ["Context", "ContextFragment", "ContextManager", "TaskType"]

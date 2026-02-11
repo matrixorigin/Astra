@@ -6,14 +6,13 @@ Supports extensible scope chains for different business scenarios:
 - Deploy Agent: environment > project > account > global
 """
 
-from typing import Any, Optional
 from sdk import Database
 
 
 class ScopeResolver:
     """Resolve configuration with extensible scope chain."""
 
-    def __init__(self, db: Database, scope_chain: list[tuple[str, Optional[str]]]):
+    def __init__(self, db: Database, scope_chain: list[tuple[str, str | None]]):
         """Initialize resolver with priority chain.
 
         Args:
@@ -25,7 +24,7 @@ class ScopeResolver:
         self.db = db
         self.scope_chain = scope_chain
 
-    def resolve_model(self, model_name: str) -> Optional[dict]:
+    def resolve_model(self, model_name: str) -> dict | None:
         """Resolve model config by scope chain.
 
         Returns first matching model config from most specific to most general scope.
@@ -49,7 +48,7 @@ class ScopeResolver:
 
         return None
 
-    def resolve_token(self, token_type: str, provider: str) -> Optional[dict]:
+    def resolve_token(self, token_type: str, provider: str) -> dict | None:
         """Resolve API token by scope chain.
 
         Returns first matching token from most specific to most general scope.
@@ -57,7 +56,7 @@ class ScopeResolver:
         for scope_type, scope_id in self.scope_chain:
             query = """
                 SELECT * FROM agent_config.api_tokens
-                WHERE token_type = %s AND provider = %s 
+                WHERE token_type = %s AND provider = %s
                 AND scope_type = %s AND is_active = TRUE
             """
             params = [token_type, provider, scope_type]
@@ -133,13 +132,13 @@ class ScopeChainBuilder:
 
     @staticmethod
     def dev_agent(
-        user_id: str, account_id: str, repo: Optional[str] = None, project: Optional[str] = None
-    ) -> list[tuple[str, Optional[str]]]:
+        user_id: str, account_id: str, repo: str | None = None, project: str | None = None
+    ) -> list[tuple[str, str | None]]:
         """Build scope chain for Dev Agent scenario.
 
         Priority: repo > project > user > account > global
         """
-        chain = []
+        chain: list[tuple[str, str | None]] = []
         if repo:
             chain.append(("repo", repo))
         if project:
@@ -151,14 +150,14 @@ class ScopeChainBuilder:
     def sales_agent(
         user_id: str,
         account_id: str,
-        region: Optional[str] = None,
-        sales_group: Optional[str] = None,
-    ) -> list[tuple[str, Optional[str]]]:
+        region: str | None = None,
+        sales_group: str | None = None,
+    ) -> list[tuple[str, str | None]]:
         """Build scope chain for Sales Agent scenario.
 
         Priority: region > sales_group > user > account > global
         """
-        chain = []
+        chain: list[tuple[str, str | None]] = []
         if region:
             chain.append(("region", region))
         if sales_group:
@@ -170,14 +169,14 @@ class ScopeChainBuilder:
     def deploy_agent(
         user_id: str,
         account_id: str,
-        environment: Optional[str] = None,
-        project: Optional[str] = None,
-    ) -> list[tuple[str, Optional[str]]]:
+        environment: str | None = None,
+        project: str | None = None,
+    ) -> list[tuple[str, str | None]]:
         """Build scope chain for Deploy Agent scenario.
 
         Priority: environment > project > account > global
         """
-        chain = []
+        chain: list[tuple[str, str | None]] = []
         if environment:
             chain.append(("environment", environment))
         if project:
@@ -188,12 +187,12 @@ class ScopeChainBuilder:
     @staticmethod
     def custom(
         user_id: str, account_id: str, custom_scopes: list[tuple[str, str]]
-    ) -> list[tuple[str, Optional[str]]]:
+    ) -> list[tuple[str, str | None]]:
         """Build custom scope chain.
 
         Args:
             custom_scopes: List of (scope_type, scope_id) tuples in priority order
         """
-        chain = list(custom_scopes)
+        chain: list[tuple[str, str | None]] = list(custom_scopes)
         chain.extend([("user", user_id), ("account", account_id), ("global", None)])
         return chain

@@ -16,10 +16,10 @@ sandbox.create("sandbox_exp1")
 
 # 2. List sandboxes with filtering
 print("\n2. List sandboxes")
-all_sandboxes = sandbox.list()
+all_sandboxes = sandbox.list_sandboxes()
 print(f"   All: {[s['name'] for s in all_sandboxes if 'exp' in s['name']]}")
 
-exp_sandboxes = sandbox.list(pattern="%exp%")
+exp_sandboxes = sandbox.list_sandboxes(pattern="%exp%")
 print(f"   Filtered (exp): {[s['name'] for s in exp_sandboxes]}")
 
 # 3. Use sandbox (switch to sandbox database)
@@ -97,6 +97,6 @@ print("\n✅ Done!")
 print("\n=== Key Takeaways ===")
 print("1. Use sandbox.use(name) to switch database context")
 print("2. Or use explicit names: sandbox_name.table_name")
-print("3. Use sandbox.list(pattern='%exp%') to filter sandboxes")
+print("3. Use sandbox.list_sandboxes(pattern='%exp%') to filter sandboxes")
 print("4. Use sandbox.checkpoint() and restore() for versioning")
 print("5. All operations are zero-copy (instant, no storage overhead)")

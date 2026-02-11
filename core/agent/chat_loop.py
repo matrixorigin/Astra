@@ -1,16 +1,16 @@
 """Chat loop with multi-turn tool use and full message chain."""
 
 import json
-import re
-from typing import Dict, Any, Optional, List, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
-from core.llm.models import LLMMessage
-from core.events.event_logger import EventLogger
-from core.agent.selector import AgentSkillSelector
 from core.agent.executor import AgentExecutor
+from core.agent.planner import Planner
+from core.agent.selector import AgentSkillSelector
+from core.events.event_logger import EventLogger
+from core.events.models import StreamEvent, StreamEventType
+from core.llm.models import LLMMessage
 from core.logging_config import get_logger
-from core.events.models import StreamEvent, StreamEventType, EventType
-from core.agent.planner import Planner, PlanConstraints
 
 logger = get_logger(__name__)
 
@@ -52,11 +52,7 @@ def _needs_planning(user_input: str) -> bool:
         return True
 
     # Check for planning keywords
-    for keyword in planning_keywords:
-        if keyword in user_input:
-            return True
-
-    return False
+    return any(keyword in user_input for keyword in planning_keywords)
 
 
 def _merge_tool_call_fragments(fragments: list[dict], new_fragments: list[dict]) -> list[dict]:
@@ -105,7 +101,7 @@ class ChatLoop:
         user_input: str,
         session_id: str,
         user_id: str,
-        context: Optional[Dict[str, Any]] = None,
+        context: dict[str, Any] | None = None,
         max_candidates: int = 5,
     ) -> str:
         """Run a full conversation step with multi-turn tool use.
@@ -154,11 +150,11 @@ class ChatLoop:
             self._log_response(
                 user_id,
                 session_id,
-                response.content,
+                response.content or "",
                 user_event.event_id,
                 user_event.causal_chain_id,
             )
-            return response.content
+            return response.content or ""
 
         # 4. Multi-turn tool use loop
         for _round in range(MAX_TOOL_ROUNDS):
@@ -180,10 +176,10 @@ class ChatLoop:
                     user_event.event_id,
                     user_event.causal_chain_id,
                 )
-                return final_content
+                return final_content or ""
 
             # Append the assistant message (with tool_calls) to the chain
-            assistant_msg: Dict[str, Any] = {
+            assistant_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": llm_result.get("content") or "",
             }
@@ -234,16 +230,20 @@ class ChatLoop:
             session_id=session_id,
         )
         self._log_response(
-            user_id, session_id, response.content, user_event.event_id, user_event.causal_chain_id
+            user_id,
+            session_id,
+            response.content or "",
+            user_event.event_id,
+            user_event.causal_chain_id,
         )
-        return response.content
+        return response.content or ""
 
     async def run_step_stream(
         self,
         user_input: str,
         session_id: str,
         user_id: str,
-        context: Optional[Dict[str, Any]] = None,
+        context: dict[str, Any] | None = None,
         max_candidates: int = 5,
     ) -> AsyncIterator[StreamEvent]:
         """Stream events as the agent processes a request.
@@ -496,7 +496,7 @@ class ChatLoop:
         user_input: str,
         session_id: str,
         user_id: str,
-        context: Optional[Dict[str, Any]] = None,
+        context: dict[str, Any] | None = None,
         max_candidates: int = 5,
     ) -> AsyncIterator[StreamEvent]:
         """PAOR: Plan → Act → Observe → Reflect loop.
@@ -552,7 +552,7 @@ class ChatLoop:
                 return
 
             for step in next_steps:
-                step.status = "in_progress"
+                step.status = "in_progress"  # type: ignore
                 yield StreamEvent(
                     event_type=StreamEventType.PLAN_STEP_START,
                     data={"step": step.step_id},
@@ -571,7 +571,7 @@ class ChatLoop:
                     # Use plain chat for step execution
                     result = "Step executed"
 
-                step.status = "completed"
+                step.status = "completed"  # type: ignore
                 step.result = str(result)
                 step_results.append({"step_id": step.step_id, "result": result})
 
@@ -586,7 +586,7 @@ class ChatLoop:
                 break
 
             # R: Reflect — should we revise?
-            assessment, revised_plan = await planner.reflect(plan, step_results)
+            _assessment, revised_plan = await planner.reflect(plan, step_results)
             if revised_plan is not None:
                 plan = revised_plan
                 yield StreamEvent(
@@ -609,10 +609,10 @@ class ChatLoop:
     # ------------------------------------------------------------------
 
     def _build_messages(
-        self, user_input: str, context: Optional[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
+        self, user_input: str, context: dict[str, Any] | None
+    ) -> list[dict[str, Any]]:
         """Build the initial messages list, injecting context if available."""
-        messages: List[Dict[str, Any]] = []
+        messages: list[dict[str, Any]] = []
 
         system_parts = [
             "You are a development assistant. Use the available tools to help the user."
@@ -639,7 +639,7 @@ class ChatLoop:
         session_id: str,
         content: str,
         parent_event_id: str,
-        causal_chain_id: str,
+        causal_chain_id: str | None,
     ) -> None:
         """Log the final agent response as an event."""
         self.event_logger.create_llm_response(
@@ -649,6 +649,6 @@ class ChatLoop:
             agent_id="dev-agent",
             agent_version="0.1.0",
             parent_event_id=parent_event_id,
-            causal_chain_id=causal_chain_id,
+            causal_chain_id=causal_chain_id or "",
             llm_model_used=self.llm.config.get("model", "unknown"),
         )

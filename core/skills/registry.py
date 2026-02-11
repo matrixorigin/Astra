@@ -1,13 +1,14 @@
 """Skill registry for managing skill lifecycle and versioning."""
 
-import json
 import hashlib
 import inspect
-from typing import Optional
-from sdk import Database
+import json
+
+from core.exceptions import DatabaseError, SkillNotFoundError
 from core.logging_config import get_logger
-from core.exceptions import SkillNotFoundError, DatabaseError
-from .base import Skill, AccessScope
+from sdk import Database
+
+from .base import Skill
 
 logger = get_logger(__name__)
 
@@ -25,8 +26,8 @@ class SkillRegistry:
         is_active: bool = True,
         category: str = "general",
         subcategory: str = "default",
-        triggers: list = None,
-        dependencies: list = None,
+        triggers: list | None = None,
+        dependencies: list | None = None,
         priority: int = 5,
         cost_estimate: str = "medium",
     ) -> None:
@@ -49,7 +50,7 @@ class SkillRegistry:
             if is_active:
                 self.db.execute(
                     """
-                    UPDATE skills_registry 
+                    UPDATE skills_registry
                     SET is_active = 0
                     WHERE skill_name = %s
                 """,
@@ -62,8 +63,8 @@ class SkillRegistry:
             # 3. Insert new version with metadata
             self.db.execute(
                 """
-                INSERT INTO skills_registry 
-                (skill_id, skill_name, version, description, requirements, 
+                INSERT INTO skills_registry
+                (skill_id, skill_name, version, description, requirements,
                  code_hash, is_active, status, category, subcategory,
                  triggers, dependencies, priority, cost_estimate, side_effect_category)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s, %s)
@@ -111,9 +112,9 @@ class SkillRegistry:
 
         except Exception as e:
             logger.error(f"Failed to register skill {skill.name}@{skill.version}: {e}")
-            raise DatabaseError(f"Failed to register skill: {e}")
+            raise DatabaseError(f"Failed to register skill: {e}") from e
 
-    def get(self, skill_name: str, version: str = None) -> Optional[Skill]:
+    def get(self, skill_name: str, version: str | None = None) -> Skill | None:
         """Get skill by name and optional version
 
         Raises:
@@ -137,7 +138,7 @@ class SkillRegistry:
         # Query repo type and access scope
         repo = self.db.fetchone(
             """
-            SELECT repo_type, access_scope 
+            SELECT repo_type, access_scope
             FROM repos WHERE repo_id = %s
         """,
             (repo_id,),

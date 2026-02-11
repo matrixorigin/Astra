@@ -2,8 +2,9 @@
 
 import unittest
 from unittest.mock import MagicMock
-from core.agent.chat_loop import _needs_planning, _merge_tool_call_fragments
-from core.agent.planner import Planner, Plan, PlanStep, PlanStatus, PlanConstraints
+
+from core.agent.chat_loop import _merge_tool_call_fragments, _needs_planning
+from core.agent.planner import Plan, Planner, PlanStatus, PlanStep
 
 
 class TestNeedsPlanning(unittest.TestCase):

@@ -1,12 +1,11 @@
 """Multi-tenancy support for enterprise deployment."""
 
-from typing import Optional, List
 from dataclasses import dataclass
 from enum import Enum
 
-from sdk import Database
-from core.logging_config import get_logger
 from core.exceptions import AuthenticationError
+from core.logging_config import get_logger
+from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -70,9 +69,12 @@ class TenantManager:
 
         logger.info(f"Created tenant: {tenant_id} ({name})")
 
-        return self.get_tenant(tenant_id)
+        tenant = self.get_tenant(tenant_id)
+        if not tenant:
+            raise RuntimeError(f"Failed to create tenant: {tenant_id}")
+        return tenant
 
-    def get_tenant(self, tenant_id: str) -> Optional[Tenant]:
+    def get_tenant(self, tenant_id: str) -> Tenant | None:
         """Get tenant by ID."""
         row = self.db.fetchone("SELECT * FROM tenants WHERE tenant_id = %s", (tenant_id,))
 
@@ -80,13 +82,13 @@ class TenantManager:
             return None
 
         return Tenant(
-            tenant_id=row["tenant_id"],
-            name=row["name"],
-            status=TenantStatus(row["status"]),
-            max_users=row["max_users"],
-            max_sessions_per_day=row["max_sessions_per_day"],
-            max_llm_cost_per_day=row["max_llm_cost_per_day"],
-            created_at=str(row["created_at"]),
+            tenant_id=row.get("tenant_id", ""),
+            name=row.get("name", ""),
+            status=TenantStatus(row.get("status", "active")),
+            max_users=row.get("max_users", 100),
+            max_sessions_per_day=row.get("max_sessions_per_day", 1000),
+            max_llm_cost_per_day=row.get("max_llm_cost_per_day", 100.0),
+            created_at=str(row.get("created_at", "")),
             metadata=row.get("metadata", {}),
         )
 
@@ -97,7 +99,7 @@ class TenantManager:
             raise AuthenticationError(f"Tenant not found: {tenant_id}")
 
         # Check daily sessions
-        sessions_today = self.db.fetchone(
+        sessions_row = self.db.fetchone(
             """
             SELECT COUNT(*) as count
             FROM sessions
@@ -105,10 +107,11 @@ class TenantManager:
             AND DATE(created_at) = CURDATE()
         """,
             (tenant_id,),
-        )["count"]
+        )
+        sessions_today = sessions_row.get("count", 0) if sessions_row else 0
 
         # Check daily LLM cost
-        cost_today = self.db.fetchone(
+        cost_row = self.db.fetchone(
             """
             SELECT COALESCE(SUM(cost), 0) as total
             FROM llm_call_logs
@@ -116,17 +119,19 @@ class TenantManager:
             AND DATE(created_at) = CURDATE()
         """,
             (tenant_id,),
-        )["total"]
+        )
+        cost_today = cost_row.get("total", 0) if cost_row else 0
 
         # Check user count
-        user_count = self.db.fetchone(
+        user_row = self.db.fetchone(
             """
             SELECT COUNT(DISTINCT user_id) as count
             FROM sessions
             WHERE tenant_id = %s
         """,
             (tenant_id,),
-        )["count"]
+        )
+        user_count = user_row.get("count", 0) if user_row else 0
 
         return {
             "sessions_today": sessions_today,
@@ -166,7 +171,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     max_llm_cost_per_day DECIMAL(10, 2) NOT NULL DEFAULT 100.00,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     metadata JSON,
-    
+
     INDEX idx_status (status),
     INDEX idx_created (created_at)
 );

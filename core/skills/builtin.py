@@ -1,19 +1,19 @@
 """Built-in skills for mo-dev-agent."""
 
 import logging
-from pydantic import BaseModel
+
+from core.llm import LLMClient
 from core.skills.base import (
+    AccessScope,
+    RepoType,
+    SideEffectCategory,
+    SideEffectProfile,
     Skill,
     SkillInput,
     SkillOutput,
     SkillRequirement,
-    RepoType,
-    AccessScope,
-    SideEffectCategory,
-    SideEffectProfile,
 )
 from core.skills.github_client import GitHubClient
-from core.llm import LLMClient
 from sdk import Database
 
 logger = logging.getLogger(__name__)
@@ -234,9 +234,9 @@ def register_builtin_skills(
         agent_registry: Optional AgentRegistry for multi-agent delegation
         chat_loop_factory: Optional factory for creating ChatLoop instances
     """
-    from core.skills.github_client import GitHubClient
     from core.llm import LLMClient
     from core.skills.delegation import DelegateTaskSkill
+    from core.skills.github_client import GitHubClient
 
     # Initialize clients if not provided
     if github is None:

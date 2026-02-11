@@ -1,10 +1,11 @@
 """Database connection pool for high performance."""
 
+import os
+import threading
+from queue import Empty, Queue
+
 import pymysql
 from pymysql.cursors import DictCursor
-from queue import Queue, Empty
-import threading
-import os
 
 from core.logging_config import get_logger
 

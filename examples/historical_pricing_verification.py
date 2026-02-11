@@ -5,7 +5,7 @@ Demonstrates accurate cost calculation using historical pricing.
 Validates the "10 years later, reproduce today's cost" capability.
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timezone
 
 from core.llm.client import LLMClient
 from core.llm.models import LLMProvider
@@ -41,7 +41,7 @@ db.execute(
         0.06,  # $0.06/1K completion
         datetime(2026, 1, 1, 0, 0, 0),
         datetime(2026, 2, 1, 0, 0, 0),
-        datetime.now(UTC),
+        datetime.now(timezone.utc),
     ),
 )
 print("✓ Original pricing (2026-01-01): $0.03/$0.06 per 1K tokens")
@@ -63,7 +63,7 @@ db.execute(
         0.04,
         datetime(2026, 2, 1, 0, 0, 0),
         None,  # NULL = current pricing
-        datetime.now(UTC),
+        datetime.now(timezone.utc),
     ),
 )
 print("✓ New pricing (2026-02-01): $0.02/$0.04 per 1K tokens")
@@ -125,7 +125,7 @@ cost_replay = client._calculate_cost(
     call_timestamp=call_timestamp_old,  # ✅ Use original call timestamp
 )
 
-print(f"Today: {datetime.now(UTC).strftime('%Y-%m-%d')}")
+print(f"Today: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
 print(f"Replaying call from: {call_timestamp_old}")
 print(f"Calculated cost: ${cost_replay:.6f}")
 print(f"Original cost: ${cost_old:.6f}")

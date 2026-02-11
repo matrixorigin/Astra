@@ -1,9 +1,10 @@
 """Unit tests for streaming output functionality."""
 
 import unittest
-from unittest.mock import MagicMock, AsyncMock
-from core.events.models import StreamEvent, StreamEventType
+from unittest.mock import MagicMock
+
 from core.events.event_logger import EventLogger
+from core.events.models import StreamEvent, StreamEventType
 
 
 class TestStreamEventModel(unittest.TestCase):

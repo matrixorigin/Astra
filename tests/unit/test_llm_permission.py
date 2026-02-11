@@ -1,7 +1,7 @@
 """Test LLM client permission control."""
 
-import os
 import pytest
+
 from core.llm.client import LLMClient
 from tests.unit.test_model_scope import MockDB
 
@@ -116,7 +116,7 @@ def test_detailed_permission_error():
 
     try:
         client._check_model_permission("gpt-4o")
-        assert False, "Should have raised PermissionError"
+        raise AssertionError("Should have raised PermissionError")
     except PermissionError as e:
         error_msg = str(e)
         # Should contain user info

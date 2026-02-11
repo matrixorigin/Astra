@@ -3,8 +3,6 @@ mo-dev-agent 核心能力演示
 展示实际应用场景
 """
 
-from datetime import UTC, datetime
-
 from core.events.causal_chain import CausalChainManager
 from core.events.event_logger import EventLogger
 from core.events.event_reader import EventReader
@@ -58,7 +56,7 @@ print(f"✓ LLM 响应: {llm_event.event_id}")
 
 # 追踪因果链
 chain = chain_mgr.get_chain(user_event.causal_chain_id)
-print(f"\n因果链分析:")
+print("\n因果链分析:")
 print(f"  - 链 ID: {user_event.causal_chain_id}")
 print(f"  - 事件数: {len(chain)}")
 print(f"  - 事件类型: {[e.event_type for e in chain]}")
@@ -123,18 +121,18 @@ for config in repos_config:
 
 # 按组查询所有相关仓库
 group_repos = registry.list_by_group("matrixone-project")
-print(f"\n项目仓库组 'matrixone-project':")
+print("\n项目仓库组 'matrixone-project':")
 print(f"  - 总数: {len(group_repos)}")
 for repo in group_repos:
     print(f"  - {repo.repo_type.value:8s}: {repo.repo_url}")
 
 # 场景：Skills 可以跨仓库操作
-print(f"\n跨仓库操作示例:")
-code_repo = [r for r in group_repos if r.repo_type == RepoType.CODE][0]
-ci_repo = [r for r in group_repos if r.repo_type == RepoType.CI][0]
+print("\n跨仓库操作示例:")
+code_repo = next(r for r in group_repos if r.repo_type == RepoType.CODE)
+ci_repo = next(r for r in group_repos if r.repo_type == RepoType.CI)
 print(f"  1. 从 {code_repo.repo_type.value} 仓库获取最新提交")
 print(f"  2. 从 {ci_repo.repo_type.value} 仓库查询 CI 状态")
-print(f"  3. 关联分析：提交 → CI 结果")
+print("  3. 关联分析：提交 → CI 结果")
 
 # Cleanup
 for repo in created_repos:
@@ -168,9 +166,9 @@ event2 = logger.create_llm_response(
     causal_chain_id=event1.causal_chain_id,
 )
 
-print(f"✓ 创建测试会话和对话")
+print("✓ 创建测试会话和对话")
 print(f"  - 会话 ID: {session.session_id}")
-print(f"  - 事件数: 2")
+print("  - 事件数: 2")
 
 # 列出所有检查点
 checkpoints = tm.list_checkpoints()
@@ -190,14 +188,14 @@ print("用例：测试新的 prompt 版本，不影响生产数据")
 sandbox = Sandbox(db=db)
 
 # 列出现有沙盒
-sandboxes = sandbox.list()
+sandboxes = sandbox.list_sandboxes()
 print(f"✓ 当前沙盒数量: {len(sandboxes)}")
 
-print(f"\n沙盒能力:")
-print(f"  - 零拷贝克隆（秒级创建）")
-print(f"  - 完全隔离（不影响生产）")
-print(f"  - 支持检查点和恢复")
-print(f"  - 可以添加/删除特定表")
+print("\n沙盒能力:")
+print("  - 零拷贝克隆（秒级创建）")
+print("  - 完全隔离（不影响生产）")
+print("  - 支持检查点和恢复")
+print("  - 可以添加/删除特定表")
 
 # ============================================================================
 # 场景 5: 数据分支 - Git-like 工作流
@@ -208,11 +206,11 @@ print("用例：在分支上测试数据变更，对比差异后合并")
 
 branch = Branch(db=db)
 
-print(f"✓ 数据分支能力:")
-print(f"  - 创建分支（零拷贝）")
-print(f"  - 对比差异（diff）")
-print(f"  - 合并变更（merge）")
-print(f"  - 冲突处理（error/skip/accept）")
+print("✓ 数据分支能力:")
+print("  - 创建分支（零拷贝）")
+print("  - 对比差异（diff）")
+print("  - 合并变更（merge）")
+print("  - 冲突处理（error/skip/accept）")
 
 # ============================================================================
 # 总结

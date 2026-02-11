@@ -1,9 +1,10 @@
 """Agent skill selection logic."""
 
-from typing import List, Dict, Any, Optional
-from sdk import Database
-from core.skills.modern_selector import ModernSkillSelector
+from typing import Any
+
 from core.logging_config import get_logger
+from core.skills.modern_selector import ModernSkillSelector
+from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -15,8 +16,8 @@ class AgentSkillSelector:
         self.selector = ModernSkillSelector(db, llm_client)
 
     def select_skills(
-        self, query: str, context: Optional[Dict[str, Any]] = None, max_candidates: int = 5
-    ) -> List[Dict[str, Any]]:
+        self, query: str, context: dict[str, Any] | None = None, max_candidates: int = 5
+    ) -> list[dict[str, Any]]:
         """Select skills based on query and context.
 
         Args:

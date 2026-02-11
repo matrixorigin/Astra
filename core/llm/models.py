@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -32,7 +32,7 @@ class LLMRequest(BaseModel):
     messages: list[LLMMessage]
     model: str
     temperature: float = 0.7
-    max_tokens: Optional[int] = None
+    max_tokens: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -64,7 +64,7 @@ class LLMCallLog(BaseModel):
     cost_usd: float
     latency_ms: int
     status: str  # 'success' | 'failed'
-    error_message: Optional[str] = None
+    error_message: str | None = None
     created_at: datetime
     metadata: dict[str, Any] = Field(default_factory=dict)
 

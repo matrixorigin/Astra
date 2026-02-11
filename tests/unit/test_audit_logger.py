@@ -1,7 +1,5 @@
 """Tests for audit logger."""
 
-import pytest
-from datetime import datetime
 from core.auth.audit_logger import AuditLogger
 
 

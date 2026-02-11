@@ -1,10 +1,10 @@
 import sys
-import os
-from unittest.mock import MagicMock, patch
 from datetime import datetime
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 # Add project root to path
-sys.path.append(os.path.abspath("/home/xupeng/github/mo-dev-agent"))
+sys.path.append(str(Path("/home/xupeng/github/mo-dev-agent").resolve()))
 
 from core.context.manager import ContextManager, TaskType
 
@@ -51,10 +51,9 @@ def verify_context_manager():
     ]
 
     # Initialize Manager
-    with patch("core.context.embeddings.EmbeddingService") as MockEmbed:
-        mock_embed = MockEmbed.return_value
-        mock_embed.embed_text.return_value = [0.1] * 1024
-        mock_embed.search_similar.return_value = [
+    with patch("core.context.embeddings.EmbeddingService") as mock_embed:
+        mock_embed.return_value.embed_text.return_value = [0.1] * 1024
+        mock_embed.return_value.search_similar.return_value = [
             {"event_id": "evt_1", "distance": 0.1},
             {"event_id": "evt_2", "distance": 0.2},
         ]
@@ -66,7 +65,7 @@ def verify_context_manager():
             session_id="sess_1", query="test query", task_type=TaskType.GENERAL
         )
 
-        print(f"\nContext Built Successfully!")
+        print("\nContext Built Successfully!")
         print(f"Total Tokens: {context.total_tokens}")
         print(f"Selected Events: {len(context.selected_events)}")
         print(f"Skill Definitions: {len(context.skill_definitions)}")

@@ -1,6 +1,5 @@
 """Tests for permission checker."""
 
-import pytest
 from core.auth.permission_checker import PermissionChecker
 
 

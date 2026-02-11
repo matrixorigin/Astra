@@ -7,7 +7,7 @@ Demonstrates:
 3. Call log retrieval
 """
 
-from core.llm import LLMClient, LLMMessage
+from core.llm import LLMClient
 from sdk import Database
 
 print("=" * 80)
@@ -72,7 +72,7 @@ print("-" * 80)
 logs = client.get_call_logs()
 if logs:
     print(f"Total logs: {len(logs)}")
-    print(f"\nMost recent call:")
+    print("\nMost recent call:")
     log = logs[0]
     print(f"  - Provider: {log.provider.value}")
     print(f"  - Model: {log.model}")
@@ -112,7 +112,7 @@ print("-" * 80)
 print("""
 To switch providers, update config in MatrixOne:
 
-UPDATE configs 
+UPDATE configs
 SET value = '{"provider": "groq", "model": "llama3-70b", ...}'
 WHERE key_name = 'llm_config';
 

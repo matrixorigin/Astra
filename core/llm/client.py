@@ -1,20 +1,19 @@
 """LLM client with provider abstraction, routing, rate limiting, circuit breaker, and call logging."""
 
 import json
+import logging
 import os
 import time
-import logging
-from datetime import UTC, datetime
-from typing import Optional
+from datetime import datetime, timezone
 
 from uuid_utils import uuid7
 
 from core.llm.models import LLMCallLog, LLMMessage, LLMProvider, LLMResponse
-from core.llm.providers import BaseProvider, OpenAIProvider, GroqProvider, AnthropicProvider
-from core.llm.router import ModelRouter, ModelConfig
+from core.llm.providers import AnthropicProvider, BaseProvider, GroqProvider, OpenAIProvider
 from core.llm.rate_limiter import RateLimiter
+from core.llm.router import ModelConfig, ModelRouter
 from core.repos.token_resolver import TokenResolver
-from core.scope.scope_resolver import ScopeResolver, ScopeChainBuilder
+from core.scope.scope_resolver import ScopeChainBuilder, ScopeResolver
 from sdk import Database
 
 logger = logging.getLogger(__name__)
@@ -31,7 +30,7 @@ class LLMClient:
 
     def __init__(
         self,
-        db: Optional[Database] = None,
+        db: Database | None = None,
         user_id: str | None = None,
         tenant_id: str | None = None,
         use_default_models: bool = True,
@@ -52,6 +51,7 @@ class LLMClient:
         self.scope_context = scope_context or {}
 
         # Initialize scope resolver
+        self.scope_resolver: ScopeResolver | None = None
         if user_id and tenant_id:
             scope_chain = ScopeChainBuilder.dev_agent(
                 user_id=user_id,
@@ -60,8 +60,6 @@ class LLMClient:
                 project=self.scope_context.get("project"),
             )
             self.scope_resolver = ScopeResolver(self.db, scope_chain)
-        else:
-            self.scope_resolver = None
 
         self._providers: dict[LLMProvider, BaseProvider] = {}
         self.router = ModelRouter(
@@ -89,7 +87,7 @@ class LLMClient:
         self.scope_context = scope_context or {}
 
         # Rebuild scope resolver
-        if user_id and tenant_id:
+        if user_id and tenant_id and scope_context:
             scope_chain = ScopeChainBuilder.dev_agent(
                 user_id=user_id,
                 account_id=tenant_id,
@@ -178,12 +176,13 @@ class LLMClient:
         if self.user_id or self.tenant_id:
             token = self._resolve_llm_token(provider)
             if token:
-                return token.encrypted_value or token.secret_ref
+                val = token.encrypted_value or token.secret_ref
+                return str(val) if val else None
 
         # 3. Fallback to config
         key = self.config.get(f"{provider}_api_key")
         if key:
-            return key
+            return str(key) if key else None
 
         # 4. Fallback to environment variable
         key = os.getenv(f"{provider.upper()}_API_KEY")
@@ -197,7 +196,7 @@ class LLMClient:
                 (f"{provider}_api_key",),
             )
             if row:
-                return row["value"]
+                return str(row.get("value", "")) or None
         except Exception:
             pass
 
@@ -208,8 +207,8 @@ class LLMClient:
         # 1. User-scoped token
         if self.user_id:
             query = """
-                SELECT * FROM tokens 
-                WHERE type = 'llm' AND provider = %s 
+                SELECT * FROM tokens
+                WHERE type = 'llm' AND provider = %s
                 AND scope_user_id = %s AND is_active = TRUE
                 ORDER BY created_at DESC LIMIT 1
             """
@@ -220,8 +219,8 @@ class LLMClient:
         # 2. Tenant-scoped token
         if self.tenant_id:
             query = """
-                SELECT * FROM tokens 
-                WHERE type = 'llm' AND provider = %s 
+                SELECT * FROM tokens
+                WHERE type = 'llm' AND provider = %s
                 AND scope_tenant_id = %s AND is_active = TRUE
                 ORDER BY created_at DESC LIMIT 1
             """
@@ -307,7 +306,7 @@ class LLMClient:
             ]
 
             # Group by provider for better readability
-            by_provider = {}
+            by_provider: dict[str, list[str]] = {}
             for m in available_models:
                 provider = m.provider.value
                 if provider not in by_provider:
@@ -369,11 +368,11 @@ class LLMClient:
         self,
         messages: list[LLMMessage] | list[dict],
         user_id: str,
-        session_id: str = None,
-        event_id: str = None,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-        metadata: Optional[dict] = None,
+        session_id: str | None = None,
+        event_id: str | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        metadata: dict | None = None,
         task_hint: str | None = None,
     ) -> LLMResponse:
         """Send chat request to LLM."""
@@ -422,8 +421,8 @@ class LLMClient:
         messages: list[dict],
         tools: list[dict],
         tool_choice: str = "auto",
-        model: Optional[str] = None,
-        session_id: str = None,
+        model: str | None = None,
+        session_id: str | None = None,
         task_hint: str | None = None,
     ) -> dict:
         """Chat with function calling."""
@@ -442,7 +441,7 @@ class LLMClient:
             temperature=temp,
             max_tokens=max_tok,
         )
-        return result
+        return dict(result) if result else {}
 
     async def chat_stream(
         self,
@@ -594,7 +593,7 @@ class LLMClient:
                         response.latency_ms,
                         status,
                         json.dumps(metadata) if metadata else None,
-                        datetime.now(UTC),
+                        datetime.now(timezone.utc),
                     ),
                 )
             else:
@@ -618,7 +617,7 @@ class LLMClient:
                         status,
                         error_message,
                         json.dumps(metadata) if metadata else None,
-                        datetime.now(UTC),
+                        datetime.now(timezone.utc),
                     ),
                 )
         except Exception as e:
@@ -666,15 +665,15 @@ class LLMClient:
     # ── Helpers ────────────────────────────────────────────────────
 
     @staticmethod
-    def _normalize_messages(messages: list) -> list[dict]:
-        result = []
+    def _normalize_messages(messages: list) -> list[dict[str, str]]:
+        result: list[dict[str, str]] = []
         for m in messages:
             if isinstance(m, LLMMessage):
-                d = {"role": m.role}
+                d: dict[str, str] = {"role": m.role}
                 if m.content is not None:
                     d["content"] = m.content
                 if m.tool_calls:
-                    d["tool_calls"] = m.tool_calls
+                    d["tool_calls"] = m.tool_calls  # type: ignore
                 if m.tool_call_id:
                     d["tool_call_id"] = m.tool_call_id
                 if m.name:

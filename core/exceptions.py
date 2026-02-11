@@ -13,7 +13,7 @@ class AgentError(Exception):
 class SkillError(AgentError):
     """Base exception for skill-related errors."""
 
-    def __init__(self, message: str, skill_name: str = None):
+    def __init__(self, message: str, skill_name: str | None = None):
         self.skill_name = skill_name
         super().__init__(message, code="SKILL_ERROR")
 
@@ -21,7 +21,7 @@ class SkillError(AgentError):
 class SkillNotFoundError(SkillError):
     """Skill not found in registry."""
 
-    def __init__(self, skill_name: str, version: str = None):
+    def __init__(self, skill_name: str, version: str | None = None):
         message = f"Skill '{skill_name}'"
         if version:
             message += f" version '{version}'"
@@ -51,7 +51,7 @@ class SkillValidationError(SkillError):
 class ReplayError(AgentError):
     """Replay operation failed."""
 
-    def __init__(self, message: str, session_id: str = None):
+    def __init__(self, message: str, session_id: str | None = None):
         self.session_id = session_id
         super().__init__(message, code="REPLAY_ERROR")
 
@@ -73,7 +73,7 @@ class ContextError(AgentError):
 class LLMError(AgentError):
     """LLM operation failed."""
 
-    def __init__(self, message: str, provider: str = None):
+    def __init__(self, message: str, provider: str | None = None):
         self.provider = provider
         super().__init__(message, code="LLM_ERROR")
 
@@ -97,7 +97,7 @@ class LLMRateLimitError(LLMError):
 class GitHubError(AgentError):
     """GitHub API operation failed."""
 
-    def __init__(self, message: str, status_code: int = None):
+    def __init__(self, message: str, status_code: int | None = None):
         self.status_code = status_code
         super().__init__(message, code="GITHUB_ERROR")
 

@@ -106,7 +106,7 @@ def test_sandbox_creation(sandbox):
     sandbox.create(sandbox_name)
 
     # List sandboxes
-    sandboxes = sandbox.list()
+    sandboxes = sandbox.list_sandboxes()
     assert any(s["sandbox_name"] == sandbox_name for s in sandboxes)
 
     # Delete sandbox

@@ -1,8 +1,10 @@
 """Test scope-based model access control."""
 
 import json
+
 import pytest
-from core.llm.router import ModelRegistry, ModelConfig
+
+from core.llm.router import ModelRegistry
 
 
 class MockDB:

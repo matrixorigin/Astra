@@ -12,6 +12,7 @@ Run with: pytest tests/integration/test_admin_cli.py -v
 
 import pytest
 from click.testing import CliRunner
+
 from cli.mo_admin import cli
 from sdk import Database
 

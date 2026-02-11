@@ -1,5 +1,5 @@
 """Scope package for scope-based configuration resolution."""
 
-from core.scope.scope_resolver import ScopeResolver, ScopeChainBuilder
+from core.scope.scope_resolver import ScopeChainBuilder, ScopeResolver
 
-__all__ = ["ScopeResolver", "ScopeChainBuilder"]
+__all__ = ["ScopeChainBuilder", "ScopeResolver"]

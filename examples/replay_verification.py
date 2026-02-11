@@ -9,7 +9,7 @@ This script validates:
 3. Dry-run filtering in replay
 """
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from core.repos import (
     AccessScope,
@@ -64,7 +64,7 @@ db.execute(
     "ON DUPLICATE KEY UPDATE value = %s",
     ("allow_global", "allow_global_repo_token", "true", "true"),
 )
-print(f"✓ Global fallback enabled")
+print("✓ Global fallback enabled")
 
 # 2. Create repo with NULL token_id (triggers priority chain)
 print("\n2. Create repo with NULL token_id (priority fallback)")
@@ -80,7 +80,7 @@ repo = registry.create(
     metadata={"default_branch": "main"},
 )
 print(f"✓ Repo created: {repo.repo_id}")
-print(f"  - token_id: NULL (will use priority chain)")
+print("  - token_id: NULL (will use priority chain)")
 
 # 3. Resolve token (should use tenant token)
 print("\n3. Resolve token for repo")
@@ -91,8 +91,8 @@ resolved = resolver.resolve_repo_token(
     repo_id=repo.repo_id,
 )
 print(f"✓ Resolved token: {resolved.token_id}")
-print(f"  - Priority: Tenant default token")
-print(f"  - Reason: repo.token_id=NULL, no user token, tenant token found")
+print("  - Priority: Tenant default token")
+print("  - Reason: repo.token_id=NULL, no user token, tenant token found")
 
 # 4. Simulate GitHub operation with dry-run
 print("\n4. Simulate GitHub operation (dry-run)")
@@ -101,7 +101,7 @@ print("\n4. Simulate GitHub operation (dry-run)")
 db.execute(
     """
     INSERT INTO github_operations (
-        operation_id, event_id, repo_id, operation_type, 
+        operation_id, event_id, repo_id, operation_type,
         operation_params, token_id, is_dry_run, status, executed_at
     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """,
@@ -114,12 +114,12 @@ db.execute(
         resolved.token_id,
         True,  # Dry-run
         "success",
-        datetime.now(UTC),
+        datetime.now(timezone.utc),
     ),
 )
-print(f"✓ Dry-run operation logged")
-print(f"  - operation_id: op_dry_run_1")
-print(f"  - is_dry_run: TRUE")
+print("✓ Dry-run operation logged")
+print("  - operation_id: op_dry_run_1")
+print("  - is_dry_run: TRUE")
 
 # 5. Execute real operation
 print("\n5. Execute real operation")
@@ -127,7 +127,7 @@ print("\n5. Execute real operation")
 db.execute(
     """
     INSERT INTO github_operations (
-        operation_id, event_id, repo_id, operation_type, 
+        operation_id, event_id, repo_id, operation_type,
         operation_params, token_id, is_dry_run, status, executed_at
     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """,
@@ -140,12 +140,12 @@ db.execute(
         resolved.token_id,
         False,  # Real execution
         "success",
-        datetime.now(UTC),
+        datetime.now(timezone.utc),
     ),
 )
-print(f"✓ Real operation logged")
-print(f"  - operation_id: op_real_1")
-print(f"  - is_dry_run: FALSE")
+print("✓ Real operation logged")
+print("  - operation_id: op_real_1")
+print("  - is_dry_run: FALSE")
 
 # 6. Replay: Filter out dry-run operations
 print("\n6. Replay: Reproduce real execution chain")
@@ -160,7 +160,7 @@ real_ops = db.fetchall(
     ("event_test_1",),
 )
 
-print(f"✓ Real operations (excluding dry-run):")
+print("✓ Real operations (excluding dry-run):")
 for op in real_ops:
     print(f"  - {op['operation_id']}: {op['operation_type']} (is_dry_run={op['is_dry_run']})")
 
@@ -173,7 +173,7 @@ all_ops = db.fetchall(
     """,
     ("event_test_1",),
 )
-print(f"\n✓ All operations (including dry-run):")
+print("\n✓ All operations (including dry-run):")
 for op in all_ops:
     print(f"  - {op['operation_id']}: {op['operation_type']} (is_dry_run={op['is_dry_run']})")
 
@@ -205,10 +205,10 @@ db.execute(
 - Comment: Minor issues found
 """,
         "active",
-        datetime.now(UTC),
+        datetime.now(timezone.utc),
     ),
 )
-print(f"✓ Skill documentation stored in MatrixOne")
+print("✓ Skill documentation stored in MatrixOne")
 
 # Retrieve documentation (simulating replay)
 skill_doc = db.fetchone(
@@ -219,7 +219,7 @@ skill_doc = db.fetchone(
     """,
     ("pr_review_skill", "1.0.0"),
 )
-print(f"\n✓ Retrieved skill documentation:")
+print("\n✓ Retrieved skill documentation:")
 print(skill_doc["documentation"][:200] + "...")
 
 # Cleanup

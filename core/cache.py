@@ -1,10 +1,11 @@
 """Redis cache layer for performance optimization."""
 
-import redis
 import json
 import os
-from typing import Any, Optional
 from functools import wraps
+from typing import Any
+
+import redis
 
 from core.logging_config import get_logger
 
@@ -30,7 +31,7 @@ class RedisCache:
         else:
             logger.info("Redis cache disabled")
 
-    def get(self, key: str) -> Optional[Any]:
+    def get(self, key: str) -> Any | None:
         """Get value from cache."""
         if not self.enabled:
             return None

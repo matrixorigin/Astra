@@ -1,22 +1,23 @@
 """Integration tests for Agent Architecture."""
 
+import asyncio
 import unittest
 from unittest.mock import MagicMock, patch
-import asyncio
-from core.agent.selector import AgentSkillSelector
-from core.agent.executor import AgentExecutor
+
 from core.agent.chat_loop import ChatLoop
-from core.skills.mocking import MockMode
+from core.agent.executor import AgentExecutor
+from core.agent.selector import AgentSkillSelector
 from core.skills.base import (
-    Skill,
-    SideEffectProfile,
-    SideEffectCategory,
-    SkillRequirement,
-    RepoType,
     AccessScope,
+    RepoType,
+    SideEffectCategory,
+    SideEffectProfile,
+    Skill,
     SkillInput,
     SkillOutput,
+    SkillRequirement,
 )
+from core.skills.mocking import MockMode
 
 
 class MockInput(SkillInput):
@@ -85,18 +86,18 @@ class TestAgentArchitecture(unittest.TestCase):
 
     def test_selector_delegation(self):
         """Test that selector delegates to ModernSkillSelector."""
-        with patch("core.agent.selector.ModernSkillSelector") as MockModernSelector:
+        with patch("core.agent.selector.ModernSkillSelector") as mock_modern_selector:
             selector = AgentSkillSelector(self.db, self.llm_client)
             selector.select_skills("query", {})
-            MockModernSelector.return_value.select_and_execute.assert_called_with("query", {}, 5)
+            mock_modern_selector.return_value.select_and_execute.assert_called_with("query", {}, 5)
 
     def test_executor_execution(self):
         """Test that executor uses ToolMockingLayer."""
         # We need to mock ToolMockingLayer because it might do DB calls or validation
-        with patch("core.agent.executor.ToolMockingLayer") as MockLayer:
+        with patch("core.agent.executor.ToolMockingLayer") as mock_layer:
             executor = AgentExecutor(self.db, self.registry, MockMode.PRODUCTION)
             executor.execute_skill("test_skill", {"param": "value"}, "session_1", "parent_1")
-            MockLayer.return_value.execute.assert_called()
+            mock_layer.return_value.execute.assert_called()
 
     def test_chat_loop_flow(self):
         """Test the full chat loop flow with skills."""
