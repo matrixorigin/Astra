@@ -1,8 +1,8 @@
 # LLM Integration Design
 
-**Version**: 1.0  
-**Status**: Production-Ready  
-**Last Updated**: 2026-02-10
+**Version**: 2.0  
+**Status**: Implemented  
+**Last Updated**: 2026-02-11
 
 ## 1. Vision and Goals
 
@@ -12,8 +12,10 @@ Enable mo-dev-agent to leverage multiple LLM providers with:
 - **Complete cost transparency** - Every token tracked in MatrixOne
 - **Provider independence** - No vendor lock-in
 - **Reproducibility** - Replay any LLM call from 10 years ago
-- **Budget control** - Per-user, per-tenant, per-skill limits
+- **Budget control** - Pre-call cost estimation and enforcement
 - **Quality assurance** - A/B testing, prompt versioning, feedback loops
+- **Resilience** - Circuit breaker, fallback chains, automatic retry
+- **Intelligent routing** - Model-level MoE, pluggable routing strategies
 
 ### 1.2 Goals
 
@@ -32,72 +34,97 @@ Enable mo-dev-agent to leverage multiple LLM providers with:
 ┌─────────────────────────────────────────────────────────────┐
 │                        mo-dev-agent                          │
 ├─────────────────────────────────────────────────────────────┤
-│  Skills Layer                                                │
+│  Skills / ChatLoop / Planner                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │ PR Review    │  │ Issue Triage │  │ CI Analysis  │ ...  │
+│  │ PR Review    │  │ PAOR Planner │  │ Delegation   │ ...  │
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘      │
 │         │                  │                  │              │
 ├─────────┴──────────────────┴──────────────────┴─────────────┤
-│  LLM Client Layer                                            │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │  LLMClient (unified interface)                       │   │
-│  │  - Config from MatrixOne (provider, model, budget)   │   │
-│  │  - Provider abstraction (OpenAI, Groq, Anthropic)    │   │
-│  │  - Cost calculation (per-token pricing)              │   │
-│  │  - Budget enforcement (per-user, per-tenant limits)  │   │
-│  │  - Call logging (all calls → llm_call_logs)          │   │
-│  │  - Retry logic (exponential backoff)                 │   │
-│  │  - Caching (semantic cache for repeated queries)     │   │
-│  └──────────────────────────────────────────────────────┘   │
+│  LLMClient (unified interface)                               │
+│  chat() / chat_stream() / chat_with_tools() / chat_with_tools_stream()
+│  + task_hint for MoE routing                                 │
+│  + budget check (pre-call)                                   │
+│  + trace_id for observability                                │
 ├─────────────────────────────────────────────────────────────┤
-│  Prompt Management                                           │
+│  ModelRouter (pluggable strategy)                            │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │PromptRegistry│  │VersionControl│  │  A/B Testing │      │
+│  │FallbackChain │  │ TaskBased    │  │CostOptimized │      │
+│  │  (default)   │  │  (MoE)      │  │              │      │
 │  └──────────────┘  └──────────────┘  └──────────────┘      │
+│  ModelRegistry: model configs, pricing, tags, fallback_to    │
+├─────────────────────────────────────────────────────────────┤
+│  RateLimiter + CircuitBreaker                                │
+│  ┌──────────────┐  ┌──────────────┐                         │
+│  │ TokenBucket  │  │CircuitBreaker│                         │
+│  │ RPM + TPM    │  │ per-provider │                         │
+│  └──────────────┘  └──────────────┘                         │
+├─────────────────────────────────────────────────────────────┤
+│  Provider Adapters (connection pooling + retry)              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
+│  │ OpenAI   │  │  Groq    │  │Anthropic │  (异构 API)      │
+│  └──────────┘  └──────────┘  └──────────┘                  │
 ├─────────────────────────────────────────────────────────────┤
 │  MatrixOne (State Store)                                     │
-│  - configs (LLM settings), prompt_templates (versioned)      │
-│  - llm_call_logs (cost tracking), llm_budgets (limits)       │
+│  - configs (LLM settings, model_registry)                    │
+│  - llm_call_logs (cost tracking, trace_id)                   │
 │  - conversation_events (full context for replay)             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## 3. Core Capabilities
+### 2.1 Module Structure (Implemented)
 
-### 3.1 Provider Abstraction
-
-**Supported Providers**:
-- **OpenAI**: GPT-4, GPT-4-turbo, GPT-3.5-turbo
-- **Groq**: Llama3-70B, Mixtral-8x7B (ultra-fast inference)
-- **Anthropic**: Claude-3 (Opus, Sonnet, Haiku)
-- **Self-hosted**: Ollama, vLLM, TGI (for privacy-sensitive use cases)
-
-**Unified Interface**:
-```python
-class LLMClient:
-    def chat(
-        self,
-        messages: list[LLMMessage],
-        event_id: str,
-        user_id: str,
-        model: Optional[str] = None,
-        temperature: Optional[float] = None,
-    ) -> LLMResponse:
-        """Send chat request to LLM.
-        
-        - Loads config from MatrixOne
-        - Routes to appropriate provider
-        - Calculates cost
-        - Logs call
-        - Returns response
-        """
+```
+core/llm/
+├── __init__.py          # Public exports
+├── client.py            # LLMClient — unified interface, budget, dispatch
+├── models.py            # LLMMessage, LLMResponse, LLMProvider, LLMCallLog
+├── providers.py         # BaseProvider, OpenAIProvider, GroqProvider, AnthropicProvider
+├── router.py            # ModelRouter, ModelRegistry, RoutingStrategy (3 strategies)
+└── rate_limiter.py      # RateLimiter (TokenBucket RPM+TPM), CircuitBreaker
 ```
 
-**Provider Selection**:
-1. **Explicit**: Skill specifies provider/model
-2. **Config-based**: Load from `configs.llm_config`
-3. **Fallback chain**: Primary → Secondary → Tertiary
-4. **Cost-optimized**: Route to cheapest provider for task
+## 3. Core Capabilities
+
+### 3.1 Provider Abstraction (Implemented)
+
+**Supported Providers**:
+- **OpenAI**: GPT-4o, GPT-4o-mini, GPT-4, GPT-4-turbo, GPT-3.5-turbo
+- **Groq**: Llama3-70B, Mixtral-8x7B (ultra-fast inference)
+- **Anthropic**: Claude-3.5-Sonnet, Claude-3-Haiku (异构 API — system message 分离, tool format 转换)
+- **Self-hosted**: Via OpenAI-compatible `base_url` (Ollama, vLLM, TGI)
+
+**Provider Adapter Pattern** (`core/llm/providers.py`):
+```python
+class BaseProvider(ABC):
+    """Each provider implements 4 methods, handles its own API differences."""
+    def complete(messages, model, temperature, max_tokens) -> LLMResponse
+    def complete_stream(messages, model, temperature, max_tokens) -> Iterator[dict]
+    def complete_with_tools(messages, tools, model, ...) -> dict
+    def complete_with_tools_stream(messages, tools, model, ...) -> Iterator[dict]
+    def _with_retry(fn)  # Built-in exponential backoff (429/5xx)
+```
+
+**Key Design Decisions**:
+- Connection pooling: Client instance created once in `__init__`, reused for all calls
+- Retry is per-provider (inside adapter), fallback is per-router (outside adapter)
+- Anthropic adapter handles: system message extraction, tool format conversion (OpenAI→Anthropic), streaming via `messages.stream()` context manager
+- Shared `_accumulate_tool_calls()` helper deduplicates OpenAI-compatible streaming logic
+
+**Unified Interface** (`core/llm/client.py`):
+```python
+class LLMClient:
+    def chat(messages, user_id, ..., task_hint=None) -> LLMResponse
+    def chat_with_tools(messages, tools, ..., task_hint=None) -> dict
+    async def chat_stream(messages, user_id, ..., task_hint=None)  # yields str
+    async def chat_with_tools_stream(messages, tools, ..., task_hint=None)  # yields dict
+    def reload_config()  # Hot reload without restart
+```
+
+**Provider Selection** (via ModelRouter):
+1. **Task-based MoE**: `task_hint="code"` → models tagged `["code", "reasoning"]`
+2. **Fallback chain**: `gpt-4o` → `gpt-4o-mini` (static chain per model)
+3. **Cost-optimized**: Route to cheapest model first
+4. **Custom**: Implement `RoutingStrategy` interface
 
 ### 3.2 Cost Management
 
@@ -441,103 +468,84 @@ This transforms budget control from reactive (block at 100%) to predictive (warn
 
 ## 4. Advanced Features
 
-### 4.1 Multi-Model Routing
+### 4.1 Multi-Model Routing (Implemented)
 
-**Routing Strategy**:
+**Pluggable Routing Strategies** (`core/llm/router.py`):
+
 ```python
-def route_to_model(
-    task_type: str,
-    complexity: str,
-    budget: float,
-) -> tuple[str, str]:  # (provider, model)
-    """Route task to optimal model.
-    
-    Rules:
-    - Simple tasks → GPT-3.5-turbo (cheap, fast)
-    - Complex reasoning → GPT-4 (expensive, accurate)
-    - Code generation → Claude-3 (good at code)
-    - Ultra-fast → Groq Llama3 (lowest latency)
-    - Privacy-sensitive → Self-hosted (no data leaves)
-    """
+class RoutingStrategy(ABC):
+    def select(model, registry, task_hint=None) -> list[ModelConfig]: ...
+
+# Built-in strategies:
+FallbackChainStrategy   # Follow static fallback_to chain (default)
+TaskBasedStrategy       # Model-level MoE by task_hint + model tags
+CostOptimizedStrategy   # Cheapest model first
 ```
 
-**Task Classification**:
-- **Simple**: Issue triage, label suggestion
-- **Medium**: PR review, code explanation
-- **Complex**: Architecture design, debugging
+**Task-Based MoE** — models have tags, tasks map to preferred tags:
+```
+task_hint="code"     → tags: [code, reasoning]  → gpt-4o, claude-sonnet, gpt-4
+task_hint="chat"     → tags: [fast, cheap]      → gpt-4o-mini, gpt-3.5-turbo, mixtral
+task_hint="simple"   → tags: [cheap, fast]      → mixtral, gpt-4o-mini, llama3
+task_hint="analysis" → tags: [reasoning]        → gpt-4o, gpt-4, claude-sonnet
+```
 
-### 4.2 Streaming Responses
-
-**Streaming API**:
+**Runtime Strategy Switch**:
 ```python
-async def chat_stream(
-    messages: list[LLMMessage],
-    event_id: str,
-    user_id: str,
-) -> AsyncIterator[str]:
-    """Stream LLM response token-by-token.
-    
-    - Lower perceived latency
-    - Better UX for long responses
-    - Still logs full call to MatrixOne
-    """
+router = ModelRouter(strategy=TaskBasedStrategy())
+router.set_strategy(CostOptimizedStrategy())  # Switch at runtime
 ```
 
-**Use Cases**:
-- Interactive CLI
-- Web UI
-- Real-time PR review comments
+**Custom Strategy**: Implement `RoutingStrategy.select()` for any routing logic (A/B testing, latency-based, etc.).
 
-### 4.3 Function Calling
+### 4.2 Streaming Responses (Implemented)
 
-**Function Definition**:
-```python
-functions = [
-    {
-        "name": "search_code",
-        "description": "Search for code in repository",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "repo_url": {"type": "string"},
-            },
-            "required": ["query", "repo_url"],
-        },
-    }
-]
+**Streaming API** (`LLMClient.chat_stream()` / `chat_with_tools_stream()`):
+- All providers support streaming via their respective adapters
+- OpenAI: `stream_options={"include_usage": True}` for token counting in stream
+- Anthropic: `messages.stream()` context manager with `stream.text_stream`
+- Groq: Standard streaming (no usage in stream yet)
+- Every stream call logs to `llm_call_logs` with trace_id after completion
+- Circuit breaker + fallback chain work with streaming too
+
+### 4.3 Function Calling (Implemented)
+
+**Unified across providers** — `LLMClient.chat_with_tools()` and `chat_with_tools_stream()`:
+- OpenAI/Groq: Native function calling via `tools` parameter
+- Anthropic: Auto-converts OpenAI tool format → Anthropic tool format via `AnthropicProvider._convert_tool()`
+- Streaming: Tool call fragments accumulated via `_accumulate_tool_calls()`, yielded as complete calls
+- All providers return same dict format: `{"content": str, "tool_calls": [...], "usage": {...}}`
+
+### 4.4 Retry, Fallback, and Circuit Breaker (Implemented)
+
+**Retry** (per-provider, in `BaseProvider._with_retry()`):
+- 3 attempts with exponential backoff (1s, 2s, 4s)
+- Retries on: 429 RateLimitError, 5xx, APITimeoutError, APIConnectionError, OverloadedError
+
+**Fallback Chain** (per-model, in `ModelRouter.route()`):
 ```
-
-**Execution Flow**:
-1. LLM returns function call
-2. Agent executes function
-3. Result fed back to LLM
-4. LLM generates final response
-5. All steps logged to MatrixOne
-
-### 4.4 Retry and Fallback
-
-**Retry Strategy**:
-```python
-@retry(
-    max_attempts=3,
-    backoff=exponential_backoff(base=2, max_delay=60),
-    retry_on=[RateLimitError, TimeoutError],
-)
-def call_llm(...):
-    """Call LLM with automatic retry."""
+gpt-4   → gpt-4o → gpt-4o-mini
+llama3-70b → gpt-4o-mini
 ```
+Configured via `ModelConfig.fallback_to`. Router returns ordered list; `LLMClient._dispatch()` tries each.
 
-**Fallback Chain**:
+**Circuit Breaker** (per-provider, in `RateLimiter`):
 ```
-Primary: OpenAI GPT-4
-  ↓ (on failure)
-Secondary: Groq Llama3-70B
-  ↓ (on failure)
-Tertiary: Self-hosted Llama3
-  ↓ (on failure)
-Return error
+CLOSED (normal) ──[5 failures]──→ OPEN (reject all)
+                                      │
+                                  [60s timeout]
+                                      │
+                                      ▼
+                                 HALF_OPEN (probe)
+                                   │         │
+                              [success]   [failure]
+                                   │         │
+                                   ▼         ▼
+                                CLOSED      OPEN
 ```
+- Prevents wasting retry time on a provider that's down
+- `_dispatch()` checks `breaker.allow_request()` before each attempt
+- Records success/failure after each attempt
 
 ## 5. Reproducibility
 
@@ -758,46 +766,56 @@ messages = [
 - High retry rate (> 10%)
 - Negative feedback spike
 
-## 9. Implementation Phases
+## 9. Implementation Status
 
-### Phase 1: Foundation (Current) ✅
-- ✅ LLMClient with provider abstraction
-- ✅ Cost calculation
-- ✅ Call logging
-- ✅ Config management
+### Phase 1: Foundation ✅
+- ✅ LLMClient with provider abstraction (OpenAI, Groq, Anthropic)
+- ✅ Connection pooling (client created once, reused)
+- ✅ Exponential backoff retry (429/5xx, 3 attempts)
+- ✅ Cost calculation from model registry pricing
+- ✅ Call logging to `llm_call_logs` (including streaming)
+- ✅ Config: DB → env → defaults
 
-### Phase 2: Cost Control
-- Budget management (per-user, per-tenant)
-- Budget enforcement (soft/hard limits)
-- Cost alerts
-- Cost dashboard
+### Phase 1.5: Resilience & Routing ✅ (2026-02-11)
+- ✅ **Model-Level MoE**: `TaskBasedStrategy` routes by task_hint + model tags
+- ✅ **Pluggable Routing**: `RoutingStrategy` ABC with 3 implementations (FallbackChain, TaskBased, CostOptimized)
+- ✅ **异构 Provider**: `AnthropicProvider` with system message split, tool format conversion
+- ✅ **动态配置**: `reload_config()` / `ModelRouter.reload(db)` for hot update
+- ✅ **可观测性**: trace_id in streaming, `total_spend` property, all paths log to `llm_call_logs`
+- ✅ **Circuit Breaker**: Per-provider, 3-state (closed→open→half_open), auto-recovery
+- ✅ **Budget Control**: Pre-call `estimate_cost()`, `BudgetExceededError` on exceed
 
-### Phase 3: Quality
-- Prompt versioning
-- A/B testing framework
-- Feedback collection
-- Quality metrics
+### Phase 2: Cost Control (Planned)
+- ⏳ Budget management (per-user, per-tenant) — currently session-level only
+- ⏳ Budget persistence to MatrixOne (`llm_budgets` table)
+- ⏳ Cost alerts
 
-### Phase 4: Performance
-- Semantic caching
-- Multi-model routing
-- Streaming responses
-- Parallel calls
+### Phase 3: Quality (Planned)
+- ⏳ Prompt versioning
+- ⏳ A/B testing framework
+- ⏳ Feedback collection
+- ⏳ Quality metrics
 
-### Phase 5: Advanced
-- Function calling
-- Self-hosted models
-- Fine-tuning pipeline
-- Prompt optimization tools
+### Phase 4: Performance (Planned)
+- ⏳ Semantic caching (`llm_cache` table)
+- ⏳ Parallel calls for independent sub-tasks
+
+### Phase 5: Advanced (Planned)
+- ⏳ Self-hosted model support (via OpenAI-compatible base_url — partially ready)
+- ⏳ Fine-tuning pipeline
+- ⏳ Prompt optimization tools
 
 ## 10. Success Criteria
 
 ### 10.1 Functional Requirements
-- ✅ Support 3+ LLM providers
-- ✅ Cost tracking for every call
-- ✅ Config stored in MatrixOne
-- ✅ Call logs linked to events
-- ⏳ Budget enforcement
+- ✅ Support 3+ LLM providers (OpenAI, Groq, Anthropic)
+- ✅ Cost tracking for every call (including streaming)
+- ✅ Config stored in MatrixOne (with env fallback)
+- ✅ Call logs linked to events (trace_id)
+- ✅ Budget enforcement (pre-call estimation)
+- ✅ Pluggable routing strategies (3 built-in)
+- ✅ Circuit breaker per provider
+- ✅ Hot reload without restart
 - ⏳ Prompt versioning
 - ⏳ A/B testing
 
@@ -822,47 +840,48 @@ messages = [
 
 ## 11. Comparison with Industry Standards
 
-### vs. LangChain
-- ❌ They: No built-in cost tracking
-- ✅ Us: Every call logged with cost in MatrixOne
+### vs. LiteLLM (LLM Gateway)
+- ✅ Both: Multi-provider, unified API, cost tracking, rate limiting
+- ✅ Us: Integrated with MatrixOne for audit/replay, circuit breaker, task-based MoE
+- ❌ Us: No proxy mode (LiteLLM can run as standalone proxy server)
 
-### vs. LlamaIndex
-- ❌ They: Limited provider support
-- ✅ Us: 4+ providers with unified interface
+### vs. LangChain
+- ❌ They: No built-in cost tracking or budget control
+- ✅ Us: Every call logged with cost, pre-call budget check
 
 ### vs. OpenAI API Direct
-- ❌ They: Vendor lock-in
-- ✅ Us: Provider abstraction, easy to switch
+- ❌ They: Vendor lock-in, no fallback
+- ✅ Us: 3 providers, automatic fallback, circuit breaker
 
-### vs. Anthropic API Direct
-- ❌ They: No budget control
-- ✅ Us: Per-user, per-tenant budget limits
+### vs. OpenRouter
+- ✅ Both: Multi-provider routing
+- ✅ Us: Self-hosted, full audit trail, pluggable routing strategies
+- ❌ Us: Fewer models (OpenRouter has 400+)
 
 ## 12. Key Insights
 
 **"LLM Calls as First-Class Events"**:
-- Every LLM call is an event in MatrixOne
-- Full context available for replay
-- Cost, latency, quality all tracked
-- Enables "10 years later, reproduce today's LLM decision"
+- Every LLM call is logged to `llm_call_logs` with trace_id
+- Full context available for replay via `conversation_events`
+- Cost, latency, provider, model all tracked — including streaming
 
-**"Cost Transparency = Trust"**:
-- Users see exactly what they're spending
-- Admins can set and enforce budgets
-- No surprise bills
+**"Resilience by Default"**:
+- Retry (per-provider) → Fallback (per-model chain) → Circuit breaker (per-provider)
+- A single provider outage doesn't take down the system
+- Budget exceeded → `BudgetExceededError` before spending
 
-**"Provider Independence = Freedom"**:
-- Switch providers without code changes
-- Route to optimal provider per task
-- Negotiate better pricing with leverage
+**"Route Smart, Not Hard"**:
+- Task-based MoE: code tasks get reasoning models, chat tasks get fast/cheap models
+- Strategy is pluggable — swap at runtime without code changes
+- Model registry with tags enables declarative routing rules
 
-**"Quality Through Feedback"**:
-- User feedback drives prompt improvement
-- A/B testing validates changes
-- Continuous improvement loop
+**"异构 Provider, 统一接口"**:
+- Anthropic's different API (system param, tool format, streaming) fully abstracted
+- Callers never see provider differences — same `chat()` / `chat_stream()` interface
+- Adding a new provider = implement 4 methods on `BaseProvider`
 
 ---
 
-**Document Status**: Production-Ready  
-**Next Review**: After Phase 2 implementation  
+**Document Status**: Implemented (v2.0)  
+**Next Review**: After Phase 2 (per-user budget persistence)  
 **Owner**: mo-dev-agent team

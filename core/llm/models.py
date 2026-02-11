@@ -19,8 +19,11 @@ class LLMProvider(str, Enum):
 class LLMMessage(BaseModel):
     """LLM message."""
 
-    role: str  # 'system' | 'user' | 'assistant'
-    content: str
+    role: str  # 'system' | 'user' | 'assistant' | 'tool'
+    content: str | None = None
+    tool_calls: list[dict[str, Any]] | None = None
+    tool_call_id: str | None = None
+    name: str | None = None
 
 
 class LLMRequest(BaseModel):

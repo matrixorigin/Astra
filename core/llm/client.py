@@ -1,107 +1,207 @@
-"""LLM client with provider abstraction."""
+"""LLM client with provider abstraction, routing, rate limiting, circuit breaker, and call logging."""
 
 import json
+import os
 import time
+import logging
 from datetime import UTC, datetime
 from typing import Optional
 
 from uuid_utils import uuid7
 
-from core.llm.models import (
-    LLMCallLog,
-    LLMMessage,
-    LLMProvider,
-    LLMRequest,
-    LLMResponse,
-)
+from core.llm.models import LLMCallLog, LLMMessage, LLMProvider, LLMResponse
+from core.llm.providers import BaseProvider, OpenAIProvider, GroqProvider, AnthropicProvider
+from core.llm.router import ModelRouter, ModelConfig
+from core.llm.rate_limiter import RateLimiter
 from sdk import Database
+
+logger = logging.getLogger(__name__)
+
+
+class BudgetExceededError(Exception):
+    """Raised when estimated cost exceeds remaining budget."""
+    pass
 
 
 class LLMClient:
-    """LLM client with swappable providers."""
+    """LLM client with routing, rate limiting, circuit breaker, budget control, and logging."""
 
     def __init__(self, db: Optional[Database] = None) -> None:
         self.db = db or Database()
+        self._providers: dict[LLMProvider, BaseProvider] = {}
+        self.router = ModelRouter(db=self.db)
+        self.rate_limiter = RateLimiter()
         self._load_config()
+        self._init_providers()
+        self._init_rate_limits()
+
+    # ── Config (#4 动态配置) ───────────────────────────────────────
 
     def _load_config(self) -> None:
-        """Load LLM config from MatrixOne."""
-        config = self.db.fetchone(
-            "SELECT value FROM configs WHERE key_name = 'llm_config' LIMIT 1"
-        )
-        if config:
-            self.config = json.loads(config["value"])
-        else:
-            # Default config
-            self.config = {
-                "provider": "openai",
-                "model": "gpt-4",
-                "temperature": 0.7,
-                "max_tokens": 2000,
-                "token_budget": 100000,
+        """Load config: DB → env → defaults."""
+        config = None
+        try:
+            row = self.db.fetchone(
+                "SELECT value FROM configs WHERE key_name = 'llm_config' LIMIT 1")
+            if row:
+                config = json.loads(row["value"])
+        except Exception:
+            pass
+        if not config:
+            config = {
+                "provider": os.getenv("LLM_PROVIDER", "openai"),
+                "model": os.getenv("LLM_MODEL", "gpt-4o"),
+                "temperature": float(os.getenv("LLM_TEMPERATURE", "0.7")),
+                "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2000")),
+                "budget_usd": float(os.getenv("LLM_BUDGET_USD", "0")),  # 0 = unlimited
             }
+        self.config = config
+        self._total_spend_usd = 0.0
+
+    def reload_config(self):
+        """Hot reload config + model registry (#4)."""
+        self._load_config()
+        self.router.reload(self.db)
+        self._init_rate_limits()
+        logger.info("LLM config reloaded")
+
+    # ── Provider init (#3 异构) ────────────────────────────────────
+
+    def _init_providers(self) -> None:
+        """Initialize provider clients once (connection pooling)."""
+        for provider_name, cls, extra in [
+            ("openai", OpenAIProvider, lambda k: {"base_url": self.config.get("openai_base_url") or os.getenv("OPENAI_BASE_URL")}),
+            ("groq", GroqProvider, lambda k: {}),
+            ("anthropic", AnthropicProvider, lambda k: {}),
+        ]:
+            api_key = self._get_api_key(provider_name)
+            if api_key:
+                try:
+                    kwargs = extra(api_key)
+                    kwargs = {k: v for k, v in kwargs.items() if v}
+                    self._providers[LLMProvider(provider_name)] = cls(api_key, **kwargs)
+                except Exception as e:
+                    logger.debug(f"Skipping {provider_name}: {e}")
+
+    def _get_api_key(self, provider: str) -> str | None:
+        key = self.config.get(f"{provider}_api_key")
+        if key:
+            return key
+        key = os.getenv(f"{provider.upper()}_API_KEY")
+        if key:
+            return key
+        try:
+            row = self.db.fetchone(
+                "SELECT value FROM configs WHERE key_name = %s LIMIT 1",
+                (f"{provider}_api_key",))
+            if row:
+                return row["value"]
+        except Exception:
+            pass
+        return None
+
+    def _init_rate_limits(self) -> None:
+        for m in self.router.list_models():
+            self.rate_limiter.configure(m.model_name, m.rpm_limit, m.tpm_limit)
+
+    def _get_provider(self, p: LLMProvider) -> BaseProvider:
+        provider = self._providers.get(p)
+        if not provider:
+            raise ValueError(f"Provider {p.value} not configured. Set API key.")
+        return provider
+
+    def _resolve_model(self, model: str | None) -> str:
+        return model or self.config.get("model", "gpt-4o")
+
+    # ── Budget control (#7) ────────────────────────────────────────
+
+    def _check_budget(self, model: str, estimated_tokens: int = 1000):
+        budget = self.config.get("budget_usd", 0)
+        if budget <= 0:
+            return  # unlimited
+        estimated_cost = self.router.estimate_cost(model, estimated_tokens)
+        if self._total_spend_usd + estimated_cost > budget:
+            raise BudgetExceededError(
+                f"Estimated cost ${estimated_cost:.4f} would exceed budget "
+                f"(spent ${self._total_spend_usd:.4f} of ${budget:.2f})")
+
+    def _record_spend(self, cost: float):
+        self._total_spend_usd += cost
+
+    # ── Core dispatch with circuit breaker (#6) ────────────────────
+
+    def _dispatch(self, model: str, fn_name: str, task_hint: str | None = None, **kwargs):
+        """Route to model chain, respecting circuit breaker + rate limiter.
+
+        fn_name: method name on BaseProvider (complete, complete_stream, etc.)
+        Returns the result of the first successful provider call.
+        """
+        chain = self.router.route(model, task_hint=task_hint)
+        if not chain:
+            # Unknown model — try direct with default provider
+            chain = [ModelConfig(model_name=model,
+                                 provider=LLMProvider(self.config.get("provider", "openai")))]
+
+        last_error = None
+        for model_cfg in chain:
+            breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
+            if not breaker.allow_request():
+                logger.warning(f"Circuit open for {model_cfg.provider.value}, skipping {model_cfg.model_name}")
+                continue
+
+            try:
+                self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
+                provider = self._get_provider(model_cfg.provider)
+                result = getattr(provider, fn_name)(model=model_cfg.model_name, **kwargs)
+                breaker.record_success()
+                return result, model_cfg
+            except Exception as e:
+                breaker.record_failure()
+                last_error = e
+                logger.warning(f"{model_cfg.model_name} failed: {e}, trying next")
+                continue
+
+        raise last_error or ValueError(f"No available model for: {model}")
+
+    # ── Public API ─────────────────────────────────────────────────
 
     def chat(
         self,
-        messages: list[LLMMessage],
+        messages: list[LLMMessage] | list[dict],
         user_id: str,
         session_id: str = None,
         event_id: str = None,
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         metadata: Optional[dict] = None,
+        task_hint: str | None = None,
     ) -> LLMResponse:
         """Send chat request to LLM."""
-        start_time = time.time()
+        start = time.time()
+        event_id = event_id or str(uuid7())
+        model = self._resolve_model(model)
+        temp = temperature or self.config.get("temperature", 0.7)
+        max_tok = self.config.get("max_tokens")
 
-        # Generate event_id if not provided
-        if not event_id:
-            event_id = str(uuid7())
-
-        # Use config defaults if not specified
-        model = model or self.config["model"]
-        temperature = temperature or self.config["temperature"]
-
-        request = LLMRequest(
-            messages=messages,
-            model=model,
-            temperature=temperature,
-            max_tokens=self.config.get("max_tokens"),
-        )
+        self._check_budget(model)
+        msg_dicts = self._normalize_messages(messages)
 
         try:
-            # Call provider
-            provider = LLMProvider(self.config["provider"])
-            response = self._call_provider(provider, request)
-
-            # Calculate latency
-            latency_ms = int((time.time() - start_time) * 1000)
-            response.latency_ms = latency_ms
-
-            # Log call
-            self._log_call(
-                event_id=event_id,
-                user_id=user_id,
-                provider=provider,
-                response=response,
-                status="success",
-                metadata=metadata,
-            )
-
+            response, model_cfg = self._dispatch(
+                model, "complete", task_hint=task_hint,
+                messages=msg_dicts, temperature=temp, max_tokens=max_tok)
+            response.latency_ms = int((time.time() - start) * 1000)
+            response.cost_usd = self.router.calculate_cost(
+                model_cfg.model_name, response.tokens_prompt, response.tokens_completion)
+            self._record_spend(response.cost_usd)
+            self._log_call(event_id, user_id, model_cfg.provider, response, "success",
+                           metadata=metadata)
             return response
-
         except Exception as e:
-            latency_ms = int((time.time() - start_time) * 1000)
-            self._log_call(
-                event_id=event_id,
-                user_id=user_id,
-                provider=LLMProvider(self.config["provider"]),
-                response=None,
-                status="failed",
-                error_message=str(e),
-                latency_ms=latency_ms,
-                metadata=metadata,
-            )
+            self._log_call(event_id, user_id,
+                           LLMProvider(self.config.get("provider", "openai")),
+                           None, "failed", error_message=str(e),
+                           latency_ms=int((time.time() - start) * 1000), metadata=metadata)
             raise
 
     def chat_with_tools(
@@ -110,36 +210,20 @@ class LLMClient:
         tools: list[dict],
         tool_choice: str = "auto",
         model: Optional[str] = None,
+        session_id: str = None,
+        task_hint: str | None = None,
     ) -> dict:
-        """Send chat request with tools to LLM (OpenAI only)."""
-        # Simple implementation for OpenAI
-        try:
-            import openai
-        except ImportError:
-            raise ImportError("openai package not installed.")
+        """Chat with function calling."""
+        model = self._resolve_model(model)
+        self._check_budget(model)
+        temp = self.config.get("temperature", 0.7)
+        max_tok = self.config.get("max_tokens")
 
-        # Get API key
-        api_key = self.config.get("openai_api_key") or self.db.fetchone(
-            "SELECT value FROM configs WHERE key_name = 'openai_api_key' LIMIT 1"
-        )
-        if api_key and isinstance(api_key, dict):
-            api_key = api_key["value"]
-
-        client = openai.OpenAI(api_key=api_key)
-        
-        model = model or self.config["model"]
-        
-        # Call OpenAI
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=tools,
-            tool_choice=tool_choice
-        )
-        
-        # Return dict representation of the message
-        # This allows accessing .get('tool_calls')
-        return response.choices[0].message.model_dump()
+        result, _ = self._dispatch(
+            model, "complete_with_tools", task_hint=task_hint,
+            messages=messages, tools=tools, tool_choice=tool_choice,
+            temperature=temp, max_tokens=max_tok)
+        return result
 
     async def chat_stream(
         self,
@@ -147,31 +231,59 @@ class LLMClient:
         user_id: str,
         session_id: str | None = None,
         model: str | None = None,
+        task_hint: str | None = None,
     ):
-        """Yield text chunks as they arrive from LLM."""
-        try:
-            import openai
-        except ImportError:
-            raise ImportError("openai package not installed.")
+        """Yield text chunks. Logs token usage at end (#5 可观测性)."""
+        start = time.time()
+        trace_id = str(uuid7())
+        model = self._resolve_model(model)
+        self._check_budget(model)
+        temp = self.config.get("temperature", 0.7)
+        max_tok = self.config.get("max_tokens")
 
-        api_key = self.config.get("openai_api_key") or self.db.fetchone(
-            "SELECT value FROM configs WHERE key_name = 'openai_api_key' LIMIT 1"
-        )
-        if api_key and isinstance(api_key, dict):
-            api_key = api_key["value"]
+        chain = self.router.route(model, task_hint=task_hint)
+        if not chain:
+            chain = [ModelConfig(model_name=model,
+                                 provider=LLMProvider(self.config.get("provider", "openai")))]
 
-        client = openai.OpenAI(api_key=api_key)
-        model = model or self.config["model"]
+        for model_cfg in chain:
+            breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
+            if not breaker.allow_request():
+                continue
+            try:
+                self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
+                provider = self._get_provider(model_cfg.provider)
+                usage = {"prompt": 0, "completion": 0}
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            stream=True,
-        )
-        for chunk in response:
-            delta = chunk.choices[0].delta
-            if delta.content:
-                yield delta.content
+                for chunk in provider.complete_stream(
+                    messages, model_cfg.model_name, temp, max_tok
+                ):
+                    if chunk["type"] == "text":
+                        yield chunk["content"]
+                    elif chunk["type"] == "usage":
+                        usage["prompt"] = chunk["prompt"]
+                        usage["completion"] = chunk["completion"]
+
+                breaker.record_success()
+                latency = int((time.time() - start) * 1000)
+                cost = self.router.calculate_cost(
+                    model_cfg.model_name, usage["prompt"], usage["completion"])
+                self._record_spend(cost)
+                self._log_call(trace_id, user_id, model_cfg.provider,
+                               LLMResponse(content="[streamed]", model=model_cfg.model_name,
+                                           provider=model_cfg.provider,
+                                           tokens_prompt=usage["prompt"],
+                                           tokens_completion=usage["completion"],
+                                           tokens_total=usage["prompt"] + usage["completion"],
+                                           latency_ms=latency, cost_usd=cost),
+                               "success")
+                return
+            except Exception as e:
+                breaker.record_failure()
+                logger.warning(f"Stream {model_cfg.model_name} failed: {e}")
+                continue
+
+        raise ValueError(f"All models failed for streaming: {model}")
 
     async def chat_with_tools_stream(
         self,
@@ -179,398 +291,115 @@ class LLMClient:
         tools: list[dict],
         tool_choice: str = "auto",
         model: str | None = None,
+        task_hint: str | None = None,
     ):
-        """Yield tool calls and text chunks during function calling.
-        
-        Yields dicts with 'type' key: 'text' or 'tool_call'.
-        For tool_call, accumulates fragments until complete.
-        """
-        try:
-            import openai
-        except ImportError:
-            raise ImportError("openai package not installed.")
+        """Yield tool calls and text chunks."""
+        model = self._resolve_model(model)
+        self._check_budget(model)
+        temp = self.config.get("temperature", 0.7)
+        max_tok = self.config.get("max_tokens")
 
-        api_key = self.config.get("openai_api_key") or self.db.fetchone(
-            "SELECT value FROM configs WHERE key_name = 'openai_api_key' LIMIT 1"
-        )
-        if api_key and isinstance(api_key, dict):
-            api_key = api_key["value"]
+        chain = self.router.route(model, task_hint=task_hint)
+        if not chain:
+            chain = [ModelConfig(model_name=model,
+                                 provider=LLMProvider(self.config.get("provider", "openai")))]
 
-        client = openai.OpenAI(api_key=api_key)
-        model = model or self.config["model"]
+        for model_cfg in chain:
+            breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
+            if not breaker.allow_request():
+                continue
+            try:
+                self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
+                provider = self._get_provider(model_cfg.provider)
+                for chunk in provider.complete_with_tools_stream(
+                    messages, tools, model_cfg.model_name, tool_choice, temp, max_tok
+                ):
+                    if chunk["type"] != "usage":
+                        yield chunk
+                breaker.record_success()
+                return
+            except Exception as e:
+                breaker.record_failure()
+                logger.warning(f"Stream+tools {model_cfg.model_name} failed: {e}")
+                continue
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=tools,
-            tool_choice=tool_choice,
-            stream=True,
-        )
-        
-        # Accumulate tool call fragments — use index as stable key
-        tool_call_buffer: dict[int, dict] = {}
-        
-        for chunk in response:
-            delta = chunk.choices[0].delta
-            
-            if delta.content:
-                yield {"type": "text", "content": delta.content}
-            
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_call_buffer:
-                        tool_call_buffer[idx] = {
-                            "id": tc.id or f"idx_{idx}",
-                            "type": tc.type or "function",
-                            "function": {"name": "", "arguments": ""},
-                        }
-                    elif tc.id:
-                        tool_call_buffer[idx]["id"] = tc.id
-                    
-                    if tc.function and tc.function.name:
-                        tool_call_buffer[idx]["function"]["name"] = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        tool_call_buffer[idx]["function"]["arguments"] += tc.function.arguments
-        
-        # Yield all completed tool calls
-        for tc in tool_call_buffer.values():
-            if tc["function"]["name"]:
-                yield {"type": "tool_call", "data": tc}
+        raise ValueError(f"All models failed for tools streaming: {model}")
 
-    def _call_provider(
-        self, provider: LLMProvider, request: LLMRequest
-    ) -> LLMResponse:
-        """Call specific LLM provider."""
-        if provider == LLMProvider.OPENAI:
-            return self._call_openai(request)
-        elif provider == LLMProvider.GROQ:
-            return self._call_groq(request)
-        else:
-            raise ValueError(f"Unsupported provider: {provider}")
+    # ── Logging (#5 可观测性 & 回溯) ──────────────────────────────
 
-    def _call_openai(self, request: LLMRequest) -> LLMResponse:
-        """Call OpenAI API."""
-        try:
-            import openai
-        except ImportError:
-            raise ImportError("openai package not installed. Run: pip install openai")
-
-        # Get API key from config
-        api_key = self.config.get("openai_api_key") or self.db.fetchone(
-            "SELECT value FROM configs WHERE key_name = 'openai_api_key' LIMIT 1"
-        )
-        if api_key and isinstance(api_key, dict):
-            api_key = api_key["value"]
-
-        client = openai.OpenAI(api_key=api_key)
-
-        response = client.chat.completions.create(
-            model=request.model,
-            messages=[{"role": m.role, "content": m.content} for m in request.messages],
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-        )
-
-        # Calculate cost (approximate)
-        cost_usd = self._calculate_cost(
-            provider=LLMProvider.OPENAI,
-            model=request.model,
-            tokens_prompt=response.usage.prompt_tokens,
-            tokens_completion=response.usage.completion_tokens,
-        )
-
-        return LLMResponse(
-            content=response.choices[0].message.content,
-            model=response.model,
-            provider=LLMProvider.OPENAI,
-            tokens_prompt=response.usage.prompt_tokens,
-            tokens_completion=response.usage.completion_tokens,
-            tokens_total=response.usage.total_tokens,
-            latency_ms=0,  # Will be set by caller
-            cost_usd=cost_usd,
-        )
-
-    def _call_groq(self, request: LLMRequest) -> LLMResponse:
-        """Call Groq API."""
-        try:
-            from groq import Groq
-        except ImportError:
-            raise ImportError("groq package not installed. Run: pip install groq")
-
-        # Get API key from config
-        api_key = self.config.get("groq_api_key") or self.db.fetchone(
-            "SELECT value FROM configs WHERE key_name = 'groq_api_key' LIMIT 1"
-        )
-        if api_key and isinstance(api_key, dict):
-            api_key = api_key["value"]
-
-        client = Groq(api_key=api_key)
-
-        response = client.chat.completions.create(
-            model=request.model,
-            messages=[{"role": m.role, "content": m.content} for m in request.messages],
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-        )
-
-        # Calculate cost
-        cost_usd = self._calculate_cost(
-            provider=LLMProvider.GROQ,
-            model=request.model,
-            tokens_prompt=response.usage.prompt_tokens,
-            tokens_completion=response.usage.completion_tokens,
-        )
-
-        return LLMResponse(
-            content=response.choices[0].message.content,
-            model=response.model,
-            provider=LLMProvider.GROQ,
-            tokens_prompt=response.usage.prompt_tokens,
-            tokens_completion=response.usage.completion_tokens,
-            tokens_total=response.usage.total_tokens,
-            latency_ms=0,
-            cost_usd=cost_usd,
-        )
-
-    def _calculate_cost(
-        self,
-        provider: LLMProvider,
-        model: str,
-        tokens_prompt: int,
-        tokens_completion: int,
-        call_timestamp: Optional[datetime] = None,
-    ) -> float:
-        """Calculate cost using historical pricing.
-        
-        Args:
-            provider: LLM provider
-            model: Model name
-            tokens_prompt: Prompt tokens
-            tokens_completion: Completion tokens
-            call_timestamp: Timestamp for historical pricing (None = current)
-        
-        Returns:
-            Cost in USD
-        """
-        if call_timestamp is None:
-            call_timestamp = datetime.now(UTC)
-        
-        # Try to get pricing from database
-        query = """
-            SELECT price_per_1k_prompt, price_per_1k_completion
-            FROM llm_pricing
-            WHERE provider = %s 
-              AND model = %s
-              AND effective_from <= %s
-              AND (effective_to IS NULL OR effective_to > %s)
-            ORDER BY effective_from DESC
-            LIMIT 1
-        """
-        pricing = self.db.fetchone(
-            query, (provider.value, model, call_timestamp, call_timestamp)
-        )
-        
-        if pricing:
-            # Use database pricing
-            cost = (
-                tokens_prompt * (float(pricing["price_per_1k_prompt"]) / 1000)
-                + tokens_completion * (float(pricing["price_per_1k_completion"]) / 1000)
-            )
-            return round(cost, 6)
-        
-        # Fallback to hardcoded pricing (for backward compatibility)
-        pricing_table = {
-            LLMProvider.OPENAI: {
-                "gpt-4": {"prompt": 0.03 / 1000, "completion": 0.06 / 1000},
-                "gpt-4-turbo": {"prompt": 0.01 / 1000, "completion": 0.03 / 1000},
-                "gpt-3.5-turbo": {"prompt": 0.0005 / 1000, "completion": 0.0015 / 1000},
-            },
-            LLMProvider.GROQ: {
-                "llama3-70b": {"prompt": 0.0007 / 1000, "completion": 0.0008 / 1000},
-                "mixtral-8x7b": {"prompt": 0.0003 / 1000, "completion": 0.0003 / 1000},
-            },
-        }
-
-        model_pricing = pricing_table.get(provider, {}).get(
-            model, {"prompt": 0, "completion": 0}
-        )
-        cost = (
-            tokens_prompt * model_pricing["prompt"]
-            + tokens_completion * model_pricing["completion"]
-        )
-        return round(cost, 6)
-
-    def _log_call(
-        self,
-        event_id: str,
-        user_id: str,
-        provider: LLMProvider,
-        response: Optional[LLMResponse],
-        status: str,
-        error_message: Optional[str] = None,
-        latency_ms: int = 0,
-        metadata: Optional[dict] = None,
-    ) -> None:
-        """Log LLM call to MatrixOne."""
+    def _log_call(self, event_id, user_id, provider, response, status,
+                  error_message=None, latency_ms=0, metadata=None):
         log_id = str(uuid7())
-
-        if response:
-            query = """
-                INSERT INTO llm_call_logs (
-                    log_id, event_id, user_id, provider, model,
-                    tokens_prompt, tokens_completion, tokens_total,
-                    cost_usd, latency_ms, status, metadata, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            self.db.execute(
-                query,
-                (
-                    log_id,
-                    event_id,
-                    user_id,
-                    provider.value,
-                    response.model,
-                    response.tokens_prompt,
-                    response.tokens_completion,
-                    response.tokens_total,
-                    response.cost_usd,
-                    response.latency_ms,
-                    status,
-                    json.dumps(metadata) if metadata else None,
-                    datetime.now(UTC),
-                ),
-            )
-        else:
-            query = """
-                INSERT INTO llm_call_logs (
-                    log_id, event_id, user_id, provider, model,
-                    tokens_prompt, tokens_completion, tokens_total,
-                    cost_usd, latency_ms, status, error_message, metadata, created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            self.db.execute(
-                query,
-                (
-                    log_id,
-                    event_id,
-                    user_id,
-                    provider.value,
-                    "unknown",
-                    0,
-                    0,
-                    0,
-                    0.0,
-                    latency_ms,
-                    status,
-                    error_message,
-                    json.dumps(metadata) if metadata else None,
-                    datetime.now(UTC),
-                ),
-            )
-
-    def get_call_logs(
-        self, event_id: Optional[str] = None, user_id: Optional[str] = None
-    ) -> list[LLMCallLog]:
-        """Get LLM call logs."""
-        if event_id:
-            query = "SELECT * FROM llm_call_logs WHERE event_id = %s ORDER BY created_at DESC"
-            results = self.db.fetchall(query, (event_id,))
-        elif user_id:
-            query = "SELECT * FROM llm_call_logs WHERE user_id = %s ORDER BY created_at DESC LIMIT 100"
-            results = self.db.fetchall(query, (user_id,))
-        else:
-            query = "SELECT * FROM llm_call_logs ORDER BY created_at DESC LIMIT 100"
-            results = self.db.fetchall(query)
-
-        return [self._to_log_model(r) for r in results]
-
-    def _to_log_model(self, row: dict) -> LLMCallLog:
-        """Convert database row to LLMCallLog model."""
-        return LLMCallLog(
-            log_id=row["log_id"],
-            event_id=row["event_id"],
-            user_id=row["user_id"],
-            provider=LLMProvider(row["provider"]),
-            model=row["model"],
-            tokens_prompt=row["tokens_prompt"],
-            tokens_completion=row["tokens_completion"],
-            tokens_total=row["tokens_total"],
-            cost_usd=float(row["cost_usd"]),
-            latency_ms=row["latency_ms"],
-            status=row["status"],
-            error_message=row.get("error_message"),
-            created_at=row["created_at"],
-        )
-
-
-    def chat_with_tools(
-        self,
-        messages: list[dict],
-        tools: list[dict],
-        tool_choice: str = "auto",
-        session_id: str = None
-    ) -> dict:
-        """Chat with native function calling support.
-        
-        This enables "一步到位" - LLM directly outputs function calls with parameters.
-        
-        Args:
-            messages: Conversation messages
-            tools: Tool definitions in OpenAI format
-            tool_choice: "auto" | "none" | {"type": "function", "function": {"name": "..."}}
-            session_id: Optional session ID for logging
-            
-        Returns:
-            Response with tool_calls if any
-        """
         try:
-            provider = self.config.get("provider", "openai")
-            
-            if provider == "openai":
-                from openai import OpenAI
-                client = OpenAI(api_key=self.config.get("api_key"))
-                
-                response = client.chat.completions.create(
-                    model=self.config.get("model", "gpt-4"),
-                    messages=messages,
-                    tools=tools,
-                    tool_choice=tool_choice
-                )
-                
-                # Convert to dict
-                message = response.choices[0].message
-                result = {
-                    "content": message.content or "",
-                    "tool_calls": [],
-                    "usage": {
-                        "prompt_tokens": response.usage.prompt_tokens,
-                        "completion_tokens": response.usage.completion_tokens,
-                        "total_tokens": response.usage.total_tokens
-                    }
-                }
-                
-                if message.tool_calls:
-                    result["tool_calls"] = [
-                        {
-                            "id": tc.id,
-                            "type": tc.type,
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        }
-                        for tc in message.tool_calls
-                    ]
-                
-                logger.info(f"Function calling: {len(result['tool_calls'])} tools selected")
-                return result
-            
+            if response:
+                self.db.execute(
+                    """INSERT INTO llm_call_logs (
+                        log_id, event_id, user_id, provider, model,
+                        tokens_prompt, tokens_completion, tokens_total,
+                        cost_usd, latency_ms, status, metadata, created_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (log_id, event_id, user_id, provider.value, response.model,
+                     response.tokens_prompt, response.tokens_completion, response.tokens_total,
+                     response.cost_usd, response.latency_ms, status,
+                     json.dumps(metadata) if metadata else None, datetime.now(UTC)))
             else:
-                # Fallback for providers without native function calling
-                logger.warning(f"Provider {provider} doesn't support native function calling")
-                return {"content": "", "tool_calls": []}
-                
+                self.db.execute(
+                    """INSERT INTO llm_call_logs (
+                        log_id, event_id, user_id, provider, model,
+                        tokens_prompt, tokens_completion, tokens_total,
+                        cost_usd, latency_ms, status, error_message, metadata, created_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (log_id, event_id, user_id, provider.value, "unknown",
+                     0, 0, 0, 0.0, latency_ms, status, error_message,
+                     json.dumps(metadata) if metadata else None, datetime.now(UTC)))
         except Exception as e:
-            from core.exceptions import LLMError
-            raise LLMError(f"Function calling failed: {e}", provider=provider)
+            logger.error(f"Failed to log LLM call: {e}")
+
+    def get_call_logs(self, event_id=None, user_id=None) -> list[LLMCallLog]:
+        if event_id:
+            results = self.db.fetchall(
+                "SELECT * FROM llm_call_logs WHERE event_id = %s ORDER BY created_at DESC",
+                (event_id,))
+        elif user_id:
+            results = self.db.fetchall(
+                "SELECT * FROM llm_call_logs WHERE user_id = %s ORDER BY created_at DESC LIMIT 100",
+                (user_id,))
+        else:
+            results = self.db.fetchall(
+                "SELECT * FROM llm_call_logs ORDER BY created_at DESC LIMIT 100")
+        return [LLMCallLog(
+            log_id=r["log_id"], event_id=r["event_id"], user_id=r["user_id"],
+            provider=LLMProvider(r["provider"]), model=r["model"],
+            tokens_prompt=r["tokens_prompt"], tokens_completion=r["tokens_completion"],
+            tokens_total=r["tokens_total"], cost_usd=float(r["cost_usd"]),
+            latency_ms=r["latency_ms"], status=r["status"],
+            error_message=r.get("error_message"), created_at=r["created_at"])
+            for r in results]
+
+    @property
+    def total_spend(self) -> float:
+        """Current session spend in USD (#5)."""
+        return self._total_spend_usd
+
+    # ── Helpers ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_messages(messages: list) -> list[dict]:
+        result = []
+        for m in messages:
+            if isinstance(m, LLMMessage):
+                d = {"role": m.role}
+                if m.content is not None:
+                    d["content"] = m.content
+                if m.tool_calls:
+                    d["tool_calls"] = m.tool_calls
+                if m.tool_call_id:
+                    d["tool_call_id"] = m.tool_call_id
+                if m.name:
+                    d["name"] = m.name
+                result.append(d)
+            elif isinstance(m, dict):
+                result.append(m)
+            else:
+                result.append({"role": "user", "content": str(m)})
+        return result
