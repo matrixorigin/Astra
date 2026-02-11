@@ -20,7 +20,10 @@ from core.agent.executor import AgentExecutor
 from core.agent.chat_loop import ChatLoop
 from core.skills.mocking import MockMode
 from core.events.models import StreamEventType
+from core.llm.router import ModelConfig
+from core.llm.models import LLMProvider
 import asyncio
+import json
 
 
 @click.group()
@@ -227,6 +230,332 @@ def skill_register(skill_file):
     
     click.echo(f"✅ Skill registered: {skill_data['name']} v{skill_data['version']}")
     click.echo(f"   Skill ID: {skill_id}")
+
+
+@cli.group()
+def model():
+    """Manage LLM models."""
+    pass
+
+
+@model.command('list')
+@click.option('--user-id', help='Filter by user scope')
+@click.option('--tenant-id', help='Filter by tenant scope')
+def model_list(user_id, tenant_id):
+    """List available models."""
+    db = Database()
+    
+    # Get models from router
+    client = LLMClient(db=db, user_id=user_id, tenant_id=tenant_id)
+    models = client.router.list_models()
+    
+    if not models:
+        click.echo("No models available")
+        return
+    
+    click.echo("Available Models:")
+    click.echo("=" * 80)
+    
+    for m in models:
+        status = "✓" if m.is_active else "✗"
+        click.echo(f"{status} {m.model_name}")
+        click.echo(f"   Provider: {m.provider.value}")
+        click.echo(f"   Context: {m.context_window:,} tokens")
+        click.echo(f"   Price: ${m.price_per_1k_prompt:.4f}/1K prompt + ${m.price_per_1k_completion:.4f}/1K completion")
+        if m.fallback_to:
+            click.echo(f"   Fallback: {m.fallback_to}")
+        click.echo()
+
+
+@model.command('add')
+@click.argument('model_name')
+@click.argument('provider', type=click.Choice([p.value for p in LLMProvider]))
+@click.option('--context-window', default=128000, help='Context window size')
+@click.option('--price-prompt', default=0.01, help='Price per 1K prompt tokens')
+@click.option('--price-completion', default=0.03, help='Price per 1K completion tokens')
+@click.option('--rpm-limit', default=500, help='Requests per minute limit')
+@click.option('--tpm-limit', default=150000, help='Tokens per minute limit')
+@click.option('--scope', type=click.Choice(['global', 'user', 'tenant']), default='global', help='Scope for model')
+@click.option('--scope-id', help='User or tenant ID for scope')
+@click.option('--fallback', help='Fallback model name')
+@click.option('--tags', help='Comma-separated tags (e.g., fast,cheap,reasoning)')
+def model_add(model_name, provider, context_window, price_prompt, price_completion, 
+              rpm_limit, tpm_limit, scope, scope_id, fallback, tags):
+    """Add a new model to the registry."""
+    db = Database()
+    
+    # Validate scope_id
+    if scope in ['user', 'tenant'] and not scope_id:
+        click.echo(f"❌ --scope-id is required for {scope} scope")
+        return
+    
+    # Validate model_name format
+    if not model_name or len(model_name) < 3:
+        click.echo(f"❌ Invalid model name: must be at least 3 characters")
+        return
+    
+    # Validate prices
+    if price_prompt < 0 or price_completion < 0:
+        click.echo(f"❌ Prices must be non-negative")
+        return
+    
+    # Parse tags
+    tag_list = [t.strip() for t in tags.split(',')] if tags else []
+    
+    # Create model config
+    new_config = ModelConfig(
+        model_name=model_name,
+        provider=LLMProvider(provider),
+        context_window=context_window,
+        price_per_1k_prompt=price_prompt,
+        price_per_1k_completion=price_completion,
+        rpm_limit=rpm_limit,
+        tpm_limit=tpm_limit,
+        fallback_to=fallback,
+        tags=tag_list,
+    )
+    
+    try:
+        # Read existing registry
+        query = "SELECT value FROM configs WHERE key_name = 'model_registry'"
+        if scope == 'global':
+            query += " AND scope_type = 'global'"
+        elif scope == 'user':
+            query += f" AND scope_type = 'user' AND scope_id = '{scope_id}'"
+        elif scope == 'tenant':
+            query += f" AND scope_type = 'tenant' AND scope_id = '{scope_id}'"
+        
+        row = db.fetchone(query)
+        
+        if row:
+            # Merge with existing
+            existing = json.loads(row['value'])
+            # Check if model already exists
+            existing_names = [m['model_name'] for m in existing]
+            if model_name in existing_names:
+                click.echo(f"⚠️  Model '{model_name}' already exists, updating...")
+                existing = [m for m in existing if m['model_name'] != model_name]
+            existing.append(new_config.model_dump())
+            registry_value = json.dumps(existing)
+        else:
+            # Create new registry
+            registry_value = json.dumps([new_config.model_dump()])
+        
+        # Upsert
+        config_id = f"model_registry_{scope}" + (f"_{scope_id}" if scope_id else "")
+        db.execute(
+            """
+            INSERT INTO configs (config_id, key_name, value, scope_type, scope_id)
+            VALUES (%s, 'model_registry', %s, %s, %s)
+            ON DUPLICATE KEY UPDATE value = %s
+            """,
+            (config_id, registry_value, scope, scope_id, registry_value)
+        )
+        
+        click.echo(f"✅ Model '{model_name}' added successfully")
+        click.echo(f"   Provider: {provider}")
+        click.echo(f"   Scope: {scope}" + (f" ({scope_id})" if scope_id else ""))
+    except Exception as e:
+        click.echo(f"❌ Failed to add model: {e}")
+
+
+@model.command('remove')
+@click.argument('model_name')
+@click.option('--scope', type=click.Choice(['global', 'user', 'tenant']), default='global')
+@click.option('--scope-id', help='User or tenant ID for scope')
+@click.option('--force', is_flag=True, help='Force removal without confirmation')
+def model_remove(model_name, scope, scope_id, force):
+    """Remove a model from the registry."""
+    db = Database()
+    
+    # Validate scope_id
+    if scope in ['user', 'tenant'] and not scope_id:
+        click.echo(f"❌ --scope-id is required for {scope} scope")
+        return
+    
+    try:
+        # Read existing registry
+        query = "SELECT value FROM configs WHERE key_name = 'model_registry'"
+        if scope == 'global':
+            query += " AND scope_type = 'global'"
+        elif scope == 'user':
+            query += f" AND scope_type = 'user' AND scope_id = '{scope_id}'"
+        elif scope == 'tenant':
+            query += f" AND scope_type = 'tenant' AND scope_id = '{scope_id}'"
+        
+        row = db.fetchone(query)
+        
+        if not row:
+            click.echo(f"❌ No model registry found for {scope}" + (f" ({scope_id})" if scope_id else ""))
+            return
+        
+        # Remove model
+        existing = json.loads(row['value'])
+        existing_names = [m['model_name'] for m in existing]
+        
+        if model_name not in existing_names:
+            click.echo(f"❌ Model '{model_name}' not found in registry")
+            click.echo(f"   Available models: {', '.join(existing_names)}")
+            return
+        
+        # Check if other models depend on this one (as fallback)
+        dependent_models = [m['model_name'] for m in existing 
+                           if m.get('fallback_to') == model_name]
+        if dependent_models and not force:
+            click.echo(f"⚠️  Warning: The following models use '{model_name}' as fallback:")
+            for dep in dependent_models:
+                click.echo(f"   - {dep}")
+            click.echo(f"\nUse --force to remove anyway")
+            return
+        
+        # Confirm removal
+        if not force:
+            if not click.confirm(f"Remove model '{model_name}' from {scope} scope?"):
+                click.echo("Cancelled")
+                return
+        
+        updated = [m for m in existing if m['model_name'] != model_name]
+        
+        if not updated:
+            # Delete entire config if no models left
+            if scope_id:
+                db.execute(
+                    "DELETE FROM configs WHERE key_name = 'model_registry' AND scope_type = %s AND scope_id = %s",
+                    (scope, scope_id)
+                )
+            else:
+                db.execute(
+                    "DELETE FROM configs WHERE key_name = 'model_registry' AND scope_type = %s AND scope_id IS NULL",
+                    (scope,)
+                )
+            click.echo(f"✅ Model '{model_name}' removed (registry now empty)")
+        else:
+            # Update with remaining models
+            if scope_id:
+                db.execute(
+                    "UPDATE configs SET value = %s WHERE key_name = 'model_registry' AND scope_type = %s AND scope_id = %s",
+                    (json.dumps(updated), scope, scope_id)
+                )
+            else:
+                db.execute(
+                    "UPDATE configs SET value = %s WHERE key_name = 'model_registry' AND scope_type = %s AND scope_id IS NULL",
+                    (json.dumps(updated), scope)
+                )
+            click.echo(f"✅ Model '{model_name}' removed successfully")
+            click.echo(f"   Remaining models: {len(updated)}")
+    except Exception as e:
+        click.echo(f"❌ Failed to remove model: {e}")
+
+
+@model.command('show')
+@click.argument('model_name')
+@click.option('--user-id', help='User scope')
+@click.option('--tenant-id', help='Tenant scope')
+def model_show(model_name, user_id, tenant_id):
+    """Show detailed information about a model."""
+    db = Database()
+    
+    try:
+        client = LLMClient(db=db, user_id=user_id, tenant_id=tenant_id)
+        model_config = client.router.registry.get(model_name)
+        
+        if not model_config:
+            click.echo(f"❌ Model '{model_name}' not found")
+            return
+        
+        click.echo(f"Model: {model_config.model_name}")
+        click.echo("=" * 60)
+        click.echo(f"Provider:        {model_config.provider.value}")
+        click.echo(f"Context Window:  {model_config.context_window:,} tokens")
+        click.echo(f"Price (Prompt):  ${model_config.price_per_1k_prompt:.4f} per 1K tokens")
+        click.echo(f"Price (Completion): ${model_config.price_per_1k_completion:.4f} per 1K tokens")
+        click.echo(f"RPM Limit:       {model_config.rpm_limit}")
+        click.echo(f"TPM Limit:       {model_config.tpm_limit:,}")
+        click.echo(f"Active:          {'Yes' if model_config.is_active else 'No'}")
+        if model_config.fallback_to:
+            click.echo(f"Fallback:        {model_config.fallback_to}")
+        if model_config.tags:
+            click.echo(f"Tags:            {', '.join(model_config.tags)}")
+    except Exception as e:
+        click.echo(f"❌ Failed to show model: {e}")
+
+
+@model.command('update')
+@click.argument('model_name')
+@click.option('--price-prompt', type=float, help='Update price per 1K prompt tokens')
+@click.option('--price-completion', type=float, help='Update price per 1K completion tokens')
+@click.option('--rpm-limit', type=int, help='Update requests per minute limit')
+@click.option('--tpm-limit', type=int, help='Update tokens per minute limit')
+@click.option('--active/--inactive', default=None, help='Set model active status')
+@click.option('--fallback', help='Update fallback model')
+@click.option('--scope', type=click.Choice(['global', 'user', 'tenant']), default='global')
+@click.option('--scope-id', help='User or tenant ID for scope')
+def model_update(model_name, price_prompt, price_completion, rpm_limit, tpm_limit, 
+                active, fallback, scope, scope_id):
+    """Update model configuration."""
+    db = Database()
+    
+    # Validate scope_id
+    if scope in ['user', 'tenant'] and not scope_id:
+        click.echo(f"❌ --scope-id is required for {scope} scope")
+        return
+    
+    try:
+        # Read existing registry
+        query = "SELECT value FROM configs WHERE key_name = 'model_registry'"
+        if scope == 'global':
+            query += " AND scope_type = 'global'"
+        elif scope == 'user':
+            query += f" AND scope_type = 'user' AND scope_id = '{scope_id}'"
+        elif scope == 'tenant':
+            query += f" AND scope_type = 'tenant' AND scope_id = '{scope_id}'"
+        
+        row = db.fetchone(query)
+        
+        if not row:
+            click.echo(f"❌ No model registry found for {scope}" + (f" ({scope_id})" if scope_id else ""))
+            return
+        
+        existing = json.loads(row['value'])
+        model_found = False
+        
+        for model in existing:
+            if model['model_name'] == model_name:
+                model_found = True
+                # Update fields
+                if price_prompt is not None:
+                    model['price_per_1k_prompt'] = price_prompt
+                if price_completion is not None:
+                    model['price_per_1k_completion'] = price_completion
+                if rpm_limit is not None:
+                    model['rpm_limit'] = rpm_limit
+                if tpm_limit is not None:
+                    model['tpm_limit'] = tpm_limit
+                if active is not None:
+                    model['is_active'] = active
+                if fallback is not None:
+                    model['fallback_to'] = fallback
+                break
+        
+        if not model_found:
+            click.echo(f"❌ Model '{model_name}' not found in registry")
+            return
+        
+        # Save updated registry
+        if scope_id:
+            db.execute(
+                "UPDATE configs SET value = %s WHERE key_name = 'model_registry' AND scope_type = %s AND scope_id = %s",
+                (json.dumps(existing), scope, scope_id)
+            )
+        else:
+            db.execute(
+                "UPDATE configs SET value = %s WHERE key_name = 'model_registry' AND scope_type = %s AND scope_id IS NULL",
+                (json.dumps(existing), scope)
+            )
+        
+        click.echo(f"✅ Model '{model_name}' updated successfully")
+    except Exception as e:
+        click.echo(f"❌ Failed to update model: {e}")
 
 
 @cli.command()

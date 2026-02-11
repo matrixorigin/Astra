@@ -196,6 +196,10 @@ class ModelRegistry:
 
     def get(self, model_name: str) -> ModelConfig | None:
         return self._models.get(model_name)
+    
+    def list_models(self) -> list[ModelConfig]:
+        """List all models (active and inactive)."""
+        return list(self._models.values())
 
     def list_active(self) -> list[ModelConfig]:
         return [m for m in self._models.values() if m.is_active]
