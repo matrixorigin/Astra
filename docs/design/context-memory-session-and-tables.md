@@ -1124,3 +1124,115 @@ Implementation can proceed Phase 0 → 1 → … → 5; each phase builds on the
 - **Conversation replay (“对话时光机”)**: Causal chain (parent_event_id, causal_chain_id) and LLM params (llm_model_used, llm_params) enable exact **replay** of any past chain; optional **replay with a different model** for regression testing and training data. Shifts debugging from “infer from logs” to “re-run and compare”.
 - **Time-point sandbox (“平行宇宙实验台”)**: MatrixOne Git for Data (or clone) provides **branch-at-T1** and **isolated sandbox**; new prompt/skills/memory can be tested on historical traffic with **zero production impact**; merge or discard after evaluation.
 - **Memory–Prompt–Context clarity**: Explicit three-layer model (Memory = persistent knowledge, Prompt = versioned behavior, Context = one-shot assembled input + snapshot) keeps storage, versioning, and replay semantics consistent and programmable.
+
+
+---
+
+## 11. From Design to Engineering: Operational Completeness
+
+**Context**: This section addresses the review feedback that "操作性完备" (operational completeness) is currently at the design vision layer, lacking concrete validation and acceptance paths. The goal is to bridge the gap between design and provable operational capability.
+
+### 11.1 Engineering Validation Roadmap
+
+The following capabilities move from "design points" to **engineering-validated features** with measurable acceptance criteria:
+
+| Capability | Design Status | Engineering Target | Validation Method |
+|------------|---------------|-------------------|-------------------|
+| **Replay with quality gate** | Designed (§10, Phase 5) | Automated replay gate with 6 metrics | CI/CD integration, 95% pass rate |
+| **Sandbox-based validation** | Designed (§10, Phase 5) | Sandbox lifecycle + isolation guarantees | End-to-end test, zero cross-contamination |
+| **Prompt/Skill evolution** | Designed (§10, Phase 5) | Closed-loop automation (trigger → optimize → validate → deploy) | Weekly optimization runs, < 2 week cycle time |
+| **Training data pipeline** | Designed (§10, Phase 3) | Automated export + quality filtering | Monthly training dataset generation |
+| **A/B testing framework** | Not yet designed | Controlled rollout with statistical analysis | 2 A/B tests per quarter |
+
+**Key insight**: The design provides the **data model and abstractions** (conversation_events, context_snapshot, versioned configs, sandbox); the engineering work is to build the **automation and quality gates** on top of these primitives.
+
+### 11.2 Concrete Deliverables (Next 8 Weeks)
+
+**Week 1-2: Replay Gate MVP**
+- Deliverable: `mo-agent replay-gate run` command
+- Acceptance: Runs 50 golden sessions in < 15 minutes, produces pass/fail decision
+- Metrics: 6 automated metrics (success rate, output stability, latency, token efficiency, skill accuracy, error rate)
+- Validation: Manual spot-check 5 sessions, false positive rate < 5%
+
+**Week 3-4: Sandbox Validation**
+- Deliverable: `mo-agent sandbox create/load/validate/delete` commands
+- Acceptance: Sandbox creation < 30 seconds, zero production data affected
+- Isolation: Separate DB, config, metrics namespace
+- Validation: Audit query confirms no cross-contamination
+
+**Week 5-6: Evolution Automation**
+- Deliverable: `mo-agent evolution optimize-prompt` and `discover-skills` commands
+- Acceptance: Generates valid candidate, runs replay gate automatically
+- Trigger: Automated (satisfaction < 3.5, error rate > 5%) or manual
+- Validation: Finds at least 1 skill gap in test data
+
+**Week 7-8: CI/CD Integration**
+- Deliverable: GitHub Actions workflow for replay gate on PR
+- Acceptance: Gate runs in < 20 minutes, PR comment shows metrics
+- Merge protection: Blocks merge if gate fails
+- Validation: End-to-end test with real PR
+
+### 11.3 Quality Metrics & Acceptance Criteria
+
+**Operational metrics** (3 months post-deployment):
+- Replay gate adoption: 100% of prompt/skill changes
+- Gate pass rate: > 90%
+- False positive rate: < 5%
+- Sandbox usage: > 50 experiments/month
+- Evolution cycle time: < 2 weeks (trigger → production)
+
+**Quality metrics** (6 months post-deployment):
+- User satisfaction: > 4.0/5 (sustained)
+- Production error rate: < 2%
+- Prompt optimization frequency: 1-2 per month
+- New skills added: 3-5 per quarter
+
+**Business metrics**:
+- Reduced manual testing time: 80% (from 4 hours → 48 minutes per change)
+- Faster iteration: 50% reduction in time-to-production for new features
+- Increased confidence: 95% of changes deployed without rollback
+
+### 11.4 Reference Implementation
+
+See **[Replay, Sandbox, Evaluation & Evolution: Engineering Validation](replay-sandbox-evaluation-automation.md)** for complete specification including:
+- Automated replay gating with golden session selection
+- Sandbox lifecycle and isolation guarantees
+- Skill/Prompt evolution closed-loop workflow
+- A/B testing framework
+- CI/CD integration patterns
+- Risk mitigation strategies
+
+**Key difference from this document**: This document defines the **data model and design principles**; the engineering validation document defines the **automation, workflows, and acceptance tests** that prove operational completeness.
+
+### 11.5 Success Criteria for "Provably Leading"
+
+To claim **"可证明的领先"** (provable leadership), the system must demonstrate:
+
+1. **Reproducibility**: Any historical conversation can be replayed with bit-for-bit accuracy (or documented variance)
+2. **Automation**: Prompt/skill changes go through automated quality gates without manual testing
+3. **Isolation**: Experiments run in sandboxes with zero production impact
+4. **Traceability**: Every production decision can be traced to specific prompt version, skills, and context
+5. **Evolution**: Closed-loop improvement (feedback → optimization → validation → deployment) runs continuously
+
+**Validation method**: Public demo showing:
+- Replay of 6-month-old conversation with exact reproduction
+- Automated replay gate blocking a regression
+- Sandbox experiment with prompt optimization
+- A/B test results driving production deployment
+- Training dataset export from production events
+
+**Timeline**: All 5 capabilities demonstrated by **Week 12** (3 months from start).
+
+---
+
+## 12. Conclusion
+
+This design provides a **complete foundation** for event-centric, reproducible, evolvable conversation management:
+
+- **Data model**: conversation_events, sessions, versioned configs, evaluation/training tables
+- **Abstractions**: Token Budget Manager, Memory–Prompt–Context layers, causal chains
+- **Capabilities**: Replay, sandbox, evolution, training pipeline
+
+**Next step**: Implement the **engineering validation roadmap** (§11) to move from design to **provably operational** system. The combination of this design document and the [engineering validation specification](replay-sandbox-evaluation-automation.md) provides a complete path from vision to production-ready implementation.
+
+**Key insight**: The design is **intentionally minimal** to support maximum evolution; the engineering work is to build **automation and quality gates** that make the design operationally complete without requiring schema changes.

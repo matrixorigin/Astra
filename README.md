@@ -170,6 +170,8 @@ See [examples/](examples/) for more detailed examples.
   - [Skills-First Architecture](docs/design/skills-first-architecture.md) ⭐ Phase 2 design
   - [Context Management](docs/design/context-management.md) ⭐ Phase 3 design
   - [Context, Memory, Session and Tables](docs/design/context-memory-session-and-tables.md)
+  - [Replay, Sandbox, Evaluation & Evolution](docs/design/replay-sandbox-evaluation-automation.md) ⭐ Engineering validation
+  - [Side-Effect Isolation](docs/design/side-effect-isolation.md) ⭐ Critical safety
   - [Deployment Architecture](docs/design/deployment-architecture-proposal.md)
   - [GitHub Integration](docs/design/github-integration.md) ⭐ Industry-leading
   - [LLM Integration](docs/design/llm-integration.md) ⭐ Production-ready
