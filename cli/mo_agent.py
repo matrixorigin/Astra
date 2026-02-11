@@ -111,6 +111,9 @@ def chat(user_id, model, mode):
     click.echo(f"Session: {session.session_id}")
     click.echo("Type 'exit' or 'quit' to end session\n")
     
+    # Set user context for LLM client (for scope-based access control)
+    llm_client.set_user_context(user_id=user_id)
+    
     try:
         while True:
             # Get user input

@@ -13,6 +13,7 @@ from core.llm.models import LLMCallLog, LLMMessage, LLMProvider, LLMResponse
 from core.llm.providers import BaseProvider, OpenAIProvider, GroqProvider, AnthropicProvider
 from core.llm.router import ModelRouter, ModelConfig
 from core.llm.rate_limiter import RateLimiter
+from core.repos.token_resolver import TokenResolver
 from sdk import Database
 
 logger = logging.getLogger(__name__)
@@ -26,14 +27,36 @@ class BudgetExceededError(Exception):
 class LLMClient:
     """LLM client with routing, rate limiting, circuit breaker, budget control, and logging."""
 
-    def __init__(self, db: Optional[Database] = None) -> None:
+    def __init__(self, db: Optional[Database] = None, user_id: str | None = None, 
+                 tenant_id: str | None = None, use_default_models: bool = True) -> None:
+        """Initialize LLM client.
+        
+        Args:
+            use_default_models: If True, use DEFAULT_MODELS as fallback. Set to False
+                               in production to enforce strict scope-based access control.
+        """
         self.db = db or Database()
+        self.user_id = user_id
+        self.tenant_id = tenant_id
+        self.use_default_models = use_default_models
         self._providers: dict[LLMProvider, BaseProvider] = {}
-        self.router = ModelRouter(db=self.db)
+        self.router = ModelRouter(db=self.db, user_id=user_id, tenant_id=tenant_id,
+                                  use_defaults=use_default_models)
         self.rate_limiter = RateLimiter()
+        self.token_resolver = TokenResolver(db=self.db)
         self._load_config()
         self._init_providers()
         self._init_rate_limits()
+    
+    def set_user_context(self, user_id: str | None = None, tenant_id: str | None = None):
+        """Update user context for scope-based access control."""
+        self.user_id = user_id
+        self.tenant_id = tenant_id
+        # Reload router with new context
+        self.router = ModelRouter(db=self.db, user_id=user_id, tenant_id=tenant_id,
+                                  use_defaults=self.use_default_models)
+        # Re-initialize providers with new API keys
+        self._init_providers()
 
     # ── Config (#4 动态配置) ───────────────────────────────────────
 
@@ -80,25 +103,84 @@ class LLMClient:
                     kwargs = extra(api_key)
                     kwargs = {k: v for k, v in kwargs.items() if v}
                     self._providers[LLMProvider(provider_name)] = cls(api_key, **kwargs)
+                    logger.debug(f"Initialized {provider_name} provider")
                 except Exception as e:
-                    logger.debug(f"Skipping {provider_name}: {e}")
+                    logger.warning(f"Failed to initialize {provider_name} provider: {e}")
+            else:
+                logger.debug(f"No API key found for {provider_name}, skipping")
 
     def _get_api_key(self, provider: str) -> str | None:
+        """Get API key with scope-based resolution.
+        
+        Priority: user > tenant > config/env
+        """
+        # 1. Try TokenResolver (user/tenant scope)
+        if self.user_id or self.tenant_id:
+            token = self._resolve_llm_token(provider)
+            if token:
+                # Decrypt if needed (simplified - assumes plaintext for now)
+                return token.encrypted_value or token.secret_ref
+        
+        # 2. Fallback to config
         key = self.config.get(f"{provider}_api_key")
         if key:
             return key
+        
+        # 3. Fallback to environment variable
         key = os.getenv(f"{provider.upper()}_API_KEY")
         if key:
             return key
+        
+        # 4. Fallback to configs table (global)
         try:
             row = self.db.fetchone(
-                "SELECT value FROM configs WHERE key_name = %s LIMIT 1",
+                "SELECT value FROM configs WHERE key_name = %s "
+                "AND scope_type = 'global' LIMIT 1",
                 (f"{provider}_api_key",))
             if row:
                 return row["value"]
         except Exception:
             pass
+        
         return None
+    
+    def _resolve_llm_token(self, provider: str):
+        """Resolve LLM token using TokenResolver logic."""
+        # 1. User-scoped token
+        if self.user_id:
+            query = """
+                SELECT * FROM tokens 
+                WHERE type = 'llm' AND provider = %s 
+                AND scope_user_id = %s AND is_active = TRUE
+                ORDER BY created_at DESC LIMIT 1
+            """
+            result = self.db.fetchone(query, (provider, self.user_id))
+            if result:
+                return self._token_from_row(result)
+        
+        # 2. Tenant-scoped token
+        if self.tenant_id:
+            query = """
+                SELECT * FROM tokens 
+                WHERE type = 'llm' AND provider = %s 
+                AND scope_tenant_id = %s AND is_active = TRUE
+                ORDER BY created_at DESC LIMIT 1
+            """
+            result = self.db.fetchone(query, (provider, self.tenant_id))
+            if result:
+                return self._token_from_row(result)
+        
+        return None
+    
+    def _token_from_row(self, row):
+        """Convert DB row to simple token object."""
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            token_id=row["token_id"],
+            provider=row["provider"],
+            encrypted_value=row.get("encrypted_value"),
+            secret_ref=row.get("secret_ref")
+        )
 
     def _init_rate_limits(self) -> None:
         for m in self.router.list_models():
@@ -107,7 +189,20 @@ class LLMClient:
     def _get_provider(self, p: LLMProvider) -> BaseProvider:
         provider = self._providers.get(p)
         if not provider:
-            raise ValueError(f"Provider {p.value} not configured. Set API key.")
+            scope_info = []
+            if self.user_id:
+                scope_info.append(f"user '{self.user_id}'")
+            if self.tenant_id:
+                scope_info.append(f"tenant '{self.tenant_id}'")
+            scope_str = " for " + " and ".join(scope_info) if scope_info else ""
+            
+            raise ValueError(
+                f"Provider '{p.value}' is not configured{scope_str}.\n"
+                f"Please set the API key using one of:\n"
+                f"  1. Database: INSERT INTO tokens (type, provider, scope_user_id, encrypted_value) VALUES ('llm', '{p.value}', '{self.user_id or 'USER_ID'}', 'YOUR_KEY')\n"
+                f"  2. Environment: export {p.value.upper()}_API_KEY=YOUR_KEY\n"
+                f"  3. Config: Add '{p.value}_api_key' to configs table"
+            )
         return provider
 
     def _resolve_model(self, model: str | None) -> str:
@@ -129,6 +224,42 @@ class LLMClient:
         self._total_spend_usd += cost
 
     # ── Core dispatch with circuit breaker (#6) ────────────────────
+    
+    def _check_model_permission(self, model: str):
+        """Check if current user has permission to use the model."""
+        available_models = self.router.list_models()
+        model_names = [m.model_name for m in available_models]
+        
+        if model not in model_names:
+            # Build detailed error message
+            scope_info = []
+            if self.user_id:
+                scope_info.append(f"user '{self.user_id}'")
+            if self.tenant_id:
+                scope_info.append(f"tenant '{self.tenant_id}'")
+            
+            scope_str = " and ".join(scope_info) if scope_info else "current scope"
+            
+            error_msg = [
+                f"Model '{model}' is not available for {scope_str}.",
+                f"\nAvailable models ({len(model_names)}):"
+            ]
+            
+            # Group by provider for better readability
+            by_provider = {}
+            for m in available_models:
+                provider = m.provider.value
+                if provider not in by_provider:
+                    by_provider[provider] = []
+                by_provider[provider].append(m.model_name)
+            
+            for provider, models in sorted(by_provider.items()):
+                error_msg.append(f"  {provider}: {', '.join(models)}")
+            
+            if not model_names:
+                error_msg.append("\nNo models configured. Please contact your administrator.")
+            
+            raise PermissionError("\n".join(error_msg))
 
     def _dispatch(self, model: str, fn_name: str, task_hint: str | None = None, **kwargs):
         """Route to model chain, respecting circuit breaker + rate limiter.
@@ -136,6 +267,9 @@ class LLMClient:
         fn_name: method name on BaseProvider (complete, complete_stream, etc.)
         Returns the result of the first successful provider call.
         """
+        # Check permission before routing
+        self._check_model_permission(model)
+        
         chain = self.router.route(model, task_hint=task_hint)
         if not chain:
             # Unknown model — try direct with default provider
