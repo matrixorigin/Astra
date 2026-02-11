@@ -46,15 +46,11 @@ def chat(user_id, model, mode):
     llm_client = LLMClient(db)
     context_mgr = ContextManager(db)
     
-    # Register skills
-    skill_registry = SkillRegistry(db)
-    register_builtin_skills(skill_registry, db)
-    
     # Agent Components
     selector = AgentSkillSelector(db, llm_client)
     executor = AgentExecutor(
         db=db, 
-        registry=skill_registry, 
+        registry=None,  # Will be set after skill registration
         mode=MockMode(mode)
     )
     chat_loop = ChatLoop(
@@ -63,6 +59,52 @@ def chat(user_id, model, mode):
         llm_client=llm_client,
         event_logger=logger
     )
+    
+    # Create agent registry with example agents
+    from core.agent.agent_registry import AgentRegistry, AgentProfile
+    agent_registry = AgentRegistry()
+    
+    # Register example agents
+    agent_registry.register(AgentProfile(
+        agent_id="code_reviewer",
+        system_prompt="You are a code review expert. Analyze code for bugs, style issues, and performance problems. Provide constructive feedback.",
+        skill_filter=["summarize_pr", "analyze_code"]
+    ))
+    agent_registry.register(AgentProfile(
+        agent_id="security_auditor",
+        system_prompt="You are a security auditor. Review code for security vulnerabilities, input validation issues, and potential exploits.",
+        skill_filter=["summarize_pr", "analyze_code"]
+    ))
+    agent_registry.register(AgentProfile(
+        agent_id="documentation_writer",
+        system_prompt="You are a documentation writer. Create clear, comprehensive documentation for code, APIs, and features.",
+        skill_filter=["summarize_pr", "write_docs"]
+    ))
+    
+    # Create chat_loop_factory for delegation
+    def create_chat_loop(system_prompt=None):
+        return ChatLoop(
+            selector=AgentSkillSelector(db, llm_client),
+            executor=AgentExecutor(
+                db=db,
+                registry=SkillRegistry(db),
+                mode=MockMode(mode)
+            ),
+            llm_client=llm_client,
+            event_logger=EventLogger(db)
+        )
+    
+    # Register skills with agent registry
+    skill_registry = SkillRegistry(db)
+    register_builtin_skills(
+        skill_registry,
+        db,
+        agent_registry=agent_registry,
+        chat_loop_factory=create_chat_loop
+    )
+    
+    # Update executor with registered skills
+    executor.registry = skill_registry
 
     # Create session
     session = session_mgr.create_session(user_id=user_id)

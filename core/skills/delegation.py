@@ -2,7 +2,10 @@
 
 from typing import Any
 
-from core.skills.base import Skill, SkillInput, SkillOutput
+from core.skills.base import (
+    Skill, SkillInput, SkillOutput, SkillRequirement, 
+    RepoType, AccessScope, SideEffectCategory, SideEffectProfile
+)
 from core.logging_config import get_logger
 from core.events.models import StreamEvent, StreamEventType
 
@@ -35,6 +38,14 @@ class DelegateTaskSkill(Skill):
     name: str = "delegate_task"
     version: str = "1.0.0"
     description: str = "Delegate a task to another agent for execution"
+    requirements: SkillRequirement = SkillRequirement(
+        repo_types=[RepoType.CODE, RepoType.DOCS],
+        min_access=AccessScope.READ,
+        llm_required=True
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ
+    )
 
     def __init__(self, agent_registry, chat_loop_factory):
         """Initialize delegation skill.
@@ -46,22 +57,26 @@ class DelegateTaskSkill(Skill):
         self.registry = agent_registry
         self.make_loop = chat_loop_factory
 
-    async def execute(self, input_data: dict) -> DelegateTaskOutput:
+    def validate_input(self, input_data: dict) -> DelegateTaskInput:
+        """Validate and parse input data."""
+        return DelegateTaskInput(**input_data)
+
+    async def execute(self, input: DelegateTaskInput) -> DelegateTaskOutput:
         """Execute the delegation.
 
         Args:
-            input_data: Contains agent_id, task, and optional context
+            input: DelegateTaskInput with agent_id, task, and optional context
 
         Returns:
             DelegateTaskOutput with result from delegated agent
         """
-        input_model = self.validate_input(input_data)
-        profile = self.registry.get(input_model.agent_id)
+        profile = self.registry.get(input.agent_id)
 
         if not profile:
             return DelegateTaskOutput(
-                result=f"Error: Agent '{input_model.agent_id}' not found",
-                agent_id=input_model.agent_id,
+                success=False,
+                result=f"Error: Agent '{input.agent_id}' not found",
+                agent_id=input.agent_id,
                 events_produced=0,
             )
 
@@ -70,14 +85,15 @@ class DelegateTaskSkill(Skill):
 
         # Execute the task
         result = await loop.run_step(
-            user_input=input_model.task,
-            session_id=input_model.session_id,
-            user_id=input_model.user_id,
+            user_input=input.task,
+            session_id=input.session_id,
+            user_id=input.user_id,
             context={"system_prompt": profile.system_prompt},
         )
 
         return DelegateTaskOutput(
+            success=True,
             result=result,
-            agent_id=input_model.agent_id,
+            agent_id=input.agent_id,
             events_produced=0,  # Will be counted by the loop
         )
