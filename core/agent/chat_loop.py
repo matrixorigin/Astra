@@ -429,13 +429,17 @@ class ChatLoop:
             "role": "system",
             "content": "Please provide your final answer based on the tool results above.",
         })
+        full_text = ""
         async for chunk in self.llm.chat_stream(messages, user_id, session_id):
+            full_text += chunk
             yield StreamEvent(
                 event_type=StreamEventType.TEXT_DELTA,
                 data={"chunk": chunk},
                 event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
             )
+        self._log_response(user_id, session_id, full_text,
+                           user_event.event_id, user_event.causal_chain_id)
         yield StreamEvent(
             event_type=StreamEventType.RUN_FINISHED,
             data={},
@@ -470,32 +474,17 @@ class ChatLoop:
             )
             return
         
-        # Log plan created event using event_logger directly
-        self.event_logger.create_llm_response(
+        # Log plan created event
+        self.event_logger.create_stream_event(
             user_id=user_id,
             session_id=session_id,
-            content=json.dumps(plan),
-            agent_id="dev-agent",
-            agent_version="0.1.0",
-            parent_event_id=None,
-            causal_chain_id=None,
-        )
-        
-        # Also log as PLAN_CREATED event type
-        self.event_logger.create_llm_response(
-            user_id=user_id,
-            session_id=session_id,
-            content=json.dumps(plan),
-            agent_id="dev-agent",
-            agent_version="0.1.0",
-            parent_event_id=None,
-            causal_chain_id=None,
-            metadata={"event_type_override": "plan_created"},
+            event_type="stream_plan_created",
+            content=plan.model_dump_json(),
         )
         
         yield StreamEvent(
             event_type=StreamEventType.PLAN_CREATED,
-            data={"plan": plan},
+            data={"plan": plan.model_dump()},
         )
 
         max_revisions = self.llm.config.get("max_revisions", 3)
@@ -512,7 +501,7 @@ class ChatLoop:
             if len(plan.steps) > constraints.max_steps:
                 yield StreamEvent(
                     event_type=StreamEventType.RUN_ERROR,
-                    data={"error": f"Step count {len(plan['steps'])} exceeds max {constraints.max_steps}"},
+                    data={"error": f"Step count {len(plan.steps)} exceeds max {constraints.max_steps}"},
                 )
                 return
 
@@ -552,11 +541,11 @@ class ChatLoop:
 
             # R: Reflect — should we revise?
             assessment, revised_plan = await planner.reflect(plan, step_results)
-            if revised_plan and revised_plan is not None:
-                plan.steps = revised_plan["revised_steps"]
+            if revised_plan is not None:
+                plan = revised_plan
                 yield StreamEvent(
                     event_type=StreamEventType.PLAN_REVISED,
-                    data={"plan": plan},
+                    data={"plan": plan.model_dump()},
                 )
 
         # Final synthesis

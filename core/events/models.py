@@ -99,20 +99,6 @@ class StreamEvent(BaseModel):
     agent_id: str | None = None
 
 
-class StreamEventLog(BaseModel):
-    """Stream event for logging to conversation_events table.
-
-    Uses EventType enum for compatibility with existing schema.
-    """
-
-    event_type: EventType  # Must be valid EventType enum value
-    content: str  # JSON string of stream data
-    metadata: dict[str, Any] | None = None
-    event_id: str | None = None
-    causal_chain_id: str | None = None
-    agent_id: str | None = None
-
-
 class TokenUsage(BaseModel):
     """Token usage statistics."""
 

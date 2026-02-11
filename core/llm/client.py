@@ -207,8 +207,8 @@ class LLMClient:
             stream=True,
         )
         
-        # Accumulate tool call fragments
-        tool_call_buffer: dict[str, dict] = {}
+        # Accumulate tool call fragments — use index as stable key
+        tool_call_buffer: dict[int, dict] = {}
         
         for chunk in response:
             delta = chunk.choices[0].delta
@@ -218,26 +218,25 @@ class LLMClient:
             
             if delta.tool_calls:
                 for tc in delta.tool_calls:
-                    # Use index as key since tc.id may be None in streaming
-                    tc_id = tc.id or f"idx_{tc.index}"
-                    if tc_id not in tool_call_buffer:
-                        tool_call_buffer[tc_id] = {
-                            "id": tc_id,
+                    idx = tc.index
+                    if idx not in tool_call_buffer:
+                        tool_call_buffer[idx] = {
+                            "id": tc.id or f"idx_{idx}",
                             "type": tc.type or "function",
                             "function": {"name": "", "arguments": ""},
                         }
+                    elif tc.id:
+                        tool_call_buffer[idx]["id"] = tc.id
                     
                     if tc.function and tc.function.name:
-                        tool_call_buffer[tc_id]["function"]["name"] = tc.function.name
+                        tool_call_buffer[idx]["function"]["name"] = tc.function.name
                     if tc.function and tc.function.arguments:
-                        tool_call_buffer[tc_id]["function"]["arguments"] += tc.function.arguments
-                    
-                    # Only yield on first occurrence (when name is set)
-                    if tc.function and tc.function.name and len(tc.function.name) > 0:
-                        yield {
-                            "type": "tool_call",
-                            "data": tool_call_buffer[tc_id],
-                        }
+                        tool_call_buffer[idx]["function"]["arguments"] += tc.function.arguments
+        
+        # Yield all completed tool calls
+        for tc in tool_call_buffer.values():
+            if tc["function"]["name"]:
+                yield {"type": "tool_call", "data": tc}
 
     def _call_provider(
         self, provider: LLMProvider, request: LLMRequest

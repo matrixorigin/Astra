@@ -57,9 +57,6 @@ class TestEventLoggerStream(unittest.TestCase):
 
     def test_create_stream_event(self):
         """Test creating a stream event."""
-        # Note: Stream events are logged with SYSTEM_MESSAGE event_type
-        # since ConversationEvent.event_type is limited to EventType enum
-        # The actual stream event type is stored in metadata.stream_event_type
         event = self.logger.create_stream_event(
             user_id="user_1",
             session_id="session_1",
@@ -72,8 +69,7 @@ class TestEventLoggerStream(unittest.TestCase):
         self.assertIsNotNone(event.event_id)
         self.assertEqual(event.user_id, "user_1")
         self.assertEqual(event.session_id, "session_1")
-        self.assertEqual(event.event_type, "system_message")  # Mapped to SYSTEM_MESSAGE
-        self.assertEqual(event.metadata.get("stream_event_type"), "stream_text_delta")
+        self.assertEqual(event.event_type, "stream_text_delta")
         
         # Verify database was called
         self.db.execute.assert_called_once()
