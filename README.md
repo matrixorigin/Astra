@@ -12,6 +12,11 @@ Event-centric intelligent agent platform with conversation replay and time-point
 - **Production-Ready**: Logging, auth, rate limiting, monitoring, Docker support
 - **Type-Safe**: 100% type annotations with Pydantic validation
 - **Comprehensive Testing**: 79 tests with VCR-recorded real API responses
+- **Hallucination Firewall**: Verify LLM claims against versioned data snapshots before delivery
+- **Cost-Aware Branching**: Predict execution cost from historical data before spending
+- **Regression Gate**: Automated quality gates for every skill/prompt change
+- **Training Data Pipeline**: Versioned datasets with full lineage tracking
+- **Event Lineage**: Full upstream/downstream traceability for every data point
 
 ## Quick Start
 
@@ -155,12 +160,23 @@ See [examples/](examples/) for more detailed examples.
 - **Branch**: Table-level Git-like workflows (create, diff, merge)
 - **Zero-copy CLONE**: Instant duplication with no storage overhead
 
+### 5. Innovation Layer
+- **Hallucination Firewall**: Snapshot-consistent fact verification before response delivery
+- **Cost-Aware Branching**: Historical cost prediction, budget enforcement, cheaper alternatives
+- **Regression Gate (Sandbox-as-CI)**: Automated testing of every skill/prompt change in isolated snapshots
+- **Prompt Evolution Pipeline**: Branch-based prompt experimentation with quality-gated merging
+- **Training Data Pipeline**: Versioned datasets from high-quality events, contamination detection
+- **Event Lineage Graph**: Recursive causal chain tracing, data contamination detection
+- **Snapshot-Scoped Permissions**: Access control bound to data versions
+
 ## Architecture
 
 - **Event-Centric**: Single source of truth for all conversation data
 - **MatrixOne**: Hyper-converged database with Git for Data capabilities
 - **Type-Safe**: Pydantic models for all data structures
 - **Testable**: Comprehensive unit and integration tests
+- **Deterministic Boundary Control**: Agent Decision = f(versioned inputs); Git for Data controls 4 of 5 inputs
+- **Innovation Layer**: Hallucination firewall, cost prediction, regression gates, training pipeline
 
 ## Documentation
 
@@ -171,12 +187,14 @@ See [examples/](examples/) for more detailed examples.
   - [Context Management](docs/design/context-management.md) ⭐ Phase 3 design
   - [Context, Memory, Session and Tables](docs/design/context-memory-session-and-tables.md)
   - [Replay, Sandbox, Evaluation & Evolution](docs/design/replay-sandbox-evaluation-automation.md) ⭐ Engineering validation
-  - [Side-Effect Isolation](docs/design/side-effect-isolation.md) ⭐ Critical safety
+  - [Side-Effect Isolation](docs/design/replay-sandbox-evaluation-automation.md#1-side-effect-isolation-critical) ⭐ Critical safety
   - [Deployment Architecture](docs/design/deployment-architecture-proposal.md)
   - [GitHub Integration](docs/design/github-integration.md) ⭐ Industry-leading
   - [LLM Integration](docs/design/llm-integration.md) ⭐ Production-ready
   - [Git for Data Features](docs/design/git-for-data-features.md)
   - [Concurrency Model](docs/design/concurrency-model.md)
+  - [Hallucination Firewall](docs/design/git-for-data-features.md#5-hallucination-firewall) ⭐ Innovation
+  - [Training Data Pipeline](docs/design/git-for-data-features.md#8-training-data-pipeline) ⭐ Data Science
 - [Examples](examples/)
 
 ## Testing

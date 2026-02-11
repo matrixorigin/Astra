@@ -22,7 +22,9 @@ Enable mo-dev-agent to leverage multiple LLM providers with:
 3. **Provider Flexibility**: Swap providers without code changes
 4. **Reproducibility**: "10 years later, reproduce today's LLM decision"
 5. **Quality**: Continuous improvement through feedback loops
-6. **Performance**: Sub-second latency for 95% of calls
+6. **Hallucination Prevention**: Real-time fact verification against versioned data before delivering responses
+7. **Cost Prediction**: Predict execution cost from historical data before spending
+8. **Performance**: Sub-second latency for 95% of calls
 
 ## 2. Architecture Overview
 
@@ -413,6 +415,30 @@ CREATE TABLE llm_feedback (
 3. **Pattern detection**: Identify common failure modes
 4. **Automatic retry**: Re-run with different prompt on low rating
 
+### 3.7 Hallucination Firewall
+
+The Hallucination Firewall verifies LLM responses against versioned data before delivery.
+
+Key design:
+- Extract verifiable claims from LLM response (numeric claims, historical references)
+- Verify each claim against the same data snapshot the LLM saw (using context_snapshot's snapshot reference)
+- Annotate response with verification status (verified/contradicted/unverifiable)
+- Block delivery if contradictions found; return corrected response
+- Log verification results for quality tracking
+
+This leverages Git for Data's time-travel queries to ensure verification operates on the exact same data state as generation.
+
+### 3.8 Cost-Aware Branching
+
+Before executing any LLM call, predict cost from historical data:
+- Query llm_call_logs for same skill + similar parameters in last 30 days
+- Use max historical cost * 1.2 as conservative estimate
+- If estimated cost > remaining budget: block and suggest cheaper alternative
+- Cheaper alternatives found by querying same-category skills with lower avg cost
+- All predictions logged for accuracy tracking
+
+This transforms budget control from reactive (block at 100%) to predictive (warn before spending).
+
 ## 4. Advanced Features
 
 ### 4.1 Multi-Model Routing
@@ -585,6 +611,13 @@ LIMIT 1;
 2. **Semantic comparison**: Compare meaning, not exact text
 3. **Acceptance criteria**: Define "close enough" threshold
 4. **Seed control**: Use seed parameter (if supported by provider)
+
+### 5.3 Snapshot-Consistent Verification
+
+When verifying LLM outputs for hallucination, the verification query must use the same data snapshot that was used to build the LLM's context. This is achieved by:
+1. Recording the snapshot name in context_snapshot at generation time
+2. Using {SNAPSHOT = 'name'} syntax for all verification queries
+3. This ensures verification and generation see identical data, eliminating false positives from data drift
 
 ## 6. Performance Optimization
 
@@ -783,6 +816,9 @@ messages = [
 - User rating > 4.0 (out of 5)
 - Task completion rate > 90%
 - Prompt improvement cycle < 1 week
+- Hallucination detection rate > 80% for verifiable claims
+- Cost prediction accuracy within 20% of actual
+- Zero budget overruns with predictive cost control
 
 ## 11. Comparison with Industry Standards
 

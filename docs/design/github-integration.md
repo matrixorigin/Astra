@@ -287,6 +287,41 @@ CREATE TABLE approval_requests (
 );
 ```
 
+### 5.4 Snapshot-Scoped Permissions
+
+Permissions are not just about operations—they also control **which data versions** a user can access.
+
+**Design**:
+- Each user role has an associated set of accessible snapshots
+- `admin` and `auditor` roles can access all historical snapshots
+- `developer` role can access snapshots from the last 30 days
+- `viewer` role can only access the current state (no time-travel)
+
+**Schema Extension**:
+```sql
+CREATE TABLE snapshot_permissions (
+  permission_id   VARCHAR(64) PRIMARY KEY,
+  user_id         VARCHAR(255),
+  role            VARCHAR(50),           -- 'admin' | 'auditor' | 'developer' | 'viewer'
+  snapshot_pattern VARCHAR(255),         -- glob pattern, e.g. 'prod_*' or '*'
+  max_age_days    INT,                   -- NULL = unlimited, 30 = last 30 days only
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_user (user_id),
+  INDEX idx_role (role)
+);
+```
+
+**Enforcement**:
+- All time-travel queries (`{SNAPSHOT = 'name'}`) pass through permission check
+- Write operations on snapshots are always blocked (snapshots are read-only)
+- Sandbox creation from snapshot requires `developer` or higher role
+- Training data export from snapshot requires `admin` role
+
+**Use Cases**:
+- Compliance: Auditors can review any historical state
+- Security: Interns cannot access historical data that may contain sensitive information
+- Cost control: Limit who can create expensive snapshot-based experiments
+
 ## 6. Risk Control
 
 ### 6.1 Rate Limiting
@@ -403,6 +438,16 @@ def execute_github_operation(operation, dry_run=False):
 - Dry-run operations marked with `is_dry_run=TRUE`
 - On replay: Filter `WHERE is_dry_run = FALSE`
 - Ensures replay reproduces only real execution chain, not simulations
+
+### 6.5 Hallucination Prevention for GitHub Operations
+
+When the agent reports GitHub data (PR status, CI results, issue counts), the Hallucination Firewall verifies claims against actual GitHub API data or cached snapshots:
+
+- Agent says "PR #123 has 5 files changed" → verify against stored github_operations result
+- Agent says "All CI checks passing" → verify against most recent ci_status skill result
+- If verification fails: annotate response with warning, do not deliver unverified claims
+
+This is especially critical for GitHub operations because incorrect information can lead to wrong merge decisions.
 
 ## 7. Skills and Use Cases
 
@@ -521,6 +566,8 @@ def execute_github_operation(operation, dry_run=False):
 - Issue triage
 - CI analysis
 - Approval workflows
+- Snapshot-scoped permissions
+- Hallucination verification for GitHub data claims
 
 ### Phase 4: Cross-Repo Coordination
 - Multi-repo skills
@@ -591,6 +638,16 @@ def execute_github_operation(operation, dry_run=False):
 - **Jira**: Issue sync
 - **Datadog**: Metrics export
 - **PagerDuty**: Incident management
+
+### 11.4 Regression Gate for GitHub Skills
+
+Before deploying new versions of GitHub skills (e.g., updated PR review logic), automatically:
+1. Create snapshot of current state
+2. Replay recent GitHub skill executions against snapshot
+3. Compare results with original outputs
+4. Gate deployment on quality metrics
+
+This ensures GitHub skill updates don't degrade review quality or introduce errors.
 
 ---
 

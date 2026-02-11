@@ -42,8 +42,8 @@ def chat(user_id, model, mode):
     db = Database()
     session_mgr = SessionManager(db)
     logger = EventLogger(db)
-    llm_client = LLMClient(db, provider='openai', model=model)
-    # context_mgr = ContextManager(db) # ChatLoop might handle context?
+    llm_client = LLMClient(db)
+    context_mgr = ContextManager(db)
     
     # Register skills
     skill_registry = SkillRegistry(db)
@@ -79,11 +79,25 @@ def chat(user_id, model, mode):
             # Run Chat Loop Step
             click.echo("Agent> ", nl=False)
             
+            # Build context from history
+            try:
+                ctx = context_mgr.build_context(
+                    session_id=session.session_id,
+                    query=user_input,
+                )
+                context_dict = {
+                    "system_prompt": ctx.system_prompt,
+                    "selected_events": ctx.selected_events,
+                }
+            except Exception:
+                context_dict = None
+            
             # Run async loop
             response = asyncio.run(chat_loop.run_step(
                 user_input=user_input, 
                 session_id=session.session_id,
-                user_id=user_id
+                user_id=user_id,
+                context=context_dict,
             ))
             
             click.echo(response)

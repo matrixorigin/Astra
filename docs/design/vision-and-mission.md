@@ -2,7 +2,7 @@
 
 ## Vision
 
-**A platform of intelligent digital employees** that act as virtual engineers, observing, operating, testing, developing, and evolving across code, test, and data repositories. These agents scale routine and complex engineering workflows without increasing headcount, while **every interaction generates high-quality data**: captured, versioned, analyzed, and leveraged to perpetually refine agents, prompts, memory structures, workflows, and even the underlying models. Deeply integrated with MatrixOne, this system transforms raw interactions into actionable insights, enabling self-evolution and producing robust, traceable engineering outputs that rival or surpass human-led processes.
+**A platform of intelligent digital employees** that act as virtual engineers, observing, operating, testing, developing, and evolving across code, test, and data repositories. These agents achieve **Deterministic Agent through Data Versioning**—where Git for Data serves as the architectural spine controlling the deterministic boundary of every agent decision. Agent Decision = LLM(versioned_prompt, versioned_skill, versioned_context_snapshot, versioned_memory, fixed_llm_params). When 4 of 5 inputs are precisely controlled through data versioning, LLM non-determinism is constrained to a minimal range. **Every interaction generates high-quality data**: captured, versioned, analyzed, and leveraged to perpetually refine agents, prompts, memory structures, workflows, and even the underlying models. This system transforms raw interactions into actionable insights, enabling self-evolution and producing robust, traceable engineering outputs that rival or surpass human-led processes.
 
 ## Mission
 
@@ -13,6 +13,31 @@ Build an agentic system that:
 2. **Evolves through self-training**: Every service interaction—from conversations to task executions—produces **recorded data** including histories, summaries, ratings, outcomes, and feedback. This data drives **continuous fine-tuning** (e.g., user-specific, role-based, or task-specialized models), **prompt engineering**, **context optimization**, **memory enhancements**, and **strategy retrospectives**, creating a closed-loop where serving fuels improvement without human intervention.
 
 3. **Powers on a unified data engine**: Anchor all persistent state in **MatrixOne**, harnessing its advanced features: **Git for data** (version prompts, memory snapshots, and datasets like code—branch, merge, diff, rollback), **data cloning**, **multimodal storage and querying**, **hybrid transactional-analytical processing (HTAP)**, **role-based access control (RBAC)**, and **fine-grained row-level security**. This ensures data is **accumulated securely**, **versioned transparently**, **queried efficiently**, and **consumed intelligently** for analytics, model tuning, agent personalization, and multi-tenant operations—turning the platform into a data-driven powerhouse for engineering excellence.
+
+---
+
+## Core Innovations
+
+### Deterministic Agent through Data Versioning
+Every agent decision's inputs are version-controlled via Git for Data snapshots/branches. This is not 'approximate reproduction' but 'deterministic boundary control'.
+
+### Hallucination Firewall
+Real-time fact verification using Git for Data's time-travel queries. Verify LLM claims against the same data snapshot the LLM saw, ensuring verification and generation operate on identical data state.
+
+### Cost-Aware Branching
+Use historical cost data to predict execution cost before spending. Block or suggest alternatives when budget would be exceeded.
+
+### Data-Versioned Prompt Evolution
+Every prompt change is a data branch. Experiments run in isolation, with full lineage, diffable, mergeable only when quality improves.
+
+### Event Lineage Graph
+Full upstream/downstream traceability for every data point using recursive causal chain queries. Enables contamination detection in training data.
+
+### Snapshot-Scoped Permissions
+Permissions bound to data versions, not just operations. Controls who can see which historical state.
+
+### Sandbox-as-CI
+Every skill/prompt change automatically triggers isolated regression testing in a data sandbox before merge.
 
 ---
 
@@ -37,11 +62,13 @@ Build an agentic system that:
   - **Fine-tuning loops**: Automatically retrain LLMs or distill smaller models (e.g., using LoRA adapters) on domain-specific datasets, such as per-repo code patterns or user feedback.
   - **Prompt and context refinement**: Dynamically adjust prompt templates, context windows, and token budgets based on performance metrics, incorporating techniques for multi-step reasoning.
   - **Workflow automation**: Trigger periodic retraining or hyperparameter sweeps via scheduled jobs, ensuring the system evolves in real-time without downtime.
+  - **Training data versioning**: Every training dataset is a named snapshot. Data scientists can diff datasets across versions, detect contamination via lineage tracking, and reproduce any training run by referencing the exact snapshot used.
 - **Inspired by industry practice**: Blend moltbot-style memory-focused design with shared knowledge bases and data-from-usage feedback loops common in modern agent systems.
 
 ### Core Storage and Integration: MatrixOne
 
 - **Centralized data hub**: All state—conversations, agent memories, evaluation scores, configurations, and derived analytics—resides in MatrixOne, eliminating silos and enabling atomic transactions across operational and analytical workloads.
+- **Git for Data is the architectural spine**: Git for Data is not an optional feature—it is the architectural spine. Every agent decision flows through versioned data: prompts are branched and merged like code, context snapshots are immutable checkpoints, training datasets are versioned artifacts, and regression tests run against snapshot-isolated environments. This transforms MatrixOne from a storage layer into the deterministic control plane for AI agent behavior.
 - **Leveraging MatrixOne features**:
   - **Git for data** (first-class): Treat data like code—version prompts, memory snapshots, and datasets with **branch**, **merge**, **diff**, and **rollback**. Track changes over time (e.g., "What changed in this prompt between v1 and v2?"), reproduce any prior state, and collaborate on data assets with the same workflow engineers use for source code. This is central to traceability, experimentation, and safe iteration of agent configs and training data.
   - **Cloning and branching**: Create instant, space-efficient copies of datasets for A/B testing agent versions or rollback to stable states; complements Git for data for large-table workflows.
@@ -87,6 +114,7 @@ Build an agentic system that:
 - **Integrated feedback loops**: Every task includes optional ratings, explicit feedback, or implicit signals (e.g., task completion time), stored for analysis.
 - **Advanced memory engineering**: Adopt moltbot-inspired hybrid systems (vector + keyword retrieval) for contextual recall, with collaborative filtering to share insights across agents where appropriate.
 - **Evolutionary optimization**: Use data to drive regressions (e.g., "Did this prompt change improve accuracy?"), release gating (e.g., deploy only if scores > threshold), and iterative product enhancements—aligning with data-centric AI and agent-evaluation trends.
+- **Regression Gate**: Before any prompt/skill version is merged to production, automatically replay golden sessions in a snapshot-isolated sandbox. Compute quality delta. Reject merge if regression exceeds threshold. This replaces manual spot-checks with automated, data-versioned quality gates.
 - **Traceability and auditability**: All actions are logged with provenance (e.g., "This fix derived from session #123"), enabling root-cause analysis and compliance.
 - **Self-evolution at scale**: Periodic workflows retrain or tune models on accumulated data, optimizing for efficiency (e.g., distilling to smaller SLMs for edge deployment), ensuring the platform improves with usage.
 
@@ -97,6 +125,13 @@ Build an agentic system that:
 **mo-dev-agent** is a platform for **intelligent digital employees** that:
 
 - **Serve dynamically**: Monitor and manage code/test repos, CI pipelines, regressions, and benchmarks; summarize PRs, create issues/fixes with modular skills and rules; integrate observability tools; operate, test, develop, and collaborate—all via **sandboxed**, **LLM-powered** execution that handles natural language and multimodal inputs.
+- **Achieve deterministic control**: Through **Deterministic Agent through Data Versioning**, where Git for Data serves as the architectural spine controlling agent decision boundaries.
+- **Prevent hallucinations**: Via **Hallucination Firewall** using time-travel queries to verify LLM claims against identical data snapshots.
+- **Control costs**: Through **Cost-Aware Branching** that predicts and blocks budget-exceeding operations.
+- **Version everything**: **Data-Versioned Prompt Evolution** treats every prompt change as a data branch with full lineage.
+- **Track lineage**: **Event Lineage Graph** provides full upstream/downstream traceability for contamination detection.
+- **Secure historically**: **Snapshot-Scoped Permissions** bind access control to data versions.
+- **Test automatically**: **Sandbox-as-CI** triggers isolated regression testing before any merge.
 - **Harness history intelligently**: Store and summarize **conversation histories** and **multi-session contexts** per user/team for personalization and continuity.
 - **Drive with data**: **Capture** interactions comprehensively, **analyze** for performance insights, and **optimize** prompts, memory, workflows, and models; fully bound to **MatrixOne** for **Git for data** (version and diff prompts, memory, and datasets like code), **cloning**, **multimodal querying**, **HTAP**, **RBAC**, and **row-level security**.
-- **Evolve autonomously**: Through **automatic fine-tuning**, **strategy retrospectives**, and **feedback-driven iterations**, the system self-improves, producing high-quality, traceable engineering artifacts while scaling to enterprise needs.
+- **Evolve autonomously**: Through **automatic fine-tuning**, **strategy retrospectives**, **Regression Gates**, and **feedback-driven iterations**, the system self-improves, producing high-quality, traceable engineering artifacts while scaling to enterprise needs.

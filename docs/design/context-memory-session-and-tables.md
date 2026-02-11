@@ -28,6 +28,10 @@ We adopt an **event-centric** model so that:
 | **溯源** | **context_snapshot** (JSON) on each LLM-related event captures template id, skills used, history event ids, retrieved chunks; any event can be fully reproduced. |
 | **评分训练** | **event_evaluations** (user/auto scores) and **training_annotations** (labels, dataset_split); **training_eligible** + **quality_score** on events; export pipeline for SFT/RLHF. |
 | **MatrixOne 全栈** | All metadata, events, and configs in MatrixOne; vectors only as **embedding_ref** (external store); no dependency on other stores for core analytics. |
+| **确定性边界控制** | Agent Decision = LLM(versioned_prompt, versioned_skill, versioned_context, versioned_memory, fixed_params); Git for Data controls 4 of 5 inputs, constraining LLM non-determinism to auditable range. |
+| **幻觉防火墙** | hallucination_checks table records every verification; claims verified against same snapshot used for context assembly. |
+| **回归门禁** | gate_results table records every quality gate; snapshot-isolated regression testing before any change reaches production. |
+| **训练数据版本化** | training_datasets table with snapshot_name as version; full lineage from events to datasets. |
 
 **Core shift**: Conversation is no longer “ephemeral context” but **traceable, analyzable, trainable event data**. Business value (e.g. code-review summary) is produced by upper layers via metadata or views; the core event store stays generic and evolution-resistant.
 
@@ -978,6 +982,71 @@ CREATE TABLE memory_index_queue (
   status      VARCHAR(32) NOT NULL,
   retry_count INT DEFAULT 0,
   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Regression gate results
+CREATE TABLE gate_results (
+  gate_id         VARCHAR(64) PRIMARY KEY,
+  change_type     VARCHAR(50) NOT NULL,   -- 'skill_change' | 'prompt_change' | 'config_change'
+  change_id       VARCHAR(255) NOT NULL,  -- e.g. 'summarize_pr@2.0.0'
+  snapshot_used   VARCHAR(255) NOT NULL,  -- Git for Data snapshot name
+  sessions_tested INT NOT NULL,
+  error_rate      DECIMAL(5,4),
+  passed          BOOLEAN NOT NULL,
+  metrics         JSON,                   -- detailed metrics breakdown
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_change (change_type, change_id),
+  INDEX idx_created (created_at)
+);
+
+-- Training datasets (versioned via snapshots)
+CREATE TABLE training_datasets (
+  dataset_id      VARCHAR(64) PRIMARY KEY,
+  name            VARCHAR(255) NOT NULL,
+  snapshot_name   VARCHAR(255) NOT NULL,  -- Git for Data snapshot = dataset version
+  event_count     INT NOT NULL,
+  pair_count      INT NOT NULL,           -- SFT instruction-response pairs
+  criteria        JSON NOT NULL,          -- selection criteria used
+  quality_stats   JSON,                   -- avg_score, score_distribution, etc.
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  created_by      VARCHAR(255),
+  INDEX idx_name (name),
+  INDEX idx_snapshot (snapshot_name)
+);
+
+-- Hallucination verification log
+CREATE TABLE hallucination_checks (
+  check_id        VARCHAR(64) PRIMARY KEY,
+  event_id        VARCHAR(64) NOT NULL,   -- LLM response event
+  session_id      VARCHAR(64) NOT NULL,
+  snapshot_used   VARCHAR(255),           -- snapshot used for verification
+  claims_total    INT NOT NULL,
+  claims_verified INT NOT NULL,
+  claims_contradicted INT NOT NULL,
+  claims_unverifiable INT NOT NULL,
+  safe_to_deliver BOOLEAN NOT NULL,
+  contradictions  JSON,                   -- details of contradicted claims
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_event (event_id),
+  INDEX idx_session (session_id),
+  INDEX idx_safe (safe_to_deliver)
+);
+
+-- Prompt experiment branches
+CREATE TABLE prompt_experiments (
+  experiment_id   VARCHAR(64) PRIMARY KEY,
+  template_id     VARCHAR(64) NOT NULL,
+  branch_name     VARCHAR(255) NOT NULL,  -- Git for Data branch/snapshot
+  hypothesis      TEXT,
+  candidate_content TEXT NOT NULL,
+  baseline_metrics JSON,
+  experiment_metrics JSON,
+  quality_delta   DECIMAL(5,4),
+  status          VARCHAR(50) DEFAULT 'running', -- 'running' | 'passed' | 'failed' | 'merged'
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  completed_at    TIMESTAMP,
+  INDEX idx_template (template_id),
+  INDEX idx_status (status)
 );
 ```
 

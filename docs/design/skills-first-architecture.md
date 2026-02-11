@@ -68,6 +68,17 @@ An agent **IS**:
    - LLM pricing versioned (llm_pricing table)
    - **Replay uses exact versions from the past**
 
+7. **Sandbox-as-CI for Every Change**
+   - Every skill version change triggers automated regression testing
+   - Tests run in snapshot-isolated sandbox (Git for Data)
+   - Quality gate must pass before new version becomes active
+   - Full data lineage: which snapshot, which sessions tested, what metrics
+
+8. **Permission Enforcement at Framework Level**
+   - AgentExecutor MUST validate permissions before skill execution
+   - Permissions are snapshot-scoped: control who sees which data version
+   - Framework enforces, skills never self-check
+
 4. **Everything Flows Through Events**
    - User query → event
    - Skill selection → event
@@ -235,6 +246,13 @@ class SummarizePRSkill(Skill):
 Register → Store metadata in skills_registry (with version)
          → Keep in-memory for fast lookup
          → Archive old versions (don't delete)
+
+CI Gate  → On version change, auto-create snapshot sandbox
+         → Replay golden sessions against new version
+         → Compute quality delta (error rate, score change)
+         → Pass: activate new version
+         → Fail: reject, keep old version active
+         → Record gate_results with full lineage
 
 Execute  → Framework validates requirements
          → Framework resolves repo_id
@@ -729,6 +747,12 @@ Response:
 **Question 5**: Can we build Web UI without changing backend?  
 **Answer**: Yes - REST API is client-agnostic.
 
+**Question 6**: Can we automatically regression-test skill changes before deployment?
+**Answer**: Yes - Sandbox-as-CI creates snapshot sandbox, replays golden sessions, computes quality delta, and gates deployment.
+
+**Question 7**: Can we prevent hallucinations at the framework level?
+**Answer**: Yes - Hallucination Firewall verifies LLM claims against versioned data snapshots before delivery.
+
 **Conclusion**: Design is **extensible** and **future-proof**.
 
 ---
@@ -759,6 +783,12 @@ Response:
    → Skill returns SkillOutput(success=False, error="PR #123 not found")
    → Agent explains error to user
    → Log failure event
+
+5. Permission violation at execution time
+   → AgentExecutor checks SkillRequirement against session context
+   → If insufficient: return error "Skill 'X' requires WRITE access, current scope is READ"
+   → Log permission_denied event to conversation_events
+   → Never execute the skill
 ```
 
 **Error Handler Architecture**:
@@ -986,6 +1016,19 @@ def select_skill(query: str, repo_id: int):
 - Streaming responses
 - Response caching
 - Parallel skill execution (if multiple skills needed)
+
+---
+
+### 6. Hallucination Firewall Integration
+
+Before delivering any LLM response to the user, the framework runs a hallucination check:
+
+1. Extract verifiable claims from response (numeric values, historical references)
+2. Verify against the same data snapshot used to build the LLM's context
+3. If contradictions found: annotate response with warnings, or block delivery
+4. Log verification results as events (event_type = 'hallucination_check')
+
+This is framework-level behavior, not skill-level. Skills don't implement verification—the framework does.
 
 ---
 

@@ -386,6 +386,7 @@ skills:
 - ✅ GitHub skills → GPT-4
 - ✅ Docs skills → Claude 3 Sonnet
 - ✅ 优先级/成本自适应调整
+- ✅ Sandbox-as-CI integration for automated regression testing
 
 **效果对比**：
 ```python
@@ -405,6 +406,62 @@ LLM 直接输出: code_review(pr_id="repo/123", pr_number=123, focus="performanc
    - 自动调整优先级
    - 成本优化
 
+## Sandbox-as-CI for Skill Changes
+
+Every skill version change triggers automated regression testing before activation.
+
+### CI Workflow
+
+```
+Skill Change Detected (new version registered)
+    │
+    ▼
+1. Create snapshot sandbox
+    │
+    ▼
+2. Load golden sessions (quality_score >= 4.0)
+    │
+    ▼
+3. Replay sessions with new skill version
+    │
+    ▼
+4. Compute quality delta
+    │
+    ├─ Pass (error_rate < 5%) → Activate new version
+    │
+    └─ Fail (error_rate >= 5%) → Reject, keep old version
+    │
+    ▼
+5. Record gate_results with full lineage
+    │
+    ▼
+6. Cleanup sandbox
+```
+
+### Integration with Skill Registry
+
+```python
+class SkillRegistry:
+    def register(self, skill: Skill, is_active: bool = True, **kwargs) -> None:
+        # ... existing registration logic ...
+        
+        # NEW: Trigger CI gate before activation
+        if is_active:
+            gate = SandboxCI(self.db, sandbox, git)
+            result = gate.on_skill_change(skill.name, skill.version)
+            
+            if not result['verdict'] == 'PASS':
+                logger.warning(f"Skill {skill.name}@{skill.version} failed CI gate")
+                is_active = False  # Don't activate failed skill
+```
+
+### Benefits
+
+- **No manual testing**: Every change is automatically validated
+- **Snapshot isolation**: Tests don't affect production
+- **Full lineage**: Know exactly which sessions were tested, what metrics were computed
+- **Rollback safety**: Failed skills never reach production
+
 ## 总结
 
 **当前状态**: 扁平 skills，无选择机制
@@ -414,5 +471,6 @@ LLM 直接输出: code_review(pr_id="repo/123", pr_number=123, focus="performanc
 2. ✅ 实现混合选择器（规则 + LLM）
 3. ✅ 记录 skill 执行历史
 4. ✅ 支持依赖解析
+- ✅ Sandbox-as-CI: Every skill change automatically regression-tested before activation
 
 **下一步**: 实现 SkillSelector 和 SkillOrchestrator

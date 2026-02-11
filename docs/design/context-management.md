@@ -460,6 +460,35 @@ ORDER BY date;
 
 **Design Principle**: **Context is data**—store it, version it, query it.
 
+### Hallucination Verification via Snapshots
+
+Context snapshots enable a powerful hallucination detection mechanism:
+
+1. When the LLM generates a response, the context snapshot records exactly what data it saw
+2. The Hallucination Firewall extracts verifiable claims from the response
+3. Each claim is verified against the **same snapshot** using `{SNAPSHOT = 'name'}` queries
+4. This eliminates false positives from data drift: verification sees exactly what generation saw
+
+Workflow:
+```python
+# 1. Build context (snapshot recorded)
+context = context_manager.build_context(session_id, query)
+snapshot_id = context_manager.save_snapshot(context, session_id)
+
+# 2. Call LLM
+response = llm.chat(context.to_prompt())
+
+# 3. Verify against same snapshot
+firewall = HallucinationFirewall(db, git)
+verification = firewall.verify_response(response.content, session_id, snapshot_name=snapshot_id)
+
+# 4. Deliver only if safe
+if verification['safe_to_deliver']:
+    return response
+else:
+    return annotate_with_warnings(response, verification['contradictions'])
+```
+
 ---
 
 ## Key Design Decisions
@@ -617,6 +646,12 @@ User Query
    └─ Documentation
     ↓
 8. Send to LLM
+    ↓
+9. Hallucination check
+   ├─ Extract verifiable claims from LLM response
+   ├─ Verify against context snapshot
+   ├─ Annotate or block if contradictions found
+   └─ Log verification event
 ```
 
 ### 2. Context Evolution (Across Requests)
@@ -740,6 +775,17 @@ prompt = f"""
 
 **Design Principle**: **Anchor + Recency + Retrieval** for ultra-long conversations.
 
+### 5. Cost-Aware Context Assembly
+
+**Idea**: Predict total LLM cost before context assembly and adjust context size accordingly.
+
+- Query historical cost data for similar skill + context size combinations
+- If predicted cost exceeds remaining budget: reduce context size (fewer history events, skip RAG)
+- If predicted cost is well within budget: expand context for better quality
+- Log prediction vs actual for continuous calibration
+
+This transforms context assembly from "fill to budget" to "optimize cost-quality tradeoff".
+
 ### 3. Adaptive Context Windows
 
 **Idea**: Dynamically adjust context size based on task complexity.
@@ -785,6 +831,8 @@ prompt = f"""
 5. **Adaptability**: Works across different task types (code, planning, debugging)
 6. **Reproducibility**: Can reproduce exact context from any point in time via snapshots
 7. **Cost Efficiency**: Leverage LLM native caching to reduce cost by 90%
+8. **Hallucination Prevention**: Verifiable claims in LLM responses checked against versioned data with >80% detection rate
+9. **Cost Prediction**: Context assembly cost predicted within 20% of actual before execution
 
 **The ultimate test**: Can the agent handle a 6-month-old conversation with 10,000 events and still give relevant answers?
 
@@ -802,6 +850,8 @@ prompt = f"""
 4. **LLM Native Caching**: Separate static/dynamic context to maximize KV cache hits
 5. **Multi-Signal Scoring**: Combine semantic, temporal, causal, and explicit signals
 6. **Task-Aware Allocation**: Dynamic token budget based on task type
+7. **Hallucination Firewall**: Verify LLM claims against the same snapshot used for context assembly—ensuring verification and generation see identical data
+8. **Cost-Aware Context Assembly**: Predict LLM cost from historical data before assembly; adjust context size to stay within budget
 
 **Design Philosophy**: **Intelligence through selection, not accumulation.**
 

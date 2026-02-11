@@ -12,6 +12,10 @@ This document bridges the gap between design vision and operational completeness
 - **Sandbox-based validation** workflows
 - **Skill/Prompt evolution** closed-loop automation
 - **Acceptance criteria** for production readiness
+- **Regression Gate with data lineage** for automated quality gates
+- **Prompt Evolution Pipeline** with branch-based experimentation
+- **Sandbox-as-CI** for automated testing of every skill/prompt change
+- **Training Data Pipeline** with versioned datasets
 
 **Goal**: Make "replay + sandbox + evaluation + evolution" provably operational, not just aspirational.
 
@@ -555,22 +559,220 @@ time mo-agent sandbox create-from-snapshot test-sandbox prod-snapshot
 
 ---
 
+## 9. Regression Gate with Data Lineage
+
+Every skill/prompt change must pass through an automated regression gate before reaching production.
+
+Workflow:
+1. Create snapshot of current production state
+2. Load golden sessions (quality_score >= 4.0, training_eligible = TRUE, last 50)
+3. Replay golden sessions against the snapshot
+4. Compute quality metrics (error rate, score delta)
+5. Pass/fail decision (error rate < 5%)
+6. Record gate result with full data lineage (which snapshot, which sessions, what metrics)
+
+Schema:
+```sql
+CREATE TABLE gate_results (
+  gate_id VARCHAR(64) PRIMARY KEY,
+  change_type VARCHAR(50) NOT NULL,
+  change_id VARCHAR(255) NOT NULL,
+  snapshot_used VARCHAR(255) NOT NULL,
+  sessions_tested INT NOT NULL,
+  error_rate DECIMAL(5,4),
+  passed BOOLEAN NOT NULL,
+  metrics JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_change (change_type, change_id),
+  INDEX idx_created (created_at)
+);
+```
+
+---
+
+## 10. Prompt Evolution Pipeline
+
+Data-versioned prompt experimentation follows a Git-like workflow:
+
+1. **Propose change**: Create new prompt variant
+2. **Create data branch**: Branch conversation_events table
+3. **Evaluate on branch**: Run experiments in isolated environment
+4. **Merge if better**: Promote successful variants to production
+
+Each experiment maintains full lineage:
+- Which baseline prompt was used
+- What changes were made
+- Which sessions were tested
+- Performance comparison metrics
+- Decision rationale
+
+Implementation:
+```python
+class PromptEvolution:
+    def experiment(self, prompt_id: str, variant: str) -> ExperimentResult:
+        # Create data branch
+        branch_name = f"prompt_exp_{prompt_id}_{timestamp}"
+        self.branch.create(branch_name, "conversation_events")
+        
+        # Run evaluation
+        results = self.evaluate_prompt(variant, branch_name)
+        
+        # Compare with baseline
+        baseline = self.load_baseline_metrics(prompt_id)
+        improvement = self.compare_metrics(results, baseline)
+        
+        # Record experiment
+        self.record_experiment(prompt_id, variant, results, improvement)
+        
+        return ExperimentResult(
+            improved=improvement > 0.05,
+            metrics=results,
+            recommendation="merge" if improvement > 0.05 else "reject"
+        )
+```
+
+---
+
+## 11. Sandbox-as-CI
+
+Automatically trigger sandbox-based regression tests on every skill/prompt change:
+
+1. **Change detection**: Monitor skill registry and prompt updates
+2. **Sandbox creation**: Spin up isolated test environment
+3. **Test execution**: Run regression suite against change
+4. **Result recording**: Store test outcomes with full context
+5. **Cleanup**: Destroy sandbox after test completion
+
+Workflow:
+```python
+class SandboxCI:
+    def on_change(self, change_event: ChangeEvent):
+        # Create test sandbox
+        sandbox_id = f"ci_{change_event.id}_{uuid4()}"
+        self.sandbox.create(sandbox_id)
+        
+        try:
+            # Load test suite
+            tests = self.load_regression_tests(change_event.type)
+            
+            # Execute in sandbox
+            results = []
+            for test in tests:
+                result = self.execute_test(test, sandbox_id)
+                results.append(result)
+            
+            # Aggregate results
+            summary = self.aggregate_results(results)
+            
+            # Record outcome
+            self.record_ci_run(change_event.id, summary)
+            
+            # Block deployment if failed
+            if not summary.passed:
+                self.block_deployment(change_event.id, summary.failures)
+                
+        finally:
+            # Always cleanup
+            self.sandbox.delete(sandbox_id)
+```
+
+---
+
+## 12. Training Data Pipeline
+
+Automated training data extraction with versioned datasets:
+
+1. **Quality filtering**: Extract high-quality conversation events (score >= 4.0)
+2. **SFT pair creation**: Build supervised fine-tuning pairs from causal chains
+3. **Dataset versioning**: Snapshot each dataset with metadata
+4. **Cross-version comparison**: Track data drift and quality changes
+5. **Contamination detection**: Ensure test/train separation
+
+Schema:
+```sql
+CREATE TABLE training_datasets (
+  dataset_id VARCHAR(64) PRIMARY KEY,
+  version VARCHAR(32) NOT NULL,
+  source_snapshot VARCHAR(255) NOT NULL,
+  quality_threshold DECIMAL(3,2),
+  record_count INT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  metadata JSON,
+  INDEX idx_version (version),
+  INDEX idx_created (created_at)
+);
+
+CREATE TABLE sft_pairs (
+  pair_id VARCHAR(64) PRIMARY KEY,
+  dataset_id VARCHAR(64) NOT NULL,
+  input_text TEXT NOT NULL,
+  target_text TEXT NOT NULL,
+  source_session VARCHAR(64),
+  source_event VARCHAR(64),
+  quality_score DECIMAL(3,2),
+  FOREIGN KEY (dataset_id) REFERENCES training_datasets(dataset_id)
+);
+```
+
+Implementation:
+```python
+class TrainingDataPipeline:
+    def extract_dataset(self, version: str, quality_threshold: float = 4.0) -> Dataset:
+        # Create snapshot for reproducibility
+        snapshot_id = f"training_data_{version}_{timestamp}"
+        self.db.execute(f"CREATE SNAPSHOT {snapshot_id} FOR ACCOUNT sys")
+        
+        # Extract high-quality events
+        events = self.db.query("""
+            SELECT session_id, event_id, content, quality_score
+            FROM conversation_events
+            WHERE quality_score >= ?
+              AND training_eligible = TRUE
+            ORDER BY created_at DESC
+        """, (quality_threshold,))
+        
+        # Build SFT pairs
+        pairs = []
+        for event in events:
+            if event.event_type == "llm_response":
+                input_event = self.get_parent_event(event.parent_event_id)
+                pairs.append({
+                    "input": input_event.content,
+                    "target": event.content,
+                    "quality": event.quality_score
+                })
+        
+        # Store dataset
+        dataset = self.create_dataset(version, snapshot_id, pairs)
+        return dataset
+```
+
+---
+
 ## 8. Implementation Priority
 
 **Critical (Week 1-2)**:
 1. Tool mocking layer
 2. Skill classification system
 3. Replay mode enforcement
+4. Regression gate with data lineage
 
 **High (Week 3-4)**:
-4. Code execution sandbox
-5. Snapshot-based sandbox creation
-6. Validation checks
+5. Code execution sandbox
+6. Snapshot-based sandbox creation
+7. Validation checks
+8. Sandbox-as-CI automation
 
 **Medium (Week 5-6)**:
-7. Columnar metrics optimization
-8. Mock GitHub server
-9. Comprehensive tests
+9. Columnar metrics optimization
+10. Mock GitHub server
+11. Prompt evolution pipeline
+12. Training data pipeline
+
+**Low (Week 7-8)**:
+13. Comprehensive tests
+14. Performance optimizations
+15. Advanced analytics
 
 ---
 
@@ -581,14 +783,19 @@ This document addresses the **fatal gap** of side-effect isolation, making the r
 1. **Execution Sandbox**: Tool mocking prevents real API calls during replay
 2. **Code Sandbox**: Docker isolation prevents malicious code execution
 3. **MatrixOne Optimizations**: Snapshots enable instant sandbox creation
+4. **Regression Gate**: Automated quality gates with full data lineage
+5. **Prompt Evolution**: Branch-based experimentation with version control
+6. **Sandbox-as-CI**: Continuous integration for every change
+7. **Training Pipeline**: Versioned datasets with contamination detection
 
-**Without these additions, the entire replay system would be dangerous and unusable.** With them, it becomes a **production-ready quality gate**.
+**Without these additions, the entire replay system would be dangerous and unusable.** With them, it becomes a **production-ready quality gate** with comprehensive automation.
 
 **Next steps**:
 1. Implement tool mocking layer (Week 1-2)
-2. Classify all existing skills
+2. Build regression gate with data lineage
 3. Add code execution sandbox
-4. Integrate with replay gate
-5. Comprehensive testing
+4. Deploy sandbox-as-CI automation
+5. Create training data pipeline
+6. Comprehensive testing
 
-**Key insight**: Side-effect isolation is not optional—it's **critical infrastructure** for any replay/evaluation system.
+**Key insight**: Side-effect isolation is not optional—it's **critical infrastructure** for any replay/evaluation system. The additional automation capabilities transform this from a manual tool into a complete MLOps platform.

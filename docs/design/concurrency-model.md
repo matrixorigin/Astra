@@ -202,6 +202,15 @@ sandbox: dev_agent_tenant_a_sandbox_exp1
 | Log event | ~5-10ms | No | 1000+ QPS |
 | Query events | ~10-50ms | No | High |
 
+### Experiments & Gates
+
+| Operation | Latency | Blocking | Scalability |
+|-----------|---------|----------|-------------|
+| Create experiment snapshot | ~100ms | No | 10+ parallel |
+| Run regression gate | ~30-60s | No | Parallel with production |
+| Build training dataset | ~5-30s | No | Parallel with production |
+| Hallucination check | ~50-200ms | No | Per-request |
+
 ---
 
 ## 8. Best Practices
@@ -258,3 +267,89 @@ sandbox: dev_agent_tenant_a_sandbox_exp1
 1. **PITR integration** - Continuous time-travel
 2. **Cross-branch queries** - Query multiple branches
 3. **Branch permissions** - Fine-grained access control
+
+---
+
+## 11. Branch-Level Isolation for Experiments
+
+### Scenario: Multiple Prompt Experiments Running in Parallel
+
+**Architecture**:
+```
+Experiment A: snapshot_prompt_exp_a (Git for Data snapshot)
+Experiment B: snapshot_prompt_exp_b (Git for Data snapshot)
+Experiment C: snapshot_prompt_exp_c (Git for Data snapshot)
+Main DB: dev_agent (unchanged)
+```
+
+**Isolation Level**: Snapshot-level
+- Each experiment operates on its own snapshot
+- Read-only queries via `{SNAPSHOT = 'name'}` syntax
+- No cross-experiment interference
+- Main database unaffected
+
+**Guarantees**:
+- ✅ Experiment A's prompt changes don't affect Experiment B
+- ✅ No experiment affects production data
+- ✅ Can run 10+ experiments in parallel
+- ✅ Zero storage overhead until writes (copy-on-write)
+
+### Scenario: Regression Gate Running While Production Serves Traffic
+
+**Architecture**:
+```
+Production: dev_agent (serving live traffic)
+Gate: snapshot_gate_123 (isolated regression test)
+```
+
+**Isolation**:
+- Gate creates a snapshot of production state
+- Replays golden sessions against the snapshot
+- Production continues serving traffic normally
+- Gate results written to gate_results table in main DB
+
+**Guarantees**:
+- ✅ Gate testing doesn't affect production latency
+- ✅ Production writes don't affect gate's snapshot
+- ✅ Deterministic: gate always sees consistent state
+
+### Scenario: Training Data Pipeline Running Alongside Production
+
+**Architecture**:
+```
+Production: dev_agent (serving + logging events)
+Pipeline: snapshot_dataset_v3 (building training data)
+```
+
+**Isolation**:
+- Pipeline creates snapshot at dataset build time
+- Queries events from snapshot (consistent point-in-time view)
+- Production continues logging new events
+- New events after snapshot are not in the dataset (by design)
+
+**Guarantees**:
+- ✅ Dataset is reproducible (same snapshot = same data)
+- ✅ No interference with production
+- ✅ Dataset version = snapshot name (traceable)
+
+---
+
+## 12. Hallucination Firewall Concurrency
+
+### Scenario: Hallucination Check While Data is Being Written
+
+**Architecture**:
+```
+User A: LLM response generated, hallucination check running
+User B: New events being written to conversation_events
+```
+
+**Isolation**:
+- Hallucination check uses `{SNAPSHOT = 'name'}` from context_snapshot
+- Verification queries see the exact data state the LLM saw
+- User B's concurrent writes don't affect the verification
+
+**Guarantees**:
+- ✅ Verification is snapshot-consistent (no false positives from data drift)
+- ✅ No blocking between verification and writes
+- ✅ Deterministic: same snapshot always gives same verification result

@@ -18,6 +18,17 @@ class ModernSkillSelector:
         self.llm = llm_client
         self.rule_selector = SkillSelector(db)  # For retrieval
     
+    def get_tools_schema(
+        self,
+        query: str,
+        max_candidates: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Return OpenAI tool schemas for candidate skills (no LLM call)."""
+        candidates = self.rule_selector.select_skills(query, max_skills=max_candidates)
+        if not candidates:
+            return []
+        return [self._skill_to_tool_schema(skill) for skill in candidates]
+
     def select_and_execute(
         self,
         query: str,

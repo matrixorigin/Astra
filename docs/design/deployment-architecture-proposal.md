@@ -47,6 +47,7 @@ This proposal defines the deployment architecture for mo-dev-agent, aligning wit
 | **Time-Point Traceability** | All tables enable MatrixOne Git for Data (AS OF queries) | Replay precisely restores "then" skill code/prompt templates |
 | **Cache as Performance Only** | Local cache (memory/file) must be disposable and rebuildable | Service restart doesn't affect data integrity |
 | **Metadata as Asset** | Skills docs, prompt descriptions, workflow YAML all in DB | Satisfies audit/compliance/knowledge requirements |
+| **Deterministic Boundary Control** | Agent Decision = f(versioned_prompt, versioned_skill, versioned_context, versioned_memory, fixed_params); Git for Data controls 4 of 5 inputs | LLM non-determinism constrained to auditable range |
 
 **Design Mantra**:
 > "When you say 'skill documentation in MatrixOne', you're not storing data — you're injecting traceable memory into the system."
@@ -67,6 +68,10 @@ This proposal defines the deployment architecture for mo-dev-agent, aligning wit
 2. **Time-Point Sandbox ("平行宇宙实验台")**: Test new prompts/skills on historical data with zero production impact
 3. **Continuous Evolution**: Feedback → Evaluation → Training → Improved Models
 4. **Extensible Skills System**: Skills as first-class citizens with versioning, composition, and marketplace support
+5. **Hallucination Firewall**: Verify LLM claims against versioned data snapshots before delivery
+6. **Cost-Aware Branching**: Predict execution cost from historical data; block or suggest alternatives when budget exceeded
+7. **Regression Gate (Sandbox-as-CI)**: Automated quality gates for every skill/prompt change using snapshot-isolated testing
+8. **Training Data Pipeline**: Versioned datasets built from high-quality events with full lineage tracking
 
 ### 4. Architectural Growth Principles
 
@@ -91,6 +96,9 @@ This proposal defines the deployment architecture for mo-dev-agent, aligning wit
 | **Replay** | ❌ Force bypass cache | Precise historical restoration; cache causes distortion |
 | **Sandbox Experiment** | ❌ Query MatrixOne AS OF | Experiments need isolated historical state |
 | **Service Restart** | ✅ Cache auto-rebuilds | No data loss risk (all data in MatrixOne) |
+| **Hallucination Check** | ❌ Force use snapshot queries | Verification must see exact data state LLM saw; cache causes false results |
+| **Regression Gate** | ❌ Query snapshot directly | Gate must test against consistent historical state |
+| **Training Pipeline** | ❌ Query snapshot directly | Dataset must be reproducible from snapshot |
 
 **Implementation Guideline**:
 - Cache invalidation on write: When skill/prompt updated, clear cache entry
@@ -100,6 +108,22 @@ This proposal defines the deployment architecture for mo-dev-agent, aligning wit
 ---
 
 ## Project Structure
+
+### Innovation Layer Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│  Innovation Layer                               │
+│  ├─ Hallucination Firewall (snapshot-consistent)  │
+│  ├─ Cost-Aware Branching (predictive budget)      │
+│  ├─ Regression Gate (sandbox-as-CI)               │
+│  ├─ Prompt Evolution Pipeline (branch-based)      │
+│  ├─ Training Data Pipeline (versioned datasets)   │
+│  └─ Event Lineage Tracker (contamination detect)  │
+└─────────────────────────────────────────────────┘
+```
+
+### Directory Structure
 
 ```
 mo-dev-agent/                  # Project root

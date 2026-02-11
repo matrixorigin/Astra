@@ -1,5 +1,21 @@
 # Git for Data Features - Complete Design
 
+## 0. Design Philosophy: Git for Data as Architectural Spine
+
+Git for Data is not an optional feature—it is the **architectural spine** of mo-dev-agent. Every agent decision flows through versioned data:
+
+| Capability | Git for Data Role |
+|---|---|
+| **Prompt Evolution** | Each prompt change is a data branch; merge only when quality improves |
+| **Hallucination Firewall** | Verify LLM claims against the same snapshot the LLM saw |
+| **Cost Prediction** | Query historical cost data at any time point for accurate estimation |
+| **Regression Gate** | Replay golden sessions against snapshot-isolated environments |
+| **Training Data** | Every dataset is a named snapshot; diff/compare across versions |
+| **Data Lineage** | Trace any output back through causal chains to its data origin |
+| **Permission Control** | Bind access rights to specific data versions, not just operations |
+
+Agent Decision = LLM(prompt@version, skill@version, context@snapshot, memory@branch, llm_params). When 4 of 5 inputs are precisely version-controlled, LLM non-determinism is constrained to a minimal, auditable range. This is **deterministic boundary control**.
+
 ## 1. Time Machine
 
 ### Core Capabilities
@@ -175,7 +191,193 @@ class DiffMerge:
 
 ---
 
-## 5. Feature Priority
+## 5. Hallucination Firewall
+
+### Core Capabilities
+
+**To Be Implemented** ⏳:
+- [ ] Extract verifiable claims from LLM responses
+- [ ] Query same snapshot the LLM saw for verification
+- [ ] Annotate responses with verification status
+- [ ] Block delivery if contradictions found
+- [ ] Confidence scoring for claims
+
+### Use Cases
+
+1. **Fact Verification**: Verify LLM claims against known data
+2. **Consistency Checking**: Ensure responses align with context
+3. **Quality Assurance**: Block hallucinated responses before delivery
+4. **Trust Scoring**: Build confidence metrics for LLM outputs
+
+### API Design
+
+```python
+class HallucinationFirewall:
+    def extract_claims(response_text) -> list[Claim]
+    def verify_claims(claims, snapshot_id) -> list[VerificationResult]
+    def annotate_response(response, verifications) -> AnnotatedResponse
+    def should_block_response(verifications, threshold) -> bool
+    def compute_confidence_score(verifications) -> float
+```
+
+---
+
+## 6. Cost-Aware Branching
+
+### Core Capabilities
+
+**To Be Implemented** ⏳:
+- [ ] Query historical LLM call costs via time-travel
+- [ ] Predict costs before execution
+- [ ] Suggest cheaper alternatives
+- [ ] Enforce budget limits per branch
+- [ ] Cost optimization recommendations
+
+### Use Cases
+
+1. **Budget Control**: Prevent expensive operations
+2. **Cost Optimization**: Choose most cost-effective approaches
+3. **Resource Planning**: Predict costs for experiments
+4. **Alternative Suggestions**: Recommend cheaper models/approaches
+
+### API Design
+
+```python
+class CostAwareBranching:
+    def predict_cost(operation, model, context_size) -> CostEstimate
+    def get_historical_costs(time_range, filters) -> list[CostRecord]
+    def suggest_alternatives(operation, budget_limit) -> list[Alternative]
+    def enforce_budget_limit(branch, budget) -> BudgetPolicy
+    def optimize_for_cost(operation_plan) -> OptimizedPlan
+```
+
+---
+
+## 7. Data-Versioned Prompt Evolution
+
+### Core Capabilities
+
+**To Be Implemented** ⏳:
+- [ ] Create branch for each prompt change
+- [ ] Write candidate prompts to branch
+- [ ] Replay golden sessions on branch
+- [ ] Compute quality delta vs baseline
+- [ ] Merge only if improvement exceeds threshold
+
+### Use Cases
+
+1. **Prompt A/B Testing**: Compare prompt versions scientifically
+2. **Quality Gates**: Only deploy improved prompts
+3. **Rollback Safety**: Revert to previous prompt versions
+4. **Performance Tracking**: Monitor prompt quality over time
+
+### API Design
+
+```python
+class PromptEvolution:
+    def create_prompt_branch(base_version, candidate_prompt) -> Branch
+    def replay_golden_sessions(branch, session_ids) -> ReplayResults
+    def compute_quality_delta(branch_results, baseline_results) -> QualityDelta
+    def merge_if_improved(branch, threshold) -> MergeResult
+    def rollback_to_version(prompt_id, version) -> None
+```
+
+---
+
+## 8. Training Data Pipeline
+
+### Core Capabilities
+
+**To Be Implemented** ⏳:
+- [ ] Build datasets from high-quality events
+- [ ] Create snapshot as dataset version
+- [ ] Build SFT pairs from causal chains
+- [ ] Compare datasets across versions
+- [ ] Detect contamination via lineage
+
+### Use Cases
+
+1. **Dataset Versioning**: Track training data evolution
+2. **Quality Control**: Ensure high-quality training data
+3. **Contamination Detection**: Prevent test data leakage
+4. **Reproducible Training**: Recreate exact training conditions
+
+### API Design
+
+```python
+class TrainingDataPipeline:
+    def build_dataset_from_events(quality_filter, time_range) -> Dataset
+    def create_dataset_snapshot(dataset, version_name) -> Snapshot
+    def build_sft_pairs(causal_chains) -> list[SFTPair]
+    def compare_dataset_versions(v1, v2) -> DatasetDiff
+    def detect_contamination(train_snapshot, test_snapshot) -> ContaminationReport
+```
+
+---
+
+## 9. Event Lineage Graph
+
+### Core Capabilities
+
+**To Be Implemented** ⏳:
+- [ ] Full upstream/downstream traceability
+- [ ] Recursive CTE queries on causal_chain_id/parent_event_id
+- [ ] Contamination detection across datasets
+- [ ] Impact analysis for data changes
+- [ ] Lineage visualization
+
+### Use Cases
+
+1. **Root Cause Analysis**: Trace decisions to source data
+2. **Impact Assessment**: Understand downstream effects
+3. **Contamination Detection**: Find data leakage paths
+4. **Audit Trails**: Complete decision provenance
+
+### API Design
+
+```python
+class EventLineage:
+    def trace_upstream(event_id) -> LineageGraph
+    def trace_downstream(event_id) -> LineageGraph
+    def detect_contamination_paths(source, target) -> list[Path]
+    def analyze_impact(change_event_id) -> ImpactAnalysis
+    def visualize_lineage(event_id, depth) -> LineageVisualization
+```
+
+---
+
+## 10. Snapshot-Scoped Permissions
+
+### Core Capabilities
+
+**To Be Implemented** ⏳:
+- [ ] Bind permissions to data versions
+- [ ] Version-specific access control
+- [ ] Permission inheritance across snapshots
+- [ ] Audit permission changes
+- [ ] Time-bounded access grants
+
+### Use Cases
+
+1. **Data Governance**: Control access to specific data versions
+2. **Compliance**: Ensure proper data access controls
+3. **Experiment Isolation**: Restrict access to experimental data
+4. **Audit Requirements**: Track who accessed what version when
+
+### API Design
+
+```python
+class SnapshotPermissions:
+    def grant_snapshot_access(user, snapshot, permissions) -> Grant
+    def revoke_snapshot_access(user, snapshot) -> None
+    def check_snapshot_permission(user, snapshot, operation) -> bool
+    def list_user_snapshots(user) -> list[SnapshotAccess]
+    def audit_snapshot_access(snapshot, time_range) -> list[AccessLog]
+```
+
+---
+
+## 11. Feature Priority
 
 ### P0 - Immediate Implementation (Core Scenarios) ✅ Completed
 
@@ -194,25 +396,40 @@ class DiffMerge:
    - `list_sandbox_checkpoints()` - List checkpoints
    - `restore_sandbox_to_checkpoint()` - Restore to checkpoint
 
+4. **Hallucination Firewall** ⏳
+   - Verify LLM claims against snapshot data
+   - Block contradictory responses
+
 ### P1 - Near-term Implementation (Enhanced Features)
 
-4. **Time Machine Enhancement**
+5. **Time Machine Enhancement**
    - `diff_checkpoints()` - Compare checkpoints
    - `search_checkpoints()` - Search checkpoints
 
-5. **Sandbox Merge**
+6. **Sandbox Merge**
    - `diff_sandbox_with_main()` - Difference comparison
    - `merge_sandbox_to_main()` - Merge back to main
 
+7. **Cost-Aware Branching**
+   - Historical cost queries
+   - Budget enforcement
+
+8. **Data-Versioned Prompt Evolution**
+   - Prompt A/B testing via branches
+   - Quality-gated merging
+
 ### P2 - Long-term Planning (Advanced Features)
 
-6. **PITR Integration**
-7. **Visualization Tools**
-8. **Permissions and Multi-tenancy**
+9. **PITR Integration**
+10. **Training Data Pipeline**
+11. **Event Lineage Graph**
+12. **Snapshot-Scoped Permissions**
+13. **Visualization Tools**
+14. **Multi-tenancy**
 
 ---
 
-## 6. MatrixOne Capability Mapping
+## 12. MatrixOne Capability Mapping
 
 ### Fully Utilized ✅
 
@@ -229,7 +446,7 @@ class DiffMerge:
 
 ---
 
-## 7. Implementation Roadmap
+## 13. Implementation Roadmap
 
 ### Phase 1: Table-level Sandbox ✅ (Completed)
 - Implement table-level cloning
@@ -246,14 +463,44 @@ class DiffMerge:
 - Merge strategies
 - Conflict detection
 
-### Phase 4: PITR Integration (1 month)
+### Phase 4: Hallucination Firewall (3 weeks)
+- Claim extraction from LLM responses
+- Snapshot-consistent verification
+- Response blocking logic
+
+### Phase 5: Cost-Aware Branching (2 weeks)
+- Historical cost queries
+- Budget enforcement
+- Alternative suggestions
+
+### Phase 6: Prompt Evolution (4 weeks)
+- Branch-based prompt testing
+- Quality measurement
+- Automated merging
+
+### Phase 7: Training Data Pipeline (6 weeks)
+- Dataset versioning
+- SFT pair generation
+- Contamination detection
+
+### Phase 8: Event Lineage (4 weeks)
+- Lineage graph construction
+- Impact analysis
+- Visualization
+
+### Phase 9: PITR Integration (1 month)
 - Enable PITR
 - Time-point queries
 - Automatic history management
 
+### Phase 10: Snapshot Permissions (3 weeks)
+- Version-scoped access control
+- Permission inheritance
+- Audit trails
+
 ---
 
-## 8. Current Status
+## 14. Current Status
 
 ### Implemented Features ✅
 
