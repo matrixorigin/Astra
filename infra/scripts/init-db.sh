@@ -111,6 +111,22 @@ CREATE TABLE IF NOT EXISTS prompt_templates (
   PRIMARY KEY (template_id, version)
 ) COMMENT='Versioned prompt templates (anti-fragility)';
 
+-- llm_feedback: User feedback on LLM responses
+CREATE TABLE IF NOT EXISTS llm_feedback (
+  feedback_id         VARCHAR(36) PRIMARY KEY,
+  prompt_template_id  VARCHAR(64) NOT NULL,
+  prompt_version      VARCHAR(32) NOT NULL,
+  llm_request_id      VARCHAR(128) NOT NULL,
+  rating              INT NOT NULL COMMENT '1-5 rating',
+  comment             TEXT COMMENT 'User comment',
+  metadata            JSON COMMENT 'Additional metadata',
+  created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  
+  INDEX idx_prompt (prompt_template_id, prompt_version),
+  INDEX idx_rating (rating),
+  INDEX idx_created (created_at)
+) COMMENT='User feedback for prompt optimization';
+
 -- skills_registry: Versioned skill definitions
 CREATE TABLE IF NOT EXISTS skills_registry (
   skill_id            VARCHAR(64) NOT NULL,

@@ -1,6 +1,6 @@
 """Prompt template management with versioning and dynamic updates."""
 
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Any
 from sdk import Database
 from core.logging_config import get_logger
 
@@ -195,35 +195,143 @@ Be helpful, accurate, and concise."""
 
 
 # =============================================================================
-# TODO: Phase 2 - Feedback Collection (Future)
+# Phase 2: Feedback Collection
 # =============================================================================
-# 
-# Collect user feedback on LLM responses to enable prompt optimization.
-# 
-# Dependencies:
-# - llm_feedback table (already exists in schema)
-# - User rating UI/API
-# - Feedback analysis tools
-#
-# Example implementation:
-#
-# class PromptFeedback:
-#     def record_feedback(
-#         self,
-#         prompt_id: str,
-#         prompt_version: str,
-#         llm_response: str,
-#         user_rating: int,  # 1-5
-#         user_comment: Optional[str] = None
-#     ):
-#         """Record user feedback for a prompt."""
-#         self.db.execute("""
-#             INSERT INTO llm_feedback
-#             (prompt_template_id, prompt_version, rating, comment, created_at)
-#             VALUES (%s, %s, %s, %s, NOW())
-#         """, (prompt_id, prompt_version, user_rating, user_comment))
-#
-# =============================================================================
+
+class PromptFeedback:
+    """Collect and analyze user feedback on LLM responses."""
+    
+    def __init__(self, db: Database):
+        self.db = db
+    
+    def record_feedback(
+        self,
+        prompt_template_id: str,
+        prompt_version: str,
+        llm_request_id: str,
+        user_rating: int,
+        user_comment: Optional[str] = None,
+        metadata: Optional[Dict[str, str]] = None
+    ) -> str:
+        """Record user feedback for a prompt.
+        
+        Args:
+            prompt_template_id: Template ID (e.g., 'system_code_review')
+            prompt_version: Version used (e.g., '1.0')
+            llm_request_id: LLM request ID for tracing
+            user_rating: Rating 1-5 (1=poor, 5=excellent)
+            user_comment: Optional text feedback
+            metadata: Optional additional data
+            
+        Returns:
+            feedback_id
+        """
+        from uuid_utils import uuid7
+        import json
+        
+        if not 1 <= user_rating <= 5:
+            raise ValueError(f"Rating must be 1-5, got {user_rating}")
+        
+        feedback_id = str(uuid7())
+        
+        self.db.execute("""
+            INSERT INTO llm_feedback
+            (feedback_id, prompt_template_id, prompt_version, llm_request_id,
+             rating, comment, metadata, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+        """, (
+            feedback_id,
+            prompt_template_id,
+            prompt_version,
+            llm_request_id,
+            user_rating,
+            user_comment,
+            json.dumps(metadata or {})
+        ))
+        
+        logger.info(f"Recorded feedback: {prompt_template_id}@{prompt_version} rating={user_rating}")
+        return feedback_id
+    
+    def get_feedback_stats(
+        self,
+        prompt_template_id: str,
+        prompt_version: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get feedback statistics for a prompt."""
+        if prompt_version:
+            where_clause = "WHERE prompt_template_id = %s AND prompt_version = %s"
+            params = (prompt_template_id, prompt_version)
+        else:
+            where_clause = "WHERE prompt_template_id = %s"
+            params = (prompt_template_id,)
+        
+        stats_row = self.db.fetchone(f"""
+            SELECT 
+                COUNT(*) as total_count,
+                AVG(rating) as avg_rating,
+                MIN(rating) as min_rating,
+                MAX(rating) as max_rating
+            FROM llm_feedback
+            {where_clause}
+        """, params)
+        
+        distribution = self.db.fetchall(f"""
+            SELECT rating, COUNT(*) as count
+            FROM llm_feedback
+            {where_clause}
+            GROUP BY rating
+            ORDER BY rating
+        """, params)
+        
+        return {
+            'total_count': stats_row['total_count'],
+            'avg_rating': float(stats_row['avg_rating']) if stats_row['avg_rating'] else 0.0,
+            'min_rating': stats_row['min_rating'],
+            'max_rating': stats_row['max_rating'],
+            'distribution': {row['rating']: row['count'] for row in distribution}
+        }
+    
+    def get_low_score_cases(
+        self,
+        prompt_template_id: str,
+        threshold: int = 2,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Get low-scoring feedback cases for analysis."""
+        rows = self.db.fetchall("""
+            SELECT 
+                feedback_id,
+                prompt_version,
+                llm_request_id,
+                rating,
+                comment,
+                metadata,
+                created_at
+            FROM llm_feedback
+            WHERE prompt_template_id = %s AND rating <= %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (prompt_template_id, threshold, limit))
+        
+        return [dict(row) for row in rows]
+    
+    def compare_versions(
+        self,
+        prompt_template_id: str,
+        version_a: str,
+        version_b: str
+    ) -> Dict[str, Any]:
+        """Compare feedback between two prompt versions."""
+        stats_a = self.get_feedback_stats(prompt_template_id, version_a)
+        stats_b = self.get_feedback_stats(prompt_template_id, version_b)
+        
+        return {
+            'version_a': version_a,
+            'version_b': version_b,
+            'stats_a': stats_a,
+            'stats_b': stats_b,
+            'improvement': stats_b['avg_rating'] - stats_a['avg_rating'] if stats_a['avg_rating'] and stats_b['avg_rating'] else None
+        }
 
 
 # =============================================================================
