@@ -22,6 +22,7 @@ help:
 	@echo ""
 	@echo "Database:"
 	@echo "  make db-init            - Initialize database schema"
+	@echo "  make db-init-agent      - Initialize agent configuration system (RBAC + tables)"
 	@echo "  make db-connect         - Connect to MatrixOne CLI"
 	@echo "  make db-reset           - Reset database (drop + recreate)"
 	@echo ""
@@ -145,6 +146,11 @@ dev-init: dev-up db-init
 db-init:
 	@echo "Initializing database schema..."
 	@bash infra/scripts/init-db.sh
+
+.PHONY: db-init-agent
+db-init-agent:
+	@echo "Initializing agent configuration system..."
+	@python3 infra/scripts/init_agent_system.py
 
 .PHONY: db-connect
 db-connect:
