@@ -79,6 +79,49 @@ class EventLogger:
         self.db.execute(query, params)
         return event.event_id
 
+    def create_stream_event(
+        self,
+        user_id: str,
+        session_id: str,
+        event_type: str,
+        content: str,
+        agent_id: str = "dev-agent",
+        agent_version: str = "0.1.0",
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> ConversationEvent:
+        """Create and log a stream event to the database.
+
+        Args:
+            user_id: User identifier
+            session_id: Session identifier
+            event_type: Stream event type (e.g., text_delta, tool_call_start)
+            content: Event content (JSON string)
+            agent_id: Agent identifier
+            agent_version: Agent version
+            parent_event_id: Parent event ID in causal chain
+            causal_chain_id: Causal chain identifier
+            metadata: Additional metadata
+
+        Returns:
+            ConversationEvent: Created event
+        """
+        event = ConversationEvent(
+            event_id=str(uuid7()),
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            agent_version=agent_version,
+            event_type=event_type,
+            content=content,
+            parent_event_id=parent_event_id,
+            causal_chain_id=causal_chain_id or str(uuid7()),
+            metadata=metadata,
+        )
+        self.log_event(event)
+        return event
+
     def create_user_query(
         self,
         user_id: str,

@@ -66,6 +66,17 @@ class TestAgentArchitecture(unittest.TestCase):
             llm_client=self.llm_client,
             event_logger=self.event_logger
         )
+        
+        # Mock the selector's get_tools_schema method
+        self.selector.selector.get_tools_schema = MagicMock(return_value=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "test_skill",
+                    "parameters": {"type": "object", "properties": {"param": {"type": "string"}}}
+                }
+            }
+        ])
 
     def test_selector_delegation(self):
         """Test that selector delegates to ModernSkillSelector."""
@@ -127,9 +138,9 @@ class TestAgentArchitecture(unittest.TestCase):
             session_id="session_1",
             content="User Input"
         )
-        self.selector.select_skills.assert_called_with(
+        # selector.selector.get_tools_schema is called (not select_skills)
+        self.selector.selector.get_tools_schema.assert_called_with(
             query="User Input", 
-            context=None,
             max_candidates=5
         )
         self.executor.execute_skill.assert_called_with(

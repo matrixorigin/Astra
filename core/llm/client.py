@@ -218,7 +218,8 @@ class LLMClient:
             
             if delta.tool_calls:
                 for tc in delta.tool_calls:
-                    tc_id = tc.id
+                    # Use index as key since tc.id may be None in streaming
+                    tc_id = tc.id or f"idx_{tc.index}"
                     if tc_id not in tool_call_buffer:
                         tool_call_buffer[tc_id] = {
                             "id": tc_id,
@@ -231,16 +232,12 @@ class LLMClient:
                     if tc.function and tc.function.arguments:
                         tool_call_buffer[tc_id]["function"]["arguments"] += tc.function.arguments
                     
-                    # Yield when function name is complete (indicates start)
+                    # Only yield on first occurrence (when name is set)
                     if tc.function and tc.function.name and len(tc.function.name) > 0:
                         yield {
                             "type": "tool_call",
                             "data": tool_call_buffer[tc_id],
                         }
-        
-        # Yield all accumulated tool calls
-        for tc in tool_call_buffer.values():
-            yield {"type": "tool_call", "data": tc}
 
     def _call_provider(
         self, provider: LLMProvider, request: LLMRequest

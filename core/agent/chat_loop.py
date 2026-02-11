@@ -1,6 +1,7 @@
 """Chat loop with multi-turn tool use and full message chain."""
 
 import json
+import re
 from typing import Dict, Any, Optional, List, AsyncIterator
 
 from core.llm.models import LLMMessage
@@ -14,6 +15,30 @@ from core.agent.planner import Planner, PlanConstraints
 logger = get_logger(__name__)
 
 MAX_TOOL_ROUNDS = 10
+
+
+def _needs_planning(user_input: str) -> bool:
+    """Check if user input needs planning based on heuristics."""
+    # Keywords that indicate multi-step tasks
+    planning_keywords = [
+        "分析并", "分析和", "分析以及", "分析与",
+        "修复并", "修复和", "修复以及", "修复与",
+        "完成", "实现", "创建", "设置", "建立",
+        "帮我", "请帮我", "请帮我完成",
+        "多步", "多个步骤", "分步", "逐步",
+        "首先", "然后", "接着", "最后",
+    ]
+    
+    # Check if query is long enough (likely complex)
+    if len(user_input) > 100:
+        return True
+    
+    # Check for planning keywords
+    for keyword in planning_keywords:
+        if keyword in user_input:
+            return True
+    
+    return False
 
 
 def _merge_tool_call_fragments(
@@ -83,9 +108,22 @@ class ChatLoop:
         # 2. Build messages with context
         messages = self._build_messages(user_input, context)
 
+        # 3. Check if planning is needed
+        if _needs_planning(user_input):
+            # Use planning for complex tasks - collect final result
+            final_result = ""
+            async for event in self.run_step_with_planning(
+                user_input, session_id, user_id, context, max_candidates
+            ):
+                if event.event_type == StreamEventType.TEXT_DELTA:
+                    final_result += event.data.get("chunk", "")
+                elif event.event_type == StreamEventType.RUN_FINISHED:
+                    break
+            return final_result
+
         # 3. Get available tools schema
-        tools_schema = self.selector.select_skills(
-            query=user_input, context=context, max_candidates=max_candidates
+        tools_schema = self.selector.selector.get_tools_schema(
+            query=user_input, max_candidates=max_candidates
         )
 
         if not tools_schema:
@@ -185,36 +223,72 @@ class ChatLoop:
         messages = self._build_messages(user_input, context)
 
         # 3. Get available tools schema
-        tools_schema = self.selector.select_skills(
-            query=user_input, context=context, max_candidates=max_candidates
+        tools_schema = self.selector.selector.get_tools_schema(
+            query=user_input, max_candidates=max_candidates
+        )
+
+        # Log RUN_STARTED event
+        run_started_event = self.event_logger.create_stream_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_type="stream_run_started",
+            content=json.dumps({"query": user_input}),
+            parent_event_id=user_event.event_id,
+            causal_chain_id=user_event.causal_chain_id,
         )
 
         yield StreamEvent(
             event_type=StreamEventType.RUN_STARTED,
             data={"query": user_input},
-            event_id=user_event.event_id,
+            event_id=run_started_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
         )
 
         if not tools_schema:
             # Plain chat — stream text
             async for chunk in self.llm.chat_stream(messages, user_id, session_id):
+                text_event = self.event_logger.create_stream_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="stream_text_delta",
+                    content=json.dumps({"chunk": chunk}),
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DELTA,
                     data={"chunk": chunk},
-                    event_id=user_event.event_id,
+                    event_id=text_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
+            
+            text_done_event = self.event_logger.create_stream_event(
+                user_id=user_id,
+                session_id=session_id,
+                event_type="stream_text_done",
+                content="{}",
+                parent_event_id=user_event.event_id,
+                causal_chain_id=user_event.causal_chain_id,
+            )
             yield StreamEvent(
                 event_type=StreamEventType.TEXT_DONE,
                 data={},
-                event_id=user_event.event_id,
+                event_id=text_done_event.event_id,
+                causal_chain_id=user_event.causal_chain_id,
+            )
+            
+            run_finished_event = self.event_logger.create_stream_event(
+                user_id=user_id,
+                session_id=session_id,
+                event_type="stream_run_finished",
+                content="{}",
+                parent_event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
             )
             yield StreamEvent(
                 event_type=StreamEventType.RUN_FINISHED,
                 data={},
-                event_id=user_event.event_id,
+                event_id=run_finished_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
             )
             return
@@ -227,10 +301,18 @@ class ChatLoop:
             async for chunk in self.llm.chat_with_tools_stream(messages, tools_schema):
                 if chunk["type"] == "text":
                     full_text += chunk["content"]
+                    text_event = self.event_logger.create_stream_event(
+                        user_id=user_id,
+                        session_id=session_id,
+                        event_type="stream_text_delta",
+                        content=json.dumps({"chunk": chunk["content"]}),
+                        parent_event_id=user_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                    )
                     yield StreamEvent(
                         event_type=StreamEventType.TEXT_DELTA,
                         data={"chunk": chunk["content"]},
-                        event_id=user_event.event_id,
+                        event_id=text_event.event_id,
                         causal_chain_id=user_event.causal_chain_id,
                     )
                 elif chunk["type"] == "tool_call":
@@ -238,18 +320,35 @@ class ChatLoop:
                     tool_calls = _merge_tool_call_fragments(tool_calls, [chunk["data"]])
 
             if not tool_calls:
+                text_done_event = self.event_logger.create_stream_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="stream_text_done",
+                    content=json.dumps({"full_text": full_text}),
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DONE,
                     data={"full_text": full_text},
-                    event_id=user_event.event_id,
+                    event_id=text_done_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
                 self._log_response(user_id, session_id, full_text,
                                    user_event.event_id, user_event.causal_chain_id)
+                
+                run_finished_event = self.event_logger.create_stream_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="stream_run_finished",
+                    content="{}",
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.RUN_FINISHED,
                     data={},
-                    event_id=user_event.event_id,
+                    event_id=run_finished_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
                 return
@@ -258,20 +357,36 @@ class ChatLoop:
             messages.append({"role": "assistant", "content": full_text, "tool_calls": tool_calls})
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
+                tool_start_event = self.event_logger.create_stream_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="stream_tool_call_start",
+                    content=json.dumps({"tool": fn_name, "call_id": tc["id"]}),
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.TOOL_CALL_START,
                     data={"tool": fn_name, "call_id": tc["id"]},
-                    event_id=user_event.event_id,
+                    event_id=tool_start_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
                 
                 # Handle delegation skill specially for multi-agent
                 if fn_name == "delegate_task":
                     params = json.loads(tc["function"]["arguments"])
+                    agent_delegated_event = self.event_logger.create_stream_event(
+                        user_id=user_id,
+                        session_id=session_id,
+                        event_type="stream_agent_delegated",
+                        content=json.dumps({"agent": params.get("agent_id", "unknown")}),
+                        parent_event_id=user_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                    )
                     yield StreamEvent(
                         event_type=StreamEventType.AGENT_DELEGATED,
                         data={"agent": params.get("agent_id", "unknown")},
-                        event_id=user_event.event_id,
+                        event_id=agent_delegated_event.event_id,
                         causal_chain_id=user_event.causal_chain_id,
                     )
                     # Execute delegation and stream results
@@ -293,10 +408,18 @@ class ChatLoop:
                     )
                     result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
                 
+                tool_result_event = self.event_logger.create_stream_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="stream_tool_result",
+                    content=json.dumps({"call_id": tc["id"], "result": result_str[:500]}),
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.TOOL_RESULT,
                     data={"call_id": tc["id"], "result": result_str[:500]},
-                    event_id=user_event.event_id,
+                    event_id=tool_result_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
                 )
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
@@ -347,7 +470,7 @@ class ChatLoop:
             )
             return
         
-        # Log plan created event
+        # Log plan created event using event_logger directly
         self.event_logger.create_llm_response(
             user_id=user_id,
             session_id=session_id,
@@ -356,7 +479,18 @@ class ChatLoop:
             agent_version="0.1.0",
             parent_event_id=None,
             causal_chain_id=None,
-            event_type=EventType.PLAN_CREATED,
+        )
+        
+        # Also log as PLAN_CREATED event type
+        self.event_logger.create_llm_response(
+            user_id=user_id,
+            session_id=session_id,
+            content=json.dumps(plan),
+            agent_id="dev-agent",
+            agent_version="0.1.0",
+            parent_event_id=None,
+            causal_chain_id=None,
+            metadata={"event_type_override": "plan_created"},
         )
         
         yield StreamEvent(

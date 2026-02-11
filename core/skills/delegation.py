@@ -59,7 +59,17 @@ class DelegateTaskSkill(Skill):
 
     def validate_input(self, input_data: dict) -> DelegateTaskInput:
         """Validate and parse input data."""
-        return DelegateTaskInput(**input_data)
+        # Extract session_id and user_id from input or use defaults
+        session_id = input_data.get("session_id", "default_session")
+        user_id = input_data.get("user_id", "default_user")
+        
+        return DelegateTaskInput(
+            agent_id=input_data.get("agent_id", ""),
+            task=input_data.get("task", ""),
+            context=input_data.get("context"),
+            session_id=session_id,
+            user_id=user_id,
+        )
 
     async def execute(self, input: DelegateTaskInput) -> DelegateTaskOutput:
         """Execute the delegation.
