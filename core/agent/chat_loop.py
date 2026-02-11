@@ -274,14 +274,16 @@ class ChatLoop:
                         event_id=user_event.event_id,
                         causal_chain_id=user_event.causal_chain_id,
                     )
-                    # For now, execute as regular skill
-                    # Multi-agent stream multiplexing would require deeper integration
+                    # Execute delegation and stream results
                     result = self.executor.execute_skill(
                         skill_name=fn_name,
                         params=params,
                         session_id=session_id,
                         parent_event_id=user_event.event_id,
                     )
+                    # For delegation, the result is a string from the delegated agent
+                    # In a full implementation, we would stream the delegated agent's events
+                    result_str = str(result) if not isinstance(result, str) else result
                 else:
                     result = self.executor.execute_skill(
                         skill_name=fn_name,
@@ -289,8 +291,8 @@ class ChatLoop:
                         session_id=session_id,
                         parent_event_id=user_event.event_id,
                     )
+                    result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
                 
-                result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
                 yield StreamEvent(
                     event_type=StreamEventType.TOOL_RESULT,
                     data={"call_id": tc["id"], "result": result_str[:500]},
