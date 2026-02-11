@@ -1,6 +1,6 @@
 # Examples
 
-This directory contains examples demonstrating mo-dev-agent capabilities.
+This directory contains examples demonstrating mo-agent-engine capabilities.
 
 ## Quick Start
 

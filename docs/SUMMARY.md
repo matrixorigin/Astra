@@ -1,4 +1,4 @@
-# mo-dev-agent Project Summary
+# mo-agent-engine Project Summary
 
 ## Overview
 
@@ -141,7 +141,7 @@ See [docs/design/concurrency-model.md](design/concurrency-model.md) for details.
 ## Project Structure
 
 ```
-mo-dev-agent/
+mo-agent-engine/
 ├── sdk/                    # Public SDK
 │   ├── database.py         # Database connection
 │   └── git_for_data.py     # Git for Data SDK
@@ -318,7 +318,7 @@ See [examples/](../examples/) for more detailed examples.
 - [Development Guide](development.md) - Setup and development
 - [Git for Data Features](design/git-for-data-features.md) - Comprehensive feature design
 - [Concurrency Model](design/concurrency-model.md) - Multi-user guarantees
-- [Worklog](../../memo/docs/mo-dev-agent/worklog-2026-02-10.md) - Development history
+- [Worklog](../../memo/docs/mo-agent-engine/worklog-2026-02-10.md) - Development history
 
 ---
 

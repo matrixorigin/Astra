@@ -1,4 +1,4 @@
--- MatrixOne RBAC Initialization for mo-dev-agent
+-- MatrixOne RBAC Initialization for mo-agent-engine
 -- This script creates custom roles and grants appropriate privileges
 
 -- Create custom roles for agent system

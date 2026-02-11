@@ -1,4 +1,4 @@
-# mo-dev-agent Docker Compose Configuration
+# mo-agent-engine Docker Compose Configuration
 # Minimal setup for local development: MatrixOne (standalone) + Redis
 
 services:
@@ -6,7 +6,7 @@ services:
   # Reference: https://docs.matrixorigin.io/
   matrixone:
     image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
-    container_name: mo-dev-agent-db
+    container_name: mo-agent-engine-db
     hostname: matrixone
     profiles:
       - dev
@@ -30,7 +30,7 @@ services:
   # Redis (for future caching/queue)
   redis:
     image: redis:7.2
-    container_name: mo-dev-agent-redis
+    container_name: mo-agent-engine-redis
     hostname: redis
     profiles:
       - dev
@@ -49,13 +49,13 @@ services:
 
 volumes:
   mo-data:
-    name: mo-dev-agent-data
+    name: mo-agent-engine-data
   mo-logs:
-    name: mo-dev-agent-logs
+    name: mo-agent-engine-logs
   redis-data:
-    name: mo-dev-agent-redis
+    name: mo-agent-engine-redis
 
 networks:
   mo-dev-net:
-    name: mo-dev-agent-network
+    name: mo-agent-engine-network
     driver: bridge

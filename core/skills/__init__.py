@@ -1,4 +1,4 @@
-"""Skills package for mo-dev-agent."""
+"""Skills package for mo-agent-engine."""
 
 from .base import (
     AccessScope,

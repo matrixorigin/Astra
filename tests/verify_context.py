@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # Add project root to path
-sys.path.append(str(Path("/home/xupeng/github/mo-dev-agent").resolve()))
+sys.path.append(str(Path("/home/xupeng/github/mo-agent-engine").resolve()))
 
 from core.context.manager import ContextManager, TaskType
 

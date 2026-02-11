@@ -1,6 +1,6 @@
 # Deployment Architecture Proposal
 
-**Project**: mo-dev-agent  
+**Project**: mo-agent-engine  
 **Date**: 2026-02-10  
 **Status**: Proposal for Review  
 **Alignment**: Based on [vision-and-mission.md](./vision-and-mission.md) and [context-memory-session-and-tables.md](./context-memory-session-and-tables.md)
@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-This proposal defines the deployment architecture for mo-dev-agent, aligning with the core design principle: **event-centric memory system** that treats every interaction as traceable, analyzable, and trainable data assets. The architecture prioritizes:
+This proposal defines the deployment architecture for mo-agent-engine, aligning with the core design principle: **event-centric memory system** that treats every interaction as traceable, analyzable, and trainable data assets. The architecture prioritizes:
 
 1. **Event-first design**: `conversation_events` as the central data structure
 2. **Reproducibility**: "Ten years from now we can still precisely reproduce today's decision"
@@ -28,7 +28,7 @@ This proposal defines the deployment architecture for mo-dev-agent, aligning wit
 ❌ Traditional Agent Framework:
    Agent Roles → Skills → Memory → Context
 
-✅ mo-dev-agent (Event-Centric):
+✅ mo-agent-engine (Event-Centric):
    Events → Context Assembly → Execution → New Events → Training Loop
 ```
 
@@ -126,7 +126,7 @@ This proposal defines the deployment architecture for mo-dev-agent, aligning wit
 ### Directory Structure
 
 ```
-mo-dev-agent/                  # Project root
+mo-agent-engine/                  # Project root
 ├── 📁 infra/                  # Infrastructure layer
 │   ├── docker-compose.yml     # MatrixOne + Chroma + Redis (local dev)
 │   ├── Makefile               # Global commands (setup/dev/test/deploy)
@@ -1291,7 +1291,7 @@ This architecture proposal:
 
 > **"When tomorrow brings a disruptive practice, integrate it in 1 day, not refactor the entire system."**
 > 
-> Extension system transforms mo-dev-agent from "excellent system" into **"industry practice incubator"**.
+> Extension system transforms mo-agent-engine from "excellent system" into **"industry practice incubator"**.
 
 **Design Verification Matrix**:
 

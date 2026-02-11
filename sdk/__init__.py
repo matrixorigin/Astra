@@ -1,4 +1,4 @@
-"""mo-dev-agent SDK for building intelligent agents."""
+"""mo-agent-engine SDK for building intelligent agents."""
 
 from sdk.database import Database
 from sdk.git_for_data import GitForData

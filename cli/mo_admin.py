@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mo-admin CLI - Administrative interface for mo-dev-agent."""
+"""mo-admin CLI - Administrative interface for mo-agent-engine."""
 
 import json
 import sys
@@ -22,7 +22,7 @@ from sdk import Database
 @click.option("--user", envvar="MO_ADMIN_USER", help="Admin user (or set MO_ADMIN_USER env var)")
 @click.pass_context
 def cli(ctx, user):
-    """mo-admin - Administrative CLI for mo-dev-agent."""
+    """mo-admin - Administrative CLI for mo-agent-engine."""
     ctx.ensure_object(dict)
     ctx.obj["user"] = user or "admin"
     ctx.obj["db"] = Database()

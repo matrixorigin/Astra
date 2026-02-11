@@ -1,4 +1,4 @@
-"""Skill framework for mo-dev-agent.
+"""Skill framework for mo-agent-engine.
 
 Skills are first-class citizens with versioning, declarative requirements,
 and full lifecycle management.

@@ -8,7 +8,7 @@
 
 ### 1.1 Vision
 
-Enable mo-dev-agent to leverage multiple LLM providers with:
+Enable mo-agent-engine to leverage multiple LLM providers with:
 - **Complete cost transparency** - Every token tracked in MatrixOne
 - **Provider independence** - No vendor lock-in
 - **Reproducibility** - Replay any LLM call from 10 years ago
@@ -32,7 +32,7 @@ Enable mo-dev-agent to leverage multiple LLM providers with:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        mo-dev-agent                          │
+│                        mo-agent-engine                          │
 ├─────────────────────────────────────────────────────────────┤
 │  Skills / ChatLoop / Planner                                 │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
@@ -884,4 +884,4 @@ messages = [
 
 **Document Status**: Implemented (v2.0)  
 **Next Review**: After Phase 2 (per-user budget persistence)  
-**Owner**: mo-dev-agent team
+**Owner**: mo-agent-engine team

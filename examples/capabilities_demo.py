@@ -1,5 +1,5 @@
 """
-mo-dev-agent 核心能力演示
+mo-agent-engine 核心能力演示
 展示实际应用场景
 """
 
@@ -12,7 +12,7 @@ from core.sandbox import Branch, Sandbox
 from sdk import Database
 
 print("=" * 80)
-print("mo-dev-agent 核心能力演示")
+print("mo-agent-engine 核心能力演示")
 print("=" * 80)
 
 db = Database()

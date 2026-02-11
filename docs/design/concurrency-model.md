@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes how mo-dev-agent handles concurrent operations, multi-user scenarios, and isolation guarantees.
+This document describes how mo-agent-engine handles concurrent operations, multi-user scenarios, and isolation guarantees.
 
 ## Core Principles
 

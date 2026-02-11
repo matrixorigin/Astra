@@ -1,4 +1,4 @@
-"""Complete example demonstrating mo-dev-agent core capabilities.
+"""Complete example demonstrating mo-agent-engine core capabilities.
 
 This example shows:
 1. Session management
@@ -27,7 +27,7 @@ def print_section(title: str) -> None:
 
 def main() -> None:
     """Run the complete example."""
-    print_section("mo-dev-agent Complete Example")
+    print_section("mo-agent-engine Complete Example")
 
     # Initialize components
     db = Database()

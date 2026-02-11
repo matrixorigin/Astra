@@ -1,6 +1,6 @@
 # Context, Memory, Session Management, Table Design, and Token Management
 
-This document defines the **first-step design** for mo-dev-agent: how context is assembled for the LLM, how memory and sessions work, which tables live in MatrixOne, and how tokens (repo and LLM) are stored and managed. The goal is a clear, implementable design that stays **open to change** as we learn from the MVP.
+This document defines the **first-step design** for mo-agent-engine: how context is assembled for the LLM, how memory and sessions work, which tables live in MatrixOne, and how tokens (repo and LLM) are stored and managed. The goal is a clear, implementable design that stays **open to change** as we learn from the MVP.
 
 **Scope**: Design only. Implementation follows in subsequent steps. Tables and abstractions are expected to evolve. This revision incorporates **review feedback** and a **event-centric data-asset** evolution: conversation data is treated as **analyzable, reproducible, and trainable** enterprise assets, with atomic events, versioned configs, evaluation/training pipeline, and MatrixOne as the single persistence layer.
 
@@ -39,7 +39,7 @@ We adopt an **event-centric** model so that:
 
 The design aligns with or borrows from several established industry approaches, while keeping MatrixOne as the single persistence layer and event-centric causality as the core differentiator:
 
-| Reference | Core idea | Alignment with mo-dev-agent |
+| Reference | Core idea | Alignment with mo-agent-engine |
 |-----------|-----------|-----------------------------|
 | **MemGPT** | Memory as OS: core / recall / archival layers; eviction and summarization; "infinite context" via managed flow. | Our **Memory–Prompt–Context** three-layer model and **Token Budget Manager** map to a similar hierarchy; **adaptive compression** (§2.4) and post-conversation **knowledge extraction** mirror eviction/summarization. Long-term = **embedding_ref** + external vector store. |
 | **Redis Agent Memory / LangGraph** | Short-term (session context) + long-term (summaries, vectors); TTL, vector search; graph-like state and checkpoints for replay. | **conversation_events** + **sessions** = short-term; **memory_index_queue** + vector store = long-term. **causal_chain_id** and **context_snapshot** provide checkpoint/replay without tying to a specific runtime. **multi_agent_message** supports LangGraph-style multi-agent workflows. |

@@ -8,7 +8,7 @@
 
 ### 1.1 Vision
 
-Enable mo-dev-agent to act as a **virtual employee** that can perform nearly all GitHub operations that a human developer would do, with:
+Enable mo-agent-engine to act as a **virtual employee** that can perform nearly all GitHub operations that a human developer would do, with:
 - **Full state tracking** in MatrixOne (reproducibility)
 - **Fine-grained permission control** (security)
 - **Risk mitigation** (safety)
@@ -27,7 +27,7 @@ Enable mo-dev-agent to act as a **virtual employee** that can perform nearly all
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                        mo-dev-agent                          │
+│                        mo-agent-engine                          │
 ├─────────────────────────────────────────────────────────────┤
 │  Skills Layer                                                │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
@@ -653,4 +653,4 @@ This ensures GitHub skill updates don't degrade review quality or introduce erro
 
 **Document Status**: Draft  
 **Next Review**: After Phase 2 implementation  
-**Owner**: mo-dev-agent team
+**Owner**: mo-agent-engine team

@@ -1,1 +1,1 @@
-"""mo-dev-agent core modules."""
+"""mo-agent-engine core modules."""

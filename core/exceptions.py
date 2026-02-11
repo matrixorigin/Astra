@@ -1,4 +1,4 @@
-"""Custom exceptions for mo-dev-agent."""
+"""Custom exceptions for mo-agent-engine."""
 
 
 class AgentError(Exception):

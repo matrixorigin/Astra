@@ -1,9 +1,9 @@
-# mo-dev-agent Makefile
+# mo-agent-engine Makefile
 # Inspired by MatrixOne's development workflow
 
 .PHONY: help
 help:
-	@echo "mo-dev-agent Development Commands"
+	@echo "mo-agent-engine Development Commands"
 	@echo "=================================="
 	@echo ""
 	@echo "Environment Setup:"
@@ -51,7 +51,7 @@ help:
 
 .PHONY: setup
 setup:
-	@echo "Setting up mo-dev-agent development environment..."
+	@echo "Setting up mo-agent-engine development environment..."
 	@if [ ! -f .env ]; then \
 		cp .env.example .env; \
 		echo "✅ Created .env file (please review and customize)"; \
@@ -91,7 +91,7 @@ lock:
 
 .PHONY: dev-up
 dev-up:
-	@echo "Starting mo-dev-agent development environment..."
+	@echo "Starting mo-agent-engine development environment..."
 	@cd infra && docker compose --profile dev up -d
 	@echo ""
 	@echo "✅ Services started!"
@@ -102,12 +102,12 @@ dev-up:
 
 .PHONY: dev-down
 dev-down:
-	@echo "Stopping mo-dev-agent services..."
+	@echo "Stopping mo-agent-engine services..."
 	@cd infra && docker compose --profile dev down
 
 .PHONY: dev-restart
 dev-restart:
-	@echo "Restarting mo-dev-agent services..."
+	@echo "Restarting mo-agent-engine services..."
 	@cd infra && docker compose --profile dev restart
 
 .PHONY: dev-logs

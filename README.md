@@ -1,4 +1,4 @@
-# mo-dev-agent
+# mo-agent-engine
 
 Intelligent agent platform with auditable decisions, safe iteration, and versioned data lineage.
 

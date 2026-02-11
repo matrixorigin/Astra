@@ -1,4 +1,4 @@
-"""Built-in skills for mo-dev-agent."""
+"""Built-in skills for mo-agent-engine."""
 
 import logging
 

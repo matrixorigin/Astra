@@ -28,11 +28,11 @@ settings = get_settings()
 setup_logging(level=settings.log_level, json_format=(settings.log_format == "json"))
 logger = get_logger(__name__)
 
-logger.info(f"Starting mo-dev-agent v{settings.version} in {settings.environment} mode")
+logger.info(f"Starting mo-agent-engine v{settings.version} in {settings.environment} mode")
 
 # Create app
 app = FastAPI(
-    title="mo-dev-agent",
+    title="mo-agent-engine",
     description="Event-centric intelligent agent platform",
     version=settings.version,
     debug=settings.debug,
@@ -210,7 +210,7 @@ async def liveness_check():
 async def root():
     """Root endpoint."""
     return {
-        "name": "mo-dev-agent",
+        "name": "mo-agent-engine",
         "version": settings.version,
         "environment": settings.environment,
         "description": "Event-centric intelligent agent platform",

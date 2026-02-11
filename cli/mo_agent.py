@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mo-agent CLI - Command-line interface for mo-dev-agent."""
+"""mo-agent CLI - Command-line interface for mo-agent-engine."""
 
 import sys
 from pathlib import Path

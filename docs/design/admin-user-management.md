@@ -49,7 +49,7 @@ We adopt a three-layer taxonomy to clarify the definition of "Agent" vs "Platfor
 
 ### 3.2 Service Model: Stateful Intelligence Service
 
-*   **Definition**: mo-dev-agent is a **Stateful Intelligence Service**, not a SaaS ERP.
+*   **Definition**: mo-agent-engine is a **Stateful Intelligence Service**, not a SaaS ERP.
 *   **Data Ownership**:
     *   **User Data**: (e.g., Code, Orders, Customer Lists) resides in the user's external databases or Git repositories. We do not own this.
     *   **Intelligence Metadata**: (e.g., Decision history, Skill execution logs, Context snapshots) resides in **MatrixOne**. We own this to enable "Intelligence" (Recall, Replay, Reasoning).
@@ -131,7 +131,7 @@ DROP ROLE role_name;
 
 ---
 
-## 2. Role Design for mo-dev-agent
+## 2. Role Design for mo-agent-engine
 
 ### 2.1 Role Hierarchy
 

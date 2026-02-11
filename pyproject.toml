@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "mo-dev-agent"
+name = "mo-agent-engine"
 version = "0.1.0"
 description = "Event-centric intelligent agent platform with conversation replay and time-point sandbox"
 authors = ["MatrixOne Team"]

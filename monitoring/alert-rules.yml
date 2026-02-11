@@ -1,4 +1,4 @@
-# Prometheus Alert Rules for mo-dev-agent
+# Prometheus Alert Rules for mo-agent-engine
 
 groups:
   - name: mo_dev_agent_alerts
@@ -56,13 +56,13 @@ groups:
       
       # Service down
       - alert: ServiceDown
-        expr: up{job="mo-dev-agent"} == 0
+        expr: up{job="mo-agent-engine"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Service is down"
-          description: "mo-dev-agent service is not responding"
+          description: "mo-agent-engine service is not responding"
       
       # High memory usage
       - alert: HighMemoryUsage

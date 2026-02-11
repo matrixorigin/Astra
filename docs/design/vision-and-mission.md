@@ -72,7 +72,7 @@ MatrixOne provides all three natively through its Git for Data capabilities. Thi
 
 ### The Agent OS Model
 
-mo-dev-agent is not an agent framework — it is an **Agent Operating System**. The distinction matters:
+mo-agent-engine is not an agent framework — it is an **Agent Operating System**. The distinction matters:
 
 - A **framework** provides libraries for building agents (LangChain, CrewAI)
 - An **OS** provides infrastructure that makes all agents on it inherently more capable

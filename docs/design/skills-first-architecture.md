@@ -559,7 +559,7 @@ WHERE session_id = 'xxx';
 
 ```bash
 # Command 1: Interactive chat
-$ mo-dev-agent chat --repo 123
+$ mo-agent-engine chat --repo 123
 
 Starting chat (session: session-1234)
 Repo: matrixone (CODE, READ)
@@ -581,7 +581,7 @@ Session saved. Total cost: $0.0021
 
 ```bash
 # Command 2: List skills
-$ mo-dev-agent skills --repo 123
+$ mo-agent-engine skills --repo 123
 
 Available Skills:
 - summarize_pr: Summarize a GitHub PR
@@ -1040,7 +1040,7 @@ This is framework-level behavior, not skill-level. Skills don't implement verifi
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  CLI                                                        │
-│  - Reads API_KEY from env or ~/.mo-dev-agent/config        │
+│  - Reads API_KEY from env or ~/.mo-agent-engine/config        │
 │  - Sends in Authorization header                           │
 └────────────────────┬────────────────────────────────────────┘
                      │ Authorization: Bearer <api_key>
@@ -1176,7 +1176,7 @@ Agent: "PR created: https://github.com/..."
 
 ## References
 
-- [Roadmap](../../memo/docs/mo-dev-agent/roadmap.md)
+- [Roadmap](../../memo/docs/mo-agent-engine/roadmap.md)
 - [Phase 1 Summary](./PHASE1_SUMMARY.md)
 - [Vision and Mission](./vision-and-mission.md)
 - [GitHub Integration](./github-integration.md)
