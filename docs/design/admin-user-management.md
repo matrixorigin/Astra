@@ -24,7 +24,69 @@ Current system has the following issues:
 
 ---
 
-## 1. MatrixOne RBAC System
+## 3. Architectural Decisions
+
+Before diving into implementation details, we establish the following core architectural decisions that define the system's nature, boundaries, and security model.
+
+### 3.1 Agent Architecture Taxonomy
+
+We adopt a three-layer taxonomy to clarify the definition of "Agent" vs "Platform":
+
+1.  **Platform Capabilities (The Kernel)**:
+    *   **Definition**: The underlying "Operating System" capabilities provided by the core framework. These are passive APIs, not active agents.
+    *   **Components**: Event Bus, Time Machine (Time Travel), Sandbox (Isolation), Memory Manager, Scope Resolver.
+    *   **Role**: Provides the laws of physics (Time, Space, Memory) for agents to live in.
+
+2.  **System Agents (The Daemons)**:
+    *   **Definition**: Pre-installed, autonomous agents that maintain system health and perform background tasks. They run automatically based on triggers.
+    *   **Components**: Regression Agent (auto-test on change), Audit Agent (security scan), Tuning Agent (prompt optimization).
+    *   **Role**: Like system daemons (cron, logrotate), ensuring the platform remains stable and self-improving.
+
+3.  **User Agents (The Apps)**:
+    *   **Definition**: Business-specific agents triggered by user actions to solve domain problems.
+    *   **Components**: Code Review Agent, CI Diagnosis Agent, Data Analysis Agent.
+    *   **Role**: Like user applications, utilizing platform capabilities to deliver business value.
+
+### 3.2 Service Model: Stateful Intelligence Service
+
+*   **Definition**: mo-dev-agent is a **Stateful Intelligence Service**, not a SaaS ERP.
+*   **Data Ownership**:
+    *   **User Data**: (e.g., Code, Orders, Customer Lists) resides in the user's external databases or Git repositories. We do not own this.
+    *   **Intelligence Metadata**: (e.g., Decision history, Skill execution logs, Context snapshots) resides in **MatrixOne**. We own this to enable "Intelligence" (Recall, Replay, Reasoning).
+*   **Implication**: The service manages the *context* of work, not the *work product* itself.
+
+### 3.3 Dual-Layer Security Architecture
+
+We avoid reinventing RBAC by using a hybrid approach:
+
+*   **Layer 1: Infrastructure Security (MatrixOne RBAC)**
+    *   **Scope**: Database connection, Table access, SQL execution.
+    *   **Mechanism**: MatrixOne native roles (`mo_agent_admin`, `mo_agent_user`).
+    *   **Responsibility**: Prevents unauthorized data access at the physical level (e.g., "User A cannot DROP TABLE").
+    *   **Managed By**: Platform Ops / MatrixOne.
+
+*   **Layer 2: Business Scope Control (Open Scope Protocol)**
+    *   **Scope**: Project visibility, Model usage quotas, Repo access.
+    *   **Mechanism**: Application-level `scope_type` + `scope_id` filtering.
+    *   **Responsibility**: Enforces business logic boundaries (e.g., "Dev Team A cannot use Marketing Team's GPT-4 quota").
+    *   **Managed By**: Business Admins (via `mo-admin`).
+
+### 3.4 MatrixOne Binding Strategy
+
+We consciously choose a **strong binding** with MatrixOne at the kernel level for strategic advantages, while maintaining architectural decoupling via interfaces.
+
+*   **Why Strong Binding?**
+    *   **Time Travel**: MatrixOne's `SELECT ... AS OF TIMESTAMP` enables instant agent state restoration without complex event sourcing logic.
+    *   **Zero-Copy Branching**: MatrixOne's `CREATE SNAPSHOT` enables instant Sandbox creation for safe agent experimentation.
+    *   **Unified Storage**: Combining Vector, Relational, and Git-like capabilities in one engine reduces stack complexity.
+
+*   **Future Compatibility**:
+    *   While implementation is bound, we define **Interface Layers** (e.g., `TimeTravelProvider`, `SandboxProvider`) in code.
+    *   Non-MatrixOne implementations (e.g., Log-based replay, Docker-based sandbox) can be added as alternative providers in the future if needed.
+
+---
+
+## 2. MatrixOne RBAC System
 
 ### 1.1 Built-in Roles
 
@@ -273,7 +335,7 @@ def resolve_config(key, context):
 
 ---
 
-## 4. CLI Architecture
+## 5. CLI Architecture
 
 ### 4.1 Separation of Concerns
 
@@ -355,7 +417,7 @@ mo-admin audit logs --user alice --action create_model --since 2026-02-01
 
 ---
 
-## 5. Permission Checker Implementation
+## 6. Permission Checker Implementation
 
 See [permission-checker.md](./admin-user-management/permission-checker.md) for detailed implementation.
 
@@ -446,7 +508,7 @@ GRANT moadmin TO admin; -- Optional: full system access
 
 ---
 
-## 9. Example Scenarios
+## 10. Example Scenarios
 
 ### Scenario 1: Admin Adds Global Model
 
@@ -490,7 +552,7 @@ mo-agent model add my-model openai
 
 ---
 
-## 10. Summary
+## 11. Summary
 
 ### Core Principles
 1. **Leverage MatrixOne RBAC**: Use built-in role and privilege system
