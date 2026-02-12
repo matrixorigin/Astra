@@ -79,6 +79,62 @@ class EventLogger:
         self.db.execute(query, params)
         return event.event_id
 
+    def create_plan_event(
+        self,
+        user_id: str,
+        session_id: str,
+        event_type: str,
+        plan_data: dict,
+        agent_id: str = "dev-agent",
+        agent_version: str = "0.1.0",
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> ConversationEvent:
+        """Create and log a plan event.
+
+        Args:
+            user_id: User identifier
+            session_id: Session identifier
+            event_type: Plan event type (plan_created, plan_revised, etc.)
+            plan_data: Plan data dictionary
+            agent_id: Agent identifier
+            agent_version: Agent version
+            parent_event_id: Parent event ID
+            causal_chain_id: Causal chain ID
+            metadata: Additional metadata
+
+        Returns:
+            ConversationEvent: Created event
+        """
+        event_id = str(uuid7())
+        chain_id = causal_chain_id or str(uuid7())
+
+        # Merge plan_data into metadata
+        event_metadata = metadata or {}
+        if "plan_id" in plan_data:
+            event_metadata["plan_id"] = plan_data["plan_id"]
+        if "goal" in plan_data:
+            event_metadata["goal"] = plan_data["goal"]
+        if "revision_of" in plan_data and plan_data["revision_of"]:
+            event_metadata["revision_of"] = plan_data["revision_of"]
+
+        event = ConversationEvent(
+            event_id=event_id,
+            user_id=user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            agent_version=agent_version,
+            event_type=event_type,
+            content=json.dumps(plan_data),
+            parent_event_id=parent_event_id,
+            causal_chain_id=chain_id,
+            metadata=event_metadata,
+        )
+
+        self.log_event(event)
+        return event
+
     def create_stream_event(
         self,
         user_id: str,

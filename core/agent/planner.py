@@ -113,11 +113,20 @@ def get_plan_constraints() -> PlanConstraints:
 class Planner:
     """Plans and manages PAOR loop execution."""
 
-    def __init__(self, llm_client, constraints: PlanConstraints | None = None):
+    def __init__(self, llm_client, constraints: PlanConstraints | None = None, event_logger=None):
         self.llm = llm_client
         self.constraints = constraints or get_plan_constraints()
+        self.event_logger = event_logger
 
-    async def create_plan(self, goal: str, context: str = "") -> Plan:
+    async def create_plan(
+        self, 
+        goal: str, 
+        context: str = "",
+        user_id: str | None = None,
+        session_id: str | None = None,
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
+    ) -> Plan:
         """Ask LLM to decompose goal into steps.
 
         Returns Plan Pydantic model with validation.
@@ -172,12 +181,30 @@ Output format (JSON):
             plan_data = json.loads(content)
 
             # Validate and create Plan model
-            return Plan(**plan_data)
+            plan = Plan(**plan_data)
+
+            # Log plan_created event if event_logger is available
+            if self.event_logger and user_id and session_id:
+                # Convert to dict with JSON-serializable types
+                plan_dict = plan.model_dump()
+                if "created_at" in plan_dict and isinstance(plan_dict["created_at"], datetime):
+                    plan_dict["created_at"] = plan_dict["created_at"].isoformat()
+
+                self.event_logger.create_plan_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="plan_created",
+                    plan_data=plan_dict,
+                    parent_event_id=parent_event_id,
+                    causal_chain_id=causal_chain_id,
+                )
+
+            return plan
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse plan JSON: {e}")
             # Fallback: create a simple single-step plan
-            return Plan(
+            plan = Plan(
                 plan_id="plan_001",
                 goal=goal,
                 steps=[
@@ -188,6 +215,24 @@ Output format (JSON):
                 ],
                 constraints=self.constraints.model_dump(),
             )
+
+            # Log fallback plan
+            if self.event_logger and user_id and session_id:
+                plan_dict = plan.model_dump()
+                if "created_at" in plan_dict and isinstance(plan_dict["created_at"], datetime):
+                    plan_dict["created_at"] = plan_dict["created_at"].isoformat()
+
+                self.event_logger.create_plan_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="plan_created",
+                    plan_data=plan_dict,
+                    parent_event_id=parent_event_id,
+                    causal_chain_id=causal_chain_id,
+                    metadata={"fallback": True, "error": str(e)},
+                )
+
+            return plan
         except ValidationError as e:
             logger.error(f"Plan validation failed: {e}")
             # Fallback: create a simple single-step plan
@@ -383,3 +428,235 @@ Sub-steps format:
         except Exception as e:
             logger.error(f"Failed to decompose step: {e}")
             return None
+
+    def log_step_start(
+        self,
+        step: PlanStep,
+        plan_id: str,
+        user_id: str,
+        session_id: str,
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
+    ) -> str | None:
+        """Log plan step start event.
+
+        Returns:
+            Event ID if logged, None otherwise
+        """
+        if not self.event_logger:
+            return None
+
+        event = self.event_logger.create_plan_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_type="plan_step_start",
+            plan_data={
+                "plan_id": plan_id,
+                "step_id": step.step_id,
+                "description": step.description,
+                "skill_hint": step.skill_hint,
+            },
+            parent_event_id=parent_event_id,
+            causal_chain_id=causal_chain_id,
+        )
+        return event.event_id
+
+    def log_step_done(
+        self,
+        step: PlanStep,
+        plan_id: str,
+        user_id: str,
+        session_id: str,
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
+    ) -> str | None:
+        """Log plan step completion event.
+
+        Returns:
+            Event ID if logged, None otherwise
+        """
+        if not self.event_logger:
+            return None
+
+        event = self.event_logger.create_plan_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_type="plan_step_done",
+            plan_data={
+                "plan_id": plan_id,
+                "step_id": step.step_id,
+                "description": step.description,
+                "status": step.status,
+                "result": step.result,
+                "reflection": step.reflection,
+            },
+            parent_event_id=parent_event_id,
+            causal_chain_id=causal_chain_id,
+        )
+        return event.event_id
+
+    def log_plan_completed(
+        self,
+        plan: Plan,
+        user_id: str,
+        session_id: str,
+        summary: str,
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
+    ) -> str | None:
+        """Log plan completion event.
+
+        Returns:
+            Event ID if logged, None otherwise
+        """
+        if not self.event_logger:
+            return None
+
+        event = self.event_logger.create_plan_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_type="plan_completed",
+            plan_data={
+                "plan_id": plan.plan_id,
+                "goal": plan.goal,
+                "summary": summary,
+                "total_steps": len(plan.steps),
+                "completed_steps": sum(1 for s in plan.steps if s.status == PlanStatus.COMPLETED),
+            },
+            parent_event_id=parent_event_id,
+            causal_chain_id=causal_chain_id,
+        )
+        return event.event_id
+
+    def log_plan_failed(
+        self,
+        plan: Plan,
+        user_id: str,
+        session_id: str,
+        reason: str,
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
+    ) -> str | None:
+        """Log plan failure event.
+
+        Returns:
+            Event ID if logged, None otherwise
+        """
+        if not self.event_logger:
+            return None
+
+        event = self.event_logger.create_plan_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_type="plan_failed",
+            plan_data={
+                "plan_id": plan.plan_id,
+                "goal": plan.goal,
+                "reason": reason,
+                "completed_steps": sum(1 for s in plan.steps if s.status == PlanStatus.COMPLETED),
+                "failed_step": next((s.step_id for s in plan.steps if s.status == PlanStatus.FAILED), None),
+            },
+            parent_event_id=parent_event_id,
+            causal_chain_id=causal_chain_id,
+        )
+        return event.event_id
+
+    def log_plan_revised(
+        self,
+        revised_plan: Plan,
+        user_id: str,
+        session_id: str,
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
+    ) -> str | None:
+        """Log plan revision event.
+
+        Returns:
+            Event ID if logged, None otherwise
+        """
+        if not self.event_logger:
+            return None
+
+        # Convert plan to dict with JSON-serializable types
+        plan_dict = revised_plan.model_dump()
+        # Convert datetime to ISO string
+        if "created_at" in plan_dict and isinstance(plan_dict["created_at"], datetime):
+            plan_dict["created_at"] = plan_dict["created_at"].isoformat()
+
+        event = self.event_logger.create_plan_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_type="plan_revised",
+            plan_data=plan_dict,
+            parent_event_id=parent_event_id,
+            causal_chain_id=causal_chain_id,
+        )
+        return event.event_id
+
+
+def restore_plan_from_events(db, goal_id: str) -> Plan | None:
+    """Restore plan state from events by goal_id.
+
+    Args:
+        db: Database instance
+        goal_id: Goal identifier (stored in metadata)
+
+    Returns:
+        Latest plan state or None if not found
+    """
+    # Query all plan events for this goal
+    rows = db.fetchall(
+        """
+        SELECT event_id, event_type, content, created_at, metadata
+        FROM conversation_events
+        WHERE event_type IN ('plan_created', 'plan_revised')
+          AND JSON_EXTRACT(metadata, '$.goal') = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (goal_id,),
+    )
+
+    if not rows:
+        return None
+
+    # Get the latest plan
+    latest = rows[0]
+    plan_data = json.loads(latest["content"])
+
+    # Restore step statuses from step events
+    step_events = db.fetchall(
+        """
+        SELECT event_type, content
+        FROM conversation_events
+        WHERE event_type IN ('plan_step_start', 'plan_step_done')
+          AND JSON_EXTRACT(content, '$.plan_id') = %s
+        ORDER BY created_at
+        """,
+        (plan_data["plan_id"],),
+    )
+
+    # Update step statuses
+    step_status_map = {}
+    for event in step_events:
+        event_data = json.loads(event["content"])
+        step_id = event_data["step_id"]
+
+        if event["event_type"] == "plan_step_start":
+            step_status_map[step_id] = {
+                "status": "in_progress",
+            }
+        elif event["event_type"] == "plan_step_done":
+            step_status_map[step_id] = {
+                "status": event_data.get("status", "completed"),
+                "result": event_data.get("result"),
+                "reflection": event_data.get("reflection"),
+            }
+
+    # Apply statuses to plan
+    for step in plan_data.get("steps", []):
+        step_id = step["step_id"]
+        if step_id in step_status_map:
+            step.update(step_status_map[step_id])
+
+    return Plan(**plan_data)

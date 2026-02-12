@@ -27,6 +27,8 @@ class EventType(str, Enum):
     PLAN_STEP_DONE = "plan_step_done"
     PLAN_REVISED = "plan_revised"
     PLAN_REFLECTION = "plan_reflection"
+    PLAN_COMPLETED = "plan_completed"
+    PLAN_FAILED = "plan_failed"
 
     # Streaming events
     STREAM_RUN_STARTED = "stream_run_started"
