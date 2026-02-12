@@ -189,38 +189,54 @@ class ContextManager:
             raise ContextError(f"Context assembly failed: {e}") from e
 
     def _allocate_budget(self, total_tokens: int, task_type: TaskType) -> dict[str, int]:
-        """Allocate token budget based on task type."""
+        """Allocate token budget based on task type.
+        
+        Follows design in context-management.md:
+        - CODE_REVIEW: 60% code, 20% history, 20% docs
+        - PLANNING: 60% history, 20% code, 20% docs
+        - DEBUGGING: 40% code, 40% logs, 20% history
+        - GENERAL: 50% history, 30% code, 20% docs
+        
+        Fixed allocations:
+        - system: 500 tokens (system prompt)
+        - skills: 1000 tokens (skill definitions)
+        - reserve: 500 tokens (safety buffer)
+        """
+        # Reserve fixed tokens
+        fixed_tokens = 500 + 1000 + 500  # system + skills + reserve
+        available_tokens = max(0, total_tokens - fixed_tokens)
+        
         allocations = {
             TaskType.CODE_REVIEW: {
                 "system": 500,
                 "skills": 1000,
-                "history": int(total_tokens * 0.2),
-                "code": int(total_tokens * 0.6),
-                "docs": int(total_tokens * 0.1),
+                "history": int(available_tokens * 0.2),
+                "code": int(available_tokens * 0.6),
+                "docs": int(available_tokens * 0.2),
                 "reserve": 500,
             },
             TaskType.PLANNING: {
                 "system": 500,
                 "skills": 1000,
-                "history": int(total_tokens * 0.6),
-                "code": int(total_tokens * 0.2),
-                "docs": int(total_tokens * 0.1),
+                "history": int(available_tokens * 0.6),
+                "code": int(available_tokens * 0.2),
+                "docs": int(available_tokens * 0.2),
                 "reserve": 500,
             },
             TaskType.DEBUGGING: {
                 "system": 500,
                 "skills": 1000,
-                "history": int(total_tokens * 0.2),
-                "code": int(total_tokens * 0.4),
-                "docs": int(total_tokens * 0.1),
+                "history": int(available_tokens * 0.2),
+                "code": int(available_tokens * 0.4),
+                "docs": int(available_tokens * 0.2),  # logs treated as docs
                 "reserve": 500,
             },
             TaskType.GENERAL: {
                 "system": 500,
                 "skills": 1000,
-                "history": int(total_tokens * 0.5),
-                "code": int(total_tokens * 0.2),
-                "docs": int(total_tokens * 0.1),
+                "history": int(available_tokens * 0.5),
+                "code": int(available_tokens * 0.3),
+                "docs": int(available_tokens * 0.2),
                 "reserve": 500,
             },
         }
