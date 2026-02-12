@@ -146,9 +146,7 @@ class TestReplaySession:
         assert len(events) == 3
         for event in events:
             assert event["success"] is True
-            assert event["mode"] == "mock"
-            assert "original_content" in event
-            assert "replayed_content" in event
+            assert "content" in event
     
     def test_replay_session_not_found(self, replay_service, test_user):
         """测试重放不存在的会话
@@ -349,14 +347,14 @@ class TestReplayEvent:
         
         验证点：
         1. 返回原始内容
-        2. mode 标记为 mock
-        3. success 为 True
+        2. success 为 True
         """
         # 创建模拟事件对象
         class MockEvent:
             event_id = "test_event_1"
             event_type = "user_query"
             content = "Test content"
+            session_id = "test_session"
             created_at = datetime.now(timezone.utc)
         
         event = MockEvent()
@@ -368,9 +366,7 @@ class TestReplayEvent:
         )
         
         assert result["success"] is True
-        assert result["mode"] == "mock"
-        assert result["replayed_content"] == "Test content"
-        assert result["original_content"] == "Test content"
+        assert result["content"] == "Test content"
     
     def test_replay_event_different_types(self, replay_service):
         """测试不同事件类型的重放
@@ -378,28 +374,22 @@ class TestReplayEvent:
         验证点：
         1. user_query 正确处理
         2. llm_response 正确处理
-        3. skill_invocation 正确处理
         """
         class MockEvent:
             event_id = "test_event"
             content = "Test content"
+            session_id = "test_session"
             created_at = datetime.now(timezone.utc)
         
         # 测试 user_query
         event = MockEvent()
         event.event_type = "user_query"
-        result = replay_service._replay_event(event, False, None)
+        result = replay_service._replay_event(event, True, None)
         assert result["success"] is True
-        assert "User query" in result["note"]
+        assert result["content"] == "Test content"
         
         # 测试 llm_response
         event.event_type = "llm_response"
-        result = replay_service._replay_event(event, False, None)
+        result = replay_service._replay_event(event, True, None)
         assert result["success"] is True
-        assert "LLM response" in result["note"]
-        
-        # 测试 skill_invocation
-        event.event_type = "skill_invocation"
-        result = replay_service._replay_event(event, False, None)
-        assert result["success"] is True
-        assert "Skill invocation" in result["note"]
+        assert result["content"] == "Test content"

@@ -30,7 +30,8 @@ Intelligent agent platform with auditable decisions, safe iteration, and version
 - **Multi-Repo Management**: Register and manage multiple repositories with per-repo tokens
 - **Production-Ready**: Logging, monitoring, Docker support
 - **Type-Safe**: 100% type annotations with Pydantic validation
-- **Comprehensive Testing**: 509 tests passing with real database integration
+- **Comprehensive Testing**: 527 tests passing with real database integration
+- **Side-Effect Isolation**: ToolMockingLayer prevents real-world side effects during replay
 
 ## Quick Start
 
