@@ -78,6 +78,13 @@ open http://localhost:8000/redoc
 curl http://localhost:8000/health
 ```
 
+## Documentation
+
+- **[API Usage Guide](docs/API_USAGE_GUIDE.md)** - Complete API guide with examples
+- **[API Implementation Summary](docs/API_IMPLEMENTATION_SUMMARY.md)** - Technical implementation details
+- **Interactive Swagger UI**: `http://localhost:8000/docs`
+- **ReDoc**: `http://localhost:8000/redoc`
+
 **API Documentation**:
 - Interactive Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
