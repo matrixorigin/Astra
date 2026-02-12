@@ -26,12 +26,17 @@ class TestStreamingAPI:
     """Test streaming API endpoints."""
 
     @pytest.mark.asyncio
-    @patch("api.routers.streaming.ChatLoop")
-    @patch("api.routers.streaming.SkillSelector")
-    @patch("api.routers.streaming.LLMClient")
     @patch("api.routers.streaming.EventLogger")
+    @patch("api.routers.streaming.LLMClient")
+    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.AgentExecutor")
+    @patch("api.routers.streaming.ContextManager")
+    @patch("api.routers.streaming.HallucinationFirewall")
+    @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_success(
-        self, mock_event_logger_class, mock_llm_class, mock_selector_class, mock_chat_loop_class, mock_db, mock_auth
+        self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
+        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class,
+        mock_db, mock_auth
     ):
         """Test successful streaming chat."""
         from api.routers.streaming import stream_chat, StreamChatRequest
@@ -77,8 +82,9 @@ class TestStreamingAPI:
         # Collect events
         events = []
         async for chunk in response.body_iterator:
-            if chunk.startswith("data: "):
-                event_data = json.loads(chunk[6:])
+            chunk_str = chunk.decode() if isinstance(chunk, bytes) else chunk
+            if chunk_str.startswith("data: "):
+                event_data = json.loads(chunk_str[6:].strip())
                 events.append(event_data)
 
         # Verify events
@@ -114,12 +120,16 @@ class TestStreamingAPI:
         assert "not found" in exc_info.value.detail.lower()
 
     @pytest.mark.asyncio
-    @patch("api.routers.streaming.ChatLoop")
-    @patch("api.routers.streaming.SkillSelector")
-    @patch("api.routers.streaming.LLMClient")
     @patch("api.routers.streaming.EventLogger")
+    @patch("api.routers.streaming.LLMClient")
+    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.AgentExecutor")
+    @patch("api.routers.streaming.ContextManager")
+    @patch("api.routers.streaming.HallucinationFirewall")
+    @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_with_context(
-        self, mock_event_logger_class, mock_llm_class, mock_selector_class, mock_chat_loop_class, mock_db, mock_auth
+        self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
+        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
     ):
         """Test streaming with custom context."""
         from api.routers.streaming import stream_chat, StreamChatRequest
@@ -153,12 +163,16 @@ class TestStreamingAPI:
         mock_chat_loop_class.assert_called_once()
 
     @pytest.mark.asyncio
-    @patch("api.routers.streaming.ChatLoop")
-    @patch("api.routers.streaming.SkillSelector")
-    @patch("api.routers.streaming.LLMClient")
     @patch("api.routers.streaming.EventLogger")
+    @patch("api.routers.streaming.LLMClient")
+    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.AgentExecutor")
+    @patch("api.routers.streaming.ContextManager")
+    @patch("api.routers.streaming.HallucinationFirewall")
+    @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_error_handling(
-        self, mock_event_logger_class, mock_llm_class, mock_selector_class, mock_chat_loop_class, mock_db, mock_auth
+        self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
+        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
     ):
         """Test error handling during streaming."""
         from api.routers.streaming import stream_chat, StreamChatRequest
@@ -187,8 +201,9 @@ class TestStreamingAPI:
         # Collect events
         events = []
         async for chunk in response.body_iterator:
-            if chunk.startswith("data: "):
-                event_data = json.loads(chunk[6:])
+            chunk_str = chunk.decode() if isinstance(chunk, bytes) else chunk
+            if chunk_str.startswith("data: "):
+                event_data = json.loads(chunk_str[6:].strip())
                 events.append(event_data)
 
         # Should have run_started and run_error
@@ -198,12 +213,16 @@ class TestStreamingAPI:
         assert "error" in events[-1]["data"]
 
     @pytest.mark.asyncio
-    @patch("api.routers.streaming.ChatLoop")
-    @patch("api.routers.streaming.SkillSelector")
-    @patch("api.routers.streaming.LLMClient")
     @patch("api.routers.streaming.EventLogger")
+    @patch("api.routers.streaming.LLMClient")
+    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.AgentExecutor")
+    @patch("api.routers.streaming.ContextManager")
+    @patch("api.routers.streaming.HallucinationFirewall")
+    @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_tool_calls(
-        self, mock_event_logger_class, mock_llm_class, mock_selector_class, mock_chat_loop_class, mock_db, mock_auth
+        self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
+        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
     ):
         """Test streaming with tool calls."""
         from api.routers.streaming import stream_chat, StreamChatRequest
@@ -251,8 +270,9 @@ class TestStreamingAPI:
         # Collect events
         events = []
         async for chunk in response.body_iterator:
-            if chunk.startswith("data: "):
-                event_data = json.loads(chunk[6:])
+            chunk_str = chunk.decode() if isinstance(chunk, bytes) else chunk
+            if chunk_str.startswith("data: "):
+                event_data = json.loads(chunk_str[6:].strip())
                 events.append(event_data)
 
         # Verify event sequence
@@ -264,12 +284,16 @@ class TestStreamingAPI:
         assert events[4]["event_type"] == "run_finished"
 
     @pytest.mark.asyncio
-    @patch("api.routers.streaming.ChatLoop")
-    @patch("api.routers.streaming.SkillSelector")
-    @patch("api.routers.streaming.LLMClient")
     @patch("api.routers.streaming.EventLogger")
+    @patch("api.routers.streaming.LLMClient")
+    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.AgentExecutor")
+    @patch("api.routers.streaming.ContextManager")
+    @patch("api.routers.streaming.HallucinationFirewall")
+    @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_planning_events(
-        self, mock_event_logger_class, mock_llm_class, mock_selector_class, mock_chat_loop_class, mock_db, mock_auth
+        self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
+        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
     ):
         """Test streaming with planning events."""
         from api.routers.streaming import stream_chat, StreamChatRequest
@@ -317,8 +341,9 @@ class TestStreamingAPI:
         # Collect events
         events = []
         async for chunk in response.body_iterator:
-            if chunk.startswith("data: "):
-                event_data = json.loads(chunk[6:])
+            chunk_str = chunk.decode() if isinstance(chunk, bytes) else chunk
+            if chunk_str.startswith("data: "):
+                event_data = json.loads(chunk_str[6:].strip())
                 events.append(event_data)
 
         # Verify planning events

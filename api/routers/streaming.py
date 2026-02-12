@@ -10,10 +10,13 @@ from pydantic import BaseModel, Field
 from api.dependencies import get_current_user
 from api.database import get_db_session
 from core.agent.chat_loop import ChatLoop
+from core.agent.executor import AgentExecutor
+from core.agent.selector import AgentSkillSelector
+from core.context.manager import ContextManager
 from core.events.event_logger import EventLogger
+from core.verification.firewall import HallucinationFirewall
 from core.llm.client import LLMClient
 from core.logging_config import get_logger
-from core.skills.selector import SkillSelector
 from sdk import Database
 
 logger = get_logger(__name__)
@@ -63,13 +66,21 @@ async def stream_chat(
         raise HTTPException(status_code=404, detail="Session not found")
 
     # Initialize components
+    db = Database()
     event_logger = EventLogger(db)
     llm_client = LLMClient()
-    selector = SkillSelector(db)
+    selector = AgentSkillSelector(db)
+    executor = AgentExecutor(db)
+    context_manager = ContextManager(db)
+    firewall = HallucinationFirewall(db)
+    
     chat_loop = ChatLoop(
-        llm=llm_client,
         selector=selector,
+        executor=executor,
+        llm_client=llm_client,
         event_logger=event_logger,
+        context_manager=context_manager,
+        firewall=firewall,
     )
 
     async def event_generator():
