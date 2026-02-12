@@ -17,12 +17,11 @@ def mock_db():
 @pytest.fixture
 def context_manager(mock_db):
     """Create ContextManager with mocked dependencies."""
-    with patch("core.context.manager.get_cache"):
-        with patch("core.context.embeddings.EmbeddingService"):
-            with patch("core.context.prompts.PromptManager"):
-                with patch("core.context.scorer.RelevanceScorer"):
-                    cm = ContextManager(db=mock_db)
-                    yield cm
+    with patch("core.context.embeddings.EmbeddingService"):
+        with patch("core.context.prompts.PromptManager"):
+            with patch("core.context.scorer.RelevanceScorer"):
+                cm = ContextManager(db=mock_db)
+                yield cm
 
 
 @pytest.fixture

@@ -70,8 +70,8 @@ def init_db():
     # Check if our tables exist
     required_tables = [
         'users', 'agents', 'refresh_tokens', 'sessions', 'conversation_events',
-        'prompt_templates', 'skills_registry', 'context_snapshots', 'event_embeddings', 
-        'repos', 'sandbox_metadata', 'audit_logs'
+        'prompt_templates', 'skills_registry', 'context_snapshots', 'decision_audit',
+        'event_embeddings', 'repos', 'sandbox_metadata', 'audit_logs'
     ]
     missing = [t for t in required_tables if t not in existing_tables]
     

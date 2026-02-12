@@ -67,8 +67,8 @@ class Event(Base):
     agent_version = Column(String(32), nullable=False, default="1.0.0")
     event_type = Column(String(50), nullable=False, index=True)
     content = Column(Text, nullable=False)
-    parent_event_id = Column(String(36), nullable=True, index=True)  # 新增：父事件ID
-    causal_chain_id = Column(String(36), nullable=False, index=True)  # 新增：因果链ID
+    parent_event_id = Column(String(36), nullable=True, index=True)
+    causal_chain_id = Column(String(36), nullable=False, index=True)
     desensitized_content = Column(Text)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     event_metadata = Column("metadata", JSON)
@@ -80,8 +80,6 @@ class Event(Base):
     quality_score = Column(String(10))
     is_flagged = Column(TINYINT(1), server_default="0")
     training_eligible = Column(TINYINT(1), server_default="0")
-    parent_event_id = Column(String(36), index=True)
-    causal_chain_id = Column(String(36), index=True)
     llm_model_used = Column(String(50))
     llm_params = Column(JSON)
     skill_name = Column(String(255))
@@ -113,28 +111,20 @@ class SkillRegistry(Base):
 class ContextSnapshot(Base):
     __tablename__ = "context_snapshots"
     snapshot_id = Column(String(36), primary_key=True)
+    event_id = Column(String(64), index=True)
+    snapshot_data = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False, index=True)
+
+
+class DecisionAudit(Base):
+    __tablename__ = "decision_audit"
+    decision_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), nullable=False, index=True)
-    event_id = Column(String(36), index=True)
-    
-    # Context components
-    system_prompt = Column(Text)
-    skill_definitions = Column(JSON)
-    skills_used = Column(JSON)
-    selected_events = Column(JSON)
-    code_context = Column(JSON)
-    documentation = Column(JSON)
-    
-    # Metadata
-    total_tokens = Column(Integer)
-    token_budget = Column(JSON)
-    assembly_time_ms = Column(Integer)
-    relevance_scores = Column(JSON)
-    task_type = Column(String(50))
-    
-    # Tracing
-    llm_request_id = Column(String(100))
-    llm_response_id = Column(String(100))
-    
+    event_id = Column(String(36), nullable=False, index=True)
+    snapshot_id = Column(String(36), nullable=False, index=True)
+    decision_type = Column(String(50), nullable=False)
+    decision_output = Column(JSON, nullable=False)
+    model_params = Column(JSON)
     created_at = Column(DateTime, default=func.now(), nullable=False, index=True)
 
 

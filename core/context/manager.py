@@ -6,8 +6,6 @@ Implements intelligent context selection and assembly based on:
 - Task-aware optimization
 """
 
-import hashlib
-import os
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -15,7 +13,6 @@ from typing import Any
 
 from core.exceptions import ContextError
 from core.logging_config import get_logger
-from core.cache import get_cache
 from sdk import Database
 
 logger = get_logger(__name__)
@@ -56,7 +53,6 @@ class Context:
     assembly_time_ms: int
     relevance_scores: dict[str, float]
     task_type: TaskType
-    snapshot_id: str | None = None
 
     def to_prompt(self) -> str:
         """Convert context to LLM prompt."""
@@ -98,9 +94,6 @@ class ContextManager:
             embedding_provider: Embedding provider (openai, mock)
         """
         self.db = db
-        self.cache = get_cache()
-        self.cache_ttl = int(os.getenv("CONTEXT_CACHE_TTL", "300"))
-        self.context_version = os.getenv("CONTEXT_VERSION", "v1")
 
         # Initialize embedding service
         from core.context.embeddings import EmbeddingService
@@ -125,7 +118,6 @@ class ContextManager:
         query: str,
         max_tokens: int = 8000,
         task_type: TaskType = TaskType.GENERAL,
-        refresh: bool = False,
     ) -> Context:
         """Build optimal context for current query.
 
@@ -141,20 +133,6 @@ class ContextManager:
         start_time = time.time()
 
         try:
-            last_event_id = self._get_last_event_id(session_id)
-            cache_key = self._get_cache_key(
-                session_id=session_id,
-                query=query,
-                task_type=task_type,
-                max_tokens=max_tokens,
-                last_event_id=last_event_id,
-            )
-            if not refresh:
-                cached = self._get_cached_context(cache_key)
-                if cached is not None:
-                    logger.debug(f"Context cache hit: {cache_key}")
-                    return cached
-
             # 1. Allocate token budget
             budget = self._allocate_budget(max_tokens, task_type)
             logger.debug(f"Token budget allocated: {budget}")
@@ -181,7 +159,6 @@ class ContextManager:
                 f"{context.assembly_time_ms}ms"
             )
 
-            self._set_cached_context(cache_key, context)
             return context
 
         except Exception as e:
@@ -243,75 +220,6 @@ class ContextManager:
 
         return allocations[task_type]
 
-    def _get_last_event_id(self, session_id: str) -> str | None:
-        row = self.db.fetchone(
-            """
-            SELECT event_id
-            FROM conversation_events
-            WHERE session_id = %s
-            ORDER BY created_at DESC
-            LIMIT 1
-            """,
-            (session_id,),
-        )
-        return row["event_id"] if row else None
-
-    def _hash_query(self, query: str) -> str:
-        return hashlib.sha256(query.encode("utf-8")).hexdigest()
-
-    def _get_cache_key(
-        self,
-        session_id: str,
-        query: str,
-        task_type: TaskType,
-        max_tokens: int,
-        last_event_id: str | None,
-    ) -> str:
-        query_hash = self._hash_query(query)
-        event_part = last_event_id or "none"
-        return (
-            f"context:{self.context_version}:{session_id}:{task_type.value}:{max_tokens}:"
-            f"{event_part}:{query_hash}"
-        )
-
-    def _get_cached_context(self, cache_key: str) -> Context | None:
-        cached = self.cache.get(cache_key)
-        if not cached:
-            return None
-        try:
-            return Context(
-                system_prompt=cached["system_prompt"],
-                skill_definitions=cached["skill_definitions"],
-                selected_events=cached["selected_events"],
-                code_context=cached["code_context"],
-                documentation=cached["documentation"],
-                total_tokens=cached["total_tokens"],
-                token_budget=cached["token_budget"],
-                assembly_time_ms=cached["assembly_time_ms"],
-                relevance_scores=cached["relevance_scores"],
-                task_type=TaskType(cached["task_type"]),
-            )
-        except Exception:
-            return None
-
-    def _set_cached_context(self, cache_key: str, context: Context) -> None:
-        payload = {
-            "system_prompt": context.system_prompt,
-            "skill_definitions": context.skill_definitions,
-            "selected_events": context.selected_events,
-            "code_context": context.code_context,
-            "documentation": context.documentation,
-            "total_tokens": context.total_tokens,
-            "token_budget": context.token_budget,
-            "assembly_time_ms": context.assembly_time_ms,
-            "relevance_scores": context.relevance_scores,
-            "task_type": context.task_type.value,
-        }
-        self.cache.set(cache_key, payload, ttl=self.cache_ttl)
-
-    def invalidate_session_cache(self, session_id: str) -> None:
-        pattern = f"context:{self.context_version}:{session_id}:*"
-        self.cache.clear_pattern(pattern)
 
     def _retrieve_candidates(self, session_id: str, query: str) -> list[dict[str, Any]]:
         """Retrieve candidate events for context."""
