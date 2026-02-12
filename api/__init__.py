@@ -1,1 +1,1 @@
-"""mo-agent-engine API server."""
+"""API package."""
