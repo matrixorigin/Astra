@@ -44,6 +44,16 @@ Agent Decision = f(prompt@version, skill@version, context@snapshot, memory@state
 Control the inputs → constrain the non-determinism → audit the outputs.
 ```
 
+**Why 5 parameters, not 3?** Each parameter represents an independent dimension of change:
+
+- **prompt@version** — *what the agent is told to do* (system instructions, persona, output format). Changes infrequently (weekly/monthly), controlled by humans. Contains skill *descriptions* (text shown to LLM), but NOT skill *implementations*.
+- **skill@version** — *what the agent can actually do* (execution code, API calls, data transformations). `summarize_pr@1.0` fetches title+body; `summarize_pr@2.0` also fetches diff+reviews. Same prompt, different skill version → different data returned → different decision. This is why skill version cannot be folded into prompt version — they evolve independently.
+- **context@snapshot** — *what the agent sees right now* (selected history, retrieved chunks, code snippets). Changes every request. This is the output of the Context Manager, which selects from memory.
+- **memory@state** — *what the agent could potentially see* (all conversation history, knowledge base, vector store). Context is a subset of memory. Recording memory state explains *why* the context contains what it contains. In practice, memory state is audited indirectly through `context_snapshot.history_events` and `context_snapshot.retrieved_chunks` — the provenance fields record which memory items were selected and which were excluded.
+- **llm_params** — *how the agent thinks* (model, temperature, max_tokens, seed if supported). Recording seed enables near-deterministic replay where providers support it.
+
+Collapsing to `f(prompt@version, context@snapshot, llm_params)` would lose the ability to diagnose: "prompt didn't change, params didn't change, but output changed — was it the skill code or the context selection?"
+
 ## Mission
 
 Build an agentic platform that solves the five adoption blockers:
@@ -203,6 +213,69 @@ LLM outputs are inherently non-deterministic. But agent *decisions* don't have t
 
 Then for any past decision, we can reconstruct: "Given these exact inputs, the LLM produced this output." The LLM itself is the only uncontrolled variable — and that's a much smaller audit surface than "we have no idea what happened."
 
+**Critical clarification: Versioning ≠ Freezing**
+
+Deterministic boundary control means **recording** all inputs, not **constraining** them. An agent using `temperature=0.9` for creative writing is equally auditable as one using `temperature=0` for code review — because both record the exact parameters used. The goal is reproducibility of the *audit trail*, not reproducibility of the *output*.
+
+This distinction matters for three reasons:
+1. **Creativity is preserved**: High temperature, diverse skill sets, and exploratory prompts are all valid — they're just versioned
+2. **The formula is descriptive, not prescriptive**: `f(prompt@v, skill@v, context@snap, memory@state, llm_params)` describes what we *record*, not what we *restrict*
+3. **Over-constraining is a real risk**: Teams that misread this as "lock everything down" will produce rigid, formulaic agents. The platform should make it *easy* to experiment (sandbox, branching) while keeping the audit trail intact
+
+### Uncertainty Quantification
+
+Every LLM response carries inherent uncertainty. Rather than hiding this, we quantify it as a first-class signal:
+
+```
+Agent Response = {
+    content: "PR #123 has 5 files changed...",
+    confidence: 0.87,
+    uncertainty_factors: {
+        context_coverage: 0.92,    // Was relevant data available in context?
+        claim_verifiability: 0.85, // Can claims be checked against snapshot?
+        knowledge_freshness: 0.78, // How current is the underlying data?
+    }
+}
+```
+
+**Why this matters**:
+- Users can judge reliability before acting on a response
+- High-risk decisions (medical, financial) can require minimum confidence thresholds
+- The Hallucination Firewall already extracts and verifies claims — confidence scoring is a natural extension
+- `confidence` (pre-delivery prediction) complements `quality_score` (post-delivery evaluation) — calibrating one against the other measures how well the system knows what it doesn't know
+
+**Implementation**: Confidence is computed from signals already available in the pipeline — context snapshot completeness, claim verification results from the Hallucination Firewall, and knowledge recency. No new data collection required; this is a scoring layer on existing infrastructure.
+
+### Meta-Learning: Closing the Improvement Loop
+
+The platform already has the building blocks for self-improvement scattered across the design:
+- `SelfImprovingSelector` (skill-hierarchy-and-selection.md): learns from historical skill selection failures
+- Post-conversation hook (context-memory-session-and-tables.md): captures `prompt_improvement_signal` on negative feedback
+- Tuning Agent (System Agents): proposes prompt improvements from quality signals
+- Regression Gate: validates changes before deployment
+
+**Meta-learning unifies these into an explicit closed loop**:
+
+```
+Observe: quality_score < threshold on causal chain
+    ↓
+Diagnose: which input was the bottleneck?
+    (wrong prompt version? missing skill? insufficient context? stale knowledge?)
+    ↓
+Propose: generate candidate adjustment
+    (try prompt v3 / add skill X / increase context budget)
+    ↓
+Validate: replay the failing chain in sandbox with the candidate
+    ↓
+Deploy: if improvement > threshold, propose change (auto for config, human-approved for prompts)
+    ↓
+Record: store the learning signal for future pattern matching
+```
+
+This is not a new system — it is the **explicit orchestration** of capabilities that already exist. The `SelfImprovingSelector` does this for skill selection; meta-learning generalizes it to all versioned inputs (prompt, skills, context budget, model routing).
+
+**Key constraint**: Every meta-learning adjustment flows through the same Regression Gate as manual changes. The system cannot silently degrade — sandbox validation is mandatory.
+
 ### Event-Centric Design
 
 Every interaction flows through `conversation_events` with causal chain tracking:
@@ -268,9 +341,10 @@ These are APIs available to all agents. They are NOT agents themselves.
 | **Streaming** | AG-UI protocol event stream, transport-agnostic | SSE/WebSocket/stdout |
 | **Skill Registry** | Versioned skill management, side-effect profiles | `skills_registry` table |
 | **Planning Engine** | PAOR loop, hierarchical decomposition, plan versioning | Planner + ChatLoop |
-| **Hallucination Firewall** | Snapshot-consistent claim verification | Time Travel + LLM |
+| **Hallucination Firewall** | Snapshot-consistent claim verification + confidence scoring | Time Travel + LLM |
 | **Regression Gate** | Automated quality gate for changes | Sandbox + Replay |
 | **Cost Control** | Pre-call estimation, budget enforcement | LLM Client + `llm_call_logs` |
+| **Uncertainty Scoring** | Pre-delivery confidence score from context coverage, claim verifiability, knowledge freshness | Hallucination Firewall + Context Snapshot |
 
 ## System Agents (Daemons)
 
@@ -281,6 +355,7 @@ Pre-installed agents that maintain platform health. Same execution model as user
 | **Regression Agent** | Skill/prompt change event | Replay golden sessions in sandbox, compute quality delta, pass/fail gate | Sandbox, Replay, Regression Gate |
 | **Audit Agent** | Periodic / on-demand | Verify past decisions against current knowledge, flag inconsistencies | Time Travel, Hallucination Firewall |
 | **Tuning Agent** | Quality score threshold | Analyze low-scoring interactions, propose prompt improvements | Memory, Context, Prompt Evolution |
+| **Meta-Learning Agent** | Low quality + pattern accumulation | Diagnose input bottleneck, propose adjustment, validate in sandbox, deploy if improved | Sandbox, Regression Gate, Skill Registry, Prompt Templates |
 | **Eval Agent** | New training data batch | Validate dataset quality, detect contamination, compute metrics | Time Travel, Training Pipeline |
 
 System Agents are defined the same way as User Agents — `AgentProfile` with `system_prompt` + `skill_filter`. The only difference is they have access to platform-level skills (e.g., `create_sandbox`, `replay_session`) that User Agents don't.
@@ -303,11 +378,12 @@ Adding a new User Agent = define `AgentProfile` (system_prompt + skills + model)
 
 These are Platform Capabilities that go beyond standard agent frameworks. Each addresses a real production need:
 
-### Hallucination Firewall
+### Hallucination Firewall + Uncertainty Quantification
 
-**Problem**: LLM generates claims that contradict the data it was given.
-**Solution**: Extract verifiable claims from responses, verify against the same data snapshot the LLM saw, block delivery if contradictions found.
+**Problem**: LLM generates claims that contradict the data it was given. Users have no signal for how much to trust a response.
+**Solution**: Extract verifiable claims from responses, verify against the same data snapshot the LLM saw, block delivery if contradictions found. Compute a pre-delivery confidence score from context coverage, claim verifiability, and knowledge freshness. Expose confidence as a first-class field on every response event.
 **Why it needs data versioning**: Verification must use the *same* data state as generation. If data changed between generation and verification, you get false positives/negatives.
+**Relationship to quality_score**: `confidence` is a pre-delivery *prediction* of reliability; `quality_score` is a post-delivery *evaluation* from user feedback or auto-metrics. Calibrating one against the other measures how well the system knows what it doesn't know.
 
 ### Regression Gate (Sandbox-as-CI)
 
@@ -377,6 +453,7 @@ Event system, session management, skill framework, basic sandbox, side-effect is
 ### Phase 2: Decision Trust
 - Decision audit trail (snapshot_ts binding on every decision event)
 - Hallucination firewall (snapshot-consistent claim verification)
+- Uncertainty quantification (pre-delivery confidence score from context coverage, claim verifiability, knowledge freshness)
 - Multi-turn tool use with full message chain preservation
 
 ### Phase 3: Safe Iteration
@@ -397,9 +474,10 @@ Event system, session management, skill framework, basic sandbox, side-effect is
 - Plan dry-run in sandbox branches
 - Cross-session plan persistence
 
-### Phase 6: System Agents
+### Phase 6: System Agents + Meta-Learning
 - Regression Agent (auto-trigger on skill/prompt change)
 - Audit Agent (periodic decision verification)
+- Meta-Learning Agent (diagnose input bottleneck on low-quality chains → propose adjustment → validate in sandbox → deploy if improved; generalizes SelfImprovingSelector to all versioned inputs)
 - Tuning Agent (prompt optimization from quality signals)
 - Eval Agent (training data validation)
 
@@ -424,10 +502,14 @@ We don't compete on "smarter LLM" or "more tools." We compete on **trust infrast
 - Every decision is **auditable** — reconstruct what the agent saw, not just what it did
 - Every change is **testable** — regression gates before deployment, not after complaints
 - Every data dependency is **versioned** — from knowledge base to training data to prompts
+- Every response carries **uncertainty signals** — confidence scores, not blind trust
+- Every failure drives **self-improvement** — meta-learning closes the loop from observation to adjustment
+
+Versioning does not mean freezing. The platform makes it easy to experiment (sandbox, branching, creative exploration) while keeping the audit trail intact. Deterministic boundary control records all inputs — it does not constrain them.
 
 This is an **Agent Operating System**, not a framework:
-- **Platform Capabilities** (kernel): Event Bus, Sandbox, Time Travel, Streaming, Planning — APIs that all agents inherit
-- **System Agents** (daemons): Regression, Audit, Tuning — maintain platform health automatically
+- **Platform Capabilities** (kernel): Event Bus, Sandbox, Time Travel, Streaming, Planning, Uncertainty Scoring — APIs that all agents inherit
+- **System Agents** (daemons): Regression, Audit, Meta-Learning, Tuning — maintain platform health and drive self-improvement automatically
 - **User Agents** (apps): Code Review, CI Diagnosis, Data Analysis — user-facing, zero platform code to add
 
 The tight coupling with MatrixOne is the strategic moat. Time-travel, zero-copy branching, HTAP, and causal event chains are architecturally impossible to retrofit onto traditional database stacks. The platform turns these data capabilities into agent capabilities that no other platform can offer.

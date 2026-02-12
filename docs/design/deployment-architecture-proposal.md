@@ -47,7 +47,8 @@ This proposal defines the deployment architecture for mo-agent-engine, aligning 
 | **Time-Point Traceability** | All tables enable MatrixOne Git for Data (AS OF queries) | Replay precisely restores "then" skill code/prompt templates |
 | **Cache as Performance Only** | Local cache (memory/file) must be disposable and rebuildable | Service restart doesn't affect data integrity |
 | **Metadata as Asset** | Skills docs, prompt descriptions, workflow YAML all in DB | Satisfies audit/compliance/knowledge requirements |
-| **Deterministic Boundary Control** | Agent Decision = f(versioned_prompt, versioned_skill, versioned_context, versioned_memory, fixed_params); Git for Data controls 4 of 5 inputs | LLM non-determinism constrained to auditable range |
+| **Deterministic Boundary Control** | Agent Decision = f(versioned_prompt, versioned_skill, versioned_context, versioned_memory, fixed_params); Git for Data controls 4 of 5 inputs. Versioning = recording for audit, not constraining creativity. | LLM non-determinism constrained to auditable range |
+| **Uncertainty Quantification** | Every response carries pre-delivery `confidence_score` from context coverage, claim verifiability, knowledge freshness | Users and downstream systems can judge reliability before acting |
 
 **Design Mantra**:
 > "When you say 'skill documentation in MatrixOne', you're not storing data — you're injecting traceable memory into the system."

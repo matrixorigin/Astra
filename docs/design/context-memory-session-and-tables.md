@@ -28,8 +28,10 @@ We adopt an **event-centric** model so that:
 | **溯源** | **context_snapshot** (JSON) on each LLM-related event captures template id, skills used, history event ids, retrieved chunks; any event can be fully reproduced. |
 | **评分训练** | **event_evaluations** (user/auto scores) and **training_annotations** (labels, dataset_split); **training_eligible** + **quality_score** on events; export pipeline for SFT/RLHF. |
 | **MatrixOne 全栈** | All metadata, events, and configs in MatrixOne; vectors only as **embedding_ref** (external store); no dependency on other stores for core analytics. |
-| **确定性边界控制** | Agent Decision = LLM(versioned_prompt, versioned_skill, versioned_context, versioned_memory, fixed_params); Git for Data controls 4 of 5 inputs, constraining LLM non-determinism to auditable range. |
-| **幻觉防火墙** | hallucination_checks table records every verification; claims verified against same snapshot used for context assembly. |
+| **确定性边界控制** | Agent Decision = LLM(versioned_prompt, versioned_skill, versioned_context, versioned_memory, fixed_params); Git for Data controls 4 of 5 inputs, constraining LLM non-determinism to auditable range. Versioning means *recording*, not *constraining* — creative exploration (high temperature, diverse skills) is equally auditable. |
+| **不确定性量化** | Every LLM response carries pre-delivery `confidence_score` (0.0–1.0) computed from context coverage, claim verifiability, and knowledge freshness. Complements post-delivery `quality_score`. |
+| **Meta-Learning 闭环** | Low-quality chains trigger diagnosis → proposal → sandbox validation → deployment. Generalizes SelfImprovingSelector to all versioned inputs (prompt, skills, context budget, model routing). |
+| **幻觉防火墙** | hallucination_checks table records every verification; claims verified against same snapshot used for context assembly. Confidence scoring is a natural extension. |
 | **回归门禁** | gate_results table records every quality gate; snapshot-isolated regression testing before any change reaches production. |
 | **训练数据版本化** | training_datasets table with snapshot_name as version; full lineage from events to datasets. |
 
@@ -185,9 +187,17 @@ Three concepts are kept **explicitly distinct** so that storage, versioning, and
 2. **Memory update**: If the chain is “knowledge-heavy” → enqueue **knowledge extraction** (e.g. new memory_chunk, vector index).
 3. **Prompt signal**: If user edited the response or gave negative feedback → log **prompt_improvement_signal** (e.g. in a dedicated table or event_evaluations.feedback with source=user_feedback). **Flow**: user negative feedback → prompt_improvement_signal recorded → **human review** → A/B test proposal or template change → **new prompt_templates version** published. This closes the loop from “user didn’t like the answer” to “we tried a new prompt and measured.”
 
-**Innovation (self-healing / semi-automated prompt evolution)**:
-- **Prompt evolution in sandbox**: Beyond manual review, the system can run **“prompt evolution experiments”** in the sandbox: use **genetic algorithms** or **LLM-based search** (e.g. DSPy, TextGrad) on historical high-score and low-score causal chains to optimize the prompt, produce **candidate versions**, auto-evaluate them in sandbox, and **recommend merge** to human. This turns “human reviews prompt” into a **semi-automated** flow: human approves or rejects recommended candidates.
-- **Causal-chain regression gate**: Before any new prompt/skills version is merged to production, **automatically** replay in sandbox the **last N low-score chains** and **last N high-score chains** with the candidate version; compute **quality delta** (e.g. score change, regression rate). If regression exceeds a configured threshold, **reject merge**. This is stricter than manual spot-checks and makes releases safer.
+**Innovation (meta-learning / self-improving agents)**:
+
+The platform has multiple self-improvement mechanisms that form a unified **meta-learning loop**:
+
+- **SelfImprovingSelector** (skill-hierarchy-and-selection.md): Learns from historical skill selection failures using time-travel replay. Already implemented.
+- **Prompt evolution in sandbox**: Use genetic algorithms or LLM-based search (e.g. DSPy, TextGrad) on historical high-score and low-score causal chains to optimize prompts, produce candidate versions, auto-evaluate in sandbox, and recommend merge to human.
+- **Causal-chain regression gate**: Before any new prompt/skills version is merged to production, automatically replay in sandbox the last N low-score chains and last N high-score chains with the candidate version; compute quality delta. If regression exceeds threshold, reject merge.
+- **Meta-Learning Agent** (Phase 6 System Agent): Generalizes the above to all versioned inputs. On low-quality chains: diagnose which input was the bottleneck (wrong prompt? missing skill? insufficient context? stale knowledge?) -> generate candidate adjustment -> validate in sandbox -> deploy if improvement exceeds threshold. This is the explicit orchestration of capabilities that already exist, not a new system.
+- **Confidence calibration**: Compare pre-delivery `confidence_score` against post-delivery `quality_score`. If calibration error exceeds threshold consistently, flag for uncertainty model tuning.
+
+**Key constraint**: Every meta-learning adjustment flows through the same Regression Gate as manual changes. The system cannot silently degrade -- sandbox validation is mandatory.
 
 These hooks are **design points**; implementation can be async (queues, batch jobs) so that the main request path stays fast.
 
@@ -700,7 +710,9 @@ Optional later: `session_summaries`, `data_retention_policy` (for partitioning/a
 | created_at           | timestamp | |
 | prompt_template_id   | string   | References prompt_templates (e.g. template_id+version). |
 | skills_snapshot      | JSON     | e.g. [{"id":"review", "version":"v2", "used":true}]. |
-| quality_score        | decimal(3,2) | System pre-score (0–5). Nullable. |
+| quality_score        | decimal(3,2) | Post-delivery evaluation (0–5). Nullable. From user feedback or auto_metric. |
+| **confidence_score** | decimal(3,2) | Pre-delivery confidence (0.0–1.0). Nullable. Computed from context coverage, claim verifiability, knowledge freshness before response is delivered. |
+| **uncertainty_factors** | JSON   | Nullable. Breakdown: `{context_coverage, claim_verifiability, knowledge_freshness}`. Each 0.0–1.0. |
 | is_flagged           | bool     | Default false. |
 | training_eligible    | bool     | Default false; set by rule or evaluation for training pipeline. |
 | **parent_event_id**  | string   | Nullable; immediate prior event in causal chain (e.g. llm_response → llm_request). |
@@ -910,6 +922,8 @@ CREATE TABLE conversation_events (
   prompt_template_id  VARCHAR(64),
   skills_snapshot     JSON,
   quality_score      DECIMAL(3,2),
+  confidence_score   DECIMAL(3,2),
+  uncertainty_factors JSON,
   is_flagged          BOOLEAN DEFAULT FALSE,
   training_eligible   BOOLEAN DEFAULT FALSE,
   parent_event_id     VARCHAR(64),

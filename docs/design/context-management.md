@@ -832,7 +832,8 @@ This transforms context assembly from "fill to budget" to "optimize cost-quality
 6. **Reproducibility**: Can reproduce exact context from any point in time via snapshots
 7. **Cost Efficiency**: Leverage LLM native caching to reduce cost by 90%
 8. **Hallucination Prevention**: Verifiable claims in LLM responses checked against versioned data with >80% detection rate
-9. **Cost Prediction**: Context assembly cost predicted within 20% of actual before execution
+9. **Uncertainty Calibration**: Pre-delivery `confidence_score` correlates with post-delivery `quality_score` at r > 0.7
+10. **Cost Prediction**: Context assembly cost predicted within 20% of actual before execution
 
 **The ultimate test**: Can the agent handle a 6-month-old conversation with 10,000 events and still give relevant answers?
 
@@ -850,7 +851,7 @@ This transforms context assembly from "fill to budget" to "optimize cost-quality
 4. **LLM Native Caching**: Separate static/dynamic context to maximize KV cache hits
 5. **Multi-Signal Scoring**: Combine semantic, temporal, causal, and explicit signals
 6. **Task-Aware Allocation**: Dynamic token budget based on task type
-7. **Hallucination Firewall**: Verify LLM claims against the same snapshot used for context assembly—ensuring verification and generation see identical data
+7. **Hallucination Firewall + Uncertainty Quantification**: Verify LLM claims against the same snapshot used for context assembly. Compute pre-delivery `confidence_score` from context coverage, claim verifiability, and knowledge freshness. `confidence` (pre-delivery prediction) complements `quality_score` (post-delivery evaluation) — calibrating one against the other measures how well the system knows what it doesn't know.
 8. **Cost-Aware Context Assembly**: Predict LLM cost from historical data before assembly; adjust context size to stay within budget
 
 **Design Philosophy**: **Intelligence through selection, not accumulation.**

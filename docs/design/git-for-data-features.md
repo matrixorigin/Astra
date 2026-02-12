@@ -14,7 +14,7 @@ Agent platforms face problems that traditional databases cannot solve:
 
 Git for Data (time-travel queries, zero-copy branching, snapshots, PITR) solves these at the storage engine level. This is why it serves as the architectural spine — not as a feature showcase, but because the problems demand it.
 
-Each agent decision binds to versioned inputs: `f(prompt@version, skill@version, context@snapshot, memory@state, llm_params)`. When 4 of 5 inputs are version-controlled, LLM non-determinism is constrained to a minimal, auditable range.
+Each agent decision binds to versioned inputs: `f(prompt@version, skill@version, context@snapshot, memory@state, llm_params)`. When 4 of 5 inputs are version-controlled, LLM non-determinism is constrained to a minimal, auditable range. Note: versioning means *recording* all inputs for audit, not *constraining* them — creative exploration (high temperature, diverse skills) is equally auditable. Each response also carries a pre-delivery `confidence_score` computed from context coverage, claim verifiability, and knowledge freshness.
 
 ## 1. Time Machine
 
@@ -191,7 +191,7 @@ class DiffMerge:
 
 ---
 
-## 5. Hallucination Firewall
+## 5. Hallucination Firewall + Uncertainty Quantification
 
 ### Core Capabilities
 
@@ -200,7 +200,9 @@ class DiffMerge:
 - [ ] Query same snapshot the LLM saw for verification
 - [ ] Annotate responses with verification status
 - [ ] Block delivery if contradictions found
-- [ ] Confidence scoring for claims
+- [ ] Pre-delivery confidence scoring from context coverage, claim verifiability, knowledge freshness
+- [ ] Store `confidence_score` and `uncertainty_factors` on conversation_events
+- [ ] Calibrate confidence against post-delivery quality_score
 
 ### Use Cases
 
@@ -208,6 +210,8 @@ class DiffMerge:
 2. **Consistency Checking**: Ensure responses align with context
 3. **Quality Assurance**: Block hallucinated responses before delivery
 4. **Trust Scoring**: Build confidence metrics for LLM outputs
+5. **User Judgment**: Users see confidence level before acting on a response
+6. **Calibration Monitoring**: Track how well the system knows what it doesn't know
 
 ### API Design
 
@@ -217,7 +221,24 @@ class HallucinationFirewall:
     def verify_claims(claims, snapshot_id) -> list[VerificationResult]
     def annotate_response(response, verifications) -> AnnotatedResponse
     def should_block_response(verifications, threshold) -> bool
-    def compute_confidence_score(verifications) -> float
+    def compute_confidence_score(
+        verifications,
+        context_snapshot,
+        knowledge_recency
+    ) -> ConfidenceResult:
+        """
+        Returns:
+            confidence_score: 0.0-1.0 overall confidence
+            uncertainty_factors: {
+                context_coverage: float,     # relevant data available?
+                claim_verifiability: float,  # claims checkable against snapshot?
+                knowledge_freshness: float,  # underlying data current?
+            }
+        Relationship to quality_score:
+            confidence is pre-delivery prediction;
+            quality_score is post-delivery evaluation.
+            Calibrating one against the other measures self-awareness.
+        """
 ```
 
 ---
