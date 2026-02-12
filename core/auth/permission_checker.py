@@ -31,13 +31,13 @@ class PermissionChecker:
 
     def can_manage_models(self, user_id: str, scope: str, scope_id: str | None = None) -> bool:
         """Check if user can manage models at given scope.
-        
+
         For development: simplified to allow all operations.
         For production: uncomment RBAC checks below.
         """
         # Development mode: allow all
         return True
-        
+
         # Production mode (uncomment when RBAC is set up):
         # if scope == "global":
         #     return self.is_admin(user_id)
@@ -49,12 +49,12 @@ class PermissionChecker:
 
     def can_manage_skills(self, user_id: str, scope: str, scope_id: str | None = None) -> bool:
         """Check if user can manage skills at given scope.
-        
+
         For development: simplified to allow all operations.
         """
         # Development mode: allow all
         return True
-        
+
         # Production mode (uncomment when RBAC is set up):
         # if scope in ["global", "account"]:
         #     return self.is_admin(user_id)
