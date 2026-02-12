@@ -239,12 +239,8 @@ class TestHealthEndpoint:
 
     def test_health_check_healthy(self, client):
         """Test health check when database is healthy."""
-        with patch("db.database.get_db") as mock_get_db:
-            mock_db = MagicMock()
-            mock_db.health_check.return_value = True
-            mock_get_db.return_value = mock_db
-
-            response = client.get("/health")
+        # Health check creates Database inside the function, so we mock at import time
+        response = client.get("/health")
 
         assert response.status_code == 200
         data = response.json()
@@ -253,17 +249,18 @@ class TestHealthEndpoint:
 
     def test_health_check_unhealthy(self, client):
         """Test health check when database is unhealthy."""
-        with patch("db.database.get_db") as mock_get_db:
+        # Mock Database in sdk module (imported inside health_check function)
+        with patch("sdk.Database") as mock_db_class:
             mock_db = MagicMock()
-            mock_db.health_check.return_value = False
-            mock_get_db.return_value = mock_db
+            mock_db.get_connection.return_value.__enter__.side_effect = Exception("Connection failed")
+            mock_db_class.return_value = mock_db
 
             response = client.get("/health")
 
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "unhealthy"
-        assert data["database"] == "disconnected"
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "unhealthy"
+            assert data["database"] == "disconnected"
 
 
 class TestRootEndpoint:

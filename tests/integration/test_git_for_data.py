@@ -45,7 +45,7 @@ def sandbox(db):
 
 def test_snapshot_creation_and_listing(git):
     """Test creating and listing snapshots."""
-    snapshot_name = f"test_snapshot_{str(uuid7())[:8]}".lower()
+    snapshot_name = f"test_snapshot_{str(uuid7()).replace('-', '_')[:8]}".lower()
 
     # Create snapshot
     snapshot = git.create_snapshot(snapshot_name)
@@ -69,7 +69,7 @@ def test_time_machine_checkpoint(time_machine, event_logger):
     """Test time machine checkpoint and restore."""
     user_id = f"test_user_{uuid7()}"
     session_id = f"test_session_{uuid7()}"
-    checkpoint_name = f"test_checkpoint_{str(uuid7())[:8]}".lower()
+    checkpoint_name = f"test_checkpoint_{str(uuid7()).replace('-', '_')[:8]}".lower()
 
     # Create initial event
     _event1 = event_logger.create_user_query(
@@ -100,7 +100,7 @@ def test_time_machine_checkpoint(time_machine, event_logger):
 
 def test_sandbox_creation(sandbox):
     """Test sandbox creation and deletion."""
-    sandbox_name = f"sandbox_{str(uuid7())[:8]}".lower()
+    sandbox_name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
 
     # Create sandbox
     sandbox.create(sandbox_name)
@@ -117,7 +117,7 @@ def test_sandbox_experiment(sandbox, event_logger, db):
     """Test running an experiment in a sandbox."""
     user_id = f"test_user_{uuid7()}"
     session_id = f"test_session_{uuid7()}"
-    sandbox_name = f"sandbox_{str(uuid7())[:8]}".lower()
+    sandbox_name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
 
     # Create initial event
     _initial_event = event_logger.create_user_query(
@@ -150,7 +150,7 @@ def test_sandbox_experiment(sandbox, event_logger, db):
 
 def test_git_for_data_restore(git, event_logger, db):
     """Test snapshot restore functionality."""
-    snapshot_name = f"test_restore_{str(uuid7())[:8]}".lower()
+    snapshot_name = f"test_restore_{str(uuid7()).replace('-', '_')[:8]}".lower()
     test_event_id = f"test_event_{uuid7()}"
 
     # Create test event

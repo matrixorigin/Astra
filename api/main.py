@@ -31,10 +31,15 @@ app.include_router(agents.router, prefix="/agents", tags=["agents"])
 @app.get("/health")
 def health_check():
     """Health check endpoint."""
-    from db.database import get_db
-
-    db = get_db()
-    db_healthy = db.health_check()
+    from sdk import Database
+    
+    db = Database()
+    # Simple health check - try to connect
+    try:
+        with db.get_connection():
+            db_healthy = True
+    except Exception:
+        db_healthy = False
 
     return {
         "status": "healthy" if db_healthy else "unhealthy",

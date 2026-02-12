@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from jwt.exceptions import InvalidTokenError
 
+from api.dependencies import get_db
 from core.auth.jwt_manager import (
     JWTConfig,
     create_access_token,
@@ -13,7 +14,7 @@ from core.auth.jwt_manager import (
     verify_token_type,
 )
 from core.auth.user_manager import UserManager
-from db.database import Database, get_db
+from sdk import Database
 from schemas.auth import (
     LoginRequest,
     RefreshRequest,

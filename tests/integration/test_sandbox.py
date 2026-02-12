@@ -19,7 +19,7 @@ def sandbox(db):
 
 def test_create_and_delete(sandbox):
     """Test sandbox creation and deletion."""
-    name = f"sandbox_{str(uuid7())[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
 
     sandbox.create(name, description="Test sandbox")
     sandboxes = sandbox.list_sandboxes()
@@ -71,7 +71,7 @@ def test_create_from_snapshot(sandbox, db):
 
 def test_isolation(sandbox, db):
     """Test sandbox isolation."""
-    name = f"sandbox_{str(uuid7())[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
 
     # Create table in main
     db.execute("CREATE TABLE IF NOT EXISTS test_iso (id INT)")
@@ -115,7 +115,7 @@ def test_clone_table(sandbox, db):
 
 def test_add_remove_table(sandbox, db):
     """Test add/remove table."""
-    name = f"sandbox_{str(uuid7())[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
 
     # Create empty sandbox (no tables)
     db.execute(f"CREATE DATABASE {name}")
@@ -136,7 +136,7 @@ def test_add_remove_table(sandbox, db):
 
 def test_sandbox_info(sandbox, db):
     """Test sandbox info."""
-    name = f"sandbox_{str(uuid7())[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
 
     sandbox.create(name, description="Test info")
     info = sandbox.info(name)
@@ -150,7 +150,7 @@ def test_sandbox_info(sandbox, db):
 
 def test_sandbox_snapshot(sandbox, db):
     """Test sandbox snapshot and restore."""
-    name = f"sandbox_{str(uuid7())[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
 
     # Create sandbox
     sandbox.create(name, description="Test snapshot")
@@ -183,9 +183,14 @@ def test_sandbox_snapshot(sandbox, db):
 
 def test_use_sandbox(sandbox, db):
     """Test switching to sandbox."""
-    name = f"sandbox_{str(uuid7())[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
-    # Create sandbox
+    # Insert test data first
+    from core.events.event_logger import EventLogger
+    logger = EventLogger(db)
+    logger.create_user_query(user_id="test", session_id="test_session", content="test")
+
+    # Create sandbox (clones current data)
     sandbox.create(name)
 
     # Switch to sandbox

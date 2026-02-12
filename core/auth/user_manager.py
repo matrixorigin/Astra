@@ -8,7 +8,7 @@ from uuid_utils import uuid7
 
 from core.auth.password import hash_password, verify_password
 from core.logging_config import get_logger
-from db.database import Database
+from sdk import Database
 
 logger = get_logger(__name__)
 

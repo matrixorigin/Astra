@@ -5,7 +5,13 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from core.auth.jwt_manager import decode_token, verify_token_type
 from core.auth.user_manager import UserManager
-from db.database import Database, get_db
+from sdk import Database
+
+
+def get_db() -> Database:
+    """Get database instance."""
+    return Database()
+
 
 security = HTTPBearer()
 

@@ -2,9 +2,9 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from api.dependencies import get_current_user
+from api.dependencies import get_current_user, get_db
 from core.agent.agent_manager import AgentManager
-from db.database import Database, get_db
+from sdk import Database
 from schemas.agent import AgentCreateRequest, AgentResponse, AgentUpdateRequest
 
 router = APIRouter()
