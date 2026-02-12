@@ -17,42 +17,41 @@ logger = get_logger(__name__)
 MAX_TOOL_ROUNDS = 10
 
 
-def _needs_planning(user_input: str) -> bool:
-    """Check if user input needs planning based on heuristics."""
-    # Keywords that indicate multi-step tasks
-    planning_keywords = [
-        "分析并",
-        "分析和",
-        "分析以及",
-        "分析与",
-        "修复并",
-        "修复和",
-        "修复以及",
-        "修复与",
-        "完成",
-        "实现",
-        "创建",
-        "设置",
-        "建立",
-        "帮我",
-        "请帮我",
-        "请帮我完成",
-        "多步",
-        "多个步骤",
-        "分步",
-        "逐步",
-        "首先",
-        "然后",
-        "接着",
-        "最后",
-    ]
+async def _needs_planning(user_input: str, llm_client) -> bool:
+    """Check if user input needs planning using LLM judgment.
+    
+    Uses a lightweight LLM call to determine if the task requires multi-step planning.
+    """
+    prompt = f"""Analyze if this task requires multi-step planning.
 
-    # Check if query is long enough (likely complex)
-    if len(user_input) > 200:
-        return True
+Task: {user_input}
 
-    # Check for planning keywords
-    return any(keyword in user_input for keyword in planning_keywords)
+Answer with ONLY "yes" or "no".
+
+Answer "yes" if the task:
+- Has multiple distinct steps
+- Requires sequential execution
+- Involves complex dependencies
+- Needs coordination between different actions
+
+Answer "no" if the task:
+- Is a simple query or question
+- Can be done in one step
+- Is just asking for information
+
+Answer:"""
+
+    try:
+        response = llm_client.chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,  # Deterministic
+            max_tokens=10,
+        )
+        answer = response.strip().lower()
+        return answer.startswith("yes")
+    except Exception as e:
+        logger.warning(f"Planning check failed: {e}, defaulting to no planning")
+        return False
 
 
 def _merge_tool_call_fragments(fragments: list[dict], new_fragments: list[dict]) -> list[dict]:
@@ -123,6 +122,8 @@ class ChatLoop:
         The LLM can call tools multiple times before producing a final answer.
         The complete message chain is preserved so the LLM retains its
         chain-of-thought across tool calls.
+        
+        Note: For complex tasks requiring planning, use run_step_stream() instead.
         """
         # 1. Log user query event
         user_event = self.event_logger.create_user_query(
@@ -143,20 +144,7 @@ class ChatLoop:
         # 3. Build messages with context
         messages = self._build_messages(user_input, context)
 
-        # 4. Check if planning is needed
-        if _needs_planning(user_input):
-            # Use planning for complex tasks - collect final result
-            final_result = ""
-            async for event in self.run_step_with_planning(
-                user_input, session_id, user_id, context, max_candidates
-            ):
-                if event.event_type == StreamEventType.TEXT_DELTA:
-                    final_result += event.data.get("chunk", "")
-                elif event.event_type == StreamEventType.RUN_FINISHED:
-                    break
-            return final_result
-
-        # 5. Get available tools schema
+        # 4. Get available tools schema
         tools_schema = self.selector.selector.get_tools_schema(
             query=user_input, max_candidates=max_candidates
         )
@@ -295,10 +283,19 @@ class ChatLoop:
             content=user_input,
         )
 
-        # 2. Build messages with context
+        # 2. Check if planning is needed
+        if await _needs_planning(user_input, self.llm):
+            # Use planning for complex tasks - stream events directly
+            async for event in self.run_step_with_planning(
+                user_input, session_id, user_id, context, max_candidates
+            ):
+                yield event
+            return
+
+        # 3. Build messages with context
         messages = self._build_messages(user_input, context)
 
-        # 3. Get available tools schema
+        # 4. Get available tools schema
         tools_schema = self.selector.selector.get_tools_schema(
             query=user_input, max_candidates=max_candidates
         )

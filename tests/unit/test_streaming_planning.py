@@ -3,40 +3,56 @@
 import unittest
 from unittest.mock import MagicMock
 
+import pytest
+
 from core.agent.chat_loop import _merge_tool_call_fragments, _needs_planning
 from core.agent.planner import Plan, Planner, PlanStatus, PlanStep
 
 
-class TestNeedsPlanning(unittest.TestCase):
-    """Test _needs_planning heuristic function."""
+class TestNeedsPlanning:
+    """Test _needs_planning LLM-based function."""
 
-    def test_short_query_no_keywords(self):
-        """Test short query without planning keywords."""
-        self.assertFalse(_needs_planning("你好"))
-        self.assertFalse(_needs_planning("今天天气如何"))
+    @pytest.mark.asyncio
+    async def test_simple_query_no_planning(self):
+        """Test simple query doesn't need planning."""
+        mock_llm = MagicMock()
+        mock_llm.chat = MagicMock(return_value="no")
+        
+        result = await _needs_planning("What is the weather?", mock_llm)
+        
+        assert result is False
+        mock_llm.chat.assert_called_once()
 
-    def test_long_query(self):
-        """Test long query exceeds threshold."""
-        # 200+ characters
-        long_query = "a" * 210
-        self.assertTrue(_needs_planning(long_query))
+    @pytest.mark.asyncio
+    async def test_complex_query_needs_planning(self):
+        """Test complex multi-step query needs planning."""
+        mock_llm = MagicMock()
+        mock_llm.chat = MagicMock(return_value="yes")
+        
+        result = await _needs_planning("First analyze the code, then fix bugs, and finally run tests", mock_llm)
+        
+        assert result is True
+        mock_llm.chat.assert_called_once()
 
-    def test_planning_keywords(self):
-        """Test queries with planning keywords."""
-        self.assertTrue(_needs_planning("分析并修复这个问题"))
-        self.assertTrue(_needs_planning("完成这个任务"))
-        self.assertTrue(_needs_planning("帮我实现"))
-        self.assertTrue(_needs_planning("首先...然后...最后"))
+    @pytest.mark.asyncio
+    async def test_llm_error_defaults_to_no_planning(self):
+        """Test LLM error defaults to no planning."""
+        mock_llm = MagicMock()
+        mock_llm.chat = MagicMock(side_effect=Exception("LLM error"))
+        
+        result = await _needs_planning("Some query", mock_llm)
+        
+        assert result is False
 
-    def test_boundary_length(self):
-        """Test boundary case at 200 characters."""
-        # Exactly 200 characters
-        query_200 = "a" * 200
-        self.assertFalse(_needs_planning(query_200))
-
-        # 201 characters
-        query_201 = "a" * 201
-        self.assertTrue(_needs_planning(query_201))
+    @pytest.mark.asyncio
+    async def test_yes_prefix_detection(self):
+        """Test various 'yes' responses are detected."""
+        mock_llm = MagicMock()
+        
+        for response in ["yes", "Yes", "YES", "yes, this needs planning"]:
+            mock_llm.chat = MagicMock(return_value=response)
+            result = await _needs_planning("query", mock_llm)
+            assert result is True, f"Failed for response: {response}"
 
 
 class TestMergeToolCallFragments(unittest.TestCase):
