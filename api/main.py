@@ -10,8 +10,32 @@ logger = get_logger(__name__)
 
 app = FastAPI(
     title="Agent Engine API",
-    description="Universal agent state management platform",
+    description="""
+    Universal agent state management platform with authentication, session tracking, and event logging.
+    
+    ## Features
+    
+    * **Authentication**: JWT-based auth with access/refresh tokens
+    * **Agent Management**: CRUD operations for AI agents
+    * **Session Management**: Conversation lifecycle tracking
+    * **Event Logging**: Record and query conversation events
+    
+    ## Authentication
+    
+    Most endpoints require authentication. Use `/auth/login` to get access token, 
+    then include it in the `Authorization: Bearer <token>` header.
+    
+    ## Quick Start
+    
+    1. Register: `POST /auth/register`
+    2. Login: `POST /auth/login` 
+    3. Create agent: `POST /agents`
+    4. Create session: `POST /sessions`
+    5. Log events: `POST /events`
+    """,
     version="0.1.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
 )
 
 # CORS middleware

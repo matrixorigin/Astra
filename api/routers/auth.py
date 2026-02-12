@@ -23,7 +23,10 @@ from schemas.auth import (
     UserResponse,
 )
 
-router = APIRouter()
+router = APIRouter(
+    tags=["authentication"],
+    responses={401: {"description": "Invalid credentials"}},
+)
 
 
 def get_user_manager(db: Database = Depends(get_db)) -> UserManager:
@@ -37,16 +40,9 @@ def register(
     user_manager: UserManager = Depends(get_user_manager),
 ):
     """Register a new user.
-
-    Args:
-        request: Registration request
-        user_manager: User manager dependency
-
-    Returns:
-        Created user
-
-    Raises:
-        HTTPException: If username or email already exists
+    
+    Create a new user account with username, email, and password.
+    Username must be unique. Returns user details (password excluded).
     """
     try:
         user = user_manager.create_user(

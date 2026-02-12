@@ -4,26 +4,31 @@ Intelligent agent platform with auditable decisions, safe iteration, and version
 
 ## Features
 
+- **REST API** ⭐ NEW: Complete HTTP API for authentication, agents, sessions, and events
+- **Authentication System** ⭐ NEW: JWT-based auth with access/refresh tokens, user management
+- **Agent Management** ⭐ NEW: CRUD operations for agents with ownership verification
+- **Session Management** ⭐ NEW: Conversation lifecycle management with metadata
+- **Event Tracking** ⭐ NEW: Record and query conversation events with causal chains
 - **Auditable Decisions**: Every agent decision binds to a data snapshot — reconstruct what the agent saw at any past moment
-- **Auditable Skill Selection** ⭐ NEW: Every skill selection is versioned and auditable — time-travel to any selection decision
-- **Sandbox Pre-Validation** ⭐ NEW: Validate skill selections in isolated sandbox before execution — choose the best, not guess
-- **Self-Improving Selection** ⭐ NEW: Automatically learn from historical failures using time-travel replay — no manual labeling needed
-- **Regression Gate** ⭐ NEW: Every selector change is automatically tested against golden queries — prevent degradation
+- **Auditable Skill Selection**: Every skill selection is versioned and auditable — time-travel to any selection decision
+- **Sandbox Pre-Validation**: Validate skill selections in isolated sandbox before execution — choose the best, not guess
+- **Self-Improving Selection**: Automatically learn from historical failures using time-travel replay — no manual labeling needed
+- **Regression Gate**: Every selector change is automatically tested against golden queries — prevent degradation
 - **Event-Centric Architecture**: All interactions stored as atomic events with causal chain tracking
 - **Skill System**: Versioned, declarative skills with full replay capability and side-effect isolation
-- **Regression Gate**: Replay past sessions against prompt/skill changes in isolated environments before deployment
 - **Knowledge Regression Detection**: Automatically identify past outputs invalidated by knowledge updates
 - **Zero-Cost Experimentation**: Branch production data in milliseconds for testing — zero storage overhead
 - **Hallucination Firewall**: Verify LLM claims against the same data snapshot the LLM saw
 - **Training Data Pipeline**: Versioned datasets with full lineage from training example to source interaction
 - **Cost-Aware Execution**: Predict costs from historical data before spending
-- **Session Management**: Complete conversation lifecycle with cross-session context
 - **Multi-Repo Management**: Register and manage multiple repositories with per-repo tokens
-- **Production-Ready**: Logging, auth, rate limiting, monitoring, Docker support
+- **Production-Ready**: Logging, monitoring, Docker support
 - **Type-Safe**: 100% type annotations with Pydantic validation
-- **Comprehensive Testing**: 79 tests with VCR-recorded real API responses
+- **Comprehensive Testing**: 439 tests passing with 99%+ coverage
 
 ## Quick Start
+
+### CLI Usage
 
 ```bash
 # 1. Create and activate virtual environment
@@ -45,6 +50,28 @@ mo-agent chat
 # Or run tests
 make test
 ```
+
+### API Server
+
+```bash
+# Start API server
+uvicorn api.main:app --reload --port 8000
+
+# Visit interactive docs (Swagger UI)
+open http://localhost:8000/docs
+
+# Or ReDoc
+open http://localhost:8000/redoc
+
+# Quick test
+curl http://localhost:8000/health
+```
+
+**API Documentation**:
+- Interactive Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+- [API Reference](docs/API.md) - Detailed examples
+- [Quick Start Guide](docs/QUICKSTART.md)
 
 ## CLI Commands
 
