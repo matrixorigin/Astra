@@ -120,7 +120,7 @@ class TestListSandboxes:
         
         # Verify - 开发模式返回所有
         assert len(result) == 2
-        mock_sandbox.list_sandboxes.assert_called_once_with(pattern="%")
+        mock_sandbox.list_sandboxes.assert_called_once_with(prefix="", pattern="%")
 
 
 class TestDeleteSandbox:

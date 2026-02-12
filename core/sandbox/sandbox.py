@@ -48,8 +48,8 @@ class Sandbox:
 
         self.db.execute(f"""
             INSERT INTO sandbox_metadata
-            (sandbox_name, description, created_by, created_at, updated_at, tags, source_database, source_snapshot, status)
-            VALUES ('{name}', '{description}', '{created_by}', CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6),
+            (sandbox_name, user_id, data_source, description, created_by, created_at, updated_at, tags, source_database, source_snapshot, status)
+            VALUES ('{name}', '{created_by}', '{{"type": "matrixone", "database": "{name}"}}', '{description}', '{created_by}', CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6),
                     {tags_json}, '{self.source_db}', {snapshot_val}, 'active')
         """)
 

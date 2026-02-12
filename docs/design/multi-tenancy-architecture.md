@@ -1,361 +1,352 @@
-# Multi-Tenancy Architecture
+# 多租户和数据源架构设计
 
-## Overview
+## 概述
 
-mo-agent-engine supports flexible multi-tenancy deployment models using MatrixOne's native tenant isolation capabilities.
+mo-agent-engine 采用**租户隔离 + 灵活数据源**的架构，实现：
+1. Core Service 与用户数据完全隔离
+2. 支持多种数据源（MatrixOne, MySQL, PostgreSQL）
+3. Sandbox 能力可选（仅 MatrixOne）
+4. 权限在数据库层面管理，应用层不感知
 
-## Tenant Models
-
-### Model 1: Single Tenant (Simple Deployment)
-
-```
-MatrixOne Cluster
-  │
-  └─ agent_platform (Single Tenant)
-      └─ agent_engine (Database)
-          ├─ users
-          ├─ agents
-          ├─ events
-          ├─ skills
-          └─ ...
-```
-
-**Use Case**: Small deployment, single organization
-
-**Configuration**:
-```bash
-DATABASE_TENANT=agent_platform
-DATABASE_NAME=agent_engine
-```
-
-### Model 2: Multi-Tenant (SaaS Deployment)
+## 架构图
 
 ```
-MatrixOne Cluster
-  │
-  ├─ platform_core (Platform Tenant)
-  │   └─ agent_engine
-  │       ├─ users (all users)
-  │       ├─ tenants (tenant registry)
-  │       └─ ...
-  │
-  ├─ customer_a (Customer A's Tenant)
-  │   └─ agent_engine
-  │       ├─ agents (Customer A's agents)
-  │       ├─ events (Customer A's events)
-  │       └─ ...
-  │
-  └─ customer_b (Customer B's Tenant)
-      └─ agent_engine
-          ├─ agents
-          ├─ events
-          └─ ...
+┌─────────────────────────────────────────────────────────────┐
+│  MatrixOne Cluster                                          │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ sys 租户 (运维/系统管理员)                              │  │
+│  │  - 集群管理                                            │  │
+│  │  - 最高权限                                            │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ mo_agent_core 租户 (Core Service)                     │  │
+│  │  ✓ users, agents, sessions, events                    │  │
+│  │  ✓ skills, context, memory, tokens                    │  │
+│  │  ✓ sandbox_metadata (元数据管理)                       │  │
+│  │  ✓ 不感知用户数据库                                    │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ user_alice 租户 (Alice 的数据)                        │  │
+│  │  - Alice 的业务数据                                   │  │
+│  │  - Alice 创建的 sandbox                               │  │
+│  │  - 权限由 MatrixOne RBAC 管理                         │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ user_bob 租户 (Bob 的数据)                            │  │
+│  │  - Bob 的业务数据                                     │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  外部数据库 (可选)                                           │
+│  - MySQL, PostgreSQL, 其他 MatrixOne 集群                  │
+│  - User Agent 可以连接任何数据库                            │
+│  - 如果不是 MatrixOne，则无 Sandbox 能力                    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**Use Case**: SaaS platform, data sovereignty requirements
+## 核心原则
 
-**Configuration**:
-```bash
-# Platform service
-DATABASE_TENANT=platform_core
-DATABASE_NAME=agent_engine
+### 1. Core Service 租户隔离
 
-# Customer A service instance
-DATABASE_TENANT=customer_a
-DATABASE_NAME=agent_engine
+**Core Service 只管理平台数据**:
+- 用户账号 (users)
+- Agent 定义 (agents)
+- 会话和事件 (sessions, events)
+- 技能和上下文 (skills, context, memory)
+- Sandbox 元数据 (sandbox_metadata)
 
-# Customer B service instance
-DATABASE_TENANT=customer_b
-DATABASE_NAME=agent_engine
+**不管理用户业务数据**:
+- 用户的业务表
+- 用户的实验数据
+- 用户的 Sandbox 内容
+
+### 2. 用户数据源灵活配置
+
+**Agent 绑定数据源**:
+```python
+agent = {
+    "agent_id": "alice_agent_1",
+    "agent_name": "Alice's Data Agent",
+    "owner_user_id": "alice",
+    "data_source": {
+        "type": "matrixone",      # 或 "mysql", "postgres"
+        "host": "mo-cluster",
+        "port": 6001,
+        "user": "user_alice",     # Alice 的租户/用户
+        "password": "***",        # 加密存储
+        "database": "alice_data"
+    }
+}
 ```
 
-### Model 3: Hybrid (Shared + Isolated)
+**支持的数据源类型**:
+- `matrixone` - 支持 Sandbox, Time Travel, Git for Data
+- `mysql` - 基础功能，无 Sandbox
+- `postgres` - 基础功能，无 Sandbox
 
-```
-MatrixOne Cluster
-  │
-  ├─ shared_platform (Shared Resources)
-  │   └─ agent_engine
-  │       ├─ users
-  │       ├─ shared_skills (public skill library)
-  │       └─ shared_models (model registry)
-  │
-  ├─ agent_alice (Alice's Private Tenant)
-  │   └─ agent_engine
-  │       ├─ private_events
-  │       ├─ private_skills
-  │       └─ experiments
-  │
-  └─ agent_bob (Bob's Private Tenant)
-      └─ agent_engine
-          ├─ private_events
-          └─ experiments
+### 3. Sandbox 权限 - 数据库层面
+
+**Sandbox 不管权限**:
+```python
+# Sandbox 直接执行 SQL
+# 权限检查由数据库完成
+sandbox.create("alice_exp_1")
+# → CREATE DATABASE alice_exp_1 CLONE alice_data
+# 如果 user_alice 没有权限，MatrixOne 会拒绝
 ```
 
-**Use Case**: Shared platform with private workspaces
+**权限完全由数据库管理**:
+- MatrixOne: 使用 RBAC (GRANT/REVOKE)
+- MySQL: 使用 GRANT
+- PostgreSQL: 使用 GRANT
 
-**Configuration**:
-```bash
-# Shared platform
-DATABASE_TENANT=shared_platform
-DATABASE_NAME=agent_engine
-
-# Alice's private workspace
-DATABASE_TENANT=agent_alice
-DATABASE_NAME=agent_engine
+**Core Service 只管理元数据**:
+```python
+# 记录 Sandbox 创建
+core_db.execute("""
+    INSERT INTO sandbox_metadata
+    (sandbox_name, user_id, data_source, created_at, expires_at)
+    VALUES (%s, %s, %s, NOW(), NOW() + INTERVAL 24 HOUR)
+""")
 ```
 
-## Tenant Configuration
+### 4. 生命周期管理 - Core Service
 
-### Environment Variables
-
-```bash
-# .env
-DATABASE_HOST=localhost
-DATABASE_PORT=6001
-DATABASE_USER=app_user
-DATABASE_PASSWORD=secret
-DATABASE_TENANT=agent_platform  # ← Configurable, not hardcoded
-DATABASE_NAME=agent_engine
+**自动清理过期 Sandbox**:
+```python
+# 定时任务（每小时）
+def cleanup_expired_sandboxes():
+    expired = core_db.fetchall("""
+        SELECT sandbox_name, data_source 
+        FROM sandbox_metadata 
+        WHERE expires_at < NOW() AND status = 'active'
+    """)
+    
+    for row in expired:
+        # 连接用户数据库
+        user_db = Database(**json.loads(row["data_source"]))
+        
+        # 删除 Sandbox
+        try:
+            Sandbox(db=user_db).delete(row["sandbox_name"])
+        except:
+            pass  # 可能已被手动删除
+        
+        # 更新元数据
+        core_db.execute("""
+            UPDATE sandbox_metadata 
+            SET status = 'deleted', deleted_at = NOW()
+            WHERE sandbox_name = %s
+        """, (row["sandbox_name"],))
 ```
 
-### Dynamic Tenant Selection
+## 数据模型
+
+### Agent 模型
 
 ```python
-# For multi-tenant SaaS
-class Database:
-    def __init__(self, tenant: str = None):
-        # Use provided tenant or fall back to env
-        self.tenant = tenant or os.getenv("DATABASE_TENANT")
-        self.connect()
-    
-    def connect(self):
-        self.conn = pymysql.connect(
-            host=os.getenv("DATABASE_HOST"),
-            port=int(os.getenv("DATABASE_PORT")),
-            user=os.getenv("DATABASE_USER"),
-            password=os.getenv("DATABASE_PASSWORD"),
-            database=f"{self.tenant}.{os.getenv('DATABASE_NAME')}"
-        )
+class Agent(Base):
+    __tablename__ = "agents"
+    agent_id = Column(String(36), primary_key=True)
+    agent_name = Column(String(100), nullable=False)
+    agent_type = Column(String(50), nullable=False)
+    owner_user_id = Column(String(36), nullable=False, index=True)
+    agent_config = Column(JSON)
+    data_source = Column(JSON)  # 新增：数据源配置
+    # {
+    #   "type": "matrixone",
+    #   "host": "...",
+    #   "port": 6001,
+    #   "user": "...",
+    #   "password": "...",  # 加密
+    #   "database": "..."
+    # }
+    is_active = Column(TINYINT(1), server_default="1")
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 ```
 
-## Data Isolation Strategies
-
-### Strategy 1: Tenant-Level Isolation (Strongest)
-
-Each customer gets dedicated MatrixOne tenant.
-
-**Pros**:
-- Complete data isolation
-- Independent backups
-- Separate resource limits
-- Regulatory compliance (GDPR, HIPAA)
-
-**Cons**:
-- More complex deployment
-- Higher resource overhead
-
-### Strategy 2: Database-Level Isolation (Medium)
-
-All customers in same tenant, separate databases.
-
-```sql
--- Customer A
-CREATE DATABASE customer_a_engine;
-
--- Customer B
-CREATE DATABASE customer_b_engine;
-```
-
-**Pros**:
-- Simpler deployment
-- Shared resources
-- Easy cross-customer analytics (if needed)
-
-**Cons**:
-- Less isolation
-- Shared resource limits
-
-### Strategy 3: Row-Level Isolation (Weakest)
-
-All customers share same database, filtered by tenant_id.
-
-```sql
-CREATE TABLE events (
-  event_id VARCHAR(64) PRIMARY KEY,
-  tenant_id VARCHAR(64) NOT NULL,  -- ← Tenant discriminator
-  agent_id VARCHAR(64) NOT NULL,
-  content TEXT,
-  ...
-  INDEX idx_tenant (tenant_id)
-);
-
--- Query with tenant filter
-SELECT * FROM events WHERE tenant_id = 'customer_a';
-```
-
-**Pros**:
-- Simplest deployment
-- Minimal overhead
-
-**Cons**:
-- Weakest isolation
-- Risk of data leakage (application bugs)
-
-## Recommended Deployment
-
-### For MVP / Small Scale
-**Model 1: Single Tenant**
-- One MatrixOne tenant
-- All users in same database
-- Simple configuration
-
-### For SaaS / Enterprise
-**Model 2: Multi-Tenant**
-- Each customer gets dedicated tenant
-- Platform tenant for shared resources
-- Strong data isolation
-
-### For Hybrid Use Cases
-**Model 3: Shared + Isolated**
-- Shared platform for collaboration
-- Private tenants for sensitive data
-- Best of both worlds
-
-## Migration Between Models
-
-### From Single to Multi-Tenant
-
-```sql
--- 1. Create new tenant for customer
-CREATE ACCOUNT customer_a ADMIN_NAME 'admin' IDENTIFIED BY 'password';
-
--- 2. Export data from single tenant
-mysqldump agent_platform.agent_engine > backup.sql
-
--- 3. Import to customer tenant
-mysql customer_a.agent_engine < backup.sql
-
--- 4. Update service configuration
-DATABASE_TENANT=customer_a
-```
-
-### From Multi-Tenant to Single
-
-```sql
--- 1. Merge all customer data
-INSERT INTO platform.agent_engine.events
-SELECT * FROM customer_a.agent_engine.events;
-
-INSERT INTO platform.agent_engine.events
-SELECT * FROM customer_b.agent_engine.events;
-
--- 2. Update service configuration
-DATABASE_TENANT=platform
-```
-
-## Best Practices
-
-1. **Start Simple**: Use single tenant for MVP
-2. **Plan for Growth**: Design schema to support multi-tenancy later
-3. **Use Environment Variables**: Never hardcode tenant names
-4. **Test Isolation**: Verify data cannot leak between tenants
-5. **Monitor Resources**: Track per-tenant resource usage
-6. **Backup Strategy**: Per-tenant backups for SaaS
-
-## Security Considerations
-
-### Tenant Isolation
+### Sandbox 元数据模型
 
 ```python
-# Always validate user belongs to tenant
-def get_events(user_id: str, tenant_id: str):
-    # 1. Verify user belongs to tenant
-    user = db.fetchone("SELECT * FROM users WHERE user_id = %s", (user_id,))
-    if user["tenant_id"] != tenant_id:
-        raise PermissionError("User does not belong to tenant")
-    
-    # 2. Query with tenant filter
-    return db.fetchall(
-        "SELECT * FROM events WHERE tenant_id = %s",
-        (tenant_id,)
-    )
+class SandboxMetadata(Base):
+    __tablename__ = "sandbox_metadata"
+    sandbox_name = Column(String(255), primary_key=True)
+    user_id = Column(String(36), nullable=False, index=True)  # 新增
+    data_source = Column(JSON, nullable=False)  # 新增：数据源配置
+    description = Column(Text)
+    created_by = Column(String(255))
+    source_database = Column(String(255))
+    source_snapshot = Column(String(255))
+    status = Column(String(32), default="active")
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    expires_at = Column(DateTime)  # 新增：过期时间
+    deleted_at = Column(DateTime)  # 新增：删除时间
+    tables = Column(JSON)
+    tags = Column(JSON)
 ```
 
-### Cross-Tenant Access
+## API 设计
+
+### Sandbox API
 
 ```python
-# Explicit permission required for cross-tenant access
-def share_skill(from_tenant: str, to_tenant: str, skill_id: str):
-    # 1. Check permission
-    if not has_permission(user_id, "skill:share:cross_tenant"):
-        raise PermissionError("Cross-tenant sharing not allowed")
-    
-    # 2. Copy skill
-    skill = db.fetchone(
-        f"SELECT * FROM {from_tenant}.agent_engine.skills WHERE skill_id = %s",
-        (skill_id,)
-    )
-    db.execute(
-        f"INSERT INTO {to_tenant}.agent_engine.skills (...) VALUES (...)",
-        (...)
-    )
+# POST /sandbox
+{
+    "name": "alice_exp_1",
+    "description": "实验环境",
+    "data_source": {  # 可选，默认使用 Agent 的 data_source
+        "type": "matrixone",
+        "host": "...",
+        "user": "...",
+        "database": "..."
+    },
+    "ttl_hours": 24  # 生命周期（小时）
+}
+
+# Response
+{
+    "sandbox_name": "alice_exp_1",
+    "user_id": "alice",
+    "status": "active",
+    "created_at": "2026-02-12T10:00:00Z",
+    "expires_at": "2026-02-13T10:00:00Z",
+    "capabilities": ["time_travel", "git_for_data"]  # 根据数据源类型
+}
 ```
 
-## Performance Optimization
-
-### Connection Pooling
+### Agent API
 
 ```python
-# Per-tenant connection pools
-class TenantConnectionPool:
-    def __init__(self):
-        self.pools = {}
-    
-    def get_connection(self, tenant: str):
-        if tenant not in self.pools:
-            self.pools[tenant] = create_pool(tenant)
-        return self.pools[tenant].get_connection()
+# POST /agents
+{
+    "agent_name": "Alice's Agent",
+    "agent_type": "data_analyst",
+    "data_source": {
+        "type": "matrixone",
+        "host": "mo-cluster",
+        "port": 6001,
+        "user": "user_alice",
+        "password": "***",
+        "database": "alice_data"
+    }
+}
 ```
 
-### Query Optimization
+## 权限模型
 
+### 应用层权限（Core Service）
+
+**简单的所有权检查**:
+```python
+# 只能操作自己的资源
+def delete_sandbox(sandbox_name: str, user_id: str):
+    sandbox = get_sandbox(sandbox_name)
+    if sandbox.user_id != user_id:
+        raise PermissionError("只能删除自己的 Sandbox")
+    # ...
+```
+
+**不依赖数据库 RBAC**:
+- Core Service 不查询 `mo_catalog.mo_user_grant`
+- 不依赖 `mo_agent_admin`, `mo_agent_user` 角色
+- 纯应用层的 JWT + owner check
+
+### 数据库层权限（用户数据库）
+
+**完全由数据库管理**:
 ```sql
--- Always include tenant_id in WHERE clause
-SELECT * FROM events 
-WHERE tenant_id = 'customer_a'  -- ← Enables partition pruning
-  AND created_at > '2026-01-01';
+-- MatrixOne 示例
+CREATE USER user_alice IDENTIFIED BY '***';
+GRANT ALL ON DATABASE alice_data TO user_alice;
+GRANT CREATE DATABASE ON ACCOUNT TO user_alice;  -- 允许创建 Sandbox
 
--- Create composite indexes
-CREATE INDEX idx_tenant_created ON events(tenant_id, created_at);
+-- MySQL 示例
+CREATE USER 'alice'@'%' IDENTIFIED BY '***';
+GRANT ALL PRIVILEGES ON alice_data.* TO 'alice'@'%';
 ```
 
-## Monitoring
+**Sandbox 操作自动受限**:
+- 如果用户没有 `CREATE DATABASE` 权限，创建 Sandbox 会失败
+- 如果用户没有 `DROP DATABASE` 权限，删除 Sandbox 会失败
+- Core Service 不需要检查，数据库会拒绝
 
-### Per-Tenant Metrics
+## 实现路线图
 
-```sql
--- Storage usage per tenant
-SELECT 
-  tenant_id,
-  COUNT(*) as event_count,
-  SUM(LENGTH(content)) as total_bytes
-FROM events
-GROUP BY tenant_id;
+### Phase 1: 数据模型更新 ✅
+- [x] Agent 添加 `data_source` 字段
+- [x] SandboxMetadata 添加 `user_id`, `data_source`, `expires_at`
+- [x] 数据库迁移脚本
 
--- Query performance per tenant
-SELECT 
-  tenant_id,
-  AVG(query_time_ms) as avg_query_time,
-  MAX(query_time_ms) as max_query_time
-FROM query_logs
-GROUP BY tenant_id;
-```
+### Phase 2: Sandbox Service 重构 ✅
+- [x] 支持动态数据源
+- [x] 移除 RBAC 依赖
+- [x] 添加生命周期管理
 
-## Summary
+### Phase 3: API 更新 ✅
+- [x] Sandbox API 支持 data_source 参数
+- [x] Agent API 支持 data_source 配置
+- [x] 返回 capabilities 信息
 
-- **Flexible**: Support single-tenant, multi-tenant, and hybrid models
-- **Configurable**: Tenant name from .env, not hardcoded
-- **Scalable**: Start simple, grow to multi-tenant
-- **Secure**: Strong isolation with MatrixOne tenants
-- **Standard**: No custom multi-tenancy logic, use MatrixOne native features
+### Phase 4: 定时任务
+- [ ] 实现 Sandbox 自动清理
+- [ ] 监控和告警
+
+## 优势
+
+### ✅ 职责清晰
+- Core Service: 平台管理
+- User Database: 业务数据
+- 完全解耦
+
+### ✅ 灵活扩展
+- 支持多种数据源
+- Sandbox 能力可选
+- 易于添加新数据源类型
+
+### ✅ 权限简单
+- 应用层: JWT + owner check
+- 数据库层: 原生 RBAC
+- 不需要复杂的权限系统
+
+### ✅ 安全隔离
+- 租户级别隔离
+- 数据源级别隔离
+- Sandbox 级别隔离
+
+## 迁移指南
+
+### 从旧架构迁移
+
+**旧架构**:
+- 所有数据在一个数据库
+- Sandbox 假设固定数据库
+- 权限依赖 MatrixOne RBAC
+
+**新架构**:
+- Core Service 独立租户
+- Sandbox 支持动态数据源
+- 权限在数据库层面
+
+**迁移步骤**:
+1. 创建 `mo_agent_core` 租户
+2. 迁移平台数据到 Core Service
+3. 为每个用户创建独立租户/数据库
+4. 更新 Agent 配置添加 `data_source`
+5. 更新 Sandbox 元数据
+
+## 总结
+
+这个架构实现了：
+- **清晰的职责分离** - Core Service vs User Data
+- **灵活的数据源** - MatrixOne, MySQL, PostgreSQL
+- **简单的权限模型** - 应用层 + 数据库层
+- **可选的高级能力** - Sandbox, Time Travel (仅 MatrixOne)
+
+符合实际使用场景，易于理解和维护。

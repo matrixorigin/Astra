@@ -117,7 +117,15 @@ class SandboxService:
         """
         # 开发模式: 返回所有sandboxes
         # 生产模式: 需要权限检查和过滤
-        sandboxes = self.sandbox.list_sandboxes(pattern=pattern)
+        sandboxes = self.sandbox.list_sandboxes(prefix="", pattern=pattern)
+        
+        # Convert datetime to string for API response
+        for sandbox in sandboxes:
+            if sandbox.get("created_at"):
+                sandbox["created_at"] = sandbox["created_at"].isoformat()
+            if sandbox.get("updated_at"):
+                sandbox["updated_at"] = sandbox["updated_at"].isoformat()
+        
         return sandboxes
     
     def delete_sandbox(
@@ -136,7 +144,7 @@ class SandboxService:
         """
         # 开发模式: 允许删除任何sandbox
         # 检查 sandbox 是否存在
-        sandboxes = self.sandbox.list_sandboxes(pattern=name)
+        sandboxes = self.sandbox.list_sandboxes(prefix="", pattern=name)
         if not any(s["sandbox_name"] == name for s in sandboxes):
             raise ValueError(f"Sandbox {name} 不存在")
         
@@ -183,10 +191,16 @@ class SandboxService:
             ValueError: Sandbox 不存在
         """
         # 开发模式: 允许查看任何sandbox
-        sandboxes = self.sandbox.list_sandboxes(pattern=name)
+        sandboxes = self.sandbox.list_sandboxes(prefix="", pattern=name)
         sandbox_info = next((s for s in sandboxes if s["sandbox_name"] == name), None)
         
         if not sandbox_info:
             raise ValueError(f"Sandbox {name} 不存在")
+        
+        # Convert datetime to string for API response
+        if sandbox_info.get("created_at"):
+            sandbox_info["created_at"] = sandbox_info["created_at"].isoformat()
+        if sandbox_info.get("updated_at"):
+            sandbox_info["updated_at"] = sandbox_info["updated_at"].isoformat()
         
         return sandbox_info

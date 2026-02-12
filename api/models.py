@@ -27,6 +27,7 @@ class Agent(Base):
     agent_type = Column(String(50), nullable=False)
     owner_user_id = Column(String(36), nullable=False, index=True)
     agent_config = Column("agent_config", JSON)
+    data_source = Column(JSON)  # 新增：数据源配置
     is_active = Column(TINYINT(1), server_default="1", nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
@@ -138,6 +139,8 @@ class Repo(Base):
 class SandboxMetadata(Base):
     __tablename__ = "sandbox_metadata"
     sandbox_name = Column(String(255), primary_key=True)
+    user_id = Column(String(36), nullable=False, index=True)  # 新增
+    data_source = Column(JSON, nullable=False)  # 新增
     description = Column(Text)
     created_by = Column(String(255))
     source_database = Column(String(255))
@@ -145,6 +148,8 @@ class SandboxMetadata(Base):
     status = Column(String(32), default="active")
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    expires_at = Column(DateTime)  # 新增
+    deleted_at = Column(DateTime)  # 新增
     tables = Column(JSON)
     tags = Column(JSON)
 

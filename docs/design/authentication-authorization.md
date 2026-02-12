@@ -2,101 +2,277 @@
 
 ## Overview
 
-This document describes the production-grade authentication and authorization system for mo-agent-engine. The system is designed to work **without HTTP server** - CLI directly connects to MatrixOne database with built-in multi-tenancy support.
+mo-agent-engine 使用**应用层权限模型**，不依赖数据库 RBAC：
+1. JWT 认证 - 验证用户身份
+2. 资源所有权 - 基于 owner_user_id 的授权
+3. 数据库权限 - 由数据库本身管理（MatrixOne RBAC, MySQL GRANT等）
 
-## Design Principles
+## 设计原则
 
-1. **No HTTP Server Required**: CLI directly connects to database
-2. **Multi-Tenancy Native**: Leverage MatrixOne's tenant isolation
-3. **Shared Platform + Private Data**: Core platform in sys tenant, agent-specific data in separate tenants
-4. **Standard Auth**: API Keys for CLI, JWT for future web UI
-5. **Fine-grained Permissions**: Role-based + resource-based access control
-6. **Audit Trail**: All auth events logged for compliance
+1. **应用层权限独立**: 不依赖 MatrixOne RBAC
+2. **简单的所有权模型**: user owns agent/session/sandbox
+3. **数据库权限分离**: 数据库操作的权限由数据库管理
+4. **JWT 标准认证**: 无状态，易于扩展
+5. **审计日志**: 所有操作记录
 
-## Architecture
+## 架构
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  Client Layer                                               │
-│  - CLI (API Key in ~/.mo-agent/config.json)                │
-│  - Future: Web UI (JWT in cookie/localStorage)             │
-│  - Future: SDK (API Key in code)                           │
-└─────────────────────┬───────────────────────────────────────┘
-                      │ Direct Database Connection
-┌─────────────────────▼───────────────────────────────────────┐
-│  MatrixOne Cluster                                          │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ sys Tenant (Platform Core)                          │   │
-│  │  - app_users (all users)                            │   │
-│  │  - app_roles (roles & permissions)                  │   │
-│  │  - api_keys (authentication)                        │   │
-│  │  - conversation_events (shared events)              │   │
-│  │  - skills (shared skill library)                    │   │
-│  │  - context_snapshots (shared context)               │   │
-│  │  - models, tokens, configs (platform config)        │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ agent_alice Tenant (Alice's Private Space)         │   │
-│  │  - private_data (Alice's private data)              │   │
-│  │  - custom_skills (Alice's custom skills)            │   │
-│  │  - experiments (sandbox branches)                   │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ agent_bob Tenant (Bob's Private Space)             │   │
-│  │  - private_data                                     │   │
-│  │  - experiments                                      │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
+│  Client (CLI/Web/API)                                       │
+└────────────────────┬────────────────────────────────────────┘
+                     │ JWT Token
+┌────────────────────▼────────────────────────────────────────┐
+│  API Layer (FastAPI)                                        │
+│  - JWT 验证 → user_id                                       │
+│  - 不查询数据库 RBAC                                         │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────────────┐
+│  Service Layer                                              │
+│  - 资源所有权检查: if resource.owner_user_id != user_id     │
+│  - 不依赖 mo_catalog.mo_user_grant                          │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────────────┐
+│  Repository Layer (ORM)                                     │
+│  - 操作 Core Service 数据库                                 │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+┌────────────────────▼────────────────────────────────────────┐
+│  Core Service Database (mo_agent_core 租户)                │
+│  - users, agents, sessions, events                          │
+│  - sandbox_metadata                                         │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  User Database (用户提供的连接)                              │
+│  - 权限由数据库本身管理                                      │
+│  - Sandbox 操作受数据库权限限制                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Multi-Tenancy Model
+## 权限模型
 
-### Tenant Types
+### 应用层权限（Core Service）
 
-1. **Platform Tenant (sys)**
-   - Stores all shared platform data
-   - Users, roles, permissions
-   - Shared events, skills, context
-   - Platform configuration
-
-2. **Agent Tenant (agent_xxx)**
-   - Each agent can have dedicated tenant
-   - Private data isolation
-   - Independent experiments (sandbox/branch)
-   - Full MatrixOne capabilities (HTAP, Git for Data)
-
-### Data Sharing Patterns
-
-```sql
--- Pattern 1: Shared Platform Data (in sys tenant)
--- All agents read/write to sys.conversation_events
-INSERT INTO sys.conversation_events (event_id, user_id, content, ...)
-VALUES (...);
-
--- Pattern 2: Private Agent Data (in agent tenant)
--- Alice's private experiments
-CREATE DATABASE agent_alice.experiments;
-CREATE SNAPSHOT agent_alice.exp_v1 FOR DATABASE experiments;
-
--- Pattern 3: Cross-Tenant Pub/Sub (future)
--- Agent A publishes event, Agent B subscribes
-PUBLISH TO sys.event_stream VALUES (...);
-SUBSCRIBE FROM sys.event_stream WHERE user_id = 'bob';
-
--- Pattern 4: Git for Data
--- Alice branches for experiment
-CREATE DATABASE agent_alice.exp_branch FROM agent_alice.main;
--- Success -> merge back
--- Failure -> drop branch
+**基于资源所有权**:
+```python
+# 示例：删除 Agent
+def delete_agent(agent_id: str, user_id: str):
+    agent = agent_repo.get(agent_id)
+    
+    # 简单的所有权检查
+    if agent.owner_user_id != user_id:
+        raise PermissionError("只能删除自己的 Agent")
+    
+    agent_repo.delete(agent_id)
 ```
 
-## Authentication Flow (No HTTP Server)
+**不使用角色**:
+- ❌ 不查询 `mo_catalog.mo_user_grant`
+- ❌ 不依赖 `mo_agent_admin`, `mo_agent_user` 角色
+- ✅ 简单的 `owner_user_id` 检查
 
-### CLI Authentication
+### 数据库层权限（用户数据库）
+
+**完全由数据库管理**:
+```python
+# Sandbox 创建
+sandbox.create("alice_exp_1")
+# → CREATE DATABASE alice_exp_1 CLONE alice_data
+
+# 如果用户没有权限，数据库会拒绝：
+# - MatrixOne: ERROR 20101: Access denied
+# - MySQL: ERROR 1044: Access denied for user
+```
+
+**Core Service 不检查数据库权限**:
+- Sandbox 操作直接执行
+- 失败由数据库返回错误
+- Core Service 记录审计日志
+
+## 认证流程
+
+### JWT 认证
+
+```python
+# 1. 用户登录
+POST /auth/login
+{
+    "username": "alice",
+    "password": "***"
+}
+
+# 2. 返回 JWT
+{
+    "access_token": "eyJ...",
+    "token_type": "bearer",
+    "expires_in": 3600
+}
+
+# 3. 使用 JWT 访问 API
+GET /agents
+Authorization: Bearer eyJ...
+
+# 4. API 验证 JWT
+payload = decode_token(token)
+user_id = payload["sub"]  # alice
+
+# 5. 检查资源所有权
+agent = agent_repo.get(agent_id)
+if agent.owner_user_id != user_id:
+    raise PermissionError
+```
+
+## 数据表设计
+
+### users 表（Core Service）
+
+```sql
+CREATE TABLE users (
+  user_id           VARCHAR(36) PRIMARY KEY,
+  username          VARCHAR(50) UNIQUE NOT NULL,
+  email             VARCHAR(255) UNIQUE NOT NULL,
+  password_hash     VARCHAR(255) NOT NULL,
+  display_name      VARCHAR(100),
+  is_active         TINYINT(1) DEFAULT 1,
+  created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+  last_login_at     DATETIME,
+  
+  INDEX idx_username (username),
+  INDEX idx_email (email)
+);
+```
+
+**不需要的字段**:
+- ❌ `tenant_id` - 不使用 MatrixOne tenant 隔离
+- ❌ `role_id` - 不使用角色系统
+
+### agents 表（Core Service）
+
+```sql
+CREATE TABLE agents (
+  agent_id          VARCHAR(36) PRIMARY KEY,
+  agent_name        VARCHAR(100) NOT NULL,
+  agent_type        VARCHAR(50) NOT NULL,
+  owner_user_id     VARCHAR(36) NOT NULL,
+  agent_config      JSON,
+  data_source       JSON,  -- 新增
+  is_active         TINYINT(1) DEFAULT 1,
+  created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  
+  INDEX idx_owner (owner_user_id)
+);
+```
+
+### sandbox_metadata 表（Core Service）
+
+```sql
+CREATE TABLE sandbox_metadata (
+  sandbox_name      VARCHAR(255) PRIMARY KEY,
+  user_id           VARCHAR(36) NOT NULL,  -- 新增
+  data_source       JSON NOT NULL,         -- 新增
+  description       TEXT,
+  created_by        VARCHAR(255),
+  source_database   VARCHAR(255),
+  source_snapshot   VARCHAR(255),
+  status            VARCHAR(32) DEFAULT 'active',
+  created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  expires_at        DATETIME,              -- 新增
+  deleted_at        DATETIME,              -- 新增
+  tables            JSON,
+  tags              JSON,
+  
+  INDEX idx_user (user_id),
+  INDEX idx_status (status),
+  INDEX idx_expires (expires_at)
+);
+```
+
+## 废弃的设计
+
+### ❌ 不使用 MatrixOne RBAC
+
+**旧设计**:
+```python
+# 查询 MatrixOne 系统表
+SELECT COUNT(*) FROM mo_catalog.mo_user_grant
+WHERE user_name = 'alice' AND role_name = 'mo_agent_user'
+```
+
+**问题**:
+- 过度耦合 MatrixOne
+- 无法支持其他数据库
+- 增加复杂度
+
+**新设计**:
+```python
+# 简单的所有权检查
+if resource.owner_user_id != user_id:
+    raise PermissionError
+```
+
+### ❌ 不使用角色系统
+
+**旧设计**:
+- `mo_agent_admin` 角色
+- `mo_agent_user` 角色
+- 复杂的角色权限映射
+
+**新设计**:
+- 只有 owner 和 non-owner
+- 简单直接
+
+## 安全考虑
+
+### 1. 密码加密
+```python
+from core.auth.password import hash_password, verify_password
+
+# 存储
+password_hash = hash_password("user_password")
+
+# 验证
+if verify_password("user_password", password_hash):
+    # 登录成功
+```
+
+### 2. JWT 安全
+- 使用 HS256 算法
+- Secret key 至少 32 字节
+- Access token 1小时过期
+- Refresh token 7天过期
+
+### 3. 数据源密码加密
+```python
+# Agent 的 data_source.password 应该加密存储
+from core.auth.encryption import encrypt, decrypt
+
+encrypted_password = encrypt(password, secret_key)
+# 存储 encrypted_password
+
+# 使用时解密
+password = decrypt(encrypted_password, secret_key)
+```
+
+## 总结
+
+**新的权限模型**:
+- ✅ 应用层: JWT + owner check
+- ✅ 数据库层: 原生 RBAC/GRANT
+- ✅ 完全解耦
+- ✅ 简单易懂
+
+**废弃的设计**:
+- ❌ MatrixOne RBAC 绑定
+- ❌ 角色系统
+- ❌ 复杂的权限检查
+
+**核心原则**: Keep it simple - 用户拥有自己的资源，数据库管理自己的权限。
+
 
 ```
 1. User runs: mo-agent login --username alice
