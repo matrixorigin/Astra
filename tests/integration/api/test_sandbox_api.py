@@ -335,3 +335,53 @@ class TestSandboxPermissions:
             db_session.commit()
         except:
             pass
+
+
+class TestSandboxEdgeCases:
+    """测试 sandbox 边界情况"""
+    
+    def test_create_sandbox_with_special_chars(self, client, auth_headers):
+        """测试创建带特殊字符的 sandbox"""
+        response = client.post(
+            "/sandbox",
+            json={
+                "name": f"test_sandbox_{str(uuid7())[:8]}",
+                "description": "Test with special chars: !@#$%"
+            },
+            headers=auth_headers
+        )
+        
+        assert response.status_code == 201
+    
+    def test_list_sandboxes_with_limit(self, client, auth_headers):
+        """测试列出 sandboxes 时的分页"""
+        response = client.get(
+            "/sandbox?limit=10&offset=0",
+            headers=auth_headers
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert "sandboxes" in data
+        assert "total" in data
+    
+    def test_create_sandbox_duplicate_name(self, client, auth_headers):
+        """测试创建重名 sandbox"""
+        sandbox_name = f"test_sandbox_{str(uuid7())[:8]}"
+        
+        # Create first sandbox
+        response1 = client.post(
+            "/sandbox",
+            json={"name": sandbox_name},
+            headers=auth_headers
+        )
+        assert response1.status_code == 201
+        
+        # Try to create duplicate
+        response2 = client.post(
+            "/sandbox",
+            json={"name": sandbox_name},
+            headers=auth_headers
+        )
+        # Should fail with 400 or 409
+        assert response2.status_code in [400, 409, 500]

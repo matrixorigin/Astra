@@ -233,3 +233,108 @@ class TestGetEvent:
         response = client.get("/events/nonexistent", headers=auth_headers)
 
         assert response.status_code == 404
+
+
+class TestCausalChain:
+    """Test causal chain endpoint."""
+
+    def test_get_causal_chain(self, client, auth_headers, test_session):
+        """Test getting causal chain."""
+        # Create first event
+        event1_response = client.post(
+            "/events",
+            headers=auth_headers,
+            json={
+                "session_id": test_session,
+                "event_type": "user_query",
+                "content": "First message",
+            },
+        )
+        event1 = event1_response.json()
+        
+        # Create second event with parent
+        event2_response = client.post(
+            "/events",
+            headers=auth_headers,
+            json={
+                "session_id": test_session,
+                "event_type": "llm_response",
+                "content": "Response",
+                "parent_event_id": event1["event_id"],
+                "causal_chain_id": event1["causal_chain_id"],
+            },
+        )
+        
+        # Get causal chain
+        response = client.get(
+            f"/events/causal-chain/{event1['causal_chain_id']}",
+            headers=auth_headers,
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 2
+        assert data[0]["event_id"] == event1["event_id"]
+        assert data[1]["event_id"] == event2_response.json()["event_id"]
+
+
+class TestSessionEvents:
+    """Test session events endpoint."""
+
+    def test_get_session_events(self, client, auth_headers, test_session):
+        """Test getting session events."""
+        # Create events
+        for i in range(3):
+            client.post(
+                "/events",
+                headers=auth_headers,
+                json={
+                    "session_id": test_session,
+                    "event_type": "user_query",
+                    "content": f"Message {i}",
+                },
+            )
+        
+        # Get session events
+        response = client.get(
+            f"/events/session/{test_session}",
+            headers=auth_headers,
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["events"]) == 3
+        assert data["total"] == 3
+
+
+class TestDeleteEvent:
+    """Test delete event endpoint."""
+
+    def test_delete_event_success(self, client, auth_headers, test_session):
+        """Test successful event deletion."""
+        # Create an event
+        create_response = client.post(
+            "/events",
+            headers=auth_headers,
+            json={
+                "session_id": test_session,
+                "event_type": "user_query",
+                "content": "test",
+            },
+        )
+        event_id = create_response.json()["event_id"]
+        
+        # Delete event
+        response = client.delete(f"/events/{event_id}", headers=auth_headers)
+        
+        assert response.status_code == 204
+        
+        # Verify deleted
+        get_response = client.get(f"/events/{event_id}", headers=auth_headers)
+        assert get_response.status_code == 404
+
+    def test_delete_event_not_found(self, client, auth_headers):
+        """Test deleting non-existent event."""
+        response = client.delete("/events/nonexistent", headers=auth_headers)
+        
+        assert response.status_code == 404
