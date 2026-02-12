@@ -95,8 +95,41 @@ class ReplayEngine:
         """
         skill_name = event["skill_name"]
         skill_version = event["skill_version"]
+        created_at = event["created_at"]
 
         logger.debug(f"Replaying skill: {skill_name}@{skill_version}")
+
+        try:
+            # Try to get skill from registry (in-memory)
+            skill = self.registry.get(skill_name, skill_version)
+        except SkillNotFoundError:
+            # Fallback: Query historical skill metadata using as_of
+            logger.debug(f"Skill not in memory, querying historical metadata")
+            try:
+                skill_metadata = self.registry.get_as_of(skill_name, as_of_timestamp=created_at)
+            except Exception as e:
+                logger.error(f"Failed to query historical skill: {e}")
+                skill_metadata = None
+
+            if not skill_metadata:
+                logger.error(f"Skill not found: {skill_name}@{skill_version}")
+                # Return failure result instead of raising
+                return {
+                    "event_id": event["event_id"],
+                    "skill_name": skill_name,
+                    "skill_version": skill_version,
+                    "success": False,
+                    "error": f"Skill not found: {skill_name}@{skill_version}",
+                }
+
+            # Return metadata-based result (cannot execute without Skill instance)
+            return {
+                "event_id": event["event_id"],
+                "skill_name": skill_name,
+                "skill_version": skill_version,
+                "status": "metadata_only",
+                "metadata": skill_metadata,
+            }
 
         # 1. Load skill version from registry
         try:

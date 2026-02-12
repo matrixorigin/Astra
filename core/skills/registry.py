@@ -3,6 +3,8 @@
 import hashlib
 import inspect
 import json
+from datetime import datetime
+from functools import lru_cache
 
 from core.exceptions import DatabaseError, SkillNotFoundError
 from core.logging_config import get_logger
@@ -19,6 +21,7 @@ class SkillRegistry:
     def __init__(self, db: Database):
         self.db = db
         self._skills: dict[str, Skill] = {}  # skill_name@version -> Skill
+        self._cache_size = 100  # LRU cache size
 
     def register(
         self,
@@ -30,6 +33,7 @@ class SkillRegistry:
         dependencies: list | None = None,
         priority: int = 5,
         cost_estimate: str = "medium",
+        git_commit_hash: str | None = None,
     ) -> None:
         """Register a skill version with metadata.
 
@@ -42,6 +46,7 @@ class SkillRegistry:
             dependencies: Dependent skill names
             priority: Priority (1-10)
             cost_estimate: Cost estimate (low/medium/high)
+            git_commit_hash: Git commit hash for precise replay
         """
         logger.info(f"Registering skill: {skill.name}@{skill.version}")
 
@@ -65,13 +70,14 @@ class SkillRegistry:
                 """
                 INSERT INTO skills_registry
                 (skill_id, skill_name, version, description, requirements,
-                 code_hash, is_active, status, category, subcategory,
+                 code_hash, git_commit_hash, is_active, status, category, subcategory,
                  triggers, dependencies, priority, cost_estimate, side_effect_category)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     description = VALUES(description),
                     requirements = VALUES(requirements),
                     code_hash = VALUES(code_hash),
+                    git_commit_hash = VALUES(git_commit_hash),
                     is_active = VALUES(is_active),
                     category = VALUES(category),
                     subcategory = VALUES(subcategory),
@@ -89,6 +95,7 @@ class SkillRegistry:
                     skill.description,
                     json.dumps(skill.requirements.model_dump()),
                     code_hash,
+                    git_commit_hash,
                     1 if is_active else 0,
                     category,
                     subcategory,
@@ -105,6 +112,9 @@ class SkillRegistry:
             self._skills[key] = skill
             if is_active:
                 self._skills[skill.name] = skill  # Shortcut to active version
+
+            # 5. Clear LRU cache on new registration
+            self._get_cached.cache_clear()
 
             logger.info(
                 f"Successfully registered skill: {skill.name}@{skill.version} (category={category}, priority={priority})"
@@ -130,6 +140,95 @@ class SkillRegistry:
             raise SkillNotFoundError(skill_name, version)
 
         return skill
+
+    def get_as_of(
+        self,
+        skill_name: str,
+        as_of_timestamp: datetime | None = None,
+        as_of_commit: str | None = None,
+    ) -> dict | None:
+        """Get skill metadata as of a specific timestamp or commit.
+
+        Args:
+            skill_name: Skill name
+            as_of_timestamp: Query historical state at this timestamp
+            as_of_commit: Query by git commit hash
+
+        Returns:
+            Skill metadata dict or None if not found
+        """
+        if as_of_commit:
+            return self._get_cached(skill_name, commit=as_of_commit)
+        elif as_of_timestamp:
+            return self._get_cached(skill_name, timestamp=as_of_timestamp.isoformat())
+        else:
+            # Current version
+            return self._get_cached(skill_name)
+
+    @lru_cache(maxsize=100)
+    def _get_cached(
+        self, skill_name: str, timestamp: str | None = None, commit: str | None = None
+    ) -> dict | None:
+        """LRU cached query for skill metadata.
+
+        Args:
+            skill_name: Skill name
+            timestamp: ISO format timestamp for AS OF query
+            commit: Git commit hash for AS OF query
+
+        Returns:
+            Skill metadata dict or None
+        """
+        try:
+            if commit:
+                # Query by commit hash (MatrixOne AS OF COMMIT)
+                row = self.db.fetchone(
+                    """
+                    SELECT * FROM skills_registry
+                    WHERE skill_name = %s AND git_commit_hash = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (skill_name, commit),
+                )
+            elif timestamp:
+                # Query by timestamp (MatrixOne AS OF TIMESTAMP)
+                # Convert ISO format to MySQL datetime format
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    mysql_timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    # If parsing fails, use timestamp as-is
+                    mysql_timestamp = timestamp
+
+                row = self.db.fetchone(
+                    """
+                    SELECT * FROM skills_registry
+                    WHERE skill_name = %s AND created_at <= %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (skill_name, mysql_timestamp),
+                )
+            else:
+                # Current active version
+                row = self.db.fetchone(
+                    """
+                    SELECT * FROM skills_registry
+                    WHERE skill_name = %s AND is_active = 1
+                    LIMIT 1
+                    """,
+                    (skill_name,),
+                )
+
+            if row:
+                return dict(row)
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to query skill {skill_name}: {e}")
+            return None
 
     def list_available(self, repo_id: int) -> list[Skill]:
         """List skills available for a repo"""

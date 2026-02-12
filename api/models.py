@@ -105,6 +105,7 @@ class SkillRegistry(Base):
     version = Column(String(32), nullable=False)
     skill_version = Column(String(32), nullable=False)
     skill_definition = Column(JSON)
+    git_commit_hash = Column(String(64), index=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     is_active = Column(TINYINT(1), server_default="1")
 
