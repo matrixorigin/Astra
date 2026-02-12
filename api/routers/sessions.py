@@ -1,137 +1,239 @@
-"""FastAPI sessions router with SQLAlchemy."""
+"""Session API Router - 使用服务层"""
 
-from datetime import datetime, timezone
-from uuid import uuid4
-
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Dict, Any, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.dependencies import get_current_user
 from api.database import get_db_session
-from api.repositories.session_repository import SessionRepository
-from schemas.session import SessionCreateRequest, SessionListResponse, SessionResponse
+from api.dependencies import get_current_user
+from api.services.session_service import SessionService
+
 
 router = APIRouter()
 
 
-@router.post("", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
-def create_session(
-    request: SessionCreateRequest,
-    current_user: dict = Depends(get_current_user),
+# Request/Response Models
+class CreateSessionRequest(BaseModel):
+    """创建 Session 请求"""
+    agent_id: Optional[str] = None
+    title: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class UpdateSessionRequest(BaseModel):
+    """更新 Session 请求"""
+    title: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+
+
+class SessionResponse(BaseModel):
+    """Session 响应"""
+    session_id: str
+    user_id: str
+    agent_id: Optional[str] = None
+    title: str
+    metadata: Dict[str, Any]
+    status: str
+    event_count: int
+    created_at: str
+    updated_at: Optional[str] = None
+    ended_at: Optional[str] = None
+
+
+class SessionListResponse(BaseModel):
+    """Session 列表响应"""
+    sessions: list[SessionResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+# API Endpoints
+@router.post(
+    "",
+    response_model=SessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="创建 Session",
+    description="创建一个新的会话"
+)
+async def create_session(
+    request: CreateSessionRequest,
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Create a new session."""
-    repo = SessionRepository(db)
-    
-    session_data = {
-        "session_id": str(uuid4()),
-        "user_id": current_user["user_id"],
-        "status": "active",
-        "event_count": 0,
-        "created_at": datetime.now(timezone.utc),
-        "last_active_at": datetime.now(timezone.utc),
-        "session_metadata": request.metadata or {},
-    }
-    
-    session = repo.create(session_data)
-    
-    return SessionResponse(
-        session_id=session.session_id,
-        user_id=session.user_id,
-        status=session.status,
-        event_count=session.event_count,
-        created_at=session.created_at,
-        last_active_at=session.last_active_at,
-        metadata=session.session_metadata,
-    )
+    """创建 Session"""
+    try:
+        service = SessionService(db)
+        result = service.create_session(
+            user_id=current_user["user_id"],
+            agent_id=request.agent_id,
+            title=request.title,
+            metadata=request.metadata
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"创建 Session 失败: {str(e)}"
+        )
 
 
-@router.get("", response_model=SessionListResponse)
-def list_sessions(
-    current_user: dict = Depends(get_current_user),
+@router.get(
+    "",
+    response_model=SessionListResponse,
+    summary="列出 Sessions",
+    description="列出当前用户的会话"
+)
+async def list_sessions(
+    agent_id: Optional[str] = Query(None, description="过滤Agent ID"),
+    session_status: Optional[str] = Query(None, description="过滤状态"),
+    limit: int = Query(50, ge=1, le=100, description="限制数量"),
+    offset: int = Query(0, ge=0, description="偏移量"),
     db: Session = Depends(get_db_session),
-    status: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
+    current_user: dict = Depends(get_current_user)
 ):
-    """List user's sessions with pagination and filtering."""
-    if limit > 100:
-        limit = 100
-    
-    repo = SessionRepository(db)
-    sessions = repo.list_by_user(
-        user_id=current_user["user_id"],
-        status=status,
-        limit=limit,
-        offset=offset,
-    )
-    
-    return SessionListResponse(
-        sessions=[
-            SessionResponse(
-                session_id=s.session_id,
-                user_id=s.user_id,
-                status=s.status,
-                event_count=s.event_count,
-                created_at=s.created_at,
-                last_active_at=s.last_active_at,
-                metadata=s.session_metadata,
-            )
-            for s in sessions
-        ],
-        total=len(sessions),
-    )
+    """列出 Sessions"""
+    try:
+        service = SessionService(db)
+        result = service.list_sessions(
+            user_id=current_user["user_id"],
+            agent_id=agent_id,
+            status=session_status,
+            limit=limit,
+            offset=offset
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取 Sessions 失败: {str(e)}"
+        )
 
 
-@router.get("/{session_id}", response_model=SessionResponse)
-def get_session(
+@router.get(
+    "/{session_id}",
+    response_model=SessionResponse,
+    summary="获取 Session",
+    description="获取指定会话的详细信息"
+)
+async def get_session(
     session_id: str,
-    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Get session with ownership check."""
-    repo = SessionRepository(db)
-    session = repo.get_by_id(session_id, user_id=current_user["user_id"])
-    
-    if not session:
+    """获取 Session"""
+    try:
+        service = SessionService(db)
+        result = service.get_session(session_id=session_id, user_id=current_user["user_id"])
+        return result
+    except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found",
+            detail=str(e)
         )
-    
-    return SessionResponse(
-        session_id=session.session_id,
-        user_id=session.user_id,
-        status=session.status,
-        event_count=session.event_count,
-        created_at=session.created_at,
-        last_active_at=session.last_active_at,
-        metadata=session.session_metadata,
-    )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取 Session 失败: {str(e)}"
+        )
 
 
-@router.post("/{session_id}/close", response_model=SessionResponse)
-def close_session(
+@router.put(
+    "/{session_id}",
+    response_model=SessionResponse,
+    summary="更新 Session",
+    description="更新指定会话的信息"
+)
+async def update_session(
     session_id: str,
-    current_user: dict = Depends(get_current_user),
+    request: UpdateSessionRequest,
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Close a session."""
-    repo = SessionRepository(db)
-    session = repo.update_status(session_id, current_user["user_id"], "closed")
-    
-    if not session:
+    """更新 Session"""
+    try:
+        service = SessionService(db)
+        result = service.update_session(
+            session_id=session_id,
+            user_id=current_user["user_id"],
+            title=request.title,
+            metadata=request.metadata,
+            status=request.status
+        )
+        return result
+    except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Session not found",
+            detail=str(e)
         )
-    
-    return SessionResponse(
-        session_id=session.session_id,
-        user_id=session.user_id,
-        status=session.status,
-        event_count=session.event_count,
-        created_at=session.created_at,
-        last_active_at=session.last_active_at,
-        metadata=session.session_metadata,
-    )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"更新 Session 失败: {str(e)}"
+        )
+
+
+@router.delete(
+    "/{session_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="删除 Session",
+    description="删除指定的会话"
+)
+async def delete_session(
+    session_id: str,
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """删除 Session"""
+    try:
+        service = SessionService(db)
+        service.delete_session(session_id=session_id, user_id=current_user["user_id"])
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"删除 Session 失败: {str(e)}"
+        )
+
+
+@router.post(
+    "/{session_id}/close",
+    response_model=SessionResponse,
+    summary="关闭 Session",
+    description="关闭指定的会话"
+)
+async def close_session(
+    session_id: str,
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """关闭 Session"""
+    try:
+        service = SessionService(db)
+        result = service.update_session(
+            session_id=session_id,
+            user_id=current_user["user_id"],
+            status="closed"
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"关闭 Session 失败: {str(e)}"
+        )

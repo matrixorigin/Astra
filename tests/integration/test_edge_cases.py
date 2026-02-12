@@ -289,7 +289,7 @@ def test_user_cross_session_events(session_repo, event_repo):
             "event_metadata": {},
         })
 
-    user_sessions = session_repo.list_by_user(user_id)
+    user_sessions, total = session_repo.list_by_user(user_id)
     assert len(user_sessions) == 3
 
 

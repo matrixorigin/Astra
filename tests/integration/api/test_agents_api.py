@@ -43,13 +43,12 @@ def test_create_and_list_agents(client, auth_token):
     
     # Create agent
     response = client.post("/agents", headers=headers, json={
-        "agent_name": "Test Agent",
-        "agent_type": "chatbot",
-        "config": {"model": "gpt-4"}
+        "name": "Test Agent",
+        "agent_config": {"model": "gpt-4"}
     })
     assert response.status_code == 201
     agent = response.json()
-    assert agent["agent_name"] == "Test Agent"
+    assert agent["name"] == "Test Agent"
     agent_id = agent["agent_id"]
     
     # List agents
@@ -66,9 +65,8 @@ def test_get_agent(client, auth_token):
     
     # Create agent
     response = client.post("/agents", headers=headers, json={
-        "agent_name": "Get Test",
-        "agent_type": "assistant",
-        "config": {}
+        "name": "Get Test",
+        "agent_config": {}
     })
     agent_id = response.json()["agent_id"]
     
@@ -77,7 +75,7 @@ def test_get_agent(client, auth_token):
     assert response.status_code == 200
     agent = response.json()
     assert agent["agent_id"] == agent_id
-    assert agent["agent_name"] == "Get Test"
+    assert agent["name"] == "Get Test"
 
 
 def test_update_agent(client, auth_token):
@@ -86,21 +84,20 @@ def test_update_agent(client, auth_token):
     
     # Create agent
     response = client.post("/agents", headers=headers, json={
-        "agent_name": "Original",
-        "agent_type": "chatbot",
-        "config": {}
+        "name": "Original",
+        "agent_config": {}
     })
     agent_id = response.json()["agent_id"]
     
     # Update agent
     response = client.put(f"/agents/{agent_id}", headers=headers, json={
-        "agent_name": "Updated",
-        "config": {"new": "config"}
+        "name": "Updated",
+        "agent_config": {"new": "config"}
     })
     assert response.status_code == 200
     agent = response.json()
-    assert agent["agent_name"] == "Updated"
-    assert agent["config"]["new"] == "config"
+    assert agent["name"] == "Updated"
+    assert agent["agent_config"]["new"] == "config"
 
 
 def test_delete_agent(client, auth_token):
@@ -109,9 +106,8 @@ def test_delete_agent(client, auth_token):
     
     # Create agent
     response = client.post("/agents", headers=headers, json={
-        "agent_name": "To Delete",
-        "agent_type": "chatbot",
-        "config": {}
+        "name": "To Delete",
+        "agent_config": {}
     })
     agent_id = response.json()["agent_id"]
     

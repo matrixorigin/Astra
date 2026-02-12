@@ -189,7 +189,7 @@ def test_get_user_sessions(session_repo):
         session_repo.create(session_data)
 
     # Retrieve
-    sessions = session_repo.list_by_user(user_id)
+    sessions, total = session_repo.list_by_user(user_id)
     assert len(sessions) == 3
 
 

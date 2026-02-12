@@ -31,24 +31,32 @@ class SessionRepository:
     def list_by_user(
         self,
         user_id: str,
+        agent_id: str | None = None,
         status: str | None = None,
         limit: int = 50,
         offset: int = 0,
-    ) -> list[SessionModel]:
+    ) -> tuple[list[SessionModel], int]:
         """List sessions with filters pushed to database."""
         query = self.db.query(SessionModel).filter(SessionModel.user_id == user_id)
+        
+        # Push agent_id filter to database
+        if agent_id:
+            query = query.filter(SessionModel.agent_id == agent_id)
         
         # Push status filter to database
         if status:
             query = query.filter(SessionModel.status == status)
         
+        # Get total count before pagination
+        total = query.count()
+        
         # Order by most recent first
-        query = query.order_by(SessionModel.last_active_at.desc())
+        query = query.order_by(SessionModel.created_at.desc())
         
         # Pagination at DB level
         query = query.offset(offset).limit(limit)
         
-        return query.all()
+        return query.all(), total
     
     def update_status(self, session_id: str, user_id: str, status: str) -> SessionModel | None:
         """Update session status with ownership check at DB level."""
@@ -64,3 +72,32 @@ class SessionRepository:
         self.db.commit()
         self.db.refresh(session)
         return session
+    
+    def update(self, session_id: str, update_data: dict) -> SessionModel | None:
+        """Update session with data."""
+        session = self.db.query(SessionModel).filter(
+            SessionModel.session_id == session_id
+        ).first()
+        
+        if not session:
+            return None
+        
+        for key, value in update_data.items():
+            setattr(session, key, value)
+        
+        self.db.commit()
+        self.db.refresh(session)
+        return session
+    
+    def delete(self, session_id: str) -> bool:
+        """Delete session."""
+        session = self.db.query(SessionModel).filter(
+            SessionModel.session_id == session_id
+        ).first()
+        
+        if not session:
+            return False
+        
+        self.db.delete(session)
+        self.db.commit()
+        return True

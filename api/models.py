@@ -47,9 +47,13 @@ class Session(Base):
     __tablename__ = "sessions"
     session_id = Column(String(36), primary_key=True)
     user_id = Column(String(36), nullable=False, index=True)
+    agent_id = Column(String(36), nullable=True, index=True)  # 新增：关联的Agent
+    title = Column(String(255), nullable=True)  # 新增：会话标题
     status = Column(String(20), default="active", nullable=False, index=True)
     event_count = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())  # 新增：更新时间
+    ended_at = Column(DateTime, nullable=True)  # 新增：结束时间
     last_active_at = Column(DateTime, default=func.now(), nullable=False)
     session_metadata = Column("metadata", JSON)
 
@@ -63,6 +67,8 @@ class Event(Base):
     agent_version = Column(String(32), nullable=False, default="1.0.0")
     event_type = Column(String(50), nullable=False, index=True)
     content = Column(Text, nullable=False)
+    parent_event_id = Column(String(36), nullable=True, index=True)  # 新增：父事件ID
+    causal_chain_id = Column(String(36), nullable=False, index=True)  # 新增：因果链ID
     desensitized_content = Column(Text)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     event_metadata = Column("metadata", JSON)

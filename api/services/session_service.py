@@ -1,0 +1,336 @@
+"""Session Service - 业务逻辑层"""
+
+from datetime import datetime, timezone
+from typing import Dict, List, Any, Optional
+from sqlalchemy.orm import Session
+
+from api.repositories import SessionRepository
+from core.auth.audit_logger import AuditLogger
+from core.auth.permission_checker import PermissionChecker
+from sdk import Database
+
+
+class SessionService:
+    """Session 业务服务"""
+    
+    def __init__(self, db_session: Session):
+        self.db_session = db_session
+        self.session_repo = SessionRepository(db_session)
+        self.db = Database()  # For audit and permission
+        self.audit = AuditLogger(self.db)
+        self.permission = PermissionChecker(self.db)
+    
+    def create_session(
+        self,
+        user_id: str,
+        agent_id: Optional[str] = None,
+        title: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """创建 Session
+        
+        Args:
+            user_id: 用户ID
+            agent_id: Agent ID (可选)
+            title: 会话标题
+            metadata: 元数据
+            
+        Returns:
+            Session信息
+        """
+        # 设置默认值
+        if metadata is None:
+            metadata = {}
+        if title is None:
+            title = f"Session {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
+        
+        try:
+            from uuid_utils import uuid7
+            
+            session_data = {
+                "session_id": str(uuid7()),  # 生成session_id
+                "user_id": user_id,
+                "agent_id": agent_id,
+                "title": title,
+                "session_metadata": metadata,  # 使用正确的字段名
+                "status": "active",
+                "event_count": 0
+            }
+            
+            session = self.session_repo.create(session_data)
+            
+            # 审计日志
+            self.audit.log(
+                user_id=user_id,
+                action="session_create",
+                resource_type="session",
+                resource_id=session.session_id,
+                details={"title": title, "agent_id": agent_id},
+                status="success"
+            )
+            
+            return {
+                "session_id": session.session_id,
+                "user_id": session.user_id,
+                "agent_id": session.agent_id,
+                "title": session.title,
+                "metadata": session.session_metadata or {},
+                "status": session.status,
+                "event_count": session.event_count,
+                "created_at": session.created_at.isoformat(),
+                "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+                "ended_at": session.ended_at.isoformat() if session.ended_at else None
+            }
+            
+        except Exception as e:
+            # 审计失败
+            self.audit.log(
+                user_id=user_id,
+                action="session_create",
+                resource_type="session",
+                resource_id="unknown",
+                details={"error": str(e)},
+                status="failed"
+            )
+            raise
+    
+    def get_session(self, session_id: str, user_id: str) -> Dict[str, Any]:
+        """获取 Session 信息
+        
+        Args:
+            session_id: Session ID
+            user_id: 用户ID
+            
+        Returns:
+            Session信息
+            
+        Raises:
+            ValueError: Session不存在或无权限
+        """
+        session = self.session_repo.get_by_id(session_id)
+        
+        if not session:
+            raise ValueError(f"Session {session_id} 不存在")
+        
+        # 权限检查 - 只能访问自己的Session
+        if session.user_id != user_id:
+            raise ValueError(f"无权限访问 Session {session_id}")
+        
+        return {
+            "session_id": session.session_id,
+            "user_id": session.user_id,
+            "agent_id": session.agent_id,
+            "title": session.title,
+            "metadata": session.session_metadata or {},
+            "status": session.status,
+            "event_count": session.event_count,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+            "ended_at": session.ended_at.isoformat() if session.ended_at else None
+        }
+    
+    def list_sessions(
+        self,
+        user_id: str,
+        agent_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0
+    ) -> Dict[str, Any]:
+        """列出用户的 Sessions
+        
+        Args:
+            user_id: 用户ID
+            agent_id: 过滤Agent ID
+            status: 过滤状态
+            limit: 限制数量
+            offset: 偏移量
+            
+        Returns:
+            Sessions列表和总数
+        """
+        sessions, total = self.session_repo.list_by_user(
+            user_id=user_id,
+            agent_id=agent_id,
+            status=status,
+            limit=limit,
+            offset=offset
+        )
+        
+        return {
+            "sessions": [
+                {
+                    "session_id": session.session_id,
+                    "user_id": session.user_id,
+                    "agent_id": session.agent_id,
+                    "title": session.title,
+                    "metadata": session.session_metadata or {},
+                    "status": session.status,
+                    "event_count": session.event_count,
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+                    "ended_at": session.ended_at.isoformat() if session.ended_at else None
+                }
+                for session in sessions
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset
+        }
+    
+    def update_session(
+        self,
+        session_id: str,
+        user_id: str,
+        title: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """更新 Session
+        
+        Args:
+            session_id: Session ID
+            user_id: 用户ID
+            title: 新标题
+            metadata: 新元数据
+            status: 新状态
+            
+        Returns:
+            更新后的Session信息
+            
+        Raises:
+            ValueError: Session不存在或无权限
+        """
+        session = self.session_repo.get_by_id(session_id)
+        
+        if not session:
+            raise ValueError(f"Session {session_id} 不存在")
+        
+        # 权限检查
+        if session.user_id != user_id:
+            raise ValueError(f"无权限修改 Session {session_id}")
+        
+        # 准备更新数据
+        update_data = {}
+        if title is not None:
+            update_data["title"] = title
+        if metadata is not None:
+            update_data["session_metadata"] = metadata  # 使用正确的字段名
+        if status is not None:
+            update_data["status"] = status
+            if status == "ended":
+                update_data["ended_at"] = datetime.now(timezone.utc)
+        
+        if not update_data:
+            # 没有更新内容，直接返回当前信息
+            return self.get_session(session_id, user_id)
+        
+        try:
+            updated_session = self.session_repo.update(session_id, update_data)
+            
+            # 审计日志
+            self.audit.log(
+                user_id=user_id,
+                action="session_update",
+                resource_type="session",
+                resource_id=session_id,
+                details=update_data,
+                status="success"
+            )
+            
+            return {
+                "session_id": updated_session.session_id,
+                "user_id": updated_session.user_id,
+                "agent_id": updated_session.agent_id,
+                "title": updated_session.title,
+                "metadata": updated_session.session_metadata or {},
+                "status": updated_session.status,
+                "event_count": updated_session.event_count,
+                "created_at": updated_session.created_at.isoformat(),
+                "updated_at": updated_session.updated_at.isoformat() if updated_session.updated_at else None,
+                "ended_at": updated_session.ended_at.isoformat() if updated_session.ended_at else None
+            }
+            
+        except Exception as e:
+            # 审计失败
+            self.audit.log(
+                user_id=user_id,
+                action="session_update",
+                resource_type="session",
+                resource_id=session_id,
+                details={"error": str(e)},
+                status="failed"
+            )
+            raise
+    
+    def delete_session(self, session_id: str, user_id: str) -> None:
+        """删除 Session
+        
+        Args:
+            session_id: Session ID
+            user_id: 用户ID
+            
+        Raises:
+            ValueError: Session不存在或无权限
+        """
+        session = self.session_repo.get_by_id(session_id)
+        
+        if not session:
+            raise ValueError(f"Session {session_id} 不存在")
+        
+        # 权限检查
+        if session.user_id != user_id:
+            raise ValueError(f"无权限删除 Session {session_id}")
+        
+        try:
+            self.session_repo.delete(session_id)
+            
+            # 审计日志
+            self.audit.log(
+                user_id=user_id,
+                action="session_delete",
+                resource_type="session",
+                resource_id=session_id,
+                details={"title": session.title},
+                status="success"
+            )
+            
+        except Exception as e:
+            # 审计失败
+            self.audit.log(
+                user_id=user_id,
+                action="session_delete",
+                resource_type="session",
+                resource_id=session_id,
+                details={"error": str(e)},
+                status="failed"
+            )
+            raise
+    
+    def increment_event_count(self, session_id: str, user_id: str) -> None:
+        """增加事件计数
+        
+        Args:
+            session_id: Session ID
+            user_id: 用户ID
+            
+        Raises:
+            ValueError: Session不存在或无权限
+        """
+        session = self.session_repo.get_by_id(session_id)
+        
+        if not session:
+            raise ValueError(f"Session {session_id} 不存在")
+        
+        # 权限检查
+        if session.user_id != user_id:
+            raise ValueError(f"无权限修改 Session {session_id}")
+        
+        try:
+            self.session_repo.update(session_id, {
+                "event_count": session.event_count + 1
+            })
+            
+        except Exception as e:
+            # 静默失败，不影响主流程
+            pass

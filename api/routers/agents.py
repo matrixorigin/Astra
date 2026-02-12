@@ -1,164 +1,199 @@
-"""FastAPI agents router with SQLAlchemy optimization."""
+"""Agent API Router - 使用服务层"""
 
-from uuid import uuid4
-
+from typing import Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
-from api.repositories import AgentRepository
-from schemas.agent import AgentCreateRequest, AgentResponse, AgentUpdateRequest
+from api.services.agent_service import AgentService
+
 
 router = APIRouter()
 
 
-@router.post("", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)
-def create_agent(
-    request: AgentCreateRequest,
-    current_user: dict = Depends(get_current_user),
+# Request/Response Models
+class CreateAgentRequest(BaseModel):
+    """创建 Agent 请求"""
+    name: str
+    agent_config: Optional[Dict[str, Any]] = None
+    data_source: Optional[Dict[str, Any]] = None
+
+
+class UpdateAgentRequest(BaseModel):
+    """更新 Agent 请求"""
+    name: Optional[str] = None
+    agent_config: Optional[Dict[str, Any]] = None
+    data_source: Optional[Dict[str, Any]] = None
+    is_active: Optional[bool] = None
+
+
+class AgentResponse(BaseModel):
+    """Agent 响应"""
+    agent_id: str
+    name: str
+    agent_type: str
+    owner_user_id: str
+    agent_config: Dict[str, Any]
+    data_source: Dict[str, Any]
+    is_active: bool
+    created_at: str
+    updated_at: Optional[str] = None
+
+
+class AgentListResponse(BaseModel):
+    """Agent 列表响应"""
+    agents: list[AgentResponse]
+    total: int
+
+
+# API Endpoints
+@router.post(
+    "",
+    response_model=AgentResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="创建 Agent",
+    description="创建一个新的 Agent"
+)
+async def create_agent(
+    request: CreateAgentRequest,
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Create a new agent."""
-    repo = AgentRepository(db)
-    
-    agent_data = {
-        "agent_id": str(uuid4()),
-        "agent_name": request.agent_name,
-        "agent_type": request.agent_type,
-        "owner_user_id": current_user["user_id"],
-        "agent_config": request.config,
-        "is_active": True,
-    }
-    
-    agent = repo.create(agent_data)
-    
-    return AgentResponse(
-        agent_id=agent.agent_id,
-        agent_name=agent.agent_name,
-        agent_type=agent.agent_type,
-        owner_user_id=agent.owner_user_id,
-        config=agent.agent_config,
-        is_active=agent.is_active,
-        created_at=agent.created_at,
-    )
-
-
-@router.get("", response_model=dict)
-def list_agents(
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db_session),
-    agent_type: str | None = None,
-    is_active: bool = True,
-    limit: int = 50,
-    offset: int = 0,
-):
-    """List agents with database-level filtering and pagination."""
-    if limit > 100:
-        limit = 100
-    
-    repo = AgentRepository(db)
-    agents = repo.list_by_owner(
-        owner_user_id=current_user["user_id"],
-        agent_type=agent_type,
-        is_active=is_active,
-        limit=limit,
-        offset=offset,
-    )
-    
-    return {
-        "agents": [
-            AgentResponse(
-                agent_id=a.agent_id,
-                agent_name=a.agent_name,
-                agent_type=a.agent_type,
-                owner_user_id=a.owner_user_id,
-                config=a.agent_config,
-                is_active=a.is_active,
-                created_at=a.created_at,
-            )
-            for a in agents
-        ],
-        "total": len(agents),
-    }
-
-
-@router.get("/{agent_id}", response_model=AgentResponse)
-def get_agent(
-    agent_id: str,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db_session),
-):
-    """Get agent with ownership check at database level."""
-    repo = AgentRepository(db)
-    agent = repo.get_by_id(agent_id, owner_user_id=current_user["user_id"])
-    
-    if not agent:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
+    """创建 Agent"""
+    try:
+        service = AgentService(db)
+        result = service.create_agent(
+            user_id=current_user["user_id"],
+            name=request.name,
+            agent_config=request.agent_config,
+            data_source=request.data_source
         )
-    
-    return AgentResponse(
-        agent_id=agent.agent_id,
-        agent_name=agent.agent_name,
-        agent_type=agent.agent_type,
-        owner_user_id=agent.owner_user_id,
-        config=agent.agent_config,
-        is_active=agent.is_active,
-        created_at=agent.created_at,
-    )
-
-
-@router.put("/{agent_id}", response_model=AgentResponse)
-def update_agent(
-    agent_id: str,
-    request: AgentUpdateRequest,
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db_session),
-):
-    """Update agent with ownership check in query."""
-    repo = AgentRepository(db)
-    
-    updates = {}
-    if request.agent_name is not None:
-        updates["agent_name"] = request.agent_name
-    if request.config is not None:
-        updates["agent_config"] = request.config
-    if request.is_active is not None:
-        updates["is_active"] = request.is_active
-    
-    agent = repo.update(agent_id, current_user["user_id"], updates)
-    
-    if not agent:
+        return result
+    except ValueError as e:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
         )
-    
-    return AgentResponse(
-        agent_id=agent.agent_id,
-        agent_name=agent.agent_name,
-        agent_type=agent.agent_type,
-        owner_user_id=agent.owner_user_id,
-        config=agent.agent_config,
-        is_active=agent.is_active,
-        created_at=agent.created_at,
-    )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"创建 Agent 失败: {str(e)}"
+        )
 
 
-@router.delete("/{agent_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_agent(
-    agent_id: str,
-    current_user: dict = Depends(get_current_user),
+@router.get(
+    "",
+    response_model=AgentListResponse,
+    summary="列出 Agents",
+    description="列出当前用户的所有 Agents"
+)
+async def list_agents(
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
 ):
-    """Delete agent with ownership check in query."""
-    repo = AgentRepository(db)
-    deleted = repo.delete(agent_id, current_user["user_id"])
-    
-    if not deleted:
+    """列出 Agents"""
+    try:
+        service = AgentService(db)
+        agents = service.list_agents(user_id=current_user["user_id"])
+        return {
+            "agents": agents,
+            "total": len(agents)
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取 Agents 失败: {str(e)}"
+        )
+
+
+@router.get(
+    "/{agent_id}",
+    response_model=AgentResponse,
+    summary="获取 Agent",
+    description="获取指定 Agent 的详细信息"
+)
+async def get_agent(
+    agent_id: str,
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """获取 Agent"""
+    try:
+        service = AgentService(db)
+        result = service.get_agent(agent_id=agent_id, user_id=current_user["user_id"])
+        return result
+    except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found",
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取 Agent 失败: {str(e)}"
+        )
+
+
+@router.put(
+    "/{agent_id}",
+    response_model=AgentResponse,
+    summary="更新 Agent",
+    description="更新指定 Agent 的信息"
+)
+async def update_agent(
+    agent_id: str,
+    request: UpdateAgentRequest,
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """更新 Agent"""
+    try:
+        service = AgentService(db)
+        result = service.update_agent(
+            agent_id=agent_id,
+            user_id=current_user["user_id"],
+            name=request.name,
+            agent_config=request.agent_config,
+            data_source=request.data_source,
+            is_active=request.is_active
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"更新 Agent 失败: {str(e)}"
+        )
+
+
+@router.delete(
+    "/{agent_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="删除 Agent",
+    description="删除指定的 Agent"
+)
+async def delete_agent(
+    agent_id: str,
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user)
+):
+    """删除 Agent"""
+    try:
+        service = AgentService(db)
+        service.delete_agent(agent_id=agent_id, user_id=current_user["user_id"])
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"删除 Agent 失败: {str(e)}"
         )
