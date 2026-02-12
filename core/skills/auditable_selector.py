@@ -110,6 +110,10 @@ class AuditableSkillSelector:
         """
         )
 
+    def get_tools_schema(self, query: str, max_candidates: int = 5) -> list[dict]:
+        """Delegate to modern_selector for tool schema retrieval."""
+        return self.modern_selector.get_tools_schema(query, max_candidates)
+
     def select_with_validation(
         self, query: str, session_id: str, validate_in_sandbox: bool = True
     ) -> SkillSelectionEvent:

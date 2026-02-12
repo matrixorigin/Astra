@@ -59,6 +59,11 @@ def chat(user_id, model, mode):
     click.echo(f"Session: {session.session_id}")
     click.echo("Type 'exit' or 'quit' to end session\n")
 
+    # Initialize firewall
+    from core.verification.firewall import HallucinationFirewall
+
+    firewall = HallucinationFirewall(db, context_mgr, threshold=0.7)
+
     # Agent Components (with session_id for auditable selection)
     selector = AgentSkillSelector(db, llm_client, auditable=True, session_id=session.session_id)
     executor = AgentExecutor(
@@ -67,7 +72,12 @@ def chat(user_id, model, mode):
         mode=MockMode(mode),
     )
     chat_loop = ChatLoop(
-        selector=selector, executor=executor, llm_client=llm_client, event_logger=logger
+        selector=selector,
+        executor=executor,
+        llm_client=llm_client,
+        event_logger=logger,
+        context_manager=context_mgr,
+        firewall=firewall,
     )
 
     # Create agent registry with example agents
