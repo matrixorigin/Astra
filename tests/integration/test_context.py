@@ -16,8 +16,8 @@ def db():
 
 @pytest.fixture
 def context_manager(db):
-    """Context manager instance with snapshots enabled."""
-    return ContextManager(db, enable_snapshots=True)
+    """Context manager instance."""
+    return ContextManager(db)
 
 
 @pytest.fixture

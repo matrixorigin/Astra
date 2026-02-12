@@ -90,13 +90,25 @@ class ChatLoop:
         executor: AgentExecutor,
         llm_client,
         event_logger: EventLogger,
-        context_manager=None,
+        context_manager,
+        firewall,
     ):
+        """Initialize ChatLoop.
+        
+        Args:
+            selector: Skill selector
+            executor: Skill executor
+            llm_client: LLM client
+            event_logger: Event logger
+            context_manager: Context manager (required for snapshots)
+            firewall: Hallucination firewall (required for verification)
+        """
         self.selector = selector
         self.executor = executor
         self.llm = llm_client
         self.event_logger = event_logger
         self.context_manager = context_manager
+        self.firewall = firewall
 
     async def run_step(
         self,
@@ -119,17 +131,14 @@ class ChatLoop:
             content=user_input,
         )
 
-        # 2. Build context and save snapshot
-        snapshot_id = None
-        if self.context_manager:
-            from core.context.manager import TaskType
+        # 2. Build context and save snapshot (always enabled)
+        from core.context.manager import TaskType
 
-            ctx = self.context_manager.build_context(
-                session_id=session_id, query=user_input, task_type=TaskType.GENERAL
-            )
-            snapshot_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
-            if snapshot_id:
-                logger.debug(f"Context snapshot saved: {snapshot_id}")
+        ctx = self.context_manager.build_context(
+            session_id=session_id, query=user_input, task_type=TaskType.GENERAL
+        )
+        snapshot_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
+        logger.debug(f"Context snapshot: {snapshot_id}")
 
         # 3. Build messages with context
         messages = self._build_messages(user_input, context)
@@ -181,8 +190,23 @@ class ChatLoop:
             tool_calls = llm_result.get("tool_calls", [])
 
             if not tool_calls:
-                # LLM produced a final text answer — done
+                # LLM produced a final text answer — verify and deliver
                 final_content = llm_result.get("content", "")
+
+                # Always verify with firewall
+                verification = self.firewall.verify_response(final_content, snapshot_id, mode="warn")
+                self.firewall.log_verification(session_id, user_event.event_id, verification)
+
+                if not verification.safe_to_deliver:
+                    logger.warning(
+                        f"Firewall: confidence={verification.confidence_score:.2f}, "
+                        f"failed={verification.claims_failed}"
+                    )
+                    final_content = (
+                        f"{final_content}\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
+                        f"{verification.claims_failed} unverified claims."
+                    )
+
                 self._log_response(
                     user_id,
                     session_id,

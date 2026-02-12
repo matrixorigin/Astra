@@ -15,8 +15,8 @@ def db():
 
 @pytest.fixture
 def context_manager(db):
-    """Context manager with snapshots enabled."""
-    return ContextManager(db, enable_snapshots=True, embedding_provider="mock")
+    """Context manager fixture."""
+    return ContextManager(db, embedding_provider="mock")
 
 
 @pytest.fixture
@@ -41,7 +41,7 @@ def test_context_snapshot_save_and_load(db, context_manager, event_logger):
         session_id=session_id, query="Test query", task_type=TaskType.GENERAL
     )
 
-    # Save snapshot
+    # Save snapshot (always returns snapshot_id)
     snapshot_id = context_manager.save_snapshot(context, session_id, event.event_id)
     assert snapshot_id is not None
 
@@ -59,22 +59,6 @@ def test_context_snapshot_save_and_load(db, context_manager, event_logger):
     assert row is not None
     assert row["session_id"] == session_id
     assert row["event_id"] == event.event_id
-
-
-def test_context_snapshot_disabled(db):
-    """Test that snapshots are not saved when disabled."""
-    context_manager = ContextManager(db, enable_snapshots=False, embedding_provider="mock")
-
-    session_id = "test_session_002"
-
-    # Build context
-    context = context_manager.build_context(
-        session_id=session_id, query="Test query", task_type=TaskType.CODE_REVIEW
-    )
-
-    # Try to save snapshot (should return None)
-    snapshot_id = context_manager.save_snapshot(context, session_id)
-    assert snapshot_id is None
 
 
 def test_context_snapshot_with_events(db, context_manager, event_logger):
@@ -106,7 +90,7 @@ def test_context_snapshot_with_events(db, context_manager, event_logger):
         session_id=session_id, query="Second query", task_type=TaskType.GENERAL
     )
 
-    # Save snapshot
+    # Save snapshot (always returns snapshot_id)
     snapshot_id = context_manager.save_snapshot(context, session_id, event2.event_id)
     assert snapshot_id is not None
 

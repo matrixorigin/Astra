@@ -59,6 +59,32 @@ class TestAgentArchitecture(unittest.TestCase):
         self.mock_skill = MockSkill()
         self.registry.get.return_value = self.mock_skill
 
+        # Create context_manager and firewall mocks
+        self.context_manager = MagicMock()
+        self.context_manager.build_context.return_value = MagicMock(
+            system_prompt="Test prompt",
+            skill_definitions=[],
+            selected_events=[],
+            code_context=[],
+            documentation=[],
+            total_tokens=100,
+            token_budget={},
+            assembly_time_ms=10,
+            relevance_scores={},
+            task_type="general",
+        )
+        self.context_manager.save_snapshot.return_value = "snapshot_123"
+
+        self.firewall = MagicMock()
+        self.firewall.verify_response.return_value = MagicMock(
+            safe_to_deliver=True,
+            confidence_score=0.9,
+            claims_verified=0,
+            claims_failed=0,
+            contradictions=[],
+            warnings=[],
+        )
+
         self.selector = AgentSkillSelector(self.db, self.llm_client)
         self.executor = AgentExecutor(self.db, self.registry, MockMode.PRODUCTION)
         self.chat_loop = ChatLoop(
@@ -66,6 +92,8 @@ class TestAgentArchitecture(unittest.TestCase):
             executor=self.executor,
             llm_client=self.llm_client,
             event_logger=self.event_logger,
+            context_manager=self.context_manager,
+            firewall=self.firewall,
         )
 
         # Mock the selector's get_tools_schema method

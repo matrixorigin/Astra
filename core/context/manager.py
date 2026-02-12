@@ -85,17 +85,15 @@ class ContextManager:
     """Orchestrate context selection and assembly."""
 
     def __init__(
-        self, db: Database, enable_snapshots: bool = False, embedding_provider: str = "mock"
+        self, db: Database, embedding_provider: str = "mock"
     ):
         """Initialize context manager.
 
         Args:
             db: Database connection
-            enable_snapshots: Whether to save context snapshots (default: False)
             embedding_provider: Embedding provider (openai, mock)
         """
         self.db = db
-        self.enable_snapshots = enable_snapshots
 
         # Initialize embedding service
         from core.context.embeddings import EmbeddingService
@@ -112,11 +110,7 @@ class ContextManager:
 
         self.scorer = RelevanceScorer(db, self.embeddings)
 
-        logger.info(
-            f"ContextManager initialized "
-            f"(snapshots={'enabled' if enable_snapshots else 'disabled'}, "
-            f"embeddings={embedding_provider})"
-        )
+        logger.info(f"ContextManager initialized (embeddings={embedding_provider})")
 
     def build_context(
         self,
@@ -398,18 +392,12 @@ class ContextManager:
 
     def save_snapshot(
         self, context: Context, session_id: str, event_id: str | None = None
-    ) -> str | None:
-        """Save context snapshot to database.
-
-        Only saves if snapshots are enabled.
+    ) -> str:
+        """Save context snapshot to database (always enabled).
 
         Returns:
-            snapshot_id or None if snapshots disabled
+            snapshot_id
         """
-        if not self.enable_snapshots:
-            logger.debug("Context snapshots disabled, skipping save")
-            return None
-
         import json
 
         from uuid_utils import uuid7

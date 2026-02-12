@@ -35,6 +35,10 @@ class PlanStep(BaseModel):
         default=None,
         description="Suggested skill to use (optional)",
     )
+    sub_plan: "Plan | None" = Field(
+        default=None,
+        description="Sub-plan for complex steps (hierarchical decomposition)",
+    )
     depends_on: list[str] = Field(
         default_factory=list,
         description="Step IDs this step depends on",
@@ -56,6 +60,14 @@ class Plan(BaseModel):
     plan_id: str = Field(description="Unique plan identifier")
     goal: str = Field(description="The goal this plan aims to achieve")
     steps: list[PlanStep] = Field(description="Ordered steps to execute")
+    parent_plan_id: str | None = Field(
+        default=None,
+        description="Parent plan ID for sub-plans (hierarchical)",
+    )
+    depth: int = Field(
+        default=0,
+        description="Nesting depth (0=root, 1=sub-plan, etc.)",
+    )
     revision_of: str | None = Field(
         default=None,
         description="If this revises a previous plan, reference to it",
@@ -71,6 +83,7 @@ class PlanConstraints(BaseModel):
     """Constraints for plan execution."""
 
     max_steps: int = Field(default=10, description="Maximum steps in a plan")
+    max_depth: int = Field(default=3, description="Maximum nesting depth")
     max_revisions: int = Field(default=3, description="Maximum plan revisions")
     timeout_seconds: int = Field(default=300, description="Execution timeout")
     cost_budget_usd: float | None = Field(
@@ -87,6 +100,7 @@ def get_plan_constraints() -> PlanConstraints:
     """Load plan constraints from environment variables."""
     return PlanConstraints(
         max_steps=int(os.getenv("MAX_PLAN_STEPS", "10")),
+        max_depth=int(os.getenv("MAX_PLAN_DEPTH", "3")),
         max_revisions=int(os.getenv("MAX_PLAN_REVISIONS", "3")),
         timeout_seconds=int(os.getenv("PLAN_TIMEOUT_SECONDS", "300")),
         cost_budget_usd=float(os.getenv("PLAN_COST_BUDGET_USD", "0"))
@@ -288,4 +302,84 @@ Output format (JSON):
         if len(plan.steps) > self.constraints.max_steps:
             return False, f"Plan has {len(plan.steps)} steps, max is {self.constraints.max_steps}"
 
+        if plan.depth > self.constraints.max_depth:
+            return False, f"Plan depth {plan.depth} exceeds max {self.constraints.max_depth}"
+
         return True, None
+
+    async def decompose_step(self, step: PlanStep, parent_plan: Plan) -> Plan | None:
+        """Decompose a complex step into a sub-plan.
+
+        Args:
+            step: Step to decompose
+            parent_plan: Parent plan containing this step
+
+        Returns:
+            Sub-plan or None if step is simple enough
+        """
+        # Check depth limit
+        if parent_plan.depth >= self.constraints.max_depth:
+            logger.warning(f"Max depth {self.constraints.max_depth} reached, skipping decomposition")
+            return None
+
+        # Ask LLM if step needs decomposition
+        system_prompt = f"""You are a planning assistant. Analyze if this step needs to be broken down into sub-steps.
+
+Step: {step.description}
+Parent Goal: {parent_plan.goal}
+Current Depth: {parent_plan.depth}
+
+If the step is simple and can be executed directly, respond with: {{"needs_decomposition": false}}
+If the step is complex and needs sub-steps, respond with: {{"needs_decomposition": true, "sub_steps": [...]}}
+
+Sub-steps format:
+{{
+    "needs_decomposition": true,
+    "sub_steps": [
+        {{"step_id": "sub_1", "description": "...", "skill_hint": "..."}},
+        {{"step_id": "sub_2", "description": "...", "depends_on": ["sub_1"]}}
+    ]
+}}"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Analyze step: {step.description}"},
+        ]
+
+        try:
+            response = self.llm.chat(messages=messages, user_id="system", session_id="planning")
+
+            content = response.content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+
+            analysis = json.loads(content)
+
+            if not analysis.get("needs_decomposition", False):
+                return None
+
+            # Create sub-plan
+            sub_steps = [PlanStep(**s) for s in analysis.get("sub_steps", [])]
+
+            sub_plan = Plan(
+                plan_id=f"{parent_plan.plan_id}_sub_{step.step_id}",
+                goal=step.description,
+                steps=sub_steps,
+                parent_plan_id=parent_plan.plan_id,
+                depth=parent_plan.depth + 1,
+                constraints=self.constraints.model_dump(),
+            )
+
+            logger.info(
+                f"Decomposed step '{step.step_id}' into {len(sub_steps)} sub-steps "
+                f"(depth {sub_plan.depth})"
+            )
+
+            return sub_plan
+
+        except Exception as e:
+            logger.error(f"Failed to decompose step: {e}")
+            return None
