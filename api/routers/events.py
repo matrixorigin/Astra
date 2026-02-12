@@ -85,9 +85,20 @@ def list_events(
     current_user: dict = Depends(get_current_user),
     event_logger: EventLogger = Depends(get_event_logger),
     session_manager: SessionManager = Depends(get_session_manager),
+    event_type: str | None = None,
     limit: int = 100,
+    offset: int = 0,
 ):
-    """List events for a session."""
+    """List events for a session with pagination and filtering.
+    
+    - **session_id**: Session ID (required)
+    - **event_type**: Filter by type (user_query, llm_response)
+    - **limit**: Max results (default 100, max 500)
+    - **offset**: Skip N results for pagination
+    """
+    if limit > 500:
+        limit = 500
+    
     # Verify session ownership
     session = session_manager.get_session(session_id)
     if not session:
@@ -103,7 +114,17 @@ def list_events(
         )
     
     # Get events
-    events = event_logger.get_session_events(session_id, limit=limit)
+    events = event_logger.get_session_events(session_id, limit=limit + offset)
+    
+    # Apply offset
+    events = events[offset:]
+    
+    # Filter by event_type if provided
+    if event_type:
+        events = [e for e in events if e.event_type == event_type]
+    
+    # Apply limit
+    events = events[:limit]
     
     event_responses = [
         EventResponse(

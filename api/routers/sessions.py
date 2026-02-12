@@ -42,15 +42,28 @@ def create_session(
 def list_sessions(
     current_user: dict = Depends(get_current_user),
     session_manager: SessionManager = Depends(get_session_manager),
+    status: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ):
-    """List user's sessions."""
+    """List user's sessions with pagination and filtering.
+    
+    - **status**: Filter by status (active, closed)
+    - **limit**: Max results (default 50, max 100)
+    - **offset**: Skip N results for pagination
+    """
+    if limit > 100:
+        limit = 100
+    
     sessions = session_manager.list_sessions(
         user_id=current_user["user_id"],
         limit=limit,
         offset=offset,
     )
+    
+    # Filter by status if provided
+    if status:
+        sessions = [s for s in sessions if s.status.value == status]
     
     session_responses = [
         SessionResponse(
