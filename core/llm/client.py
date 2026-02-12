@@ -164,7 +164,7 @@ class LLMClient:
     def _get_api_key(self, provider: str) -> str | None:
         """Get API key with scope-based resolution.
 
-        Priority: scope_resolver > user > tenant > config/env
+        Priority: scope_resolver > user > tenant > configs table
         """
         # 1. Try ScopeResolver (supports extended scopes like repo/project)
         if self.scope_resolver:
@@ -179,17 +179,7 @@ class LLMClient:
                 val = token.encrypted_value or token.secret_ref
                 return str(val) if val else None
 
-        # 3. Fallback to config
-        key = self.config.get(f"{provider}_api_key")
-        if key:
-            return str(key) if key else None
-
-        # 4. Fallback to environment variable
-        key = os.getenv(f"{provider.upper()}_API_KEY")
-        if key:
-            return key
-
-        # 5. Fallback to configs table (global)
+        # 3. Fallback to configs table (global)
         try:
             row = self.db.fetchone(
                 "SELECT value FROM configs WHERE key_name = %s AND scope_type = 'global' LIMIT 1",

@@ -255,7 +255,7 @@ def token():
 
 @token.command("create")
 @click.option("--type", "token_type", type=click.Choice(["llm", "github"]), required=True)
-@click.option("--provider", required=True, help="Provider name (e.g., openai, anthropic)")
+@click.option("--provider", required=True, help="Provider name (e.g., openai, anthropic, groq)")
 @click.option("--scope", type=click.Choice(["global", "account", "user"]), required=True)
 @click.option("--scope-id", help="Account or user ID for scope")
 @click.option("--token-value", prompt=True, hide_input=True, help="API token value")
@@ -272,18 +272,36 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
         click.echo("❌ Permission denied: only admins can create tokens")
         sys.exit(1)
 
-    try:
-        # Generate token_id
-        token_id = f"token_{scope}_{scope_id or 'global'}_{token_type}_{provider}"
+    # Validate scope_id
+    if scope in ["account", "user"] and not scope_id:
+        click.echo(f"❌ --scope-id is required for {scope} scope")
+        sys.exit(1)
 
-        # Insert
+    try:
+        from uuid_utils import uuid7
+        token_id = str(uuid7())
+
+        # Map scope to tokens table columns
+        scope_user_id = scope_id if scope == "user" else None
+        scope_tenant_id = scope_id if scope == "account" else None
+
+        # Insert into tokens table (not agent_config.api_tokens)
         db.execute(
             """
-            INSERT INTO agent_config.api_tokens
-            (token_id, token_type, provider, scope_type, scope_id, encrypted_value, is_active, created_by, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s, %s)
+            INSERT INTO tokens
+            (token_id, type, provider, scope_user_id, scope_tenant_id, 
+             encrypted_value, is_active, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s)
             """,
-            (token_id, token_type, provider, scope, scope_id, token_value, user, datetime.now()),
+            (
+                token_id,
+                token_type,
+                provider,
+                scope_user_id,
+                scope_tenant_id,
+                token_value,
+                datetime.now(),
+            ),
         )
 
         # Audit log
@@ -291,6 +309,7 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
 
         click.echo("✅ Token created successfully")
         click.echo(f"   Token ID: {token_id}")
+        click.echo(f"   Scope: {scope}" + (f" ({scope_id})" if scope_id else ""))
     except Exception as e:
         click.echo(f"❌ Failed to create token: {e}")
         sys.exit(1)
@@ -304,20 +323,22 @@ def token_list(ctx, scope, scope_id):
     """List API tokens (values hidden)."""
     db = ctx.obj["db"]
 
-    query = "SELECT token_id, token_type, provider, scope_type, scope_id, is_active, created_at FROM agent_config.api_tokens"
-    conditions = []
+    query = """
+        SELECT token_id, type, provider, scope_user_id, scope_tenant_id, 
+               is_active, created_at 
+        FROM tokens
+        WHERE 1=1
+    """
     params = []
 
-    if scope:
-        conditions.append("scope_type = %s")
-        params.append(scope)
-
-    if scope_id:
-        conditions.append("scope_id = %s")
+    if scope == "user" and scope_id:
+        query += " AND scope_user_id = %s"
         params.append(scope_id)
-
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
+    elif scope == "account" and scope_id:
+        query += " AND scope_tenant_id = %s"
+        params.append(scope_id)
+    elif scope == "global":
+        query += " AND scope_user_id IS NULL AND scope_tenant_id IS NULL"
 
     query += " ORDER BY created_at DESC"
 
@@ -333,10 +354,17 @@ def token_list(ctx, scope, scope_id):
     for t in tokens:
         status = "✓" if t["is_active"] else "✗"
         click.echo(f"{status} {t['token_id']}")
-        click.echo(f"   Type: {t['token_type']}, Provider: {t['provider']}")
-        click.echo(
-            f"   Scope: {t['scope_type']}" + (f" ({t['scope_id']})" if t["scope_id"] else "")
-        )
+        click.echo(f"   Type: {t['type']}, Provider: {t['provider']}")
+        
+        # Determine scope
+        if t["scope_user_id"]:
+            scope_str = f"user ({t['scope_user_id']})"
+        elif t["scope_tenant_id"]:
+            scope_str = f"account ({t['scope_tenant_id']})"
+        else:
+            scope_str = "global"
+        
+        click.echo(f"   Scope: {scope_str}")
         click.echo(f"   Created: {t['created_at']}")
         click.echo()
 

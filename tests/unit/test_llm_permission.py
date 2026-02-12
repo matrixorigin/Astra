@@ -72,17 +72,17 @@ def test_api_key_resolution_fallback_to_env(monkeypatch):
     def mock_fetchone(query, params=None):
         if "tokens" in query:
             return None
+        if "configs" in query:
+            return {"value": "config_key_789"}
         return original_fetchone(query, params)
 
     db.fetchone = mock_fetchone
 
-    monkeypatch.setenv("OPENAI_API_KEY", "env_key_456")
-
     client = LLMClient(db=db, user_id="bob")
     key = client._get_api_key("openai")
 
-    # Should fall back to env
-    assert key == "env_key_456"
+    # Should fall back to configs table (no env fallback anymore)
+    assert key == "config_key_789"
 
 
 def test_set_user_context_updates_permissions():
