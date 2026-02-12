@@ -149,5 +149,62 @@ async def test_multiplexer_tags_untagged_events():
     assert events[0].agent_id == "agent_1"
 
 
+@pytest.mark.asyncio
+async def test_multiplexer_empty_streams():
+    """Test multiplexer with empty streams dict."""
+    multiplexer = StreamMultiplexer()
+
+    events = []
+    async for event in multiplexer.merge_streams({}):
+        events.append(event)
+
+    assert len(events) == 0
+
+
+@pytest.mark.asyncio
+async def test_multiplexer_null_stream():
+    """Test multiplexer with null stream."""
+    multiplexer = StreamMultiplexer()
+
+    streams = {"agent_1": None}
+
+    events = []
+    async for event in multiplexer.merge_streams(streams):
+        events.append(event)
+
+    # Should handle gracefully
+    assert len(events) == 0
+
+
+@pytest.mark.asyncio
+async def test_multiplexer_stream_with_error():
+    """Test multiplexer when one stream raises error."""
+
+    async def error_stream():
+        yield StreamEvent(
+            event_type=StreamEventType.TEXT_DELTA,
+            data={"chunk": "before error"},
+            agent_id="agent_1",
+        )
+        raise ValueError("Stream error")
+
+    async def normal_stream():
+        yield StreamEvent(
+            event_type=StreamEventType.TEXT_DELTA,
+            data={"chunk": "normal"},
+            agent_id="agent_2",
+        )
+
+    multiplexer = StreamMultiplexer()
+    streams = {"agent_1": error_stream(), "agent_2": normal_stream()}
+
+    events = []
+    async for event in multiplexer.merge_streams(streams):
+        events.append(event)
+
+    # Should get events from both streams (error doesn't crash multiplexer)
+    assert len(events) >= 1
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

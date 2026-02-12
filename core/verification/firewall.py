@@ -65,9 +65,47 @@ class HallucinationFirewall:
         Returns:
             FirewallResult with verification details
         """
+        # Input validation
+        if not response or not response.strip():
+            logger.warning("Empty response provided to firewall")
+            return FirewallResult(
+                safe_to_deliver=True,
+                confidence_score=1.0,
+                claims_verified=0,
+                claims_failed=0,
+                contradictions=[],
+                warnings=["Empty response"],
+            )
+
+        if not snapshot_id or not snapshot_id.strip():
+            logger.error("No snapshot_id provided to firewall")
+            return FirewallResult(
+                safe_to_deliver=True,  # Fail open
+                confidence_score=0.5,
+                claims_verified=0,
+                claims_failed=0,
+                contradictions=[],
+                warnings=["No snapshot_id provided"],
+            )
+
+        if mode not in ("warn", "block"):
+            logger.warning(f"Invalid mode '{mode}', defaulting to 'warn'")
+            mode = "warn"
+
         # 1. Extract claims
-        claims = self.extractor.extract(response)
-        logger.debug(f"Extracted {len(claims)} claims from response")
+        try:
+            claims = self.extractor.extract(response)
+            logger.debug(f"Extracted {len(claims)} claims from response")
+        except Exception as e:
+            logger.error(f"Claim extraction failed: {e}")
+            return FirewallResult(
+                safe_to_deliver=True,  # Fail open
+                confidence_score=0.5,
+                claims_verified=0,
+                claims_failed=0,
+                contradictions=[],
+                warnings=[f"Claim extraction failed: {e}"],
+            )
 
         if not claims:
             # No verifiable claims - pass through
@@ -97,7 +135,20 @@ class HallucinationFirewall:
         # 3. Verify each claim
         results = []
         for claim in claims:
-            result = self._verify_claim(claim, context)
+            try:
+                result = self._verify_claim(claim, context)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Claim verification failed for '{claim.value}': {e}")
+                # Treat as failed verification
+                results.append(
+                    VerificationResult(
+                        claim=claim,
+                        verified=False,
+                        confidence=0.0,
+                        contradiction=f"Verification error: {e}",
+                    )
+                )
             results.append(result)
 
         # 4. Compute overall result
@@ -160,44 +211,57 @@ class HallucinationFirewall:
     def log_verification(
         self, session_id: str, event_id: str, result: FirewallResult
     ) -> None:
-        """Log verification result as event."""
-        self.db.execute(
-            """
-            INSERT INTO conversation_events (
-                event_id, user_id, session_id, agent_id, agent_version,
-                event_type, content, metadata, created_at
-            ) VALUES (
-                %s, 'system', %s, 'firewall', '1.0',
-                'hallucination_check', %s, %s, NOW()
-            )
-            """,
-            (
-                f"verify_{event_id}",
-                session_id,
-                json.dumps(
-                    {
-                        "safe": result.safe_to_deliver,
-                        "confidence": result.confidence_score,
-                        "verified": result.claims_verified,
-                        "failed": result.claims_failed,
-                    }
-                ),
-                json.dumps(
-                    {
-                        "contradictions": [
-                            {
-                                "claim": c.claim.value,
-                                "type": c.claim.type,
-                                "contradiction": c.contradiction,
-                            }
-                            for c in result.contradictions
-                        ]
-                    }
-                ),
-            ),
-        )
+        """Log verification result as event.
 
-        logger.info(
-            f"Verification logged: {result.claims_verified}/{result.claims_verified + result.claims_failed} verified, "
-            f"confidence={result.confidence_score:.2f}"
-        )
+        Args:
+            session_id: Session ID
+            event_id: Event ID being verified
+            result: Verification result
+        """
+        if not session_id or not event_id:
+            logger.error("Missing session_id or event_id for verification logging")
+            return
+
+        try:
+            self.db.execute(
+                """
+                INSERT INTO conversation_events (
+                    event_id, user_id, session_id, agent_id, agent_version,
+                    event_type, content, metadata, created_at
+                ) VALUES (
+                    %s, 'system', %s, 'firewall', '1.0',
+                    'hallucination_check', %s, %s, NOW()
+                )
+                """,
+                (
+                    f"verify_{event_id}",
+                    session_id,
+                    json.dumps(
+                        {
+                            "safe": result.safe_to_deliver,
+                            "confidence": result.confidence_score,
+                            "verified": result.claims_verified,
+                            "failed": result.claims_failed,
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "contradictions": [
+                                {
+                                    "claim": c.claim.value,
+                                    "type": c.claim.type,
+                                    "contradiction": c.contradiction,
+                                }
+                                for c in result.contradictions
+                            ]
+                        }
+                    ),
+                ),
+            )
+
+            logger.info(
+                f"Verification logged: {result.claims_verified}/{result.claims_verified + result.claims_failed} verified, "
+                f"confidence={result.confidence_score:.2f}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to log verification: {e}")

@@ -184,6 +184,75 @@ def test_create_scorer_for_task(db):
     assert code_scorer.weights.semantic != planning_scorer.weights.semantic
 
 
+def test_scorer_empty_query(db, event_logger):
+    """Test scorer with empty query."""
+    from core.context.embeddings import EmbeddingService
+
+    session_id = "test_session_scorer_004"
+    user_id = "test_user"
+
+    event = event_logger.create_user_query(
+        user_id=user_id, session_id=session_id, content="Test content"
+    )
+
+    candidates = db.fetchall(
+        "SELECT event_id, event_type, content, created_at, parent_event_id, causal_chain_id, metadata "
+        "FROM conversation_events WHERE session_id = %s",
+        (session_id,),
+    )
+    candidates = [dict(c) for c in candidates]
+
+    embeddings = EmbeddingService(db, provider="mock")
+    scorer = RelevanceScorer(db, embeddings)
+
+    # Empty query
+    scored = scorer.score_candidates("", candidates, session_id, TaskType.GENERAL)
+
+    # Should return candidates with zero scores
+    assert len(scored) == len(candidates)
+    assert all(score == 0.0 for _, score, _ in scored)
+
+
+def test_scorer_empty_candidates(db):
+    """Test scorer with no candidates."""
+    from core.context.embeddings import EmbeddingService
+
+    embeddings = EmbeddingService(db, provider="mock")
+    scorer = RelevanceScorer(db, embeddings)
+
+    scored = scorer.score_candidates("test query", [], "session_123", TaskType.GENERAL)
+
+    assert len(scored) == 0
+
+
+def test_scorer_empty_session_id(db, event_logger):
+    """Test scorer with empty session_id."""
+    from core.context.embeddings import EmbeddingService
+
+    session_id = "test_session_scorer_005"
+    user_id = "test_user"
+
+    event = event_logger.create_user_query(
+        user_id=user_id, session_id=session_id, content="Test content"
+    )
+
+    candidates = db.fetchall(
+        "SELECT event_id, event_type, content, created_at, parent_event_id, causal_chain_id, metadata "
+        "FROM conversation_events WHERE session_id = %s",
+        (session_id,),
+    )
+    candidates = [dict(c) for c in candidates]
+
+    embeddings = EmbeddingService(db, provider="mock")
+    scorer = RelevanceScorer(db, embeddings)
+
+    # Empty session_id
+    scored = scorer.score_candidates("test", candidates, "", TaskType.GENERAL)
+
+    # Should return candidates with zero scores
+    assert len(scored) == len(candidates)
+
+
 def test_signal_breakdown(db, event_logger):
     """Test that signal breakdown is returned correctly."""
     from core.context.embeddings import EmbeddingService

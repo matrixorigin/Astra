@@ -26,23 +26,44 @@ class StreamMultiplexer:
         Yields:
             StreamEvent with agent_id tagged
         """
+        if not streams:
+            logger.warning("No streams provided to multiplexer")
+            return
+
         queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue()
 
         async def producer(agent_id: str, stream: AsyncIterator[StreamEvent]):
             """Produce events from one agent stream."""
+            if not agent_id or not agent_id.strip():
+                logger.error("Empty agent_id in producer")
+                return
+
             try:
                 async for event in stream:
+                    if event is None:
+                        continue
                     # Tag with agent_id if not already set
                     if event.agent_id is None:
                         event.agent_id = agent_id
                     await queue.put(event)
+            except asyncio.CancelledError:
+                logger.info(f"Agent {agent_id} stream cancelled")
+                raise
             except Exception as e:
                 logger.error(f"Error in agent {agent_id} stream: {e}")
 
         # Start all producers
-        tasks = [
-            asyncio.create_task(producer(agent_id, stream)) for agent_id, stream in streams.items()
-        ]
+        tasks = []
+        for agent_id, stream in streams.items():
+            if stream is None:
+                logger.warning(f"Null stream for agent {agent_id}")
+                continue
+            task = asyncio.create_task(producer(agent_id, stream))
+            tasks.append(task)
+
+        if not tasks:
+            logger.warning("No valid streams to multiplex")
+            return
 
         # Add sentinel task
         async def sentinel():
@@ -52,11 +73,18 @@ class StreamMultiplexer:
         asyncio.create_task(sentinel())
 
         # Consume merged stream
-        while True:
-            event = await queue.get()
-            if event is None:  # All streams done
-                break
-            yield event
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:  # All streams done
+                    break
+                yield event
+        except asyncio.CancelledError:
+            logger.info("Multiplexer cancelled")
+            # Cancel all producer tasks
+            for task in tasks:
+                task.cancel()
+            raise
 
 
 async def merge_parallel_agents(

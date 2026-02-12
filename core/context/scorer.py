@@ -82,33 +82,69 @@ class RelevanceScorer:
     ) -> list[tuple[dict[str, Any], float, dict[str, float]]]:
         """Score candidates by relevance.
 
+        Args:
+            query: User query
+            candidates: List of candidate events
+            session_id: Session ID
+            task_type: Task type for weight selection
+
         Returns:
             List of (candidate, total_score, signal_scores)
         """
+        # Input validation
+        if not query or not query.strip():
+            logger.warning("Empty query provided to scorer")
+            return [(c, 0.0, {}) for c in candidates]
+
+        if not candidates:
+            logger.debug("No candidates to score")
+            return []
+
+        if not session_id or not session_id.strip():
+            logger.warning("Empty session_id provided to scorer")
+            return [(c, 0.0, {}) for c in candidates]
+
         # Use task-specific weights
         weights = TASK_WEIGHTS.get(task_type, self.weights)
 
         # Generate query embedding
-        query_embedding = self.embeddings.embed_text(query)
+        try:
+            query_embedding = self.embeddings.embed_text(query)
+        except Exception as e:
+            logger.error(f"Failed to generate query embedding: {e}")
+            # Fallback: score without semantic signal
+            return [(c, 0.0, {"error": 1.0}) for c in candidates]
 
         # Get semantic scores
-        semantic_results = self.embeddings.search_similar(
-            query_embedding, limit=len(candidates), session_id=session_id
-        )
-        distance_map = {r["event_id"]: r["distance"] for r in semantic_results}
+        try:
+            semantic_results = self.embeddings.search_similar(
+                query_embedding, limit=len(candidates), session_id=session_id
+            )
+            distance_map = {r["event_id"]: r["distance"] for r in semantic_results}
+        except Exception as e:
+            logger.error(f"Failed to search similar embeddings: {e}")
+            distance_map = {}
 
         # Get recent causal chains
-        recent_chains = self._get_recent_chains(session_id)
+        try:
+            recent_chains = self._get_recent_chains(session_id)
+        except Exception as e:
+            logger.error(f"Failed to get recent chains: {e}")
+            recent_chains = set()
 
         # Score each candidate
         scored = []
         for candidate in candidates:
-            signal_scores = self._compute_signals(
-                candidate, query, distance_map, recent_chains, weights
-            )
-
-            total_score = sum(signal_scores.values())
-            scored.append((candidate, total_score, signal_scores))
+            try:
+                signal_scores = self._compute_signals(
+                    candidate, query, distance_map, recent_chains, weights
+                )
+                total_score = sum(signal_scores.values())
+                scored.append((candidate, total_score, signal_scores))
+            except Exception as e:
+                logger.error(f"Failed to score candidate {candidate.get('event_id')}: {e}")
+                # Include with zero score
+                scored.append((candidate, 0.0, {"error": 1.0}))
 
         # Sort by score descending
         scored.sort(key=lambda x: x[1], reverse=True)

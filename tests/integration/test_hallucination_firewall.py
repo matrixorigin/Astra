@@ -5,7 +5,7 @@ import pytest
 from core.context.manager import ContextManager, TaskType
 from core.events.event_logger import EventLogger
 from core.verification.claim_extractor import ClaimExtractor
-from core.verification.firewall import HallucinationFirewall
+from core.verification.firewall import FirewallResult, HallucinationFirewall
 from sdk import Database
 
 
@@ -199,6 +199,78 @@ def test_firewall_confidence_threshold(db, context_manager):
     # Low threshold (permissive)
     permissive_firewall = HallucinationFirewall(db, context_manager, threshold=0.5)
     assert permissive_firewall.threshold == 0.5
+
+
+def test_firewall_empty_response(db, context_manager):
+    """Test firewall with empty response."""
+    firewall = HallucinationFirewall(db, context_manager)
+
+    result = firewall.verify_response("", "snapshot_123", mode="warn")
+
+    assert result.safe_to_deliver
+    assert "Empty response" in result.warnings
+
+
+def test_firewall_invalid_snapshot_id(db, context_manager):
+    """Test firewall with invalid snapshot_id."""
+    firewall = HallucinationFirewall(db, context_manager)
+
+    result = firewall.verify_response("Test response", "", mode="warn")
+
+    assert result.safe_to_deliver  # Fail open
+    assert "No snapshot_id" in result.warnings[0]
+
+
+def test_firewall_invalid_mode(db, context_manager, event_logger):
+    """Test firewall with invalid mode."""
+    session_id = "test_session_firewall_006"
+    user_id = "test_user"
+
+    event = event_logger.create_user_query(
+        user_id=user_id, session_id=session_id, content="Test content"
+    )
+
+    context = context_manager.build_context(
+        session_id=session_id, query="Test", task_type=TaskType.GENERAL
+    )
+
+    snapshot_id = context_manager.save_snapshot(context, session_id, event.event_id)
+
+    firewall = HallucinationFirewall(db, context_manager)
+
+    # Invalid mode should default to 'warn'
+    result = firewall.verify_response("Test response", snapshot_id, mode="invalid")
+
+    assert isinstance(result, FirewallResult)
+
+
+def test_firewall_snapshot_load_failure(db, context_manager):
+    """Test firewall when snapshot load fails."""
+    firewall = HallucinationFirewall(db, context_manager)
+
+    # Non-existent snapshot
+    result = firewall.verify_response("Test response with 42", "nonexistent_snapshot", mode="warn")
+
+    assert result.safe_to_deliver  # Fail open
+    assert "Snapshot load failed" in result.warnings[0]
+
+
+def test_firewall_log_verification_missing_params(db, context_manager):
+    """Test log_verification with missing parameters."""
+    firewall = HallucinationFirewall(db, context_manager)
+
+    result = FirewallResult(
+        safe_to_deliver=True,
+        confidence_score=0.9,
+        claims_verified=1,
+        claims_failed=0,
+        contradictions=[],
+        warnings=[],
+    )
+
+    # Should not crash with missing params
+    firewall.log_verification("", "event_123", result)
+    firewall.log_verification("session_123", "", result)
 
 
 if __name__ == "__main__":
