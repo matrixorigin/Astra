@@ -4,44 +4,58 @@ Intelligent agent platform with auditable decisions, safe iteration, and version
 
 ## Features
 
-- **REST API** ⭐ NEW: Complete HTTP API for authentication, agents, sessions, and events
-- **Authentication System** ⭐ NEW: JWT-based auth with access/refresh tokens, user management
-- **Agent Management** ⭐ NEW: CRUD operations for agents with ownership verification
-- **Session Management** ⭐ NEW: Conversation lifecycle management with metadata
-- **Event Tracking** ⭐ NEW: Record and query conversation events with causal chains
-- **Auditable Decisions**: Every agent decision binds to a data snapshot — reconstruct what the agent saw at any past moment
-- **Auditable Skill Selection**: Every skill selection is versioned and auditable — time-travel to any selection decision
-- **Sandbox Pre-Validation**: Validate skill selections in isolated sandbox before execution — choose the best, not guess
-- **Self-Improving Selection**: Automatically learn from historical failures using time-travel replay — no manual labeling needed
-- **Regression Gate**: Every selector change is automatically tested against golden queries — prevent degradation
+### Core API (Complete)
+- **REST API** ✅ Complete HTTP API with 9 resource endpoints
+- **Authentication System** ✅ JWT-based auth with access/refresh tokens, user management
+- **Agent Management** ✅ CRUD operations for agents with ownership verification
+- **Session Management** ✅ Conversation lifecycle management with metadata
+- **Event Tracking** ✅ Record and query conversation events with causal chains
+- **Sandbox Management** ✅ Isolated environments for safe experimentation
+- **Session Replay** ✅ Replay conversations for testing and validation
+- **Skill Registry** ✅ Version-controlled skill management
+- **Context Snapshots** ✅ Capture complete context for every decision
+- **Decision Audit** ✅ Full audit trail linking decisions to context snapshots
+
+### Auditable Decisions (Implemented)
+- Every agent decision binds to a data snapshot — reconstruct what the agent saw at any past moment
+- Context snapshots capture: system prompt, skill definitions, selected events, code context, documentation
+- Decision audit trail: decision type, output, model parameters, linked to snapshot
+- Time-travel capability: query exact state at any historical point
+
+### Additional Features
+- **Auditable Skill Selection**: Every skill selection is versioned and auditable
+- **Sandbox Pre-Validation**: Validate skill selections in isolated sandbox before execution
 - **Event-Centric Architecture**: All interactions stored as atomic events with causal chain tracking
-- **Skill System**: Versioned, declarative skills with full replay capability and side-effect isolation
-- **Knowledge Regression Detection**: Automatically identify past outputs invalidated by knowledge updates
-- **Zero-Cost Experimentation**: Branch production data in milliseconds for testing — zero storage overhead
-- **Hallucination Firewall**: Verify LLM claims against the same data snapshot the LLM saw
-- **Training Data Pipeline**: Versioned datasets with full lineage from training example to source interaction
-- **Cost-Aware Execution**: Predict costs from historical data before spending
+- **Skill System**: Versioned, declarative skills with full replay capability
 - **Multi-Repo Management**: Register and manage multiple repositories with per-repo tokens
 - **Production-Ready**: Logging, monitoring, Docker support
 - **Type-Safe**: 100% type annotations with Pydantic validation
-- **Comprehensive Testing**: 439 tests passing with 99%+ coverage
+- **Comprehensive Testing**: 509 tests passing with real database integration
 
 ## Quick Start
+
+### API Server
+
+```bash
+# 1. Setup environment
+conda create -n dev-agent python=3.11
+conda activate dev-agent
+make setup
+
+# 2. Start services (MatrixOne + Redis)
+make dev-up
+
+# 3. Start API server
+uvicorn api.main:app --reload --port 8000
+
+# 4. Visit interactive docs
+open http://localhost:8000/docs
+```
 
 ### CLI Usage
 
 ```bash
-# 1. Create and activate virtual environment
-conda create -n dev-agent python=3.11
-conda activate dev-agent
-
-# 2. Setup environment
-make setup
-
-# 3. Start services (MatrixOne + Redis)
-make dev-up
-
-# 4. Start using CLI (database auto-initializes)
+# Start using CLI (database auto-initializes)
 mo-agent chat
 
 # Or run tests
@@ -69,6 +83,64 @@ curl http://localhost:8000/health
 - ReDoc: `http://localhost:8000/redoc`
 - [API Reference](docs/API.md) - Detailed examples
 - [Quick Start Guide](docs/QUICKSTART.md)
+
+## API Endpoints
+
+### Authentication
+- `POST /auth/register` - Register new user
+- `POST /auth/login` - Login and get JWT token
+- `POST /auth/refresh` - Refresh access token
+- `GET /auth/me` - Get current user info
+
+### Agents
+- `POST /agents` - Create agent
+- `GET /agents` - List agents
+- `GET /agents/{agent_id}` - Get agent
+- `PUT /agents/{agent_id}` - Update agent
+- `DELETE /agents/{agent_id}` - Delete agent
+
+### Sessions
+- `POST /sessions` - Create session
+- `GET /sessions` - List sessions
+- `GET /sessions/{session_id}` - Get session
+- `PUT /sessions/{session_id}` - Update session
+- `POST /sessions/{session_id}/close` - Close session
+- `DELETE /sessions/{session_id}` - Delete session
+
+### Events
+- `POST /events` - Create event
+- `GET /events` - List events
+- `GET /events/{event_id}` - Get event
+- `GET /events/session/{session_id}` - Get session events
+- `GET /events/causal-chain/{chain_id}` - Get causal chain
+- `DELETE /events/{event_id}` - Delete event
+
+### Sandbox
+- `POST /sandbox` - Create sandbox
+- `GET /sandbox` - List sandboxes
+- `GET /sandbox/{name}` - Get sandbox info
+- `DELETE /sandbox/{name}` - Delete sandbox
+
+### Replay
+- `POST /sessions/{session_id}/replay` - Replay session
+- `GET /sessions/{session_id}/replay/compare` - Compare replay results
+
+### Skills
+- `POST /skills` - Register skill
+- `GET /skills` - List skills
+- `GET /skills/{skill_id}` - Get skill
+- `GET /skills/{skill_id}/versions` - List skill versions
+
+### Context Snapshots
+- `POST /context` - Create context snapshot
+- `GET /context` - List snapshots
+- `GET /context/{snapshot_id}` - Get snapshot
+
+### Decision Audit
+- `POST /decisions` - Record decision
+- `GET /decisions` - List decisions
+- `GET /decisions/{decision_id}` - Get decision
+- `GET /decisions/{decision_id}/audit` - Audit decision (with full context)
 
 ## CLI Commands
 
@@ -285,7 +357,7 @@ make test-unit          # Unit tests
 make test-integration   # Integration tests
 ```
 
-Current test coverage: **79 tests, 100% passing**
+Current test coverage: **509 tests, 100% passing**
 
 ---
 
