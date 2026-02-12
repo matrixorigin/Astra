@@ -93,8 +93,6 @@ class Settings(BaseSettings):
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
 
     # Secrets (loaded from environment or secrets manager)
-    openai_api_key: str | None = Field(default=None)
-    groq_api_key: str | None = Field(default=None)
     github_token: str | None = Field(default=None)
 
     model_config = SettingsConfigDict(
@@ -161,9 +159,6 @@ class Settings(BaseSettings):
 
         if not self.security.jwt_secret:
             required_secrets.append("JWT_SECRET")
-
-        if not self.openai_api_key and self.llm.provider == "openai":
-            required_secrets.append("OPENAI_API_KEY")
 
         if not self.github_token:
             required_secrets.append("GITHUB_TOKEN")
