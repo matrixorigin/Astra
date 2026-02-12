@@ -56,6 +56,7 @@ class Context:
     assembly_time_ms: int
     relevance_scores: dict[str, float]
     task_type: TaskType
+    snapshot_id: str | None = None
 
     def to_prompt(self) -> str:
         """Convert context to LLM prompt."""
@@ -483,9 +484,21 @@ class ContextManager:
         return code_files
 
     def save_snapshot(
-        self, context: Context, session_id: str, event_id: str | None = None
+        self,
+        context: Context,
+        session_id: str,
+        event_id: str | None = None,
+        llm_request_id: str | None = None,
+        llm_response_id: str | None = None,
     ) -> str:
         """Save context snapshot to database (always enabled).
+
+        Args:
+            context: Context object
+            session_id: Session identifier
+            event_id: Associated event ID
+            llm_request_id: LLM request identifier
+            llm_response_id: LLM response identifier
 
         Returns:
             snapshot_id
@@ -496,15 +509,29 @@ class ContextManager:
 
         snapshot_id = str(uuid7())
 
+        # Extract skills used (name and version)
+        skills_used = [
+            {"name": s["name"], "version": s.get("version", "latest")}
+            for s in context.skill_definitions
+        ]
+
         self.db.execute(
             """
             INSERT INTO context_snapshots (
                 snapshot_id, session_id, event_id,
-                system_prompt, skill_definitions, selected_events,
-                code_context, documentation,
+                system_prompt, skill_definitions, skills_used,
+                selected_events, code_context, documentation,
                 total_tokens, token_budget, assembly_time_ms,
-                relevance_scores, task_type
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                relevance_scores, task_type,
+                llm_request_id, llm_response_id, created_at
+            ) VALUES (
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s,
+                %s, %s,
+                %s, %s, CURRENT_TIMESTAMP
+            )
             """,
             (
                 snapshot_id,
@@ -512,6 +539,7 @@ class ContextManager:
                 event_id,
                 context.system_prompt,
                 json.dumps(context.skill_definitions),
+                json.dumps(skills_used),
                 json.dumps(context.selected_events),
                 json.dumps(context.code_context),
                 json.dumps(context.documentation),
@@ -520,11 +548,45 @@ class ContextManager:
                 context.assembly_time_ms,
                 json.dumps(context.relevance_scores),
                 context.task_type.value,
+                llm_request_id,
+                llm_response_id,
             ),
         )
 
         logger.info(f"Context snapshot saved: {snapshot_id}")
         return snapshot_id
+
+    def update_snapshot_llm_ids(
+        self, snapshot_id: str, llm_request_id: str | None = None, llm_response_id: str | None = None
+    ) -> None:
+        """Update snapshot with LLM request/response IDs.
+
+        Args:
+            snapshot_id: Snapshot identifier
+            llm_request_id: LLM request identifier
+            llm_response_id: LLM response identifier
+        """
+        updates = []
+        params = []
+
+        if llm_request_id:
+            updates.append("llm_request_id = %s")
+            params.append(llm_request_id)
+
+        if llm_response_id:
+            updates.append("llm_response_id = %s")
+            params.append(llm_response_id)
+
+        if not updates:
+            return
+
+        params.append(snapshot_id)
+        query = f"""
+            UPDATE context_snapshots
+            SET {", ".join(updates)}
+            WHERE snapshot_id = %s
+        """
+        self.db.execute(query, tuple(params))
 
     def load_snapshot(self, snapshot_id: str) -> Context:
         """Load context snapshot from database."""

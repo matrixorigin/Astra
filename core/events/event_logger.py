@@ -178,6 +178,8 @@ class EventLogger:
         llm_model_used: str | None = None,
         token_usage: dict | None = None,
         llm_params: dict | None = None,
+        llm_request_id: str | None = None,
+        llm_response_id: str | None = None,
     ) -> ConversationEvent:
         """Create and log an LLM response event.
 
@@ -192,11 +194,21 @@ class EventLogger:
             llm_model_used: LLM model identifier
             token_usage: Token usage dict with prompt, completion, total
             llm_params: LLM parameters
+            llm_request_id: LLM provider request ID
+            llm_response_id: LLM provider response ID
 
         Returns:
             ConversationEvent: Created event
         """
         from core.events.models import TokenUsage
+
+        # Add IDs to params if provided
+        if llm_request_id or llm_response_id:
+            llm_params = llm_params or {}
+            if llm_request_id:
+                llm_params["request_id"] = llm_request_id
+            if llm_response_id:
+                llm_params["response_id"] = llm_response_id
 
         event = ConversationEvent(
             event_id=str(uuid7()),

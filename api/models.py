@@ -111,11 +111,30 @@ class SkillRegistry(Base):
 
 class ContextSnapshot(Base):
     __tablename__ = "context_snapshots"
-    snapshot_id = Column(String(64), primary_key=True)
+    snapshot_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), nullable=False, index=True)
-    event_id = Column(String(64), index=True)
-    snapshot_data = Column(JSON, nullable=False)
-    created_at = Column(DateTime, default=func.now(), nullable=False)
+    event_id = Column(String(36), index=True)
+    
+    # Context components
+    system_prompt = Column(Text)
+    skill_definitions = Column(JSON)
+    skills_used = Column(JSON)
+    selected_events = Column(JSON)
+    code_context = Column(JSON)
+    documentation = Column(JSON)
+    
+    # Metadata
+    total_tokens = Column(Integer)
+    token_budget = Column(JSON)
+    assembly_time_ms = Column(Integer)
+    relevance_scores = Column(JSON)
+    task_type = Column(String(50))
+    
+    # Tracing
+    llm_request_id = Column(String(100))
+    llm_response_id = Column(String(100))
+    
+    created_at = Column(DateTime, default=func.now(), nullable=False, index=True)
 
 
 class EventEmbedding(Base):

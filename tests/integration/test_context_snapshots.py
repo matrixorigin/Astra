@@ -41,8 +41,10 @@ def test_context_snapshot_save_and_load(db, context_manager, event_logger):
         session_id=session_id, query="Test query", task_type=TaskType.GENERAL
     )
 
-    # Save snapshot (always returns snapshot_id)
-    snapshot_id = context_manager.save_snapshot(context, session_id, event.event_id)
+    # Save snapshot with new parameters (llm_request_id, llm_response_id)
+    snapshot_id = context_manager.save_snapshot(
+        context, session_id, event.event_id, llm_request_id="req_001", llm_response_id="resp_001"
+    )
     assert snapshot_id is not None
 
     # Load snapshot
@@ -90,8 +92,10 @@ def test_context_snapshot_with_events(db, context_manager, event_logger):
         session_id=session_id, query="Second query", task_type=TaskType.GENERAL
     )
 
-    # Save snapshot (always returns snapshot_id)
-    snapshot_id = context_manager.save_snapshot(context, session_id, event2.event_id)
+    # Save snapshot with new parameters
+    snapshot_id = context_manager.save_snapshot(
+        context, session_id, event2.event_id, llm_request_id="req_002", llm_response_id="resp_002"
+    )
     assert snapshot_id is not None
 
     # Load and verify
@@ -115,7 +119,9 @@ def test_context_snapshot_task_types(db, context_manager):
             session_id=session_id, query=f"Test {task_type.value}", task_type=task_type
         )
 
-        snapshot_id = context_manager.save_snapshot(context, session_id)
+        snapshot_id = context_manager.save_snapshot(
+            context, session_id, llm_request_id=f"req_{task_type.value}", llm_response_id=f"resp_{task_type.value}"
+        )
         assert snapshot_id is not None
 
         loaded = context_manager.load_snapshot(snapshot_id)
@@ -137,13 +143,43 @@ def test_context_snapshot_relevance_scores(db, context_manager, event_logger):
         session_id=session_id, query="Query with relevance", task_type=TaskType.GENERAL
     )
 
-    # Save snapshot
-    snapshot_id = context_manager.save_snapshot(context, session_id, event.event_id)
+    # Save snapshot with new parameters
+    snapshot_id = context_manager.save_snapshot(
+        context, session_id, event.event_id, llm_request_id="req_003", llm_response_id="resp_003"
+    )
 
     # Load and verify relevance scores
     loaded = context_manager.load_snapshot(snapshot_id)
     assert loaded.relevance_scores is not None
     assert isinstance(loaded.relevance_scores, dict)
+
+
+def test_context_snapshot_update_llm_ids(db, context_manager, event_logger):
+    """Test updating snapshot with LLM request/response IDs."""
+    session_id = "test_session_006"
+    user_id = "test_user"
+
+    # Create event
+    event = event_logger.create_user_query(
+        user_id=user_id, session_id=session_id, content="Test query"
+    )
+
+    # Build context
+    context = context_manager.build_context(
+        session_id=session_id, query="Test query", task_type=TaskType.GENERAL
+    )
+
+    # Save snapshot without LLM IDs
+    snapshot_id = context_manager.save_snapshot(context, session_id, event.event_id)
+
+    # Update with LLM IDs
+    context_manager.update_snapshot_llm_ids(snapshot_id, llm_request_id="req_004", llm_response_id="resp_004")
+
+    # Verify update
+    row = db.fetchone("SELECT llm_request_id, llm_response_id FROM context_snapshots WHERE snapshot_id = %s", (snapshot_id,))
+    assert row is not None
+    assert row["llm_request_id"] == "req_004"
+    assert row["llm_response_id"] == "resp_004"
 
 
 if __name__ == "__main__":

@@ -359,6 +359,7 @@ CREATE TABLE context_snapshots (
     -- Context content
     system_prompt TEXT,
     skill_definitions JSON,
+    skills_used JSON,  -- List of {name, version} for skills included in context
     selected_events JSON,  -- Array of event_ids with scores
     code_context JSON,
     documentation JSON,
@@ -368,6 +369,7 @@ CREATE TABLE context_snapshots (
     token_budget JSON,  -- Breakdown by component
     assembly_time_ms INT,
     relevance_scores JSON,  -- Why each event was selected
+    task_type VARCHAR(50),
     
     -- LLM call info
     llm_request_id VARCHAR(64),

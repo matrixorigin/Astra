@@ -113,6 +113,9 @@ class ContextSnapshot(BaseModel):
     Captures the state needed to reproduce an LLM call.
     """
 
+    snapshot_id: str | None = Field(
+        default=None, description="Reference to context_snapshots table"
+    )
     prompt_template_id: str | None = Field(
         default=None, description="Prompt template ID and version"
     )
