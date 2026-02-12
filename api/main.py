@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.database import init_db
-from api.routers import agents, auth, events, sessions
+from api.routers import agents, auth, events, sessions, sandbox
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -97,6 +97,7 @@ app.include_router(auth.router, prefix="/auth", tags=["authentication"])
 app.include_router(agents.router, prefix="/agents", tags=["agents"])
 app.include_router(sessions.router, prefix="/sessions", tags=["sessions"])
 app.include_router(events.router, prefix="/events", tags=["events"])
+app.include_router(sandbox.router, tags=["sandbox"])
 
 
 @app.get("/health")
