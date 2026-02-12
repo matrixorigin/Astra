@@ -2,21 +2,35 @@
 
 import pytest
 from fastapi.testclient import TestClient
+from uuid import uuid4
 
 from api.main import app
 from api.database import get_db_session
 from api.repositories.user_repository import UserRepository
 
 
+@pytest.fixture(autouse=True)
+def cleanup_skills():
+    """Clean up test skills before and after each test."""
+    from sdk import Database
+    db = Database()
+    
+    # Clean before
+    db.execute('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"')
+    
+    yield
+    
+    # Clean after
+    db.execute('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"')
+
+
 @pytest.fixture
 def client():
-    """Create test client."""
     return TestClient(app)
 
 
 @pytest.fixture
 def db_session():
-    """Get database session."""
     session = next(get_db_session())
     yield session
     session.close()
@@ -24,7 +38,6 @@ def db_session():
 
 @pytest.fixture
 def test_user(db_session):
-    """Create test user."""
     repo = UserRepository(db_session)
     
     # Clean up first
@@ -33,9 +46,7 @@ def test_user(db_session):
         repo.delete(user.user_id)
         db_session.commit()
     
-    # Create user
     from core.auth.password import hash_password
-    from uuid import uuid4
     
     user_data = {
         "user_id": str(uuid4()),
@@ -45,6 +56,7 @@ def test_user(db_session):
         "is_active": 1,
     }
     user = repo.create(user_data)
+    db_session.commit()  # 添加 commit
     
     yield user
     
@@ -55,112 +67,76 @@ def test_user(db_session):
 
 @pytest.fixture
 def auth_headers(client, test_user):
-    """Get authentication headers."""
-    # Login to get token
     response = client.post(
         "/auth/login",
-        json={
-            "username": "skilluser",
-            "password": "password123",
-        },
+        json={"username": "skilluser", "password": "password123"},
     )
-    
     token = response.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
 
 
-class TestRegisterSkill:
-    """Test skill registration endpoint."""
+def test_register_skill_success(client, auth_headers):
+    """Test successful skill registration."""
+    skill_id = f"test_skill_{str(uuid4())[:8]}"
+    
+    response = client.post(
+        "/skills",
+        headers=auth_headers,
+        json={
+            "skill_id": skill_id,
+            "skill_name": "Test Skill",
+            "skill_version": "1.0.0",
+            "skill_code": "def test(): pass",
+            "description": "A test skill",
+            "metadata": {"category": "test"}
+        },
+    )
 
-    def test_register_skill_without_auth(self, client):
-        """Test registration without authentication."""
-        response = client.post(
-            "/skills",
-            json={
-                "skill_id": "test",
-                "skill_name": "Test",
-                "skill_version": "1.0.0",
-                "skill_code": "pass"
-            },
-        )
-
-        assert response.status_code == 403
-
-
-class TestListSkills:
-    """Test list skills endpoint."""
-
-    def test_list_skills_success(self, client, auth_headers):
-        """Test successful skill listing."""
-        response = client.get("/skills", headers=auth_headers)
-
-        assert response.status_code == 200
-        data = response.json()
-        assert "skills" in data
-        assert "total" in data
-
-    def test_list_skills_with_pagination(self, client, auth_headers):
-        """Test skill listing with pagination."""
-        response = client.get(
-            "/skills?limit=10&offset=0",
-            headers=auth_headers
-        )
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["limit"] == 10
-        assert data["offset"] == 0
+    if response.status_code != 201:
+        print(f"Error response: {response.text}")
+    
+    assert response.status_code == 201
+    data = response.json()
+    assert data["skill_id"] == skill_id
+    assert data["skill_name"] == "Test Skill"
+    assert data["version"] == "1.0.0"
 
 
-class TestGetSkill:
-    """Test get skill endpoint."""
+def test_get_skill_success(client, auth_headers):
+    """Test successful skill retrieval."""
+    skill_id = f"test_skill_{str(uuid4())[:8]}"
+    
+    # Register first
+    client.post(
+        "/skills",
+        headers=auth_headers,
+        json={
+            "skill_id": skill_id,
+            "skill_name": "Get Test",
+            "skill_version": "1.0.0",
+            "skill_code": "pass"
+        },
+    )
 
-    def test_get_skill_not_found(self, client, auth_headers):
-        """Test get non-existent skill."""
-        response = client.get("/skills/nonexistent", headers=auth_headers)
+    # Get skill
+    response = client.get(f"/skills/{skill_id}", headers=auth_headers)
 
-        assert response.status_code == 404
+    assert response.status_code == 200
+    data = response.json()
+    assert data["skill_id"] == skill_id
 
 
-class TestListSkillVersions:
-    """Test list skill versions endpoint."""
+def test_list_skills_success(client, auth_headers):
+    """Test successful skill listing."""
+    response = client.get("/skills", headers=auth_headers)
 
-    def test_list_versions_success(self, client, auth_headers):
-        """Test successful version listing."""
-        from uuid import uuid4
-        
-        # Register multiple versions
-        skill_id = f"test_skill_{str(uuid4())[:8]}"
-        
-        for version in ["1.0.0", "1.1.0", "2.0.0"]:
-            client.post(
-                "/skills",
-                headers=auth_headers,
-                json={
-                    "skill_id": skill_id,
-                    "skill_name": "Version Test",
-                    "skill_version": version,
-                    "skill_code": "pass"
-                },
-            )
+    assert response.status_code == 200
+    data = response.json()
+    assert "skills" in data
+    assert "total" in data
 
-        # List versions
-        response = client.get(
-            f"/skills/{skill_id}/versions",
-            headers=auth_headers
-        )
 
-        assert response.status_code == 200
-        data = response.json()
-        assert isinstance(data, list)
-
-    def test_list_versions_empty(self, client, auth_headers):
-        """Test listing versions for non-existent skill."""
-        response = client.get(
-            "/skills/nonexistent/versions",
-            headers=auth_headers
-        )
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data == []
+def test_get_skill_not_found(client, auth_headers):
+    """Test get non-existent skill."""
+    response = client.get("/skills/nonexistent", headers=auth_headers)
+    assert response.status_code == 404

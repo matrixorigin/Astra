@@ -14,7 +14,6 @@ from api.services.exceptions import ResourceNotFoundError
 router = APIRouter()
 
 
-# Request/Response Models
 class RegisterSkillRequest(BaseModel):
     """注册技能请求"""
     skill_id: str
@@ -50,13 +49,11 @@ class SkillVersionResponse(BaseModel):
     created_at: Optional[str] = None
 
 
-# API Endpoints
 @router.post(
     "",
     response_model=SkillResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="注册技能",
-    description="注册新技能或技能的新版本"
+    summary="注册技能"
 )
 async def register_skill(
     request: RegisterSkillRequest,
@@ -86,8 +83,7 @@ async def register_skill(
 @router.get(
     "",
     response_model=SkillListResponse,
-    summary="列出技能",
-    description="列出所有已注册的技能"
+    summary="列出技能"
 )
 async def list_skills(
     limit: int = Query(50, ge=1, le=100),
@@ -96,51 +92,33 @@ async def list_skills(
     current_user: dict = Depends(get_current_user)
 ):
     """列出技能"""
-    try:
-        service = SkillService(db)
-        result = service.list_skills(limit=limit, offset=offset)
-        return result
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取技能列表失败: {str(e)}"
-        )
+    service = SkillService(db)
+    return service.list_skills(limit=limit, offset=offset)
 
 
 @router.get(
     "/{skill_id}",
     response_model=SkillResponse,
-    summary="获取技能",
-    description="获取指定技能的信息"
+    summary="获取技能"
 )
 async def get_skill(
     skill_id: str,
-    version: Optional[str] = Query(None, description="技能版本，默认最新版本"),
+    version: Optional[str] = Query(None),
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """获取技能"""
     try:
         service = SkillService(db)
-        result = service.get_skill(skill_id=skill_id, version=version)
-        return result
+        return service.get_skill(skill_id=skill_id, version=version)
     except ResourceNotFoundError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e)
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取技能失败: {str(e)}"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
 @router.get(
     "/{skill_id}/versions",
     response_model=List[SkillVersionResponse],
-    summary="列出技能版本",
-    description="列出指定技能的所有版本"
+    summary="列出技能版本"
 )
 async def list_skill_versions(
     skill_id: str,
@@ -148,12 +126,5 @@ async def list_skill_versions(
     current_user: dict = Depends(get_current_user)
 ):
     """列出技能版本"""
-    try:
-        service = SkillService(db)
-        result = service.list_skill_versions(skill_id=skill_id)
-        return result
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取版本列表失败: {str(e)}"
-        )
+    service = SkillService(db)
+    return service.list_skill_versions(skill_id=skill_id)
