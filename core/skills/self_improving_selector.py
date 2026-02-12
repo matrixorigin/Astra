@@ -78,8 +78,9 @@ class SelfImprovingSelector:
         if not failures:
             return {"failures_analyzed": 0, "corrections_found": 0, "learnings_added": 0}
 
-        # Step 2: Create learning sandbox
-        sandbox_name = f"learn_failures_{str(uuid7())[:8]}"
+        # Step 2: Create learning sandbox (use timestamp + uuid for uniqueness)
+        import time
+        sandbox_name = f"learn_failures_{int(time.time() * 1000)}_{str(uuid7())[:8]}"
         self.sandbox.create(
             sandbox_name,
             description=f"Learning from {len(failures)} failures",

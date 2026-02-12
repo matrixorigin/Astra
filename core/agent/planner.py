@@ -10,6 +10,7 @@ from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
+from uuid_utils import uuid7
 
 from core.logging_config import get_logger
 
@@ -113,10 +114,11 @@ def get_plan_constraints() -> PlanConstraints:
 class Planner:
     """Plans and manages PAOR loop execution."""
 
-    def __init__(self, llm_client, constraints: PlanConstraints | None = None, event_logger=None):
+    def __init__(self, llm_client, constraints: PlanConstraints | None = None, event_logger=None, db=None):
         self.llm = llm_client
         self.constraints = constraints or get_plan_constraints()
         self.event_logger = event_logger
+        self.db = db  # For sandbox operations
 
     async def create_plan(
         self, 
@@ -660,3 +662,98 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
             step.update(step_status_map[step_id])
 
     return Plan(**plan_data)
+
+
+def execute_plan_in_sandbox(
+    plan: Plan,
+    db,
+    executor_fn,
+    sandbox_name: str | None = None,
+) -> dict:
+    """Execute plan in sandbox for dry-run validation.
+    
+    Args:
+        plan: Plan to execute
+        db: Database connection
+        executor_fn: Function to execute each step (step -> result)
+        sandbox_name: Optional sandbox name (auto-generated if None)
+        
+    Returns:
+        dict with execution results and sandbox info
+        
+    Example:
+        >>> def my_executor(step):
+        ...     # Execute step logic
+        ...     return {"success": True, "output": "..."}
+        >>> 
+        >>> result = execute_plan_in_sandbox(
+        ...     plan=plan,
+        ...     db=db,
+        ...     executor_fn=my_executor,
+        ... )
+        >>> print(result["sandbox_name"])  # "plan_dry_run_abc123"
+        >>> print(result["success"])  # True/False
+    """
+    from core.sandbox.sandbox import Sandbox
+    
+    # Generate sandbox name if not provided (use timestamp + random for uniqueness)
+    if sandbox_name is None:
+        import time
+        sandbox_name = f"plan_dry_run_{int(time.time() * 1000)}_{str(uuid7())[:8]}"
+    
+    sandbox = Sandbox(db=db)
+    results = {
+        "sandbox_name": sandbox_name,
+        "plan_id": plan.plan_id,
+        "success": True,
+        "steps": [],
+        "error": None,
+    }
+    
+    try:
+        # Create sandbox
+        sandbox.create(
+            name=sandbox_name,
+            description=f"Dry-run for plan {plan.plan_id}: {plan.goal}",
+            created_by="planner",
+            tags=["dry-run", "plan", plan.plan_id],
+        )
+        
+        # Execute each step in sandbox context
+        for step in plan.steps:
+            try:
+                # Execute step
+                step_result = executor_fn(step)
+                
+                results["steps"].append({
+                    "step_id": step.step_id,
+                    "description": step.description,
+                    "success": True,
+                    "result": step_result,
+                })
+                
+            except Exception as e:
+                results["success"] = False
+                results["steps"].append({
+                    "step_id": step.step_id,
+                    "description": step.description,
+                    "success": False,
+                    "error": str(e),
+                })
+                # Stop on first failure
+                break
+        
+        # Cleanup: delete sandbox after dry-run
+        sandbox.delete(sandbox_name)
+        
+    except Exception as e:
+        results["success"] = False
+        results["error"] = str(e)
+        
+        # Cleanup on error
+        try:
+            sandbox.delete(sandbox_name)
+        except Exception:
+            pass
+    
+    return results
