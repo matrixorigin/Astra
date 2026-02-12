@@ -69,7 +69,7 @@ async def stream_chat(
     db = Database()
     event_logger = EventLogger(db)
     llm_client = LLMClient()
-    selector = AgentSkillSelector(db)
+    selector = AgentSkillSelector(db, llm_client, auditable=True, session_id=request.session_id)
     executor = AgentExecutor(db)
     context_manager = ContextManager(db)
     firewall = HallucinationFirewall(db)
