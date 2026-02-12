@@ -107,6 +107,11 @@ class ContextManager:
 
         self.prompts = PromptManager(db)
 
+        # Initialize relevance scorer
+        from core.context.scorer import RelevanceScorer
+
+        self.scorer = RelevanceScorer(db, self.embeddings)
+
         logger.info(
             f"ContextManager initialized "
             f"(snapshots={'enabled' if enable_snapshots else 'disabled'}, "
@@ -143,7 +148,7 @@ class ContextManager:
             logger.debug(f"Retrieved {len(candidates)} candidate events")
 
             # 3. Score and rank
-            scored = self._score_candidates(query, candidates, session_id)
+            scored = self._score_candidates(query, candidates, session_id, task_type)
             logger.debug(f"Scored {len(scored)} candidates")
 
             # 4. Select within budget
@@ -223,70 +228,23 @@ class ContextManager:
         return [dict(e) for e in events]
 
     def _score_candidates(
-        self, query: str, candidates: list[dict[str, Any]], session_id: str
+        self, query: str, candidates: list[dict[str, Any]], session_id: str, task_type: TaskType
     ) -> list[tuple[dict[str, Any], float]]:
-        """Score candidates by relevance using L2_DISTANCE.
+        """Score candidates by relevance using configurable scorer.
 
         Multi-signal scoring:
-        - Semantic: L2 distance (40%)
-        - Temporal: Recent events score higher (20%)
-        - Causal: Events in same chain score higher (30%)
-        - Keyword: Exact matches score higher (10%)
+        - Semantic: L2 distance (weight varies by task)
+        - Temporal: Recent events score higher
+        - Causal: Events in same chain score higher
+        - Keyword: Exact matches score higher
         """
-        # Generate query embedding and search
-        query_embedding = self.embeddings.embed_text(query)
-        semantic_results = self.embeddings.search_similar(
-            query_embedding, limit=len(candidates), session_id=session_id
-        )
+        # Use the new configurable scorer
+        scored_with_signals = self.scorer.score_candidates(query, candidates, session_id, task_type)
 
-        # Build distance map
-        distance_map = {r["event_id"]: r["distance"] for r in semantic_results}
+        # Convert to old format (candidate, score) for compatibility
+        scored = [(candidate, score) for candidate, score, _signals in scored_with_signals]
 
-        # Get recent causal chains (last 5 chains in session)
-        recent_chains = self.db.fetchall(
-            """
-            SELECT causal_chain_id, MAX(created_at) as last_time
-            FROM conversation_events
-            WHERE session_id = %s
-            GROUP BY causal_chain_id
-            ORDER BY last_time DESC
-            LIMIT 5
-        """,
-            (session_id,),
-        )
-        recent_chain_ids = {row["causal_chain_id"] for row in recent_chains}
-
-        scored = []
-        for candidate in candidates:
-            event_id = candidate["event_id"]
-
-            # Semantic score (40%)
-            distance = distance_map.get(event_id, 999.0)
-            semantic_score = (1.0 / (1.0 + distance)) * 0.4
-
-            # Temporal score (20%)
-            age_hours = (time.time() - candidate["created_at"].timestamp()) / 3600
-            temporal_score = (0.5 ** (age_hours / 24.0)) * 0.2
-
-            # Causal score (30%)
-            chain_id = candidate.get("causal_chain_id")
-            if chain_id and chain_id in recent_chain_ids:
-                # In recent causal chain - high score
-                causal_score = 1.0 * 0.3
-            else:
-                causal_score = 0.0
-
-            # Keyword score (10%)
-            query_lower = query.lower()
-            content_lower = candidate["content"].lower()
-            keyword_score = (1.0 if query_lower in content_lower else 0.0) * 0.1
-
-            # Total score
-            score = semantic_score + temporal_score + causal_score + keyword_score
-            scored.append((candidate, score))
-
-        # Sort by score descending
-        scored.sort(key=lambda x: x[1], reverse=True)
+        logger.debug(f"Scored {len(scored)} candidates using task-aware weights")
         return scored
 
     def _select_within_budget(

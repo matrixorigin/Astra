@@ -90,11 +90,13 @@ class ChatLoop:
         executor: AgentExecutor,
         llm_client,
         event_logger: EventLogger,
+        context_manager=None,
     ):
         self.selector = selector
         self.executor = executor
         self.llm = llm_client
         self.event_logger = event_logger
+        self.context_manager = context_manager
 
     async def run_step(
         self,
@@ -117,10 +119,22 @@ class ChatLoop:
             content=user_input,
         )
 
-        # 2. Build messages with context
+        # 2. Build context and save snapshot
+        snapshot_id = None
+        if self.context_manager:
+            from core.context.manager import TaskType
+
+            ctx = self.context_manager.build_context(
+                session_id=session_id, query=user_input, task_type=TaskType.GENERAL
+            )
+            snapshot_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
+            if snapshot_id:
+                logger.debug(f"Context snapshot saved: {snapshot_id}")
+
+        # 3. Build messages with context
         messages = self._build_messages(user_input, context)
 
-        # 3. Check if planning is needed
+        # 4. Check if planning is needed
         if _needs_planning(user_input):
             # Use planning for complex tasks - collect final result
             final_result = ""
@@ -133,7 +147,7 @@ class ChatLoop:
                     break
             return final_result
 
-        # 3. Get available tools schema
+        # 5. Get available tools schema
         tools_schema = self.selector.selector.get_tools_schema(
             query=user_input, max_candidates=max_candidates
         )
@@ -156,7 +170,7 @@ class ChatLoop:
             )
             return response.content or ""
 
-        # 4. Multi-turn tool use loop
+        # 6. Multi-turn tool use loop
         for _round in range(MAX_TOOL_ROUNDS):
             llm_result = self.llm.chat_with_tools(
                 messages=messages,
