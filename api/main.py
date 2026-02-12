@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import auth
+from api.routers import agents, auth
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -25,6 +25,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(auth.router, prefix="/auth", tags=["authentication"])
+app.include_router(agents.router, prefix="/agents", tags=["agents"])
 
 
 @app.get("/health")

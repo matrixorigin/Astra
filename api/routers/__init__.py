@@ -1,5 +1,5 @@
 """Router package."""
 
-from api.routers import auth
+from api.routers import agents, auth
 
-__all__ = ["auth"]
+__all__ = ["agents", "auth"]

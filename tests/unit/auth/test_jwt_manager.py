@@ -113,8 +113,18 @@ class TestJWTTokenDecoding:
     def test_decode_tampered_token(self):
         """Test decoding tampered token raises error."""
         token = create_access_token({"sub": "user_123"})
-        # Tamper with token by changing last character
-        tampered_token = token[:-1] + ("a" if token[-1] != "a" else "b")
+        # Tamper with token by modifying the signature part (after last dot)
+        parts = token.rsplit(".", 1)
+        if len(parts) == 2:
+            # Change a character in the middle of the signature
+            sig = parts[1]
+            if len(sig) > 5:
+                tampered_sig = sig[:5] + ("x" if sig[5] != "x" else "y") + sig[6:]
+                tampered_token = parts[0] + "." + tampered_sig
+            else:
+                tampered_token = token[:-1] + ("a" if token[-1] != "a" else "b")
+        else:
+            tampered_token = token + "tampered"
 
         with pytest.raises(InvalidTokenError):
             decode_token(tampered_token)
