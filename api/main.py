@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.database import init_db
-from api.routers import agents, auth, events, sessions, sandbox, replay, skills, context, decisions
+from api.routers import agents, auth, events, sessions, sandbox, replay, skills, context, decisions, streaming
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -102,6 +102,7 @@ app.include_router(replay.router, tags=["replay"])
 app.include_router(skills.router, prefix="/skills", tags=["skills"])
 app.include_router(context.router, prefix="/context", tags=["context"])
 app.include_router(decisions.router, prefix="/decisions", tags=["decisions"])
+app.include_router(streaming.router, tags=["streaming"])
 
 
 @app.get("/health")
