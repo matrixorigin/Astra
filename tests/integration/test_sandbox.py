@@ -193,10 +193,18 @@ def test_use_sandbox(sandbox, db):
     """Test switching to sandbox."""
     name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
-    # Insert test data first
-    from core.events.event_logger import EventLogger
-    logger = EventLogger(db)
-    logger.create_user_query(user_id="test", session_id="test_session", content="test")
+    # Insert test data directly
+    from uuid import uuid4
+    from datetime import datetime, timezone
+    
+    db.execute(
+        """
+        INSERT INTO conversation_events 
+        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (str(uuid4()), "test_session", "test", "system", "1.0.0", "user_query", "test", datetime.now(timezone.utc))
+    )
 
     # Create sandbox (clones current data)
     sandbox.create(name)
