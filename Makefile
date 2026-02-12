@@ -144,8 +144,8 @@ dev-init: dev-up db-init
 
 .PHONY: db-init
 db-init:
-	@echo "Initializing database schema..."
-	@bash infra/scripts/init-db.sh
+	@echo "Database tables are auto-initialized by FastAPI on startup"
+	@echo "No manual initialization needed"
 
 .PHONY: db-init-agent
 db-init-agent:

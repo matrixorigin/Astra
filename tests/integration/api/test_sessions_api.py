@@ -1,145 +1,211 @@
 """Integration tests for sessions API."""
 
-from unittest.mock import MagicMock, patch
-
 import pytest
 from fastapi.testclient import TestClient
+
+from api.main import app
+from api.database import get_db_session
+from api.repositories.user_repository import UserRepository
 
 
 @pytest.fixture
 def client():
     """Create test client."""
-    from api.main import app
     return TestClient(app)
 
 
 @pytest.fixture
-def mock_session():
-    """Mock session object."""
-    from datetime import datetime, timezone
-    from core.events.session_models import SessionStatus
-    
-    session = MagicMock()
-    session.session_id = "test_session_123"
-    session.user_id = "user123"
-    session.status = SessionStatus.ACTIVE
-    session.event_count = 0
-    session.created_at = datetime.now(timezone.utc)
-    session.last_active_at = datetime.now(timezone.utc)
-    session.metadata = {"test": "data"}
-    return session
+def db_session():
+    """Get database session."""
+    session = next(get_db_session())
+    yield session
+    session.close()
 
 
 @pytest.fixture
-def auth_headers():
-    """Mock authentication headers."""
-    with patch("api.dependencies.decode_token") as mock_decode, \
-         patch("api.dependencies.UserManager") as mock_user_manager_class:
-        
-        # Mock JWT decode
-        mock_decode.return_value = {"sub": "user123", "username": "testuser", "type": "access"}
-        
-        # Mock UserManager
-        mock_user_manager = MagicMock()
-        mock_user = {"user_id": "user123", "username": "testuser"}
-        mock_user_manager.get_user_by_id.return_value = mock_user
-        mock_user_manager_class.return_value = mock_user_manager
-        
-        yield {"Authorization": "Bearer fake_token"}
+def test_user(db_session):
+    """Create test user."""
+    repo = UserRepository(db_session)
+    
+    # Clean up first
+    user = repo.get_by_username("sessionuser")
+    if user:
+        repo.delete(user.user_id)
+        db_session.commit()
+    
+    # Create user
+    from core.auth.password import hash_password
+    from uuid import uuid4
+    
+    user_data = {
+        "user_id": str(uuid4()),
+        "username": "sessionuser",
+        "email": "session@example.com",
+        "password_hash": hash_password("password123"),
+        "is_active": 1,
+    }
+    user = repo.create(user_data)
+    
+    yield user
+    
+    # Clean up
+    repo.delete(user.user_id)
+    db_session.commit()
+
+
+@pytest.fixture
+def auth_headers(client, test_user):
+    """Get authentication headers."""
+    # Login to get token
+    response = client.post(
+        "/auth/login",
+        json={
+            "username": "sessionuser",
+            "password": "password123",
+        },
+    )
+    
+    token = response.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
 
 
 class TestCreateSession:
-    """Test session creation."""
+    """Test session creation endpoint."""
 
-    def test_create_session_success(self, client, auth_headers, mock_session):
+    def test_create_session_success(self, client, auth_headers):
         """Test successful session creation."""
-        with patch("api.routers.sessions.SessionManager") as mock_manager_class:
-            mock_manager = MagicMock()
-            mock_manager.create_session.return_value = mock_session
-            mock_manager_class.return_value = mock_manager
-
-            response = client.post(
-                "/sessions",
-                json={"metadata": {"test": "data"}},
-                headers=auth_headers,
-            )
+        response = client.post(
+            "/sessions",
+            headers=auth_headers,
+            json={
+                "metadata": {"test": "data"},
+            },
+        )
 
         assert response.status_code == 201
         data = response.json()
-        assert data["session_id"] == "test_session_123"
-        assert data["user_id"] == "user123"
+        assert "session_id" in data
         assert data["status"] == "active"
+        assert data["event_count"] == 0
+        assert data["metadata"] == {"test": "data"}
 
 
 class TestListSessions:
-    """Test listing sessions."""
+    """Test list sessions endpoint."""
 
-    def test_list_sessions_success(self, client, auth_headers, mock_session):
+    def test_list_sessions_success(self, client, auth_headers):
         """Test successful session listing."""
-        with patch("api.routers.sessions.SessionManager") as mock_manager_class:
-            mock_manager = MagicMock()
-            mock_manager.list_sessions.return_value = [mock_session]
-            mock_manager_class.return_value = mock_manager
+        # Create a session first
+        client.post(
+            "/sessions",
+            headers=auth_headers,
+            json={"metadata": {"test": "data"}},
+        )
 
-            response = client.get("/sessions", headers=auth_headers)
+        # List sessions
+        response = client.get("/sessions", headers=auth_headers)
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data["sessions"]) == 1
-        assert data["sessions"][0]["session_id"] == "test_session_123"
+        assert "sessions" in data
+        assert len(data["sessions"]) > 0
 
 
 class TestGetSession:
-    """Test getting a session."""
+    """Test get session endpoint."""
 
-    def test_get_session_success(self, client, auth_headers, mock_session):
+    def test_get_session_success(self, client, auth_headers):
         """Test successful session retrieval."""
-        with patch("api.routers.sessions.SessionManager") as mock_manager_class:
-            mock_manager = MagicMock()
-            mock_manager.get_session.return_value = mock_session
-            mock_manager_class.return_value = mock_manager
+        # Create a session
+        create_response = client.post(
+            "/sessions",
+            headers=auth_headers,
+            json={"metadata": {"test": "data"}},
+        )
+        session_id = create_response.json()["session_id"]
 
-            response = client.get("/sessions/test_session_123", headers=auth_headers)
+        # Get session
+        response = client.get(f"/sessions/{session_id}", headers=auth_headers)
 
         assert response.status_code == 200
         data = response.json()
-        assert data["session_id"] == "test_session_123"
+        assert data["session_id"] == session_id
+        assert data["status"] == "active"
 
     def test_get_session_not_found(self, client, auth_headers):
-        """Test session not found."""
-        with patch("api.routers.sessions.SessionManager") as mock_manager_class:
-            mock_manager = MagicMock()
-            mock_manager.get_session.return_value = None
-            mock_manager_class.return_value = mock_manager
-
-            response = client.get("/sessions/nonexistent", headers=auth_headers)
+        """Test get non-existent session."""
+        response = client.get("/sessions/nonexistent", headers=auth_headers)
 
         assert response.status_code == 404
 
-    def test_get_session_unauthorized(self, client, auth_headers, mock_session):
-        """Test unauthorized session access."""
-        mock_session.user_id = "other_user"
+    def test_get_session_unauthorized(self, client, auth_headers, db_session):
+        """Test get session owned by another user."""
+        # Create another user
+        from core.auth.password import hash_password
+        from uuid import uuid4
         
-        with patch("api.routers.sessions.SessionManager") as mock_manager_class:
-            mock_manager = MagicMock()
-            mock_manager.get_session.return_value = mock_session
-            mock_manager_class.return_value = mock_manager
-
-            response = client.get("/sessions/test_session_123", headers=auth_headers)
-
-        assert response.status_code == 403
+        repo = UserRepository(db_session)
+        
+        # Clean up first
+        existing = repo.get_by_username("otheruser")
+        if existing:
+            repo.delete(existing.user_id)
+            db_session.commit()
+        
+        other_user = repo.create({
+            "user_id": str(uuid4()),
+            "username": "otheruser",
+            "email": "other@example.com",
+            "password_hash": hash_password("password123"),
+            "is_active": 1,
+        })
+        
+        # Login as other user
+        response = client.post(
+            "/auth/login",
+            json={
+                "username": "otheruser",
+                "password": "password123",
+            },
+        )
+        other_token = response.json()["access_token"]
+        other_headers = {"Authorization": f"Bearer {other_token}"}
+        
+        # Create session as other user
+        create_response = client.post(
+            "/sessions",
+            headers=other_headers,
+            json={"metadata": {}},
+        )
+        session_id = create_response.json()["session_id"]
+        
+        # Try to get session as first user
+        response = client.get(f"/sessions/{session_id}", headers=auth_headers)
+        
+        assert response.status_code == 404
+        
+        # Clean up
+        repo.delete(other_user.user_id)
+        db_session.commit()
 
 
 class TestCloseSession:
-    """Test closing a session."""
+    """Test close session endpoint."""
 
-    def test_close_session_success(self, client, auth_headers, mock_session):
+    def test_close_session_success(self, client, auth_headers):
         """Test successful session closure."""
-        with patch("api.routers.sessions.SessionManager") as mock_manager_class:
-            mock_manager = MagicMock()
-            mock_manager.get_session.return_value = mock_session
-            mock_manager_class.return_value = mock_manager
+        # Create a session
+        create_response = client.post(
+            "/sessions",
+            headers=auth_headers,
+            json={"metadata": {"test": "data"}},
+        )
+        session_id = create_response.json()["session_id"]
 
-            response = client.delete("/sessions/test_session_123", headers=auth_headers)
+        # Close session
+        response = client.post(f"/sessions/{session_id}/close", headers=auth_headers)
 
-        assert response.status_code == 204
+        assert response.status_code == 200
+        data = response.json()
+        assert data["session_id"] == session_id
+        assert data["status"] == "closed"

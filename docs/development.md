@@ -9,13 +9,10 @@ make setup
 # 2. Start services
 make dev-up
 
-# 3. Initialize database
-make db-init
-
-# 4. Run tests
+# 3. Run tests (database auto-initializes)
 make test
 
-# 5. Start API (optional)
+# 4. Start API (optional, database auto-initializes)
 python api/main.py
 ```
 
@@ -205,12 +202,11 @@ This will:
 # Start MatrixOne + Redis
 make dev-up
 
-# Initialize database schema
-make db-init
-
 # Verify connection
 make db-connect
 ```
+
+**Note**: Database tables are automatically created by FastAPI on first startup. No manual initialization needed.
 
 ## Daily Development Workflow
 
@@ -224,7 +220,7 @@ source .venv/bin/activate
 # Start services
 make dev-up
 
-# Run tests
+# Run tests (database auto-initializes)
 make test
 
 # Stop services when done
@@ -258,8 +254,6 @@ mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl
 [client]
 skip-ssl
 ```
-
-**Note**: The `init-db.sh` script automatically handles SSL issues by trying both with and without SSL.
 
 ### Virtual Environment Issues
 

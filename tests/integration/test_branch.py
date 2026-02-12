@@ -14,7 +14,10 @@ def db():
 
 @pytest.fixture
 def branch(db):
-    mgr = Branch(db=db)
+    # Get current database name from settings
+    from config.settings import get_settings
+    settings = get_settings()
+    mgr = Branch(database=settings.matrixone_database, db=db)
     # Cleanup
     try:
         db.execute("DROP TABLE IF EXISTS test_t0")

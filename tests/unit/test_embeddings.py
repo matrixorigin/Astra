@@ -69,24 +69,44 @@ def test_cosine_similarity(db):
     """Test L2 distance calculation."""
     service = EmbeddingService(db, provider="mock")
 
-    import time
+    from uuid import uuid4
+    from api.database import get_db_session
+    from api.repositories.session_repository import SessionRepository
+    from api.repositories.event_repository import EventRepository
 
-    from core.events.event_logger import EventLogger
-    from core.events.session_manager import SessionManager
+    db_session = next(get_db_session())
+    session_repo = SessionRepository(db_session)
+    event_repo = EventRepository(db_session)
 
-    session_mgr = SessionManager(db)
-    logger = EventLogger(db)
-
-    user_id = f"test_user_{int(time.time() * 1000)}"
-    session = session_mgr.create_session(user_id=user_id)
+    user_id = str(uuid4())
+    session_id = str(uuid4())
+    
+    session = session_repo.create({
+        "session_id": session_id,
+        "user_id": user_id
+    })
 
     # Create events
-    event1 = logger.create_user_query(
-        user_id=user_id, session_id=session.session_id, content="Hello world"
-    )
-    event2 = logger.create_user_query(
-        user_id=user_id, session_id=session.session_id, content="Hello world"
-    )
+    event1_id = str(uuid4())
+    event2_id = str(uuid4())
+    
+    event1 = event_repo.create({
+        "event_id": event1_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "event_type": "user_query",
+        "content": "Hello world",
+        "causal_chain_id": str(uuid4())
+    })
+    
+    event2 = event_repo.create({
+        "event_id": event2_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "event_type": "user_query",
+        "content": "Hello world",
+        "causal_chain_id": str(uuid4())
+    })
 
     # Same text should have distance = 0
     emb1 = service.embed_text("Hello world")
@@ -108,16 +128,22 @@ def test_search_similar(db):
     """Test semantic search using L2_DISTANCE."""
     service = EmbeddingService(db, provider="mock")
 
-    import time
+    from uuid import uuid4
+    from api.database import get_db_session
+    from api.repositories.session_repository import SessionRepository
+    from api.repositories.event_repository import EventRepository
 
-    from core.events.event_logger import EventLogger
-    from core.events.session_manager import SessionManager
+    db_session = next(get_db_session())
+    session_repo = SessionRepository(db_session)
+    event_repo = EventRepository(db_session)
 
-    session_mgr = SessionManager(db)
-    logger = EventLogger(db)
-
-    user_id = f"test_user_{int(time.time() * 1000)}"
-    session = session_mgr.create_session(user_id=user_id)
+    user_id = str(uuid4())
+    session_id = str(uuid4())
+    
+    session = session_repo.create({
+        "session_id": session_id,
+        "user_id": user_id
+    })
 
     # Create events with different content
     contents = [
@@ -127,9 +153,15 @@ def test_search_similar(db):
     ]
 
     for content in contents:
-        event = logger.create_user_query(
-            user_id=user_id, session_id=session.session_id, content=content
-        )
+        event_id = str(uuid4())
+        event = event_repo.create({
+            "event_id": event_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "event_type": "user_query",
+            "content": content,
+            "causal_chain_id": str(uuid4())
+        })
 
         # Generate and store embedding
         embedding = service.embed_text(content)
@@ -155,25 +187,43 @@ def test_search_with_json_extract_filter(db):
     """Test semantic search with JSON_EXTRACT metadata filtering."""
     service = EmbeddingService(db, provider="mock")
 
-    import time
+    from uuid import uuid4
+    from api.database import get_db_session
+    from api.repositories.session_repository import SessionRepository
+    from api.repositories.event_repository import EventRepository
 
-    from core.events.event_logger import EventLogger
-    from core.events.session_manager import SessionManager
+    db_session = next(get_db_session())
+    session_repo = SessionRepository(db_session)
+    event_repo = EventRepository(db_session)
 
-    session_mgr = SessionManager(db)
-    logger = EventLogger(db)
-
-    user_id = f"test_user_{int(time.time() * 1000)}"
-    session = session_mgr.create_session(user_id=user_id)
+    user_id = str(uuid4())
+    session_id = str(uuid4())
+    
+    session = session_repo.create({
+        "session_id": session_id,
+        "user_id": user_id
+    })
 
     # Create events with metadata
-    event1 = logger.create_user_query(
-        user_id=user_id, session_id=session.session_id, content="How to implement auth?"
-    )
+    event1_id = str(uuid4())
+    event1 = event_repo.create({
+        "event_id": event1_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "event_type": "user_query",
+        "content": "How to implement auth?",
+        "causal_chain_id": str(uuid4())
+    })
 
-    event2 = logger.create_user_query(
-        user_id=user_id, session_id=session.session_id, content="What's the weather?"
-    )
+    event2_id = str(uuid4())
+    event2 = event_repo.create({
+        "event_id": event2_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "event_type": "user_query",
+        "content": "What's the weather?",
+        "causal_chain_id": str(uuid4())
+    })
 
     # Store embeddings with metadata
     emb1 = service.embed_text("How to implement auth?")

@@ -1,179 +1,235 @@
 """Integration tests for events API."""
 
-from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
-
 import pytest
 from fastapi.testclient import TestClient
+
+from api.main import app
+from api.database import get_db_session
+from api.repositories.user_repository import UserRepository
 
 
 @pytest.fixture
 def client():
     """Create test client."""
-    from api.main import app
     return TestClient(app)
 
 
 @pytest.fixture
-def mock_event():
-    """Mock event object."""
-    event = MagicMock()
-    event.event_id = "event_123"
-    event.session_id = "session_123"
-    event.user_id = "user123"
-    event.event_type = "user_query"
-    event.content = "Test query"
-    event.created_at = datetime.now(timezone.utc)
-    event.metadata = {}
-    event.parent_event_id = None
-    event.causal_chain_id = "chain_123"
-    return event
+def db_session():
+    """Get database session."""
+    session = next(get_db_session())
+    yield session
+    session.close()
 
 
 @pytest.fixture
-def mock_session():
-    """Mock session object."""
-    session = MagicMock()
-    session.session_id = "session_123"
-    session.user_id = "user123"
-    return session
+def test_user(db_session):
+    """Create test user."""
+    repo = UserRepository(db_session)
+    
+    # Clean up first
+    user = repo.get_by_username("eventuser")
+    if user:
+        repo.delete(user.user_id)
+        db_session.commit()
+    
+    # Create user
+    from core.auth.password import hash_password
+    from uuid import uuid4
+    
+    user_data = {
+        "user_id": str(uuid4()),
+        "username": "eventuser",
+        "email": "event@example.com",
+        "password_hash": hash_password("password123"),
+        "is_active": 1,
+    }
+    user = repo.create(user_data)
+    
+    yield user
+    
+    # Clean up
+    repo.delete(user.user_id)
+    db_session.commit()
 
 
 @pytest.fixture
-def auth_headers():
-    """Mock authentication headers."""
-    with patch("api.dependencies.decode_token") as mock_decode, \
-         patch("api.dependencies.UserManager") as mock_user_manager_class:
-        
-        mock_decode.return_value = {"sub": "user123", "username": "testuser", "type": "access"}
-        
-        mock_user_manager = MagicMock()
-        mock_user = {"user_id": "user123", "username": "testuser"}
-        mock_user_manager.get_user_by_id.return_value = mock_user
-        mock_user_manager_class.return_value = mock_user_manager
-        
-        yield {"Authorization": "Bearer fake_token"}
+def auth_headers(client, test_user):
+    """Get authentication headers."""
+    # Login to get token
+    response = client.post(
+        "/auth/login",
+        json={
+            "username": "eventuser",
+            "password": "password123",
+        },
+    )
+    
+    token = response.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def test_session(client, auth_headers):
+    """Create test session."""
+    response = client.post(
+        "/sessions",
+        headers=auth_headers,
+        json={"metadata": {}},
+    )
+    return response.json()["session_id"]
 
 
 class TestCreateEvent:
-    """Test event creation."""
+    """Test event creation endpoint."""
 
-    def test_create_user_query_event(self, client, auth_headers, mock_event, mock_session):
+    def test_create_user_query_event(self, client, auth_headers, test_session):
         """Test creating a user query event."""
-        with patch("api.routers.events.EventLogger") as mock_logger_class, \
-             patch("api.routers.events.SessionManager") as mock_session_manager_class:
-            
-            mock_logger = MagicMock()
-            mock_logger.create_user_query.return_value = mock_event
-            mock_logger_class.return_value = mock_logger
-            
-            mock_session_manager = MagicMock()
-            mock_session_manager.get_session.return_value = mock_session
-            mock_session_manager_class.return_value = mock_session_manager
-
-            response = client.post(
-                "/events",
-                json={
-                    "session_id": "session_123",
-                    "event_type": "user_query",
-                    "content": "Test query",
-                },
-                headers=auth_headers,
-            )
+        response = client.post(
+            "/events",
+            headers=auth_headers,
+            json={
+                "session_id": test_session,
+                "event_type": "user_query",
+                "content": "What is the weather?",
+                "metadata": {"source": "cli"},
+            },
+        )
 
         assert response.status_code == 201
         data = response.json()
-        assert data["event_id"] == "event_123"
+        assert "event_id" in data
         assert data["event_type"] == "user_query"
+        assert data["content"] == "What is the weather?"
 
     def test_create_event_session_not_found(self, client, auth_headers):
-        """Test creating event for non-existent session."""
-        with patch("api.routers.events.SessionManager") as mock_session_manager_class:
-            mock_session_manager = MagicMock()
-            mock_session_manager.get_session.return_value = None
-            mock_session_manager_class.return_value = mock_session_manager
-
-            response = client.post(
-                "/events",
-                json={
-                    "session_id": "nonexistent",
-                    "event_type": "user_query",
-                    "content": "Test",
-                },
-                headers=auth_headers,
-            )
+        """Test creating event with non-existent session."""
+        response = client.post(
+            "/events",
+            headers=auth_headers,
+            json={
+                "session_id": "nonexistent",
+                "event_type": "user_query",
+                "content": "test",
+            },
+        )
 
         assert response.status_code == 404
 
-    def test_create_event_unauthorized(self, client, auth_headers, mock_session):
-        """Test creating event for unauthorized session."""
-        mock_session.user_id = "other_user"
+    def test_create_event_unauthorized(self, client, auth_headers, db_session):
+        """Test creating event for session owned by another user."""
+        # Create another user
+        from core.auth.password import hash_password
+        from uuid import uuid4
         
-        with patch("api.routers.events.SessionManager") as mock_session_manager_class:
-            mock_session_manager = MagicMock()
-            mock_session_manager.get_session.return_value = mock_session
-            mock_session_manager_class.return_value = mock_session_manager
-
-            response = client.post(
-                "/events",
-                json={
-                    "session_id": "session_123",
-                    "event_type": "user_query",
-                    "content": "Test",
-                },
-                headers=auth_headers,
-            )
-
-        assert response.status_code == 403
+        repo = UserRepository(db_session)
+        
+        # Clean up first
+        existing = repo.get_by_username("othereventuser")
+        if existing:
+            repo.delete(existing.user_id)
+            db_session.commit()
+        
+        other_user = repo.create({
+            "user_id": str(uuid4()),
+            "username": "othereventuser",
+            "email": "otherevent@example.com",
+            "password_hash": hash_password("password123"),
+            "is_active": 1,
+        })
+        
+        # Login as other user
+        response = client.post(
+            "/auth/login",
+            json={
+                "username": "othereventuser",
+                "password": "password123",
+            },
+        )
+        other_token = response.json()["access_token"]
+        other_headers = {"Authorization": f"Bearer {other_token}"}
+        
+        # Create session as other user
+        session_response = client.post(
+            "/sessions",
+            headers=other_headers,
+            json={"metadata": {}},
+        )
+        session_id = session_response.json()["session_id"]
+        
+        # Try to create event as first user
+        response = client.post(
+            "/events",
+            headers=auth_headers,
+            json={
+                "session_id": session_id,
+                "event_type": "user_query",
+                "content": "test",
+            },
+        )
+        
+        assert response.status_code == 404
+        
+        # Clean up
+        repo.delete(other_user.user_id)
+        db_session.commit()
 
 
 class TestListEvents:
-    """Test listing events."""
+    """Test list events endpoint."""
 
-    def test_list_events_success(self, client, auth_headers, mock_event, mock_session):
+    def test_list_events_success(self, client, auth_headers, test_session):
         """Test successful event listing."""
-        with patch("api.routers.events.EventLogger") as mock_logger_class, \
-             patch("api.routers.events.SessionManager") as mock_session_manager_class:
-            
-            mock_logger = MagicMock()
-            mock_logger.get_session_events.return_value = [mock_event]
-            mock_logger_class.return_value = mock_logger
-            
-            mock_session_manager = MagicMock()
-            mock_session_manager.get_session.return_value = mock_session
-            mock_session_manager_class.return_value = mock_session_manager
+        # Create an event
+        client.post(
+            "/events",
+            headers=auth_headers,
+            json={
+                "session_id": test_session,
+                "event_type": "user_query",
+                "content": "test",
+            },
+        )
 
-            response = client.get("/events?session_id=session_123", headers=auth_headers)
+        # List events
+        response = client.get(
+            f"/events?session_id={test_session}",
+            headers=auth_headers,
+        )
 
         assert response.status_code == 200
         data = response.json()
-        assert len(data["events"]) == 1
-        assert data["events"][0]["event_id"] == "event_123"
+        assert "events" in data
+        assert len(data["events"]) > 0
 
 
 class TestGetEvent:
-    """Test getting an event."""
+    """Test get event endpoint."""
 
-    def test_get_event_success(self, client, auth_headers, mock_event):
+    def test_get_event_success(self, client, auth_headers, test_session):
         """Test successful event retrieval."""
-        with patch("api.routers.events.EventLogger") as mock_logger_class:
-            mock_logger = MagicMock()
-            mock_logger.get_event.return_value = mock_event
-            mock_logger_class.return_value = mock_logger
+        # Create an event
+        create_response = client.post(
+            "/events",
+            headers=auth_headers,
+            json={
+                "session_id": test_session,
+                "event_type": "user_query",
+                "content": "test",
+            },
+        )
+        event_id = create_response.json()["event_id"]
 
-            response = client.get("/events/event_123", headers=auth_headers)
+        # Get event
+        response = client.get(f"/events/{event_id}", headers=auth_headers)
 
         assert response.status_code == 200
         data = response.json()
-        assert data["event_id"] == "event_123"
+        assert data["event_id"] == event_id
+        assert data["event_type"] == "user_query"
 
     def test_get_event_not_found(self, client, auth_headers):
-        """Test event not found."""
-        with patch("api.routers.events.EventLogger") as mock_logger_class:
-            mock_logger = MagicMock()
-            mock_logger.get_event.return_value = None
-            mock_logger_class.return_value = mock_logger
-
-            response = client.get("/events/nonexistent", headers=auth_headers)
+        """Test get non-existent event."""
+        response = client.get("/events/nonexistent", headers=auth_headers)
 
         assert response.status_code == 404

@@ -74,7 +74,9 @@ jobs:
           echo "✗ MatrixOne failed to start"
           exit 1
       - name: Initialize database
-        run: bash infra/scripts/init-db.sh
+        run: |
+          echo "Database tables are auto-initialized by FastAPI"
+          echo "No manual initialization needed"
         env:
           MATRIXONE_HOST: 127.0.0.1
           MATRIXONE_PORT: 6001

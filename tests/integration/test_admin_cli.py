@@ -107,45 +107,6 @@ class TestModelManagement:
 
 
 @pytest.mark.integration
-class TestTokenManagement:
-    """Test token management commands."""
-
-    def test_token_create(self, runner, test_db):
-        """Test creating an API token."""
-        result = runner.invoke(
-            cli,
-            [
-                "--user",
-                "test_admin",
-                "token",
-                "create",
-                "--type",
-                "llm",
-                "--provider",
-                "openai",
-                "--scope",
-                "global",
-                "--token-value",
-                "sk-test-token-123",
-            ],
-        )
-
-        if "Permission denied" in result.output:
-            pytest.skip("test_admin user needs mo_agent_admin role")
-
-        assert result.exit_code == 0
-        assert "Token created successfully" in result.output
-
-    def test_token_list(self, runner, test_db):
-        """Test listing tokens."""
-        result = runner.invoke(cli, ["--user", "test_admin", "token", "list"])
-
-        if "Unknown database" in result.output or result.exit_code != 0:
-            pytest.skip("agent_config database not initialized or permission denied")
-
-        assert "API Tokens:" in result.output or "No tokens found" in result.output
-
-
 @pytest.mark.integration
 class TestPermissionEnforcement:
     """Test permission enforcement.

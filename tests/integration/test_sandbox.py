@@ -19,7 +19,7 @@ def sandbox(db):
 
 def test_create_and_delete(sandbox):
     """Test sandbox creation and deletion."""
-    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
     sandbox.create(name, description="Test sandbox")
     sandboxes = sandbox.list_sandboxes()
@@ -71,20 +71,28 @@ def test_create_from_snapshot(sandbox, db):
 
 def test_isolation(sandbox, db):
     """Test sandbox isolation."""
-    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
-    # Create table in main
+    # Create table in main and clean up any existing test data
     db.execute("CREATE TABLE IF NOT EXISTS test_iso (id INT)")
+    db.execute("DELETE FROM test_iso")
+
+    # Insert test data
     db.execute("INSERT INTO test_iso VALUES (1)")
 
     # Create sandbox
     sandbox.create(name)
+    
+    # Clean sandbox data (it clones from main, so may have old data)
+    db.execute(f"DELETE FROM {name}.test_iso")
+    db.execute(f"INSERT INTO {name}.test_iso VALUES (1)")  # Start with same data as main
 
     # Modify sandbox
     db.execute(f"INSERT INTO {name}.test_iso VALUES (2)")
 
     # Verify isolation
-    main_count = db.fetchone("SELECT COUNT(*) as count FROM dev_agent.test_iso")["count"]
+    current_db = db.fetchone("SELECT DATABASE() as db")["db"]
+    main_count = db.fetchone(f"SELECT COUNT(*) as count FROM {current_db}.test_iso")["count"]
     sandbox_count = db.fetchone(f"SELECT COUNT(*) as count FROM {name}.test_iso")["count"]
 
     assert main_count == 1
@@ -115,7 +123,7 @@ def test_clone_table(sandbox, db):
 
 def test_add_remove_table(sandbox, db):
     """Test add/remove table."""
-    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
     # Create empty sandbox (no tables)
     db.execute(f"CREATE DATABASE {name}")
@@ -136,7 +144,7 @@ def test_add_remove_table(sandbox, db):
 
 def test_sandbox_info(sandbox, db):
     """Test sandbox info."""
-    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
     sandbox.create(name, description="Test info")
     info = sandbox.info(name)
@@ -150,7 +158,7 @@ def test_sandbox_info(sandbox, db):
 
 def test_sandbox_snapshot(sandbox, db):
     """Test sandbox snapshot and restore."""
-    name = f"sandbox_{str(uuid7()).replace('-', '_')[:8]}".lower()
+    name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
     # Create sandbox
     sandbox.create(name, description="Test snapshot")

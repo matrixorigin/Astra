@@ -41,10 +41,7 @@ make setup
 # 3. Start services (MatrixOne + Redis)
 make dev-up
 
-# 4. Initialize database
-make db-init
-
-# 5. Start using CLI
+# 4. Start using CLI (database auto-initializes)
 mo-agent chat
 
 # Or run tests

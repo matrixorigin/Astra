@@ -13,14 +13,15 @@ settings = get_settings()
 DATABASE_URL = (
     f"mysql+pymysql://{settings.matrixone_user}:{settings.matrixone_password}"
     f"@{settings.matrixone_host}:{settings.matrixone_port}/{settings.matrixone_database}"
+    "?charset=utf8mb4"
 )
 
 # Create engine
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,  # Verify connections before using
-    pool_recycle=3600,   # Recycle connections after 1 hour
-    echo=False,          # Set to True for SQL logging
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    echo=False,
 )
 
 # Session factory
@@ -59,6 +60,25 @@ def get_db_context():
 
 
 def init_db():
-    """Initialize database - create all tables."""
+    """Initialize database - create tables if not exist."""
     from api.models import Base
+    from sqlalchemy import inspect
+    
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+    
+    # Check if our tables exist
+    required_tables = [
+        'users', 'agents', 'refresh_tokens', 'sessions', 'conversation_events',
+        'prompt_templates', 'skills_registry', 'context_snapshots', 'event_embeddings', 
+        'repos', 'sandbox_metadata', 'audit_logs'
+    ]
+    missing = [t for t in required_tables if t not in existing_tables]
+    
+    if not missing:
+        print(f"All required tables exist")
+        return
+    
+    print(f"Creating missing tables: {missing}")
     Base.metadata.create_all(bind=engine)
+    print("Tables created successfully")

@@ -57,46 +57,6 @@ def test_load_config(client):
     assert client.config["temperature"] == 0.7
 
 
-@pytest.mark.skipif(True, reason="Requires openai package")
-@patch("openai.OpenAI")
-def test_chat_openai(mock_openai, client, db):
-    """Test chat with OpenAI (mocked)."""
-    # Mock OpenAI response
-    mock_response = MagicMock()
-    mock_response.choices = [MagicMock()]
-    mock_response.choices[0].message.content = "Hello! How can I help you?"
-    mock_response.model = "gpt-4"
-    mock_response.usage.prompt_tokens = 10
-    mock_response.usage.completion_tokens = 20
-    mock_response.usage.total_tokens = 30
-
-    mock_client = MagicMock()
-    mock_client.chat.completions.create.return_value = mock_response
-    mock_openai.return_value = mock_client
-
-    # Call chat
-    messages = [LLMMessage(role="user", content="Hello")]
-    response = client.chat(
-        messages=messages,
-        event_id="test_event_1",
-        user_id="test_user",
-    )
-
-    # Verify response
-    assert response.content == "Hello! How can I help you?"
-    assert response.model == "gpt-4"
-    assert response.provider == LLMProvider.OPENAI
-    assert response.tokens_prompt == 10
-    assert response.tokens_completion == 20
-    assert response.tokens_total == 30
-    assert response.cost_usd > 0
-
-    # Verify logging
-    logs = client.get_call_logs(event_id="test_event_1")
-    assert len(logs) == 1
-    assert logs[0].status == "success"
-    assert logs[0].tokens_total == 30
-
 
 def test_chat_error_logging(client, db):
     """Test error logging when LLM call fails."""
