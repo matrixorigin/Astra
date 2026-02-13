@@ -141,8 +141,14 @@ class DecisionService:
             ContextSnapshot.snapshot_id == decision["snapshot_id"]
         ).first()
         
-        if snapshot and snapshot.snapshot_data:
-            decision["context"] = snapshot.snapshot_data
+        if snapshot:
+            decision["context"] = {
+                "system_prompt": snapshot.system_prompt,
+                "skill_definitions": snapshot.skill_definitions,
+                "selected_events": snapshot.selected_events,
+                "code_context": snapshot.code_context,
+                "documentation": snapshot.documentation,
+            }
         
         return decision
     

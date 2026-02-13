@@ -105,7 +105,10 @@ class DestructiveSkill(Skill):
 @pytest.fixture
 def db():
     """Database fixture"""
-    return Database()
+    from api.database import get_db_session
+    session = next(get_db_session())
+    yield session
+    session.close()
 
 
 @pytest.fixture
@@ -121,6 +124,8 @@ def setup_recorded_result(db, session_id):
     def _setup(skill_name: str, params: dict, result: dict):
         # Compute params hash
         import hashlib
+        from api.models import Event
+        from datetime import datetime, timezone
 
         params_str = json.dumps(params, sort_keys=True)
         params_hash = hashlib.sha256(params_str.encode()).hexdigest()[:16]
@@ -133,30 +138,28 @@ def setup_recorded_result(db, session_id):
             "skill_result": result,
         }
 
-        db.execute(
-            """
-            INSERT INTO conversation_events
-            (event_id, user_id, session_id, agent_id, agent_version,
-             event_type, content, skill_name, metadata, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-        """,
-            (
-                "test_event_123",
-                "test_user",
-                session_id,
-                "test_agent",
-                "1.0.0",
-                "tool_result",
-                "Test content",
-                skill_name,
-                json.dumps(metadata),
-            ),
+        event = Event(
+            event_id="test_event_123",
+            user_id="test_user",
+            session_id=session_id,
+            agent_id="test_agent",
+            agent_version="1.0.0",
+            event_type="tool_result",
+            content="Test content",
+            skill_name=skill_name,
+            causal_chain_id="test_event_123",
+            event_metadata=metadata,
+            created_at=datetime.now(timezone.utc),
         )
+        db.add(event)
+        db.commit()
 
     yield _setup
 
     # Cleanup
-    db.execute("DELETE FROM conversation_events WHERE session_id = %s", (session_id,))
+    from api.models import Event
+    db.query(Event).filter(Event.session_id == session_id).delete()
+    db.commit()
 
 
 # ============================================================================
