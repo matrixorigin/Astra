@@ -2,13 +2,14 @@
 
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 import hashlib
 import json
 
 from api.services.exceptions import ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
-from sdk import Database
+# from sdk import Database
 
 
 class SkillService:
@@ -16,8 +17,8 @@ class SkillService:
     
     def __init__(self, db_session: Session):
         self.db_session = db_session
-        self.db = Database()
-        self.audit = AuditLogger(self.db)
+        # self.db = Database()
+        self.audit = AuditLogger(db_session)
     
     def register_skill(
         self,
@@ -34,30 +35,32 @@ class SkillService:
             code_hash = hashlib.sha256(skill_code.encode()).hexdigest()
             
             # 停用旧版本
-            self.db.execute(
-                "UPDATE skills_registry SET is_active = 0 WHERE skill_name = %s",
-                (skill_name,)
+            self.db_session.execute(text(
+                "UPDATE skills_registry SET is_active = 0 WHERE skill_name = :skill_name"),
+                {"skill_name": skill_name}
             )
             
             # 插入新版本
-            self.db.execute(
+            self.db_session.execute(text(
                 """
                 INSERT INTO skills_registry
                 (skill_id, skill_name, version, description, requirements,
                  code_hash, is_active, status, category, subcategory,
                  triggers, dependencies, priority, cost_estimate, side_effect_category)
-                VALUES (%s, %s, %s, %s, %s, %s, 1, 'active', %s, 'default', '[]', '[]', 5, 'medium', 'read')
-                """,
-                (
-                    skill_id,
-                    skill_name,
-                    skill_version,
-                    description or "",
-                    json.dumps(metadata or {}),
-                    code_hash,
-                    metadata.get("category", "general") if metadata else "general"
-                )
+                VALUES (:skill_id, :skill_name, :version, :description, :requirements,
+                        :code_hash, 1, 'active', :category, 'default', '[]', '[]', 5, 'medium', 'read')
+                """),
+                {
+                    "skill_id": skill_id,
+                    "skill_name": skill_name,
+                    "version": skill_version,
+                    "description": description or "",
+                    "requirements": json.dumps(metadata or {}),
+                    "code_hash": code_hash,
+                    "category": metadata.get("category", "general") if metadata else "general"
+                }
             )
+            self.db_session.commit()
             
             self.audit.log(
                 user_id=user_id,
@@ -95,41 +98,42 @@ class SkillService:
     ) -> Dict[str, Any]:
         """获取技能信息"""
         try:
-            with self.db.get_cursor() as cursor:
-                if version:
-                    cursor.execute(
-                        """
+            if version:
+                result = self.db_session.execute(
+                    text("""
                         SELECT skill_id, skill_name, version, description, requirements, created_at
                         FROM skills_registry
-                        WHERE skill_id = %s AND version = %s
-                        """,
-                        (skill_id, version)
-                    )
-                else:
-                    cursor.execute(
-                        """
+                        WHERE skill_id = :skill_id AND version = :version
+                        """),
+                    {"skill_id": skill_id, "version": version}
+                )
+            else:
+                result = self.db_session.execute(
+                    text("""
                         SELECT skill_id, skill_name, version, description, requirements, created_at
                         FROM skills_registry
-                        WHERE skill_id = %s AND is_active = 1
+                        WHERE skill_id = :skill_id AND is_active = 1
                         ORDER BY created_at DESC
                         LIMIT 1
-                        """,
-                        (skill_id,)
+                        """),
+                    {"skill_id": skill_id}
                     )
-                
-                result = cursor.fetchone()
-                
-                if not result:
-                    raise ResourceNotFoundError(f"Skill {skill_id} 不存在")
-                
-                return {
-                    "skill_id": result["skill_id"],
-                    "skill_name": result["skill_name"],
-                    "version": result["version"],
-                    "description": result["description"],
-                    "metadata": json.loads(result["requirements"]) if result["requirements"] else {},
-                    "created_at": result["created_at"].isoformat() if result.get("created_at") else None
-                }
+            
+            row = result.first()
+            
+            if not row:
+                raise ResourceNotFoundError(f"Skill {skill_id} 不存在")
+            
+            result_dict = dict(row._mapping)
+            
+            return {
+                "skill_id": result_dict["skill_id"],
+                "skill_name": result_dict["skill_name"],
+                "version": result_dict["version"],
+                "description": result_dict["description"],
+                "metadata": json.loads(result_dict["requirements"]) if result_dict["requirements"] else {},
+                "created_at": result_dict["created_at"].isoformat() if result_dict.get("created_at") else None
+            }
         except ResourceNotFoundError:
             raise
         except Exception as e:
@@ -142,7 +146,7 @@ class SkillService:
     ) -> Dict[str, Any]:
         """列出所有技能"""
         try:
-            with self.db.get_cursor() as cursor:
+            # with self.db.get_cursor() as cursor:
                 cursor.execute(
                     """
                     SELECT skill_id, skill_name, version, description
@@ -181,7 +185,7 @@ class SkillService:
     ) -> List[Dict[str, Any]]:
         """列出技能的所有版本"""
         try:
-            with self.db.get_cursor() as cursor:
+            # with self.db.get_cursor() as cursor:
                 cursor.execute(
                     """
                     SELECT version, description, created_at

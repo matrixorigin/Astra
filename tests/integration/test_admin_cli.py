@@ -12,9 +12,10 @@ Run with: pytest tests/integration/test_admin_cli.py -v
 
 import pytest
 from click.testing import CliRunner
+from sqlalchemy import text
 
+from api.database import get_db_session
 from cli.mo_admin import cli
-from sdk import Database
 
 
 @pytest.fixture
@@ -24,22 +25,23 @@ def runner():
 
 @pytest.fixture
 def test_db():
-    """Create a test database instance."""
-    db = Database()
+    """Create a test database session."""
+    db = next(get_db_session())
 
     # Check if agent_config database exists
     try:
-        db.execute("USE agent_config")
+        db.execute(text("USE agent_config"))
     except Exception as e:
         pytest.skip(f"agent_config database not initialized: {e}")
 
     # Clean up test data
     try:
-        db.execute("DELETE FROM agent_config.model_registry WHERE model_name LIKE 'test-%'")
+        db.execute(text("DELETE FROM agent_config.model_registry WHERE model_name LIKE 'test-%'"))
         db.execute(
-            "DELETE FROM agent_config.api_tokens WHERE token_id LIKE 'token_%' AND created_by = 'test_admin'"
+            text("DELETE FROM agent_config.api_tokens WHERE token_id LIKE 'token_%' AND created_by = 'test_admin'")
         )
-        db.execute("DELETE FROM agent_config.audit_logs WHERE user_id = 'test_admin'")
+        db.execute(text("DELETE FROM agent_config.audit_logs WHERE user_id = 'test_admin'"))
+        db.commit()
     except:
         pass
 
@@ -47,11 +49,17 @@ def test_db():
 
     # Cleanup after test
     try:
-        db.execute("DELETE FROM agent_config.model_registry WHERE model_name LIKE 'test-%'")
+        db.execute(text("DELETE FROM agent_config.model_registry WHERE model_name LIKE 'test-%'"))
         db.execute(
-            "DELETE FROM agent_config.api_tokens WHERE token_id LIKE 'token_%' AND created_by = 'test_admin'"
+            text("DELETE FROM agent_config.api_tokens WHERE token_id LIKE 'token_%' AND created_by = 'test_admin'")
         )
-        db.execute("DELETE FROM agent_config.audit_logs WHERE user_id = 'test_admin'")
+        db.execute(text("DELETE FROM agent_config.audit_logs WHERE user_id = 'test_admin'"))
+        db.commit()
+        # 恢复到默认数据库
+        from config.settings import get_settings
+        settings = get_settings()
+        db.execute(text(f"USE {settings.matrixone_database}"))
+        db.commit()
     except:
         pass
 
@@ -90,9 +98,12 @@ class TestModelManagement:
         assert "added successfully" in result.output
 
         # Verify in database
-        row = test_db.fetchone(
-            "SELECT * FROM agent_config.model_registry WHERE model_name = 'test-gpt-4'"
+        result_query = test_db.execute(
+            text("SELECT * FROM agent_config.model_registry WHERE model_name = 'test-gpt-4'")
         )
+        row = result_query.first()
+        if row:
+            row = dict(row._mapping)
         assert row is not None
         assert row["scope_type"] == "global"
 

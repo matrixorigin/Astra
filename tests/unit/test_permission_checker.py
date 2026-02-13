@@ -3,6 +3,27 @@
 from core.auth.permission_checker import PermissionChecker
 
 
+class MockResult:
+    """Mock result for database queries."""
+    
+    def __init__(self, data):
+        self.data = data
+        
+    def first(self):
+        return MockRow(self.data) if self.data else None
+
+
+class MockRow:
+    """Mock row for database results."""
+    
+    def __init__(self, data):
+        self.data = data
+        
+    @property
+    def _mapping(self):
+        return self.data
+
+
 class MockDB:
     """Mock database for testing."""
 
@@ -13,13 +34,15 @@ class MockDB:
             "bob": [],
         }
 
-    def fetchone(self, query, params=None):
-        if "mo_user_grant" in query or "mo_role_grant" in query:
-            user_id, role_name = params
+    def execute(self, query, params=None):
+        """Mock execute method for SQLAlchemy compatibility."""
+        if params and "user_id" in params and "role_name" in params:
+            user_id = params["user_id"]
+            role_name = params["role_name"]
             if user_id in self.roles and role_name in self.roles[user_id]:
-                return {"cnt": 1}
-            return {"cnt": 0}
-        return None
+                return MockResult({"cnt": 1})
+            return MockResult({"cnt": 0})
+        return MockResult(None)
 
 
 def test_has_role():

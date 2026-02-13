@@ -3,17 +3,18 @@
 import json
 from datetime import datetime, timezone
 
+from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
+from api.database import get_db_session
 from core.repos.models import AccessScope, OwnerType, Repo, RepoType
-from sdk import Database
 
 
 class RepoRegistry:
     """Repository registry for multi-repo management."""
 
-    def __init__(self, db: Database | None = None) -> None:
-        self.db = db or Database()
+    def __init__(self, db: Session | None = None) -> None:
+        self.db = db or next(get_db_session())
 
     def create(
         self,

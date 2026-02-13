@@ -14,7 +14,6 @@ from sqlalchemy.orm import Session
 from core.sandbox import Sandbox
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
-from sdk import Database
 
 
 class SandboxService:
@@ -24,13 +23,12 @@ class SandboxService:
         """初始化服务
         
         Args:
-            db_session: SQLAlchemy session (用于审计日志)
+            db_session: SQLAlchemy session
         """
         self.db_session = db_session
-        self.db = Database()  # Sandbox 需要直接操作 MatrixOne
-        self.sandbox = Sandbox(db=self.db)
-        self.audit = AuditLogger(self.db)
-        self.permission = PermissionChecker(self.db)
+        self.sandbox = Sandbox(db=db_session)
+        self.audit = AuditLogger(db_session)
+        self.permission = PermissionChecker(db_session)
     
     def create_sandbox(
         self,

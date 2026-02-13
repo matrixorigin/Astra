@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 from api.repositories import AgentRepository
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
-from sdk import Database
 
 
 class AgentService:
@@ -16,9 +15,8 @@ class AgentService:
     def __init__(self, db_session: Session):
         self.db_session = db_session
         self.agent_repo = AgentRepository(db_session)
-        self.db = Database()  # For audit and permission
-        self.audit = AuditLogger(self.db)
-        self.permission = PermissionChecker(self.db)
+        self.audit = AuditLogger(db_session)
+        self.permission = PermissionChecker(db_session)
     
     def create_agent(
         self,

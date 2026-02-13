@@ -8,7 +8,7 @@ from api.repositories import EventRepository, SessionRepository
 from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
-from sdk import Database
+# from sdk import Database
 
 
 class EventService:
@@ -18,9 +18,9 @@ class EventService:
         self.db_session = db_session
         self.event_repo = EventRepository(db_session)
         self.session_repo = SessionRepository(db_session)
-        self.db = Database()  # For audit and permission
-        self.audit = AuditLogger(self.db)
-        self.permission = PermissionChecker(self.db)
+        # self.db = Database()  # For audit and permission
+        self.audit = AuditLogger(db_session)
+        self.permission = PermissionChecker(db_session)
     
     def create_event(
         self,

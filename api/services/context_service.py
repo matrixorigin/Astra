@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 import json
@@ -9,7 +10,7 @@ import json
 from api.repositories import SessionRepository, EventRepository
 from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
 from core.auth.audit_logger import AuditLogger
-from sdk import Database
+# from sdk import Database
 
 
 class ContextService:
@@ -19,8 +20,8 @@ class ContextService:
         self.db_session = db_session
         self.session_repo = SessionRepository(db_session)
         self.event_repo = EventRepository(db_session)
-        self.db = Database()
-        self.audit = AuditLogger(self.db)
+        # self.db = Database()
+        self.audit = AuditLogger(db_session)
     
     def create_snapshot(
         self,
@@ -39,31 +40,34 @@ class ContextService:
             snapshot_id = str(uuid7())
             
             # 插入快照 - 使用实际的表字段
-            self.db.execute(
-                """
+            self.db_session.execute(
+                text("""
                 INSERT INTO context_snapshots
                 (snapshot_id, session_id, event_id, system_prompt, skill_definitions,
                  selected_events, code_context, documentation, total_tokens, 
                  token_budget, assembly_time_ms, relevance_scores, task_type, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    snapshot_id,
-                    session_id,
-                    event_id,
-                    context_data.get("system_prompt"),
-                    json.dumps(context_data.get("skill_definitions", [])),
-                    json.dumps(context_data.get("selected_events", [])),
-                    json.dumps(context_data.get("code_context", {})),
-                    json.dumps(context_data.get("documentation", {})),
-                    context_data.get("total_tokens"),
-                    json.dumps(context_data.get("token_budget", {})),
-                    context_data.get("assembly_time_ms"),
-                    json.dumps(context_data.get("relevance_scores", {})),
-                    context_data.get("task_type"),
-                    datetime.now(timezone.utc)
-                )
+                VALUES (:snapshot_id, :session_id, :event_id, :system_prompt, :skill_definitions,
+                        :selected_events, :code_context, :documentation, :total_tokens,
+                        :token_budget, :assembly_time_ms, :relevance_scores, :task_type, :created_at)
+                """),
+                {
+                    "snapshot_id": snapshot_id,
+                    "session_id": session_id,
+                    "event_id": event_id,
+                    "system_prompt": context_data.get("system_prompt"),
+                    "skill_definitions": json.dumps(context_data.get("skill_definitions")),
+                    "selected_events": json.dumps(context_data.get("selected_events")),
+                    "code_context": json.dumps(context_data.get("code_context")),
+                    "documentation": json.dumps(context_data.get("documentation")),
+                    "total_tokens": context_data.get("total_tokens"),
+                    "token_budget": json.dumps(context_data.get("token_budget")),
+                    "assembly_time_ms": context_data.get("assembly_time_ms"),
+                    "relevance_scores": json.dumps(context_data.get("relevance_scores")),
+                    "task_type": context_data.get("task_type"),
+                    "created_at": datetime.now(timezone.utc)
+                }
             )
+            self.db_session.commit()
             
             # 审计日志
             self.audit.log(
@@ -101,9 +105,8 @@ class ContextService:
     ) -> Dict[str, Any]:
         """获取上下文快照"""
         try:
-            with self.db.get_cursor() as cursor:
-                cursor.execute(
-                    """
+            result = self.db_session.execute(
+                text("""
                     SELECT cs.snapshot_id, cs.session_id, cs.event_id, 
                            cs.system_prompt, cs.skill_definitions, cs.selected_events,
                            cs.code_context, cs.documentation, cs.total_tokens,
@@ -111,37 +114,39 @@ class ContextService:
                            cs.task_type, cs.created_at
                     FROM context_snapshots cs
                     JOIN sessions s ON cs.session_id = s.session_id
-                    WHERE cs.snapshot_id = %s AND s.user_id = %s
-                    """,
-                    (snapshot_id, user_id)
+                    WHERE cs.snapshot_id = :snapshot_id AND s.user_id = :user_id
+                    """),
+                {"snapshot_id": snapshot_id, "user_id": user_id}
                 )
-                
-                result = cursor.fetchone()
-                
-                if not result:
-                    raise ResourceNotFoundError(f"Snapshot {snapshot_id} 不存在")
-                
-                # 重构为 context_data
-                context_data = {
-                    "system_prompt": result["system_prompt"],
-                    "skill_definitions": json.loads(result["skill_definitions"]) if result["skill_definitions"] else [],
-                    "selected_events": json.loads(result["selected_events"]) if result["selected_events"] else [],
-                    "code_context": json.loads(result["code_context"]) if result["code_context"] else {},
-                    "documentation": json.loads(result["documentation"]) if result["documentation"] else {},
-                    "total_tokens": result["total_tokens"],
-                    "token_budget": json.loads(result["token_budget"]) if result["token_budget"] else {},
-                    "assembly_time_ms": result["assembly_time_ms"],
-                    "relevance_scores": json.loads(result["relevance_scores"]) if result["relevance_scores"] else {},
-                    "task_type": result["task_type"]
-                }
-                
-                return {
-                    "snapshot_id": result["snapshot_id"],
-                    "session_id": result["session_id"],
-                    "event_id": result["event_id"],
-                    "context_data": context_data,
-                    "created_at": result["created_at"].isoformat() if result.get("created_at") else None
-                }
+            
+            row = result.first()
+            
+            if not row:
+                raise ResourceNotFoundError(f"Snapshot {snapshot_id} 不存在")
+            
+            result_dict = dict(row._mapping)
+            
+            # 重构为 context_data
+            context_data = {
+                "system_prompt": result_dict["system_prompt"],
+                "skill_definitions": json.loads(result_dict["skill_definitions"]) if result_dict["skill_definitions"] else [],
+                "selected_events": json.loads(result_dict["selected_events"]) if result_dict["selected_events"] else [],
+                "code_context": json.loads(result_dict["code_context"]) if result_dict["code_context"] else {},
+                "documentation": json.loads(result_dict["documentation"]) if result_dict["documentation"] else {},
+                "total_tokens": result_dict["total_tokens"],
+                "token_budget": json.loads(result_dict["token_budget"]) if result_dict["token_budget"] else {},
+                "assembly_time_ms": result_dict["assembly_time_ms"],
+                "relevance_scores": json.loads(result_dict["relevance_scores"]) if result_dict["relevance_scores"] else {},
+                "task_type": result_dict["task_type"]
+            }
+            
+            return {
+                "snapshot_id": result_dict["snapshot_id"],
+                "session_id": result_dict["session_id"],
+                "event_id": result_dict["event_id"],
+                "context_data": context_data,
+                "created_at": result_dict["created_at"].isoformat() if result_dict.get("created_at") else None
+            }
         except ResourceNotFoundError:
             raise
         except Exception as e:
@@ -156,64 +161,63 @@ class ContextService:
     ) -> Dict[str, Any]:
         """列出上下文快照"""
         try:
-            with self.db.get_cursor() as cursor:
-                if session_id:
-                    # 验证权限
-                    session = self.session_repo.get_by_id(session_id)
-                    if not session or session.user_id != user_id:
-                        raise PermissionDeniedError(f"无权限访问 Session {session_id}")
-                    
-                    cursor.execute(
-                        """
+            if session_id:
+                # 验证权限
+                session = self.session_repo.get_by_id(session_id)
+                if not session or session.user_id != user_id:
+                    raise PermissionDeniedError(f"无权限访问 Session {session_id}")
+                
+                result = self.db_session.execute(
+                    text("""
                         SELECT snapshot_id, session_id, event_id, created_at
                         FROM context_snapshots
-                        WHERE session_id = %s
+                        WHERE session_id = :session_id
                         ORDER BY created_at DESC
-                        LIMIT %s OFFSET %s
-                        """,
-                        (session_id, limit, offset)
-                    )
-                    snapshots = cursor.fetchall()
-                    
-                    cursor.execute(
-                        "SELECT COUNT(*) as total FROM context_snapshots WHERE session_id = %s",
-                        (session_id,)
-                    )
-                    total = cursor.fetchone()["total"]
-                else:
-                    cursor.execute(
-                        """
+                        LIMIT :limit OFFSET :offset
+                        """),
+                    {"session_id": session_id, "limit": limit, "offset": offset}
+                )
+                snapshots = [dict(row._mapping) for row in result]
+                
+                count_result = self.db_session.execute(
+                    text("SELECT COUNT(*) as total FROM context_snapshots WHERE session_id = :session_id"),
+                    {"session_id": session_id}
+                )
+                total = count_result.first()._mapping["total"]
+            else:
+                result = self.db_session.execute(
+                    text("""
                         SELECT cs.snapshot_id, cs.session_id, cs.event_id, cs.created_at
                         FROM context_snapshots cs
                         JOIN sessions s ON cs.session_id = s.session_id
-                        WHERE s.user_id = %s
+                        WHERE s.user_id = :user_id
                         ORDER BY cs.created_at DESC
-                        LIMIT %s OFFSET %s
-                        """,
-                        (user_id, limit, offset)
-                    )
-                    snapshots = cursor.fetchall()
-                    
-                    cursor.execute(
-                        """
+                        LIMIT :limit OFFSET :offset
+                        """),
+                    {"user_id": user_id, "limit": limit, "offset": offset}
+                )
+                snapshots = [dict(row._mapping) for row in result]
+                
+                count_result = self.db_session.execute(
+                    text("""
                         SELECT COUNT(*) as total
                         FROM context_snapshots cs
                         JOIN sessions s ON cs.session_id = s.session_id
-                        WHERE s.user_id = %s
-                        """,
-                        (user_id,)
-                    )
-                    total = cursor.fetchone()["total"]
-                
-                return {
-                    "snapshots": [
-                        {
-                            "snapshot_id": s["snapshot_id"],
-                            "session_id": s["session_id"],
-                            "event_id": s["event_id"],
-                            "created_at": s["created_at"].isoformat() if s.get("created_at") else None
-                        }
-                        for s in snapshots
+                        WHERE s.user_id = :user_id
+                        """),
+                    {"user_id": user_id}
+                )
+                total = count_result.first()._mapping["total"]
+            
+            return {
+                "snapshots": [
+                    {
+                        "snapshot_id": s["snapshot_id"],
+                        "session_id": s["session_id"],
+                        "event_id": s["event_id"],
+                        "created_at": s["created_at"].isoformat() if s.get("created_at") else None
+                    }
+                    for s in snapshots
                     ],
                     "total": total,
                     "limit": limit,

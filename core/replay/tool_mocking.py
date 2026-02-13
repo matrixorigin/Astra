@@ -101,33 +101,35 @@ class ToolMockingLayer:
         Loads all skill invocation events from the session and builds
         a lookup table: (skill_id, params) -> result
         """
-        with self.db.get_cursor() as cursor:
-            cursor.execute(
-                """
+        from sqlalchemy import text
+        
+        result = self.db.execute(
+            text("""
                 SELECT skill_name, skill_version, metadata, skill_result
                 FROM conversation_events
-                WHERE session_id = %s 
+                WHERE session_id = :session_id 
                   AND event_type = 'skill_invocation'
                   AND skill_result IS NOT NULL
                 ORDER BY created_at
-                """,
-                (self.session_id,)
-            )
+                """),
+            {"session_id": self.session_id}
+        )
+        
+        events = result.fetchall()
+        
+        for event in events:
+            row = event._mapping
+            # Parse metadata to get params
+            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
+            params = metadata.get("skill_params", {})
             
-            events = cursor.fetchall()
+            # Build lookup key
+            key = self._make_key(row["skill_name"], params)
             
-            for event in events:
-                # Parse metadata to get params
-                metadata = json.loads(event["metadata"]) if event["metadata"] else {}
-                params = metadata.get("skill_params", {})
-                
-                # Build lookup key
-                key = self._make_key(event["skill_name"], params)
-                
-                # Store result
-                self.recorded_results[key] = json.loads(event["skill_result"]) if event["skill_result"] else None
-            
-            logger.info(f"Loaded {len(self.recorded_results)} recorded skill results for session {self.session_id}")
+            # Store result
+            self.recorded_results[key] = json.loads(row["skill_result"]) if row["skill_result"] else None
+        
+        logger.info(f"Loaded {len(self.recorded_results)} recorded skill results for session {self.session_id}")
     
     def _make_key(self, skill_id: str, params: Dict[str, Any]) -> str:
         """Create lookup key for skill invocation

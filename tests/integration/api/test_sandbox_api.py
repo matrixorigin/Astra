@@ -13,7 +13,6 @@ from api.database import get_db_session
 from api.repositories import UserRepository
 from core.auth.jwt_manager import create_access_token
 from core.sandbox import Sandbox
-from sdk import Database
 
 
 # pytestmark = pytest.mark.skip(reason="需要完整的MatrixOne环境和清理逻辑")
@@ -98,7 +97,7 @@ def auth_headers(auth_token):
 def cleanup_sandboxes():
     """Cleanup test sandboxes before and after"""
     # Cleanup before test
-    db = Database()
+    db = next(get_db_session())
     sandbox = Sandbox(db=db)
     sandboxes = sandbox.list_sandboxes(prefix="", pattern="test_sandbox_%")
     for s in sandboxes:
@@ -116,8 +115,6 @@ def cleanup_sandboxes():
             sandbox.delete(s["sandbox_name"])
         except:
             pass
-    
-    # Cleanup after test
     sandboxes = sandbox.list_sandboxes(pattern="test_sandbox_%")
     for s in sandboxes:
         try:
@@ -139,6 +136,9 @@ class TestCreateSandbox:
             },
             headers=auth_headers
         )
+        
+        if response.status_code != 201:
+            print(f"Error response: {response.json()}")
         
         assert response.status_code == 201
         data = response.json()

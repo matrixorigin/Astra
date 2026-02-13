@@ -19,7 +19,6 @@ from api.repositories import SessionRepository, EventRepository
 from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
 from core.auth.audit_logger import AuditLogger
 from core.replay.tool_mocking import ToolMockingLayer, ExecutionMode
-from sdk import Database
 
 
 class ReplayService:
@@ -40,8 +39,7 @@ class ReplayService:
         self.db_session = db_session
         self.session_repo = SessionRepository(db_session)
         self.event_repo = EventRepository(db_session)
-        self.db = Database()
-        self.audit = AuditLogger(self.db)
+        self.audit = AuditLogger(db_session)
     
     def replay_session(
         self,
@@ -194,7 +192,7 @@ class ReplayService:
         execution_mode = ExecutionMode.REPLAY if mock_mode else ExecutionMode.PRODUCTION
         mocker = ToolMockingLayer(
             mode=execution_mode,
-            db=self.db,
+            db=self.db_session,
             session_id=event.session_id if mock_mode else None
         )
         

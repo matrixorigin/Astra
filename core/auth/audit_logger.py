@@ -4,13 +4,14 @@ import json
 from datetime import datetime
 from typing import Any
 
-from sdk import Database
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 
 class AuditLogger:
     """Log admin operations to audit_logs table."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Session):
         self.db = db
 
     def log(
@@ -29,22 +30,23 @@ class AuditLogger:
         log_id = f"log_{uuid.uuid4().hex[:16]}"
 
         self.db.execute(
-            """
+            text("""
             INSERT INTO agent_config.audit_logs
             (log_id, user_id, action, resource_type, resource_id, new_value, status, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                log_id,
-                user_id,
-                action,
-                resource_type,
-                resource_id,
-                json.dumps(details) if details else None,
-                status,
-                datetime.now(),
-            ),
+            VALUES (:log_id, :user_id, :action, :resource_type, :resource_id, :new_value, :status, :created_at)
+            """),
+            {
+                "log_id": log_id,
+                "user_id": user_id,
+                "action": action,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "new_value": json.dumps(details) if details else None,
+                "status": status,
+                "created_at": datetime.now(),
+            }
         )
+        self.db.commit()
 
     def log_model_add(self, user_id: str, model_name: str, scope: str, scope_id: str | None = None):
         """Log model addition."""

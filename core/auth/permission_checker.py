@@ -1,12 +1,13 @@
 """Permission checker using MatrixOne RBAC."""
 
-from sdk import Database
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 
 class PermissionChecker:
     """Check user permissions using MatrixOne RBAC."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Session):
         self.db = db
 
     def has_role(self, user_id: str, role_name: str) -> bool:
@@ -16,10 +17,11 @@ class PermissionChecker:
         FROM mo_catalog.mo_user_grant ug
         JOIN mo_catalog.mo_user u ON ug.user_id = u.user_id
         JOIN mo_catalog.mo_role r ON ug.role_id = r.role_id
-        WHERE u.user_name = %s AND r.role_name = %s
+        WHERE u.user_name = :user_id AND r.role_name = :role_name
         """
-        row = self.db.fetchone(query, (user_id, role_name))
-        return bool(row and row.get("cnt", 0) > 0)
+        result = self.db.execute(text(query), {"user_id": user_id, "role_name": role_name})
+        row = result.first()
+        return bool(row and row._mapping.get("cnt", 0) > 0)
 
     def is_admin(self, user_id: str) -> bool:
         """Check if user is mo_agent_admin."""

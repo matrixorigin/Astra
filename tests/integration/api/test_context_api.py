@@ -104,6 +104,9 @@ def test_create_snapshot_success(client, auth_headers, test_session):
         },
     )
 
+    if response.status_code != 201:
+        print(f"Error: {response.json()}")
+    
     assert response.status_code == 201
     data = response.json()
     assert "snapshot_id" in data

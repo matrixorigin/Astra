@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from api.repositories import SessionRepository
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
-from sdk import Database
+# from sdk import Database
 
 
 class SessionService:
@@ -16,9 +16,9 @@ class SessionService:
     def __init__(self, db_session: Session):
         self.db_session = db_session
         self.session_repo = SessionRepository(db_session)
-        self.db = Database()  # For audit and permission
-        self.audit = AuditLogger(self.db)
-        self.permission = PermissionChecker(self.db)
+        # self.db = Database()  # For audit and permission
+        self.audit = AuditLogger(db_session)
+        self.permission = PermissionChecker(db_session)
     
     def create_session(
         self,

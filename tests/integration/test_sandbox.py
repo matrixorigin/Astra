@@ -3,13 +3,13 @@
 import pytest
 from uuid_utils import uuid7
 
+from api.database import get_db_session
 from core.sandbox import Sandbox
-from sdk import Database
 
 
 @pytest.fixture
 def db():
-    return Database()
+    return next(get_db_session())
 
 
 @pytest.fixture
@@ -71,62 +71,89 @@ def test_create_from_snapshot(sandbox, db):
 
 def test_isolation(sandbox, db):
     """Test sandbox isolation."""
+    from sqlalchemy import text
+    
     name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
     # Create table in main and clean up any existing test data
-    db.execute("CREATE TABLE IF NOT EXISTS test_iso (id INT)")
-    db.execute("DELETE FROM test_iso")
+    db.execute(text("CREATE TABLE IF NOT EXISTS test_iso (id INT)"))
+    db.execute(text("DELETE FROM test_iso"))
+    db.commit()
 
     # Insert test data
-    db.execute("INSERT INTO test_iso VALUES (1)")
+    db.execute(text("INSERT INTO test_iso VALUES (1)"))
+    db.commit()
 
     # Create sandbox
     sandbox.create(name)
     
     # Clean sandbox data (it clones from main, so may have old data)
-    db.execute(f"DELETE FROM {name}.test_iso")
-    db.execute(f"INSERT INTO {name}.test_iso VALUES (1)")  # Start with same data as main
+    db.execute(text(f"DELETE FROM {name}.test_iso"))
+    db.execute(text(f"INSERT INTO {name}.test_iso VALUES (1)"))  # Start with same data as main
+    db.commit()
 
     # Modify sandbox
-    db.execute(f"INSERT INTO {name}.test_iso VALUES (2)")
+    db.execute(text(f"INSERT INTO {name}.test_iso VALUES (2)"))
+    db.commit()
 
     # Verify isolation
-    current_db = db.fetchone("SELECT DATABASE() as db")["db"]
-    main_count = db.fetchone(f"SELECT COUNT(*) as count FROM {current_db}.test_iso")["count"]
-    sandbox_count = db.fetchone(f"SELECT COUNT(*) as count FROM {name}.test_iso")["count"]
+    result = db.execute(text("SELECT DATABASE() as db"))
+    current_db = result.first()._mapping["db"]
+    
+    result = db.execute(text(f"SELECT COUNT(*) as count FROM {current_db}.test_iso"))
+    main_count = result.first()._mapping["count"]
+    
+    result = db.execute(text(f"SELECT COUNT(*) as count FROM {name}.test_iso"))
+    sandbox_count = result.first()._mapping["count"]
 
     assert main_count == 1
     assert sandbox_count == 2
 
     # Cleanup
     sandbox.delete(name)
-    db.execute("DROP TABLE IF EXISTS test_iso")
+    db.execute(text("DROP TABLE IF EXISTS test_iso"))
+    db.commit()
 
 
 def test_clone_table(sandbox, db):
     """Test table cloning."""
+    from sqlalchemy import text
+    
+    # Cleanup first
+    db.commit()
+    db.execute(text("DROP TABLE IF EXISTS test_clone_src"))
+    db.execute(text("DROP TABLE IF EXISTS test_clone_dst"))
+    db.commit()
+    
     # Create source table
-    db.execute("CREATE TABLE IF NOT EXISTS test_clone_src (id INT)")
-    db.execute("INSERT INTO test_clone_src VALUES (1), (2)")
+    db.execute(text("CREATE TABLE IF NOT EXISTS test_clone_src (id INT)"))
+    db.execute(text("INSERT INTO test_clone_src VALUES (1), (2)"))
+    db.commit()
 
     # Clone table
     sandbox.clone_table("test_clone_dst", "test_clone_src")
 
     # Verify
-    count = db.fetchone("SELECT COUNT(*) as count FROM test_clone_dst")["count"]
+    result = db.execute(text("SELECT COUNT(*) as count FROM test_clone_dst"))
+    count = result.first()._mapping["count"]
     assert count == 2
 
     # Cleanup
-    db.execute("DROP TABLE IF EXISTS test_clone_src")
-    db.execute("DROP TABLE IF EXISTS test_clone_dst")
+    db.commit()
+    db.execute(text("DROP TABLE IF EXISTS test_clone_src"))
+    db.execute(text("DROP TABLE IF EXISTS test_clone_dst"))
+    db.commit()
 
 
 def test_add_remove_table(sandbox, db):
     """Test add/remove table."""
+    from sqlalchemy import text
+    
     name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
     # Create empty sandbox (no tables)
-    db.execute(f"CREATE DATABASE {name}")
+    db.commit()
+    db.execute(text(f"CREATE DATABASE {name}"))
 
     # Add table
     sandbox.add_table(name, "conversation_events")
@@ -158,6 +185,8 @@ def test_sandbox_info(sandbox, db):
 
 def test_sandbox_snapshot(sandbox, db):
     """Test sandbox snapshot and restore."""
+    from sqlalchemy import text
+    
     name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
     # Create sandbox
@@ -172,7 +201,8 @@ def test_sandbox_snapshot(sandbox, db):
     assert any(s["name"] == "snap1" for s in snapshots)
 
     # Modify sandbox
-    db.execute(f"DROP TABLE IF EXISTS {name}.conversation_events")
+    db.commit()
+    db.execute(text(f"DROP TABLE IF EXISTS {name}.conversation_events"))
 
     # Restore
     sandbox.restore(name, "snap1")
@@ -191,6 +221,8 @@ def test_sandbox_snapshot(sandbox, db):
 
 def test_use_sandbox(sandbox, db):
     """Test switching to sandbox."""
+    from sqlalchemy import text
+    
     name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
     # Insert test data directly
@@ -198,13 +230,23 @@ def test_use_sandbox(sandbox, db):
     from datetime import datetime, timezone
     
     db.execute(
-        """
+        text("""
         INSERT INTO conversation_events 
         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (str(uuid4()), "test_session", "test", "system", "1.0.0", "user_query", "test", datetime.now(timezone.utc))
+        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :created_at)
+        """),
+        {
+            "event_id": str(uuid4()),
+            "session_id": "test_session",
+            "user_id": "test",
+            "agent_id": "system",
+            "agent_version": "1.0.0",
+            "event_type": "user_query",
+            "content": "test",
+            "created_at": datetime.now(timezone.utc)
+        }
     )
+    db.commit()
 
     # Create sandbox (clones current data)
     sandbox.create(name)
@@ -213,7 +255,8 @@ def test_use_sandbox(sandbox, db):
     sandbox.use(name)
 
     # Query in sandbox (no need to prefix with sandbox name)
-    count = db.fetchone("SELECT COUNT(*) as count FROM conversation_events")["count"]
+    result = db.execute(text("SELECT COUNT(*) as count FROM conversation_events"))
+    count = result.first()._mapping["count"]
     assert count > 0
 
     # Switch back to main

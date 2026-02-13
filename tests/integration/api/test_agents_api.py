@@ -46,6 +46,10 @@ def test_create_and_list_agents(client, auth_token):
         "name": "Test Agent",
         "agent_config": {"model": "gpt-4"}
     })
+    
+    if response.status_code != 201:
+        print(f"Error: {response.json()}")
+    
     assert response.status_code == 201
     agent = response.json()
     assert agent["name"] == "Test Agent"

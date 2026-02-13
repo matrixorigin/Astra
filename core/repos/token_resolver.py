@@ -1,5 +1,4 @@
 """Token resolution service.
-from sqlalchemy import text
 
 Implements the token resolution priority from design doc:
 1. Repo-specific token
@@ -11,17 +10,19 @@ Implements the token resolution priority from design doc:
 import json
 from datetime import datetime, timezone
 
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
+from api.database import get_db_session
 from core.repos.token_models import Token, TokenType
-from sdk import Database
 
 
 class TokenResolver:
     """Token resolution service."""
 
-    def __init__(self, db: Database | None = None) -> None:
-        self.db = db or Database()
+    def __init__(self, db: Session | None = None) -> None:
+        self.db = db or next(get_db_session())
 
     def resolve_repo_token(
         self,

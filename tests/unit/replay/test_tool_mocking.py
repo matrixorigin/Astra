@@ -27,7 +27,11 @@ class TestToolMockingLayer:
     def mock_db(self):
         """Create mock database"""
         db = Mock()
-        cursor = Mock()
+        # Mock execute().fetchall() pattern
+        result_mock = Mock()
+        result_mock.fetchall.return_value = []
+        db.execute.return_value = result_mock
+        return db
         cursor.__enter__ = Mock(return_value=cursor)
         cursor.__exit__ = Mock(return_value=False)
         db.get_cursor = Mock(return_value=cursor)
@@ -48,16 +52,18 @@ class TestToolMockingLayer:
     
     def test_replay_mode_returns_recorded_result(self, mock_db):
         """Test replay mode returns recorded results"""
-        # Setup mock cursor to return recorded event
-        cursor = mock_db.get_cursor().__enter__()
-        cursor.fetchall.return_value = [
-            {
-                "skill_name": "test_skill",
-                "skill_version": "1.0.0",
-                "metadata": json.dumps({"skill_params": {"param": "value"}}),
-                "skill_result": json.dumps({"status": "recorded"})
-            }
-        ]
+        # Setup mock to return recorded event
+        mock_row = Mock()
+        mock_row._mapping = {
+            "skill_name": "test_skill",
+            "skill_version": "1.0.0",
+            "metadata": json.dumps({"skill_params": {"param": "value"}}),
+            "skill_result": json.dumps({"status": "recorded"})
+        }
+        
+        result_mock = Mock()
+        result_mock.fetchall.return_value = [mock_row]
+        mock_db.execute.return_value = result_mock
         
         mocker = ToolMockingLayer(
             mode=ExecutionMode.REPLAY,
@@ -71,8 +77,9 @@ class TestToolMockingLayer:
     
     def test_replay_mode_missing_result_raises_error(self, mock_db):
         """Test replay mode raises error when no recorded result"""
-        cursor = mock_db.get_cursor().__enter__()
-        cursor.fetchall.return_value = []
+        result_mock = Mock()
+        result_mock.fetchall.return_value = []
+        mock_db.execute.return_value = result_mock
         
         mocker = ToolMockingLayer(
             mode=ExecutionMode.REPLAY,
@@ -146,21 +153,24 @@ class TestToolMockingLayer:
     
     def test_load_multiple_recorded_results(self, mock_db):
         """Test loading multiple recorded results"""
-        cursor = mock_db.get_cursor().__enter__()
-        cursor.fetchall.return_value = [
-            {
-                "skill_name": "skill1",
-                "skill_version": "1.0.0",
-                "metadata": json.dumps({"skill_params": {"id": 1}}),
-                "skill_result": json.dumps({"result": "first"})
-            },
-            {
-                "skill_name": "skill2",
-                "skill_version": "1.0.0",
-                "metadata": json.dumps({"skill_params": {"id": 2}}),
-                "skill_result": json.dumps({"result": "second"})
-            }
-        ]
+        mock_row1 = Mock()
+        mock_row1._mapping = {
+            "skill_name": "skill1",
+            "skill_version": "1.0.0",
+            "metadata": json.dumps({"skill_params": {"id": 1}}),
+            "skill_result": json.dumps({"result": "first"})
+        }
+        mock_row2 = Mock()
+        mock_row2._mapping = {
+            "skill_name": "skill2",
+            "skill_version": "1.0.0",
+            "metadata": json.dumps({"skill_params": {"id": 2}}),
+            "skill_result": json.dumps({"result": "second"})
+        }
+        
+        result_mock = Mock()
+        result_mock.fetchall.return_value = [mock_row1, mock_row2]
+        mock_db.execute.return_value = result_mock
         
         mocker = ToolMockingLayer(
             mode=ExecutionMode.REPLAY,

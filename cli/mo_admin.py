@@ -11,10 +11,10 @@ import click
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from api.database import get_db_session
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
 from core.llm.models import LLMProvider
-from sdk import Database
 
 
 @click.group()
@@ -25,9 +25,10 @@ def cli(ctx, user):
     """mo-admin - Administrative CLI for mo-agent-engine."""
     ctx.ensure_object(dict)
     ctx.obj["user"] = user or "admin"
-    ctx.obj["db"] = Database()
-    ctx.obj["checker"] = PermissionChecker(ctx.obj["db"])
-    ctx.obj["audit"] = AuditLogger(ctx.obj["db"])
+    db = next(get_db_session())
+    ctx.obj["db"] = db
+    ctx.obj["checker"] = PermissionChecker(db)
+    ctx.obj["audit"] = AuditLogger(db)
 
 
 @cli.group()
@@ -101,23 +102,25 @@ def model_add(
         }
 
         # Insert into model_registry
+        from sqlalchemy import text
         db.execute(
-            """
+            text("""
             INSERT INTO agent_config.model_registry
             (config_id, scope_type, scope_id, model_name, provider, config_json, created_by, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                config_id,
-                scope,
-                scope_id,
-                model_name,
-                provider,
-                json.dumps(config),
-                user,
-                datetime.now(),
-            ),
+            VALUES (:config_id, :scope, :scope_id, :model_name, :provider, :config_json, :user, :created_at)
+            """),
+            {
+                "config_id": config_id,
+                "scope": scope,
+                "scope_id": scope_id,
+                "model_name": model_name,
+                "provider": provider,
+                "config_json": json.dumps(config),
+                "user": user,
+                "created_at": datetime.now(),
+            }
         )
+        db.commit()
 
         # Audit log
         audit.log_model_add(user, model_name, scope, scope_id)
@@ -159,19 +162,22 @@ def model_remove(ctx, model_name, scope, scope_id, force):
 
     try:
         # Check if model exists
+        from sqlalchemy import text
+        
         query = """
         SELECT * FROM agent_config.model_registry
-        WHERE model_name = %s AND scope_type = %s
+        WHERE model_name = :model_name AND scope_type = :scope
         """
-        params = [model_name, scope]
+        params = {"model_name": model_name, "scope": scope}
 
         if scope_id:
-            query += " AND scope_id = %s"
-            params.append(scope_id)
+            query += " AND scope_id = :scope_id"
+            params["scope_id"] = scope_id
         else:
             query += " AND scope_id IS NULL"
 
-        row = db.fetchone(query, tuple(params))
+        result = db.execute(text(query), params)
+        row = result.first()
 
         if not row:
             click.echo(f"❌ Model '{model_name}' not found in {scope} scope")
@@ -185,8 +191,10 @@ def model_remove(ctx, model_name, scope, scope_id, force):
 
         # Delete
         db.execute(
-            "DELETE FROM agent_config.model_registry WHERE config_id = %s", (row["config_id"],)
+            text("DELETE FROM agent_config.model_registry WHERE config_id = :config_id"),
+            {"config_id": row._mapping["config_id"]}
         )
+        db.commit()
 
         # Audit log
         audit.log_model_remove(user, model_name, scope, scope_id)
@@ -206,26 +214,29 @@ def model_remove(ctx, model_name, scope, scope_id, force):
 @click.pass_context
 def model_list(ctx, scope, scope_id):
     """List all models."""
+    from sqlalchemy import text
+    
     db = ctx.obj["db"]
 
     query = "SELECT * FROM agent_config.model_registry"
     conditions = []
-    params = []
+    params = {}
 
     if scope:
-        conditions.append("scope_type = %s")
-        params.append(scope)
+        conditions.append("scope_type = :scope")
+        params["scope"] = scope
 
     if scope_id:
-        conditions.append("scope_id = %s")
-        params.append(scope_id)
+        conditions.append("scope_id = :scope_id")
+        params["scope_id"] = scope_id
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
 
     query += " ORDER BY scope_type, model_name"
 
-    models = db.fetchall(query, tuple(params))
+    result = db.execute(text(query), params)
+    models = [dict(row._mapping) for row in result]
 
     if not models:
         click.echo("No models found")
@@ -286,23 +297,25 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
         scope_tenant_id = scope_id if scope == "account" else None
 
         # Insert into tokens table (not agent_config.api_tokens)
+        from sqlalchemy import text
         db.execute(
-            """
+            text("""
             INSERT INTO tokens
             (token_id, type, provider, scope_user_id, scope_tenant_id, 
              encrypted_value, is_active, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, TRUE, %s)
-            """,
-            (
-                token_id,
-                token_type,
-                provider,
-                scope_user_id,
-                scope_tenant_id,
-                token_value,
-                datetime.now(),
-            ),
+            VALUES (:token_id, :token_type, :provider, :scope_user_id, :scope_tenant_id, :token_value, TRUE, :created_at)
+            """),
+            {
+                "token_id": token_id,
+                "token_type": token_type,
+                "provider": provider,
+                "scope_user_id": scope_user_id,
+                "scope_tenant_id": scope_tenant_id,
+                "token_value": token_value,
+                "created_at": datetime.now(),
+            }
         )
+        db.commit()
 
         # Audit log
         audit.log_token_create(user, token_type, provider, scope)
@@ -321,6 +334,8 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
 @click.pass_context
 def token_list(ctx, scope, scope_id):
     """List API tokens (values hidden)."""
+    from sqlalchemy import text
+    
     db = ctx.obj["db"]
 
     query = """
@@ -329,20 +344,21 @@ def token_list(ctx, scope, scope_id):
         FROM tokens
         WHERE 1=1
     """
-    params = []
+    params = {}
 
     if scope == "user" and scope_id:
-        query += " AND scope_user_id = %s"
-        params.append(scope_id)
+        query += " AND scope_user_id = :scope_id"
+        params["scope_id"] = scope_id
     elif scope == "account" and scope_id:
-        query += " AND scope_tenant_id = %s"
-        params.append(scope_id)
+        query += " AND scope_tenant_id = :scope_id"
+        params["scope_id"] = scope_id
     elif scope == "global":
         query += " AND scope_user_id IS NULL AND scope_tenant_id IS NULL"
 
     query += " ORDER BY created_at DESC"
 
-    tokens = db.fetchall(query, tuple(params))
+    result = db.execute(text(query), params)
+    tokens = [dict(row._mapping) for row in result]
 
     if not tokens:
         click.echo("No tokens found")

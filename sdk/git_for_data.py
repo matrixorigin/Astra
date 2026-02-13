@@ -3,7 +3,10 @@
 Provides snapshot, restore, and time-travel capabilities.
 """
 
-from sdk.database import Database
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from api.database import get_db_session
 
 
 class GitForData:
@@ -13,13 +16,13 @@ class GitForData:
     Based on MatrixOne v3.0+ Git for Data features.
     """
 
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, db: Session | None = None) -> None:
         """Initialize Git for Data manager.
 
         Args:
-            db: Database instance. If None, creates a new one.
+            db: Session instance. If None, creates a new one.
         """
-        self.db = db or Database()
+        self.db = db or next(get_db_session())
 
     def create_snapshot(self, snapshot_name: str, account: str = "sys") -> dict:
         """Create a snapshot of the current database state.
@@ -36,8 +39,9 @@ class GitForData:
             >>> snapshot = git.create_snapshot("before_experiment")
             >>> print(snapshot["snapshot_name"])
         """
+        self.db.commit()  # Commit before DDL
         query = f"CREATE SNAPSHOT {snapshot_name} FOR ACCOUNT {account}"
-        self.db.execute(query)
+        self.db.execute(text(query))
 
         # Get snapshot info
         snapshots = self.list_snapshots()
@@ -51,22 +55,24 @@ class GitForData:
         Returns:
             list[dict]: List of snapshots with metadata
         """
+        self.db.commit()  # Commit before DDL
         query = "SHOW SNAPSHOTS"
-        rows = self.db.fetchall(query)
+        result = self.db.execute(text(query))
         return [
             {
-                "snapshot_name": row["SNAPSHOT_NAME"],
-                "timestamp": row["TIMESTAMP"],
-                "snapshot_level": row["SNAPSHOT_LEVEL"],
-                "account_name": row["ACCOUNT_NAME"],
-                "database_name": row.get("DATABASE_NAME"),
-                "table_name": row.get("TABLE_NAME"),
+                "snapshot_name": row._mapping["SNAPSHOT_NAME"],
+                "timestamp": row._mapping["TIMESTAMP"],
+                "snapshot_level": row._mapping["SNAPSHOT_LEVEL"],
+                "account_name": row._mapping["ACCOUNT_NAME"],
+                "database_name": row._mapping.get("DATABASE_NAME"),
+                "table_name": row._mapping.get("TABLE_NAME"),
+                "ts": row._mapping.get("TIMESTAMP"),  # Alias for compatibility
             }
-            for row in rows
+            for row in result
         ]
 
     def query_at_snapshot(
-        self, query: str, snapshot_name: str, params: tuple | None = None
+        self, query: str, snapshot_name: str, params: dict | None = None
     ) -> list[dict]:
         """Execute a query at a specific snapshot (time-travel query).
 
@@ -76,7 +82,7 @@ class GitForData:
         Args:
             query: SQL query (must be SELECT)
             snapshot_name: Snapshot to query
-            params: Optional query parameters
+            params: Optional query parameters (dict for named params)
 
         Returns:
             list[dict]: Query results
@@ -84,9 +90,9 @@ class GitForData:
         Example:
             >>> git = GitForData()
             >>> results = git.query_at_snapshot(
-            ...     "SELECT * FROM conversation_events WHERE session_id = %s",
+            ...     "SELECT * FROM conversation_events WHERE session_id = :session_id",
             ...     "my_checkpoint",
-            ...     ("session_123",)
+            ...     {"session_id": "session_123"}
             ... )
         """
         # Inject snapshot syntax into query
@@ -110,7 +116,8 @@ class GitForData:
         else:
             modified_query = query
 
-        return self.db.fetchall(modified_query, params)
+        result = self.db.execute(text(modified_query), params or {})
+        return [dict(row._mapping) for row in result]
 
     def restore_from_snapshot(self, snapshot_name: str, account: str = "sys") -> None:
         """Restore database state from a snapshot.
@@ -123,8 +130,9 @@ class GitForData:
             This operation will restore the entire account state.
             All changes after the snapshot will be lost.
         """
+        self.db.commit()  # Commit before DDL
         query = f"RESTORE ACCOUNT {account} FROM SNAPSHOT {snapshot_name}"
-        self.db.execute(query)
+        self.db.execute(text(query))
 
     def drop_snapshot(self, snapshot_name: str) -> None:
         """Delete a snapshot.
@@ -132,8 +140,9 @@ class GitForData:
         Args:
             snapshot_name: Name of the snapshot to delete
         """
+        self.db.commit()  # Commit before DDL
         query = f"DROP SNAPSHOT {snapshot_name}"
-        self.db.execute(query)
+        self.db.execute(text(query))
 
     def get_snapshot_info(self, snapshot_name: str) -> dict | None:
         """Get information about a specific snapshot.

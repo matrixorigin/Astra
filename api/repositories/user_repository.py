@@ -15,6 +15,10 @@ class UserRepository:
     
     def create(self, user_data: dict) -> UserModel:
         """Create user."""
+        # Set default values for required fields
+        if 'is_active' not in user_data:
+            user_data['is_active'] = True
+        
         user = UserModel(**user_data)
         self.db.add(user)
         self.db.commit()
