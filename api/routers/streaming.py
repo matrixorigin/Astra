@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from api.dependencies import get_current_user
 from api.database import get_db_session
@@ -17,7 +18,6 @@ from core.events.event_logger import EventLogger
 from core.verification.firewall import HallucinationFirewall
 from core.llm.client import LLMClient
 from core.logging_config import get_logger
-from sdk import Database
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -36,7 +36,7 @@ class StreamChatRequest(BaseModel):
 async def stream_chat(
     request: StreamChatRequest,
     current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Database, Depends(get_db_session)],
+    db: Annotated[Session, Depends(get_db_session)],
 ):
     """Stream chat response as Server-Sent Events.
 
@@ -58,21 +58,25 @@ async def stream_chat(
     user_id = current_user["user_id"]
 
     # Verify session exists and belongs to user
-    session = db.fetchone(
-        "SELECT session_id FROM conversation_sessions WHERE session_id = %s",
-        (request.session_id,),
+    from sqlalchemy import text
+    result = db.execute(
+        text("SELECT session_id FROM sessions WHERE session_id = :session_id"),
+        {"session_id": request.session_id},
     )
+    session = result.first()
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Initialize components
-    db = Database()
+    # Initialize components with injected db session
+    from core.skills.registry import SkillRegistry
+    
     event_logger = EventLogger(db)
     llm_client = LLMClient()
-    selector = AgentSkillSelector(db, llm_client, auditable=True, session_id=request.session_id)
-    executor = AgentExecutor(db)
+    skill_registry = SkillRegistry(db)
     context_manager = ContextManager(db)
-    firewall = HallucinationFirewall(db)
+    selector = AgentSkillSelector(db, llm_client, auditable=True, session_id=request.session_id)
+    executor = AgentExecutor(db, skill_registry)
+    firewall = HallucinationFirewall(db, context_manager)
     
     chat_loop = ChatLoop(
         selector=selector,

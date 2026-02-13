@@ -10,9 +10,11 @@ from core.events.models import StreamEvent, StreamEventType
 
 @pytest.fixture
 def mock_db():
-    """Mock database."""
+    """Mock database - SQLAlchemy style."""
     db = MagicMock()
-    db.fetchone.return_value = {"session_id": "sess_123"}
+    mock_result = MagicMock()
+    mock_result.first.return_value = MagicMock(session_id="sess_123")
+    db.execute.return_value = mock_result
     return db
 
 
@@ -100,9 +102,11 @@ class TestStreamingAPI:
         """Test streaming with non-existent session."""
         from api.routers.streaming import stream_chat, StreamChatRequest
 
-        # Mock DB with no session
+        # Mock DB with no session - SQLAlchemy style
         mock_db = MagicMock()
-        mock_db.fetchone.return_value = None
+        mock_result = MagicMock()
+        mock_result.first.return_value = None  # No session found
+        mock_db.execute.return_value = mock_result
 
         # Create request
         request = StreamChatRequest(
