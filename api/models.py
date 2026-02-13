@@ -98,6 +98,8 @@ class Event(Base):
     llm_params = Column(JSON)
     skill_name = Column(String(255))
     skill_version = Column(String(32))
+    skill_result = Column(JSON)
+    side_effects = Column(JSON)
 
 
 class PromptTemplate(Base):
