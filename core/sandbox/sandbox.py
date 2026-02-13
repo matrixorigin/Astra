@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from sdk.git_for_data import GitForData
+from core.validation import validate_identifier
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -35,6 +36,11 @@ class Sandbox:
     ) -> None:
         """Create sandbox with metadata."""
         import json
+
+        # Validate inputs to prevent SQL injection
+        validate_identifier(name)
+        if from_snapshot:
+            validate_identifier(from_snapshot)
 
         # DDL commands need to be outside transaction
         self.db.commit()  # Commit any pending transaction
@@ -85,6 +91,9 @@ class Sandbox:
             >>> sandbox.delete("exp1")
             >>> # Deletes: exp1 database + all exp1_* snapshots + metadata
         """
+        # Validate to prevent SQL injection
+        validate_identifier(name)
+        
         # Delete all snapshots for this sandbox
         snapshots = self.list_snapshots(name)
         for snapshot in snapshots:
@@ -201,10 +210,17 @@ class Sandbox:
 
     def use(self, sandbox: str) -> None:
         """Switch to sandbox database."""
+        validate_identifier(sandbox)
         self.db.execute(text(f"USE {sandbox}"))
 
     def clone_table(self, target: str, source: str, snapshot: str | None = None) -> None:
         """Clone table (zero-copy)."""
+        # Validate identifiers
+        validate_identifier(target, allow_dot=True)
+        validate_identifier(source, allow_dot=True)
+        if snapshot:
+            validate_identifier(snapshot)
+            
         self.db.commit()  # Commit before DDL
         self.db.execute(text(f"DROP TABLE IF EXISTS {target}"))
         if snapshot:

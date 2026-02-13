@@ -7,6 +7,46 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 
+def validate_identifier(name: str, max_length: int = 64, allow_dot: bool = False) -> str:
+    """Validate SQL identifier (database, table, column name) to prevent SQL injection.
+    
+    Args:
+        name: Identifier to validate
+        max_length: Maximum allowed length
+        allow_dot: Allow dots in name (for qualified names like db.table)
+        
+    Returns:
+        Validated identifier
+        
+    Raises:
+        ValueError: If identifier is invalid
+        
+    Example:
+        >>> validate_identifier("my_table")
+        'my_table'
+        >>> validate_identifier("dev_agent.events", allow_dot=True)
+        'dev_agent.events'
+        >>> validate_identifier("'; DROP TABLE users--")
+        ValueError: Invalid identifier
+    """
+    if not name:
+        raise ValueError("Identifier cannot be empty")
+    
+    if len(name) > max_length:
+        raise ValueError(f"Identifier too long (max {max_length} characters)")
+    
+    # Allow alphanumeric, underscore, and optionally dot
+    pattern = r'^[a-zA-Z0-9_.]+$' if allow_dot else r'^[a-zA-Z0-9_]+$'
+    if not re.match(pattern, name):
+        raise ValueError(f"Invalid identifier: {name}. Only alphanumeric characters, underscores{', and dots' if allow_dot else ''} are allowed")
+    
+    # Must start with letter or underscore
+    if not name[0].isalpha() and name[0] != '_':
+        raise ValueError(f"Identifier must start with letter or underscore: {name}")
+    
+    return name
+
+
 class QueryRequest(BaseModel):
     """Query request with validation."""
 
