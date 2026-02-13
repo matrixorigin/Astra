@@ -36,13 +36,15 @@ def registry(db):
 @pytest.fixture(autouse=True)
 def cleanup(db):
     """Clean up test data."""
-    from api.models import Repo
+    from api.models import Repo, Token
     # Clean before test
     db.query(Repo).filter(Repo.repo_url.like('%test/repo%')).delete(synchronize_session=False)
+    db.query(Token).filter(Token.provider == 'github').delete(synchronize_session=False)
     db.commit()
     yield
     # Clean after test
     db.query(Repo).filter(Repo.repo_url.like('%test/repo%')).delete(synchronize_session=False)
+    db.query(Token).filter(Token.provider == 'github').delete(synchronize_session=False)
     db.commit()
 
 

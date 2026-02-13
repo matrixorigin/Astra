@@ -129,10 +129,51 @@ class GitForData:
         Warning:
             This operation will restore the entire account state.
             All changes after the snapshot will be lost.
+            
+        Note:
+            This is a heavy operation that affects the entire account.
+            For testing, consider using query_snapshot() for read-only access.
         """
         self.db.commit()  # Commit before DDL
         query = f"RESTORE ACCOUNT {account} FROM SNAPSHOT {snapshot_name}"
         self.db.execute(text(query))
+
+    def restore_table_from_snapshot(self, table_name: str, snapshot_name: str) -> None:
+        """Restore a single table from snapshot using time-travel queries.
+        
+        This is a lighter alternative to restore_from_snapshot() that only
+        affects one table instead of the entire account.
+        
+        Args:
+            table_name: Name of the table to restore
+            snapshot_name: Name of the snapshot to restore from
+        """
+        from core.validation import validate_identifier
+        
+        # Validate table name to prevent SQL injection
+        validate_identifier(table_name)
+        
+        self.db.commit()  # Ensure clean transaction state
+        
+        # Step 1: Get snapshot timestamp
+        snapshots = self.list_snapshots()
+        snapshot_info = next((s for s in snapshots if s["snapshot_name"] == snapshot_name), None)
+        if not snapshot_info:
+            raise ValueError(f"Snapshot {snapshot_name} not found")
+        
+        snapshot_ts = snapshot_info["timestamp"]
+        
+        # Step 2: Clear current table data
+        self.db.execute(text(f"DELETE FROM {table_name}"))
+        
+        # Step 3: Insert data from snapshot using time-travel query
+        # Note: This uses MatrixOne's {SNAPSHOT = 'name'} syntax
+        insert_query = f"""
+        INSERT INTO {table_name} 
+        SELECT * FROM {table_name} {{SNAPSHOT = '{snapshot_name}'}}
+        """
+        self.db.execute(text(insert_query))
+        self.db.commit()
 
     def drop_snapshot(self, snapshot_name: str) -> None:
         """Delete a snapshot.

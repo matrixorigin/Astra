@@ -204,7 +204,7 @@ def test_sandbox_experiment(sandbox, db):
 
 
 def test_git_for_data_restore(git, db):
-    """Test snapshot restore functionality."""
+    """Test snapshot restore functionality using table-level restore."""
     from sqlalchemy import text
     
     snapshot_name = f"test_restore_{str(uuid7()).replace('-', '_')[:8]}".lower()
@@ -248,8 +248,8 @@ def test_git_for_data_restore(git, db):
     row = result.first()
     assert row._mapping["content"] == "Modified content"
 
-    # Restore from snapshot
-    git.restore_from_snapshot(snapshot_name)
+    # Restore table from snapshot (lightweight operation)
+    git.restore_table_from_snapshot("conversation_events", snapshot_name)
 
     # Verify restoration
     result = db.execute(
