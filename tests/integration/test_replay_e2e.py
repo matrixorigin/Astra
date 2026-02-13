@@ -148,34 +148,30 @@ async def test_e2e_skill_version_replay(
 
     from uuid_utils import uuid7
 
+    from api.models import Event
+    from datetime import datetime, timezone
     event_id = str(uuid7())
-    db.execute(
-        """
-        INSERT INTO conversation_events (
-            event_id, user_id, session_id, agent_id, agent_version,
-            event_type, content, skill_name, skill_version, metadata, created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-    """,
-        (
-            event_id,
-            user_id,
-            session_id,
-            "dev-agent",
-            "0.2.0",
-            "skill_exec",
-            output_v1.summary,
-            skill_v1.name,
-            skill_v1.version,
-            json.dumps(
-                {
-                    "skill": skill_v1.name,
-                    "skill_version": skill_v1.version,
-                    "input": input_data,
-                    "output": output_v1.model_dump(),
-                }
-            ),
-        ),
+    event = Event(
+        event_id=event_id,
+        user_id=user_id,
+        session_id=session_id,
+        agent_id="dev-agent",
+        agent_version="0.2.0",
+        event_type="skill_exec",
+        content=output_v1.summary,
+        skill_name=skill_v1.name,
+        skill_version=skill_v1.version,
+        causal_chain_id=event_id,
+        event_metadata={
+            "skill": skill_v1.name,
+            "skill_version": skill_v1.version,
+            "input": input_data,
+            "output": output_v1.model_dump(),
+        },
+        created_at=datetime.now(timezone.utc),
     )
+    db.add(event)
+    db.commit()
 
     # Verify v1.0.0 output
     assert "1.0.0" in output_v1.summary
@@ -232,34 +228,28 @@ async def test_replay_missing_skill_version(db, registry, github, llm, logger, r
 
     user_id = "test_user"
 
+    from api.models import Event
+    from datetime import datetime, timezone
     event_id = str(uuid7())
-    db.execute(
-        text("""
-        INSERT INTO conversation_events (
-            event_id, user_id, session_id, agent_id, agent_version,
-            event_type, content, skill_name, skill_version, metadata, created_at
-        ) VALUES (:event_id, :user_id, :session_id, :agent_id, :agent_version, 
-                  :event_type, :content, :skill_name, :skill_version, :metadata, NOW())
-    """),
-        {
-            "event_id": event_id,
-            "user_id": user_id,
-            "session_id": session_id,
-            "agent_id": "dev-agent",
-            "agent_version": "0.2.0",
-            "event_type": "skill_exec",
-            "content": "Test content",
-            "skill_name": "nonexistent_skill",
+    event = Event(
+        event_id=event_id,
+        user_id=user_id,
+        session_id=session_id,
+        agent_id="dev-agent",
+        agent_version="0.2.0",
+        event_type="skill_exec",
+        content="Test content",
+        skill_name="nonexistent_skill",
+        skill_version="99.99.99",
+        causal_chain_id=event_id,
+        event_metadata={
+            "skill": "nonexistent_skill",
             "skill_version": "99.99.99",
-            "metadata": json.dumps(
-                {
-                    "skill": "nonexistent_skill",
-                    "skill_version": "99.99.99",
-                    "input": {"test": "data"},
-                }
-            ),
-        }
+            "input": {"test": "data"},
+        },
+        created_at=datetime.now(timezone.utc),
     )
+    db.add(event)
     db.commit()
 
     # Replay should handle missing skill gracefully
@@ -343,33 +333,29 @@ async def test_verify_reproducibility(
 
     from uuid_utils import uuid7
 
+    from api.models import Event
+    from datetime import datetime, timezone
     event_id = str(uuid7())
-    db.execute(
-        """
-        INSERT INTO conversation_events (
-            event_id, user_id, session_id, agent_id, agent_version,
-            event_type, content, skill_name, skill_version, metadata, created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-    """,
-        (
-            event_id,
-            user_id,
-            session_id,
-            "dev-agent",
-            "0.2.0",
-            "skill_exec",
-            output.summary,
-            skill.name,
-            skill.version,
-            json.dumps(
-                {
-                    "skill": skill.name,
-                    "skill_version": skill.version,
-                    "input": input_data,
-                }
-            ),
-        ),
+    event = Event(
+        event_id=event_id,
+        user_id=user_id,
+        session_id=session_id,
+        agent_id="dev-agent",
+        agent_version="0.2.0",
+        event_type="skill_exec",
+        content=output.summary,
+        skill_name=skill.name,
+        skill_version=skill.version,
+        causal_chain_id=event_id,
+        event_metadata={
+            "skill": skill.name,
+            "skill_version": skill.version,
+            "input": input_data,
+        },
+        created_at=datetime.now(timezone.utc),
     )
+    db.add(event)
+    db.commit()
 
     # Verify reproducibility
     verification = replay_engine.verify_reproducibility(session_id)

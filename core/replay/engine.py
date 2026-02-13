@@ -38,21 +38,13 @@ class ReplayEngine:
 
         try:
             # 1. Fetch events
-            query = """
-                SELECT event_id, event_type, content, skill_name, skill_version,
-                       created_at, metadata
-                FROM conversation_events
-                WHERE session_id = %s
-            """
-            params = [session_id]
+            from api.models import Event
+            query = self.db.query(Event).filter(Event.session_id == session_id)
 
             if replay_timestamp:
-                query += " AND created_at <= %s"
-                params.append(replay_timestamp)
+                query = query.filter(Event.created_at <= replay_timestamp)
 
-            query += " ORDER BY created_at"
-
-            events = self.db.fetchall(query, tuple(params))
+            events = query.order_by(Event.created_at).all()
 
             if not events:
                 logger.warning(f"No events found for session {session_id}")
@@ -62,7 +54,17 @@ class ReplayEngine:
 
             # 2. Replay each skill execution event
             results = []
-            for event in events:
+            for event_obj in events:
+                # Convert ORM to dict
+                event = {
+                    "event_id": event_obj.event_id,
+                    "event_type": event_obj.event_type,
+                    "content": event_obj.content,
+                    "skill_name": event_obj.skill_name,
+                    "skill_version": event_obj.skill_version,
+                    "created_at": event_obj.created_at,
+                    "metadata": event_obj.event_metadata,
+                }
                 if event["event_type"] == "skill_exec" and event["skill_name"]:
                     result = await self._replay_skill_execution(event)
                     results.append(result)
@@ -145,7 +147,7 @@ class ReplayEngine:
             }
 
         # 2. Parse original input from metadata
-        metadata = json.loads(event["metadata"]) if event["metadata"] else {}
+        metadata = event["metadata"] if event["metadata"] else {}
         original_input = metadata.get("input", {})
 
         if not original_input:
@@ -203,21 +205,23 @@ class ReplayEngine:
         Returns:
             dict with verification results
         """
-        events = self.db.fetchall(
-            """
-            SELECT event_id, event_type, skill_name, skill_version,
-                   created_at, metadata
-            FROM conversation_events
-            WHERE session_id = %s
-            ORDER BY created_at
-        """,
-            (session_id,),
-        )
+        from api.models import Event
+        events = self.db.query(Event).filter(
+            Event.session_id == session_id
+        ).order_by(Event.created_at).all()
 
         issues = []
         skill_versions_checked = set()
 
-        for event in events:
+        for event_obj in events:
+            # Convert ORM to dict
+            event = {
+                "event_id": event_obj.event_id,
+                "event_type": event_obj.event_type,
+                "skill_name": event_obj.skill_name,
+                "skill_version": event_obj.skill_version,
+                "metadata": event_obj.event_metadata,
+            }
             # Check skill availability
             if event["event_type"] == "skill_exec" and event["skill_name"]:
                 skill_key = f"{event['skill_name']}@{event['skill_version']}"
@@ -236,7 +240,7 @@ class ReplayEngine:
                     skill_versions_checked.add(skill_key)
 
                 # Check input metadata
-                metadata = json.loads(event["metadata"]) if event["metadata"] else {}
+                metadata = event["metadata"] if event["metadata"] else {}
                 if not metadata.get("input"):
                     issues.append(
                         {

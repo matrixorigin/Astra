@@ -102,13 +102,24 @@ class PromptTemplate(Base):
 
 class SkillRegistry(Base):
     __tablename__ = "skills_registry"
-    skill_id = Column(String(64), primary_key=True)
+    skill_id = Column(String(128), primary_key=True)
     skill_name = Column(String(255), nullable=False)
     version = Column(String(32), nullable=False)
-    skill_definition = Column("requirements", JSON)  # Map to 'requirements' column
-    git_commit_hash = Column(String(64), index=True)
-    created_at = Column(DateTime, default=func.now(), nullable=False)
+    description = Column(Text)
+    skill_definition = Column("requirements", JSON)
+    code_hash = Column(String(64))
     is_active = Column(TINYINT(1), server_default="1")
+    status = Column(String(32), server_default="active")
+    category = Column(String(64))
+    subcategory = Column(String(64))
+    triggers = Column(JSON)
+    dependencies = Column(JSON)
+    priority = Column(Integer, server_default="50")
+    cost_estimate = Column(String(32))
+    side_effect_category = Column(String(32))
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    git_commit_hash = Column(String(64), index=True)
 
 
 class ContextSnapshot(Base):

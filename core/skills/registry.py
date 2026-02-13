@@ -85,17 +85,32 @@ class SkillRegistry:
                 # Update existing
                 existing.description = skill.description
                 existing.skill_definition = skill.requirements.model_dump()
+                existing.code_hash = code_hash
                 existing.git_commit_hash = git_commit_hash
                 existing.is_active = 1 if is_active else 0
+                existing.category = category
+                existing.subcategory = subcategory
+                existing.triggers = triggers
+                existing.dependencies = dependencies
+                existing.priority = priority
+                existing.cost_estimate = cost_estimate
             else:
                 # Insert new
                 skill_model = SkillModel(
                     skill_id=skill_id,
                     skill_name=skill.name,
                     version=skill.version,
+                    description=skill.description,
                     skill_definition=skill.requirements.model_dump(),
+                    code_hash=code_hash,
                     git_commit_hash=git_commit_hash,
                     is_active=1 if is_active else 0,
+                    category=category,
+                    subcategory=subcategory,
+                    triggers=triggers,
+                    dependencies=dependencies,
+                    priority=priority,
+                    cost_estimate=cost_estimate,
                 )
                 session.add(skill_model)
             
@@ -202,7 +217,7 @@ class SkillRegistry:
                 ).first()
 
             if skill:
-                return {
+                result = {
                     "skill_id": skill.skill_id,
                     "skill_name": skill.skill_name,
                     "version": skill.version,
@@ -211,6 +226,18 @@ class SkillRegistry:
                     "is_active": skill.is_active,
                     "created_at": skill.created_at,
                 }
+                # Add optional metadata fields
+                if skill.cost_estimate:
+                    result["cost_estimate"] = skill.cost_estimate
+                if skill.triggers:
+                    result["triggers"] = skill.triggers
+                if skill.dependencies:
+                    result["dependencies"] = skill.dependencies
+                if skill.category:
+                    result["category"] = skill.category
+                if skill.priority is not None:
+                    result["priority"] = skill.priority
+                return result
             return None
 
         except Exception as e:

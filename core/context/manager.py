@@ -224,10 +224,10 @@ class ContextManager:
     def _retrieve_candidates(self, session_id: str, query: str) -> list[dict[str, Any]]:
         """Retrieve candidate events for context."""
         # Get recent events from current session
-        from api.models import ConversationEvent
-        events = self.db.query(ConversationEvent).filter(
-            ConversationEvent.session_id == session_id
-        ).order_by(ConversationEvent.created_at.desc()).limit(100).all()
+        from api.models import Event
+        events = self.db.query(Event).filter(
+            Event.session_id == session_id
+        ).order_by(Event.created_at.desc()).limit(100).all()
 
         return [
             {
