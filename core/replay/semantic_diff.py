@@ -22,8 +22,14 @@ class SemanticDiff:
         Args:
             db: SQLAlchemy Session instance. If None, creates a new one.
         """
+        self._owns_session = db is None
         self.db = db or next(get_db_session())
-        self.reader = EventReader(db)
+        self.reader = EventReader(self.db)
+
+    def __del__(self):
+        """Close session if owned."""
+        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
+            self.db.close()
         self.chain_mgr = CausalChainManager(db)
 
     def compare_sessions(self, session_id1: str, session_id2: str) -> dict:

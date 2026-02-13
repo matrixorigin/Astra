@@ -23,8 +23,14 @@ class Sandbox:
     ):
         self.source_db = source_db
         self.account = account
+        self._owns_session = db is None
         self.db = db or next(get_db_session())
         self.git = GitForData(self.db)
+
+    def __del__(self):
+        """Close session if owned."""
+        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
+            self.db.close()
 
     def create(
         self,

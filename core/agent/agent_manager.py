@@ -1,5 +1,6 @@
 """Agent management module."""
 
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -45,28 +46,33 @@ class AgentManager:
             ValueError: If owner user does not exist
         """
         # Verify owner exists
-        owner = self.db.fetchone(
-            "SELECT user_id FROM users WHERE user_id = %s", (owner_user_id,)
-        )
+        from sqlalchemy import text
+        owner = self.db.execute(
+            text("SELECT user_id FROM users WHERE user_id = :user_id"), 
+            {"user_id": owner_user_id}
+        ).fetchone()
+        
         if not owner:
             raise ValueError(f"User '{owner_user_id}' does not exist")
 
         agent_id = str(uuid7())
 
         self.db.execute(
-            """
-            INSERT INTO agents (agent_id, agent_name, agent_type, owner_user_id, config, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """,
-            (
-                agent_id,
-                agent_name,
-                agent_type,
-                owner_user_id,
-                None if config is None else str(config),
-                datetime.now(timezone.utc),
-            ),
+            text("""
+            INSERT INTO agents (agent_id, agent_name, agent_type, owner_user_id, agent_config, is_active, created_at)
+            VALUES (:agent_id, :agent_name, :agent_type, :owner_user_id, :agent_config, :is_active, :created_at)
+            """),
+            {
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "agent_type": agent_type,
+                "owner_user_id": owner_user_id,
+                "agent_config": None if config is None else json.dumps(config),
+                "is_active": True,
+                "created_at": datetime.now(timezone.utc),
+            },
         )
+        self.db.commit()
 
         logger.info(f"Created agent: {agent_name} ({agent_id}) for user {owner_user_id}")
 
@@ -87,15 +93,17 @@ class AgentManager:
         Returns:
             Agent dictionary if found, None otherwise
         """
-        agent = self.db.fetchone(
-            """
-            SELECT agent_id, agent_name, agent_type, owner_user_id, config, is_active, created_at
-            FROM agents WHERE agent_id = %s
-            """,
-            (agent_id,),
+        from sqlalchemy import text
+        result = self.db.execute(
+            text("""
+            SELECT agent_id, agent_name, agent_type, owner_user_id, agent_config, is_active, created_at
+            FROM agents WHERE agent_id = :agent_id
+            """),
+            {"agent_id": agent_id},
         )
+        agent = result.mappings().first()
 
-        return agent
+        return dict(agent) if agent else None
 
     def list_agents(self, owner_user_id: Optional[str] = None) -> list[dict]:
         """List agents.
@@ -106,25 +114,27 @@ class AgentManager:
         Returns:
             List of agent dictionaries
         """
+        from sqlalchemy import text
+        
         if owner_user_id:
-            agents = self.db.fetchall(
-                """
-                SELECT agent_id, agent_name, agent_type, owner_user_id, is_active, created_at
-                FROM agents WHERE owner_user_id = %s
+            result = self.db.execute(
+                text("""
+                SELECT agent_id, agent_name, agent_type, owner_user_id, agent_config, is_active, created_at
+                FROM agents WHERE owner_user_id = :owner_user_id
                 ORDER BY created_at DESC
-                """,
-                (owner_user_id,),
+                """),
+                {"owner_user_id": owner_user_id}
             )
         else:
-            agents = self.db.fetchall(
-                """
-                SELECT agent_id, agent_name, agent_type, owner_user_id, is_active, created_at
+            result = self.db.execute(
+                text("""
+                SELECT agent_id, agent_name, agent_type, owner_user_id, agent_config, is_active, created_at
                 FROM agents
                 ORDER BY created_at DESC
-                """
+                """)
             )
 
-        return agents
+        return [dict(row._mapping) for row in result]
 
     def update_agent(
         self,
@@ -132,7 +142,7 @@ class AgentManager:
         agent_name: Optional[str] = None,
         config: Optional[dict] = None,
         is_active: Optional[bool] = None,
-    ) -> bool:
+    ) -> dict:
         """Update agent.
 
         Args:
@@ -142,38 +152,40 @@ class AgentManager:
             is_active: Optional active status
 
         Returns:
-            True if agent was updated, False if not found
+            Updated agent dictionary or empty dict if not found
         """
+        from sqlalchemy import text
+        
         updates = []
-        params = []
+        params = {"agent_id": agent_id}
 
         if agent_name is not None:
-            updates.append("agent_name = %s")
-            params.append(agent_name)
+            updates.append("agent_name = :agent_name")
+            params["agent_name"] = agent_name
 
         if config is not None:
-            updates.append("config = %s")
-            params.append(str(config))
+            updates.append("agent_config = :agent_config")
+            params["agent_config"] = json.dumps(config)
 
         if is_active is not None:
-            updates.append("is_active = %s")
-            params.append(is_active)
+            updates.append("is_active = :is_active")
+            params["is_active"] = is_active
 
         if not updates:
-            return False
+            return {}
 
-        updates.append("updated_at = %s")
-        params.append(datetime.now(timezone.utc))
-        params.append(agent_id)
+        updates.append("updated_at = :updated_at")
+        params["updated_at"] = datetime.now(timezone.utc)
 
-        query = f"UPDATE agents SET {', '.join(updates)} WHERE agent_id = %s"
-        rowcount = self.db.execute(query, tuple(params))
+        query = f"UPDATE agents SET {', '.join(updates)} WHERE agent_id = :agent_id"
+        result = self.db.execute(text(query), params)
+        self.db.commit()
 
-        if rowcount > 0:
+        if result.rowcount > 0:
             logger.info(f"Updated agent: {agent_id}")
-            return True
+            return self.get_agent(agent_id) or {}
 
-        return False
+        return {}
 
     def delete_agent(self, agent_id: str) -> bool:
         """Delete agent.
@@ -184,9 +196,14 @@ class AgentManager:
         Returns:
             True if agent was deleted, False if not found
         """
-        rowcount = self.db.execute("DELETE FROM agents WHERE agent_id = %s", (agent_id,))
+        from sqlalchemy import text
+        result = self.db.execute(
+            text("DELETE FROM agents WHERE agent_id = :agent_id"),
+            {"agent_id": agent_id}
+        )
+        self.db.commit()
 
-        if rowcount > 0:
+        if result.rowcount > 0:
             logger.info(f"Deleted agent: {agent_id}")
             return True
 
@@ -202,11 +219,14 @@ class AgentManager:
         Returns:
             True if user owns the agent, False otherwise
         """
-        agent = self.db.fetchone(
-            "SELECT owner_user_id FROM agents WHERE agent_id = %s", (agent_id,)
+        from sqlalchemy import text
+        result = self.db.execute(
+            text("SELECT owner_user_id FROM agents WHERE agent_id = :agent_id"),
+            {"agent_id": agent_id}
         )
+        agent = result.first()
 
         if not agent:
             return False
 
-        return agent["owner_user_id"] == user_id
+        return agent.owner_user_id == user_id

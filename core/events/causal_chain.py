@@ -3,6 +3,7 @@
 Manages causal chains and parent-child relationships between events.
 """
 
+from sqlalchemy import text
 from core.events.event_reader import EventReader
 from core.events.models import ConversationEvent
 from sqlalchemy.orm import Session
@@ -21,8 +22,14 @@ class CausalChainManager:
         Args:
             db: SQLAlchemy Session instance. If None, creates a new one.
         """
+        self._owns_session = db is None
         self.db = db or next(get_db_session())
-        self.reader = EventReader(db)
+        self.reader = EventReader(self.db)
+
+    def __del__(self):
+        """Close session if owned."""
+        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
+            self.db.close()
 
     def get_chain(self, causal_chain_id: str) -> list[ConversationEvent]:
         """Get all events in a causal chain.
@@ -58,13 +65,16 @@ class CausalChainManager:
         Returns:
             list[ConversationEvent]: Child events
         """
-        query = """
+        query = text("""
             SELECT * FROM conversation_events
-            WHERE parent_event_id = %s
+            WHERE parent_event_id = :event_id
             ORDER BY created_at ASC
-        """
-        rows = self.db.fetchall(query, (event_id,))
-        return [self.reader._row_to_event(row) for row in rows]
+        """)
+        
+        result = self.db.execute(query, {"event_id": event_id})
+        rows = result.fetchall()
+        
+        return [self.reader._row_to_event(dict(row._mapping)) for row in rows]
 
     def get_chain_summary(self, causal_chain_id: str) -> dict:
         """Get summary statistics for a causal chain.

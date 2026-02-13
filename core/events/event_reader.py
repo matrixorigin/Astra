@@ -5,6 +5,7 @@ Provides methods to retrieve and query events from the database.
 
 import json
 
+from sqlalchemy import text
 from core.events.models import ContextSnapshot, ConversationEvent, TokenUsage
 from sqlalchemy.orm import Session
 from api.database import get_db_session
@@ -22,7 +23,13 @@ class EventReader:
         Args:
             db: SQLAlchemy Session instance. If None, creates a new one.
         """
+        self._owns_session = db is None
         self.db = db or next(get_db_session())
+
+    def __del__(self):
+        """Close session if owned."""
+        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
+            self.db.close()
 
     def _row_to_event(self, row: dict) -> ConversationEvent:
         """Convert database row to ConversationEvent.
@@ -80,9 +87,15 @@ class EventReader:
         Returns:
             Optional[ConversationEvent]: Event if found, None otherwise
         """
-        query = "SELECT * FROM conversation_events WHERE event_id = %s"
-        row = self.db.fetchone(query, (event_id,))
-        return self._row_to_event(row) if row else None
+        query = text("SELECT * FROM conversation_events WHERE event_id = :event_id")
+        result = self.db.execute(query, {"event_id": event_id})
+        row = result.fetchone()
+        
+        if row:
+            # Convert row (SQLAlchemy Row) to dict
+            row_dict = dict(row._mapping)
+            return self._row_to_event(row_dict)
+        return None
 
     def get_session_events(
         self, session_id: str, limit: int | None = None
@@ -103,16 +116,18 @@ class EventReader:
             parent_event_id, causal_chain_id
         """
 
-        query = f"""
+        sql = f"""
             SELECT {columns} FROM conversation_events
-            WHERE session_id = %s
+            WHERE session_id = :session_id
             ORDER BY created_at DESC
         """
         if limit:
-            query += f" LIMIT {limit}"
+            sql += f" LIMIT {limit}"
 
-        rows = self.db.fetchall(query, (session_id,))
-        return [self._row_to_event(row) for row in rows]
+        result = self.db.execute(text(sql), {"session_id": session_id})
+        rows = result.fetchall()
+        
+        return [self._row_to_event(dict(row._mapping)) for row in rows]
 
     def get_user_events(self, user_id: str, limit: int | None = 100) -> list[ConversationEvent]:
         """Get all events for a user across sessions.
@@ -130,16 +145,18 @@ class EventReader:
             parent_event_id, causal_chain_id
         """
 
-        query = f"""
+        sql = f"""
             SELECT {columns} FROM conversation_events
-            WHERE user_id = %s
+            WHERE user_id = :user_id
             ORDER BY created_at DESC
         """
         if limit:
-            query += f" LIMIT {limit}"
+            sql += f" LIMIT {limit}"
 
-        rows = self.db.fetchall(query, (user_id,))
-        return [self._row_to_event(row) for row in rows]
+        result = self.db.execute(text(sql), {"user_id": user_id})
+        rows = result.fetchall()
+        
+        return [self._row_to_event(dict(row._mapping)) for row in rows]
 
     def get_causal_chain(self, causal_chain_id: str) -> list[ConversationEvent]:
         """Get all events in a causal chain.
@@ -150,10 +167,13 @@ class EventReader:
         Returns:
             list[ConversationEvent]: List of events in chronological order
         """
-        query = """
+        query = text("""
             SELECT * FROM conversation_events
-            WHERE causal_chain_id = %s
+            WHERE causal_chain_id = :causal_chain_id
             ORDER BY created_at ASC
-        """
-        rows = self.db.fetchall(query, (causal_chain_id,))
-        return [self._row_to_event(row) for row in rows]
+        """)
+        
+        result = self.db.execute(query, {"causal_chain_id": causal_chain_id})
+        rows = result.fetchall()
+        
+        return [self._row_to_event(dict(row._mapping)) for row in rows]
