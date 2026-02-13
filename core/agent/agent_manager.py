@@ -6,7 +6,8 @@ from typing import Optional
 from uuid_utils import uuid7
 
 from core.logging_config import get_logger
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -14,11 +15,11 @@ logger = get_logger(__name__)
 class AgentManager:
     """Manage agent operations."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Session):
         """Initialize agent manager.
 
         Args:
-            db: Database instance
+            db: Session instance
         """
         self.db = db
 

@@ -16,7 +16,8 @@ from core.skills.base import (
     SkillRequirement,
 )
 from core.skills.mocking import MockMode, SecurityError, ToolMockingLayer
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 # ============================================================================
 # Mock Skills for Testing

@@ -14,7 +14,9 @@ from core.llm.rate_limiter import RateLimiter
 from core.llm.router import ModelConfig, ModelRouter
 from core.repos.token_resolver import TokenResolver
 from core.scope.scope_resolver import ScopeChainBuilder, ScopeResolver
-from sdk import Database
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,7 @@ class LLMClient:
 
     def __init__(
         self,
-        db: Database | None = None,
+        db: Session | None = None,
         user_id: str | None = None,
         tenant_id: str | None = None,
         use_default_models: bool = True,
@@ -44,7 +46,7 @@ class LLMClient:
             scope_context: Optional scope context for resolver, e.g.,
                           {'repo': 'matrixone', 'project': 'backend'}
         """
-        self.db = db or Database()
+        self.db = db or next(get_db_session())
         self.user_id = user_id
         self.tenant_id = tenant_id
         self.use_default_models = use_default_models
@@ -109,11 +111,12 @@ class LLMClient:
         """Load config: DB → env → defaults."""
         config = None
         try:
-            row = self.db.fetchone(
-                "SELECT value FROM configs WHERE key_name = 'llm_config' LIMIT 1"
+            result = self.db.execute(
+                text("SELECT value FROM configs WHERE key_name = 'llm_config' LIMIT 1")
             )
+            row = result.first()
             if row:
-                config = json.loads(row["value"])
+                config = json.loads(row.value)
         except Exception:
             pass
         if not config:
@@ -181,12 +184,13 @@ class LLMClient:
 
         # 3. Fallback to configs table (global)
         try:
-            row = self.db.fetchone(
-                "SELECT value FROM configs WHERE key_name = %s AND scope_type = 'global' LIMIT 1",
-                (f"{provider}_api_key",),
+            result = self.db.execute(
+                text("SELECT value FROM configs WHERE key_name = :key_name AND scope_type = 'global' LIMIT 1"),
+                {"key_name": f"{provider}_api_key"}
             )
+            row = result.first()
             if row:
-                return str(row.get("value", "")) or None
+                return str(row.value) or None
         except Exception:
             pass
 
@@ -198,25 +202,33 @@ class LLMClient:
         if self.user_id:
             query = """
                 SELECT * FROM tokens
-                WHERE type = 'llm' AND provider = %s
-                AND scope_user_id = %s AND is_active = TRUE
+                WHERE type = 'llm' AND provider = :provider
+                AND scope_user_id = :user_id AND is_active = TRUE
                 ORDER BY created_at DESC LIMIT 1
             """
-            result = self.db.fetchone(query, (provider, self.user_id))
-            if result:
-                return self._token_from_row(result)
+            result = self.db.execute(
+                text(query),
+                {"provider": provider, "user_id": self.user_id}
+            )
+            row = result.first()
+            if row:
+                return self._token_from_row(row)
 
         # 2. Tenant-scoped token
         if self.tenant_id:
             query = """
                 SELECT * FROM tokens
-                WHERE type = 'llm' AND provider = %s
-                AND scope_tenant_id = %s AND is_active = TRUE
+                WHERE type = 'llm' AND provider = :provider
+                AND scope_tenant_id = :tenant_id AND is_active = TRUE
                 ORDER BY created_at DESC LIMIT 1
             """
-            result = self.db.fetchone(query, (provider, self.tenant_id))
-            if result:
-                return self._token_from_row(result)
+            result = self.db.execute(
+                text(query),
+                {"provider": provider, "tenant_id": self.tenant_id}
+            )
+            row = result.first()
+            if row:
+                return self._token_from_row(row)
 
         return None
 
@@ -225,10 +237,10 @@ class LLMClient:
         from types import SimpleNamespace
 
         return SimpleNamespace(
-            token_id=row["token_id"],
-            provider=row["provider"],
-            encrypted_value=row.get("encrypted_value"),
-            secret_ref=row.get("secret_ref"),
+            token_id=row.token_id,
+            provider=row.provider,
+            encrypted_value=row.encrypted_value if hasattr(row, 'encrypted_value') else None,
+            secret_ref=row.secret_ref if hasattr(row, 'secret_ref') else None,
         )
 
     def _init_rate_limits(self) -> None:
@@ -573,7 +585,7 @@ class LLMClient:
                         log_id, event_id, user_id, provider, model,
                         tokens_prompt, tokens_completion, tokens_total,
                         cost_usd, latency_ms, status, metadata, created_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    ) VALUES (:p0, :p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8, :p9, :p10, :p11, :p12)""",
                     (
                         log_id,
                         event_id,
@@ -596,7 +608,7 @@ class LLMClient:
                         log_id, event_id, user_id, provider, model,
                         tokens_prompt, tokens_completion, tokens_total,
                         cost_usd, latency_ms, status, error_message, metadata, created_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    ) VALUES (:p0, :p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8, :p9, :p10, :p11, :p12, :p13)""",
                     (
                         log_id,
                         event_id,
@@ -619,34 +631,37 @@ class LLMClient:
 
     def get_call_logs(self, event_id=None, user_id=None) -> list[LLMCallLog]:
         if event_id:
-            results = self.db.fetchall(
-                "SELECT * FROM llm_call_logs WHERE event_id = %s ORDER BY created_at DESC",
-                (event_id,),
+            result = self.db.execute(
+                text("SELECT * FROM llm_call_logs WHERE event_id = :event_id ORDER BY created_at DESC"),
+                {"event_id": event_id}
             )
+            results = result.fetchall()
         elif user_id:
-            results = self.db.fetchall(
-                "SELECT * FROM llm_call_logs WHERE user_id = %s ORDER BY created_at DESC LIMIT 100",
-                (user_id,),
+            result = self.db.execute(
+                text("SELECT * FROM llm_call_logs WHERE user_id = :user_id ORDER BY created_at DESC LIMIT 100"),
+                {"user_id": user_id}
             )
+            results = result.fetchall()
         else:
-            results = self.db.fetchall(
-                "SELECT * FROM llm_call_logs ORDER BY created_at DESC LIMIT 100"
+            result = self.db.execute(
+                text("SELECT * FROM llm_call_logs ORDER BY created_at DESC LIMIT 100")
             )
+            results = result.fetchall()
         return [
             LLMCallLog(
-                log_id=r["log_id"],
-                event_id=r["event_id"],
-                user_id=r["user_id"],
-                provider=LLMProvider(r["provider"]),
-                model=r["model"],
-                tokens_prompt=r["tokens_prompt"],
-                tokens_completion=r["tokens_completion"],
-                tokens_total=r["tokens_total"],
-                cost_usd=float(r["cost_usd"]),
-                latency_ms=r["latency_ms"],
-                status=r["status"],
-                error_message=r.get("error_message"),
-                created_at=r["created_at"],
+                log_id=r.log_id,
+                event_id=r.event_id,
+                user_id=r.user_id,
+                provider=LLMProvider(r.provider),
+                model=r.model,
+                tokens_prompt=r.tokens_prompt,
+                tokens_completion=r.tokens_completion,
+                tokens_total=r.tokens_total,
+                cost_usd=float(r.cost_usd),
+                latency_ms=r.latency_ms,
+                status=r.status,
+                error_message=r.error_message if hasattr(r, 'error_message') else None,
+                created_at=r.created_at,
             )
             for r in results
         ]

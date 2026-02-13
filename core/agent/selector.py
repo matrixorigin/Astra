@@ -5,7 +5,8 @@ from typing import Any
 from core.logging_config import get_logger
 from core.skills.auditable_selector import AuditableSkillSelector
 from core.skills.modern_selector import ModernSkillSelector
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -19,11 +20,11 @@ class AgentSkillSelector:
     - Automatic learning from failures
     """
 
-    def __init__(self, db: Database, llm_client, auditable: bool = True, session_id: str | None = None):
+    def __init__(self, db: Session, llm_client, auditable: bool = True, session_id: str | None = None):
         """Initialize skill selector.
         
         Args:
-            db: Database instance
+            db: Session instance
             llm_client: LLM client
             auditable: Use auditable selector (default True)
             session_id: Session ID for auditable selections

@@ -5,8 +5,9 @@ Provides time-travel capabilities to replay conversations at any point in time.
 
 from core.events.event_reader import EventReader
 from core.events.models import ConversationEvent
-from sdk.database import Database
-from sdk.git_for_data import GitForData
+from sqlalchemy.orm import Session
+from api.database import get_db_session
+from core.git_for_data import GitForData
 
 
 class TimeMachine:
@@ -16,13 +17,13 @@ class TimeMachine:
     MatrixOne's Git for Data capabilities.
     """
 
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, db: Session | None = None) -> None:
         """Initialize time machine.
 
         Args:
-            db: Database instance. If None, creates a new one.
+            db: SQLAlchemy Session instance. If None, creates a new one.
         """
-        self.db = db or Database()
+        self.db = db or next(get_db_session())
         self.git = GitForData(db)
         self.reader = EventReader(db)
 

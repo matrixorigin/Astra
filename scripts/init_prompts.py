@@ -2,10 +2,11 @@
 """Initialize default prompt templates in database."""
 
 from core.context.prompts import init_default_prompts
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 if __name__ == "__main__":
-    db = Database()
+    db = next(get_db_session())
     print("Initializing default prompt templates...")
     init_default_prompts(db)
     print("✓ Done! Default prompts registered.")

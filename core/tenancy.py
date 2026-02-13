@@ -5,7 +5,8 @@ from enum import Enum
 
 from core.exceptions import AuthenticationError
 from core.logging_config import get_logger
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -35,7 +36,7 @@ class Tenant:
 class TenantManager:
     """Manage multi-tenant isolation."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Session):
         self.db = db
 
     def create_tenant(

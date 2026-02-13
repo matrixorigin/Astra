@@ -2,7 +2,7 @@
 
 from github import Auth, Github, GithubException
 
-from core.config import get_settings
+from config.settings import get_settings
 from core.exceptions import GitHubError, GitHubRateLimitError
 from core.logging_config import get_logger
 from sqlalchemy.orm import Session
@@ -40,8 +40,8 @@ class GitHubClient:
         repo_data = None
 
         if not repo_data:
-            # In test mode, return mock repo URL
-            if settings.environment.value == "test" or settings.is_development():
+            # In test/dev mode, return mock repo URL
+            if settings.is_development or settings.app_env == "test":
                 logger.debug(f"Test mode: using mock repo for repo_id={repo_id}")
                 repo_full_name = "octocat/Hello-World"  # GitHub's test repo
             else:

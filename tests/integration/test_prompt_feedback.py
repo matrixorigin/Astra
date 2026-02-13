@@ -3,13 +3,14 @@
 import pytest
 
 from core.context.prompts import PromptFeedback
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 @pytest.fixture
 def db():
     """Database fixture."""
-    return Database()
+    return next(get_db_session())
 
 
 @pytest.fixture
@@ -20,8 +21,9 @@ def feedback(db):
     yield feedback_instance
 
     # Cleanup test data
-    db.execute("DELETE FROM llm_feedback WHERE prompt_template_id LIKE 'system_test%'")
-    db.execute("DELETE FROM llm_feedback WHERE prompt_template_id = 'system_compare'")
+    from sqlalchemy import text
+    db.execute(text("DELETE FROM llm_feedback WHERE prompt_template_id LIKE 'system_test%'"))
+    db.execute(text("DELETE FROM llm_feedback WHERE prompt_template_id = 'system_compare'"))
 
 
 def test_record_feedback(db, feedback):
@@ -38,15 +40,15 @@ def test_record_feedback(db, feedback):
     assert feedback_id is not None
 
     # Verify stored
-    row = db.fetchone(
-        """
-        SELECT * FROM llm_feedback WHERE feedback_id = %s
-    """,
-        (feedback_id,),
+    from sqlalchemy import text
+    result = db.execute(
+        text("SELECT * FROM llm_feedback WHERE feedback_id = :feedback_id"),
+        {"feedback_id": feedback_id}
     )
+    row = result.first()
 
-    assert row["rating"] == 5
-    assert row["comment"] == "Excellent response!"
+    assert row.rating == 5
+    assert row.comment == "Excellent response!"
 
 
 def test_invalid_rating(feedback):

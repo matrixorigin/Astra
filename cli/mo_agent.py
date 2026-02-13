@@ -23,7 +23,8 @@ from core.llm.client import LLMClient
 from core.skills.builtin import register_builtin_skills
 from core.skills.mocking import MockMode
 from core.skills.registry import SkillRegistry
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 @click.group()
@@ -48,7 +49,7 @@ def chat(user_id, model, mode):
     click.echo("=" * 50)
 
     # Initialize
-    db = Database()
+    db = next(get_db_session())
     session_mgr = SessionManager(db)
     logger = EventLogger(db)
     llm_client = LLMClient(db)
@@ -195,7 +196,7 @@ def skill():
 @click.option("--active-only", is_flag=True, help="Show only active skills")
 def skill_list(active_only):
     """List available skills."""
-    db = Database()
+    db = next(get_db_session())
 
     # Query skills directly
     query = "SELECT * FROM skills_registry"
@@ -224,7 +225,7 @@ def skill_list(active_only):
 def skill_register(skill_file):
     """Register a new skill from file."""
 
-    db = Database()
+    db = next(get_db_session())
     registry = SkillRegistry(db)
 
     with open(skill_file) as f:
@@ -252,7 +253,7 @@ def skill_learn(days):
     
     click.echo(f"🧠 Learning from failures (last {days} days)...")
     
-    db = Database()
+    db = next(get_db_session())
     llm_client = LLMClient(db)
     learner = SelfImprovingSelector(db, llm_client)
     
@@ -285,7 +286,7 @@ def skill_gate(version, min_improvement):
     
     click.echo(f"🚪 Running regression gate for selector {version}...")
     
-    db = Database()
+    db = next(get_db_session())
     llm_client = LLMClient(db)
     gate = SkillSelectionRegressionGate(db, llm_client)
     
@@ -322,7 +323,7 @@ def skill_history(session, limit):
     from core.llm.client import LLMClient
     from core.skills.auditable_selector import AuditableSkillSelector
     
-    db = Database()
+    db = next(get_db_session())
     llm_client = LLMClient(db)
     selector = AuditableSkillSelector(db, llm_client)
     
@@ -362,7 +363,7 @@ def skill_stats():
     from core.skills.regression_gate import SkillSelectionRegressionGate
     from core.skills.self_improving_selector import SelfImprovingSelector
     
-    db = Database()
+    db = next(get_db_session())
     llm_client = LLMClient(db)
     
     learner = SelfImprovingSelector(db, llm_client)
@@ -400,7 +401,7 @@ def model():
 @click.option("--tenant-id", help="Filter by tenant scope")
 def model_list(user_id, tenant_id):
     """List available models."""
-    db = Database()
+    db = next(get_db_session())
 
     # Get models from router
     client = LLMClient(db=db, user_id=user_id, tenant_id=tenant_id)
@@ -436,7 +437,7 @@ def model_list(user_id, tenant_id):
 @click.option("--tenant-id", help="Tenant scope")
 def model_show(model_name, user_id, tenant_id):
     """Show detailed information about a model."""
-    db = Database()
+    db = next(get_db_session())
 
     try:
         client = LLMClient(db=db, user_id=user_id, tenant_id=tenant_id)
@@ -476,7 +477,7 @@ def replay(session_id, output):
 
     from core.replay.engine import ReplayEngine
 
-    db = Database()
+    db = next(get_db_session())
     replay_engine = ReplayEngine(db)
 
     click.echo(f"🔄 Replaying session: {session_id}")
@@ -516,7 +517,7 @@ def session():
 @click.option("--limit", default=10, help="Number of sessions to show")
 def session_list(user_id, limit):
     """List recent sessions."""
-    db = Database()
+    db = next(get_db_session())
 
     query = "SELECT * FROM sessions"
     params = []
@@ -550,7 +551,7 @@ def session_list(user_id, limit):
 @click.argument("session_id")
 def session_show(session_id):
     """Show session details."""
-    db = Database()
+    db = next(get_db_session())
 
     # Get session
     session = db.fetchone("SELECT * FROM sessions WHERE session_id = %s", (session_id,))
@@ -602,7 +603,7 @@ def init():
 @cli.command()
 def health():
     """Check system health."""
-    db = Database()
+    db = next(get_db_session())
 
     click.echo("🏥 System Health Check")
     click.echo("=" * 50)

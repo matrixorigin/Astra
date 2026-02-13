@@ -51,7 +51,7 @@ def test_list_with_filter(sandbox):
 
 def test_create_from_snapshot(sandbox, db):
     """Test creating sandbox from snapshot."""
-    from sdk.git_for_data import GitForData
+    from core.git_for_data import GitForData
 
     git = GitForData(db=db)
 

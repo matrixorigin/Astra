@@ -12,16 +12,21 @@ from api.repositories.user_repository import UserRepository
 @pytest.fixture(autouse=True)
 def cleanup_skills():
     """Clean up test skills before and after each test."""
-    from sdk import Database
-    db = Database()
+    from sqlalchemy.orm import Session
+    from sqlalchemy import text
+    from api.database import get_db_session
+    db = next(get_db_session())
     
     # Clean before
-    db.execute('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"')
+    db.execute(text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
+    db.commit()
     
     yield
     
     # Clean after
-    db.execute('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"')
+    db.execute(text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
+    db.commit()
+    db.close()
 
 
 @pytest.fixture

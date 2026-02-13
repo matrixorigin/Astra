@@ -5,7 +5,8 @@ from typing import Any
 from core.logging_config import get_logger
 from core.skills.mocking import MockMode, ToolMockingLayer
 from core.skills.registry import SkillRegistry
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -13,7 +14,7 @@ logger = get_logger(__name__)
 class AgentExecutor:
     """Executes skills safely using the ToolMockingLayer."""
 
-    def __init__(self, db: Database, registry: SkillRegistry, mode: MockMode = MockMode.PRODUCTION):
+    def __init__(self, db: Session, registry: SkillRegistry, mode: MockMode = MockMode.PRODUCTION):
         self.db = db
         self.registry = registry
         self.mode = mode

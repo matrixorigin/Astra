@@ -5,7 +5,8 @@ Provides high-level comparison of agent performance, not just data differences.
 
 from core.events.causal_chain import CausalChainManager
 from core.events.event_reader import EventReader
-from sdk.database import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 class SemanticDiff:
@@ -15,13 +16,13 @@ class SemanticDiff:
     rather than just raw data differences.
     """
 
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, db: Session | None = None) -> None:
         """Initialize semantic diff analyzer.
 
         Args:
-            db: Database instance. If None, creates a new one.
+            db: SQLAlchemy Session instance. If None, creates a new one.
         """
-        self.db = db or Database()
+        self.db = db or next(get_db_session())
         self.reader = EventReader(db)
         self.chain_mgr = CausalChainManager(db)
 

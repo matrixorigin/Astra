@@ -6,7 +6,8 @@ Provides methods to retrieve and query events from the database.
 import json
 
 from core.events.models import ContextSnapshot, ConversationEvent, TokenUsage
-from sdk.database import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 class EventReader:
@@ -15,13 +16,13 @@ class EventReader:
     Provides methods to query events by various criteria.
     """
 
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, db: Session | None = None) -> None:
         """Initialize event reader.
 
         Args:
-            db: Database instance. If None, creates a new one.
+            db: SQLAlchemy Session instance. If None, creates a new one.
         """
-        self.db = db or Database()
+        self.db = db or next(get_db_session())
 
     def _row_to_event(self, row: dict) -> ConversationEvent:
         """Convert database row to ConversationEvent.

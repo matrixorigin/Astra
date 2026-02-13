@@ -66,6 +66,15 @@ class MockDB:
         return []
 
     def execute(self, query, params=None):
+        # Return a mock result that has first() method
+        class MockResult:
+            def first(self):
+                return None
+            def fetchall(self):
+                return []
+        return MockResult()
+    
+    def commit(self):
         pass
 
 

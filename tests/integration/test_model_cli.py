@@ -4,7 +4,8 @@ import pytest
 from click.testing import CliRunner
 
 from cli.mo_agent import cli
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 @pytest.fixture
@@ -15,7 +16,7 @@ def runner():
 @pytest.fixture
 def test_db():
     """Create a test database instance."""
-    db = Database()
+    db = next(get_db_session())
     yield db
 
 

@@ -12,7 +12,7 @@ from core.verification.claim_extractor import ClaimExtractor
 
 @pytest.fixture
 def db_session():
-    """Database session fixture."""
+    """SQLAlchemy Session fixture."""
     session = next(get_db_session())
     try:
         yield session
@@ -35,10 +35,11 @@ def event_repo(db_session):
 @pytest.fixture
 def firewall(db_session):
     """Hallucination firewall fixture."""
-    from sdk.database import Database
+    from sqlalchemy.orm import Session
+    from api.database import get_db_session
     from core.context.manager import ContextManager
     
-    db = Database()
+    db = next(get_db_session())
     context_manager = ContextManager(db)
     return HallucinationFirewall(db, context_manager)
 

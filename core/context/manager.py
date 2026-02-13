@@ -13,7 +13,8 @@ from typing import Any
 
 from core.exceptions import ContextError
 from core.logging_config import get_logger
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -85,12 +86,12 @@ class ContextManager:
     """Orchestrate context selection and assembly."""
 
     def __init__(
-        self, db: Database, embedding_provider: str = "mock"
+        self, db: Session, embedding_provider: str = "mock"
     ):
         """Initialize context manager.
 
         Args:
-            db: Database connection
+            db: Session connection
             embedding_provider: Embedding provider (openai, mock)
         """
         self.db = db

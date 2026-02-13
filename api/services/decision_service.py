@@ -8,7 +8,8 @@ from uuid_utils import uuid7
 from api.repositories import DecisionRepository, SessionRepository, EventRepository
 from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
 from core.auth.audit_logger import AuditLogger
-# from sdk import Database
+# from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 class DecisionService:
@@ -19,7 +20,7 @@ class DecisionService:
         self.decision_repo = DecisionRepository(db_session)
         self.session_repo = SessionRepository(db_session)
         self.event_repo = EventRepository(db_session)
-        # self.db = Database()
+        # self.db = next(get_db_session())
         self.audit = AuditLogger(db_session)
     
     def record_decision(

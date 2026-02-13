@@ -6,7 +6,8 @@ from core.events.event_logger import EventLogger
 from core.exceptions import ReplayError, SkillNotFoundError
 from core.logging_config import get_logger
 from core.skills import SkillRegistry
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -14,7 +15,7 @@ logger = get_logger(__name__)
 class ReplayEngine:
     """Replay conversations with exact skill versions from the past"""
 
-    def __init__(self, db: Database, registry: SkillRegistry, logger_instance: EventLogger):
+    def __init__(self, db: Session, registry: SkillRegistry, logger_instance: EventLogger):
         self.db = db
         self.registry = registry
         self.logger_instance = logger_instance

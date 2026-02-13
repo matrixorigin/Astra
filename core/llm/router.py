@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from pydantic import BaseModel
+from sqlalchemy import text
 
 from core.llm.models import LLMProvider
 
@@ -222,37 +223,40 @@ class ModelRegistry:
         try:
             # Try user scope first
             if user_id:
-                row = db.fetchone(
-                    "SELECT value FROM configs WHERE key_name = 'model_registry' "
-                    "AND scope_type = 'user' AND scope_id = %s LIMIT 1",
-                    (user_id,),
+                result = db.execute(
+                    text("SELECT value FROM configs WHERE key_name = 'model_registry' "
+                         "AND scope_type = 'user' AND scope_id = :user_id LIMIT 1"),
+                    {"user_id": user_id}
                 )
+                row = result.first()
                 if row:
-                    for c in json.loads(row["value"]):
+                    for c in json.loads(row.value):
                         mc = ModelConfig(**c)
                         self._models[mc.model_name] = mc
                     return
 
             # Try tenant scope
             if tenant_id:
-                row = db.fetchone(
-                    "SELECT value FROM configs WHERE key_name = 'model_registry' "
-                    "AND scope_type = 'tenant' AND scope_id = %s LIMIT 1",
-                    (tenant_id,),
+                result = db.execute(
+                    text("SELECT value FROM configs WHERE key_name = 'model_registry' "
+                         "AND scope_type = 'tenant' AND scope_id = :tenant_id LIMIT 1"),
+                    {"tenant_id": tenant_id}
                 )
+                row = result.first()
                 if row:
-                    for c in json.loads(row["value"]):
+                    for c in json.loads(row.value):
                         mc = ModelConfig(**c)
                         self._models[mc.model_name] = mc
                     return
 
             # Fallback to global scope
-            row = db.fetchone(
-                "SELECT value FROM configs WHERE key_name = 'model_registry' "
-                "AND scope_type = 'global' LIMIT 1"
+            result = db.execute(
+                text("SELECT value FROM configs WHERE key_name = 'model_registry' "
+                     "AND scope_type = 'global' LIMIT 1")
             )
+            row = result.first()
             if row:
-                for c in json.loads(row["value"]):
+                for c in json.loads(row.value):
                     mc = ModelConfig(**c)
                     self._models[mc.model_name] = mc
         except Exception as e:

@@ -65,7 +65,7 @@ class RelevanceScorer:
         """Initialize scorer.
 
         Args:
-            db: Database connection
+            db: SQLAlchemy Session
             embeddings: Embedding service
             weights: Custom weights (default: GENERAL task weights)
         """

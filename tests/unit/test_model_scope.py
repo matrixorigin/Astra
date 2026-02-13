@@ -48,6 +48,57 @@ class MockDB:
             elif "scope_type = 'tenant'" in query and params[0] == "team_a":
                 return {"value": json.dumps(self.tenant_config)}
         return None
+    
+    def execute(self, query, params=None):
+        """Mock execute for SQLAlchemy compatibility."""
+        class MockResult:
+            def __init__(self, data):
+                self.data = data
+            def first(self):
+                return self.data
+            def fetchall(self):
+                return []
+        
+        # Handle token queries - return None (no tokens)
+        if "tokens" in str(query):
+            return MockResult(None)
+        
+        # Handle model_registry queries
+        if "model_registry" in str(query):
+            if params:
+                if params.get("user_id") == "alice":
+                    class Row:
+                        value = json.dumps(self.user_config)
+                    return MockResult(Row())
+                elif params.get("tenant_id") == "team_a":
+                    class Row:
+                        value = json.dumps(self.tenant_config)
+                    return MockResult(Row())
+            # Global scope
+            if "scope_type = 'global'" in str(query):
+                class Row:
+                    value = json.dumps(self.global_config)
+                return MockResult(Row())
+        
+        # Handle other config queries
+        if params:
+            if "scope_type = 'user'" in str(query) and params.get("user_id") == "alice":
+                class Row:
+                    value = json.dumps(self.user_config)
+                return MockResult(Row())
+            elif "scope_type = 'tenant'" in str(query) and params.get("tenant_id") == "team_a":
+                class Row:
+                    value = json.dumps(self.tenant_config)
+                return MockResult(Row())
+            elif "scope_type = 'global'" in str(query):
+                class Row:
+                    value = json.dumps(self.global_config)
+                return MockResult(Row())
+        
+        return MockResult(None)
+    
+    def commit(self):
+        pass
 
 
 @pytest.fixture

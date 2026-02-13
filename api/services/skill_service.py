@@ -9,7 +9,8 @@ import json
 
 from api.services.exceptions import ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
-# from sdk import Database
+# from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 class SkillService:
@@ -17,7 +18,7 @@ class SkillService:
     
     def __init__(self, db_session: Session):
         self.db_session = db_session
-        # self.db = Database()
+        # self.db = next(get_db_session())
         self.audit = AuditLogger(db_session)
     
     def register_skill(

@@ -600,7 +600,7 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
     """Restore plan state from events by goal_id.
 
     Args:
-        db: Database instance
+        db: SQLAlchemy Session instance
         goal_id: Goal identifier (stored in metadata)
 
     Returns:
@@ -674,7 +674,7 @@ def execute_plan_in_sandbox(
     
     Args:
         plan: Plan to execute
-        db: Database connection
+        db: SQLAlchemy Session
         executor_fn: Function to execute each step (step -> result)
         sandbox_name: Optional sandbox name (auto-generated if None)
         

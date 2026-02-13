@@ -8,7 +8,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
-from sdk.git_for_data import GitForData
+from core.git_for_data import GitForData
 from core.validation import validate_identifier
 
 if TYPE_CHECKING:

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Event-centric intelligent agent platform with conversation replay and time-point sandbox"
 authors = ["MatrixOne Team"]
 readme = "README.md"
-packages = [{include = "sdk"}, {include = "core"}, {include = "api"}]
+packages = [{include = "core"}, {include = "api"}, {include = "config"}]
 
 [tool.poetry.dependencies]
 python = "^3.10"

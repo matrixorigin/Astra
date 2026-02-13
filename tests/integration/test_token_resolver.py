@@ -14,7 +14,7 @@ from core.repos import (
 
 @pytest.fixture
 def db():
-    """Database session fixture."""
+    """SQLAlchemy Session fixture."""
     from api.database import get_db_session
     session = next(get_db_session())
     yield session

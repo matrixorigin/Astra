@@ -40,20 +40,25 @@ def test_api_key_resolution_user_scope():
     """Test API key resolution prioritizes user scope."""
     db = MockDB()
 
-    # Mock fetchone to return user-scoped token
-    original_fetchone = db.fetchone
+    # Mock execute to return user-scoped token
+    original_execute = db.execute
 
-    def mock_fetchone(query, params=None):
-        if "tokens" in query and "type = 'llm'" in query:
-            return {
-                "token_id": "tok_123",
-                "provider": "openai",
-                "encrypted_value": "user_key_123",
-                "secret_ref": None,
-            }
-        return original_fetchone(query, params)
+    def mock_execute(query, params=None):
+        if "tokens" in str(query) and "type = 'llm'" in str(query):
+            class MockResult:
+                def first(self):
+                    class Row:
+                        token_id = "tok_123"
+                        provider = "openai"
+                        encrypted_value = "user_key_123"
+                        secret_ref = None
+                    return Row()
+                def fetchall(self):
+                    return []
+            return MockResult()
+        return original_execute(query, params)
 
-    db.fetchone = mock_fetchone
+    db.execute = mock_execute
 
     client = LLMClient(db=db, user_id="alice")
     key = client._get_api_key("openai")
@@ -66,17 +71,29 @@ def test_api_key_resolution_fallback_to_env(monkeypatch):
     """Test API key falls back to environment variable."""
     db = MockDB()
 
-    # Mock fetchone to return None (no token in DB)
-    original_fetchone = db.fetchone
+    # Mock execute to return config value
+    original_execute = db.execute
 
-    def mock_fetchone(query, params=None):
-        if "tokens" in query:
-            return None
-        if "configs" in query:
-            return {"value": "config_key_789"}
-        return original_fetchone(query, params)
+    def mock_execute(query, params=None):
+        if "tokens" in str(query):
+            class MockResult:
+                def first(self):
+                    return None
+                def fetchall(self):
+                    return []
+            return MockResult()
+        if "configs" in str(query):
+            class MockResult:
+                def first(self):
+                    class Row:
+                        value = "config_key_789"
+                    return Row()
+                def fetchall(self):
+                    return []
+            return MockResult()
+        return original_execute(query, params)
 
-    db.fetchone = mock_fetchone
+    db.execute = mock_execute
 
     client = LLMClient(db=db, user_id="bob")
     key = client._get_api_key("openai")

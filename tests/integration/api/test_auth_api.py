@@ -315,10 +315,8 @@ class TestHealthEndpoint:
 
     def test_health_check_unhealthy(self, client):
         """Test health check when database is unhealthy."""
-        with patch("sdk.Database") as mock_db_class:
-            mock_db = MagicMock()
-            mock_db.get_connection.return_value.__enter__.side_effect = Exception("Connection failed")
-            mock_db_class.return_value = mock_db
+        with patch("api.database.engine.connect") as mock_connect:
+            mock_connect.side_effect = Exception("Connection failed")
 
             response = client.get("/health")
 

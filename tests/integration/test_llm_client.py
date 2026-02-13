@@ -6,42 +6,42 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from core.llm import LLMClient, LLMMessage, LLMProvider
-from sdk import Database
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 @pytest.fixture
 def db():
     """Database fixture."""
-    db = Database()
+    db = next(get_db_session())
     # Insert test config
+    config_data = json.dumps({
+        "provider": "openai",
+        "model": "gpt-4",
+        "temperature": 0.7,
+        "max_tokens": 2000,
+    })
     db.execute(
-        "INSERT INTO configs (config_id, key_name, value) VALUES (%s, %s, %s) "
-        "ON DUPLICATE KEY UPDATE value = %s",
-        (
-            "llm_config",
-            "llm_config",
-            json.dumps(
-                {
-                    "provider": "openai",
-                    "model": "gpt-4",
-                    "temperature": 0.7,
-                    "max_tokens": 2000,
-                }
-            ),
-            json.dumps(
-                {
-                    "provider": "openai",
-                    "model": "gpt-4",
-                    "temperature": 0.7,
-                    "max_tokens": 2000,
-                }
-            ),
-        ),
+        text("""
+        INSERT INTO configs (config_id, key_name, value) 
+        VALUES (:config_id, :key_name, :value) 
+        ON DUPLICATE KEY UPDATE value = :value2
+        """),
+        {
+            "config_id": "llm_config",
+            "key_name": "llm_config",
+            "value": config_data,
+            "value2": config_data,
+        },
     )
+    db.commit()
     yield db
     # Cleanup
-    db.execute("DELETE FROM llm_call_logs WHERE event_id LIKE 'test_%'")
-    db.execute("DELETE FROM configs WHERE config_id = 'llm_config'")
+    db.execute(text("DELETE FROM llm_call_logs WHERE event_id LIKE 'test_%'"))
+    db.execute(text("DELETE FROM configs WHERE config_id = 'llm_config'"))
+    db.commit()
+    db.close()
 
 
 @pytest.fixture
@@ -53,7 +53,7 @@ def client(db):
 def test_load_config(client):
     """Test loading config from MatrixOne."""
     assert client.config["provider"] == "openai"
-    assert client.config["model"] == "gpt-4"
+    assert client.config["model"] == "gpt-4"  # From database config
     assert client.config["temperature"] == 0.7
 
 
@@ -90,27 +90,30 @@ def test_get_call_logs_by_user(client, db):
     """Test getting call logs by user."""
     # Insert test logs
     db.execute(
-        """
+        text("""
         INSERT INTO llm_call_logs (
             log_id, event_id, user_id, provider, model,
             tokens_prompt, tokens_completion, tokens_total,
             cost_usd, latency_ms, status, created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-        """,
-        (
-            "log_1",
-            "test_event_2",
-            "user_alice",
-            "openai",
-            "gpt-4",
-            100,
-            200,
-            300,
-            0.015,
-            1500,
-            "success",
-        ),
+        ) VALUES (:log_id, :event_id, :user_id, :provider, :model, 
+                  :tokens_prompt, :tokens_completion, :tokens_total,
+                  :cost_usd, :latency_ms, :status, NOW())
+        """),
+        {
+            "log_id": "log_1",
+            "event_id": "test_event_2",
+            "user_id": "user_alice",
+            "provider": "openai",
+            "model": "gpt-4",
+            "tokens_prompt": 100,
+            "tokens_completion": 200,
+            "tokens_total": 300,
+            "cost_usd": 0.015,
+            "latency_ms": 1500,
+            "status": "success",
+        }
     )
+    db.commit()
 
     logs = client.get_call_logs(user_id="user_alice")
     assert len(logs) >= 1

@@ -10,7 +10,8 @@ import json
 from api.repositories import SessionRepository, EventRepository
 from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
 from core.auth.audit_logger import AuditLogger
-# from sdk import Database
+# from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 class ContextService:
@@ -20,7 +21,7 @@ class ContextService:
         self.db_session = db_session
         self.session_repo = SessionRepository(db_session)
         self.event_repo = EventRepository(db_session)
-        # self.db = Database()
+        # self.db = next(get_db_session())
         self.audit = AuditLogger(db_session)
     
     def create_snapshot(

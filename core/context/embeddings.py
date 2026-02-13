@@ -22,7 +22,7 @@ class EmbeddingService:
         """Initialize embedding service.
 
         Args:
-            db: Database session
+            db: SQLAlchemy Session
             provider: Embedding provider (openai, mock)
             model: Model name
         """

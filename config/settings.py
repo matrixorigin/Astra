@@ -39,6 +39,9 @@ class Settings(BaseSettings):
         default="dev-secret-key-change-in-production",
         description="Secret key for encryption",
     )
+    
+    # External Services
+    github_token: str | None = Field(default=None, description="GitHub API token")
 
     @property
     def is_development(self) -> bool:

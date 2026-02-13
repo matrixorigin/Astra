@@ -172,7 +172,7 @@ def test_delete(branch, db):
 
 def test_diff_with_snapshot(branch, db):
     """Test diff with snapshots."""
-    from sdk.git_for_data import GitForData
+    from core.git_for_data import GitForData
     from uuid_utils import uuid7
     import time
     suffix = str(int(time.time() * 1000) % 10000)  # 唯一后缀

@@ -26,7 +26,7 @@ def client():
 
 @pytest.fixture
 def db_session():
-    """Database session"""
+    """SQLAlchemy Session"""
     session = next(get_db_session())
     yield session
     session.close()

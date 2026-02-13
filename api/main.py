@@ -108,13 +108,15 @@ app.include_router(streaming.router, tags=["streaming"])
 @app.get("/health")
 def health_check():
     """Health check endpoint."""
-    from sdk import Database
+    from sqlalchemy.orm import Session
+    from api.database import get_db_session
     
-    db = Database()
-    # Simple health check - try to connect
+    db = next(get_db_session())
+    # Simple health check - try to execute a query
     try:
-        with db.get_connection():
-            db_healthy = True
+        from sqlalchemy import text
+        db.execute(text("SELECT 1"))
+        db_healthy = True
     except Exception:
         db_healthy = False
 

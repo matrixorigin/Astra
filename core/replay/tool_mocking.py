@@ -19,7 +19,8 @@ from typing import Dict, Any, Optional, Literal
 from enum import Enum
 
 from core.logging_config import get_logger
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -74,14 +75,14 @@ class ToolMockingLayer:
     def __init__(
         self,
         mode: ExecutionMode,
-        db: Database,
+        db: Session,
         session_id: Optional[str] = None
     ):
         """Initialize tool mocking layer
         
         Args:
             mode: Execution mode (production/replay/dry_run)
-            db: Database instance
+            db: Session instance
             session_id: Session ID (required for replay mode)
         """
         self.mode = mode

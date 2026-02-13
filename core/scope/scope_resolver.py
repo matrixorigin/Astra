@@ -6,17 +6,18 @@ Supports extensible scope chains for different business scenarios:
 - Deploy Agent: environment > project > account > global
 """
 
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 
 class ScopeResolver:
     """Resolve configuration with extensible scope chain."""
 
-    def __init__(self, db: Database, scope_chain: list[tuple[str, str | None]]):
+    def __init__(self, db: Session, scope_chain: list[tuple[str, str | None]]):
         """Initialize resolver with priority chain.
 
         Args:
-            db: Database connection
+            db: Session connection
             scope_chain: Priority chain from specific to general, e.g.,
                 [('repo', 'matrixone'), ('project', 'backend'),
                  ('user', 'alice'), ('account', 'acme'), ('global', None)]

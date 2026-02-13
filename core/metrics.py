@@ -3,7 +3,7 @@
 from fastapi import Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
-from core.config import get_settings
+from config.settings import get_settings
 
 settings = get_settings()
 

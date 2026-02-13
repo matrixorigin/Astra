@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from api.database import get_db_session
 from core.replay.time_machine import TimeMachine
 from core.sandbox import Sandbox
-from sdk.git_for_data import GitForData
+from core.git_for_data import GitForData
 
 
 @pytest.fixture

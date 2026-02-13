@@ -27,14 +27,46 @@ class MockDB:
                     if params and config.get("scope_id") == params[0]:
                         return config
         return None
+    
+    def execute(self, query, params=None):
+        """Mock execute for SQLAlchemy compatibility."""
+        class MockResult:
+            def first(self):
+                return None
+            def fetchall(self):
+                return []
+        return MockResult()
+    
+    def commit(self):
+        pass
+        class MockResult:
+            def __init__(self, data):
+                self.data = data
+            def first(self):
+                return self.data
+            def fetchall(self):
+                return []
+        
+        # Handle token queries - return None
+        if "tokens" in str(query):
+            return MockResult(None)
+        
+        # Handle config queries - delegate to fetchone logic
+        row_data = self.fetchone(str(query), params)
+        if row_data:
+            class Row:
+                def __init__(self, data):
+                    for k, v in data.items():
+                        setattr(self, k, v)
+            return MockResult(Row(row_data))
+        
+        return MockResult(None)
+    
+    def commit(self):
+        pass
 
     def fetchall(self, query, params=None):
         return []
-
-    def execute(self, query, params=None):
-        self.data["last_query"] = query
-        self.data["last_params"] = params
-        return None
 
 
 class TestModelRegistry:

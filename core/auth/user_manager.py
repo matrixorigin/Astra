@@ -8,7 +8,8 @@ from uuid_utils import uuid7
 
 from core.auth.password import hash_password, verify_password
 from core.logging_config import get_logger
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -16,11 +17,11 @@ logger = get_logger(__name__)
 class UserManager:
     """Manage user operations."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Session):
         """Initialize user manager.
 
         Args:
-            db: Database instance
+            db: Session instance
         """
         self.db = db
 

@@ -6,7 +6,8 @@ from queue import Queue
 from typing import Any
 
 from core.logging_config import get_logger
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -16,11 +17,11 @@ logger = get_logger(__name__)
 class BatchEventWriter:
     """Batch writer for conversation events."""
 
-    def __init__(self, db: Database, batch_size: int = 100, flush_interval: float = 1.0):
+    def __init__(self, db: Session, batch_size: int = 100, flush_interval: float = 1.0):
         """Initialize batch writer.
 
         Args:
-            db: Database instance
+            db: Session instance
             batch_size: Max events per batch
             flush_interval: Max seconds between flushes
         """
@@ -143,7 +144,7 @@ class BatchEventWriter:
 _writer = None
 
 
-def get_batch_writer(db: Database | None = None) -> BatchEventWriter | None:
+def get_batch_writer(db: Session | None = None) -> BatchEventWriter | None:
     """Get global batch writer instance."""
     global _writer
     if _writer is None and db:

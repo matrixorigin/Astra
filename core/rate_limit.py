@@ -5,7 +5,7 @@ from collections import defaultdict
 
 from fastapi import HTTPException, Request, status
 
-from core.config import get_settings
+from config.settings import get_settings
 from core.logging_config import get_logger
 
 settings = get_settings()

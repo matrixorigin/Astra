@@ -12,7 +12,7 @@ from api.models import Event as EventModel
 
 @pytest.fixture
 def db_session():
-    """Database session fixture."""
+    """SQLAlchemy Session fixture."""
     session = next(get_db_session())
     yield session
     session.close()

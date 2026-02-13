@@ -208,10 +208,11 @@ from core.events.event_logger import EventLogger
 from core.events.session_manager import SessionManager
 from core.sandbox import Sandbox, Branch
 from core.repos import RepoRegistry, RepoType, AccessScope, OwnerType
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 # Initialize
-db = Database()
+db = next(get_db_session())
 session_mgr = SessionManager(db)
 logger = EventLogger(db)
 

@@ -43,7 +43,7 @@ class HallucinationFirewall:
         """Initialize firewall.
 
         Args:
-            db: Database connection
+            db: SQLAlchemy Session
             context_manager: ContextManager for loading snapshots
             threshold: Minimum confidence to pass (default: 0.7)
         """

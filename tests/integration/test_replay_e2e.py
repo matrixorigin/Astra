@@ -13,7 +13,7 @@ from core.skills.github_client import GitHubClient
 
 @pytest.fixture
 def db():
-    """Database session fixture with cleanup"""
+    """SQLAlchemy Session fixture with cleanup"""
     from api.database import get_db_session
     from sqlalchemy import text
     

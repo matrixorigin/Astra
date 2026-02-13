@@ -3,7 +3,9 @@
 from typing import Any
 
 from core.logging_config import get_logger
-from sdk import Database
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -11,7 +13,7 @@ logger = get_logger(__name__)
 class PromptManager:
     """Manage versioned prompt templates."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Session):
         self.db = db
         self._cache: dict[str, Any] = {}  # Simple in-memory cache
 
@@ -80,26 +82,31 @@ class PromptManager:
         # Deactivate old versions if this is active
         if is_active:
             self.db.execute(
-                """
+                text("""
                 UPDATE prompt_templates
                 SET is_active = 0
-                WHERE template_id = %s
-            """,
-                (template_id,),
+                WHERE template_id = :template_id
+                """),
+                {"template_id": template_id}
             )
 
         # Insert new version
         self.db.execute(
-            """
+            text("""
             INSERT INTO prompt_templates
             (template_id, version, content, is_active, effective_at)
-            VALUES (%s, %s, %s, %s, NOW())
+            VALUES (:template_id, :version, :content, :is_active, NOW())
             ON DUPLICATE KEY UPDATE
                 content = VALUES(content),
                 is_active = VALUES(is_active),
                 effective_at = VALUES(effective_at)
-        """,
-            (template_id, version, content, is_active),
+            """),
+            {
+                "template_id": template_id,
+                "version": version,
+                "content": content,
+                "is_active": is_active
+            }
         )
 
         # Clear cache
@@ -123,7 +130,7 @@ class PromptManager:
         logger.info("Prompt cache cleared")
 
 
-def init_default_prompts(db: Database):
+def init_default_prompts(db: Session):
     """Initialize default prompt templates."""
     manager = PromptManager(db)
 
@@ -203,7 +210,7 @@ Be helpful, accurate, and concise.""",
 class PromptFeedback:
     """Collect and analyze user feedback on LLM responses."""
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Session):
         self.db = db
 
     def record_feedback(
@@ -238,21 +245,21 @@ class PromptFeedback:
         feedback_id = str(uuid7())
 
         self.db.execute(
-            """
+            text("""
             INSERT INTO llm_feedback
             (feedback_id, prompt_template_id, prompt_version, llm_request_id,
              rating, comment, metadata, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-        """,
-            (
-                feedback_id,
-                prompt_template_id,
-                prompt_version,
-                llm_request_id,
-                user_rating,
-                user_comment,
-                json.dumps(metadata or {}),
-            ),
+            VALUES (:feedback_id, :template_id, :version, :request_id, :rating, :comment, :metadata, NOW())
+            """),
+            {
+                "feedback_id": feedback_id,
+                "template_id": prompt_template_id,
+                "version": prompt_version,
+                "request_id": llm_request_id,
+                "rating": user_rating,
+                "comment": user_comment,
+                "metadata": json.dumps(metadata or {}),
+            }
         )
 
         logger.info(
@@ -265,14 +272,14 @@ class PromptFeedback:
     ) -> dict[str, Any]:
         """Get feedback statistics for a prompt."""
         if prompt_version:
-            where_clause = "WHERE prompt_template_id = %s AND prompt_version = %s"
-            params: tuple[str, ...] = (prompt_template_id, prompt_version)
+            where_clause = "WHERE prompt_template_id = :template_id AND prompt_version = :version"
+            params = {"template_id": prompt_template_id, "version": prompt_version}
         else:
-            where_clause = "WHERE prompt_template_id = %s"
-            params = (prompt_template_id,)
+            where_clause = "WHERE prompt_template_id = :template_id"
+            params = {"template_id": prompt_template_id}
 
-        stats_row = self.db.fetchone(
-            f"""
+        result = self.db.execute(
+            text(f"""
             SELECT
                 COUNT(*) as total_count,
                 AVG(rating) as avg_rating,
@@ -280,37 +287,37 @@ class PromptFeedback:
                 MAX(rating) as max_rating
             FROM llm_feedback
             {where_clause}
-        """,
-            params,
+            """),
+            params
         )
+        stats_row = result.first()
 
-        distribution = self.db.fetchall(
-            f"""
+        result = self.db.execute(
+            text(f"""
             SELECT rating, COUNT(*) as count
             FROM llm_feedback
             {where_clause}
             GROUP BY rating
             ORDER BY rating
-        """,
-            params,
+            """),
+            params
         )
+        distribution = result.fetchall()
 
         return {
-            "total_count": stats_row.get("total_count", 0) if stats_row else 0,
-            "avg_rating": float(stats_row.get("avg_rating", 0))
-            if stats_row and stats_row.get("avg_rating")
-            else 0.0,
-            "min_rating": stats_row.get("min_rating", 0) if stats_row else 0,
-            "max_rating": stats_row.get("max_rating", 0) if stats_row else 0,
-            "distribution": {row["rating"]: row["count"] for row in distribution},
+            "total_count": stats_row.total_count if stats_row else 0,
+            "avg_rating": float(stats_row.avg_rating) if stats_row and stats_row.avg_rating else 0.0,
+            "min_rating": stats_row.min_rating if stats_row else 0,
+            "max_rating": stats_row.max_rating if stats_row else 0,
+            "distribution": {row.rating: row.count for row in distribution},
         }
 
     def get_low_score_cases(
         self, prompt_template_id: str, threshold: int = 2, limit: int = 100
     ) -> list[dict[str, Any]]:
         """Get low-scoring feedback cases for analysis."""
-        rows = self.db.fetchall(
-            """
+        result = self.db.execute(
+            text("""
             SELECT
                 feedback_id,
                 prompt_version,
@@ -320,14 +327,16 @@ class PromptFeedback:
                 metadata,
                 created_at
             FROM llm_feedback
-            WHERE prompt_template_id = %s AND rating <= %s
+            WHERE prompt_template_id = :template_id AND rating <= :threshold
             ORDER BY created_at DESC
-            LIMIT %s
-        """,
-            (prompt_template_id, threshold, limit),
+            LIMIT :limit
+            """),
+            {"template_id": prompt_template_id, "threshold": threshold, "limit": limit}
         )
 
-        return [dict(row) for row in rows]
+        rows = result.fetchall()
+
+        return [dict(row._mapping) for row in rows]
 
     def compare_versions(
         self, prompt_template_id: str, version_a: str, version_b: str
