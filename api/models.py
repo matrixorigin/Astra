@@ -33,6 +33,18 @@ class Agent(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
+class Config(Base):
+    __tablename__ = "configs"
+    config_id = Column(String(36), primary_key=True)
+    key_name = Column(String(100), nullable=False, index=True)
+    value = Column(Text)
+    scope_type = Column(String(20), default="global")  # global, tenant, user
+    scope_tenant_id = Column(String(36), index=True)
+    scope_user_id = Column(String(36), index=True)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
     token_id = Column(String(36), primary_key=True)
@@ -157,10 +169,13 @@ class DecisionAudit(Base):
 
 class EventEmbedding(Base):
     __tablename__ = "event_embeddings"
-    embedding_id = Column(String(64), primary_key=True)
-    event_id = Column(String(64), nullable=False, index=True)
-    embedding_vector = Column(Text)
+    event_id = Column(String(64), primary_key=True)  # Use event_id as primary key
+    embedding = Column(Text, nullable=False)  # Store as JSON string
+    model_name = Column(String(100), nullable=False)
+    model_version = Column(String(20), nullable=False)
+    embedding_metadata = Column("metadata", JSON)  # Use column mapping for reserved word
     created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
 class Repo(Base):

@@ -177,7 +177,7 @@ class AgentManager:
         updates.append("updated_at = :updated_at")
         params["updated_at"] = datetime.now(timezone.utc)
 
-        query = f"UPDATE agents SET {', '.join(updates)} WHERE agent_id = :agent_id"
+        query = "UPDATE agents SET " + ", ".join(updates) + " WHERE agent_id = :agent_id"
         result = self.db.execute(text(query), params)
         self.db.commit()
 

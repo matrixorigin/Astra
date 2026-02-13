@@ -210,7 +210,7 @@ class Sandbox:
 
         if updates:
             updates.append("updated_at = CURRENT_TIMESTAMP")
-            query = f"UPDATE sandbox_metadata SET {', '.join(updates)} WHERE sandbox_name = :name"
+            query = "UPDATE sandbox_metadata SET " + ", ".join(updates) + " WHERE sandbox_name = :name"
             self.db.execute(text(query), params)
             self.db.commit()
 

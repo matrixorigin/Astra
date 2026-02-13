@@ -113,17 +113,12 @@ class EmbeddingService:
         metadata_json = json.dumps(metadata or {})
 
         from sqlalchemy import text
+        # Use REPLACE INTO for MatrixOne compatibility
         self.db.execute(
             text("""
-            INSERT INTO event_embeddings
-            (event_id, embedding, model_name, model_version, metadata)
-            VALUES (:event_id, :embedding, :model_name, :model_version, :metadata)
-            ON DUPLICATE KEY UPDATE
-                embedding = VALUES(embedding),
-                model_name = VALUES(model_name),
-                model_version = VALUES(model_version),
-                metadata = VALUES(metadata),
-                updated_at = CURRENT_TIMESTAMP
+            REPLACE INTO event_embeddings
+            (event_id, embedding, model_name, model_version, metadata, created_at, updated_at)
+            VALUES (:event_id, :embedding, :model_name, :model_version, :metadata, NOW(), NOW())
         """),
             {"event_id": event_id, "embedding": vec_str, "model_name": self.model, "model_version": "1.0", "metadata": metadata_json},
         )
