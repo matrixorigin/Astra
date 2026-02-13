@@ -185,26 +185,27 @@ class SkillService:
         skill_id: str
     ) -> List[Dict[str, Any]]:
         """列出技能的所有版本"""
+        from sqlalchemy import text
+        
         try:
-            # with self.db.get_cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT version, description, created_at
-                    FROM skills_registry
-                    WHERE skill_id = %s
-                    ORDER BY created_at DESC
-                    """,
-                    (skill_id,)
-                )
-                versions = cursor.fetchall()
-                
-                return [
-                    {
-                        "version": v["version"],
-                        "description": v["description"],
-                        "created_at": v["created_at"].isoformat() if v.get("created_at") else None
-                    }
-                    for v in versions
-                ]
+            result = self.db.execute(
+                text("""
+                SELECT version, description, created_at
+                FROM skills_registry
+                WHERE skill_id = :skill_id
+                ORDER BY created_at DESC
+                """),
+                {"skill_id": skill_id}
+            )
+            versions = [dict(row._mapping) for row in result]
+            
+            return [
+                {
+                    "version": v["version"],
+                    "description": v["description"],
+                    "created_at": v["created_at"].isoformat() if v.get("created_at") else None
+                }
+                for v in versions
+            ]
         except Exception:
             return []

@@ -79,22 +79,24 @@ class SemanticDiff:
         Returns:
             dict: Semantic comparison at two time points
         """
+        from sqlalchemy import text
+        
         # Query events at each checkpoint
-        query1 = f"""
+        query1 = text(f"""
             SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint1}'}}
-            WHERE session_id = %s
+            WHERE session_id = :session_id
             ORDER BY created_at ASC
-        """
-        events1_rows = self.db.fetchall(query1, (session_id,))
-        events1 = [self.reader._row_to_event(row) for row in events1_rows]
+        """)
+        events1_rows = self.db.execute(query1, {"session_id": session_id}).fetchall()
+        events1 = [self.reader._row_to_event(dict(row._mapping)) for row in events1_rows]
 
-        query2 = f"""
+        query2 = text(f"""
             SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint2}'}}
-            WHERE session_id = %s
+            WHERE session_id = :session_id
             ORDER BY created_at ASC
-        """
-        events2_rows = self.db.fetchall(query2, (session_id,))
-        events2 = [self.reader._row_to_event(row) for row in events2_rows]
+        """)
+        events2_rows = self.db.execute(query2, {"session_id": session_id}).fetchall()
+        events2 = [self.reader._row_to_event(dict(row._mapping)) for row in events2_rows]
 
         # Compare
         token_diff = self._compare_token_usage(events1, events2)

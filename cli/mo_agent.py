@@ -517,19 +517,21 @@ def session():
 @click.option("--limit", default=10, help="Number of sessions to show")
 def session_list(user_id, limit):
     """List recent sessions."""
+    from sqlalchemy import text
+    
     db = next(get_db_session())
 
     query = "SELECT * FROM sessions"
-    params = []
+    params = {}
 
     if user_id:
-        query += " WHERE user_id = %s"
-        params.append(user_id)
+        query += " WHERE user_id = :user_id"
+        params["user_id"] = user_id
 
-    query += " ORDER BY created_at DESC LIMIT %s"
-    params.append(limit)
+    query += f" ORDER BY created_at DESC LIMIT {limit}"
 
-    sessions = db.fetchall(query, tuple(params))
+    result = db.execute(text(query), params)
+    sessions = [dict(row._mapping) for row in result]
 
     if not sessions:
         click.echo("No sessions found")

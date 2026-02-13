@@ -264,18 +264,20 @@ class ToolMockingLayer:
             result: Skill execution result
             side_effects: Side effects metadata (API calls, state changes, etc.)
         """
+        from sqlalchemy import text
+        
         try:
             self.db.execute(
-                """
+                text("""
                 UPDATE conversation_events
-                SET skill_result = %s, side_effects = %s
-                WHERE event_id = %s
-                """,
-                (
-                    json.dumps(result),
-                    json.dumps(side_effects or {}),
-                    event_id
-                )
+                SET skill_result = :result, side_effects = :side_effects
+                WHERE event_id = :event_id
+                """),
+                {
+                    "result": json.dumps(result),
+                    "side_effects": json.dumps(side_effects or {}),
+                    "event_id": event_id
+                }
             )
             logger.info(f"Recorded skill result for event {event_id}")
         except Exception as e:

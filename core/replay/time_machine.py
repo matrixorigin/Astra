@@ -99,23 +99,25 @@ class TimeMachine:
 
         cols = ", ".join(columns)
 
+        from sqlalchemy import text
+        
         if session_id:
-            query = f"""
+            query = text(f"""
                 SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
-                WHERE session_id = %s
+                WHERE session_id = :session_id
                 ORDER BY created_at DESC
                 LIMIT {limit}
-            """
-            rows = self.db.fetchall(query, (session_id,))
+            """)
+            rows = self.db.execute(query, {"session_id": session_id}).fetchall()
         else:
-            query = f"""
+            query = text(f"""
                 SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
                 ORDER BY created_at DESC
                 LIMIT {limit}
-            """
-            rows = self.db.fetchall(query)
+            """)
+            rows = self.db.execute(query).fetchall()
 
-        return [self.reader._row_to_event(row) for row in rows]
+        return [self.reader._row_to_event(dict(row._mapping)) for row in rows]
 
     def list_checkpoints(self) -> list[dict]:
         """List all available checkpoints.

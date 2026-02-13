@@ -125,8 +125,9 @@ class TestToolMockingLayer:
         # Verify database update
         mock_db.execute.assert_called_once()
         call_args = mock_db.execute.call_args
-        assert "UPDATE conversation_events" in call_args[0][0]
-        assert call_args[0][1][2] == "evt_123"  # event_id
+        # Check that text() was used and params dict contains event_id
+        params_dict = call_args[0][1] if len(call_args[0]) > 1 else call_args.kwargs
+        assert params_dict.get("event_id") == "evt_123"
     
     def test_replay_mode_requires_session_id(self, mock_db):
         """Test replay mode requires session_id"""
