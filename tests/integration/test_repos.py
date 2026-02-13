@@ -3,13 +3,15 @@
 import pytest
 
 from core.repos import AccessScope, OwnerType, RepoRegistry, RepoType
-from sdk import Database
 
 
 @pytest.fixture
 def db():
-    """Database fixture."""
-    return Database()
+    """Database session fixture."""
+    from api.database import get_db_session
+    session = next(get_db_session())
+    yield session
+    session.close()
 
 
 @pytest.fixture
@@ -18,8 +20,26 @@ def registry(db):
     return RepoRegistry(db=db)
 
 
+@pytest.fixture(autouse=True)
+def cleanup(db):
+    """Clean up test data."""
+    yield
+    # Only clean after test
+    from api.models import Repo
+    try:
+        db.query(Repo).filter(Repo.repo_url.like('%github.com%')).delete(synchronize_session=False)
+        db.commit()
+    except:
+        pass
+
+
 def test_create_repo(registry, db):
     """Test creating a repository."""
+    # Clean up first
+    from api.models import Repo
+    db.query(Repo).filter(Repo.repo_url == "https://github.com/matrixorigin/matrixone").delete()
+    db.commit()
+    
     repo = registry.create(
         repo_url="https://github.com/matrixorigin/matrixone",
         repo_type=RepoType.CODE,
@@ -37,8 +57,10 @@ def test_create_repo(registry, db):
     assert repo.metadata["default_branch"] == "main"
     assert repo.is_active is True
 
-    # Cleanup
-    db.execute("DELETE FROM repos WHERE repo_id = %s", (repo.repo_id,))
+    # Cleanup using ORM
+    from api.models import Repo
+    db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete()
+    db.commit()
 
 
 def test_get_repo(registry, db):
@@ -57,7 +79,7 @@ def test_get_repo(registry, db):
     assert retrieved.repo_url == repo.repo_url
 
     # Cleanup
-    db.execute("DELETE FROM repos WHERE repo_id = %s", (repo.repo_id,))
+    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
 
 
 def test_get_by_url(registry, db):
@@ -75,7 +97,7 @@ def test_get_by_url(registry, db):
     assert retrieved.repo_id == repo.repo_id
 
     # Cleanup
-    db.execute("DELETE FROM repos WHERE repo_id = %s", (repo.repo_id,))
+    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
 
 
 def test_list_by_owner(registry, db):
@@ -108,7 +130,9 @@ def test_list_by_owner(registry, db):
     assert code_repos[0].repo_type == RepoType.CODE
 
     # Cleanup
-    db.execute("DELETE FROM repos WHERE repo_id IN (%s, %s)", (repo1.repo_id, repo2.repo_id))
+    from api.models import Repo
+    db.query(Repo).filter(Repo.repo_id.in_([repo1.repo_id, repo2.repo_id])).delete(synchronize_session=False)
+    db.commit()
 
 
 def test_update_token(registry, db):
@@ -128,7 +152,7 @@ def test_update_token(registry, db):
     assert updated.token_id == "token_123"
 
     # Cleanup
-    db.execute("DELETE FROM repos WHERE repo_id = %s", (repo.repo_id,))
+    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
 
 
 def test_update_metadata(registry, db):
@@ -151,7 +175,7 @@ def test_update_metadata(registry, db):
     assert updated.metadata["ci_enabled"] is True
 
     # Cleanup
-    db.execute("DELETE FROM repos WHERE repo_id = %s", (repo.repo_id,))
+    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
 
 
 def test_deactivate_repo(registry, db):
@@ -175,7 +199,7 @@ def test_deactivate_repo(registry, db):
     assert len(repos) == 0
 
     # Cleanup
-    db.execute("DELETE FROM repos WHERE repo_id = %s", (repo.repo_id,))
+    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
 
 
 def test_repo_groups(registry, db):
@@ -220,7 +244,6 @@ def test_repo_groups(registry, db):
         assert repo.repo_group == "matrixone-project"
 
     # Cleanup
-    db.execute(
-        "DELETE FROM repos WHERE repo_id IN (%s, %s, %s)",
-        (matrixone.repo_id, mo_ci.repo_id, mo_tester.repo_id),
-    )
+    from api.models import Repo
+    db.query(Repo).filter(Repo.repo_id.in_([matrixone.repo_id, mo_ci.repo_id, mo_tester.repo_id])).delete(synchronize_session=False)
+    db.commit()

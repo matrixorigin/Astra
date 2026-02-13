@@ -10,13 +10,15 @@ from core.repos import (
     TokenResolver,
     TokenType,
 )
-from sdk import Database
 
 
 @pytest.fixture
 def db():
-    """Database fixture."""
-    return Database()
+    """Database session fixture."""
+    from api.database import get_db_session
+    session = next(get_db_session())
+    yield session
+    session.close()
 
 
 @pytest.fixture
@@ -29,6 +31,19 @@ def resolver(db):
 def registry(db):
     """Repo registry fixture."""
     return RepoRegistry(db=db)
+
+
+@pytest.fixture(autouse=True)
+def cleanup(db):
+    """Clean up test data."""
+    from api.models import Repo
+    # Clean before test
+    db.query(Repo).filter(Repo.repo_url.like('%test/repo%')).delete(synchronize_session=False)
+    db.commit()
+    yield
+    # Clean after test
+    db.query(Repo).filter(Repo.repo_url.like('%test/repo%')).delete(synchronize_session=False)
+    db.commit()
 
 
 def test_create_token(resolver, db):
@@ -47,7 +62,7 @@ def test_create_token(resolver, db):
     assert token.is_active is True
 
     # Cleanup
-    db.execute("DELETE FROM tokens WHERE token_id = %s", (token.token_id,))
+    from api.models import Token; db.query(Token).filter(Token.token_id == token.token_id).delete(); db.commit()
 
 
 def test_resolve_user_default_token(resolver, db):
@@ -67,7 +82,7 @@ def test_resolve_user_default_token(resolver, db):
     assert resolved.scope_user_id == "user_456"
 
     # Cleanup
-    db.execute("DELETE FROM tokens WHERE token_id = %s", (token.token_id,))
+    from api.models import Token; db.query(Token).filter(Token.token_id == token.token_id).delete(); db.commit()
 
 
 def test_resolve_tenant_default_token(resolver, db):
@@ -87,7 +102,7 @@ def test_resolve_tenant_default_token(resolver, db):
     assert resolved.scope_tenant_id == "tenant_789"
 
     # Cleanup
-    db.execute("DELETE FROM tokens WHERE token_id = %s", (token.token_id,))
+    from api.models import Token; db.query(Token).filter(Token.token_id == token.token_id).delete(); db.commit()
 
 
 def test_resolve_repo_specific_token(resolver, registry, db):
@@ -124,7 +139,7 @@ def test_resolve_repo_specific_token(resolver, registry, db):
 
     # Cleanup
     registry.delete(repo.repo_id)
-    db.execute("DELETE FROM tokens WHERE token_id = %s", (token.token_id,))
+    from api.models import Token; db.query(Token).filter(Token.token_id == token.token_id).delete(); db.commit()
 
 
 def test_token_priority_fallback(resolver, registry, db):
@@ -160,10 +175,9 @@ def test_token_priority_fallback(resolver, registry, db):
     assert resolved.token_id == tenant_token.token_id
 
     # Cleanup
-    db.execute(
-        "DELETE FROM tokens WHERE token_id IN (%s, %s, %s)",
-        (global_token.token_id, tenant_token.token_id, user_token.token_id),
-    )
+    from api.models import Token
+    db.query(Token).filter(Token.token_id.in_([global_token.token_id, tenant_token.token_id, user_token.token_id])).delete(synchronize_session=False)
+    db.commit()
 
 
 def test_deactivate_token(resolver, db):
@@ -183,4 +197,4 @@ def test_deactivate_token(resolver, db):
     assert resolved is None
 
     # Cleanup
-    db.execute("DELETE FROM tokens WHERE token_id = %s", (token.token_id,))
+    from api.models import Token; db.query(Token).filter(Token.token_id == token.token_id).delete(); db.commit()

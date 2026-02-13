@@ -224,19 +224,23 @@ class ContextManager:
     def _retrieve_candidates(self, session_id: str, query: str) -> list[dict[str, Any]]:
         """Retrieve candidate events for context."""
         # Get recent events from current session
-        events = self.db.fetchall(
-            """
-            SELECT event_id, event_type, content, created_at,
-                   parent_event_id, causal_chain_id, metadata
-            FROM conversation_events
-            WHERE session_id = %s
-            ORDER BY created_at DESC
-            LIMIT 100
-            """,
-            (session_id,),
-        )
+        from api.models import ConversationEvent
+        events = self.db.query(ConversationEvent).filter(
+            ConversationEvent.session_id == session_id
+        ).order_by(ConversationEvent.created_at.desc()).limit(100).all()
 
-        return [dict(e) for e in events]
+        return [
+            {
+                "event_id": e.event_id,
+                "event_type": e.event_type,
+                "content": e.content,
+                "created_at": e.created_at,
+                "parent_event_id": e.parent_event_id,
+                "causal_chain_id": e.causal_chain_id,
+                "metadata": e.metadata,
+            }
+            for e in events
+        ]
 
     def _score_candidates(
         self, query: str, candidates: list[dict[str, Any]], session_id: str, task_type: TaskType
@@ -354,20 +358,17 @@ class ContextManager:
 
     def _get_skill_definitions(self, token_budget: int) -> list[dict[str, Any]]:
         """Get available skill definitions within budget."""
-        skills = self.db.fetchall("""
-            SELECT skill_name, version, description, category, subcategory
-            FROM skills_registry
-            WHERE is_active = 1
-            ORDER BY priority DESC
-            LIMIT 10
-        """)
+        from api.models import SkillRegistry
+        skills = self.db.query(SkillRegistry).filter(
+            SkillRegistry.is_active == 1
+        ).limit(10).all()
 
         return [
             {
-                "name": s["skill_name"],
-                "version": s["version"],
-                "description": s["description"],
-                "category": s.get("category", "general"),
+                "name": s.skill_name,
+                "version": s.version,
+                "description": s.skill_definition.get("description", "") if isinstance(s.skill_definition, dict) else "",
+                "category": "general",
             }
             for s in skills
         ]

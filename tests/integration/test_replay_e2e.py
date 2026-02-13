@@ -124,7 +124,7 @@ async def test_e2e_skill_version_replay(
     monkeypatch.setattr(github, "get_pr_diff", mock_get_pr_diff)
 
     # Step 1: Register skill v1.0.0
-    skill_v1 = SummarizePRSkill(db, llm, github)
+    skill_v1 = SummarizePRSkill(llm, github, db)
     skill_v1.version = "1.0.0"
     registry.register(skill_v1)
 
@@ -181,7 +181,7 @@ async def test_e2e_skill_version_replay(
     assert "1.0.0" in output_v1.summary
 
     # Step 3: Register skill v1.1.0 (should deactivate v1.0.0)
-    skill_v2 = SummarizePRSkill(db, llm, github)
+    skill_v2 = SummarizePRSkill(llm, github, db)
     skill_v2.version = "1.1.0"
     registry.register(skill_v2)
 
@@ -228,36 +228,39 @@ async def test_replay_missing_skill_version(db, registry, github, llm, logger, r
     import json
 
     from uuid_utils import uuid7
+    from sqlalchemy import text
 
     user_id = "test_user"
 
     event_id = str(uuid7())
     db.execute(
-        """
+        text("""
         INSERT INTO conversation_events (
             event_id, user_id, session_id, agent_id, agent_version,
             event_type, content, skill_name, skill_version, metadata, created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-    """,
-        (
-            event_id,
-            user_id,
-            session_id,
-            "dev-agent",
-            "0.2.0",
-            "skill_exec",
-            "Test content",
-            "nonexistent_skill",
-            "99.99.99",
-            json.dumps(
+        ) VALUES (:event_id, :user_id, :session_id, :agent_id, :agent_version, 
+                  :event_type, :content, :skill_name, :skill_version, :metadata, NOW())
+    """),
+        {
+            "event_id": event_id,
+            "user_id": user_id,
+            "session_id": session_id,
+            "agent_id": "dev-agent",
+            "agent_version": "0.2.0",
+            "event_type": "skill_exec",
+            "content": "Test content",
+            "skill_name": "nonexistent_skill",
+            "skill_version": "99.99.99",
+            "metadata": json.dumps(
                 {
                     "skill": "nonexistent_skill",
                     "skill_version": "99.99.99",
                     "input": {"test": "data"},
                 }
             ),
-        ),
+        }
     )
+    db.commit()
 
     # Replay should handle missing skill gracefully
     replay_result = await replay_engine.replay_conversation(session_id)
@@ -318,7 +321,7 @@ async def test_verify_reproducibility(
     monkeypatch.setattr(github, "get_pr_diff", mock_get_pr_diff)
 
     # Register skill
-    skill = SummarizePRSkill(db, llm, github)
+    skill = SummarizePRSkill(llm, github, db)
     registry.register(skill)
 
     # Execute skill

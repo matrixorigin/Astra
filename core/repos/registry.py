@@ -73,47 +73,43 @@ class RepoRegistry:
 
     def get(self, repo_id: str) -> Repo | None:
         """Get repository by ID."""
-        query = "SELECT * FROM repos WHERE repo_id = %s"
-        result = self.db.fetchone(query, (repo_id,))
+        from api.models import Repo as RepoModel
+        result = self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
         if not result:
             return None
         return self._to_model(result)
 
     def get_by_url(self, repo_url: str, owner_id: str) -> Repo | None:
         """Get repository by URL and owner."""
-        query = "SELECT * FROM repos WHERE repo_url = %s AND owner_id = %s"
-        result = self.db.fetchone(query, (repo_url, owner_id))
+        from api.models import Repo as RepoModel
+        result = self.db.query(RepoModel).filter(
+            RepoModel.repo_url == repo_url,
+            RepoModel.owner_id == owner_id
+        ).first()
         if not result:
             return None
         return self._to_model(result)
 
     def list_by_owner(self, owner_id: str, repo_type: RepoType | None = None) -> list[Repo]:
         """List repositories by owner."""
+        from api.models import Repo as RepoModel
+        query = self.db.query(RepoModel).filter(
+            RepoModel.owner_id == owner_id,
+            RepoModel.is_active == True
+        )
         if repo_type:
-            query = """
-                SELECT * FROM repos
-                WHERE owner_id = %s AND repo_type = %s AND is_active = TRUE
-                ORDER BY created_at DESC
-            """
-            results = self.db.fetchall(query, (owner_id, repo_type.value))
-        else:
-            query = """
-                SELECT * FROM repos
-                WHERE owner_id = %s AND is_active = TRUE
-                ORDER BY created_at DESC
-            """
-            results = self.db.fetchall(query, (owner_id,))
-
+            query = query.filter(RepoModel.repo_type == repo_type.value)
+        
+        results = query.order_by(RepoModel.created_at.desc()).all()
         return [self._to_model(r) for r in results]
 
     def list_by_group(self, repo_group: str) -> list[Repo]:
         """List repositories by group."""
-        query = """
-            SELECT * FROM repos
-            WHERE repo_group = %s AND is_active = TRUE
-            ORDER BY repo_type, created_at DESC
-        """
-        results = self.db.fetchall(query, (repo_group,))
+        from api.models import Repo as RepoModel
+        results = self.db.query(RepoModel).filter(
+            RepoModel.repo_group == repo_group,
+            RepoModel.is_active == True
+        ).order_by(RepoModel.repo_type, RepoModel.created_at.desc()).all()
         return [self._to_model(r) for r in results]
 
     def update_token(self, repo_id: str, token_id: str) -> None:
@@ -156,22 +152,45 @@ class RepoRegistry:
         self.db.execute(query, {"repo_id": repo_id})
         self.db.commit()
 
-    def _to_model(self, row: dict) -> Repo:
+    def _to_model(self, row) -> Repo:
         """Convert database row to Repo model."""
-        metadata = row.get("metadata")
-        if isinstance(metadata, str):
-            metadata = json.loads(metadata)
+        # Handle both dict and ORM object
+        if hasattr(row, '__dict__'):
+            # Use repo_metadata attribute (column is named 'metadata' but Python attr is 'repo_metadata')
+            metadata = getattr(row, 'repo_metadata', None)
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            
+            return Repo(
+                repo_id=row.repo_id,
+                repo_url=row.repo_url,
+                repo_type=RepoType(row.repo_type),
+                owner_id=row.owner_id,
+                owner_type=OwnerType(row.owner_type),
+                repo_group=row.repo_group,
+                token_id=row.token_id,
+                access_scope=AccessScope(row.access_scope),
+                metadata=metadata or {},
+                is_active=bool(row.is_active),
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+        else:
+            # Dict format
+            metadata = row.get("metadata")
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
 
-        return Repo(
-            repo_id=row["repo_id"],
-            repo_url=row["repo_url"],
-            repo_type=RepoType(row["repo_type"]),
-            owner_id=row["owner_id"],
-            owner_type=OwnerType(row["owner_type"]),
-            repo_group=row.get("repo_group"),
-            token_id=row.get("token_id"),
-            access_scope=AccessScope(row["access_scope"]),
-            metadata=metadata or {},
+            return Repo(
+                repo_id=row["repo_id"],
+                repo_url=row["repo_url"],
+                repo_type=RepoType(row["repo_type"]),
+                owner_id=row["owner_id"],
+                owner_type=OwnerType(row["owner_type"]),
+                repo_group=row.get("repo_group"),
+                token_id=row.get("token_id"),
+                access_scope=AccessScope(row["access_scope"]),
+                metadata=metadata or {},
             is_active=row.get("is_active", True),
             created_at=row["created_at"],
             updated_at=row["updated_at"],

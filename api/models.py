@@ -113,10 +113,23 @@ class SkillRegistry(Base):
 
 class ContextSnapshot(Base):
     __tablename__ = "context_snapshots"
-    snapshot_id = Column(String(36), primary_key=True)
+    snapshot_id = Column(String(64), primary_key=True)
+    session_id = Column(String(36), nullable=False, index=True)
     event_id = Column(String(64), index=True)
-    snapshot_data = Column(JSON, nullable=False)
-    created_at = Column(DateTime, default=func.now(), nullable=False, index=True)
+    system_prompt = Column(Text)
+    skill_definitions = Column(JSON)
+    selected_events = Column(JSON)
+    code_context = Column(JSON)
+    documentation = Column(JSON)
+    total_tokens = Column(Integer)
+    token_budget = Column(JSON)
+    assembly_time_ms = Column(Integer)
+    relevance_scores = Column(JSON)
+    task_type = Column(String(64))
+    created_at = Column(DateTime, default=func.now(), index=True)
+    skills_used = Column(JSON)
+    llm_request_id = Column(String(100))
+    llm_response_id = Column(String(100))
 
 
 class DecisionAudit(Base):
@@ -153,6 +166,22 @@ class Repo(Base):
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     is_active = Column(TINYINT(1), server_default="1", nullable=False)
+
+
+class Token(Base):
+    __tablename__ = "tokens"
+    token_id = Column(String(64), primary_key=True)
+    type = Column(String(32), nullable=False)
+    provider = Column(String(64))
+    scope_user_id = Column(String(64))
+    scope_tenant_id = Column(String(64))
+    scope_repo = Column(String(255))
+    secret_ref = Column(String(255))
+    encrypted_value = Column(Text)
+    is_active = Column(TINYINT(1), server_default="1")
+    expires_at = Column(DateTime)
+    created_at = Column(DateTime, default=func.now())
+    token_metadata = Column("metadata", JSON)
 
 
 class SandboxMetadata(Base):
