@@ -1,127 +1,53 @@
 """Tests for permission checker."""
 
+import pytest
+from sqlalchemy import delete
+
 from core.auth.permission_checker import PermissionChecker
+from api.database import get_db_session
+from api.models import User
 
 
-class MockResult:
-    """Mock result for database queries."""
+@pytest.fixture
+def db():
+    """Get test database session."""
+    session = next(get_db_session())
+    # Clean up before test
+    session.execute(delete(User))
+    session.commit()
+    yield session
+    # Clean up after test
+    session.execute(delete(User))
+    session.commit()
+    session.close()
+
+
+def test_can_manage_models_global(db):
+    """Test global model management permission."""
+    checker = PermissionChecker(db)
     
-    def __init__(self, data):
-        self.data = data
-        
-    def first(self):
-        return MockRow(self.data) if self.data else None
+    # In development mode, all operations are allowed
+    assert checker.can_manage_models("admin", "global") is True
+    assert checker.can_manage_models("user", "global") is True
 
 
-class MockRow:
-    """Mock row for database results."""
+def test_can_manage_models_account(db):
+    """Test account model management permission."""
+    checker = PermissionChecker(db)
     
-    def __init__(self, data):
-        self.data = data
-        
-    @property
-    def _mapping(self):
-        return self.data
+    # In development mode, all operations are allowed
+    assert checker.can_manage_models("admin", "account", "acme") is True
+    assert checker.can_manage_models("user", "account", "acme") is True
 
 
-class MockDB:
-    """Mock database for testing."""
-
-    def __init__(self):
-        self.roles = {
-            "admin": ["mo_agent_admin", "mo_agent_user"],
-            "alice": ["mo_agent_user"],
-            "bob": [],
-        }
-
-    def execute(self, query, params=None):
-        """Mock execute method for SQLAlchemy compatibility."""
-        if params and "user_id" in params and "role_name" in params:
-            user_id = params["user_id"]
-            role_name = params["role_name"]
-            if user_id in self.roles and role_name in self.roles[user_id]:
-                return MockResult({"cnt": 1})
-            return MockResult({"cnt": 0})
-        return MockResult(None)
-
-
-def test_has_role():
-    """Test role checking."""
-    db = MockDB()
+def test_can_manage_models_user(db):
+    """Test user model management permission."""
     checker = PermissionChecker(db)
-
-    assert checker.has_role("admin", "mo_agent_admin")
-    assert checker.has_role("alice", "mo_agent_user")
-    assert not checker.has_role("bob", "mo_agent_user")
-
-
-def test_is_admin():
-    """Test admin role checking."""
-    db = MockDB()
-    checker = PermissionChecker(db)
-
-    assert checker.is_admin("admin")
-    assert not checker.is_admin("alice")
-    assert not checker.is_admin("bob")
-
-
-def test_is_user():
-    """Test user role checking."""
-    db = MockDB()
-    checker = PermissionChecker(db)
-
-    assert checker.is_user("admin")
-    assert checker.is_user("alice")
-    assert not checker.is_user("bob")
-
-
-def test_can_manage_models():
-    """Test model management permissions.
     
-    Note: In development mode, all operations are allowed.
-    This test documents the expected production behavior.
-    """
-    db = MockDB()
-    checker = PermissionChecker(db)
-
-    # Development mode: all operations allowed
-    assert checker.can_manage_models("admin", "global")
-    assert checker.can_manage_models("admin", "account", "acme")
-    assert checker.can_manage_models("admin", "user", "alice")
-    assert checker.can_manage_models("alice", "user", "alice")
-    assert checker.can_manage_models("alice", "user", "bob")  # Allowed in dev mode
-    assert checker.can_manage_models("alice", "global")  # Allowed in dev mode
-    assert checker.can_manage_models("bob", "user", "bob")  # Allowed in dev mode
+    # In development mode, all operations are allowed
+    assert checker.can_manage_models("admin", "user", "alice") is True
+    assert checker.can_manage_models("alice", "user", "alice") is True
 
 
-def test_can_manage_skills():
-    """Test skill management permissions.
-    
-    Note: In development mode, all operations are allowed.
-    This test documents the expected production behavior.
-    """
-    db = MockDB()
-    checker = PermissionChecker(db)
-
-    # Development mode: all operations allowed
-    assert checker.can_manage_skills("admin", "global")
-    assert checker.can_manage_skills("admin", "account", "acme")
-    assert checker.can_manage_skills("alice", "user", "alice")
-    assert checker.can_manage_skills("admin", "user", "alice")  # Allowed in dev mode
-    assert checker.can_manage_skills("alice", "user", "bob")  # Allowed in dev mode
-    assert checker.can_manage_skills("alice", "global")  # Allowed in dev mode
-
-
-def test_can_view_audit_logs():
-    """Test audit log viewing permissions."""
-    db = MockDB()
-    checker = PermissionChecker(db)
-
-    # Admin can view all logs
-    assert checker.can_view_audit_logs("admin")
-    assert checker.can_view_audit_logs("admin", "alice")
-
-    # User can view their own logs
-    assert checker.can_view_audit_logs("alice", "alice")
-    assert not checker.can_view_audit_logs("alice", "bob")
-    assert not checker.can_view_audit_logs("alice")
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

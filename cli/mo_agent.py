@@ -199,12 +199,15 @@ def skill_list(active_only):
     db = next(get_db_session())
 
     # Query skills directly
+    from sqlalchemy import text
+    
     query = "SELECT * FROM skills_registry"
     if active_only:
         query += " WHERE is_active = TRUE"
     query += " ORDER BY skill_name, version DESC"
 
-    skills = db.fetchall(query)
+    result = db.execute(text(query))
+    skills = [dict(row._mapping) for row in result]
 
     if not skills:
         click.echo("No skills registered")

@@ -606,18 +606,21 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
     Returns:
         Latest plan state or None if not found
     """
+    from sqlalchemy import text
+    
     # Query all plan events for this goal
-    rows = db.fetchall(
-        """
+    result = db.execute(
+        text("""
         SELECT event_id, event_type, content, created_at, metadata
         FROM conversation_events
         WHERE event_type IN ('plan_created', 'plan_revised')
-          AND JSON_EXTRACT(metadata, '$.goal') = %s
-        ORDER BY created_at DESC
+          AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.goal')) = :goal_id
+        ORDER BY created_at DESC, event_id DESC
         LIMIT 1
-        """,
-        (goal_id,),
+        """),
+        {"goal_id": goal_id},
     )
+    rows = [dict(row._mapping) for row in result]
 
     if not rows:
         return None
@@ -627,16 +630,17 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
     plan_data = json.loads(latest["content"])
 
     # Restore step statuses from step events
-    step_events = db.fetchall(
-        """
+    result = db.execute(
+        text("""
         SELECT event_type, content
         FROM conversation_events
         WHERE event_type IN ('plan_step_start', 'plan_step_done')
-          AND JSON_EXTRACT(content, '$.plan_id') = %s
+          AND JSON_UNQUOTE(JSON_EXTRACT(content, '$.plan_id')) = :plan_id
         ORDER BY created_at
-        """,
-        (plan_data["plan_id"],),
+        """),
+        {"plan_id": plan_data["plan_id"]},
     )
+    step_events = [dict(row._mapping) for row in result]
 
     # Update step statuses
     step_status_map = {}
