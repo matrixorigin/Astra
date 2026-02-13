@@ -1,4 +1,4 @@
-"""Scope-based configuration resolver with Open Scope Protocol.
+"""Scope-based configuration resolver with Open Scope Protocol - ORM Version.
 
 Supports extensible scope chains for different business scenarios:
 - Dev Agent: repo > project > user > account > global
@@ -8,10 +8,11 @@ Supports extensible scope chains for different business scenarios:
 
 from sqlalchemy.orm import Session
 from api.database import get_db_session
+from api.models import Config, Token
 
 
 class ScopeResolver:
-    """Resolve configuration with extensible scope chain."""
+    """Resolve configuration with extensible scope chain using ORM."""
 
     def __init__(self, db: Session, scope_chain: list[tuple[str, str | None]]):
         """Initialize resolver with priority chain.
@@ -25,28 +26,26 @@ class ScopeResolver:
         self.db = db
         self.scope_chain = scope_chain
 
-    def resolve_model(self, model_name: str) -> dict | None:
-        """Resolve model config by scope chain.
+    def resolve_config(self, key_name: str) -> str | None:
+        """Resolve config value by scope chain.
 
-        Returns first matching model config from most specific to most general scope.
+        Returns first matching config from most specific to most general scope.
         """
         for scope_type, scope_id in self.scope_chain:
-            query = """
-                SELECT * FROM agent_config.model_registry
-                WHERE model_name = %s AND scope_type = %s
-            """
-            params = [model_name, scope_type]
-
+            query = self.db.query(Config).filter(
+                Config.key_name == key_name,
+                Config.scope_type == scope_type
+            )
+            
             if scope_id is not None:
-                query += " AND scope_id = %s"
-                params.append(scope_id)
+                query = query.filter(Config.scope_user_id == scope_id)
             else:
-                query += " AND scope_id IS NULL"
-
-            result = self.db.fetchone(query, tuple(params))
-            if result:
-                return dict(result)
-
+                query = query.filter(Config.scope_user_id.is_(None))
+            
+            config = query.first()
+            if config:
+                return config.value
+        
         return None
 
     def resolve_token(self, token_type: str, provider: str) -> dict | None:
@@ -55,145 +54,142 @@ class ScopeResolver:
         Returns first matching token from most specific to most general scope.
         """
         for scope_type, scope_id in self.scope_chain:
-            query = """
-                SELECT * FROM agent_config.api_tokens
-                WHERE token_type = %s AND provider = %s
-                AND scope_type = %s AND is_active = TRUE
-            """
-            params = [token_type, provider, scope_type]
-
-            if scope_id is not None:
-                query += " AND scope_id = %s"
-                params.append(scope_id)
-            else:
-                query += " AND scope_id IS NULL"
-
-            result = self.db.fetchone(query, tuple(params))
-            if result:
-                return dict(result)
-
+            query = self.db.query(Token).filter(
+                Token.type == token_type,
+                Token.provider == provider,
+                Token.is_active == True
+            )
+            
+            # Match scope based on scope_type
+            if scope_type == "user" and scope_id:
+                query = query.filter(Token.scope_user_id == scope_id)
+            elif scope_type == "account" and scope_id:
+                query = query.filter(Token.scope_tenant_id == scope_id)
+            elif scope_type == "repo" and scope_id:
+                query = query.filter(Token.scope_repo == scope_id)
+            elif scope_type == "global":
+                query = query.filter(
+                    Token.scope_user_id.is_(None),
+                    Token.scope_tenant_id.is_(None),
+                    Token.scope_repo.is_(None)
+                )
+            
+            token = query.first()
+            if token:
+                return {
+                    "token_id": token.token_id,
+                    "provider": token.provider,
+                    "encrypted_value": token.encrypted_value,
+                    "secret_ref": token.secret_ref,
+                }
+        
         return None
 
-    def list_models(self) -> list[dict]:
-        """List all accessible models across scope chain.
+    def list_tokens(self, token_type: str) -> list[dict]:
+        """List all accessible tokens across scope chain.
 
-        Returns models from all scopes in the chain, with more specific scopes
-        overriding more general ones for the same model_name.
+        Returns tokens from all scopes in the chain.
         """
-        models = {}
-
+        tokens = {}
+        
         # Iterate in reverse order (general to specific)
         for scope_type, scope_id in reversed(self.scope_chain):
-            query = """
-                SELECT * FROM agent_config.model_registry
-                WHERE scope_type = %s
-            """
-            params = [scope_type]
-
+            query = self.db.query(Token).filter(
+                Token.token_type == token_type,
+                Token.scope_type == scope_type,
+                Token.is_active == True
+            )
+            
             if scope_id is not None:
-                query += " AND scope_id = %s"
-                params.append(scope_id)
+                query = query.filter(Token.scope_user_id == scope_id)
             else:
-                query += " AND scope_id IS NULL"
-
-            results = self.db.fetchall(query, tuple(params))
-            for row in results:
-                # More specific scopes override general ones
-                models[row["model_name"]] = dict(row)
-
-        return list(models.values())
-
-    def list_skills(self) -> list[dict]:
-        """List all accessible skills across scope chain."""
-        skills = {}
-
-        # Iterate in reverse order (general to specific)
-        for scope_type, scope_id in reversed(self.scope_chain):
-            query = """
-                SELECT * FROM agent_config.skills_registry
-                WHERE scope_type = %s AND is_active = TRUE
-            """
-            params = [scope_type]
-
-            if scope_id is not None:
-                query += " AND scope_id = %s"
-                params.append(scope_id)
-            else:
-                query += " AND scope_id IS NULL"
-
-            results = self.db.fetchall(query, tuple(params))
-            for row in results:
-                skills[row["skill_name"]] = dict(row)
-
-        return list(skills.values())
+                query = query.filter(Token.scope_user_id.is_(None))
+            
+            for token in query.all():
+                # More specific scope overrides general
+                tokens[token.provider] = {
+                    "token_id": token.token_id,
+                    "provider": token.provider,
+                    "encrypted_value": token.encrypted_value,
+                    "secret_ref": token.secret_ref,
+                }
+        
+        return list(tokens.values())
 
 
 class ScopeChainBuilder:
-    """Build scope chains for different scenarios."""
+    """Build scope chains for different contexts."""
 
     @staticmethod
-    def dev_agent(
-        user_id: str, account_id: str, repo: str | None = None, project: str | None = None
-    ) -> list[tuple[str, str | None]]:
-        """Build scope chain for Dev Agent scenario.
-
-        Priority: repo > project > user > account > global
-        """
-        chain: list[tuple[str, str | None]] = []
+    def dev_agent(user_id: str | None = None, account_id: str | None = None, repo: str | None = None, project: str | None = None) -> list[tuple[str, str | None]]:
+        """Build scope chain for dev agent context."""
+        chain = []
         if repo:
             chain.append(("repo", repo))
         if project:
             chain.append(("project", project))
-        chain.extend([("user", user_id), ("account", account_id), ("global", None)])
+        if user_id:
+            chain.append(("user", user_id))
+        if account_id:
+            chain.append(("account", account_id))
+        chain.append(("global", None))
         return chain
 
     @staticmethod
-    def sales_agent(
-        user_id: str,
-        account_id: str,
-        region: str | None = None,
-        sales_group: str | None = None,
-    ) -> list[tuple[str, str | None]]:
-        """Build scope chain for Sales Agent scenario.
-
-        Priority: region > sales_group > user > account > global
-        """
-        chain: list[tuple[str, str | None]] = []
+    def sales_agent(user_id: str | None = None, account_id: str | None = None, region: str | None = None, sales_group: str | None = None) -> list[tuple[str, str | None]]:
+        """Build scope chain for sales agent context."""
+        chain = []
         if region:
             chain.append(("region", region))
         if sales_group:
             chain.append(("sales_group", sales_group))
-        chain.extend([("user", user_id), ("account", account_id), ("global", None)])
+        if user_id:
+            chain.append(("user", user_id))
+        if account_id:
+            chain.append(("account", account_id))
+        chain.append(("global", None))
         return chain
 
     @staticmethod
-    def deploy_agent(
-        user_id: str,
-        account_id: str,
-        environment: str | None = None,
-        project: str | None = None,
-    ) -> list[tuple[str, str | None]]:
-        """Build scope chain for Deploy Agent scenario.
-
-        Priority: environment > project > account > global
-        """
-        chain: list[tuple[str, str | None]] = []
+    def deploy_agent(user_id: str | None = None, account_id: str | None = None, environment: str | None = None, project: str | None = None) -> list[tuple[str, str | None]]:
+        """Build scope chain for deploy agent context."""
+        chain = []
         if environment:
             chain.append(("environment", environment))
         if project:
             chain.append(("project", project))
-        chain.extend([("account", account_id), ("global", None)])
+        if account_id:
+            chain.append(("account", account_id))
+        chain.append(("global", None))
         return chain
 
     @staticmethod
-    def custom(
-        user_id: str, account_id: str, custom_scopes: list[tuple[str, str]]
-    ) -> list[tuple[str, str | None]]:
-        """Build custom scope chain.
+    def custom(user_id: str | None = None, account_id: str | None = None, custom_scopes: list[tuple[str, str]] | None = None) -> list[tuple[str, str | None]]:
+        """Build custom scope chain."""
+        chain = []
+        if custom_scopes:
+            chain.extend(custom_scopes)
+        if user_id:
+            chain.append(("user", user_id))
+        if account_id:
+            chain.append(("account", account_id))
+        chain.append(("global", None))
+        return chain
 
-        Args:
-            custom_scopes: List of (scope_type, scope_id) tuples in priority order
-        """
-        chain: list[tuple[str, str | None]] = list(custom_scopes)
-        chain.extend([("user", user_id), ("account", account_id), ("global", None)])
+    @staticmethod
+    def for_user(user_id: str, tenant_id: str | None = None) -> list[tuple[str, str | None]]:
+        """Build scope chain for user context."""
+        chain = [("user", user_id)]
+        if tenant_id:
+            chain.append(("tenant", tenant_id))
+        chain.append(("global", None))
+        return chain
+
+    @staticmethod
+    def for_repo(repo_id: str, user_id: str, tenant_id: str | None = None) -> list[tuple[str, str | None]]:
+        """Build scope chain for repo context."""
+        chain = [("repo", repo_id), ("user", user_id)]
+        if tenant_id:
+            chain.append(("tenant", tenant_id))
+        chain.append(("global", None))
         return chain

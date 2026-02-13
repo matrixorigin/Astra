@@ -17,12 +17,13 @@ if __name__ == "__main__":
     manager = PromptManager(db)
 
     print("\nRegistered prompts:")
-    rows = db.fetchall("""
+    from sqlalchemy import text
+    result = db.execute(text("""
         SELECT template_id, version, is_active
         FROM prompt_templates
         ORDER BY template_id, version
-    """)
+    """))
 
-    for row in rows:
-        status = "✓ active" if row["is_active"] else "  inactive"
-        print(f"  {status} {row['template_id']}@{row['version']}")
+    for row in result:
+        status = "✓ active" if row.is_active else "  inactive"
+        print(f"  {status} {row.template_id}@{row.version}")

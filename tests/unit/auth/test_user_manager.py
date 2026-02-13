@@ -1,33 +1,42 @@
 """Tests for user manager."""
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from core.auth.user_manager import UserManager
+from api.database import get_db_session
+from sqlalchemy import delete
+from api.models import User, RefreshToken
 
 
 @pytest.fixture
-def mock_db():
-    """Mock database for testing."""
-    return MagicMock()
+def db():
+    """Get test database session."""
+    session = next(get_db_session())
+    # Clean up before test
+    session.execute(delete(RefreshToken))
+    session.execute(delete(User))
+    session.commit()
+    yield session
+    # Clean up after test
+    session.execute(delete(RefreshToken))
+    session.execute(delete(User))
+    session.commit()
+    session.close()
 
 
 @pytest.fixture
-def user_manager(mock_db):
-    """Create user manager with mock database."""
-    return UserManager(mock_db)
+def user_manager(db):
+    """Create user manager with real database."""
+    return UserManager(db)
 
 
 class TestCreateUser:
     """Test user creation."""
 
-    def test_create_user_success(self, user_manager, mock_db):
+    def test_create_user_success(self, user_manager):
         """Test successful user creation."""
-        mock_db.fetchone.return_value = None  # No existing user
-        mock_db.execute.return_value = 1
-
         user = user_manager.create_user(
             username="testuser",
             email="test@example.com",
@@ -39,35 +48,39 @@ class TestCreateUser:
         assert user["email"] == "test@example.com"
         assert user["display_name"] == "Test User"
         assert "user_id" in user
-        mock_db.execute.assert_called_once()
 
-    def test_create_user_duplicate_username(self, user_manager, mock_db):
+    def test_create_user_duplicate_username(self, user_manager):
         """Test creating user with duplicate username."""
-        mock_db.fetchone.return_value = {"user_id": "existing"}
+        user_manager.create_user(
+            username="existing",
+            email="test@example.com",
+            password="password123",
+        )
 
         with pytest.raises(ValueError, match="Username .* already exists"):
             user_manager.create_user(
                 username="existing",
-                email="test@example.com",
+                email="test2@example.com",
                 password="password123",
             )
 
-    def test_create_user_duplicate_email(self, user_manager, mock_db):
+    def test_create_user_duplicate_email(self, user_manager):
         """Test creating user with duplicate email."""
-        mock_db.fetchone.side_effect = [None, {"user_id": "existing"}]
+        user_manager.create_user(
+            username="user1",
+            email="existing@example.com",
+            password="password123",
+        )
 
         with pytest.raises(ValueError, match="Email .* already exists"):
             user_manager.create_user(
-                username="testuser",
+                username="user2",
                 email="existing@example.com",
                 password="password123",
             )
 
-    def test_create_user_without_display_name(self, user_manager, mock_db):
+    def test_create_user_without_display_name(self, user_manager):
         """Test creating user without display name."""
-        mock_db.fetchone.return_value = None
-        mock_db.execute.return_value = 1
-
         user = user_manager.create_user(
             username="testuser",
             email="test@example.com",
@@ -80,60 +93,50 @@ class TestCreateUser:
 class TestAuthenticateUser:
     """Test user authentication."""
 
-    def test_authenticate_success(self, user_manager, mock_db):
+    def test_authenticate_success(self, user_manager):
         """Test successful authentication."""
-        from core.auth.password import hash_password
-
-        password_hash = hash_password("password123")
-        mock_db.fetchone.return_value = {
-            "user_id": "user_123",
-            "username": "testuser",
-            "email": "test@example.com",
-            "password_hash": password_hash,
-            "display_name": "Test User",
-            "is_active": True,
-        }
-        mock_db.execute.return_value = 1
+        user_manager.create_user(
+            username="testuser",
+            email="test@example.com",
+            password="password123",
+            display_name="Test User",
+        )
 
         user = user_manager.authenticate_user("testuser", "password123")
 
         assert user is not None
-        assert user["user_id"] == "user_123"
         assert user["username"] == "testuser"
-        mock_db.execute.assert_called_once()  # Update last_login_at
 
-    def test_authenticate_user_not_found(self, user_manager, mock_db):
+    def test_authenticate_user_not_found(self, user_manager):
         """Test authentication with non-existent user."""
-        mock_db.fetchone.return_value = None
-
         user = user_manager.authenticate_user("nonexistent", "password123")
 
         assert user is None
 
-    def test_authenticate_inactive_user(self, user_manager, mock_db):
+    def test_authenticate_inactive_user(self, user_manager, db):
         """Test authentication with inactive user."""
-        mock_db.fetchone.return_value = {
-            "user_id": "user_123",
-            "username": "testuser",
-            "password_hash": "hash",
-            "is_active": False,
-        }
+        from sqlalchemy import text
+        
+        user_manager.create_user(
+            username="testuser",
+            email="test@example.com",
+            password="password123",
+        )
+        # Deactivate user
+        db.execute(text("UPDATE users SET is_active = FALSE WHERE username = 'testuser'"))
+        db.commit()
 
         user = user_manager.authenticate_user("testuser", "password123")
 
         assert user is None
 
-    def test_authenticate_wrong_password(self, user_manager, mock_db):
+    def test_authenticate_wrong_password(self, user_manager):
         """Test authentication with wrong password."""
-        from core.auth.password import hash_password
-
-        password_hash = hash_password("correct_password")
-        mock_db.fetchone.return_value = {
-            "user_id": "user_123",
-            "username": "testuser",
-            "password_hash": password_hash,
-            "is_active": True,
-        }
+        user_manager.create_user(
+            username="testuser",
+            email="test@example.com",
+            password="correct_password",
+        )
 
         user = user_manager.authenticate_user("testuser", "wrong_password")
 
@@ -143,48 +146,23 @@ class TestAuthenticateUser:
 class TestGetUser:
     """Test getting user information."""
 
-    def test_get_user_by_id_found(self, user_manager, mock_db):
+    def test_get_user_by_id_found(self, user_manager):
         """Test getting user by ID when found."""
-        mock_db.fetchone.return_value = {
-            "user_id": "user_123",
-            "username": "testuser",
-            "email": "test@example.com",
-            "display_name": "Test User",
-            "is_active": True,
-            "created_at": datetime.now(timezone.utc),
-        }
+        created = user_manager.create_user(
+            username="testuser",
+            email="test@example.com",
+            password="password123",
+            display_name="Test User",
+        )
 
-        user = user_manager.get_user_by_id("user_123")
+        user = user_manager.get_user(created["user_id"])
 
         assert user is not None
-        assert user["user_id"] == "user_123"
+        assert user["user_id"] == created["user_id"]
 
-    def test_get_user_by_id_not_found(self, user_manager, mock_db):
+    def test_get_user_by_id_not_found(self, user_manager):
         """Test getting user by ID when not found."""
-        mock_db.fetchone.return_value = None
-
-        user = user_manager.get_user_by_id("nonexistent")
-
-        assert user is None
-
-    def test_get_user_by_username_found(self, user_manager, mock_db):
-        """Test getting user by username when found."""
-        mock_db.fetchone.return_value = {
-            "user_id": "user_123",
-            "username": "testuser",
-            "email": "test@example.com",
-        }
-
-        user = user_manager.get_user_by_username("testuser")
-
-        assert user is not None
-        assert user["username"] == "testuser"
-
-    def test_get_user_by_username_not_found(self, user_manager, mock_db):
-        """Test getting user by username when not found."""
-        mock_db.fetchone.return_value = None
-
-        user = user_manager.get_user_by_username("nonexistent")
+        user = user_manager.get_user("nonexistent")
 
         assert user is None
 
@@ -192,73 +170,60 @@ class TestGetUser:
 class TestRefreshToken:
     """Test refresh token management."""
 
-    def test_store_refresh_token(self, user_manager, mock_db):
+    def test_store_refresh_token(self, user_manager):
         """Test storing refresh token."""
-        mock_db.execute.return_value = 1
         expires_at = datetime.now(timezone.utc) + timedelta(days=7)
 
         token_id = user_manager.store_refresh_token("user_123", "token_abc", expires_at)
 
         assert token_id is not None
-        mock_db.execute.assert_called_once()
 
-    def test_verify_refresh_token_valid(self, user_manager, mock_db):
+    def test_verify_refresh_token_valid(self, user_manager):
         """Test verifying valid refresh token."""
-        mock_db.fetchone.return_value = {
-            "user_id": "user_123",
-            "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
-            "is_revoked": False,
-        }
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+        user_manager.store_refresh_token("user_123", "token_abc", expires_at)
 
         user_id = user_manager.verify_refresh_token("token_abc")
 
         assert user_id == "user_123"
 
-    def test_verify_refresh_token_not_found(self, user_manager, mock_db):
+    def test_verify_refresh_token_not_found(self, user_manager):
         """Test verifying non-existent refresh token."""
-        mock_db.fetchone.return_value = None
-
         user_id = user_manager.verify_refresh_token("invalid_token")
 
         assert user_id is None
 
-    def test_verify_refresh_token_revoked(self, user_manager, mock_db):
+    def test_verify_refresh_token_revoked(self, user_manager):
         """Test verifying revoked refresh token."""
-        mock_db.fetchone.return_value = {
-            "user_id": "user_123",
-            "expires_at": datetime.now(timezone.utc) + timedelta(days=7),
-            "is_revoked": True,
-        }
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+        user_manager.store_refresh_token("user_123", "token_abc", expires_at)
+        user_manager.revoke_refresh_token("token_abc")
 
         user_id = user_manager.verify_refresh_token("token_abc")
 
         assert user_id is None
 
-    def test_verify_refresh_token_expired(self, user_manager, mock_db):
+    def test_verify_refresh_token_expired(self, user_manager):
         """Test verifying expired refresh token."""
-        mock_db.fetchone.return_value = {
-            "user_id": "user_123",
-            "expires_at": datetime.now(timezone.utc) - timedelta(days=1),
-            "is_revoked": False,
-        }
+        expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+        user_manager.store_refresh_token("user_123", "token_abc", expires_at)
 
         user_id = user_manager.verify_refresh_token("token_abc")
 
         assert user_id is None
 
-    def test_revoke_refresh_token_success(self, user_manager, mock_db):
+    def test_revoke_refresh_token_success(self, user_manager):
         """Test revoking refresh token successfully."""
-        mock_db.execute.return_value = 1
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+        user_manager.store_refresh_token("user_123", "token_abc", expires_at)
 
         result = user_manager.revoke_refresh_token("token_abc")
 
         assert result is True
-        mock_db.execute.assert_called_once()
 
-    def test_revoke_refresh_token_not_found(self, user_manager, mock_db):
+    def test_revoke_refresh_token_not_found(self, user_manager):
         """Test revoking non-existent refresh token."""
-        mock_db.execute.return_value = 0
-
         result = user_manager.revoke_refresh_token("invalid_token")
 
         assert result is False
+

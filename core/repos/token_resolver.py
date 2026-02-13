@@ -181,18 +181,23 @@ class TokenResolver:
             ORDER BY created_at DESC
             LIMIT 1
         """
-        result = self.db.fetchone(query)
-        return self._to_model(result) if result else None
+        result = self.db.query(Token).filter(
+            Token.token_type == token_type,
+            Token.provider == provider,
+            Token.scope_type == scope_type,
+            Token.is_active == True
+        ).order_by(Token.created_at.desc()).first()
+        
+        return result if result else None
 
     def _allow_global_token(self) -> bool:
-        """Check if global token fallback is allowed."""
+        """Check if global token fallback is allowed using ORM."""
         from sqlalchemy import text
-        query = text("""
-            SELECT value FROM configs
-            WHERE key_name = 'allow_global_repo_token'
-            LIMIT 1
-        """)
-        result = self.db.execute(query).fetchone()
+        
+        result = self.db.execute(
+            text("SELECT value FROM configs WHERE key_name = 'allow_global_repo_token'")
+        ).first()
+        
         if not result:
             return False
         return result[0].lower() in ("true", "1", "yes")

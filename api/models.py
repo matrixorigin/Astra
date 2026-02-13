@@ -35,13 +35,11 @@ class Agent(Base):
 
 class Config(Base):
     __tablename__ = "configs"
-    config_id = Column(String(36), primary_key=True)
-    key_name = Column(String(100), nullable=False, index=True)
-    value = Column(Text)
-    scope_type = Column(String(20), default="global")  # global, tenant, user
-    scope_tenant_id = Column(String(36), index=True)
-    scope_user_id = Column(String(36), index=True)
-    created_at = Column(DateTime, default=func.now(), nullable=False)
+    config_id = Column(String(64))
+    key_name = Column(String(255), primary_key=True, nullable=False)
+    value = Column(Text, nullable=False)
+    description = Column(Text)
+    created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 

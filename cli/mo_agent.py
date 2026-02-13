@@ -551,23 +551,24 @@ def session_list(user_id, limit):
 @click.argument("session_id")
 def session_show(session_id):
     """Show session details."""
+    from api.models import Session as SessionModel, Event
+    from sqlalchemy import text
+    
     db = next(get_db_session())
 
-    # Get session
-    session = db.fetchone("SELECT * FROM sessions WHERE session_id = %s", (session_id,))
+    # Get session using ORM
+    session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
 
     if not session:
         click.echo(f"Session not found: {session_id}", err=True)
         sys.exit(1)
 
-    # Get events
-    events = db.fetchall(
-        "SELECT * FROM conversation_events WHERE session_id = %s ORDER BY created_at", (session_id,)
-    )
+    # Get events using ORM
+    events = db.query(Event).filter(Event.session_id == session_id).order_by(Event.created_at).all()
 
-    click.echo(f"Session: {session['session_id']}")
+    click.echo(f"Session: {session.session_id}")
     click.echo("=" * 70)
-    click.echo(f"User: {session['user_id']}")
+    click.echo(f"User: {session.user_id}")
     click.echo(f"Status: {session['status']}")
     click.echo(f"Created: {session['created_at']}")
     click.echo(f"Events: {len(events)}")
@@ -620,8 +621,9 @@ def health():
     tables = ["sessions", "conversation_events", "skills_registry"]
     for table in tables:
         try:
-            count = db.fetchone(f"SELECT COUNT(*) as cnt FROM {table}")
-            click.echo(f"✅ Table {table}: {count['cnt']} rows")
+            from sqlalchemy import text
+            result = db.execute(text(f"SELECT COUNT(*) as cnt FROM {table}")).first()
+            click.echo(f"✅ Table {table}: {result.cnt} rows")
         except Exception as e:
             click.echo(f"❌ Table {table}: {e}")
 

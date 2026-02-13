@@ -29,22 +29,19 @@ class AuditLogger:
 
         log_id = f"log_{uuid.uuid4().hex[:16]}"
 
+        from sqlalchemy import insert
+        from api.models import AuditLog
+        
         self.db.execute(
-            text("""
-            INSERT INTO agent_config.audit_logs
-            (log_id, user_id, action, resource_type, resource_id, new_value, status, created_at)
-            VALUES (:log_id, :user_id, :action, :resource_type, :resource_id, :new_value, :status, :created_at)
-            """),
-            {
-                "log_id": log_id,
-                "user_id": user_id,
-                "action": action,
-                "resource_type": resource_type,
-                "resource_id": resource_id,
-                "new_value": json.dumps(details) if details else None,
-                "status": status,
-                "created_at": datetime.now(),
-            }
+            insert(AuditLog).values(
+                log_id=log_id,
+                user_id=user_id,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                details=details,
+                timestamp=datetime.now(),
+            )
         )
         self.db.commit()
 
@@ -109,32 +106,35 @@ class AuditLogger:
         limit: int = 100,
     ):
         """Query audit logs."""
+        from sqlalchemy import text
+        
         conditions = []
-        params = []
+        params = {}
 
         if user_id:
-            conditions.append("user_id = %s")
-            params.append(user_id)
+            conditions.append("user_id = :user_id")
+            params["user_id"] = user_id
 
         if action:
-            conditions.append("action = %s")
-            params.append(action)
+            conditions.append("action = :action")
+            params["action"] = action
 
         if resource_type:
-            conditions.append("resource_type = %s")
-            params.append(resource_type)
+            conditions.append("resource_type = :resource_type")
+            params["resource_type"] = resource_type
 
         if since:
-            conditions.append("created_at >= %s")
-            params.append(since.isoformat() if isinstance(since, datetime) else since)
+            conditions.append("created_at >= :since")
+            params["since"] = since.isoformat() if isinstance(since, datetime) else since
 
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-        query = f"""
-        SELECT * FROM agent_config.audit_logs
+        query = text(f"""
+        SELECT * FROM audit_logs
         WHERE {where_clause}
-        ORDER BY created_at DESC
+        ORDER BY timestamp DESC
         LIMIT {limit}
-        """
+        """)
 
-        return self.db.fetchall(query, tuple(params))
+        result = self.db.execute(query, params)
+        return [dict(row._mapping) for row in result] if result else []

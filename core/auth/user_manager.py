@@ -1,4 +1,4 @@
-"""User management module."""
+"""User management module - ORM Version."""
 
 import hashlib
 from datetime import datetime, timezone
@@ -10,12 +10,13 @@ from core.auth.password import hash_password, verify_password
 from core.logging_config import get_logger
 from sqlalchemy.orm import Session
 from api.database import get_db_session
+from api.models import User, RefreshToken
 
 logger = get_logger(__name__)
 
 
 class UserManager:
-    """Manage user operations."""
+    """Manage user operations using ORM."""
 
     def __init__(self, db: Session):
         """Initialize user manager.
@@ -32,7 +33,7 @@ class UserManager:
         password: str,
         display_name: Optional[str] = None,
     ) -> dict:
-        """Create a new user.
+        """Create a new user using ORM.
 
         Args:
             username: Unique username
@@ -46,31 +47,32 @@ class UserManager:
         Raises:
             ValueError: If username or email already exists
         """
-        # Check if username exists
-        existing = self.db.fetchone(
-            "SELECT user_id FROM users WHERE username = %s", (username,)
-        )
+        # Check if username exists using ORM
+        existing = self.db.query(User).filter(User.username == username).first()
         if existing:
             raise ValueError(f"Username '{username}' already exists")
 
-        # Check if email exists
-        existing = self.db.fetchone(
-            "SELECT user_id FROM users WHERE email = %s", (email,)
-        )
+        # Check if email exists using ORM
+        existing = self.db.query(User).filter(User.email == email).first()
         if existing:
             raise ValueError(f"Email '{email}' already exists")
 
-        # Create user
+        # Create user using ORM
         user_id = str(uuid7())
         password_hash = hash_password(password)
 
-        self.db.execute(
-            """
-            INSERT INTO users (user_id, username, email, password_hash, display_name, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """,
-            (user_id, username, email, password_hash, display_name, datetime.now(timezone.utc)),
+        user = User(
+            user_id=user_id,
+            username=username,
+            email=email,
+            password_hash=password_hash,
+            display_name=display_name,
+            is_active=True,
+            created_at=datetime.now(timezone.utc)
         )
+
+        self.db.add(user)
+        self.db.commit()
 
         logger.info(f"Created user: {username} ({user_id})")
 
@@ -82,7 +84,7 @@ class UserManager:
         }
 
     def authenticate_user(self, username: str, password: str) -> Optional[dict]:
-        """Authenticate user with username and password.
+        """Authenticate user with username and password using ORM.
 
         Args:
             username: Username
@@ -91,43 +93,27 @@ class UserManager:
         Returns:
             User dictionary if authentication successful, None otherwise
         """
-        user = self.db.fetchone(
-            """
-            SELECT user_id, username, email, password_hash, display_name, is_active
-            FROM users WHERE username = %s
-            """,
-            (username,),
-        )
+        user = self.db.query(User).filter(User.username == username).first()
 
         if not user:
-            logger.warning(f"Authentication failed: user '{username}' not found")
             return None
 
-        if not user["is_active"]:
-            logger.warning(f"Authentication failed: user '{username}' is inactive")
+        if not user.is_active:
             return None
 
-        if not verify_password(password, user["password_hash"]):
-            logger.warning(f"Authentication failed: invalid password for user '{username}'")
+        if not verify_password(password, user.password_hash):
             return None
-
-        # Update last login
-        self.db.execute(
-            "UPDATE users SET last_login_at = %s WHERE user_id = %s",
-            (datetime.now(timezone.utc), user["user_id"]),
-        )
-
-        logger.info(f"User authenticated: {username} ({user['user_id']})")
 
         return {
-            "user_id": user["user_id"],
-            "username": user["username"],
-            "email": user["email"],
-            "display_name": user["display_name"],
+            "user_id": user.user_id,
+            "username": user.username,
+            "email": user.email,
+            "display_name": user.display_name,
+            "is_active": user.is_active,
         }
 
-    def get_user_by_id(self, user_id: str) -> Optional[dict]:
-        """Get user by ID.
+    def get_user(self, user_id: str) -> Optional[dict]:
+        """Get user by ID using ORM.
 
         Args:
             user_id: User ID
@@ -135,112 +121,122 @@ class UserManager:
         Returns:
             User dictionary if found, None otherwise
         """
-        user = self.db.fetchone(
-            """
-            SELECT user_id, username, email, display_name, is_active, created_at
-            FROM users WHERE user_id = %s
-            """,
-            (user_id,),
-        )
+        user = self.db.query(User).filter(User.user_id == user_id).first()
 
-        return user
+        if not user:
+            return None
 
-    def get_user_by_username(self, username: str) -> Optional[dict]:
-        """Get user by username.
+        return {
+            "user_id": user.user_id,
+            "username": user.username,
+            "email": user.email,
+            "display_name": user.display_name,
+            "is_active": user.is_active,
+            "created_at": user.created_at,
+            "last_login_at": user.last_login_at,
+        }
 
-        Args:
-            username: Username
-
-        Returns:
-            User dictionary if found, None otherwise
-        """
-        user = self.db.fetchone(
-            """
-            SELECT user_id, username, email, display_name, is_active, created_at
-            FROM users WHERE username = %s
-            """,
-            (username,),
-        )
-
-        return user
-
-    def store_refresh_token(self, user_id: str, refresh_token: str, expires_at: datetime) -> str:
-        """Store refresh token.
+    def update_last_login(self, user_id: str) -> bool:
+        """Update user's last login timestamp using ORM.
 
         Args:
             user_id: User ID
-            refresh_token: Refresh token (will be hashed)
+
+        Returns:
+            True if updated successfully, False if user not found
+        """
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+
+        if not user:
+            return False
+
+        user.last_login_at = datetime.now(timezone.utc)
+        self.db.commit()
+
+        return True
+
+    def deactivate_user(self, user_id: str) -> bool:
+        """Deactivate user using ORM.
+
+        Args:
+            user_id: User ID
+
+        Returns:
+            True if deactivated successfully, False if user not found
+        """
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+
+        if not user:
+            return False
+
+        user.is_active = False
+        self.db.commit()
+
+        logger.info(f"Deactivated user: {user.username} ({user_id})")
+        return True
+
+    def store_refresh_token(self, user_id: str, token: str, expires_at: datetime) -> str:
+        """Store refresh token using ORM.
+
+        Args:
+            user_id: User ID
+            token: Refresh token
             expires_at: Token expiration time
 
         Returns:
             Token ID
         """
+        from core.auth.password import hash_password
+        
         token_id = str(uuid7())
-        token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
-
-        self.db.execute(
-            """
-            INSERT INTO refresh_tokens (token_id, user_id, token_hash, expires_at, created_at)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (token_id, user_id, token_hash, expires_at, datetime.now(timezone.utc)),
+        refresh_token = RefreshToken(
+            token_id=token_id,
+            user_id=user_id,
+            token_hash=hash_password(token),
+            expires_at=expires_at,
+            is_revoked=False,
+            created_at=datetime.now(timezone.utc)
         )
-
-        logger.info(f"Stored refresh token for user: {user_id}")
+        self.db.add(refresh_token)
+        self.db.commit()
         return token_id
 
-    def verify_refresh_token(self, refresh_token: str) -> Optional[str]:
-        """Verify refresh token and return user_id.
+    def verify_refresh_token(self, token: str) -> Optional[str]:
+        """Verify refresh token using ORM.
 
         Args:
-            refresh_token: Refresh token
+            token: Refresh token
 
         Returns:
             User ID if token is valid, None otherwise
         """
-        token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+        from core.auth.password import verify_password
+        
+        rt = self.db.query(RefreshToken).filter(RefreshToken.expires_at > datetime.now(timezone.utc)).all()
 
-        token = self.db.fetchone(
-            """
-            SELECT user_id, expires_at, is_revoked
-            FROM refresh_tokens
-            WHERE token_hash = %s
-            """,
-            (token_hash,),
-        )
+        for refresh_token in rt:
+            if verify_password(token, refresh_token.token_hash) and not refresh_token.is_revoked:
+                return refresh_token.user_id
 
-        if not token:
-            logger.warning("Refresh token not found")
-            return None
+        return None
 
-        if token["is_revoked"]:
-            logger.warning("Refresh token is revoked")
-            return None
-
-        if token["expires_at"] < datetime.now(timezone.utc):
-            logger.warning("Refresh token expired")
-            return None
-
-        return token["user_id"]
-
-    def revoke_refresh_token(self, refresh_token: str) -> bool:
-        """Revoke refresh token.
+    def revoke_refresh_token(self, token: str) -> bool:
+        """Revoke refresh token using ORM.
 
         Args:
-            refresh_token: Refresh token
+            token: Refresh token
 
         Returns:
-            True if token was revoked, False if not found
+            True if revoked successfully, False if token not found
         """
-        token_hash = hashlib.sha256(refresh_token.encode()).hexdigest()
+        from core.auth.password import verify_password
+        
+        rt = self.db.query(RefreshToken).all()
 
-        rowcount = self.db.execute(
-            "UPDATE refresh_tokens SET is_revoked = TRUE WHERE token_hash = %s",
-            (token_hash,),
-        )
-
-        if rowcount > 0:
-            logger.info("Refresh token revoked")
-            return True
+        for refresh_token in rt:
+            if verify_password(token, refresh_token.token_hash):
+                refresh_token.is_revoked = True
+                self.db.commit()
+                return True
 
         return False

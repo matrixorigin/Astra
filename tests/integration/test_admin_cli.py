@@ -28,19 +28,11 @@ def test_db():
     """Create a test database session."""
     db = next(get_db_session())
 
-    # Check if agent_config database exists
-    try:
-        db.execute(text("USE agent_config"))
-    except Exception as e:
-        pytest.skip(f"agent_config database not initialized: {e}")
-
     # Clean up test data
     try:
-        db.execute(text("DELETE FROM agent_config.model_registry WHERE model_name LIKE 'test-%'"))
-        db.execute(
-            text("DELETE FROM agent_config.api_tokens WHERE token_id LIKE 'token_%' AND created_by = 'test_admin'")
-        )
-        db.execute(text("DELETE FROM agent_config.audit_logs WHERE user_id = 'test_admin'"))
+        db.execute(text("DELETE FROM configs WHERE key_name LIKE 'test-%'"))
+        db.execute(text("DELETE FROM tokens WHERE token_id LIKE 'token_%'"))
+        db.execute(text("DELETE FROM audit_logs WHERE user_id = 'test_admin'"))
         db.commit()
     except:
         pass
@@ -49,16 +41,9 @@ def test_db():
 
     # Cleanup after test
     try:
-        db.execute(text("DELETE FROM agent_config.model_registry WHERE model_name LIKE 'test-%'"))
-        db.execute(
-            text("DELETE FROM agent_config.api_tokens WHERE token_id LIKE 'token_%' AND created_by = 'test_admin'")
-        )
-        db.execute(text("DELETE FROM agent_config.audit_logs WHERE user_id = 'test_admin'"))
-        db.commit()
-        # 恢复到默认数据库
-        from config.settings import get_settings
-        settings = get_settings()
-        db.execute(text(f"USE {settings.matrixone_database}"))
+        db.execute(text("DELETE FROM configs WHERE key_name LIKE 'test-%'"))
+        db.execute(text("DELETE FROM tokens WHERE token_id LIKE 'token_%'"))
+        db.execute(text("DELETE FROM audit_logs WHERE user_id = 'test_admin'"))
         db.commit()
     except:
         pass
@@ -99,21 +84,19 @@ class TestModelManagement:
 
         # Verify in database
         result_query = test_db.execute(
-            text("SELECT * FROM agent_config.model_registry WHERE model_name = 'test-gpt-4'")
+            text("SELECT * FROM configs WHERE key_name = 'test-gpt-4'")
         )
         row = result_query.first()
         if row:
             row = dict(row._mapping)
         assert row is not None
-        assert row["scope_type"] == "global"
+        assert row["key_name"] == "test-gpt-4"
 
     def test_model_list(self, runner, test_db):
         """Test listing models."""
         result = runner.invoke(cli, ["--user", "test_admin", "model", "list"])
 
-        if "Unknown database" in result.output or result.exit_code != 0:
-            pytest.skip("agent_config database not initialized or permission denied")
-
+        assert result.exit_code == 0
         assert "Models:" in result.output or "No models found" in result.output
 
 

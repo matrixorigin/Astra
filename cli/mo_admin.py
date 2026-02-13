@@ -101,25 +101,15 @@ def model_add(
             "is_active": True,
         }
 
-        # Insert into model_registry
-        from sqlalchemy import text
-        db.execute(
-            text("""
-            INSERT INTO agent_config.model_registry
-            (config_id, scope_type, scope_id, model_name, provider, config_json, created_by, created_at)
-            VALUES (:config_id, :scope, :scope_id, :model_name, :provider, :config_json, :user, :created_at)
-            """),
-            {
-                "config_id": config_id,
-                "scope": scope,
-                "scope_id": scope_id,
-                "model_name": model_name,
-                "provider": provider,
-                "config_json": json.dumps(config),
-                "user": user,
-                "created_at": datetime.now(),
-            }
+        # Insert using ORM
+        from api.models import Config
+        cfg = Config(
+            config_id=config_id,
+            key_name=model_name,
+            value=json.dumps(config),
+            description=f"Model config for {model_name}",
         )
+        db.add(cfg)
         db.commit()
 
         # Audit log
@@ -130,9 +120,6 @@ def model_add(
         click.echo(f"   Scope: {scope}" + (f" ({scope_id})" if scope_id else ""))
         click.echo(f"   Config ID: {config_id}")
     except Exception as e:
-        audit.log(
-            user, "add_model", "model", model_name, status="failed", details={"error": str(e)}
-        )
         click.echo(f"❌ Failed to add model: {e}")
         sys.exit(1)
 
@@ -164,34 +151,25 @@ def model_remove(ctx, model_name, scope, scope_id, force):
         # Check if model exists
         from sqlalchemy import text
         
-        query = """
-        SELECT * FROM agent_config.model_registry
-        WHERE model_name = :model_name AND scope_type = :scope
-        """
-        params = {"model_name": model_name, "scope": scope}
-
-        if scope_id:
-            query += " AND scope_id = :scope_id"
-            params["scope_id"] = scope_id
-        else:
-            query += " AND scope_id IS NULL"
-
-        result = db.execute(text(query), params)
+        result = db.execute(
+            text("SELECT * FROM configs WHERE key_name = :model_name"),
+            {"model_name": model_name}
+        )
         row = result.first()
 
         if not row:
-            click.echo(f"❌ Model '{model_name}' not found in {scope} scope")
+            click.echo(f"❌ Model '{model_name}' not found")
             sys.exit(1)
 
         # Confirm removal
         if not force:
-            if not click.confirm(f"Remove model '{model_name}' from {scope} scope?"):
+            if not click.confirm(f"Remove model '{model_name}'?"):
                 click.echo("Cancelled")
                 return
 
         # Delete
         db.execute(
-            text("DELETE FROM agent_config.model_registry WHERE config_id = :config_id"),
+            text("DELETE FROM configs WHERE config_id = :config_id"),
             {"config_id": row._mapping["config_id"]}
         )
         db.commit()
@@ -201,9 +179,6 @@ def model_remove(ctx, model_name, scope, scope_id, force):
 
         click.echo(f"✅ Model '{model_name}' removed successfully")
     except Exception as e:
-        audit.log(
-            user, "remove_model", "model", model_name, status="failed", details={"error": str(e)}
-        )
         click.echo(f"❌ Failed to remove model: {e}")
         sys.exit(1)
 
@@ -218,24 +193,8 @@ def model_list(ctx, scope, scope_id):
     
     db = ctx.obj["db"]
 
-    query = "SELECT * FROM agent_config.model_registry"
-    conditions = []
-    params = {}
-
-    if scope:
-        conditions.append("scope_type = :scope")
-        params["scope"] = scope
-
-    if scope_id:
-        conditions.append("scope_id = :scope_id")
-        params["scope_id"] = scope_id
-
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-
-    query += " ORDER BY scope_type, model_name"
-
-    result = db.execute(text(query), params)
+    result = db.execute(text("SELECT * FROM configs WHERE key_name LIKE '%gpt%' OR key_name LIKE 'model_%'"))
+    
     models = [dict(row._mapping) for row in result]
 
     if not models:
@@ -246,16 +205,12 @@ def model_list(ctx, scope, scope_id):
     click.echo("=" * 80)
 
     for m in models:
-        config = json.loads(m["config_json"])
-        click.echo(f"✓ {m['model_name']}")
-        click.echo(f"   Provider: {m['provider']}")
-        click.echo(
-            f"   Scope: {m['scope_type']}" + (f" ({m['scope_id']})" if m["scope_id"] else "")
-        )
-        click.echo(
-            f"   Price: ${config['price_per_1k_prompt']:.4f}/1K prompt + ${config['price_per_1k_completion']:.4f}/1K completion"
-        )
+        config = json.loads(m["value"])
+        click.echo(f"✓ {m['key_name']}")
+        click.echo(f"   Provider: {config.get('provider', 'N/A')}")
+        click.echo(f"   Context Window: {config.get('context_window', 'N/A')}")
         click.echo()
+
 
 
 @cli.group()
