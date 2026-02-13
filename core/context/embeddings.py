@@ -113,20 +113,22 @@ class EmbeddingService:
         vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
         metadata_json = json.dumps(metadata or {})
 
+        from sqlalchemy import text
         self.db.execute(
-            """
+            text("""
             INSERT INTO event_embeddings
             (event_id, embedding, model_name, model_version, metadata)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (:event_id, :embedding, :model_name, :model_version, :metadata)
             ON DUPLICATE KEY UPDATE
                 embedding = VALUES(embedding),
                 model_name = VALUES(model_name),
                 model_version = VALUES(model_version),
                 metadata = VALUES(metadata),
                 updated_at = CURRENT_TIMESTAMP
-        """,
-            (event_id, vec_str, self.model, "1.0", metadata_json),
+        """),
+            {"event_id": event_id, "embedding": vec_str, "model_name": self.model, "model_version": "1.0", "metadata": metadata_json},
         )
+        self.db.commit()
 
     def search_similar(
         self,
@@ -155,22 +157,19 @@ class EmbeddingService:
         vec_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
         where_clauses = []
-        params = []
 
         if session_id:
-            where_clauses.append("e.session_id = %s")
-            params.append(session_id)
+            where_clauses.append("e.session_id = :session_id")
 
         if filters:
-            for key, value in filters.items():
+            for i, (key, value) in enumerate(filters.items()):
+                param_name = f"filter_{i}"
                 if key == "event_type":
-                    where_clauses.append("e.event_type = %s")
-                    params.append(value)
+                    where_clauses.append(f"e.event_type = :{param_name}")
                 else:
                     where_clauses.append(
-                        f"JSON_UNQUOTE(JSON_EXTRACT(emb.metadata, '$.{key}')) = %s"
+                        f"JSON_UNQUOTE(JSON_EXTRACT(emb.metadata, '$.{key}')) = :{param_name}"
                     )
-                    params.append(value)
 
         where_clause = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
@@ -182,14 +181,27 @@ class EmbeddingService:
                 e.content,
                 e.event_type,
                 e.created_at,
-                L2_DISTANCE(emb.embedding, %s) AS distance,
-                1.0 / (1.0 + L2_DISTANCE(emb.embedding, %s)) AS similarity
+                L2_DISTANCE(emb.embedding, :vec1) AS distance,
+                1.0 / (1.0 + L2_DISTANCE(emb.embedding, :vec2)) AS similarity
             FROM conversation_events e
             JOIN event_embeddings emb ON e.event_id = emb.event_id
             {where_clause}
             ORDER BY distance ASC
-            LIMIT %s
+            LIMIT :limit
         """
 
-        params_list: list[str | int] = [vec_str, vec_str, *params, limit]
-        return self.db.fetchall(query, tuple(params_list))
+        from sqlalchemy import text
+        # Build params dict
+        params_dict = {"vec1": vec_str, "vec2": vec_str, "limit": limit}
+        
+        # Add session_id and filters params
+        if session_id:
+            params_dict["session_id"] = session_id
+        
+        if filters:
+            for i, (key, value) in enumerate(filters.items()):
+                param_name = f"filter_{i}"
+                params_dict[param_name] = value
+        
+        result = self.db.execute(text(query), params_dict)
+        return [dict(row._mapping) for row in result.fetchall()]

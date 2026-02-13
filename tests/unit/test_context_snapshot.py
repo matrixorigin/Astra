@@ -53,20 +53,17 @@ class TestSaveSnapshot:
         )
 
         assert snapshot_id is not None
-        assert mock_db.execute.called
+        assert mock_db.add.called
+        assert mock_db.commit.called
         
-        # Verify SQL args
-        args = mock_db.execute.call_args[0]
-        query = args[0]
-        params = args[1]
+        # Verify snapshot object
+        snapshot = mock_db.add.call_args[0][0]
         
-        assert "INSERT INTO context_snapshots" in query
-        assert params[1] == "session-123"  # session_id
-        assert params[2] == "event-456"    # event_id
+        assert snapshot.session_id == "session-123"
+        assert snapshot.event_id == "event-456"
         
         # Verify skills_used extraction
-        skills_used_json = params[5]
-        skills_used = json.loads(skills_used_json)
+        skills_used = snapshot.skills_used
         assert len(skills_used) == 2
         assert skills_used[0]["name"] == "skill1"
         assert skills_used[0]["version"] == "v1"
@@ -82,11 +79,10 @@ class TestSaveSnapshot:
             llm_response_id="res-1"
         )
         
-        args = mock_db.execute.call_args[0]
-        params = args[1]
+        snapshot = mock_db.add.call_args[0][0]
         
-        assert params[14] == "req-1"  # llm_request_id
-        assert params[15] == "res-1"  # llm_response_id
+        assert snapshot.llm_request_id == "req-1"
+        assert snapshot.llm_response_id == "res-1"
 
 
 class TestUpdateSnapshotLlmIds:
@@ -94,33 +90,34 @@ class TestUpdateSnapshotLlmIds:
 
     def test_update_snapshot_ids(self, context_manager, mock_db):
         """Test updating LLM IDs."""
+        # Mock query chain
+        mock_query = mock_db.query.return_value
+        mock_filter = mock_query.filter.return_value
+        
         context_manager.update_snapshot_llm_ids(
             snapshot_id="snap-123",
             llm_request_id="req-1",
             llm_response_id="res-1"
         )
         
-        assert mock_db.execute.called
-        args = mock_db.execute.call_args[0]
-        query = args[0]
-        params = args[1]
-        
-        assert "UPDATE context_snapshots" in query
-        assert "llm_request_id = %s" in query
-        assert "llm_response_id = %s" in query
-        assert params == ("req-1", "res-1", "snap-123")
+        assert mock_db.query.called
+        mock_filter.update.assert_called_once()
+        update_dict = mock_filter.update.call_args[0][0]
+        assert update_dict["llm_request_id"] == "req-1"
+        assert update_dict["llm_response_id"] == "res-1"
+        assert mock_db.commit.called
 
     def test_update_snapshot_ids_partial(self, context_manager, mock_db):
         """Test updating with only one ID."""
+        # Mock query chain
+        mock_query = mock_db.query.return_value
+        mock_filter = mock_query.filter.return_value
+        
         context_manager.update_snapshot_llm_ids(
             snapshot_id="snap-123",
             llm_request_id="req-1"
         )
-        
-        args = mock_db.execute.call_args[0]
-        params = args[1]
-        query = args[0]
 
-        assert "llm_request_id = %s" in query
-        assert "llm_response_id" not in query
-        assert params == ("req-1", "snap-123")
+        update_dict = mock_filter.update.call_args[0][0]
+        assert "llm_request_id" in update_dict
+        assert "llm_response_id" not in update_dict

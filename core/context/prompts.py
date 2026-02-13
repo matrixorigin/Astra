@@ -38,33 +38,25 @@ class PromptManager:
             content = self._cache[cache_key]
         else:
             # Load from database
+            from api.models import PromptTemplate
+            
             if version:
-                row = self.db.fetchone(
-                    """
-                    SELECT content
-                    FROM prompt_templates
-                    WHERE template_id = %s AND version = %s
-                """,
-                    (template_id, version),
-                )
+                row = self.db.query(PromptTemplate).filter(
+                    PromptTemplate.template_id == template_id,
+                    PromptTemplate.version == version
+                ).first()
             else:
                 # Get latest active version
-                row = self.db.fetchone(
-                    """
-                    SELECT content
-                    FROM prompt_templates
-                    WHERE template_id = %s AND is_active = 1
-                    ORDER BY effective_at DESC, created_at DESC
-                    LIMIT 1
-                """,
-                    (template_id,),
-                )
+                row = self.db.query(PromptTemplate).filter(
+                    PromptTemplate.template_id == template_id,
+                    PromptTemplate.is_active == 1
+                ).order_by(PromptTemplate.created_at.desc()).first()
 
             if not row:
                 logger.warning(f"Prompt template not found: {template_id}@{version}")
                 return self._get_fallback_prompt(template_id)
 
-            content = row["content"]
+            content = row.template_content
             self._cache[cache_key] = content
 
         # Substitute variables

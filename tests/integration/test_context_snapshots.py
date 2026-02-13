@@ -59,10 +59,11 @@ def test_context_snapshot_save_and_load(db, context_manager, event_logger):
     assert loaded_context.assembly_time_ms == context.assembly_time_ms
 
     # Verify snapshot is in database
-    row = db.fetchone("SELECT * FROM context_snapshots WHERE snapshot_id = %s", (snapshot_id,))
+    from api.models import ContextSnapshot as SnapshotModel
+    row = db.query(SnapshotModel).filter(SnapshotModel.snapshot_id == snapshot_id).first()
     assert row is not None
-    assert row["session_id"] == session_id
-    assert row["event_id"] == event.event_id
+    assert row.session_id == session_id
+    assert row.event_id == event.event_id
 
 
 def test_context_snapshot_with_events(db, context_manager, event_logger):
@@ -178,10 +179,11 @@ def test_context_snapshot_update_llm_ids(db, context_manager, event_logger):
     context_manager.update_snapshot_llm_ids(snapshot_id, llm_request_id="req_004", llm_response_id="resp_004")
 
     # Verify update
-    row = db.fetchone("SELECT llm_request_id, llm_response_id FROM context_snapshots WHERE snapshot_id = %s", (snapshot_id,))
+    from api.models import ContextSnapshot as SnapshotModel
+    row = db.query(SnapshotModel).filter(SnapshotModel.snapshot_id == snapshot_id).first()
     assert row is not None
-    assert row["llm_request_id"] == "req_004"
-    assert row["llm_response_id"] == "resp_004"
+    assert row.llm_request_id == "req_004"
+    assert row.llm_response_id == "resp_004"
 
 
 if __name__ == "__main__":

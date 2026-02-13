@@ -51,17 +51,18 @@ def test_store_and_retrieve_embedding(db):
     service.store_embedding(event_id, embedding, metadata={"test": True})
 
     # Retrieve
-    row = db.fetchone(
-        "SELECT model_name, model_version, metadata FROM event_embeddings WHERE event_id = %s",
-        (event_id,),
-    )
+    from sqlalchemy import text
+    row = db.execute(
+        text("SELECT model_name, model_version, metadata FROM event_embeddings WHERE event_id = :event_id"),
+        {"event_id": event_id},
+    ).fetchone()
 
     assert row is not None
-    assert row["model_name"] == "text-embedding-3-small"
+    assert row.model_name == "text-embedding-3-small"
 
     import json
 
-    metadata = json.loads(row["metadata"])
+    metadata = json.loads(row.metadata)
     assert metadata["test"] is True
 
 

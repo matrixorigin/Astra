@@ -440,43 +440,29 @@ class ContextManager:
             for s in context.skill_definitions
         ]
 
-        self.db.execute(
-            """
-            INSERT INTO context_snapshots (
-                snapshot_id, session_id, event_id,
-                system_prompt, skill_definitions, skills_used,
-                selected_events, code_context, documentation,
-                total_tokens, token_budget, assembly_time_ms,
-                relevance_scores, task_type,
-                llm_request_id, llm_response_id, created_at
-            ) VALUES (
-                %s, %s, %s,
-                %s, %s, %s,
-                %s, %s, %s,
-                %s, %s, %s,
-                %s, %s,
-                %s, %s, CURRENT_TIMESTAMP
-            )
-            """,
-            (
-                snapshot_id,
-                session_id,
-                event_id,
-                context.system_prompt,
-                json.dumps(context.skill_definitions),
-                json.dumps(skills_used),
-                json.dumps(context.selected_events),
-                json.dumps(context.code_context),
-                json.dumps(context.documentation),
-                context.total_tokens,
-                json.dumps(context.token_budget),
-                context.assembly_time_ms,
-                json.dumps(context.relevance_scores),
-                context.task_type.value,
-                llm_request_id,
-                llm_response_id,
-            ),
+        from api.models import ContextSnapshot as SnapshotModel
+        from datetime import datetime, timezone
+        
+        snapshot = SnapshotModel(
+            snapshot_id=snapshot_id,
+            session_id=session_id,
+            event_id=event_id,
+            system_prompt=context.system_prompt,
+            skill_definitions=context.skill_definitions,
+            selected_events=context.selected_events,
+            code_context=context.code_context,
+            documentation=context.documentation,
+            total_tokens=context.total_tokens,
+            token_budget=context.token_budget,
+            assembly_time_ms=context.assembly_time_ms,
+            relevance_scores=context.relevance_scores,
+            task_type=context.task_type.value,
+            skills_used=skills_used,
+            llm_request_id=llm_request_id,
+            llm_response_id=llm_response_id,
         )
+        self.db.add(snapshot)
+        self.db.commit()
 
         logger.info(f"Context snapshot saved: {snapshot_id}")
         return snapshot_id
@@ -491,80 +477,48 @@ class ContextManager:
             llm_request_id: LLM request identifier
             llm_response_id: LLM response identifier
         """
-        updates = []
-        params = []
-
+        from api.models import ContextSnapshot as SnapshotModel
+        
+        update_dict = {}
         if llm_request_id:
-            updates.append("llm_request_id = %s")
-            params.append(llm_request_id)
-
+            update_dict["llm_request_id"] = llm_request_id
         if llm_response_id:
-            updates.append("llm_response_id = %s")
-            params.append(llm_response_id)
+            update_dict["llm_response_id"] = llm_response_id
 
-        if not updates:
+        if not update_dict:
             return
 
-        params.append(snapshot_id)
-        query = f"""
-            UPDATE context_snapshots
-            SET {", ".join(updates)}
-            WHERE snapshot_id = %s
-        """
-        self.db.execute(query, tuple(params))
+        self.db.query(SnapshotModel).filter(
+            SnapshotModel.snapshot_id == snapshot_id
+        ).update(update_dict)
+        self.db.commit()
 
     def load_snapshot(self, snapshot_id: str) -> Context:
         """Load context snapshot from database."""
-        import json
+        from api.models import ContextSnapshot as SnapshotModel
 
-        row = self.db.fetchone(
-            "SELECT * FROM context_snapshots WHERE snapshot_id = %s", (snapshot_id,)
-        )
+        row = self.db.query(SnapshotModel).filter(
+            SnapshotModel.snapshot_id == snapshot_id
+        ).first()
 
         if not row:
             raise ContextError(f"Snapshot not found: {snapshot_id}")
 
-        # Parse JSON fields
-        skill_definitions = (
-            json.loads(row["skill_definitions"])
-            if isinstance(row["skill_definitions"], str)
-            else row["skill_definitions"]
-        )
-        selected_events = (
-            json.loads(row["selected_events"])
-            if isinstance(row["selected_events"], str)
-            else row["selected_events"]
-        )
-        code_context = (
-            json.loads(row["code_context"])
-            if isinstance(row["code_context"], str)
-            else row["code_context"]
-        )
-        documentation = (
-            json.loads(row["documentation"])
-            if isinstance(row["documentation"], str)
-            else row["documentation"]
-        )
-        token_budget = (
-            json.loads(row["token_budget"])
-            if isinstance(row["token_budget"], str)
-            else row["token_budget"]
-        )
-        relevance_scores = (
-            json.loads(row["relevance_scores"])
-            if isinstance(row["relevance_scores"], str)
-            else row["relevance_scores"]
-        )
+        # JSON fields are already parsed by SQLAlchemy
+        skill_definitions = row.skill_definitions or []
+        selected_events = row.selected_events or []
+        code_context = row.code_context or []
+        documentation = row.documentation or []
 
         return Context(
-            system_prompt=row["system_prompt"],
-            skill_definitions=skill_definitions or [],
-            selected_events=selected_events or [],
-            code_context=code_context or [],
-            documentation=documentation or [],
-            total_tokens=row["total_tokens"],
-            token_budget=token_budget,
-            assembly_time_ms=row["assembly_time_ms"],
-            relevance_scores=relevance_scores,
-            task_type=TaskType(row["task_type"]),
+            system_prompt=row.system_prompt,
+            skill_definitions=skill_definitions,
+            selected_events=selected_events,
+            code_context=code_context,
+            documentation=documentation,
+            total_tokens=row.total_tokens,
+            token_budget=row.token_budget or {},
+            assembly_time_ms=row.assembly_time_ms or 0,
+            relevance_scores=row.relevance_scores or {},
+            task_type=TaskType(row.task_type) if row.task_type else TaskType.GENERAL,
         )

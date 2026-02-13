@@ -152,18 +152,19 @@ class RelevanceScorer:
 
     def _get_recent_chains(self, session_id: str, limit: int = 5) -> set[str]:
         """Get recent causal chain IDs."""
-        chains = self.db.fetchall(
-            """
-            SELECT causal_chain_id, MAX(created_at) as last_time
-            FROM conversation_events
-            WHERE session_id = %s
-            GROUP BY causal_chain_id
-            ORDER BY last_time DESC
-            LIMIT %s
-            """,
-            (session_id, limit),
-        )
-        return {row["causal_chain_id"] for row in chains}
+        from api.models import Event
+        from sqlalchemy import func
+        
+        chains = self.db.query(
+            Event.causal_chain_id,
+            func.max(Event.created_at).label('last_time')
+        ).filter(
+            Event.session_id == session_id
+        ).group_by(Event.causal_chain_id).order_by(
+            func.max(Event.created_at).desc()
+        ).limit(limit).all()
+        
+        return {row.causal_chain_id for row in chains}
 
     def _compute_signals(
         self,
