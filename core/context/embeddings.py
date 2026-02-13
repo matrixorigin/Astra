@@ -7,7 +7,6 @@ import json
 from typing import Any
 
 from core.logging_config import get_logger
-from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -18,12 +17,12 @@ class EmbeddingService:
     DIMENSION = 1024  # Fixed dimension for VECF32(1024)
 
     def __init__(
-        self, db: Database, provider: str = "openai", model: str = "text-embedding-3-small"
+        self, db, provider: str = "openai", model: str = "text-embedding-3-small"
     ):
         """Initialize embedding service.
 
         Args:
-            db: Database connection
+            db: Database session
             provider: Embedding provider (openai, mock)
             model: Model name
         """

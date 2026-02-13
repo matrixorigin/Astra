@@ -3,18 +3,21 @@
 import pytest
 
 from core.context.embeddings import EmbeddingService
-from sdk import Database
 
 
 @pytest.fixture
 def db(request):
     """Database fixture with cleanup."""
-    database = Database()
+    from api.database import get_db_session
+    from sqlalchemy import text
+    
+    database = next(get_db_session())
 
     yield database
 
     # Cleanup
-    database.execute("DELETE FROM event_embeddings WHERE event_id LIKE 'test_%'")
+    database.execute(text("DELETE FROM event_embeddings WHERE event_id LIKE 'test_%'"))
+    database.commit()
 
 
 def test_mock_embedding_deterministic(db):
