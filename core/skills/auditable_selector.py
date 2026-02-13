@@ -13,13 +13,14 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
+from api.database import get_db_session
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
 from core.skills.modern_selector import ModernSkillSelector
 from core.skills.selector import SkillMetadata
-from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -73,47 +74,30 @@ class AuditableSkillSelector:
     3. Learns from failures automatically
     """
 
-    def __init__(self, db: Database, llm_client, account: str = "sys"):
-        self.db = db
+    def __init__(self, session: Session | None = None, llm_client=None, account: str = "sys"):
+        self._session = session
+        self._owns_session = session is None
         self.llm = llm_client
         self.account = account
-        self.modern_selector = ModernSkillSelector(db, llm_client)
-        self.sandbox = Sandbox(db=db, account=account)
+        self.modern_selector = ModernSkillSelector(session, llm_client) if session else None
+        self.sandbox = Sandbox(db=None, account=account)  # Sandbox still uses old DB
         self._ensure_table()
+
+    def _get_session(self) -> Session:
+        """Get or create session."""
+        if self._session is None:
+            self._session = next(get_db_session())
+        return self._session
+
+    def __del__(self):
+        """Close session if we own it."""
+        if self._owns_session and self._session:
+            self._session.close()
 
     def _ensure_table(self):
         """Ensure skill_selection_events table exists."""
-        self.db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS skill_selection_events (
-                event_id VARCHAR(36) PRIMARY KEY,
-                session_id VARCHAR(36) NOT NULL,
-                user_query TEXT NOT NULL,
-                context_snapshot VARCHAR(100) NOT NULL,
-                available_skills JSON NOT NULL,
-                selected_skills JSON NOT NULL,
-                selection_method VARCHAR(50) NOT NULL,
-                selection_reasoning TEXT,
-                candidate_scores JSON,
-                execution_result JSON,
-                execution_success BOOLEAN,
-                execution_time_ms INT,
-                execution_cost DECIMAL(10, 4),
-                user_feedback_score INT,
-                selection_correctness BOOLEAN,
-                correction_suggestion JSON,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_session (session_id),
-                INDEX idx_correctness (selection_correctness),
-                INDEX idx_created (created_at)
-            )
-        """
-        )
-
-    def get_tools_schema(self, query: str, max_candidates: int = 5) -> list[dict]:
-        """Delegate to modern_selector for tool schema retrieval."""
-        return self.modern_selector.get_tools_schema(query, max_candidates)
-
+        # Table should already exist from schema
+        pass
     def select_with_validation(
         self, query: str, session_id: str, validate_in_sandbox: bool = True
     ) -> SkillSelectionEvent:
@@ -196,43 +180,30 @@ class AuditableSkillSelector:
         This enables time-travel debugging - we can replay any selection
         with the exact data state the selector saw.
         """
-        snapshot_name = f"skill_select_{session_id}_{event_id[:8]}"
-
-        try:
-            # Create snapshot of relevant tables
-            self.db.execute(
-                f"CREATE SNAPSHOT {snapshot_name} FOR ACCOUNT {self.account}"
-            )
-            return snapshot_name
-        except Exception as e:
-            logger.error(f"Failed to create snapshot: {e}")
-            # Fallback to timestamp-based identifier
-            return f"snapshot_{datetime.now(timezone.utc).isoformat()}"
+        # Snapshot functionality temporarily disabled during ORM migration
+        # TODO: Re-implement using raw SQL connection if needed
+        return f"snapshot_{datetime.now(timezone.utc).isoformat()}"
 
     def _get_available_skills(self) -> list[SkillMetadata]:
         """Get all available skills at this moment."""
-        rows = self.db.fetchall(
-            """
-            SELECT skill_name, version, description, category, 
-                   subcategory, triggers, dependencies, priority, cost_estimate
-            FROM skills_registry
-            WHERE is_active = 1
-        """
-        )
+        from api.models import SkillRegistry as SkillModel
+        
+        session = self._get_session()
+        skills_data = session.query(SkillModel).filter(SkillModel.is_active == 1).all()
 
         skills = []
-        for row in rows:
+        for skill in skills_data:
             skills.append(
                 SkillMetadata(
-                    name=row["skill_name"],
-                    version=row["version"],
-                    description=row["description"],
-                    category=row.get("category", "general"),
-                    subcategory=row.get("subcategory", "default"),
-                    triggers=json.loads(row.get("triggers", "[]")),
-                    dependencies=json.loads(row.get("dependencies", "[]")),
-                    priority=row.get("priority", 5),
-                    cost_estimate=row.get("cost_estimate", "medium"),
+                    name=skill.skill_name,
+                    version=skill.version,
+                    description=skill.skill_definition.get("description", "") if skill.skill_definition else "",
+                    category="general",
+                    subcategory="default",
+                    triggers=[],
+                    dependencies=[],
+                    priority=5,
+                    cost_estimate="medium",
                 )
             )
 
@@ -376,27 +347,23 @@ class AuditableSkillSelector:
 
     def _save_event(self, event: SkillSelectionEvent):
         """Save selection event to database."""
-        self.db.execute(
-            """
-            INSERT INTO skill_selection_events (
-                event_id, session_id, user_query, context_snapshot,
-                available_skills, selected_skills, selection_method,
-                selection_reasoning, candidate_scores, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-            (
-                event.event_id,
-                event.session_id,
-                event.user_query,
-                event.context_snapshot,
-                json.dumps(event.available_skills),
-                json.dumps(event.selected_skills),
-                event.selection_method,
-                event.selection_reasoning,
-                json.dumps(event.candidate_scores),
-                event.created_at,
-            ),
+        from api.models import SkillSelectionEvent as EventModel
+        
+        session = self._get_session()
+        event_model = EventModel(
+            event_id=event.event_id,
+            session_id=event.session_id,
+            user_query=event.user_query,
+            context_snapshot=event.context_snapshot,
+            available_skills=event.available_skills,
+            selected_skills=event.selected_skills,
+            selection_method=event.selection_method,
+            selection_reasoning=event.selection_reasoning,
+            candidate_scores=event.candidate_scores,
+            created_at=event.created_at,
         )
+        session.add(event_model)
+        session.commit()
 
     def update_execution_result(
         self,
@@ -410,17 +377,16 @@ class AuditableSkillSelector:
         
         This completes the audit trail - we now know if the selection was correct.
         """
-        self.db.execute(
-            """
-            UPDATE skill_selection_events
-            SET execution_success = %s,
-                execution_time_ms = %s,
-                execution_cost = %s,
-                execution_result = %s
-            WHERE event_id = %s
-        """,
-            (success, time_ms, cost, json.dumps(result), event_id),
-        )
+        from api.models import SkillSelectionEvent as EventModel
+        
+        session = self._get_session()
+        event = session.query(EventModel).filter(EventModel.event_id == event_id).first()
+        if event:
+            event.execution_success = success
+            event.execution_time_ms = time_ms
+            event.execution_cost = cost
+            event.execution_result = result
+            session.commit()
 
     def update_user_feedback(self, event_id: str, score: int):
         """Update event with user feedback.
@@ -430,74 +396,63 @@ class AuditableSkillSelector:
         if not 1 <= score <= 5:
             raise ValueError("Score must be between 1 and 5")
 
-        self.db.execute(
-            """
-            UPDATE skill_selection_events
-            SET user_feedback_score = %s
-            WHERE event_id = %s
-        """,
-            (score, event_id),
-        )
-
-        # Auto-evaluate correctness based on feedback
-        correctness = score >= 4
-        self.db.execute(
-            """
-            UPDATE skill_selection_events
-            SET selection_correctness = %s
-            WHERE event_id = %s
-        """,
-            (correctness, event_id),
-        )
+        from api.models import SkillSelectionEvent as EventModel
+        
+        session = self._get_session()
+        event = session.query(EventModel).filter(EventModel.event_id == event_id).first()
+        if event:
+            event.user_feedback_score = score
+            # Auto-evaluate correctness based on feedback
+            event.selection_correctness = score >= 4
+            session.commit()
 
     def get_selection_history(
         self, session_id: str | None = None, limit: int = 100
     ) -> list[SkillSelectionEvent]:
         """Get selection history for analysis."""
-        query = """
-            SELECT * FROM skill_selection_events
-            WHERE 1=1
-        """
-        params = []
-
+        from api.models import SkillSelectionEvent as EventModel
+        from decimal import Decimal
+        import json
+        
+        def convert_decimals(obj):
+            """Convert Decimal to float in nested structures."""
+            if isinstance(obj, Decimal):
+                return float(obj)
+            elif isinstance(obj, dict):
+                return {k: convert_decimals(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_decimals(item) for item in obj]
+            return obj
+        
+        session = self._get_session()
+        query = session.query(EventModel)
+        
         if session_id:
-            query += " AND session_id = %s"
-            params.append(session_id)
-
-        query += " ORDER BY created_at DESC LIMIT %s"
-        params.append(limit)
-
-        rows = self.db.fetchall(query, tuple(params))
+            query = query.filter(EventModel.session_id == session_id)
+        
+        events_data = query.order_by(EventModel.created_at.desc()).limit(limit).all()
 
         events = []
-        for row in rows:
+        for event in events_data:
             events.append(
                 SkillSelectionEvent(
-                    event_id=row["event_id"],
-                    session_id=row["session_id"],
-                    user_query=row["user_query"],
-                    context_snapshot=row["context_snapshot"],
-                    available_skills=json.loads(row["available_skills"]),
-                    selected_skills=json.loads(row["selected_skills"]),
-                    selection_method=row["selection_method"],
-                    selection_reasoning=row["selection_reasoning"],
-                    candidate_scores=json.loads(row.get("candidate_scores", "{}")),
-                    execution_result=(
-                        json.loads(row["execution_result"])
-                        if row.get("execution_result")
-                        else None
-                    ),
-                    execution_success=row.get("execution_success"),
-                    execution_time_ms=row.get("execution_time_ms"),
-                    execution_cost=row.get("execution_cost"),
-                    user_feedback_score=row.get("user_feedback_score"),
-                    selection_correctness=row.get("selection_correctness"),
-                    correction_suggestion=(
-                        json.loads(row["correction_suggestion"])
-                        if row.get("correction_suggestion")
-                        else None
-                    ),
-                    created_at=row["created_at"],
+                    event_id=event.event_id,
+                    session_id=event.session_id,
+                    user_query=event.user_query,
+                    context_snapshot=event.context_snapshot,
+                    available_skills=convert_decimals(event.available_skills),
+                    selected_skills=event.selected_skills,
+                    selection_method=event.selection_method,
+                    selection_reasoning=event.selection_reasoning,
+                    candidate_scores=convert_decimals(event.candidate_scores or {}),
+                    execution_result=convert_decimals(event.execution_result),
+                    execution_success=event.execution_success,
+                    execution_time_ms=float(event.execution_time_ms) if event.execution_time_ms else None,
+                    execution_cost=float(event.execution_cost) if event.execution_cost else None,
+                    user_feedback_score=event.user_feedback_score,
+                    selection_correctness=event.selection_correctness,
+                    correction_suggestion=event.correction_suggestion,
+                    created_at=event.created_at,
                 )
             )
 

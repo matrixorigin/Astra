@@ -8,13 +8,15 @@ from core.skills import (
 )
 from core.skills.builtin import CIStatusSkill, ListPRsSkill, SummarizePRSkill
 from core.skills.github_client import GitHubClient
-from sdk import Database
 
 
 @pytest.fixture
 def db():
-    """Database fixture"""
-    return Database()
+    """Database session fixture"""
+    from api.database import get_db_session
+    session = next(get_db_session())
+    yield session
+    session.close()
 
 
 @pytest.fixture
@@ -37,6 +39,11 @@ def llm(db):
 
 def test_skill_registry_register(db, registry, llm, github):
     """Test skill registration"""
+    # Clean up first
+    from api.models import SkillRegistry as SkillModel
+    db.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").delete()
+    db.commit()
+    
     skill = SummarizePRSkill(db, llm, github)
     registry.register(skill)
 
@@ -44,15 +51,20 @@ def test_skill_registry_register(db, registry, llm, github):
     assert registry.get("summarize_pr") is not None
     assert registry.get("summarize_pr").version == "1.0.0"
 
-    # Check database
-    row = db.fetchone("SELECT * FROM skills_registry WHERE skill_name = %s", ("summarize_pr",))
+    # Check database using ORM
+    row = db.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").first()
     assert row is not None
-    assert row["version"] == "1.0.0"
-    assert row["is_active"] in (1, True, "true")  # Handle different DB return types
+    assert row.version == "1.0.0"
+    assert row.is_active in (1, True)
 
 
 def test_skill_registry_versioning(db, registry, llm, github):
     """Test skill versioning"""
+    # Clean up first
+    from api.models import SkillRegistry as SkillModel
+    db.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").delete()
+    db.commit()
+    
     # Register v1.0.0
     skill_v1 = SummarizePRSkill(db, llm, github)
     skill_v1.version = "1.0.0"
@@ -70,16 +82,17 @@ def test_skill_registry_versioning(db, registry, llm, github):
     assert registry.get("summarize_pr", version="1.0.0") is not None
     assert registry.get("summarize_pr", version="1.1.0") is not None
 
-    # Check database
-    rows = db.fetchall(
-        "SELECT version, is_active FROM skills_registry WHERE skill_name = %s ORDER BY version",
-        ("summarize_pr",),
-    )
+    # Check database using ORM
+    from api.models import SkillRegistry as SkillModel
+    rows = db.query(SkillModel).filter(
+        SkillModel.skill_name == "summarize_pr"
+    ).order_by(SkillModel.version).all()
+    
     assert len(rows) == 2
-    assert rows[0]["version"] == "1.0.0"
-    assert rows[0]["is_active"] in (0, False, "false")  # Handle different DB return types
-    assert rows[1]["version"] == "1.1.0"
-    assert rows[1]["is_active"] in (1, True, "true")
+    assert rows[0].version == "1.0.0"
+    assert rows[0].is_active in (0, False)
+    assert rows[1].version == "1.1.0"
+    assert rows[1].is_active in (1, True)
 
 
 def test_skill_registry_list_available(db, registry, llm, github):
@@ -165,7 +178,7 @@ async def test_summarize_pr_skill(db, llm, github, monkeypatch):
     monkeypatch.setattr(github, "get_pr", mock_get_pr)
     monkeypatch.setattr(github, "get_pr_diff", mock_get_pr_diff)
 
-    skill = SummarizePRSkill(db, llm, github)
+    skill = SummarizePRSkill(llm, github, db)
 
     input_data = {
         "repo_id": 1,
@@ -204,7 +217,7 @@ async def test_list_prs_skill(db, github, monkeypatch):
 
     monkeypatch.setattr(github, "list_prs", mock_list_prs)
 
-    skill = ListPRsSkill(db, github)
+    skill = ListPRsSkill(github, db)
 
     input_data = {
         "repo_id": 1,
@@ -241,7 +254,7 @@ async def test_ci_status_skill(db, github, monkeypatch):
 
     monkeypatch.setattr(github, "list_workflow_runs", mock_list_workflow_runs)
 
-    skill = CIStatusSkill(db, github)
+    skill = CIStatusSkill(github, db)
 
     input_data = {
         "repo_id": 1,

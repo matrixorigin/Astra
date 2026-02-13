@@ -54,6 +54,8 @@ class TestEventLoggerStream(unittest.TestCase):
 
     def setUp(self):
         self.db = MagicMock()
+        self.db.add = MagicMock()
+        self.db.commit = MagicMock()
         self.logger = EventLogger(self.db)
 
     def test_create_stream_event(self):
@@ -73,7 +75,8 @@ class TestEventLoggerStream(unittest.TestCase):
         self.assertEqual(event.event_type, "stream_text_delta")
 
         # Verify database was called
-        self.db.execute.assert_called_once()
+        self.db.add.assert_called_once()
+        self.db.commit.assert_called_once()
 
 
 if __name__ == "__main__":

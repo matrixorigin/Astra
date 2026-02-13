@@ -3,12 +3,14 @@
 Handles session creation, updates, and lifecycle management.
 """
 
-import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from sqlalchemy.orm import Session as DBSession
+
+from api.database import get_db_session
+from api.models import Session as SessionModel
 from core.events.session_models import Session, SessionStatus
-from sdk.database import Database
 
 
 class SessionManager:
@@ -17,66 +19,60 @@ class SessionManager:
     Provides methods to create, update, and manage session lifecycle.
     """
 
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, session: DBSession | None = None) -> None:
         """Initialize session manager.
 
         Args:
-            db: Database instance. If None, creates a new one.
+            session: SQLAlchemy session. If None, creates a new one.
         """
-        self.db = db or Database()
+        self._session = session
+        self._owns_session = session is None
+
+    def _get_session(self) -> DBSession:
+        """Get or create session."""
+        if self._session is None:
+            self._session = next(get_db_session())
+        return self._session
+
+    def __del__(self):
+        """Close session if we own it."""
+        if self._owns_session and self._session:
+            self._session.close()
 
     def create_session(
         self,
         user_id: str,
-        tenant_id: str | None = None,
         metadata: dict | None = None,
     ) -> Session:
         """Create a new session.
 
         Args:
             user_id: User identifier
-            tenant_id: Optional tenant identifier
             metadata: Optional metadata
 
         Returns:
             Session: Created session
         """
-        session = Session(
-            session_id=str(uuid4()),
+        session_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        
+        db_session = SessionModel(
+            session_id=session_id,
             user_id=user_id,
-            tenant_id=tenant_id,
-            last_active_at=datetime.now(timezone.utc),
-            metadata=metadata,
+            created_at=now,
+            updated_at=now,
+            last_active_at=now,
+            status=SessionStatus.ACTIVE,
+            event_count=0,
+            session_metadata=metadata,
         )
-
-        query = """
-            INSERT INTO sessions (
-                session_id, user_id, tenant_id, created_at, updated_at,
-                last_active_at, status, last_event_id, event_count,
-                summary_status, summary_job_id, vector_db_snapshot_id, metadata
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            )
-        """
-
-        params = (
-            session.session_id,
-            session.user_id,
-            session.tenant_id,
-            session.created_at,
-            session.updated_at,
-            session.last_active_at,
-            session.status,
-            session.last_event_id,
-            session.event_count,
-            session.summary_status,
-            session.summary_job_id,
-            session.vector_db_snapshot_id,
-            json.dumps(session.metadata) if session.metadata else None,
-        )
-
-        self.db.execute(query, params)
-        return session
+        
+        db = self._get_session()
+        db.add(db_session)
+        db.commit()
+        db.refresh(db_session)
+        
+        return self._model_to_session(db_session)
 
     def get_session(self, session_id: str) -> Session | None:
         """Get a session by ID.
@@ -87,9 +83,9 @@ class SessionManager:
         Returns:
             Optional[Session]: Session if found, None otherwise
         """
-        query = "SELECT * FROM sessions WHERE session_id = %s"
-        row = self.db.fetchone(query, (session_id,))
-        return self._row_to_session(row) if row else None
+        db = self._get_session()
+        db_session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        return self._model_to_session(db_session) if db_session else None
 
     def update_session_activity(self, session_id: str, last_event_id: str) -> None:
         """Update session activity timestamp and last event.
@@ -98,16 +94,16 @@ class SessionManager:
             session_id: Session identifier
             last_event_id: Last event identifier
         """
-        query = """
-            UPDATE sessions
-            SET last_active_at = %s,
-                last_event_id = %s,
-                event_count = event_count + 1,
-                updated_at = %s
-            WHERE session_id = %s
-        """
+        db = self._get_session()
         now = datetime.now(timezone.utc)
-        self.db.execute(query, (now, last_event_id, now, session_id))
+        
+        db_session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        if db_session:
+            db_session.last_active_at = now
+            db_session.last_event_id = last_event_id
+            db_session.event_count += 1
+            db_session.updated_at = now
+            db.commit()
 
     def close_session(self, session_id: str) -> None:
         """Close a session.
@@ -115,12 +111,12 @@ class SessionManager:
         Args:
             session_id: Session identifier
         """
-        query = """
-            UPDATE sessions
-            SET status = %s, updated_at = %s
-            WHERE session_id = %s
-        """
-        self.db.execute(query, (SessionStatus.CLOSED, datetime.now(timezone.utc), session_id))
+        db = self._get_session()
+        db_session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        if db_session:
+            db_session.status = SessionStatus.CLOSED
+            db_session.updated_at = datetime.now(timezone.utc)
+            db.commit()
 
     def get_user_sessions(
         self, user_id: str, status: SessionStatus | None = None, limit: int = 10
@@ -135,48 +131,37 @@ class SessionManager:
         Returns:
             list[Session]: List of sessions
         """
+        db = self._get_session()
+        query = db.query(SessionModel).filter(SessionModel.user_id == user_id)
+        
         if status:
-            query = """
-                SELECT * FROM sessions
-                WHERE user_id = %s AND status = %s
-                ORDER BY last_active_at DESC
-                LIMIT %s
-            """
-            rows = self.db.fetchall(query, (user_id, status, limit))
-        else:
-            query = """
-                SELECT * FROM sessions
-                WHERE user_id = %s
-                ORDER BY last_active_at DESC
-                LIMIT %s
-            """
-            rows = self.db.fetchall(query, (user_id, limit))
+            query = query.filter(SessionModel.status == status)
+        
+        query = query.order_by(SessionModel.last_active_at.desc()).limit(limit)
+        db_sessions = query.all()
+        
+        return [self._model_to_session(s) for s in db_sessions]
 
-        return [self._row_to_session(row) for row in rows]
-
-    def _row_to_session(self, row: dict) -> Session:
-        """Convert database row to Session.
+    def _model_to_session(self, model: SessionModel) -> Session:
+        """Convert SQLAlchemy model to Pydantic Session.
 
         Args:
-            row: Database row as dictionary
+            model: SQLAlchemy Session model
 
         Returns:
-            Session: Session object
+            Session: Pydantic Session object
         """
-        metadata = json.loads(row["metadata"]) if row.get("metadata") else None
-
         return Session(
-            session_id=row["session_id"],
-            user_id=row["user_id"],
-            tenant_id=row.get("tenant_id"),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            last_active_at=row.get("last_active_at"),
-            status=row["status"],
-            last_event_id=row.get("last_event_id"),
-            event_count=row.get("event_count", 0),
-            summary_status=row.get("summary_status"),
-            summary_job_id=row.get("summary_job_id"),
-            vector_db_snapshot_id=row.get("vector_db_snapshot_id"),
-            metadata=metadata,
+            session_id=model.session_id,
+            user_id=model.user_id,
+            created_at=model.created_at,
+            updated_at=model.updated_at,
+            last_active_at=model.last_active_at,
+            status=model.status,
+            last_event_id=model.last_event_id,
+            event_count=model.event_count,
+            summary_status=model.summary_status,
+            summary_job_id=model.summary_job_id,
+            vector_db_snapshot_id=model.vector_db_snapshot_id,
+            metadata=model.session_metadata,
         )

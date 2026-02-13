@@ -13,7 +13,6 @@ import pytest
 import vcr
 
 from core.skills.github_client import GitHubClient
-from sdk import Database
 
 
 # VCR configuration
@@ -38,9 +37,12 @@ vcr_config = vcr.VCR(
 @pytest.fixture
 def github_client():
     """GitHub client with real token (if available)."""
-    db = Database()
+    from api.database import get_db_session
+    session = next(get_db_session())
     token = os.getenv("GITHUB_TOKEN")
-    return GitHubClient(db, token=token)
+    client = GitHubClient(session, token=token)
+    yield client
+    session.close()
 
 
 @pytest.mark.skipif(
@@ -54,16 +56,17 @@ async def test_real_github_get_pr(github_client):
     # Use GitHub's official test repository
     # First, we need to add it to our database
     from core.repos import AccessScope, OwnerType, RepoRegistry, RepoType
+    from api.models import Repo
 
-    registry = RepoRegistry(github_client.db)
+    registry = RepoRegistry(github_client._session)
 
     # Check if repo exists
-    existing = github_client.db.fetchone(
-        "SELECT repo_id FROM repos WHERE repo_url = %s", ("https://github.com/octocat/Hello-World",)
-    )
+    existing = github_client._session.query(Repo).filter(
+        Repo.repo_url == "https://github.com/octocat/Hello-World"
+    ).first()
 
     if existing:
-        repo_id = existing["repo_id"]
+        repo_id = existing.repo_id
     else:
         repo = registry.create(
             repo_url="https://github.com/octocat/Hello-World",
@@ -93,15 +96,16 @@ async def test_real_github_get_pr(github_client):
 async def test_real_github_list_prs(github_client):
     """Test listing real PRs from GitHub."""
     from core.repos import AccessScope, OwnerType, RepoRegistry, RepoType
+    from api.models import Repo
 
-    registry = RepoRegistry(github_client.db)
+    registry = RepoRegistry(github_client._session)
 
-    existing = github_client.db.fetchone(
-        "SELECT repo_id FROM repos WHERE repo_url = %s", ("https://github.com/octocat/Hello-World",)
-    )
+    existing = github_client._session.query(Repo).filter(
+        Repo.repo_url == "https://github.com/octocat/Hello-World"
+    ).first()
 
     if existing:
-        repo_id = existing["repo_id"]
+        repo_id = existing.repo_id
     else:
         repo = registry.create(
             repo_url="https://github.com/octocat/Hello-World",

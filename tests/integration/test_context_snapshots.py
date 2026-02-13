@@ -4,13 +4,15 @@ import pytest
 
 from core.context.manager import ContextManager, TaskType
 from core.events.event_logger import EventLogger
-from sdk import Database
 
 
 @pytest.fixture
 def db():
-    """Database fixture."""
-    return Database()
+    """Database session fixture."""
+    from api.database import get_db_session
+    session = next(get_db_session())
+    yield session
+    session.close()
 
 
 @pytest.fixture

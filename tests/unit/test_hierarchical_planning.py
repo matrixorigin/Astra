@@ -4,13 +4,8 @@ import pytest
 
 from core.agent.planner import Plan, PlanConstraints, Planner, PlanStep, PlanStatus
 from core.llm.client import LLMClient
-from sdk import Database
 
 
-@pytest.fixture
-def db():
-    """Database fixture."""
-    return Database()
 
 
 @pytest.fixture

@@ -9,20 +9,27 @@ from core.replay import ReplayEngine
 from core.skills import SkillRegistry
 from core.skills.builtin import SummarizePRSkill
 from core.skills.github_client import GitHubClient
-from sdk import Database
 
 
 @pytest.fixture
 def db():
-    """Database fixture with cleanup"""
-    db = Database()
+    """Database session fixture with cleanup"""
+    from api.database import get_db_session
+    from sqlalchemy import text
+    
+    session = next(get_db_session())
     # Cleanup before test
-    db.execute("DELETE FROM conversation_events WHERE session_id LIKE %s", ("test_session%",))
-    db.execute("DELETE FROM skills_registry WHERE skill_name = %s", ("summarize_pr",))
-    yield db
+    session.execute(text("DELETE FROM conversation_events WHERE session_id LIKE 'test_session%'"))
+    session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'summarize_pr'"))
+    session.commit()
+    
+    yield session
+    
     # Cleanup after test
-    db.execute("DELETE FROM conversation_events WHERE session_id LIKE %s", ("test_session%",))
-    db.execute("DELETE FROM skills_registry WHERE skill_name = %s", ("summarize_pr",))
+    session.execute(text("DELETE FROM conversation_events WHERE session_id LIKE 'test_session%'"))
+    session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'summarize_pr'"))
+    session.commit()
+    session.close()
 
 
 @pytest.fixture

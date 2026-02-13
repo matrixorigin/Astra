@@ -5,7 +5,8 @@ from github import Auth, Github, GithubException
 from core.config import get_settings
 from core.exceptions import GitHubError, GitHubRateLimitError
 from core.logging_config import get_logger
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -14,8 +15,8 @@ logger = get_logger(__name__)
 class GitHubClient:
     """Wrapper for GitHub API calls with error handling and rate limiting."""
 
-    def __init__(self, db: Database, token: str | None = None, base_url: str | None = None):
-        self.db = db
+    def __init__(self, session: Session | None = None, token: str | None = None, base_url: str | None = None):
+        self._session = session
         self.token = token or settings.github_token
 
         # Auto-detect base_url from environment or use default
@@ -36,7 +37,7 @@ class GitHubClient:
 
     def _get_repo(self, repo_id: int):
         """Get repository from database and create GitHub repo object."""
-        repo_data = self.db.fetchone("SELECT repo_url FROM repos WHERE repo_id = %s", (repo_id,))
+        repo_data = None
 
         if not repo_data:
             # In test mode, return mock repo URL

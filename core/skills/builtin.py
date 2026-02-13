@@ -14,7 +14,8 @@ from core.skills.base import (
     SkillRequirement,
 )
 from core.skills.github_client import GitHubClient
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +55,8 @@ class SummarizePRSkill(Skill):
         external_apis=["github", "llm"],
     )
 
-    def __init__(self, db: Database, llm: LLMClient, github: GitHubClient):
-        self.db = db
+    def __init__(self, llm: LLMClient, github: GitHubClient, session: Session | None = None):
+        self._session = session
         self.llm = llm
         self.github = github
 
@@ -136,8 +137,7 @@ class ListPRsSkill(Skill):
         external_apis=["github"],
     )
 
-    def __init__(self, db: Database, github: GitHubClient):
-        self.db = db
+    def __init__(self, github: GitHubClient, session: Session | None = None):
         self.github = github
 
     def validate_input(self, input_data: dict) -> ListPRsInput:
@@ -195,8 +195,7 @@ class CIStatusSkill(Skill):
         external_apis=["github"],
     )
 
-    def __init__(self, db: Database, github: GitHubClient):
-        self.db = db
+    def __init__(self, github: GitHubClient, session: Session | None = None):
         self.github = github
 
     def validate_input(self, input_data: dict) -> CIStatusInput:
@@ -228,7 +227,7 @@ def register_builtin_skills(
 
     Args:
         registry: SkillRegistry instance
-        db: Database instance
+        session: Session | None = None instance
         llm: Optional LLMClient instance
         github: Optional GitHubClient instance
         agent_registry: Optional AgentRegistry for multi-agent delegation

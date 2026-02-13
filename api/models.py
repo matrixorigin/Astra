@@ -47,13 +47,17 @@ class Session(Base):
     __tablename__ = "sessions"
     session_id = Column(String(36), primary_key=True)
     user_id = Column(String(36), nullable=False, index=True)
-    agent_id = Column(String(36), nullable=True, index=True)  # 新增：关联的Agent
-    title = Column(String(255), nullable=True)  # 新增：会话标题
+    agent_id = Column(String(36), nullable=True, index=True)
+    title = Column(String(255), nullable=True)
     status = Column(String(20), default="active", nullable=False, index=True)
     event_count = Column(Integer, default=0, nullable=False)
+    last_event_id = Column(String(36), nullable=True)
+    summary_status = Column(String(20), nullable=True)
+    summary_job_id = Column(String(36), nullable=True)
+    vector_db_snapshot_id = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())  # 新增：更新时间
-    ended_at = Column(DateTime, nullable=True)  # 新增：结束时间
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    ended_at = Column(DateTime, nullable=True)
     last_active_at = Column(DateTime, default=func.now(), nullable=False)
     session_metadata = Column("metadata", JSON)
 
@@ -101,8 +105,7 @@ class SkillRegistry(Base):
     skill_id = Column(String(64), primary_key=True)
     skill_name = Column(String(255), nullable=False)
     version = Column(String(32), nullable=False)
-    skill_version = Column(String(32), nullable=False)
-    skill_definition = Column(JSON)
+    skill_definition = Column("requirements", JSON)  # Map to 'requirements' column
     git_commit_hash = Column(String(64), index=True)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     is_active = Column(TINYINT(1), server_default="1")
@@ -181,3 +184,38 @@ class AuditLog(Base):
     timestamp = Column(DateTime, default=func.now(), nullable=False)
     ip_address = Column(String(45))
     user_agent = Column(Text)
+
+
+class SkillSelectionEvent(Base):
+    __tablename__ = "skill_selection_events"
+    event_id = Column(String(36), primary_key=True)
+    session_id = Column(String(36), nullable=False, index=True)
+    user_query = Column(Text, nullable=False)
+    context_snapshot = Column(String(100), nullable=False)
+    available_skills = Column(JSON, nullable=False)
+    selected_skills = Column(JSON, nullable=False)
+    selection_method = Column(String(50), nullable=False)
+    selection_reasoning = Column(Text)
+    candidate_scores = Column(JSON)
+    execution_result = Column(JSON)
+    execution_success = Column(TINYINT(1))
+    execution_time_ms = Column(Integer)
+    execution_cost = Column(JSON)
+    user_feedback_score = Column(Integer)
+    selection_correctness = Column(TINYINT(1))
+    correction_suggestion = Column(JSON)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+
+
+class SkillSelectionLearning(Base):
+    __tablename__ = "skill_selection_learnings"
+    learning_id = Column(String(36), primary_key=True)
+    query_pattern = Column(String(255), nullable=False, index=True)
+    wrong_skills = Column(JSON, nullable=False)
+    correct_skills = Column(JSON, nullable=False)
+    improvement_score = Column(Integer)
+    evidence_count = Column(Integer, default=1)
+    confidence = Column(Integer)
+    learned_at = Column(DateTime, default=func.now())
+    applied_count = Column(Integer, default=0)
+    last_applied_at = Column(DateTime)

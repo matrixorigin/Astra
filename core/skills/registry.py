@@ -6,9 +6,12 @@ import json
 from datetime import datetime
 from functools import lru_cache
 
+from sqlalchemy.orm import Session
+
+from api.database import get_db_session
+from api.models import SkillRegistry as SkillModel
 from core.exceptions import DatabaseError, SkillNotFoundError
 from core.logging_config import get_logger
-from sdk import Database
 
 from .base import Skill
 
@@ -18,10 +21,22 @@ logger = get_logger(__name__)
 class SkillRegistry:
     """Manage skill metadata and lifecycle with versioning"""
 
-    def __init__(self, db: Database):
-        self.db = db
+    def __init__(self, session: Session | None = None):
+        self._session = session
+        self._owns_session = session is None
         self._skills: dict[str, Skill] = {}  # skill_name@version -> Skill
         self._cache_size = 100  # LRU cache size
+
+    def _get_session(self) -> Session:
+        """Get or create session."""
+        if self._session is None:
+            self._session = next(get_db_session())
+        return self._session
+
+    def __del__(self):
+        """Close session if we own it."""
+        if self._owns_session and self._session:
+            self._session.close()
 
     def register(
         self,
@@ -51,61 +66,40 @@ class SkillRegistry:
         logger.info(f"Registering skill: {skill.name}@{skill.version}")
 
         try:
+            session = self._get_session()
+            
             # 1. Deactivate old versions if this is active
             if is_active:
-                self.db.execute(
-                    """
-                    UPDATE skills_registry
-                    SET is_active = 0
-                    WHERE skill_name = %s
-                """,
-                    (skill.name,),
-                )
+                session.query(SkillModel).filter(
+                    SkillModel.skill_name == skill.name
+                ).update({"is_active": 0})
 
             # 2. Compute code hash
             code_hash = self._compute_code_hash(skill)
 
-            # 3. Insert new version with metadata
-            self.db.execute(
-                """
-                INSERT INTO skills_registry
-                (skill_id, skill_name, version, description, requirements,
-                 code_hash, git_commit_hash, is_active, status, category, subcategory,
-                 triggers, dependencies, priority, cost_estimate, side_effect_category)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    description = VALUES(description),
-                    requirements = VALUES(requirements),
-                    code_hash = VALUES(code_hash),
-                    git_commit_hash = VALUES(git_commit_hash),
-                    is_active = VALUES(is_active),
-                    category = VALUES(category),
-                    subcategory = VALUES(subcategory),
-                    triggers = VALUES(triggers),
-                    dependencies = VALUES(dependencies),
-                    priority = VALUES(priority),
-                    cost_estimate = VALUES(cost_estimate),
-                    side_effect_category = VALUES(side_effect_category),
-                    updated_at = CURRENT_TIMESTAMP
-            """,
-                (
-                    f"{skill.name}@{skill.version}",
-                    skill.name,
-                    skill.version,
-                    skill.description,
-                    json.dumps(skill.requirements.model_dump()),
-                    code_hash,
-                    git_commit_hash,
-                    1 if is_active else 0,
-                    category,
-                    subcategory,
-                    json.dumps(triggers or []),
-                    json.dumps(dependencies or []),
-                    priority,
-                    cost_estimate,
-                    skill.side_effect_profile.category.value,
-                ),
-            )
+            # 3. Check if skill already exists
+            skill_id = f"{skill.name}@{skill.version}"
+            existing = session.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
+            
+            if existing:
+                # Update existing
+                existing.description = skill.description
+                existing.skill_definition = skill.requirements.model_dump()
+                existing.git_commit_hash = git_commit_hash
+                existing.is_active = 1 if is_active else 0
+            else:
+                # Insert new
+                skill_model = SkillModel(
+                    skill_id=skill_id,
+                    skill_name=skill.name,
+                    version=skill.version,
+                    skill_definition=skill.requirements.model_dump(),
+                    git_commit_hash=git_commit_hash,
+                    is_active=1 if is_active else 0,
+                )
+                session.add(skill_model)
+            
+            session.commit()
 
             # 4. Store in memory
             key = f"{skill.name}@{skill.version}"
@@ -180,50 +174,43 @@ class SkillRegistry:
             Skill metadata dict or None
         """
         try:
+            session = self._get_session()
+            
             if commit:
-                # Query by commit hash (MatrixOne AS OF COMMIT)
-                row = self.db.fetchone(
-                    """
-                    SELECT * FROM skills_registry
-                    WHERE skill_name = %s AND git_commit_hash = %s
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (skill_name, commit),
-                )
+                # Query by commit hash
+                skill = session.query(SkillModel).filter(
+                    SkillModel.skill_name == skill_name,
+                    SkillModel.git_commit_hash == commit
+                ).order_by(SkillModel.created_at.desc()).first()
             elif timestamp:
-                # Query by timestamp (MatrixOne AS OF TIMESTAMP)
-                # Convert ISO format to MySQL datetime format
+                # Query by timestamp
                 try:
                     from datetime import datetime
                     dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                    mysql_timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
                 except Exception:
-                    # If parsing fails, use timestamp as-is
-                    mysql_timestamp = timestamp
-
-                row = self.db.fetchone(
-                    """
-                    SELECT * FROM skills_registry
-                    WHERE skill_name = %s AND created_at <= %s
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (skill_name, mysql_timestamp),
-                )
+                    dt = datetime.fromisoformat(timestamp)
+                
+                skill = session.query(SkillModel).filter(
+                    SkillModel.skill_name == skill_name,
+                    SkillModel.created_at <= dt
+                ).order_by(SkillModel.created_at.desc()).first()
             else:
                 # Current active version
-                row = self.db.fetchone(
-                    """
-                    SELECT * FROM skills_registry
-                    WHERE skill_name = %s AND is_active = 1
-                    LIMIT 1
-                    """,
-                    (skill_name,),
-                )
+                skill = session.query(SkillModel).filter(
+                    SkillModel.skill_name == skill_name,
+                    SkillModel.is_active == 1
+                ).first()
 
-            if row:
-                return dict(row)
+            if skill:
+                return {
+                    "skill_id": skill.skill_id,
+                    "skill_name": skill.skill_name,
+                    "version": skill.version,
+                    "skill_definition": skill.skill_definition,
+                    "git_commit_hash": skill.git_commit_hash,
+                    "is_active": skill.is_active,
+                    "created_at": skill.created_at,
+                }
             return None
 
         except Exception as e:
@@ -235,13 +222,9 @@ class SkillRegistry:
         logger.debug(f"Listing available skills for repo {repo_id}")
 
         # Query repo type and access scope
-        repo = self.db.fetchone(
-            """
-            SELECT repo_type, access_scope
-            FROM repos WHERE repo_id = %s
-        """,
-            (repo_id,),
-        )
+        from api.models import Repo
+        session = self._get_session()
+        repo = session.query(Repo).filter(Repo.repo_id == str(repo_id)).first()
 
         if not repo:
             logger.warning(f"Repo not found: {repo_id}")
@@ -253,9 +236,9 @@ class SkillRegistry:
             if "@" in key:  # Skip versioned keys, only check active
                 continue
 
-            if repo["repo_type"] in [
+            if repo.repo_type in [
                 rt.value for rt in skill.requirements.repo_types
-            ] and self._has_access(repo["access_scope"], skill.requirements.min_access.value):
+            ] and self._has_access(repo.access_scope, skill.requirements.min_access.value):
                 available.append(skill)
 
         logger.debug(f"Found {len(available)} available skills for repo {repo_id}")

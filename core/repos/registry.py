@@ -30,28 +30,31 @@ class RepoRegistry:
         repo_id = str(uuid7())
         now = datetime.now(timezone.utc)
 
-        query = """
+        from sqlalchemy import text
+        query = text("""
             INSERT INTO repos (
                 repo_id, repo_url, repo_type, owner_id, owner_type,
                 repo_group, token_id, access_scope, metadata, created_at, updated_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
+            ) VALUES (:repo_id, :repo_url, :repo_type, :owner_id, :owner_type, 
+                      :repo_group, :token_id, :access_scope, :metadata, :created_at, :updated_at)
+        """)
         self.db.execute(
             query,
-            (
-                repo_id,
-                repo_url,
-                repo_type.value,
-                owner_id,
-                owner_type.value,
-                repo_group,
-                token_id,
-                access_scope.value,
-                json.dumps(metadata or {}),
-                now,
-                now,
-            ),
+            {
+                "repo_id": repo_id,
+                "repo_url": repo_url,
+                "repo_type": repo_type.value,
+                "owner_id": owner_id,
+                "owner_type": owner_type.value,
+                "repo_group": repo_group,
+                "token_id": token_id,
+                "access_scope": access_scope.value,
+                "metadata": json.dumps(metadata or {}),
+                "created_at": now,
+                "updated_at": now,
+            },
         )
+        self.db.commit()
 
         return Repo(
             repo_id=repo_id,
@@ -115,35 +118,43 @@ class RepoRegistry:
 
     def update_token(self, repo_id: str, token_id: str) -> None:
         """Update repository token."""
-        query = """
+        from sqlalchemy import text
+        query = text("""
             UPDATE repos
-            SET token_id = %s, updated_at = %s
-            WHERE repo_id = %s
-        """
-        self.db.execute(query, (token_id, datetime.now(timezone.utc), repo_id))
+            SET token_id = :token_id, updated_at = :updated_at
+            WHERE repo_id = :repo_id
+        """)
+        self.db.execute(query, {"token_id": token_id, "updated_at": datetime.now(timezone.utc), "repo_id": repo_id})
+        self.db.commit()
 
     def update_metadata(self, repo_id: str, metadata: dict) -> None:
         """Update repository metadata."""
-        query = """
+        from sqlalchemy import text
+        query = text("""
             UPDATE repos
-            SET metadata = %s, updated_at = %s
-            WHERE repo_id = %s
-        """
-        self.db.execute(query, (json.dumps(metadata), datetime.now(timezone.utc), repo_id))
+            SET metadata = :metadata, updated_at = :updated_at
+            WHERE repo_id = :repo_id
+        """)
+        self.db.execute(query, {"metadata": json.dumps(metadata), "updated_at": datetime.now(timezone.utc), "repo_id": repo_id})
+        self.db.commit()
 
     def deactivate(self, repo_id: str) -> None:
         """Deactivate repository."""
-        query = """
+        from sqlalchemy import text
+        query = text("""
             UPDATE repos
-            SET is_active = FALSE, updated_at = %s
-            WHERE repo_id = %s
-        """
-        self.db.execute(query, (datetime.now(timezone.utc), repo_id))
+            SET is_active = FALSE, updated_at = :updated_at
+            WHERE repo_id = :repo_id
+        """)
+        self.db.execute(query, {"updated_at": datetime.now(timezone.utc), "repo_id": repo_id})
+        self.db.commit()
 
     def delete(self, repo_id: str) -> None:
         """Delete repository."""
-        query = "DELETE FROM repos WHERE repo_id = %s"
-        self.db.execute(query, (repo_id,))
+        from sqlalchemy import text
+        query = text("DELETE FROM repos WHERE repo_id = :repo_id")
+        self.db.execute(query, {"repo_id": repo_id})
+        self.db.commit()
 
     def _to_model(self, row: dict) -> Repo:
         """Convert database row to Repo model."""

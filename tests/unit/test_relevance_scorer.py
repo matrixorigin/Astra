@@ -1,7 +1,9 @@
 """Test configurable relevance scorer."""
 
 import pytest
+from sqlalchemy.orm import Session
 
+from api.database import get_db_session
 from core.context.manager import TaskType
 from core.context.scorer import (
     TASK_WEIGHTS,
@@ -10,13 +12,14 @@ from core.context.scorer import (
     create_scorer_for_task,
 )
 from core.events.event_logger import EventLogger
-from sdk import Database
 
 
 @pytest.fixture
 def db():
-    """Database fixture."""
-    return Database()
+    """Database session fixture."""
+    session = next(get_db_session())
+    yield session
+    session.close()
 
 
 @pytest.fixture
@@ -70,6 +73,7 @@ def test_scorer_with_custom_weights(db):
 
 def test_score_candidates_basic(db, event_logger):
     """Test basic candidate scoring."""
+    from api.models import Event as EventModel
     from core.context.embeddings import EmbeddingService
 
     session_id = "test_session_scorer_001"
@@ -94,19 +98,21 @@ def test_score_candidates_basic(db, event_logger):
         user_id=user_id, session_id=session_id, content="Second query about JavaScript"
     )
 
-    # Get candidates
-    candidates = db.fetchall(
-        """
-        SELECT event_id, event_type, content, created_at,
-               parent_event_id, causal_chain_id, metadata
-        FROM conversation_events
-        WHERE session_id = %s
-        ORDER BY created_at DESC
-        """,
-        (session_id,),
-    )
-
-    candidates = [dict(c) for c in candidates]
+    # Get candidates using SQLAlchemy
+    events = db.query(EventModel).filter(EventModel.session_id == session_id).order_by(EventModel.created_at.desc()).all()
+    
+    candidates = [
+        {
+            "event_id": e.event_id,
+            "event_type": e.event_type,
+            "content": e.content,
+            "created_at": e.created_at,
+            "parent_event_id": e.parent_event_id,
+            "causal_chain_id": e.causal_chain_id,
+            "metadata": e.event_metadata,
+        }
+        for e in events
+    ]
 
     # Score candidates
     embeddings = EmbeddingService(db, provider="mock")
@@ -129,6 +135,7 @@ def test_score_candidates_basic(db, event_logger):
 
 def test_task_specific_scoring(db, event_logger):
     """Test that different task types produce different scores."""
+    from api.models import Event as EventModel
     from core.context.embeddings import EmbeddingService
 
     session_id = "test_session_scorer_002"
@@ -139,17 +146,21 @@ def test_task_specific_scoring(db, event_logger):
         user_id=user_id, session_id=session_id, content="Code review query"
     )
 
-    candidates = db.fetchall(
-        """
-        SELECT event_id, event_type, content, created_at,
-               parent_event_id, causal_chain_id, metadata
-        FROM conversation_events
-        WHERE session_id = %s
-        """,
-        (session_id,),
-    )
-
-    candidates = [dict(c) for c in candidates]
+    # Get candidates using SQLAlchemy
+    events = db.query(EventModel).filter(EventModel.session_id == session_id).all()
+    
+    candidates = [
+        {
+            "event_id": e.event_id,
+            "event_type": e.event_type,
+            "content": e.content,
+            "created_at": e.created_at,
+            "parent_event_id": e.parent_event_id,
+            "causal_chain_id": e.causal_chain_id,
+            "metadata": e.event_metadata,
+        }
+        for e in events
+    ]
 
     embeddings = EmbeddingService(db, provider="mock")
     scorer = RelevanceScorer(db, embeddings)
@@ -186,6 +197,7 @@ def test_create_scorer_for_task(db):
 
 def test_scorer_empty_query(db, event_logger):
     """Test scorer with empty query."""
+    from api.models import Event as EventModel
     from core.context.embeddings import EmbeddingService
 
     session_id = "test_session_scorer_004"
@@ -195,12 +207,20 @@ def test_scorer_empty_query(db, event_logger):
         user_id=user_id, session_id=session_id, content="Test content"
     )
 
-    candidates = db.fetchall(
-        "SELECT event_id, event_type, content, created_at, parent_event_id, causal_chain_id, metadata "
-        "FROM conversation_events WHERE session_id = %s",
-        (session_id,),
-    )
-    candidates = [dict(c) for c in candidates]
+    # Get candidates using SQLAlchemy
+    events = db.query(EventModel).filter(EventModel.session_id == session_id).all()
+    candidates = [
+        {
+            "event_id": e.event_id,
+            "event_type": e.event_type,
+            "content": e.content,
+            "created_at": e.created_at,
+            "parent_event_id": e.parent_event_id,
+            "causal_chain_id": e.causal_chain_id,
+            "metadata": e.event_metadata,
+        }
+        for e in events
+    ]
 
     embeddings = EmbeddingService(db, provider="mock")
     scorer = RelevanceScorer(db, embeddings)
@@ -227,6 +247,7 @@ def test_scorer_empty_candidates(db):
 
 def test_scorer_empty_session_id(db, event_logger):
     """Test scorer with empty session_id."""
+    from api.models import Event as EventModel
     from core.context.embeddings import EmbeddingService
 
     session_id = "test_session_scorer_005"
@@ -236,12 +257,20 @@ def test_scorer_empty_session_id(db, event_logger):
         user_id=user_id, session_id=session_id, content="Test content"
     )
 
-    candidates = db.fetchall(
-        "SELECT event_id, event_type, content, created_at, parent_event_id, causal_chain_id, metadata "
-        "FROM conversation_events WHERE session_id = %s",
-        (session_id,),
-    )
-    candidates = [dict(c) for c in candidates]
+    # Get candidates using SQLAlchemy
+    events = db.query(EventModel).filter(EventModel.session_id == session_id).all()
+    candidates = [
+        {
+            "event_id": e.event_id,
+            "event_type": e.event_type,
+            "content": e.content,
+            "created_at": e.created_at,
+            "parent_event_id": e.parent_event_id,
+            "causal_chain_id": e.causal_chain_id,
+            "metadata": e.event_metadata,
+        }
+        for e in events
+    ]
 
     embeddings = EmbeddingService(db, provider="mock")
     scorer = RelevanceScorer(db, embeddings)
@@ -255,6 +284,7 @@ def test_scorer_empty_session_id(db, event_logger):
 
 def test_signal_breakdown(db, event_logger):
     """Test that signal breakdown is returned correctly."""
+    from api.models import Event as EventModel
     from core.context.embeddings import EmbeddingService
 
     session_id = "test_session_scorer_003"
@@ -265,17 +295,20 @@ def test_signal_breakdown(db, event_logger):
         user_id=user_id, session_id=session_id, content="Test query with keyword"
     )
 
-    candidates = db.fetchall(
-        """
-        SELECT event_id, event_type, content, created_at,
-               parent_event_id, causal_chain_id, metadata
-        FROM conversation_events
-        WHERE session_id = %s
-        """,
-        (session_id,),
-    )
-
-    candidates = [dict(c) for c in candidates]
+    # Get candidates using SQLAlchemy
+    events = db.query(EventModel).filter(EventModel.session_id == session_id).all()
+    candidates = [
+        {
+            "event_id": e.event_id,
+            "event_type": e.event_type,
+            "content": e.content,
+            "created_at": e.created_at,
+            "parent_event_id": e.parent_event_id,
+            "causal_chain_id": e.causal_chain_id,
+            "metadata": e.event_metadata,
+        }
+        for e in events
+    ]
 
     embeddings = EmbeddingService(db, provider="mock")
     scorer = RelevanceScorer(db, embeddings)

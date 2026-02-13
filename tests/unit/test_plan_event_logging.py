@@ -10,16 +10,17 @@ from core.events.event_logger import EventLogger
 
 @pytest.fixture
 def mock_db():
-    """Mock database."""
-    db = MagicMock()
-    db.fetchone.return_value = None
-    db.fetchall.return_value = []
-    return db
+    """Mock database session."""
+    session = MagicMock()
+    session.add = MagicMock()
+    session.commit = MagicMock()
+    session.query = MagicMock()
+    return session
 
 
 @pytest.fixture
 def event_logger(mock_db):
-    """EventLogger with mocked database."""
+    """EventLogger with mocked database session."""
     return EventLogger(mock_db)
 
 
@@ -59,7 +60,8 @@ class TestPlanEventLogging:
         assert event.event_type == "plan_created"
         assert event.metadata["plan_id"] == "plan_001"
         assert event.metadata["goal"] == "Test goal"
-        mock_db.execute.assert_called_once()
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
 
     def test_create_plan_event_with_revision(self, event_logger, mock_db):
         """Test creating a plan revision event."""
@@ -111,7 +113,8 @@ class TestPlannerEventLogging:
         )
 
         assert event_id is not None
-        mock_db.execute.assert_called_once()
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
 
     def test_log_step_done(self, planner, mock_db):
         """Test logging step completion event."""
@@ -131,7 +134,8 @@ class TestPlannerEventLogging:
         )
 
         assert event_id is not None
-        mock_db.execute.assert_called_once()
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
 
     def test_log_plan_completed(self, planner, mock_db):
         """Test logging plan completion event."""
@@ -152,7 +156,8 @@ class TestPlannerEventLogging:
         )
 
         assert event_id is not None
-        mock_db.execute.assert_called_once()
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
 
     def test_log_plan_failed(self, planner, mock_db):
         """Test logging plan failure event."""
@@ -173,7 +178,8 @@ class TestPlannerEventLogging:
         )
 
         assert event_id is not None
-        mock_db.execute.assert_called_once()
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
 
     def test_log_plan_revised(self, planner, mock_db):
         """Test logging plan revision event."""
@@ -191,7 +197,8 @@ class TestPlannerEventLogging:
         )
 
         assert event_id is not None
-        mock_db.execute.assert_called_once()
+        mock_db.add.assert_called_once()
+        mock_db.commit.assert_called_once()
 
     def test_log_without_event_logger(self, mock_llm):
         """Test logging methods return None when no event logger."""
@@ -324,8 +331,9 @@ class TestCreatePlanWithEventLogging:
         )
 
         assert plan.plan_id == "plan_001"
-        # Should have called db.execute for event logging
-        assert mock_db.execute.called
+        # Should have called db.add and db.commit for event logging
+        assert mock_db.add.called
+        assert mock_db.commit.called
 
     @pytest.mark.asyncio
     async def test_create_plan_fallback_logs_event(self, planner, mock_llm, mock_db):
@@ -343,7 +351,8 @@ class TestCreatePlanWithEventLogging:
 
         assert plan.plan_id == "plan_001"  # Fallback plan
         # Should have logged event with fallback metadata
-        assert mock_db.execute.called
+        assert mock_db.add.called
+        assert mock_db.commit.called
 
     @pytest.mark.asyncio
     async def test_create_plan_without_user_session(self, planner, mock_llm, mock_db):
@@ -356,4 +365,4 @@ class TestCreatePlanWithEventLogging:
 
         assert plan.plan_id == "plan_001"
         # Should not have logged event (no user_id/session_id)
-        assert not mock_db.execute.called
+        assert not mock_db.add.called

@@ -11,8 +11,10 @@ import logging
 from enum import Enum
 from typing import Any, Protocol
 
+from sqlalchemy.orm import Session
+
+from api.database import get_db_session
 from core.skills.base import SideEffectCategory, Skill
-from sdk import Database
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +57,22 @@ class ToolMockingLayer:
     def __init__(
         self,
         mode: MockMode,
-        db: Database,
+        session: Session | None = None,
         result_storage: ResultStorage | None = None,
     ):
         self.mode = mode
-        self.db = db
-        self.result_storage = result_storage  # Optional: for large results
+        self._session = session
+        self._owns_session = session is None
+        self.result_storage = result_storage
+
+    def _get_session(self) -> Session:
+        if self._session is None:
+            self._session = next(get_db_session())
+        return self._session
+
+    def __del__(self):
+        if self._owns_session and self._session:
+            self._session.close()
 
     def execute(
         self,
@@ -139,43 +151,32 @@ class ToolMockingLayer:
             Recorded result or None if not found
         """
         try:
+            from api.models import Event as EventModel
+            
             # Compute params hash for matching
             params_hash = self._hash_params(params)
+            session = self._get_session()
 
             if parent_event_id:
                 # Exact lookup by event ID (concurrency-safe)
-                query = """
-                    SELECT metadata
-                    FROM conversation_events
-                    WHERE event_id = %s
-                    AND skill_name = %s
-                """
-                row = self.db.fetchone(query, (parent_event_id, skill_name))
+                event = session.query(EventModel).filter(
+                    EventModel.event_id == parent_event_id,
+                    EventModel.skill_name == skill_name
+                ).first()
             else:
                 # Fuzzy lookup: most recent matching event in session
-                # ⚠️  WARNING: Not concurrency-safe! Multiple concurrent writes may cause
-                # ORDER BY created_at DESC to return wrong result. Always prefer parent_event_id.
                 logger.warning(
                     f"Using fuzzy lookup for {skill_name} without parent_event_id. "
                     f"This is not concurrency-safe. Consider providing parent_event_id."
                 )
-                query = """
-                    SELECT metadata
-                    FROM conversation_events
-                    WHERE session_id = %s
-                    AND skill_name = %s
-                    AND event_type = 'tool_result'
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """
-                row = self.db.fetchone(query, (session_id, skill_name))
+                event = session.query(EventModel).filter(
+                    EventModel.session_id == session_id,
+                    EventModel.skill_name == skill_name,
+                    EventModel.event_type == 'tool_result'
+                ).order_by(EventModel.created_at.desc()).first()
 
-            if row and row["metadata"]:
-                metadata = (
-                    json.loads(row["metadata"])
-                    if isinstance(row["metadata"], str)
-                    else row["metadata"]
-                )
+            if event and event.event_metadata:
+                metadata = event.event_metadata
 
                 # Verify params match (optional, for safety)
                 recorded_hash = metadata.get("skill_params_hash")
@@ -255,16 +256,18 @@ class ToolMockingLayer:
                 return
 
             # Update most recent tool_result event for this skill
-            query = """
-                UPDATE conversation_events
-                SET metadata = %s
-                WHERE session_id = %s
-                AND skill_name = %s
-                AND event_type = 'tool_result'
-                ORDER BY created_at DESC
-                LIMIT 1
-            """
-            self.db.execute(query, (metadata_json, session_id, skill_name))
+            from api.models import Event as EventModel
+            
+            session = self._get_session()
+            event = session.query(EventModel).filter(
+                EventModel.session_id == session_id,
+                EventModel.skill_name == skill_name,
+                EventModel.event_type == 'tool_result'
+            ).order_by(EventModel.created_at.desc()).first()
+            
+            if event:
+                event.event_metadata = metadata
+                session.commit()
 
             logger.debug(f"Recorded result for {skill_name} in session {session_id}")
 

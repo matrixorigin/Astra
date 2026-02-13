@@ -5,10 +5,12 @@ Handles event creation and persistence to the database.
 
 import json
 
+from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
+from api.database import get_db_session
+from api.models import Event as EventModel
 from core.events.models import ConversationEvent, EventType
-from sdk.database import Database
 
 
 class EventLogger:
@@ -17,13 +19,25 @@ class EventLogger:
     Provides methods to create and persist events following the event-centric design.
     """
 
-    def __init__(self, db: Database | None = None) -> None:
+    def __init__(self, session: Session | None = None) -> None:
         """Initialize event logger.
 
         Args:
-            db: Database instance. If None, creates a new one.
+            session: SQLAlchemy session. If None, creates a new one.
         """
-        self.db = db or Database()
+        self._session = session
+        self._owns_session = session is None
+
+    def _get_session(self) -> Session:
+        """Get or create session."""
+        if self._session is None:
+            self._session = next(get_db_session())
+        return self._session
+
+    def __del__(self):
+        """Close session if we own it."""
+        if self._owns_session and self._session:
+            self._session.close()
 
     def log_event(self, event: ConversationEvent) -> str:
         """Log a conversation event to the database.
@@ -37,46 +51,35 @@ class EventLogger:
         Raises:
             Exception: If database operation fails
         """
-        query = """
-            INSERT INTO conversation_events (
-                event_id, user_id, session_id, agent_id, agent_version,
-                event_type, content, desensitized_content, metadata,
-                context_snapshot, token_usage, embedding_ref, created_at,
-                prompt_template_id, skills_snapshot, quality_score,
-                is_flagged, training_eligible, parent_event_id,
-                causal_chain_id, llm_model_used, llm_params
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s
-            )
-        """
-
-        params = (
-            event.event_id,
-            event.user_id,
-            event.session_id,
-            event.agent_id,
-            event.agent_version,
-            event.event_type,
-            event.content,
-            event.desensitized_content,
-            json.dumps(event.metadata) if event.metadata else None,
-            (event.context_snapshot.model_dump_json() if event.context_snapshot else None),
-            event.token_usage.model_dump_json() if event.token_usage else None,
-            event.embedding_ref,
-            event.created_at,
-            event.prompt_template_id,
-            json.dumps(event.skills_snapshot) if event.skills_snapshot else None,
-            event.quality_score,
-            event.is_flagged,
-            event.training_eligible,
-            event.parent_event_id,
-            event.causal_chain_id,
-            event.llm_model_used,
-            json.dumps(event.llm_params) if event.llm_params else None,
+        session = self._get_session()
+        
+        db_event = EventModel(
+            event_id=event.event_id,
+            user_id=event.user_id,
+            session_id=event.session_id,
+            agent_id=event.agent_id,
+            agent_version=event.agent_version,
+            event_type=event.event_type,
+            content=event.content,
+            desensitized_content=event.desensitized_content,
+            event_metadata=event.metadata,
+            context_snapshot=event.context_snapshot.model_dump() if event.context_snapshot else None,
+            token_usage=event.token_usage.model_dump() if event.token_usage else None,
+            embedding_ref=event.embedding_ref,
+            created_at=event.created_at,
+            prompt_template_id=event.prompt_template_id,
+            skills_snapshot=event.skills_snapshot,
+            quality_score=event.quality_score,
+            is_flagged=event.is_flagged,
+            training_eligible=event.training_eligible,
+            parent_event_id=event.parent_event_id,
+            causal_chain_id=event.causal_chain_id,
+            llm_model_used=event.llm_model_used,
+            llm_params=event.llm_params,
         )
-
-        self.db.execute(query, params)
+        
+        session.add(db_event)
+        session.commit()
         return event.event_id
 
     def create_plan_event(

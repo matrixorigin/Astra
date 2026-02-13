@@ -4,7 +4,8 @@ from typing import Any
 
 from core.skills.base import AccessScope, RepoType, Skill, SkillInput, SkillOutput, SkillRequirement
 from core.skills.github_client import GitHubClient
-from sdk import Database
+from sqlalchemy.orm import Session
+from api.database import get_db_session
 
 # ============================================================================
 # Code Review Skill
@@ -30,7 +31,7 @@ class CodeReviewSkill(Skill):
     input_schema = CodeReviewInput
     output_schema = CodeReviewOutput
 
-    def __init__(self, db: Database, github: GitHubClient):
+    def __init__(self, github: GitHubClient, session: Session | None = None):
         self.db = db
         self.github = github
 
@@ -73,7 +74,7 @@ class SearchCodeSkill(Skill):
     input_schema = SearchCodeInput
     output_schema = SearchCodeOutput
 
-    def __init__(self, db: Database, github: GitHubClient):
+    def __init__(self, github: GitHubClient, session: Session | None = None):
         self.db = db
         self.github = github
 
@@ -106,7 +107,7 @@ class GenerateTestsSkill(Skill):
     input_schema = GenerateTestsInput
     output_schema = GenerateTestsOutput
 
-    def __init__(self, db: Database, github: GitHubClient):
+    def __init__(self, github: GitHubClient, session: Session | None = None):
         self.db = db
         self.github = github
 
@@ -138,7 +139,7 @@ class AnalyzeBugSkill(Skill):
     input_schema = AnalyzeBugInput
     output_schema = AnalyzeBugOutput
 
-    def __init__(self, db: Database, github: GitHubClient):
+    def __init__(self, github: GitHubClient, session: Session | None = None):
         self.db = db
         self.github = github
 

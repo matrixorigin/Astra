@@ -35,7 +35,6 @@ class Session(BaseModel):
 
     session_id: str = Field(description="Session identifier")
     user_id: str = Field(description="User identifier")
-    tenant_id: str | None = Field(default=None, description="Tenant identifier")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_active_at: datetime | None = Field(default=None, description="Last activity timestamp")

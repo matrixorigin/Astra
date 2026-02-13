@@ -3,9 +3,10 @@
 import json
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 from core.logging_config import get_logger
 from core.skills.selector import SkillMetadata, SkillSelector
-from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -13,10 +14,10 @@ logger = get_logger(__name__)
 class ModernSkillSelector:
     """Skill selector using native LLM function calling (OpenAI/Gemini/DeepSeek)."""
 
-    def __init__(self, db: Database, llm_client):
-        self.db = db
+    def __init__(self, session: Session | None = None, llm_client=None):
+        self._session = session
         self.llm = llm_client
-        self.rule_selector = SkillSelector(db)  # For retrieval
+        self.rule_selector = SkillSelector(session)  # For retrieval
 
     def get_tools_schema(
         self,
@@ -211,8 +212,8 @@ class ModelRouter:
     This implements "Mixture of Agents" pattern.
     """
 
-    def __init__(self, db: Database):
-        self.db = db
+    def __init__(self, session: Session | None = None):
+        self._session = session
         self.model_mapping = {
             # Code-related: Use DeepSeek Coder or Claude
             "code": {"model": "deepseek-coder", "style": "concise", "temperature": 0.2},
@@ -274,10 +275,10 @@ class AdaptiveSkillOrchestrator:
     This is the "千人千面" implementation.
     """
 
-    def __init__(self, db: Database, llm_client):
-        self.db = db
-        self.selector = ModernSkillSelector(db, llm_client)
-        self.router = ModelRouter(db)
+    def __init__(self, session: Session | None = None, llm_client=None):
+        self._session = session
+        self.selector = ModernSkillSelector(session, llm_client)
+        self.router = ModelRouter(session)
         self.llm = llm_client
 
     async def execute_query(

@@ -3,8 +3,11 @@
 from dataclasses import dataclass
 from typing import Any
 
+from sqlalchemy.orm import Session
+
+from api.database import get_db_session
+from api.models import SkillRegistry as SkillModel
 from core.logging_config import get_logger
-from sdk import Database
 
 logger = get_logger(__name__)
 
@@ -27,42 +30,40 @@ class SkillMetadata:
 class SkillSelector:
     """Rule-based skill selector with keyword matching."""
 
-    def __init__(self, db: Database):
-        self.db = db
+    def __init__(self, session: Session | None = None):
+        self._session = session
+        self._owns_session = session is None
         self._load_skills()
+
+    def _get_session(self) -> Session:
+        if self._session is None:
+            self._session = next(get_db_session())
+        return self._session
+
+    def __del__(self):
+        if self._owns_session and self._session:
+            self._session.close()
 
     def _load_skills(self):
         """Load skills with metadata from database."""
         self.skills = {}
+        
+        session = self._get_session()
+        skills_data = session.query(SkillModel).filter(SkillModel.is_active == 1).all()
 
-        # Load from database
-        rows = self.db.fetchall("""
-            SELECT skill_name, version, description, category, subcategory,
-                   triggers, dependencies, priority, cost_estimate, is_active
-            FROM skills_registry
-            WHERE is_active = 1
-        """)
-
-        for row in rows:
-            # Parse JSON fields
-            import json
-
-            triggers = json.loads(row["triggers"]) if row.get("triggers") else []
-            dependencies = json.loads(row["dependencies"]) if row.get("dependencies") else []
-
-            skill = SkillMetadata(
-                name=row["skill_name"],
-                version=row["version"],
-                description=row["description"],
-                category=row.get("category", "general"),
-                subcategory=row.get("subcategory", "default"),
-                triggers=triggers,
-                dependencies=dependencies,
-                priority=row.get("priority", 5),
-                cost_estimate=row.get("cost_estimate", "medium"),
+        for skill in skills_data:
+            metadata = SkillMetadata(
+                name=skill.skill_name,
+                version=skill.version,
+                description="",
+                category="general",
+                subcategory="default",
+                triggers=[],
+                dependencies=[],
+                priority=5,
+                cost_estimate="medium",
             )
-
-            self.skills[skill.name] = skill
+            self.skills[metadata.name] = metadata
 
         logger.info(f"Loaded {len(self.skills)} skills from database")
 
@@ -147,9 +148,9 @@ class SkillSelector:
 class SkillOrchestrator:
     """Orchestrate skill selection and execution."""
 
-    def __init__(self, db: Database):
-        self.db = db
-        self.selector = SkillSelector(db)
+    def __init__(self, session: Session | None = None):
+        self._session = session
+        self.selector = SkillSelector(session)
 
     def plan_execution(self, query: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
         """Plan skill execution for query.

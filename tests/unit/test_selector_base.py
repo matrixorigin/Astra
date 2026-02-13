@@ -4,49 +4,8 @@ import pytest
 from unittest.mock import Mock
 
 from core.skills.selector import SkillSelector, SkillMetadata, SkillOrchestrator
-from sdk import Database
 
 
-@pytest.fixture
-def db():
-    """Mock database."""
-    mock_db = Mock(spec=Database)
-    mock_db.fetchall.return_value = [
-        {
-            "skill_name": "skill_a",
-            "version": "1.0.0",
-            "description": "Skill A",
-            "category": "test",
-            "subcategory": "sub1",
-            "triggers": '["trigger_a"]',
-            "dependencies": '["skill_b"]',
-            "priority": 8,
-            "cost_estimate": "low",
-        },
-        {
-            "skill_name": "skill_b",
-            "version": "1.0.0",
-            "description": "Skill B",
-            "category": "test",
-            "subcategory": "sub1",
-            "triggers": '["trigger_b"]',
-            "dependencies": '[]',
-            "priority": 5,
-            "cost_estimate": "medium",
-        },
-        {
-            "skill_name": "skill_c",
-            "version": "1.0.0",
-            "description": "Skill C",
-            "category": "code",
-            "subcategory": "analysis",
-            "triggers": '["trigger_c"]',
-            "dependencies": '[]',
-            "priority": 6,
-            "cost_estimate": "high",
-        },
-    ]
-    return mock_db
 
 
 class TestSkillSelector:
@@ -56,8 +15,23 @@ class TestSkillSelector:
         """Test dependency resolution adds missing dependencies."""
         selector = SkillSelector(db)
         
-        # skill_a depends on skill_b
-        skill_a = selector.skills["skill_a"]
+        # Create mock skills with dependencies
+        from core.skills.selector import SkillMetadata
+        skill_b = SkillMetadata(
+            name="skill_b", version="1.0.0", description="Dependency",
+            category="test", subcategory="sub", triggers=[],
+            dependencies=[], priority=5, cost_estimate="low"
+        )
+        skill_a = SkillMetadata(
+            name="skill_a", version="1.0.0", description="Main skill",
+            category="test", subcategory="sub", triggers=[],
+            dependencies=["skill_b"], priority=5, cost_estimate="low"
+        )
+        
+        # Add to selector
+        selector.skills["skill_a"] = skill_a
+        selector.skills["skill_b"] = skill_b
+        
         skills = [skill_a]
         
         result = selector._resolve_dependencies(skills)
@@ -71,8 +45,23 @@ class TestSkillSelector:
         """Test dependency resolution doesn't add duplicates."""
         selector = SkillSelector(db)
         
-        skill_a = selector.skills["skill_a"]
-        skill_b = selector.skills["skill_b"]
+        # Create skills manually
+        from core.skills.selector import SkillMetadata
+        skill_b = SkillMetadata(
+            name="skill_b", version="1.0.0", description="Dependency",
+            category="test", subcategory="sub", triggers=[],
+            dependencies=[], priority=5, cost_estimate="low"
+        )
+        skill_a = SkillMetadata(
+            name="skill_a", version="1.0.0", description="Main skill",
+            category="test", subcategory="sub", triggers=[],
+            dependencies=["skill_b"], priority=5, cost_estimate="low"
+        )
+        
+        # Add to selector
+        selector.skills["skill_a"] = skill_a
+        selector.skills["skill_b"] = skill_b
+        
         skills = [skill_a, skill_b]
         
         result = selector._resolve_dependencies(skills)
@@ -109,11 +98,20 @@ class TestSkillSelector:
         """Test getting skill by name."""
         selector = SkillSelector(db)
         
-        skill = selector.get_skill_by_name("skill_a")
+        # Register test skill
+        from core.skills.selector import SkillMetadata
+        skill = SkillMetadata(
+            name="skill_a", version="1.0.0", description="Skill A",
+            category="test", subcategory="sub", triggers=[],
+            dependencies=[], priority=5, cost_estimate="low"
+        )
+        selector.skills["skill_a"] = skill
         
-        assert skill is not None
-        assert skill.name == "skill_a"
-        assert skill.description == "Skill A"
+        found_skill = selector.get_skill_by_name("skill_a")
+        
+        assert found_skill is not None
+        assert found_skill.name == "skill_a"
+        assert found_skill.description == "Skill A"
 
     def test_get_skill_by_name_not_found(self, db):
         """Test getting non-existent skill returns None."""
@@ -126,6 +124,16 @@ class TestSkillSelector:
     def test_list_skills_by_category(self, db):
         """Test listing skills by category."""
         selector = SkillSelector(db)
+        
+        # Register test skills
+        from core.skills.selector import SkillMetadata
+        skills = [
+            SkillMetadata(name="skill_a", version="1.0.0", description="A", category="test", subcategory="sub", triggers=[], dependencies=[], priority=5, cost_estimate="low"),
+            SkillMetadata(name="skill_b", version="1.0.0", description="B", category="test", subcategory="sub", triggers=[], dependencies=[], priority=5, cost_estimate="low"),
+            SkillMetadata(name="skill_c", version="1.0.0", description="C", category="code", subcategory="sub", triggers=[], dependencies=[], priority=5, cost_estimate="low")
+        ]
+        for skill in skills:
+            selector.skills[skill.name] = skill
         
         test_skills = selector.list_skills_by_category("test")
         
@@ -152,6 +160,15 @@ class TestSkillOrchestrator:
     def test_plan_execution_with_skills(self, db):
         """Test execution planning with selected skills."""
         orchestrator = SkillOrchestrator(db)
+        
+        # Register test skills with triggers
+        from core.skills.selector import SkillMetadata
+        skills = [
+            SkillMetadata(name="skill_a", version="1.0.0", description="A", category="test", subcategory="sub", triggers=["trigger_a"], dependencies=[], priority=5, cost_estimate="low"),
+            SkillMetadata(name="skill_b", version="1.0.0", description="B", category="test", subcategory="sub", triggers=["trigger_b"], dependencies=[], priority=5, cost_estimate="low")
+        ]
+        for skill in skills:
+            orchestrator.selector.skills[skill.name] = skill
         
         plan = orchestrator.plan_execution("trigger_a trigger_b")
         
