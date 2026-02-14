@@ -203,6 +203,86 @@ class TestSelfImprovingSelector:
         # Should prioritize code_review
         assert len(corrected) > 0
 
+    def test_apply_learnings_limits_matches(self, self_improving, db):
+        """Test applying only top matching learnings."""
+        from api.models import SkillSelectionLearning
+        db.query(SkillSelectionLearning).delete()
+        db.commit()
+
+        confidences = [0.9, 0.8, 0.7, 0.6]
+        for i, conf in enumerate(confidences):
+            learning = SkillSelectionLearning(
+                learning_id=f"learn-{i}-{uuid.uuid4().hex[:8]}",
+                query_pattern="review",
+                wrong_skills=["summarize_pr"],
+                correct_skills=["code_review"],
+                confidence=conf,
+                evidence_count=5,
+            )
+            db.add(learning)
+        db.commit()
+
+        candidates = [
+            SkillMetadata(
+                name="summarize_pr", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=6, cost_estimate="low"
+            ),
+            SkillMetadata(
+                name="code_review", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=8, cost_estimate="medium"
+            )
+        ]
+
+        self_improving.apply_learnings("review pr", candidates)
+
+        learnings = db.query(SkillSelectionLearning).order_by(
+            SkillSelectionLearning.confidence.desc()
+        ).all()
+        applied_counts = [learning.applied_count for learning in learnings]
+
+        assert applied_counts[0] == 1
+        assert applied_counts[1] == 1
+        assert applied_counts[2] == 1
+        assert applied_counts[3] == 0
+
+    def test_apply_learnings_returns_candidates_on_zero_scores(self, db, mock_llm):
+        """Test fallback when all scores are zero."""
+        from api.models import SkillSelectionLearning
+        from core.skills.learning_signals import SignalWeights
+        db.query(SkillSelectionLearning).delete()
+        db.commit()
+
+        si = SelfImprovingSelector(
+            db,
+            mock_llm,
+            weights=SignalWeights(accuracy=1.0, speed=0.0, cost=0.0, satisfaction=0.0),
+        )
+
+        learning = SkillSelectionLearning(
+            learning_id=f"learn-{uuid.uuid4().hex[:8]}",
+            query_pattern="review",
+            wrong_skills=["summarize_pr"],
+            correct_skills=[],
+            confidence=1.0,
+            evidence_count=5,
+        )
+        db.add(learning)
+        db.commit()
+
+        candidates = [
+            SkillMetadata(
+                name="summarize_pr", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=6, cost_estimate="low"
+            )
+        ]
+
+        corrected = si.apply_learnings("review", candidates)
+
+        assert corrected == candidates
+
     def test_get_learning_stats_with_data(self, self_improving, db):
         """Test stats with data."""
         # Clear and insert using ORM

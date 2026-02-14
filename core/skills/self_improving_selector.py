@@ -287,24 +287,94 @@ class SelfImprovingSelector:
 
     def apply_learnings(self, query: str, candidates: list) -> list:
         """Apply learned corrections to candidate selection with multi-dimensional scoring."""
-        
-        # Find matching learnings
-        learnings = self.session.query(LearningModel).filter(
-            LearningModel.confidence >= 50
-        ).all()
-        
-        for learning in learnings:
-            if learning.query_pattern.lower() in query.lower():
-                # Apply correction
-                learning.applied_count += 1
-                learning.last_applied_at = datetime.now(timezone.utc)
-                self.session.commit()
-                
-                # Filter out wrong skills, add correct ones
-                filtered = [c for c in candidates if c.name not in learning.wrong_skills]
-                return filtered
-        
-        return candidates
+        if not candidates:
+            return candidates
+
+        learnings = self.session.query(LearningModel).all()
+        matched = [
+            learning for learning in learnings
+            if learning.query_pattern and learning.query_pattern.lower() in query.lower()
+            and self._is_high_confidence(learning.confidence)
+        ]
+
+        if not matched:
+            return candidates
+
+        matched.sort(
+            key=lambda learning: (
+                self._normalize_confidence(learning.confidence),
+                learning.evidence_count or 0,
+                learning.applied_count or 0,
+            ),
+            reverse=True,
+        )
+        matched = matched[:3]
+
+        candidate_map = {}
+        candidate_scores = {}
+        for candidate in candidates:
+            name = candidate.name
+            candidate_map[name] = candidate
+            candidate_scores[name] = self._normalize_confidence(
+                getattr(candidate, "confidence", 1.0) or 1.0
+            )
+
+        from core.agent.selector import SkillCandidate
+
+        for learning in matched:
+            learning_confidence = self._normalize_confidence(learning.confidence)
+            weight = self._get_signal_weight(learning.signal_type)
+            delta = learning_confidence * weight
+
+            wrong_skills = learning.wrong_skills or []
+            correct_skills = learning.correct_skills or []
+
+            for skill in wrong_skills:
+                if skill in candidate_scores:
+                    candidate_scores[skill] = max(0.0, candidate_scores[skill] - delta)
+
+            for skill in correct_skills:
+                if skill not in candidate_scores:
+                    candidate_map[skill] = SkillCandidate(name=skill)
+                    candidate_scores[skill] = min(1.0, delta)
+                candidate_scores[skill] = min(1.0, candidate_scores[skill] + delta)
+
+            learning.applied_count += 1
+            learning.last_applied_at = datetime.now(timezone.utc)
+
+        self.session.commit()
+
+        scored = [
+            (name, score) for name, score in candidate_scores.items() if score > 0.0
+        ]
+        if not scored:
+            return candidates
+
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return [candidate_map[name] for name, _ in scored]
+
+    def _normalize_confidence(self, value: float | None) -> float:
+        if value is None:
+            return 0.0
+        if value <= 1.0:
+            return max(0.0, float(value))
+        return min(1.0, float(value) / 100.0)
+
+    def _is_high_confidence(self, value: float | None) -> bool:
+        if value is None:
+            return False
+        if value <= 1.0:
+            return value >= 0.5
+        return value >= 50.0
+
+    def _get_signal_weight(self, signal_type: str | None) -> float:
+        if signal_type == SignalType.SLOW_EXECUTION.value:
+            return self.weights.speed
+        if signal_type == SignalType.HIGH_COST.value:
+            return self.weights.cost
+        if signal_type == SignalType.LOW_SATISFACTION.value:
+            return self.weights.satisfaction
+        return self.weights.accuracy
     
     def calculate_multi_factor_score(self, event: dict) -> float:
         """Calculate weighted score across multiple dimensions.
