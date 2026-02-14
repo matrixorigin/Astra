@@ -736,9 +736,18 @@ class SelfImprovingSelector:
             "low_confidence": total - high_confidence,
             "avg_confidence": avg_confidence,
             "by_signal_type": signal_breakdown,
-            "weights": runtime_config["weights"].to_dict(),
-            "weights_per_signal": runtime_config["weights_per_signal"],
-            "decay": runtime_config["decay"],
+            "learnings": {
+                "weights": runtime_config["weights"].to_dict(),
+                "weights_per_signal": runtime_config["weights_per_signal"],
+                "decay": runtime_config["decay"],
+            },
+            "regression_gates": {
+                "total_gates": 0,
+                "passed": 0,
+                "failed": 0,
+                "pass_rate": 0.0,
+                "avg_improvement_pct": 0.0,
+            },
             "semantic_similarity_threshold": runtime_config["semantic_similarity_threshold"],
             "semantic_match_limit": runtime_config["semantic_match_limit"],
         }

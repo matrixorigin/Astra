@@ -603,11 +603,12 @@ class TestLearningStats:
         assert stats["by_signal_type"]["high_cost"] == 1
         assert stats["by_signal_type"]["low_satisfaction"] == 0
         
-        # Check weights included
-        assert "weights" in stats
-        assert stats["weights"]["accuracy"] == 0.4
-        assert "weights_per_signal" in stats
-        assert "decay" in stats
+        # Check weights included in learnings
+        assert "learnings" in stats
+        assert "weights" in stats["learnings"]
+        assert stats["learnings"]["weights"]["accuracy"] == 0.4
+        assert "weights_per_signal" in stats["learnings"]
+        assert "decay" in stats["learnings"]
 
 
 class TestSignalThresholds:

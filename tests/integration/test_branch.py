@@ -162,11 +162,12 @@ def test_diff_with_snapshot(branch, db_session):
     db_session.commit()
     git.create_snapshot(snap2)
 
-    # Diff between snapshots
-    diff = branch.diff(f"test_t0_{suffix}", f"test_t0_{suffix}", source_snapshot=snap1, target_snapshot=snap2)
+    # Diff between snapshots - target_snapshot has new data, source_snapshot is old
+    diff = branch.diff(f"test_t0_{suffix}", f"test_t0_{suffix}", target_snapshot=snap2, source_snapshot=snap1)
     assert len(diff) > 0
 
     # Cleanup
+    db_session.commit()
     git.drop_snapshot(snap1)
     git.drop_snapshot(snap2)
     db_session.commit()
