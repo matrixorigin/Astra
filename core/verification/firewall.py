@@ -1,27 +1,23 @@
 """Hallucination Firewall - Verify LLM responses against data snapshots.
 
-Prevents delivering incorrect information by verifying claims against
-the same data snapshot the LLM saw during generation.
+Enhanced version with:
+- LLM-based claim extraction (catches implicit assertions)
+- Structured verification against snapshot content
+- Evidence backlinks for traceability
 """
 
 import json
 from dataclasses import dataclass
 
 from core.logging_config import get_logger
-from core.verification.claim_extractor import Claim, ClaimExtractor
+from core.verification.claim_extractor import ClaimExtractor
+from core.verification.llm_claim_extractor import LLMClaimExtractor, Claim
+from core.verification.structured_verifier import (
+    StructuredVerifier,
+    VerificationResult,
+)
 
 logger = get_logger(__name__)
-
-
-@dataclass
-class VerificationResult:
-    """Result of claim verification."""
-
-    claim: Claim
-    verified: bool
-    confidence: float  # 0.0-1.0
-    evidence: str | None = None
-    contradiction: str | None = None
 
 
 @dataclass
@@ -34,28 +30,59 @@ class FirewallResult:
     claims_failed: int
     contradictions: list[VerificationResult]
     warnings: list[str]
+    evidence_count: int = 0  # Total evidence pieces found
 
 
 class HallucinationFirewall:
-    """Verify LLM responses against data snapshots."""
+    """Verify LLM responses against data snapshots.
 
-    def __init__(self, db, context_manager, threshold: float = 0.7):
+    Enhanced with:
+    - LLM-based claim extraction (vs regex)
+    - Structured verification with evidence backlinks
+    - Semantic confidence scoring
+    """
+
+    def __init__(
+        self,
+        db,
+        context_manager,
+        llm_client=None,
+        threshold: float = 0.7,
+        use_llm_extraction: bool = True,
+    ):
         """Initialize firewall.
 
         Args:
             db: SQLAlchemy Session
             context_manager: ContextManager for loading snapshots
+            llm_client: LLM client for enhanced extraction/verification
             threshold: Minimum confidence to pass (default: 0.7)
+            use_llm_extraction: Use LLM for claim extraction (default: True)
         """
         self.db = db
         self.context_manager = context_manager
         self.threshold = threshold
-        self.extractor = ClaimExtractor()
+        self.use_llm_extraction = use_llm_extraction
+
+        # Extractors
+        self.regex_extractor = ClaimExtractor()
+        self.llm_extractor = LLMClaimExtractor(llm_client) if llm_client else None
+
+        # Verifier
+        self.verifier = StructuredVerifier(llm_client) if llm_client else None
+
+        # Initialize tables (auto-create if not exist)
+        self._init_tables()
 
     def verify_response(
         self, response: str, snapshot_id: str, mode: str = "warn"
     ) -> FirewallResult:
         """Verify LLM response against context snapshot.
+
+        Enhanced with:
+        - LLM-based claim extraction (if enabled)
+        - Structured verification with evidence backlinks
+        - Semantic confidence scoring
 
         Args:
             response: LLM response text
@@ -63,7 +90,7 @@ class HallucinationFirewall:
             mode: 'warn' (annotate) or 'block' (reject delivery)
 
         Returns:
-            FirewallResult with verification details
+            FirewallResult with verification details and evidence
         """
         # Input validation
         if not response or not response.strip():
@@ -92,10 +119,14 @@ class HallucinationFirewall:
             logger.warning(f"Invalid mode '{mode}', defaulting to 'warn'")
             mode = "warn"
 
-        # 1. Extract claims
+        # 1. Extract claims (LLM or regex)
         try:
-            claims = self.extractor.extract(response)
-            logger.debug(f"Extracted {len(claims)} claims from response")
+            if self.use_llm_extraction and self.llm_extractor:
+                claims = self.llm_extractor.extract(response)
+                logger.info(f"Extracted {len(claims)} claims using LLM")
+            else:
+                claims = self.regex_extractor.extract(response)
+                logger.info(f"Extracted {len(claims)} claims using regex")
         except Exception as e:
             logger.error(f"Claim extraction failed: {e}")
             return FirewallResult(
@@ -108,7 +139,6 @@ class HallucinationFirewall:
             )
 
         if not claims:
-            # No verifiable claims - pass through
             return FirewallResult(
                 safe_to_deliver=True,
                 confidence_score=1.0,
@@ -120,7 +150,7 @@ class HallucinationFirewall:
 
         # 2. Load context snapshot
         try:
-            context = self.context_manager.load_snapshot(snapshot_id)
+            snapshot = self.context_manager.load_snapshot(snapshot_id)
         except Exception as e:
             logger.error(f"Failed to load snapshot {snapshot_id}: {e}")
             return FirewallResult(
@@ -132,24 +162,32 @@ class HallucinationFirewall:
                 warnings=[f"Snapshot load failed: {e}"],
             )
 
-        # 3. Verify each claim
+        # 3. Verify each claim (structured or simple)
         results = []
+        total_evidence = 0
+
         for claim in claims:
             try:
-                result = self._verify_claim(claim, context)
+                if self.verifier:
+                    # Structured verification with evidence
+                    result = self.verifier.verify_claim(claim, snapshot)
+                    total_evidence += len(result.evidence)
+                else:
+                    # Fallback to simple verification
+                    result = self._simple_verify_claim(claim, snapshot)
+
                 results.append(result)
             except Exception as e:
                 logger.error(f"Claim verification failed for '{claim.value}': {e}")
-                # Treat as failed verification
                 results.append(
                     VerificationResult(
                         claim=claim,
                         verified=False,
                         confidence=0.0,
+                        evidence=[],
                         contradiction=f"Verification error: {e}",
                     )
                 )
-            results.append(result)
 
         # 4. Compute overall result
         verified = [r for r in results if r.verified]
@@ -166,33 +204,35 @@ class HallucinationFirewall:
             claims_failed=len(failed),
             contradictions=failed,
             warnings=[] if safe else ["Confidence below threshold"],
+            evidence_count=total_evidence,
         )
 
-    def _verify_claim(self, claim: Claim, context) -> VerificationResult:
-        """Verify a single claim against context.
+    def _simple_verify_claim(self, claim: Claim, snapshot) -> VerificationResult:
+        """Simple verification fallback (string matching).
 
-        Strategy:
-        - Numbers: Check if mentioned in context events
-        - Dates: Check if mentioned in context events
-        - References: Check if PR/issue/commit exists in context
-        - Booleans: Fuzzy match against context content
+        Args:
+            claim: Claim to verify
+            snapshot: Context snapshot
+
+        Returns:
+            VerificationResult
         """
-        # Simple verification: check if claim value appears in context
-        context_text = self._context_to_text(context)
+        context_text = self._context_to_text(snapshot)
 
         if claim.value.lower() in context_text.lower():
             return VerificationResult(
                 claim=claim,
                 verified=True,
                 confidence=0.9,
-                evidence=f"Found in context: {claim.value}",
+                evidence=[],
+                contradiction=None,
             )
 
-        # Not found - potential hallucination
         return VerificationResult(
             claim=claim,
             verified=False,
             confidence=0.3,
+            evidence=[],
             contradiction=f"Claim '{claim.value}' not found in context",
         )
 
@@ -209,59 +249,90 @@ class HallucinationFirewall:
         return "\n".join(parts)
 
     def log_verification(
-        self, session_id: str, event_id: str, result: FirewallResult
+        self, session_id: str, event_id: str, result: FirewallResult, snapshot_id: str
     ) -> None:
-        """Log verification result as event.
+        """Log verification result with evidence backlinks.
 
         Args:
             session_id: Session ID
             event_id: Event ID being verified
             result: Verification result
+            snapshot_id: Context snapshot ID
         """
         if not session_id or not event_id:
             logger.error("Missing session_id or event_id for verification logging")
             return
 
         try:
+            # 1. Insert hallucination check record
+            check_id = f"check_{event_id}"
+
             self.db.execute(
                 """
-                INSERT INTO conversation_events (
-                    event_id, user_id, session_id, agent_id, agent_version,
-                    event_type, content, metadata, created_at
+                INSERT INTO hallucination_checks (
+                    check_id, session_id, event_id, snapshot_id,
+                    claims_total, claims_verified, claims_contradicted,
+                    confidence_score, safe_to_deliver, evidence_count,
+                    created_at
                 ) VALUES (
-                    %s, 'system', %s, 'firewall', '1.0',
-                    'hallucination_check', %s, %s, NOW()
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
                 )
                 """,
                 (
-                    f"verify_{event_id}",
+                    check_id,
                     session_id,
-                    json.dumps(
-                        {
-                            "safe": result.safe_to_deliver,
-                            "confidence": result.confidence_score,
-                            "verified": result.claims_verified,
-                            "failed": result.claims_failed,
-                        }
-                    ),
-                    json.dumps(
-                        {
-                            "contradictions": [
-                                {
-                                    "claim": c.claim.value,
-                                    "type": c.claim.type,
-                                    "contradiction": c.contradiction,
-                                }
-                                for c in result.contradictions
-                            ]
-                        }
-                    ),
+                    event_id,
+                    snapshot_id,
+                    result.claims_verified + result.claims_failed,
+                    result.claims_verified,
+                    result.claims_failed,
+                    result.confidence_score,
+                    result.safe_to_deliver,
+                    result.evidence_count,
                 ),
             )
 
+            # 2. Insert evidence backlinks for each contradiction
+            for contradiction in result.contradictions:
+                for evidence in contradiction.evidence:
+                    self.db.execute(
+                        """
+                        INSERT INTO claim_evidence (
+                            check_id, claim_type, claim_value,
+                            source_type, source_id, content, location,
+                            confidence, created_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                        )
+                        """,
+                        (
+                            check_id,
+                            contradiction.claim.type,
+                            contradiction.claim.value,
+                            evidence.source_type,
+                            evidence.source_id,
+                            evidence.content,
+                            evidence.location,
+                            evidence.confidence,
+                        ),
+                    )
+
+            self.db.commit()
+
             logger.info(
                 f"Verification logged: {result.claims_verified}/{result.claims_verified + result.claims_failed} verified, "
-                f"confidence={result.confidence_score:.2f}"
+                f"confidence={result.confidence_score:.2f}, evidence={result.evidence_count}"
             )
+
         except Exception as e:
             logger.error(f"Failed to log verification: {e}")
+            self.db.rollback()
+
+    def _init_tables(self):
+        """Initialize database tables (auto-create if not exist)."""
+        try:
+            from core.verification.schema import init_hallucination_tables
+
+            init_hallucination_tables(self.db)
+        except Exception as e:
+            logger.warning(f"Table initialization skipped: {e}")
