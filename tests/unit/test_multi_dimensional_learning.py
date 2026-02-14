@@ -1,11 +1,11 @@
 """Tests for multi-dimensional learning signals (Phase 1)."""
 
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from core.skills.learning_signals import LearningSignal, SignalType, SignalWeights
 from core.skills.self_improving_selector import SelfImprovingSelector
-from api.models import SkillSelectionEvent as EventModel
+from api.models import SkillSelectionEvent as EventModel, Config
 
 
 class TestLearningSignals:
@@ -139,6 +139,67 @@ class TestMultiDimensionalLearning:
         
         signal = selector._extract_signal(failure, SignalType.HIGH_COST)
         assert signal is None
+
+    def test_runtime_weights_override(self, db_session):
+        selector = SelfImprovingSelector(db_session, llm_client=None)
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.add(
+            Config(
+                key_name="selector_learning_weights",
+                value='{"accuracy": 0.1, "speed": 0.7, "cost": 0.1, "satisfaction": 0.1}',
+            )
+        )
+        db_session.commit()
+
+        event = {
+            "selection_correctness": 1,
+            "execution_time_ms": 3000,
+            "execution_cost": 0.02,
+            "user_feedback_score": 5,
+        }
+        score = selector.calculate_multi_factor_score(event)
+        assert abs(score - 92.6) < 0.01
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.commit()
+
+    def test_confidence_time_decay_blocks_match(self, db_session):
+        selector = SelfImprovingSelector(db_session, llm_client=None)
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_decay"
+        ).delete()
+        db_session.add(
+            Config(
+                key_name="selector_learning_decay",
+                value='{"enabled": true, "half_life_days": 1}',
+            )
+        )
+        from api.models import SkillSelectionLearning
+        learning = SkillSelectionLearning(
+            learning_id="decay_test",
+            query_pattern="review",
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            improvement_score=10.0,
+            confidence=80.0,
+            evidence_count=8,
+            created_at=datetime.now(timezone.utc) - timedelta(days=3),
+            updated_at=datetime.now(timezone.utc) - timedelta(days=3),
+        )
+        db_session.add(learning)
+        db_session.commit()
+
+        from core.agent.selector import SkillCandidate
+        candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
+        corrected = selector.apply_learnings("review PR", candidates)
+        assert [c.name for c in corrected] == [c.name for c in candidates]
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_decay"
+        ).delete()
+        db_session.commit()
     
     def test_extract_low_satisfaction_signal(self, selector):
         """Test extracting low_satisfaction signal."""

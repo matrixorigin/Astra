@@ -36,6 +36,10 @@ from core.skills.learning_signals import LearningSignal, SignalType, SignalWeigh
 
 logger = get_logger(__name__)
 
+CONFIG_KEY_LEARNING_WEIGHTS = "selector_learning_weights"
+CONFIG_KEY_LEARNING_DECAY = "selector_learning_decay"
+RUNTIME_CONFIG_TTL_SECONDS = 30
+
 
 class SelfImprovingSelector:
     """Skill selector that learns from historical failures automatically.
@@ -55,6 +59,10 @@ class SelfImprovingSelector:
         self.thresholds = thresholds or SignalThresholds()
         self.auditable_selector = AuditableSkillSelector(session, llm_client, account)
         self.sandbox = Sandbox(db=session, account=account)
+        self._runtime_config_cache: dict[str, Any] | None = None
+        self._runtime_config_loaded_at: datetime | None = None
+        self._runtime_config_last_updated_at: datetime | None = None
+        self._runtime_config_ttl_seconds = RUNTIME_CONFIG_TTL_SECONDS
         self._ensure_tables()
 
     def _ensure_tables(self):
@@ -294,11 +302,17 @@ class SelfImprovingSelector:
 
         query_lower = query.lower()
 
+        runtime_config = self._load_runtime_config()
+        weights = runtime_config["weights"]
+        decay = runtime_config["decay"]
+
         learnings = self.session.query(LearningModel).all()
         matched = [
             learning for learning in learnings
             if learning.query_pattern and learning.query_pattern.lower() in query_lower
-            and self._is_high_confidence(learning.confidence)
+            and self._is_high_confidence_value(
+                self._effective_confidence(learning, decay)
+            )
         ]
 
         if not matched:
@@ -306,7 +320,7 @@ class SelfImprovingSelector:
 
         matched.sort(
             key=lambda learning: (
-                self._normalize_confidence(learning.confidence),
+                self._effective_confidence(learning, decay),
                 learning.evidence_count or 0,
                 learning.applied_count or 0,
             ),
@@ -327,8 +341,8 @@ class SelfImprovingSelector:
 
         applied_learnings = []
         for learning in matched:
-            learning_confidence = self._normalize_confidence(learning.confidence)
-            weight = self._get_signal_weight(learning.signal_type)
+            learning_confidence = self._effective_confidence(learning, decay)
+            weight = self._get_signal_weight(learning.signal_type, weights)
             delta = learning_confidence * weight
             if delta <= 0:
                 continue
@@ -398,14 +412,20 @@ class SelfImprovingSelector:
             return value >= 0.5
         return value >= 50.0
 
-    def _get_signal_weight(self, signal_type: str | None) -> float:
+    def _is_high_confidence_value(self, normalized_value: float | None) -> bool:
+        if normalized_value is None:
+            return False
+        return normalized_value >= 0.5
+
+    def _get_signal_weight(self, signal_type: str | None, weights: SignalWeights | None = None) -> float:
+        active_weights = weights or self.weights
         if signal_type == SignalType.SLOW_EXECUTION.value:
-            return self.weights.speed
+            return active_weights.speed
         if signal_type == SignalType.HIGH_COST.value:
-            return self.weights.cost
+            return active_weights.cost
         if signal_type == SignalType.LOW_SATISFACTION.value:
-            return self.weights.satisfaction
-        return self.weights.accuracy
+            return active_weights.satisfaction
+        return active_weights.accuracy
     
     def calculate_multi_factor_score(self, event: dict) -> float:
         """Calculate weighted score across multiple dimensions.
@@ -448,29 +468,30 @@ class SelfImprovingSelector:
             scores["satisfaction"] = 75.0  # Assume good if no feedback
         
         # Weighted average
+        weights = self._load_runtime_config()["weights"]
         total_score = (
-            scores["accuracy"] * self.weights.accuracy +
-            scores["speed"] * self.weights.speed +
-            scores["cost"] * self.weights.cost +
-            scores["satisfaction"] * self.weights.satisfaction
+            scores["accuracy"] * weights.accuracy +
+            scores["speed"] * weights.speed +
+            scores["cost"] * weights.cost +
+            scores["satisfaction"] * weights.satisfaction
         )
         
         return total_score
 
     def get_learning_stats(self) -> dict[str, Any]:
         """Get statistics about learned corrections with multi-dimensional breakdown."""
-        
-        total = self.session.query(LearningModel).count()
-        high_confidence = self.session.query(LearningModel).filter(
-            LearningModel.confidence >= 70
-        ).count()
-        
-        # Calculate average confidence
-        avg_confidence = 0.0
-        if total > 0:
-            from sqlalchemy import func
-            result = self.session.query(func.avg(LearningModel.confidence)).scalar()
-            avg_confidence = float(result) if result else 0.0
+        runtime_config = self._load_runtime_config()
+        decay = runtime_config["decay"]
+
+        learnings = self.session.query(LearningModel).all()
+        total = len(learnings)
+        effective_confidences = [
+            self._effective_confidence(learning, decay) for learning in learnings
+        ]
+        high_confidence = sum(1 for c in effective_confidences if c >= 0.7)
+        avg_confidence = (
+            sum(effective_confidences) / total * 100.0 if total > 0 else 0.0
+        )
         
         # Breakdown by signal type
         signal_breakdown = {}
@@ -486,5 +507,98 @@ class SelfImprovingSelector:
             "low_confidence": total - high_confidence,
             "avg_confidence": avg_confidence,
             "by_signal_type": signal_breakdown,
-            "weights": self.weights.to_dict(),
+            "weights": runtime_config["weights"].to_dict(),
+            "decay": runtime_config["decay"],
         }
+
+    def _load_runtime_config(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        if self._runtime_config_cache and self._runtime_config_loaded_at:
+            cache_age = (now - self._runtime_config_loaded_at).total_seconds()
+            if cache_age < self._runtime_config_ttl_seconds:
+                from api.models import Config
+                from sqlalchemy import func
+
+                latest_updated_at = (
+                    self.session.query(func.max(Config.updated_at))
+                    .filter(Config.key_name.in_([CONFIG_KEY_LEARNING_WEIGHTS, CONFIG_KEY_LEARNING_DECAY]))
+                    .scalar()
+                )
+                if (
+                    (latest_updated_at is None and self._runtime_config_last_updated_at is None)
+                    or (
+                        latest_updated_at
+                        and self._runtime_config_last_updated_at
+                        and latest_updated_at <= self._runtime_config_last_updated_at
+                    )
+                ):
+                    return self._runtime_config_cache
+
+        weights = self.weights
+        decay = {"enabled": False, "half_life_days": 0.0, "min_confidence": 0.0}
+
+        from api.models import Config
+
+        configs = (
+            self.session.query(Config)
+            .filter(Config.key_name.in_([CONFIG_KEY_LEARNING_WEIGHTS, CONFIG_KEY_LEARNING_DECAY]))
+            .all()
+        )
+        latest_updated_at = None
+        for cfg in configs:
+            if cfg.updated_at and (latest_updated_at is None or cfg.updated_at > latest_updated_at):
+                latest_updated_at = cfg.updated_at
+            if cfg.key_name == CONFIG_KEY_LEARNING_WEIGHTS:
+                parsed = self._parse_json_config(cfg.value)
+                weights = self._merge_weights(weights, parsed)
+            elif cfg.key_name == CONFIG_KEY_LEARNING_DECAY:
+                parsed = self._parse_json_config(cfg.value)
+                if isinstance(parsed, dict):
+                    decay = {
+                        "enabled": bool(parsed.get("enabled", False)),
+                        "half_life_days": float(parsed.get("half_life_days", 0.0) or 0.0),
+                        "min_confidence": float(parsed.get("min_confidence", 0.0) or 0.0),
+                    }
+
+        self._runtime_config_cache = {"weights": weights, "decay": decay}
+        self._runtime_config_loaded_at = now
+        self._runtime_config_last_updated_at = latest_updated_at
+        return self._runtime_config_cache
+
+    def _parse_json_config(self, raw: str | None) -> Any:
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            logger.warning("Failed to parse selector runtime config, using defaults")
+            return None
+
+    def _merge_weights(self, base: SignalWeights, override: Any) -> SignalWeights:
+        if not isinstance(override, dict):
+            return base
+        merged = base.to_dict()
+        for key in ["accuracy", "speed", "cost", "satisfaction"]:
+            if key in override:
+                merged[key] = float(override[key])
+        try:
+            return SignalWeights(**merged)
+        except Exception:
+            logger.warning("Invalid selector_learning_weights, using defaults")
+            return base
+
+    def _effective_confidence(self, learning: LearningModel, decay: dict[str, Any]) -> float:
+        normalized = self._normalize_confidence(learning.confidence)
+        if not decay.get("enabled") or not decay.get("half_life_days"):
+            return normalized
+        reference = learning.updated_at or learning.created_at
+        if not reference:
+            return normalized
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - reference).total_seconds() / 86400.0
+        factor = 0.5 ** (age_days / float(decay["half_life_days"]))
+        decayed = normalized * factor
+        min_confidence = float(decay.get("min_confidence", 0.0) or 0.0)
+        decayed = max(min_confidence, decayed)
+        return min(normalized, decayed)
