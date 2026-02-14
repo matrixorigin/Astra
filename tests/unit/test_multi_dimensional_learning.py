@@ -166,6 +166,160 @@ class TestMultiDimensionalLearning:
         ).delete()
         db_session.commit()
 
+    def test_per_signal_weights_override(self, db_session):
+        selector = SelfImprovingSelector(db_session, llm_client=None)
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.add(
+            Config(
+                key_name="selector_learning_weights",
+                value='{"accuracy": 0.4, "speed": 0.3, "cost": 0.2, "satisfaction": 0.1, "per_signal": {"wrong_skill": {"accuracy": 0.0}}}',
+            )
+        )
+        from api.models import SkillSelectionLearning
+        learning = SkillSelectionLearning(
+            learning_id="per_signal_weight_test",
+            query_pattern="review",
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            improvement_score=10.0,
+            confidence=80.0,
+            evidence_count=8,
+            signal_type="wrong_skill",
+        )
+        db_session.add(learning)
+        db_session.commit()
+
+        from core.agent.selector import SkillCandidate
+        candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
+        selector.apply_learnings("review PR", candidates)
+        learning_after = db_session.query(SkillSelectionLearning).filter(
+            SkillSelectionLearning.learning_id == learning.learning_id
+        ).first()
+        assert learning_after.applied_count == 0
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.commit()
+
+    def test_per_signal_weights_override_positive(self, db_session):
+        selector = SelfImprovingSelector(db_session, llm_client=None)
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.add(
+            Config(
+                key_name="selector_learning_weights",
+                value='{"accuracy": 0.4, "speed": 0.3, "cost": 0.2, "satisfaction": 0.1, "per_signal": {"wrong_skill": {"accuracy": 0.8, "speed": 0.1, "cost": 0.05, "satisfaction": 0.05}}}',
+            )
+        )
+        from api.models import SkillSelectionLearning
+        db_session.query(SkillSelectionLearning).delete()
+        db_session.commit()
+        learning = SkillSelectionLearning(
+            learning_id="per_signal_weight_positive",
+            query_pattern="review",
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            improvement_score=10.0,
+            confidence=80.0,
+            evidence_count=8,
+            signal_type="wrong_skill",
+        )
+        db_session.add(learning)
+        db_session.commit()
+
+        from core.agent.selector import SkillCandidate
+        candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
+        selector.apply_learnings("review PR", candidates)
+        learning_after = db_session.query(SkillSelectionLearning).filter(
+            SkillSelectionLearning.learning_id == learning.learning_id
+        ).first()
+        assert learning_after.applied_count == 1
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.commit()
+
+    def test_per_signal_weights_partial_override(self, db_session):
+        selector = SelfImprovingSelector(db_session, llm_client=None)
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.add(
+            Config(
+                key_name="selector_learning_weights",
+                value='{"accuracy": 0.4, "speed": 0.3, "cost": 0.2, "satisfaction": 0.1, "per_signal": {"wrong_skill": {"speed": 0.6}}}',
+            )
+        )
+        from api.models import SkillSelectionLearning
+        db_session.query(SkillSelectionLearning).delete()
+        db_session.commit()
+        learning = SkillSelectionLearning(
+            learning_id="per_signal_weight_partial",
+            query_pattern="review",
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            improvement_score=10.0,
+            confidence=80.0,
+            evidence_count=8,
+            signal_type="wrong_skill",
+        )
+        db_session.add(learning)
+        db_session.commit()
+
+        from core.agent.selector import SkillCandidate
+        candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
+        selector.apply_learnings("review PR", candidates)
+        learning_after = db_session.query(SkillSelectionLearning).filter(
+            SkillSelectionLearning.learning_id == learning.learning_id
+        ).first()
+        assert learning_after.applied_count == 1
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.commit()
+
+    def test_per_signal_weights_invalid_override(self, db_session):
+        selector = SelfImprovingSelector(db_session, llm_client=None)
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.add(
+            Config(
+                key_name="selector_learning_weights",
+                value='{"accuracy": 0.4, "speed": 0.3, "cost": 0.2, "satisfaction": 0.1, "per_signal": {"wrong_skill": "invalid"}}',
+            )
+        )
+        from api.models import SkillSelectionLearning
+        db_session.query(SkillSelectionLearning).delete()
+        db_session.commit()
+        learning = SkillSelectionLearning(
+            learning_id="per_signal_weight_invalid",
+            query_pattern="review",
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            improvement_score=10.0,
+            confidence=80.0,
+            evidence_count=8,
+            signal_type="wrong_skill",
+        )
+        db_session.add(learning)
+        db_session.commit()
+
+        from core.agent.selector import SkillCandidate
+        candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
+        selector.apply_learnings("review PR", candidates)
+        learning_after = db_session.query(SkillSelectionLearning).filter(
+            SkillSelectionLearning.learning_id == learning.learning_id
+        ).first()
+        assert learning_after.applied_count == 1
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_weights"
+        ).delete()
+        db_session.commit()
+
     def test_confidence_time_decay_blocks_match(self, db_session):
         selector = SelfImprovingSelector(db_session, llm_client=None)
         db_session.query(Config).filter(
@@ -178,6 +332,8 @@ class TestMultiDimensionalLearning:
             )
         )
         from api.models import SkillSelectionLearning
+        db_session.query(SkillSelectionLearning).delete()
+        db_session.commit()
         learning = SkillSelectionLearning(
             learning_id="decay_test",
             query_pattern="review",
@@ -213,6 +369,8 @@ class TestMultiDimensionalLearning:
             )
         )
         from api.models import SkillSelectionLearning
+        db_session.query(SkillSelectionLearning).delete()
+        db_session.commit()
         learning = SkillSelectionLearning(
             learning_id="per_signal_decay_test",
             query_pattern="review",

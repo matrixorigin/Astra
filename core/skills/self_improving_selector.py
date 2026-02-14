@@ -304,6 +304,7 @@ class SelfImprovingSelector:
 
         runtime_config = self._load_runtime_config()
         weights = runtime_config["weights"]
+        per_signal_weights = runtime_config["weights_per_signal"]
         decay = runtime_config["decay"]
 
         learnings = self.session.query(LearningModel).all()
@@ -342,7 +343,7 @@ class SelfImprovingSelector:
         applied_learnings = []
         for learning in matched:
             learning_confidence = self._effective_confidence(learning, decay, learning.signal_type)
-            weight = self._get_signal_weight(learning.signal_type, weights)
+            weight = self._get_signal_weight(learning.signal_type, weights, per_signal_weights)
             delta = learning_confidence * weight
             if delta <= 0:
                 continue
@@ -417,8 +418,19 @@ class SelfImprovingSelector:
             return False
         return normalized_value >= 0.5
 
-    def _get_signal_weight(self, signal_type: str | None, weights: SignalWeights | None = None) -> float:
+    def _get_signal_weight(
+        self,
+        signal_type: str | None,
+        weights: SignalWeights | None = None,
+        per_signal: dict[str, Any] | None = None,
+    ) -> float:
         active_weights = weights or self.weights
+        if per_signal is not None:
+            active_weights = self._resolve_weights_for_signal(
+                signal_type,
+                active_weights,
+                per_signal,
+            )
         if signal_type == SignalType.SLOW_EXECUTION.value:
             return active_weights.speed
         if signal_type == SignalType.HIGH_COST.value:
@@ -509,6 +521,7 @@ class SelfImprovingSelector:
             "avg_confidence": avg_confidence,
             "by_signal_type": signal_breakdown,
             "weights": runtime_config["weights"].to_dict(),
+            "weights_per_signal": runtime_config["weights_per_signal"],
             "decay": runtime_config["decay"],
         }
 
@@ -536,6 +549,7 @@ class SelfImprovingSelector:
                     return self._runtime_config_cache
 
         weights = self.weights
+        per_signal_weights: dict[str, Any] = {}
         decay = {
             "enabled": False,
             "half_life_days": 0.0,
@@ -556,6 +570,8 @@ class SelfImprovingSelector:
                 latest_updated_at = cfg.updated_at
             if cfg.key_name == CONFIG_KEY_LEARNING_WEIGHTS:
                 parsed = self._parse_json_config(cfg.value)
+                if isinstance(parsed, dict):
+                    per_signal_weights = parsed.get("per_signal", {}) or {}
                 weights = self._merge_weights(weights, parsed)
             elif cfg.key_name == CONFIG_KEY_LEARNING_DECAY:
                 parsed = self._parse_json_config(cfg.value)
@@ -567,7 +583,11 @@ class SelfImprovingSelector:
                         "per_signal": parsed.get("per_signal", {}) or {},
                     }
 
-        self._runtime_config_cache = {"weights": weights, "decay": decay}
+        self._runtime_config_cache = {
+            "weights": weights,
+            "weights_per_signal": per_signal_weights,
+            "decay": decay,
+        }
         self._runtime_config_loaded_at = now
         self._runtime_config_last_updated_at = latest_updated_at
         return self._runtime_config_cache
@@ -590,7 +610,7 @@ class SelfImprovingSelector:
                 merged[key] = float(override[key])
         try:
             return SignalWeights(**merged)
-        except Exception:
+        except ValueError:
             logger.warning("Invalid selector_learning_weights, using defaults")
             return base
 
@@ -615,6 +635,32 @@ class SelfImprovingSelector:
         min_confidence = float(decay_config.get("min_confidence", 0.0) or 0.0)
         decayed = max(min_confidence, decayed)
         return min(normalized, decayed)
+
+    def _resolve_weights_for_signal(
+        self,
+        signal_type: str | None,
+        base: SignalWeights,
+        per_signal: dict[str, Any],
+    ) -> SignalWeights:
+        if not signal_type:
+            return base
+        override = per_signal.get(signal_type)
+        if not isinstance(override, dict):
+            return base
+        merged = base.to_dict()
+        for key in ["accuracy", "speed", "cost", "satisfaction"]:
+            if key in override:
+                merged[key] = float(override[key])
+        total = sum(merged.values())
+        if total <= 0:
+            return base
+        if abs(total - 1.0) > 0.01:
+            merged = {key: value / total for key, value in merged.items()}
+        try:
+            return SignalWeights(**merged)
+        except ValueError:
+            logger.warning("Invalid selector_learning_weights per_signal override, using defaults")
+            return base
 
     def _resolve_decay_config(self, decay: dict[str, Any], signal_type: str | None) -> dict[str, Any]:
         base = {
