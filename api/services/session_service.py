@@ -8,7 +8,6 @@ from api.repositories import SessionRepository
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
 # from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 
 class SessionService:

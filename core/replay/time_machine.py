@@ -6,7 +6,7 @@ Provides time-travel capabilities to replay conversations at any point in time.
 from core.events.event_reader import EventReader
 from core.events.models import ConversationEvent
 from sqlalchemy.orm import Session
-from api.database import get_db_session
+from api.database import SessionLocal
 from core.git_for_data import GitForData
 
 
@@ -23,9 +23,21 @@ class TimeMachine:
         Args:
             db: SQLAlchemy Session instance. If None, creates a new one.
         """
-        self.db = db or next(get_db_session())
-        self.git = GitForData(db)
-        self.reader = EventReader(db)
+        self._owns_session = db is None
+        self.db = db or SessionLocal()
+        self.git = GitForData(self.db)
+        self.reader = EventReader(self.db)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Close session if owned."""
+        if self._owns_session:
+            self.db.close()
 
     def create_checkpoint(self, checkpoint_name: str, description: str = "") -> dict:
         """Create a checkpoint at the current time.

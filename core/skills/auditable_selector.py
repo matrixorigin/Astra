@@ -16,7 +16,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
 from core.skills.modern_selector import ModernSkillSelector
@@ -75,24 +75,24 @@ class AuditableSkillSelector:
     """
 
     def __init__(self, session: Session | None = None, llm_client=None, account: str = "sys"):
-        self._session = session
         self._owns_session = session is None
+        self.session = session or SessionLocal()
         self.llm = llm_client
         self.account = account
-        self.modern_selector = ModernSkillSelector(session, llm_client) if session else None
-        self.sandbox = Sandbox(db=None, account=account)  # Sandbox still uses old DB
+        self.modern_selector = ModernSkillSelector(self.session, llm_client)
+        self.sandbox = Sandbox(db=self.session, account=account)
         self._ensure_table()
 
-    def _get_session(self) -> Session:
-        """Get or create session."""
-        if self._session is None:
-            self._session = next(get_db_session())
-        return self._session
+    def __enter__(self):
+        return self
 
-    def __del__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
         """Close session if we own it."""
-        if self._owns_session and self._session:
-            self._session.close()
+        if self._owns_session:
+            self.session.close()
 
     def _ensure_table(self):
         """Ensure skill_selection_events table exists."""
@@ -188,8 +188,7 @@ class AuditableSkillSelector:
         """Get all available skills at this moment."""
         from api.models import SkillRegistry as SkillModel
         
-        session = self._get_session()
-        skills_data = session.query(SkillModel).filter(SkillModel.is_active == 1).all()
+        skills_data = self.session.query(SkillModel).filter(SkillModel.is_active == 1).all()
 
         skills = []
         for skill in skills_data:
@@ -349,7 +348,6 @@ class AuditableSkillSelector:
         """Save selection event to database."""
         from api.models import SkillSelectionEvent as EventModel
         
-        session = self._get_session()
         event_model = EventModel(
             event_id=event.event_id,
             session_id=event.session_id,
@@ -362,8 +360,8 @@ class AuditableSkillSelector:
             candidate_scores=event.candidate_scores,
             created_at=event.created_at,
         )
-        session.add(event_model)
-        session.commit()
+        self.session.add(event_model)
+        self.session.commit()
 
     def update_execution_result(
         self,
@@ -379,14 +377,13 @@ class AuditableSkillSelector:
         """
         from api.models import SkillSelectionEvent as EventModel
         
-        session = self._get_session()
-        event = session.query(EventModel).filter(EventModel.event_id == event_id).first()
+        event = self.session.query(EventModel).filter(EventModel.event_id == event_id).first()
         if event:
             event.execution_success = success
             event.execution_time_ms = time_ms
             event.execution_cost = cost
             event.execution_result = result
-            session.commit()
+            self.session.commit()
 
     def update_user_feedback(self, event_id: str, score: int):
         """Update event with user feedback.
@@ -398,13 +395,12 @@ class AuditableSkillSelector:
 
         from api.models import SkillSelectionEvent as EventModel
         
-        session = self._get_session()
-        event = session.query(EventModel).filter(EventModel.event_id == event_id).first()
+        event = self.session.query(EventModel).filter(EventModel.event_id == event_id).first()
         if event:
             event.user_feedback_score = score
             # Auto-evaluate correctness based on feedback
             event.selection_correctness = score >= 4
-            session.commit()
+            self.session.commit()
 
     def get_selection_history(
         self, session_id: str | None = None, limit: int = 100
@@ -424,8 +420,7 @@ class AuditableSkillSelector:
                 return [convert_decimals(item) for item in obj]
             return obj
         
-        session = self._get_session()
-        query = session.query(EventModel)
+        query = self.session.query(EventModel)
         
         if session_id:
             query = query.filter(EventModel.session_id == session_id)

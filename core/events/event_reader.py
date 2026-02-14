@@ -8,7 +8,7 @@ import json
 from sqlalchemy import text
 from core.events.models import ContextSnapshot, ConversationEvent, TokenUsage
 from sqlalchemy.orm import Session
-from api.database import get_db_session
+from api.database import SessionLocal
 
 
 class EventReader:
@@ -24,11 +24,17 @@ class EventReader:
             db: SQLAlchemy Session instance. If None, creates a new one.
         """
         self._owns_session = db is None
-        self.db = db or next(get_db_session())
+        self.db = db or SessionLocal()
 
-    def __del__(self):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
         """Close session if owned."""
-        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
+        if self._owns_session:
             self.db.close()
 
     def _row_to_event(self, row: dict) -> ConversationEvent:

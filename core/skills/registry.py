@@ -8,7 +8,7 @@ from functools import lru_cache
 
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.models import SkillRegistry as SkillModel
 from core.exceptions import DatabaseError, SkillNotFoundError
 from core.logging_config import get_logger
@@ -22,21 +22,21 @@ class SkillRegistry:
     """Manage skill metadata and lifecycle with versioning"""
 
     def __init__(self, session: Session | None = None):
-        self._session = session
         self._owns_session = session is None
+        self.session = session or SessionLocal()
         self._skills: dict[str, Skill] = {}  # skill_name@version -> Skill
         self._cache_size = 100  # LRU cache size
 
-    def _get_session(self) -> Session:
-        """Get or create session."""
-        if self._session is None:
-            self._session = next(get_db_session())
-        return self._session
+    def __enter__(self):
+        return self
 
-    def __del__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
         """Close session if we own it."""
-        if self._owns_session and self._session:
-            self._session.close()
+        if self._owns_session:
+            self.session.close()
 
     def register(
         self,
@@ -66,11 +66,10 @@ class SkillRegistry:
         logger.info(f"Registering skill: {skill.name}@{skill.version}")
 
         try:
-            session = self._get_session()
             
             # 1. Deactivate old versions if this is active
             if is_active:
-                session.query(SkillModel).filter(
+                self.session.query(SkillModel).filter(
                     SkillModel.skill_name == skill.name
                 ).update({"is_active": 0})
 
@@ -79,7 +78,7 @@ class SkillRegistry:
 
             # 3. Check if skill already exists
             skill_id = f"{skill.name}@{skill.version}"
-            existing = session.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
+            existing = self.session.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
             
             if existing:
                 # Update existing
@@ -112,9 +111,9 @@ class SkillRegistry:
                     priority=priority,
                     cost_estimate=cost_estimate,
                 )
-                session.add(skill_model)
+                self.session.add(skill_model)
             
-            session.commit()
+            self.session.commit()
 
             # 4. Store in memory
             key = f"{skill.name}@{skill.version}"
@@ -189,11 +188,9 @@ class SkillRegistry:
             Skill metadata dict or None
         """
         try:
-            session = self._get_session()
-            
             if commit:
                 # Query by commit hash
-                skill = session.query(SkillModel).filter(
+                skill = self.session.query(SkillModel).filter(
                     SkillModel.skill_name == skill_name,
                     SkillModel.git_commit_hash == commit
                 ).order_by(SkillModel.created_at.desc()).first()
@@ -205,13 +202,13 @@ class SkillRegistry:
                 except Exception:
                     dt = datetime.fromisoformat(timestamp)
                 
-                skill = session.query(SkillModel).filter(
+                skill = self.session.query(SkillModel).filter(
                     SkillModel.skill_name == skill_name,
                     SkillModel.created_at <= dt
                 ).order_by(SkillModel.created_at.desc()).first()
             else:
                 # Current active version
-                skill = session.query(SkillModel).filter(
+                skill = self.session.query(SkillModel).filter(
                     SkillModel.skill_name == skill_name,
                     SkillModel.is_active == 1
                 ).first()
@@ -250,8 +247,7 @@ class SkillRegistry:
 
         # Query repo type and access scope
         from api.models import Repo
-        session = self._get_session()
-        repo = session.query(Repo).filter(Repo.repo_id == str(repo_id)).first()
+        repo = self.session.query(Repo).filter(Repo.repo_id == str(repo_id)).first()
 
         if not repo:
             logger.warning(f"Repo not found: {repo_id}")

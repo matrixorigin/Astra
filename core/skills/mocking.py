@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from core.skills.base import SideEffectCategory, Skill
 
 logger = logging.getLogger(__name__)
@@ -67,12 +67,21 @@ class ToolMockingLayer:
 
     def _get_session(self) -> Session:
         if self._session is None:
-            self._session = next(get_db_session())
+            self._session = SessionLocal()
         return self._session
 
-    def __del__(self):
+    def close(self) -> None:
+        """Explicitly close the session if owned."""
         if self._owns_session and self._session:
             self._session.close()
+
+    def __enter__(self) -> "ToolMockingLayer":
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Context manager exit."""
+        self.close()
 
     def execute(
         self,

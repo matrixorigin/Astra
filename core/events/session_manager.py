@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session as DBSession
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.models import Session as SessionModel
 from core.events.session_models import Session, SessionStatus
 
@@ -25,19 +25,19 @@ class SessionManager:
         Args:
             session: SQLAlchemy session. If None, creates a new one.
         """
-        self._session = session
         self._owns_session = session is None
+        self.session = session or SessionLocal()
 
-    def _get_session(self) -> DBSession:
-        """Get or create session."""
-        if self._session is None:
-            self._session = next(get_db_session())
-        return self._session
+    def __enter__(self):
+        return self
 
-    def __del__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
         """Close session if we own it."""
-        if self._owns_session and self._session:
-            self._session.close()
+        if self._owns_session:
+            self.session.close()
 
     def create_session(
         self,
@@ -67,10 +67,9 @@ class SessionManager:
             session_metadata=metadata,
         )
         
-        db = self._get_session()
-        db.add(db_session)
-        db.commit()
-        db.refresh(db_session)
+        self.session.add(db_session)
+        self.session.commit()
+        self.session.refresh(db_session)
         
         return self._model_to_session(db_session)
 
@@ -83,8 +82,7 @@ class SessionManager:
         Returns:
             Optional[Session]: Session if found, None otherwise
         """
-        db = self._get_session()
-        db_session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        db_session = self.session.query(SessionModel).filter(SessionModel.session_id == session_id).first()
         return self._model_to_session(db_session) if db_session else None
 
     def update_session_activity(self, session_id: str, last_event_id: str) -> None:
@@ -94,16 +92,15 @@ class SessionManager:
             session_id: Session identifier
             last_event_id: Last event identifier
         """
-        db = self._get_session()
         now = datetime.now(timezone.utc)
         
-        db_session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        db_session = self.session.query(SessionModel).filter(SessionModel.session_id == session_id).first()
         if db_session:
             db_session.last_active_at = now
             db_session.last_event_id = last_event_id
             db_session.event_count += 1
             db_session.updated_at = now
-            db.commit()
+            self.session.commit()
 
     def close_session(self, session_id: str) -> None:
         """Close a session.
@@ -111,12 +108,11 @@ class SessionManager:
         Args:
             session_id: Session identifier
         """
-        db = self._get_session()
-        db_session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
+        db_session = self.session.query(SessionModel).filter(SessionModel.session_id == session_id).first()
         if db_session:
             db_session.status = SessionStatus.CLOSED
             db_session.updated_at = datetime.now(timezone.utc)
-            db.commit()
+            self.session.commit()
 
     def get_user_sessions(
         self, user_id: str, status: SessionStatus | None = None, limit: int = 10
@@ -131,8 +127,7 @@ class SessionManager:
         Returns:
             list[Session]: List of sessions
         """
-        db = self._get_session()
-        query = db.query(SessionModel).filter(SessionModel.user_id == user_id)
+        query = self.session.query(SessionModel).filter(SessionModel.user_id == user_id)
         
         if status:
             query = query.filter(SessionModel.status == status)

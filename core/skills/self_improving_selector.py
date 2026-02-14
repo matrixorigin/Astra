@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.models import SkillSelectionEvent as EventModel, SkillSelectionLearning as LearningModel
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
@@ -28,21 +28,23 @@ class SelfImprovingSelector:
     """
 
     def __init__(self, session: Session | None = None, llm_client=None, account: str = "sys"):
-        self._session = session
         self._owns_session = session is None
+        self.session = session or SessionLocal()
         self.llm = llm_client
         self.account = account
-        self.auditable_selector = AuditableSkillSelector(session, llm_client, account)
-        self.sandbox = Sandbox(db=None, account=account)  # Sandbox uses old DB
+        self.auditable_selector = AuditableSkillSelector(self.session, llm_client, account)
+        self.sandbox = Sandbox(db=self.session, account=account)
+        self._ensure_tables()
 
-    def _get_session(self) -> Session:
-        if self._session is None:
-            self._session = next(get_db_session())
-        return self._session
+    def __enter__(self):
+        return self
 
-    def __del__(self):
-        if self._owns_session and self._session:
-            self._session.close()
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        if self._owns_session:
+            self.session.close()
 
     def _ensure_tables(self):
         """Ensure learning tables exist - no-op as tables are created by ORM."""
@@ -69,10 +71,9 @@ class SelfImprovingSelector:
 
     def get_recent_failures(self, days: int = 7, limit: int = 10) -> list[dict]:
         """Get recent failed selections for learning."""
-        session = self._get_session()
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         
-        events = session.query(EventModel).filter(
+        events = self.session.query(EventModel).filter(
             EventModel.selection_correctness == 0,
             EventModel.created_at >= cutoff
         ).order_by(EventModel.created_at.desc()).limit(limit).all()
@@ -101,10 +102,9 @@ class SelfImprovingSelector:
 
     def _update_learnings(self, correction: dict):
         """Update learning database with new correction."""
-        session = self._get_session()
         
         # Check if similar learning exists
-        existing = session.query(LearningModel).filter(
+        existing = self.session.query(LearningModel).filter(
             LearningModel.query_pattern == correction["query_pattern"]
         ).first()
         
@@ -120,16 +120,15 @@ class SelfImprovingSelector:
                 improvement_score=correction["improvement_score"],
                 confidence=10,
             )
-            session.add(learning)
+            self.session.add(learning)
         
-        session.commit()
+        self.session.commit()
 
     def apply_learnings(self, query: str, candidates: list) -> list:
         """Apply learned corrections to candidate selection."""
-        session = self._get_session()
         
         # Find matching learnings
-        learnings = session.query(LearningModel).filter(
+        learnings = self.session.query(LearningModel).filter(
             LearningModel.confidence >= 50
         ).all()
         
@@ -138,7 +137,7 @@ class SelfImprovingSelector:
                 # Apply correction
                 learning.applied_count += 1
                 learning.last_applied_at = datetime.now(timezone.utc)
-                session.commit()
+                self.session.commit()
                 
                 # Filter out wrong skills, add correct ones
                 filtered = [c for c in candidates if c.name not in learning.wrong_skills]
@@ -148,10 +147,9 @@ class SelfImprovingSelector:
 
     def get_learning_stats(self) -> dict[str, Any]:
         """Get statistics about learned corrections."""
-        session = self._get_session()
         
-        total = session.query(LearningModel).count()
-        high_confidence = session.query(LearningModel).filter(
+        total = self.session.query(LearningModel).count()
+        high_confidence = self.session.query(LearningModel).filter(
             LearningModel.confidence >= 70
         ).count()
         
@@ -159,7 +157,7 @@ class SelfImprovingSelector:
         avg_confidence = 0.0
         if total > 0:
             from sqlalchemy import func
-            result = session.query(func.avg(LearningModel.confidence)).scalar()
+            result = self.session.query(func.avg(LearningModel.confidence)).scalar()
             avg_confidence = float(result) if result else 0.0
         
         return {

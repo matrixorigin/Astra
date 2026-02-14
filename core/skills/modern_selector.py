@@ -5,6 +5,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from api.database import SessionLocal
 from core.logging_config import get_logger
 from core.skills.selector import SkillMetadata, SkillSelector
 
@@ -15,9 +16,20 @@ class ModernSkillSelector:
     """Skill selector using native LLM function calling (OpenAI/Gemini/DeepSeek)."""
 
     def __init__(self, session: Session | None = None, llm_client=None):
-        self._session = session
+        self._owns_session = session is None
+        self.session = session or SessionLocal()
         self.llm = llm_client
-        self.rule_selector = SkillSelector(session)  # For retrieval
+        self.rule_selector = SkillSelector(self.session)  # For retrieval
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        if self._owns_session:
+            self.session.close()
 
     def get_tools_schema(
         self,
@@ -97,12 +109,12 @@ class ModernSkillSelector:
             # Get skill from registry
             from core.skills.registry import SkillRegistry
 
-            registry = SkillRegistry(self.db)
-            skill_instance = registry.get(skill.name)
+            registry = SkillRegistry(self.session)
+            skill_def = registry.get_skill(skill.name)
 
-            if skill_instance and hasattr(skill_instance, "input_schema"):
+            if skill_def and hasattr(skill_def, "requirements"):
                 # Use Pydantic model's schema
-                input_model = skill_instance.input_schema
+                input_model = skill_def.requirements
                 if hasattr(input_model, "model_json_schema"):
                     # Pydantic v2
                     parameters = input_model.model_json_schema()

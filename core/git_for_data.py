@@ -6,7 +6,7 @@ Provides snapshot, restore, and time-travel capabilities.
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 
 
 class GitForData:
@@ -22,7 +22,19 @@ class GitForData:
         Args:
             db: Session instance. If None, creates a new one.
         """
-        self.db = db or next(get_db_session())
+        self._owns_session = db is None
+        self.db = db or SessionLocal()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Close the session if it was created by this instance."""
+        if self._owns_session:
+            self.db.close()
 
     def create_snapshot(self, snapshot_name: str, account: str = "sys") -> dict:
         """Create a snapshot of the current database state.

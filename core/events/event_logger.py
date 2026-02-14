@@ -8,7 +8,7 @@ import json
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.models import Event as EventModel
 from core.events.models import ConversationEvent, EventType
 
@@ -25,19 +25,19 @@ class EventLogger:
         Args:
             session: SQLAlchemy session. If None, creates a new one.
         """
-        self._session = session
         self._owns_session = session is None
+        self.session = session or SessionLocal()
 
-    def _get_session(self) -> Session:
-        """Get or create session."""
-        if self._session is None:
-            self._session = next(get_db_session())
-        return self._session
+    def __enter__(self):
+        return self
 
-    def __del__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
         """Close session if we own it."""
-        if self._owns_session and self._session:
-            self._session.close()
+        if self._owns_session:
+            self.session.close()
 
     def log_event(self, event: ConversationEvent) -> str:
         """Log a conversation event to the database.
@@ -51,7 +51,6 @@ class EventLogger:
         Raises:
             Exception: If database operation fails
         """
-        session = self._get_session()
         
         db_event = EventModel(
             event_id=event.event_id,
@@ -78,8 +77,8 @@ class EventLogger:
             llm_params=event.llm_params,
         )
         
-        session.add(db_event)
-        session.commit()
+        self.session.add(db_event)
+        self.session.commit()
         return event.event_id
 
     def create_plan_event(

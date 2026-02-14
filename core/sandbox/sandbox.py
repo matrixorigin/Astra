@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from core.git_for_data import GitForData
 from core.validation import validate_identifier
 
@@ -24,12 +24,18 @@ class Sandbox:
         self.source_db = source_db
         self.account = account
         self._owns_session = db is None
-        self.db = db or next(get_db_session())
+        self.db = db or SessionLocal()
         self.git = GitForData(self.db)
 
-    def __del__(self):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
         """Close session if owned."""
-        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
+        if self._owns_session:
             self.db.close()
 
     def create(

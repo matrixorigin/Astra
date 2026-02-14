@@ -10,7 +10,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
 from core.skills.auditable_selector import AuditableSkillSelector
@@ -22,20 +22,22 @@ class SkillSelectionRegressionGate:
     """Regression gate for skill selector changes."""
 
     def __init__(self, llm_client, session: Session | None = None, account: str = "sys"):
-        self._session = session
         self._owns_session = session is None
+        self.session = session or SessionLocal()
         self.llm = llm_client
         self.account = account
-        self.sandbox = Sandbox(db=None, account=account)
+        self.sandbox = Sandbox(db=self.session, account=account)
+        self._ensure_tables()
 
-    def _get_session(self) -> Session:
-        if self._session is None:
-            self._session = next(get_db_session())
-        return self._session
+    def __enter__(self):
+        return self
 
-    def __del__(self):
-        if self._owns_session and self._session:
-            self._session.close()
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        if self._owns_session:
+            self.session.close()
 
     def _ensure_tables(self):
         """Ensure gate tables exist - no-op as tables are created by ORM."""
@@ -101,10 +103,8 @@ class SkillSelectionRegressionGate:
         """Get gate statistics."""
         from sqlalchemy import text
         
-        session = self._get_session()
-        
         # Query stats using raw SQL
-        result = session.execute(text("""
+        result = self.session.execute(text("""
             SELECT 
                 COUNT(*) as total,
                 SUM(CASE WHEN verdict = 'PASS' THEN 1 ELSE 0 END) as passed,

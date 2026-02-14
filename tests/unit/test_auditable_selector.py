@@ -181,12 +181,11 @@ class TestAuditableSkillSelector:
 
     def test_create_selection_snapshot_fallback(self, selector):
         """Test snapshot creation fallback."""
-        # Mock session to raise error
-        with patch.object(selector, '_get_session', side_effect=Exception("DB error")):
-            snapshot_id = selector._create_selection_snapshot("sess-1", "evt-1")
-            
-            # Should fallback to timestamp
-            assert "snapshot_" in snapshot_id
+        # Snapshot functionality is disabled, should return timestamp-based ID
+        snapshot_id = selector._create_selection_snapshot("sess-1", "evt-1")
+        
+        # Should return timestamp-based snapshot
+        assert "snapshot_" in snapshot_id
 
     def test_get_available_skills_empty(self, selector, db):
         """Test getting skills when none exist."""

@@ -5,7 +5,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.models import SkillRegistry as SkillModel
 from core.logging_config import get_logger
 
@@ -31,25 +31,25 @@ class SkillSelector:
     """Rule-based skill selector with keyword matching."""
 
     def __init__(self, session: Session | None = None):
-        self._session = session
         self._owns_session = session is None
+        self.session = session or SessionLocal()
         self._load_skills()
 
-    def _get_session(self) -> Session:
-        if self._session is None:
-            self._session = next(get_db_session())
-        return self._session
+    def __enter__(self):
+        return self
 
-    def __del__(self):
-        if self._owns_session and self._session:
-            self._session.close()
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        if self._owns_session:
+            self.session.close()
 
     def _load_skills(self):
         """Load skills with metadata from database."""
         self.skills = {}
         
-        session = self._get_session()
-        skills_data = session.query(SkillModel).filter(SkillModel.is_active == 1).all()
+        skills_data = self.session.query(SkillModel).filter(SkillModel.is_active == 1).all()
 
         for skill in skills_data:
             metadata = SkillMetadata(
