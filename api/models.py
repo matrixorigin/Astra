@@ -352,7 +352,7 @@ class SkillSelectionLearning(Base):
     __tablename__ = "skill_selection_learning"
     learning_id = Column(String(36), primary_key=True)
     query_pattern = Column(String(255), nullable=False, index=True)
-    query_embedding = Column(JSON)
+    query_embedding = Column(Text)
     wrong_skills = Column(JSON)
     correct_skills = Column(JSON)
     improvement_score = Column(Float)

@@ -210,11 +210,12 @@ class TestSelfImprovingSelector:
 
         service = EmbeddingService(db, provider="mock")
         embedding = service.embed_text("Review PR #123")
+        embedding_vec_str = self_improving._embedding_to_vec_str(embedding)
 
         learning = SkillSelectionLearning(
             learning_id=f"learn-sem-{uuid.uuid4().hex[:8]}",
             query_pattern="unrelated pattern",
-            query_embedding=embedding,
+            query_embedding=embedding_vec_str,
             wrong_skills=["summarize_pr"],
             correct_skills=["code_review"],
             confidence=0.9,
@@ -295,11 +296,12 @@ class TestSelfImprovingSelector:
 
         service = EmbeddingService(db, provider="mock")
         embedding = service.embed_text("Review PR #123")
+        embedding_vec_str = self_improving._embedding_to_vec_str(embedding)
 
         learning = SkillSelectionLearning(
             learning_id=f"learn-th-{uuid.uuid4().hex[:8]}",
             query_pattern="unrelated pattern",
-            query_embedding=embedding,
+            query_embedding=embedding_vec_str,
             wrong_skills=["summarize_pr"],
             correct_skills=["code_review"],
             confidence=0.9,
@@ -327,6 +329,89 @@ class TestSelfImprovingSelector:
 
         assert corrected == candidates
 
+    def test_semantic_match_limit_config(self, self_improving, db):
+        """Test semantic match limit is configurable."""
+        from api.models import Config, SkillSelectionLearning
+        from core.context.embeddings import EmbeddingService
+
+        db.query(Config).filter(
+            Config.key_name.in_(
+                [
+                    "selector_semantic_similarity_threshold",
+                    "selector_semantic_match_limit",
+                ]
+            )
+        ).delete()
+        db.query(SkillSelectionLearning).delete()
+        db.commit()
+
+        db.add(
+            Config(
+                key_name="selector_semantic_match_limit",
+                value="1",
+            )
+        )
+        db.commit()
+
+        service = EmbeddingService(db, provider="mock")
+        query_text = "Review PR #123"
+        embedding = service.embed_text(query_text)
+        embedding_vec_str = self_improving._embedding_to_vec_str(embedding)
+        other_embedding = service.embed_text("Other query")
+        other_vec_str = self_improving._embedding_to_vec_str(other_embedding)
+
+        # Create two learnings with unique IDs
+        learning_id_1 = f"learn-lim-{uuid.uuid4().hex[:8]}"
+        learning_id_2 = f"learn-lim-{uuid.uuid4().hex[:8]}"
+        
+        learning1 = SkillSelectionLearning(
+            learning_id=learning_id_1,
+            query_pattern="unrelated pattern",
+            query_embedding=embedding_vec_str,
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            confidence=0.9,
+            evidence_count=5,
+        )
+        learning2 = SkillSelectionLearning(
+            learning_id=learning_id_2,
+            query_pattern="unrelated pattern",
+            query_embedding=other_vec_str,
+            wrong_skills=["summarize_pr"],
+            correct_skills=["write_tests"],
+            confidence=0.9,
+            evidence_count=5,
+        )
+        db.add(learning1)
+        db.add(learning2)
+        db.commit()
+
+        candidates = [
+            SkillMetadata(
+                name="summarize_pr", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=6, cost_estimate="low"
+            ),
+            SkillMetadata(
+                name="code_review", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=8, cost_estimate="medium"
+            ),
+            SkillMetadata(
+                name="write_tests", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=7, cost_estimate="medium"
+            ),
+        ]
+
+        self_improving._runtime_config_cache = None
+        self_improving._runtime_config_loaded_at = None
+        self_improving.apply_learnings(query_text, candidates)
+
+        learnings = db.query(SkillSelectionLearning).all()
+        applied_total = sum(learning.applied_count for learning in learnings)
+        assert applied_total == 1
+
     def test_parse_embedding(self, self_improving):
         """Test parsing embeddings from various formats."""
         raw_list = [0.1, 0.2]
@@ -338,10 +423,26 @@ class TestSelfImprovingSelector:
         assert self_improving._parse_embedding("not-json") is None
         assert self_improving._parse_embedding(None) is None
 
+    def test_embedding_to_vec_str_round_trip(self, self_improving):
+        """Test embedding serialization round-trip."""
+        raw_list = [0.1, 0.2]
+        vec_str = self_improving._embedding_to_vec_str(raw_list)
+        assert self_improving._parse_embedding(vec_str) == raw_list
+        assert vec_str.startswith("[")
+        assert vec_str.endswith("]")
+        assert " " not in vec_str
+
     def test_cosine_similarity(self, self_improving):
         """Test cosine similarity calculations."""
         assert self_improving._cosine_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0
         assert self_improving._cosine_similarity([1.0, 0.0], [0.0, 1.0]) == 0.0
+
+    def test_l2_similarity(self, self_improving):
+        """Test L2 similarity calculations."""
+        assert self_improving._l2_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0
+        assert self_improving._l2_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(
+            1.0 / (1.0 + (2.0 ** 0.5))
+        )
 
     def test_extract_context_features(self, self_improving):
         """Test context feature extraction."""

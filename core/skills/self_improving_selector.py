@@ -41,8 +41,10 @@ logger = get_logger(__name__)
 CONFIG_KEY_LEARNING_WEIGHTS = "selector_learning_weights"
 CONFIG_KEY_LEARNING_DECAY = "selector_learning_decay"
 CONFIG_KEY_SEMANTIC_SIMILARITY = "selector_semantic_similarity_threshold"
+CONFIG_KEY_SEMANTIC_MATCH_LIMIT = "selector_semantic_match_limit"
 RUNTIME_CONFIG_TTL_SECONDS = 30
 SEMANTIC_SIMILARITY_THRESHOLD = 0.78
+SEMANTIC_MATCH_LIMIT = 50
 
 
 class SelfImprovingSelector:
@@ -79,11 +81,30 @@ class SelfImprovingSelector:
         inspector = inspect(self.session.bind)
         if "skill_selection_learning" not in inspector.get_table_names():
             return
-        columns = {col["name"] for col in inspector.get_columns("skill_selection_learning")}
+        columns_info = inspector.get_columns("skill_selection_learning")
+        columns = {col["name"] for col in columns_info}
         if "query_embedding" not in columns:
             self.session.execute(
-                text("ALTER TABLE skill_selection_learning ADD COLUMN query_embedding JSON")
+                text("ALTER TABLE skill_selection_learning ADD COLUMN query_embedding TEXT")
             )
+        else:
+            column_types = {
+                col["name"]: str(col.get("type", "")).lower() for col in columns_info
+            }
+            if "text" not in column_types.get("query_embedding", ""):
+                try:
+                    self.session.execute(
+                        text(
+                            "ALTER TABLE skill_selection_learning MODIFY COLUMN query_embedding TEXT"
+                        )
+                    )
+                    self.session.execute(
+                        text(
+                            "UPDATE skill_selection_learning SET query_embedding = CAST(query_embedding AS CHAR) WHERE query_embedding IS NOT NULL"
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(f"Failed to migrate query_embedding column to TEXT: {exc}")
         if "context_features" not in columns:
             self.session.execute(
                 text("ALTER TABLE skill_selection_learning ADD COLUMN context_features JSON")
@@ -291,12 +312,13 @@ class SelfImprovingSelector:
             LearningModel.signal_type == signal.signal_type.value
         ).first()
         embedding = self._embed_query(signal.query_pattern)
+        embedding_vec_str = self._embedding_to_vec_str(embedding)
         
         if existing:
             existing.evidence_count += 1
             existing.confidence = min(99, existing.evidence_count * 10)
-            if existing.query_embedding is None and embedding is not None:
-                existing.query_embedding = embedding
+            if existing.query_embedding is None and embedding_vec_str is not None:
+                existing.query_embedding = embedding_vec_str
             if existing.context_features is None and signal.context_features is not None:
                 existing.context_features = signal.context_features
             # Update target metrics with weighted average
@@ -316,7 +338,7 @@ class SelfImprovingSelector:
             learning = LearningModel(
                 learning_id=str(uuid7()),
                 query_pattern=signal.query_pattern,
-                query_embedding=embedding,
+                query_embedding=embedding_vec_str,
                 wrong_skills=signal.wrong_skills,
                 correct_skills=signal.correct_skills,
                 improvement_score=10.0,
@@ -346,6 +368,11 @@ class SelfImprovingSelector:
         decay = runtime_config["decay"]
         similarity_threshold = runtime_config["semantic_similarity_threshold"]
 
+        similarity_map = self._semantic_similarity_map(
+            query_embedding,
+            similarity_threshold,
+            runtime_config["semantic_match_limit"],
+        )
         learnings = self.session.query(LearningModel).all()
         matched = []
         semantic_matches = 0
@@ -360,13 +387,17 @@ class SelfImprovingSelector:
             if not self._context_matches(learning.context_features, query_features):
                 continue
             similarity = None
-            learning_embedding = self._parse_embedding(learning.query_embedding)
-            if query_embedding is not None and learning_embedding is not None:
-                similarity = self._cosine_similarity(query_embedding, learning_embedding)
-                if similarity >= similarity_threshold:
-                    matched.append((learning, similarity))
-                    semantic_matches += 1
-                    continue
+            if similarity_map is not None:
+                if learning.learning_id in similarity_map:
+                    similarity = similarity_map[learning.learning_id]
+            else:
+                learning_embedding = self._parse_embedding(learning.query_embedding)
+                if query_embedding is not None and learning_embedding is not None:
+                    similarity = self._l2_similarity(query_embedding, learning_embedding)
+            if similarity is not None and similarity >= similarity_threshold:
+                matched.append((learning, similarity))
+                semantic_matches += 1
+                continue
             if learning.query_pattern.lower() in query_lower:
                 matched.append((learning, 1.0))
                 substring_matches += 1
@@ -464,6 +495,70 @@ class SelfImprovingSelector:
         except Exception as exc:
             logger.warning(f"Embedding generation failed: {exc}")
             return None
+
+    def _embedding_to_vec_str(self, embedding: list[float] | None) -> str | None:
+        if not embedding:
+            return None
+        vector = [float(value) for value in embedding]
+        return json.dumps(vector, separators=(",", ":"))
+
+    def _semantic_similarity_map(
+        self, query_embedding: list[float] | None, threshold: float, limit: int | None = None
+    ) -> dict[str, float] | None:
+        if query_embedding is None:
+            return None
+        if not hasattr(self.session, "bind") or self.session.bind is None:
+            return None
+        vec_str = self._embedding_to_vec_str(query_embedding)
+        if vec_str is None:
+            return None
+        from sqlalchemy import text
+        if limit is None:
+            limit = SEMANTIC_MATCH_LIMIT
+        try:
+            rows = self.session.execute(
+                text(
+                    """
+                    SELECT
+                        learning_id,
+                        similarity
+                    FROM (
+                        SELECT
+                            learning_id,
+                            1.0 / (1.0 + L2_DISTANCE(query_embedding, :vec)) AS similarity
+                        FROM skill_selection_learning
+                        WHERE query_embedding IS NOT NULL
+                    ) ranked
+                    WHERE similarity >= :threshold
+                    ORDER BY similarity DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"vec": vec_str, "limit": limit, "threshold": threshold},
+            ).fetchall()
+        except Exception as exc:
+            logger.warning(f"Semantic similarity SQL failed: {exc}")
+            return None
+        similarity_map = {
+            str(row.learning_id): float(row.similarity)
+            for row in rows
+            if row.similarity is not None and row.similarity >= threshold  # Safety check for floating point precision
+        }
+        if not similarity_map:
+            return None
+        return similarity_map
+
+    def _l2_similarity(self, left: list[float], right: list[float]) -> float:
+        if not left or not right:
+            return 0.0
+        if len(left) != len(right):
+            return 0.0
+        distance = 0.0
+        for i in range(len(left)):
+            diff = float(left[i]) - float(right[i])
+            distance += diff * diff
+        distance = math.sqrt(distance)
+        return 1.0 / (1.0 + distance)
 
     def _parse_embedding(self, value: Any) -> list[float] | None:
         if value is None:
@@ -655,6 +750,7 @@ class SelfImprovingSelector:
             "weights_per_signal": runtime_config["weights_per_signal"],
             "decay": runtime_config["decay"],
             "semantic_similarity_threshold": runtime_config["semantic_similarity_threshold"],
+            "semantic_match_limit": runtime_config["semantic_match_limit"],
         }
 
     def _load_runtime_config(self) -> dict[str, Any]:
@@ -673,6 +769,7 @@ class SelfImprovingSelector:
                                 CONFIG_KEY_LEARNING_WEIGHTS,
                                 CONFIG_KEY_LEARNING_DECAY,
                                 CONFIG_KEY_SEMANTIC_SIMILARITY,
+                                CONFIG_KEY_SEMANTIC_MATCH_LIMIT,
                             ]
                         )
                     )
@@ -697,6 +794,7 @@ class SelfImprovingSelector:
             "per_signal": {},
         }
         semantic_similarity_threshold = SEMANTIC_SIMILARITY_THRESHOLD
+        semantic_match_limit = SEMANTIC_MATCH_LIMIT
 
         from api.models import Config
 
@@ -708,6 +806,7 @@ class SelfImprovingSelector:
                         CONFIG_KEY_LEARNING_WEIGHTS,
                         CONFIG_KEY_LEARNING_DECAY,
                         CONFIG_KEY_SEMANTIC_SIMILARITY,
+                        CONFIG_KEY_SEMANTIC_MATCH_LIMIT,
                     ]
                 )
             )
@@ -739,12 +838,19 @@ class SelfImprovingSelector:
                     semantic_similarity_threshold = float(parsed["threshold"])
                 elif isinstance(parsed, (int, float, str)):
                     semantic_similarity_threshold = float(parsed)
+            elif cfg.key_name == CONFIG_KEY_SEMANTIC_MATCH_LIMIT:
+                parsed = self._parse_json_config(cfg.value)
+                if isinstance(parsed, dict) and "limit" in parsed:
+                    semantic_match_limit = int(parsed["limit"])
+                elif isinstance(parsed, (int, float, str)):
+                    semantic_match_limit = int(float(parsed))
 
         self._runtime_config_cache = {
             "weights": weights,
             "weights_per_signal": per_signal_weights,
             "decay": decay,
             "semantic_similarity_threshold": semantic_similarity_threshold,
+            "semantic_match_limit": semantic_match_limit,
         }
         self._runtime_config_loaded_at = now
         self._runtime_config_last_updated_at = latest_updated_at
