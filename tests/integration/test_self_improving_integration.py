@@ -13,9 +13,9 @@ class TestSelfImprovingSelectorIntegration:
     """Test self-improving selector integration with regression gating."""
 
     @pytest.fixture(autouse=True)
-    def setup(self):
+    def setup(self, db_session):
         """Setup test database."""
-        self.db = next(get_db_session())
+        self.db = db_session
         self.llm_client = None  # Mock LLM not needed for this test
         
         # Clean up test data
@@ -31,7 +31,6 @@ class TestSelfImprovingSelectorIntegration:
         self.db.query(SkillSelectionLearning).delete()
         self.db.query(SelectorGateResult).delete()
         self.db.commit()
-        self.db.close()
 
     def test_selector_with_learning_enabled(self):
         """Test AgentSkillSelector with learning enabled."""

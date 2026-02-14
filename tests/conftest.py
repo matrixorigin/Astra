@@ -20,24 +20,17 @@ TEST_DATABASE_URL = f"mysql+pymysql://{TEST_DATABASE_CONFIG['user']}:{TEST_DATAB
 @pytest.fixture(scope="session")
 def test_engine():
     """Create test database engine with separate MatrixOne instance/database."""
-    # Connect without database to create test DB
-    base_url = f"mysql+pymysql://{TEST_DATABASE_CONFIG['user']}:{TEST_DATABASE_CONFIG['password']}@{TEST_DATABASE_CONFIG['host']}:{TEST_DATABASE_CONFIG['port']}"
-    base_engine = create_engine(base_url)
-    
-    # Create test database if not exists
-    with base_engine.connect() as conn:
-        conn.execute(text(f"DROP DATABASE IF EXISTS {TEST_DATABASE_CONFIG['database']}"))
-        conn.execute(text(f"CREATE DATABASE {TEST_DATABASE_CONFIG['database']}"))
-        conn.commit()
-    
-    # Connect to test database
-    engine = create_engine(TEST_DATABASE_URL, echo=False)
+    # Connect to test database directly (assume it exists)
+    engine = create_engine(TEST_DATABASE_URL, echo=False, pool_pre_ping=True)
     
     # Create tables in test database
     from api.models import Base
     Base.metadata.create_all(engine)
     
     yield engine
+    
+    # Cleanup: dispose engine to close all connections
+    engine.dispose()
 
 
 @pytest.fixture(scope="session") 
@@ -52,9 +45,14 @@ def db_session(test_session_factory):
     session = test_session_factory()
     try:
         yield session
-    finally:
-        # Rollback any uncommitted changes
+        # Commit if test succeeded
+        session.commit()
+    except Exception:
+        # Rollback on error
         session.rollback()
+        raise
+    finally:
+        # Always close to release locks
         session.close()
 
 
@@ -90,16 +88,26 @@ def override_db_dependency(db_session, monkeypatch):
     from api import database
     monkeypatch.setattr(database, "get_db_session", mock_get_db_session)
     
-    # Override in api.dependencies
-    import api.dependencies
-    monkeypatch.setattr(api.dependencies, "get_db_session", mock_get_db_session)
+    # Override in api.dependencies (if exists)
+    try:
+        import api.dependencies
+        monkeypatch.setattr(api.dependencies, "get_db_session", mock_get_db_session)
+    except (ImportError, AttributeError):
+        pass
     
-    # Override FastAPI dependency
-    from api.main import app
-    app.dependency_overrides[original_get_db_session] = lambda: db_session
+    # Override FastAPI dependency (only if app is imported)
+    try:
+        from api.main import app
+        app.dependency_overrides[original_get_db_session] = lambda: db_session
+    except ImportError:
+        pass
     
     yield
     
     # Clear overrides
-    app.dependency_overrides = {}
+    try:
+        from api.main import app
+        app.dependency_overrides.clear()
+    except ImportError:
+        pass
 

@@ -12,6 +12,15 @@ from core.skills.learning_signals import SignalType, SignalThresholds
 class TestMetricRecording:
     """Test automatic metric recording during skill execution."""
     
+    @pytest.fixture(autouse=True)
+    def setup(self, db):
+        """Clean up test data before each test."""
+        db.query(SkillExecutionMetric).delete()
+        db.commit()
+        yield
+        db.query(SkillExecutionMetric).delete()
+        db.commit()
+    
     def test_record_execution_metrics_directly(self, db):
         """Test that _record_execution_metrics writes to database."""
         from core.agent.executor import AgentExecutor
