@@ -35,7 +35,7 @@ def full_setup(db, mock_llm):
     selector = AuditableSkillSelector(db, mock_llm)
     selector._ensure_table()
     
-    gate = SkillSelectionRegressionGate(db, mock_llm)
+    gate = SkillSelectionRegressionGate(mock_llm, db)
     gate._ensure_tables()
     
     si = SelfImprovingSelector(db, mock_llm)

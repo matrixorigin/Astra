@@ -1,9 +1,10 @@
 """Tests for streaming API endpoints."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from sqlalchemy.orm import Session
 
 from core.events.models import StreamEvent, StreamEventType
 
@@ -11,10 +12,11 @@ from core.events.models import StreamEvent, StreamEventType
 @pytest.fixture
 def mock_db():
     """Mock database - SQLAlchemy style."""
-    db = MagicMock()
+    db = Mock(spec=Session)
     mock_result = MagicMock()
     mock_result.first.return_value = MagicMock(session_id="sess_123")
     db.execute.return_value = mock_result
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(session_id="sess_123")
     return db
 
 

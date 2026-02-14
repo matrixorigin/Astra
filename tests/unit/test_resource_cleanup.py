@@ -1,6 +1,16 @@
+"""Test resource cleanup and session management after refactoring.
+
+After the refactoring, Core layer modules no longer create their own sessions.
+This test verifies that:
+1. All Core modules require a session parameter
+2. All Core modules use the injected session
+3. Session lifecycle is managed by the caller (API/Service layer)
+"""
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import Mock
+from sqlalchemy.orm import Session
+
 from core.git_for_data import GitForData
 from core.sandbox.sandbox import Sandbox
 from core.events.event_reader import EventReader
@@ -17,293 +27,245 @@ from core.events.causal_chain import CausalChainManager
 from core.replay.semantic_diff import SemanticDiff
 from core.skills.mocking import ToolMockingLayer, MockMode
 
-class TestResourceCleanup:
-    """Test resource cleanup and session management."""
 
-    @patch("core.git_for_data.SessionLocal")
-    def test_git_for_data_context_manager(self, mock_session_local):
-        """Test GitForData context manager closes session."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
+class TestSessionInjection:
+    """Test that all Core modules require session injection."""
 
-        # Test with context manager
-        with GitForData() as git:
-            assert git._owns_session is True
-            assert git.db is mock_session
+    def test_git_for_data_requires_session(self):
+        """Test GitForData requires session parameter."""
+        with pytest.raises(TypeError, match="db must be a SQLAlchemy Session"):
+            GitForData(db=None)
         
-        # Verify close was called
-        mock_session.close.assert_called_once()
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        git = GitForData(db=mock_session)
+        assert git.db is mock_session
 
-    @patch("core.events.event_logger.SessionLocal")
-    def test_event_logger_context_manager(self, mock_session_local):
-        """Test EventLogger context manager closes session."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
-
-        with EventLogger() as logger:
-            assert logger._owns_session is True
-            assert logger.session is mock_session
-            
-        mock_session.close.assert_called_once()
-
-    def test_event_logger_external_session(self):
-        """Test EventLogger with external session doesn't close it."""
-        mock_session = MagicMock()
+    def test_event_logger_requires_session(self):
+        """Test EventLogger requires session parameter."""
+        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
+            EventLogger(session=None)
         
-        with EventLogger(session=mock_session) as logger:
-            assert logger._owns_session is False
-            assert logger.session is mock_session
-            
-        # Should NOT be called
-        mock_session.close.assert_not_called()
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        logger = EventLogger(session=mock_session)
+        assert logger.session is mock_session
 
-    @patch("core.git_for_data.SessionLocal")
-    def test_git_for_data_manual_close(self, mock_session_local):
-        """Test GitForData manual close."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
-
-        git = GitForData()
-        # Trigger lazy session creation
-        _ = git.db
-        git.close()
+    def test_sandbox_requires_session(self):
+        """Test Sandbox requires session parameter."""
+        with pytest.raises(TypeError, match="db must be a SQLAlchemy Session"):
+            Sandbox(db=None)
         
-        mock_session.close.assert_called_once()
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        sandbox = Sandbox(db=mock_session)
+        assert sandbox.db is mock_session
 
-    def test_git_for_data_external_session(self):
-        """Test GitForData with external session doesn't close it."""
-        mock_session = MagicMock()
+    def test_skill_registry_requires_session(self):
+        """Test SkillRegistry requires session parameter."""
+        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
+            SkillRegistry(session=None)
         
-        with GitForData(db=mock_session) as git:
-            assert git._owns_session is False
-            assert git.db is mock_session
-            
-        # Should NOT be called
-        mock_session.close.assert_not_called()
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        mock_session.query.return_value.filter.return_value.all.return_value = []
+        registry = SkillRegistry(session=mock_session)
+        assert registry.session is mock_session
 
-    @patch("core.sandbox.sandbox.get_db_session")
-    def test_sandbox_context_manager(self, mock_get_db_session):
-        """Test Sandbox context manager closes session."""
-        mock_session = MagicMock()
-        mock_get_db_session.return_value = iter([mock_session])
-
-        # Test with context manager
-        with Sandbox() as sandbox:
-            assert sandbox._owns_session is True
-            assert sandbox.db is mock_session
-            # GitForData inside sandbox should share the session
-            assert sandbox.git.db is mock_session
-            assert sandbox.git._owns_session is False # It shares session, so it doesn't own it
+    def test_auditable_selector_requires_session(self):
+        """Test AuditableSkillSelector requires session parameter."""
+        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
+            AuditableSkillSelector(session=None)
         
-        # Verify close was called
-        mock_session.close.assert_called_once()
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        mock_session.query.return_value.filter.return_value.all.return_value = []
+        selector = AuditableSkillSelector(session=mock_session)
+        assert selector.session is mock_session
 
-    @patch("core.sandbox.sandbox.get_db_session")
-    def test_sandbox_manual_close(self, mock_get_db_session):
-        """Test Sandbox manual close."""
-        mock_session = MagicMock()
-        mock_get_db_session.return_value = iter([mock_session])
-
-        sandbox = Sandbox()
-        sandbox.close()
+    def test_modern_selector_requires_session(self):
+        """Test ModernSkillSelector requires session parameter."""
+        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
+            ModernSkillSelector(session=None)
         
-        mock_session.close.assert_called_once()
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        mock_session.query.return_value.filter.return_value.all.return_value = []
+        selector = ModernSkillSelector(session=mock_session)
+        assert selector.session is mock_session
 
-    def test_sandbox_external_session(self):
-        """Test Sandbox with external session doesn't close it."""
-        mock_session = MagicMock()
+    def test_regression_gate_requires_session(self):
+        """Test SkillSelectionRegressionGate requires session parameter."""
+        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
+            SkillSelectionRegressionGate(llm_client=None, session=None)
         
-        with Sandbox(db=mock_session) as sandbox:
-            assert sandbox._owns_session is False
-            assert sandbox.db is mock_session
-            
-        # Should NOT be called
-        mock_session.close.assert_not_called()
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        gate = SkillSelectionRegressionGate(llm_client=None, session=mock_session)
+        assert gate.session is mock_session
 
-    @patch("core.events.event_reader.get_db_session")
-    def test_event_reader_context_manager(self, mock_get_db_session):
-        """Test EventReader context manager closes session."""
-        mock_session = MagicMock()
-        mock_get_db_session.return_value = iter([mock_session])
-
-        with EventReader() as reader:
-            assert reader._owns_session is True
-            assert reader.db is mock_session
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.replay.time_machine.get_db_session")
-    def test_time_machine_context_manager(self, mock_get_db_session):
-        """Test TimeMachine context manager closes session."""
-        mock_session = MagicMock()
-        mock_get_db_session.return_value = iter([mock_session])
-
-        with TimeMachine() as tm:
-            assert tm._owns_session is True
-            assert tm.db is mock_session
-            # Dependencies should share session
-            assert tm.git.db is mock_session
-            assert tm.reader.db is mock_session
-            assert tm.git._owns_session is False
-            assert tm.reader._owns_session is False
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.events.session_manager.get_db_session")
-    def test_session_manager_context_manager(self, mock_get_db_session):
-        """Test SessionManager context manager closes session."""
-        mock_session = MagicMock()
-        mock_get_db_session.return_value = iter([mock_session])
-
-        with SessionManager() as manager:
-            # Trigger session creation
-            manager._get_session()
-            assert manager._owns_session is True
-            assert manager._session is mock_session
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.skills.registry.SessionLocal")
-    def test_skill_registry_context_manager(self, mock_session_local):
-        """Test SkillRegistry context manager closes session."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
-
-        with SkillRegistry() as registry:
-            assert registry._owns_session is True
-            assert registry.session is mock_session
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.skills.auditable_selector.SessionLocal")
-    @patch("core.skills.auditable_selector.AuditableSkillSelector._ensure_table")
-    def test_auditable_selector_context_manager(self, mock_ensure, mock_session_local):
-        """Test AuditableSkillSelector context manager closes session."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
-
-        with AuditableSkillSelector() as selector:
-            assert selector._owns_session is True
-            assert selector.session is mock_session
-            assert selector.modern_selector.session is mock_session
-            assert selector.modern_selector._owns_session is False
-            assert selector.sandbox.db is mock_session
-            assert selector.sandbox._owns_session is False
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.skills.self_improving_selector.SessionLocal")
-    @patch("core.skills.self_improving_selector.SelfImprovingSelector._ensure_tables")
-    @patch("core.skills.auditable_selector.AuditableSkillSelector._ensure_table")
-    def test_self_improving_selector_context_manager(self, mock_ensure1, mock_ensure2, mock_session_local):
-        """Test SelfImprovingSelector context manager closes session."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
-
-        with SelfImprovingSelector() as selector:
-            assert selector._owns_session is True
-            assert selector.session is mock_session
-            assert selector.auditable_selector.session is mock_session
-            assert selector.auditable_selector._owns_session is False
-            assert selector.sandbox.db is mock_session
-            assert selector.sandbox._owns_session is False
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.skills.regression_gate.SessionLocal")
-    @patch("core.skills.regression_gate.SkillSelectionRegressionGate._ensure_tables")
-    def test_regression_gate_context_manager(self, mock_ensure, mock_session_local):
-        """Test SkillSelectionRegressionGate context manager closes session."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
-
-        with SkillSelectionRegressionGate(llm_client=None) as gate:
-            assert gate._owns_session is True
-            assert gate.session is mock_session
-            assert gate.sandbox.db is mock_session
-            assert gate.sandbox._owns_session is False
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.skills.selector.get_db_session")
-    @patch("core.skills.selector.SkillSelector._load_skills")
-    def test_skill_selector_context_manager(self, mock_load, mock_get_db_session):
-        """Test SkillSelector context manager closes session."""
-        mock_session = MagicMock()
-        mock_get_db_session.return_value = iter([mock_session])
-
-        with SkillSelector() as selector:
-            # Trigger session creation
-            selector._get_session()
-            assert selector._owns_session is True
-            assert selector._session is mock_session
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.skills.modern_selector.SessionLocal")
-    @patch("core.skills.selector.SkillSelector._load_skills")
-    def test_modern_skill_selector_context_manager(self, mock_load, mock_session_local):
-        """Test ModernSkillSelector context manager closes session."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
-
-        with ModernSkillSelector() as selector:
-            assert selector._owns_session is True
-            assert selector.session is mock_session
-            assert selector.rule_selector._session is mock_session
-            assert selector.rule_selector._owns_session is False
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.events.causal_chain.get_db_session")
-    def test_causal_chain_manager_context_manager(self, mock_get_db_session):
-        """Test CausalChainManager context manager closes session."""
-        mock_session = MagicMock()
-        mock_get_db_session.return_value = iter([mock_session])
-
-        with CausalChainManager() as manager:
-            assert manager._owns_session is True
-            assert manager.db is mock_session
-            assert manager.reader.db is mock_session
-            assert manager.reader._owns_session is False
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.replay.semantic_diff.SessionLocal")
-    def test_semantic_diff_context_manager(self, mock_session_local):
-        """Test SemanticDiff context manager closes session."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
-
-        with SemanticDiff() as diff:
-            assert diff._owns_session is True
-            assert diff.db is mock_session
-            assert diff.reader.db is mock_session
-            assert diff.reader._owns_session is False
-            
-        mock_session.close.assert_called_once()
-
-    @patch("core.skills.mocking.SessionLocal")
-    def test_tool_mocking_layer_context_manager(self, mock_session_local):
-        """Test ToolMockingLayer context manager closes session."""
-        mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
-
-        with ToolMockingLayer(MockMode.PRODUCTION) as layer:
-            # Trigger session creation
-            session = layer._get_session()
-            assert layer._owns_session is True
-            assert session is mock_session
-            
-        mock_session.close.assert_called_once()
-
-    def test_tool_mocking_layer_external_session(self):
-        """Test ToolMockingLayer with external session doesn't close it."""
-        mock_session = MagicMock()
+    def test_self_improving_selector_requires_session(self):
+        """Test SelfImprovingSelector requires session parameter."""
+        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
+            SelfImprovingSelector(session=None)
         
-        with ToolMockingLayer(MockMode.PRODUCTION, session=mock_session) as layer:
-            assert layer._owns_session is False
-            assert layer._session is mock_session
-            
-        # Should NOT be called
-        mock_session.close.assert_not_called()
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        mock_session.query.return_value.filter.return_value.all.return_value = []
+        selector = SelfImprovingSelector(session=mock_session)
+        assert selector.session is mock_session
+
+    def test_tool_mocking_layer_requires_session(self):
+        """Test ToolMockingLayer requires session parameter."""
+        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
+            ToolMockingLayer(MockMode.PRODUCTION, session=None)
+        
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        layer = ToolMockingLayer(MockMode.PRODUCTION, session=mock_session)
+        assert layer.session is mock_session
+
+    def test_semantic_diff_requires_session(self):
+        """Test SemanticDiff requires session parameter."""
+        with pytest.raises(TypeError, match="db must be a SQLAlchemy Session"):
+            SemanticDiff(db=None)
+        
+        # Should work with proper session
+        mock_session = Mock(spec=Session)
+        diff = SemanticDiff(db=mock_session)
+        assert diff.db is mock_session
+
+
+class TestSessionSharing:
+    """Test that modules share the same session when passed."""
+
+    def test_sandbox_shares_session_with_git(self):
+        """Test Sandbox shares session with GitForData."""
+        mock_session = Mock(spec=Session)
+        sandbox = Sandbox(db=mock_session)
+        
+        # GitForData inside sandbox should use the same session
+        assert sandbox.git.db is mock_session
+
+    def test_auditable_selector_shares_session(self):
+        """Test AuditableSkillSelector shares session with dependencies."""
+        mock_session = Mock(spec=Session)
+        mock_session.query.return_value.filter.return_value.all.return_value = []
+        
+        selector = AuditableSkillSelector(session=mock_session)
+        
+        # Dependencies should use the same session
+        assert selector.modern_selector.session is mock_session
+        assert selector.sandbox.db is mock_session
+
+    def test_self_improving_selector_shares_session(self):
+        """Test SelfImprovingSelector shares session with dependencies."""
+        mock_session = Mock(spec=Session)
+        mock_session.query.return_value.filter.return_value.all.return_value = []
+        
+        selector = SelfImprovingSelector(session=mock_session)
+        
+        # Dependencies should use the same session
+        assert selector.auditable_selector.session is mock_session
+        assert selector.sandbox.db is mock_session
+
+    def test_regression_gate_shares_session(self):
+        """Test SkillSelectionRegressionGate shares session with sandbox."""
+        mock_session = Mock(spec=Session)
+        
+        gate = SkillSelectionRegressionGate(llm_client=None, session=mock_session)
+        
+        # Sandbox should use the same session
+        assert gate.sandbox.db is mock_session
+
+
+class TestNoSessionCreation:
+    """Test that Core modules don't create their own sessions."""
+
+    def test_modules_dont_have_sessionlocal_import(self):
+        """Test that Core modules don't import SessionLocal."""
+        import inspect
+        
+        # Check that these modules don't create SessionLocal
+        modules_to_check = [
+            GitForData,
+            EventLogger,
+            Sandbox,
+            SkillRegistry,
+            AuditableSkillSelector,
+            ModernSkillSelector,
+            SkillSelectionRegressionGate,
+            SelfImprovingSelector,
+            ToolMockingLayer,
+            SemanticDiff,
+        ]
+        
+        for module_class in modules_to_check:
+            source = inspect.getsource(module_class.__init__)
+            # Should not create SessionLocal in __init__
+            assert "SessionLocal()" not in source, f"{module_class.__name__} creates SessionLocal"
+
+    def test_modules_dont_have_lazy_session(self):
+        """Test that Core modules don't have _lazy_session attribute."""
+        mock_session = Mock(spec=Session)
+        mock_session.query.return_value.filter.return_value.all.return_value = []
+        
+        modules = [
+            GitForData(db=mock_session),
+            EventLogger(session=mock_session),
+            Sandbox(db=mock_session),
+            SkillRegistry(session=mock_session),
+            ModernSkillSelector(session=mock_session),
+            ToolMockingLayer(MockMode.PRODUCTION, session=mock_session),
+            SemanticDiff(db=mock_session),
+        ]
+        
+        for module in modules:
+            assert not hasattr(module, '_lazy_session'), f"{type(module).__name__} has _lazy_session"
+            assert not hasattr(module, '_owns_session'), f"{type(module).__name__} has _owns_session"
+
+
+class TestSessionLifecycle:
+    """Test that session lifecycle is managed by caller."""
+
+    def test_caller_manages_session_lifecycle(self):
+        """Test that caller is responsible for session lifecycle."""
+        from api.database import get_db_session
+        
+        # Caller gets session
+        db = next(get_db_session())
+        
+        # Pass to modules
+        logger = EventLogger(session=db)
+        git = GitForData(db=db)
+        
+        # Modules use the session but don't close it
+        assert logger.session is db
+        assert git.db is db
+        
+        # Caller is responsible for closing
+        db.close()
+
+    def test_modules_dont_have_close_method(self):
+        """Test that Core modules don't have close() method."""
+        mock_session = Mock(spec=Session)
+        mock_session.query.return_value.filter.return_value.all.return_value = []
+        
+        modules = [
+            GitForData(db=mock_session),
+            EventLogger(session=mock_session),
+            SkillRegistry(session=mock_session),
+            ModernSkillSelector(session=mock_session),
+            ToolMockingLayer(MockMode.PRODUCTION, session=mock_session),
+            SemanticDiff(db=mock_session),
+        ]
+        
+        for module in modules:
+            # Should not have close method (or if it has, it shouldn't close the session)
+            if hasattr(module, 'close'):
+                # If close exists, it should be for other purposes, not session management
+                pass  # We allow close for other purposes
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

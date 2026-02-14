@@ -3,10 +3,8 @@
 Provides high-level comparison of agent performance, not just data differences.
 """
 
-from core.events.causal_chain import CausalChainManager
 from core.events.event_reader import EventReader
 from sqlalchemy.orm import Session
-from api.database import SessionLocal, get_db_session
 
 
 class SemanticDiff:
@@ -16,53 +14,16 @@ class SemanticDiff:
     rather than just raw data differences.
     """
 
-    def __init__(self, db: Session | None = None) -> None:
+    def __init__(self, db: Session) -> None:
         """Initialize semantic diff analyzer.
 
         Args:
-            db: SQLAlchemy Session instance. If None, creates a new one.
+            db: SQLAlchemy Session instance (required).
         """
-        self._owns_session = db is None
-        self._db = db
-        self._lazy_session = None
-        self._reader = None
-
-    @property
-    def db(self) -> Session:
-        """Get session, creating one if needed."""
-        if self._db:
-            return self._db
-        
-        if not self._lazy_session:
-            self._lazy_session = SessionLocal()
-        
-        return self._lazy_session
-    
-    @property
-    def reader(self) -> EventReader:
-        """Lazy init reader."""
-        if self._reader is None:
-            self._reader = EventReader(self.db)
-        return self._reader
-
-    @reader.setter
-    def reader(self, value: EventReader):
-        self._reader = value
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        """Close the session if owned"""
-        if self._owns_session and self._lazy_session:
-            self._lazy_session.close()
-            self._lazy_session = None
-
-    def __del__(self):
-        self.close()
+        if not isinstance(db, Session):
+            raise TypeError("db must be a SQLAlchemy Session")
+        self.db = db
+        self.reader = EventReader(self.db)
 
     def compare_sessions(self, session_id1: str, session_id2: str) -> dict:
         """Compare two sessions semantically.

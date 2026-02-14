@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
 from core.git_for_data import GitForData
 from core.validation import validate_identifier
 
@@ -19,36 +18,15 @@ class Sandbox:
     """Sandbox for isolated experiments with metadata management."""
 
     def __init__(
-        self, source_db: str = "dev_agent", account: str = "sys", db: Session | None = None
+        self, db: Session, source_db: str = "dev_agent", account: str = "sys"
     ):
+        if not isinstance(db, Session):
+            raise TypeError("db must be a SQLAlchemy Session")
+        
+        self.db = db
         self.source_db = source_db
         self.account = account
-        if db:
-            self.db = db
-            self._owns_session = False
-        else:
-            self.db = next(get_db_session())
-            self._owns_session = True
         self.git = GitForData(self.db)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        """Close session if owned."""
-        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
-            self.db.close()
-
-    def __del__(self):
-        """Destructor to ensure cleanup (failsafe)."""
-        # Only try to close if we own it
-        try:
-            self.close()
-        except Exception:
-            pass
 
     def create(
         self,

@@ -48,7 +48,13 @@ class MockSkill(Skill):
 
 class TestAgentArchitecture(unittest.TestCase):
     def setUp(self):
-        self.db = MagicMock()
+        from unittest.mock import Mock
+        from sqlalchemy.orm import Session
+        
+        self.db = Mock(spec=Session)
+        # Mock query chain for SkillSelector._load_skills
+        self.db.query.return_value.filter.return_value.all.return_value = []
+        
         self.registry = MagicMock()
         self.llm_client = MagicMock()
         self.event_logger = MagicMock()

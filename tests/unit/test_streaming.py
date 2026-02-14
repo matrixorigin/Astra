@@ -53,7 +53,10 @@ class TestEventLoggerStream(unittest.TestCase):
     """Test EventLogger stream event logging."""
 
     def setUp(self):
-        self.db = MagicMock()
+        from unittest.mock import Mock
+        from sqlalchemy.orm import Session
+        
+        self.db = Mock(spec=Session)
         self.db.add = MagicMock()
         self.db.commit = MagicMock()
         self.logger = EventLogger(self.db)

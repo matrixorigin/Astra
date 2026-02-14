@@ -5,7 +5,6 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
 from core.logging_config import get_logger
 from core.skills.selector import SkillMetadata, SkillSelector
 
@@ -15,45 +14,13 @@ logger = get_logger(__name__)
 class ModernSkillSelector:
     """Skill selector using native LLM function calling (OpenAI/Gemini/DeepSeek)."""
 
-    def __init__(self, session: Session | None = None, llm_client=None):
-        self._owns_session = session is None
-        self._session = session
-        self._lazy_session = None
+    def __init__(self, session: Session, llm_client=None):
+        if not isinstance(session, Session):
+            raise TypeError("session must be a SQLAlchemy Session")
+        
+        self.session = session
         self.llm = llm_client
-        self._rule_selector = None  # Lazy init
-
-    @property
-    def session(self) -> Session:
-        """Get session, creating one if needed."""
-        if self._session:
-            return self._session
-        
-        if not self._lazy_session:
-            self._lazy_session = SessionLocal()
-        
-        return self._lazy_session
-
-    @property
-    def rule_selector(self) -> SkillSelector:
-        """Lazy init rule selector."""
-        if self._rule_selector is None:
-            self._rule_selector = SkillSelector(self.session)
-        return self._rule_selector
-
-    @rule_selector.setter
-    def rule_selector(self, value: SkillSelector):
-        self._rule_selector = value
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        if self._owns_session and self._lazy_session:
-            self._lazy_session.close()
-            self._lazy_session = None
+        self.rule_selector = SkillSelector(session)
 
     def get_tools_schema(
         self,

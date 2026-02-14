@@ -16,7 +16,6 @@ from typing import Any
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
-from api.database import SessionLocal
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
 from core.skills.modern_selector import ModernSkillSelector
@@ -74,65 +73,22 @@ class AuditableSkillSelector:
     3. Learns from failures automatically
     """
 
-    def __init__(self, session: Session | None = None, llm_client=None, account: str = "sys"):
-        self._session = session
-        self._owns_session = session is None
-        self._lazy_session = None
+    def __init__(self, session: Session, llm_client=None, account: str = "sys"):
+        if not isinstance(session, Session):
+            raise TypeError("session must be a SQLAlchemy Session")
         
+        self.session = session
         self.llm = llm_client
         self.account = account
-        
-        # Lazy initialization
-        self._modern_selector = None
-        self._sandbox = None
-        
+        self.modern_selector = ModernSkillSelector(session, llm_client)
+        self.sandbox = Sandbox(db=session, account=account)
         self._ensure_table()
-
-    @property
-    def session(self) -> Session:
-        """Get current session (lazy init)."""
-        return self._get_session()
-
-    def _get_session(self) -> Session:
-        """Get session, creating one if needed."""
-        if self._session:
-            return self._session
-            
-        if not self._lazy_session:
-            self._lazy_session = SessionLocal()
-            
-        return self._lazy_session
-
-    @property
-    def modern_selector(self):
-        """Lazy init modern selector."""
-        if self._modern_selector is None:
-            self._modern_selector = ModernSkillSelector(self._get_session(), self.llm)
-        return self._modern_selector
-
-    @property
-    def sandbox(self):
-        """Lazy init sandbox."""
-        if self._sandbox is None:
-            self._sandbox = Sandbox(db=self._get_session(), account=self.account)
-        return self._sandbox
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        """Close session if we own it."""
-        if self._owns_session and self._lazy_session:
-            self._lazy_session.close()
-            self._lazy_session = None
 
     def _ensure_table(self):
         """Ensure skill_selection_events table exists."""
         # Table should already exist from schema
         pass
+
     def select_with_validation(
         self, query: str, session_id: str, validate_in_sandbox: bool = True
     ) -> SkillSelectionEvent:

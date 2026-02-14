@@ -62,9 +62,11 @@ class TestSQLInjectionPrevention:
 
     def test_sandbox_create_sql_injection(self):
         """Test sandbox creation rejects SQL injection attempts."""
-        from unittest.mock import MagicMock
+        from unittest.mock import Mock
+        from sqlalchemy.orm import Session
         
-        sandbox = Sandbox(db=MagicMock())
+        mock_db = Mock(spec=Session)
+        sandbox = Sandbox(db=mock_db)
         
         # SQL injection attempts should be rejected
         with pytest.raises(ValueError):
@@ -78,27 +80,33 @@ class TestSQLInjectionPrevention:
 
     def test_sandbox_delete_sql_injection(self):
         """Test sandbox deletion rejects SQL injection attempts."""
-        from unittest.mock import MagicMock
+        from unittest.mock import Mock
+        from sqlalchemy.orm import Session
         
-        sandbox = Sandbox(db=MagicMock())
+        mock_db = Mock(spec=Session)
+        sandbox = Sandbox(db=mock_db)
         
         with pytest.raises(ValueError):
             sandbox.delete("'; DROP TABLE users--")
 
     def test_sandbox_use_sql_injection(self):
         """Test sandbox use rejects SQL injection attempts."""
-        from unittest.mock import MagicMock
+        from unittest.mock import Mock
+        from sqlalchemy.orm import Session
         
-        sandbox = Sandbox(db=MagicMock())
+        mock_db = Mock(spec=Session)
+        sandbox = Sandbox(db=mock_db)
         
         with pytest.raises(ValueError):
             sandbox.use("'; DROP TABLE users--")
 
     def test_clone_table_sql_injection(self):
         """Test clone_table rejects SQL injection attempts."""
-        from unittest.mock import MagicMock
+        from unittest.mock import Mock
+        from sqlalchemy.orm import Session
         
-        sandbox = Sandbox(db=MagicMock())
+        mock_db = Mock(spec=Session)
+        sandbox = Sandbox(db=mock_db)
         
         with pytest.raises(ValueError):
             sandbox.clone_table("'; DROP TABLE users--", "source")

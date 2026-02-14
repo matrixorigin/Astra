@@ -1,13 +1,16 @@
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, Mock
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 from core.git_for_data import GitForData
 
 class TestGitForDataInjection:
     
     @pytest.fixture
     def mock_db_session(self):
-        return MagicMock()
+        mock = Mock(spec=Session)
+        mock.execute = MagicMock()
+        return mock
 
     @pytest.fixture
     def git_for_data(self, mock_db_session):

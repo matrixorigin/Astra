@@ -33,7 +33,7 @@ class TestRegressionGateCoverage:
 
     def test_validate_full_flow_with_results(self, db, mock_llm):
         """Test complete validation flow with actual results."""
-        gate = SkillSelectionRegressionGate(db, mock_llm)
+        gate = SkillSelectionRegressionGate(mock_llm, db)
         gate._ensure_tables()
         
         selector = AuditableSkillSelector(db, mock_llm)
@@ -88,7 +88,7 @@ class TestRegressionGateCoverage:
 
     def test_get_gate_history_with_data(self, db, mock_llm):
         """Test gate history retrieval."""
-        gate = SkillSelectionRegressionGate(db, mock_llm)
+        gate = SkillSelectionRegressionGate(mock_llm, db)
         gate._ensure_tables()
         
         # Current implementation returns empty list

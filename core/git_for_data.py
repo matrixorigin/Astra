@@ -6,7 +6,6 @@ Provides snapshot, restore, and time-travel capabilities.
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
 from core.validation import validate_identifier, QueryRequest
 
 
@@ -17,42 +16,15 @@ class GitForData:
     Based on MatrixOne v3.0+ Git for Data features.
     """
 
-    def __init__(self, db: Session | None = None) -> None:
+    def __init__(self, db: Session) -> None:
         """Initialize Git for Data manager.
 
         Args:
-            db: Session instance. If None, creates a new one.
+            db: Session instance (required).
         """
-        self._owns_session = db is None
-        self._db = db
-        self._lazy_session = None
-
-    @property
-    def db(self) -> Session:
-        """Get session, creating one if needed."""
-        if self._db:
-            return self._db
-        
-        if not self._lazy_session:
-            self._lazy_session = SessionLocal()
-        
-        return self._lazy_session
-
-    @db.setter
-    def db(self, value: Session):
-        self._db = value
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        """Close the session if it was created by this instance."""
-        if self._owns_session and self._lazy_session:
-            self._lazy_session.close()
-            self._lazy_session = None
+        if not isinstance(db, Session):
+            raise TypeError("db must be a SQLAlchemy Session")
+        self.db = db
 
     def create_snapshot(self, snapshot_name: str, account: str = "sys") -> dict:
         """Create a snapshot of the current database state.

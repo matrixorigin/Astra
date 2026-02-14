@@ -8,7 +8,6 @@ from functools import lru_cache
 
 from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
 from api.models import SkillRegistry as SkillModel
 from core.exceptions import DatabaseError, SkillNotFoundError
 from core.logging_config import get_logger
@@ -21,35 +20,13 @@ logger = get_logger(__name__)
 class SkillRegistry:
     """Manage skill metadata and lifecycle with versioning"""
 
-    def __init__(self, session: Session | None = None):
-        self._owns_session = session is None
-        self._session = session
-        self._lazy_session = None
+    def __init__(self, session: Session):
+        if not isinstance(session, Session):
+            raise TypeError("session must be a SQLAlchemy Session")
+        
+        self.session = session
         self._skills: dict[str, Skill] = {}  # skill_name@version -> Skill
         self._cache_size = 100  # LRU cache size
-
-    @property
-    def session(self) -> Session:
-        """Get session, creating one if needed."""
-        if self._session:
-            return self._session
-        
-        if not self._lazy_session:
-            self._lazy_session = SessionLocal()
-        
-        return self._lazy_session
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        """Close session if we own it."""
-        if self._owns_session and self._lazy_session:
-            self._lazy_session.close()
-            self._lazy_session = None
 
     def register(
         self,

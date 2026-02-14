@@ -13,7 +13,6 @@ from typing import Any, Protocol
 
 from sqlalchemy.orm import Session
 
-from api.database import SessionLocal, get_db_session
 from core.skills.base import SideEffectCategory, Skill
 
 logger = logging.getLogger(__name__)
@@ -63,7 +62,7 @@ class ToolMockingLayer:
     def __init__(
         self,
         mode: MockMode,
-        session: Session | None = None,
+        session: Session,
         result_storage: ResultStorage | None = None,
         session_id: str | None = None,
     ):
@@ -71,53 +70,20 @@ class ToolMockingLayer:
 
         Args:
             mode: Execution mode
-            session: SQLAlchemy session (dependency injection)
+            session: SQLAlchemy session (required)
             result_storage: Optional result storage
             session_id: Session ID (required for replay)
         """
+        if not isinstance(session, Session):
+            raise TypeError("session must be a SQLAlchemy Session")
+        
         self.mode = mode
+        self.session = session
         self.result_storage = result_storage
         self.session_id = session_id
-        
-        self._session = session
-        self._lazy_session = None
-        self._owns_session = session is None
             
         if self.mode == MockMode.REPLAY and not self.session_id:
             raise ValueError("session_id required for replay mode")
-
-    def _get_session(self) -> Session:
-        """Get database session."""
-        if self._session:
-            return self._session
-        
-        if not self._lazy_session:
-            self._lazy_session = SessionLocal()
-            
-        return self._lazy_session
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        """Close session if we own it."""
-        if self._owns_session and self._lazy_session:
-            self._lazy_session.close()
-            self._lazy_session = None
-
-    def __del__(self):
-        """Destructor to ensure cleanup (failsafe)."""
-        # Only try to close if we own it and it's not None
-        # Note: __del__ is unreliable, do not rely on it for logic
-        try:
-            if hasattr(self, '_owns_session') and self._owns_session and hasattr(self, '_session') and self._session:
-                logger.warning("ToolMockingLayer garbage collected without explicit close()")
-                self._session.close()
-        except Exception:
-            pass  # Suppress errors during destruction
 
     def execute(
         self,
@@ -263,7 +229,7 @@ class ToolMockingLayer:
             
             # Compute params hash for matching
             params_hash = self._hash_params(params)
-            session = self._get_session()
+            session = self.session
 
             if parent_event_id:
                 # Exact lookup by parent event ID (concurrency-safe)
@@ -330,7 +296,7 @@ class ToolMockingLayer:
             return {}
         
         from api.models import Event as EventModel
-        session = self._get_session()
+        session = self.session
         events = session.query(EventModel).filter(
             EventModel.session_id == self.session_id,
             EventModel.skill_result.isnot(None)
@@ -404,7 +370,7 @@ class ToolMockingLayer:
             # Update event
             from api.models import Event as EventModel
             
-            session = self._get_session()
+            session = self.session
             query = session.query(EventModel)
             
             if event_id_override:
