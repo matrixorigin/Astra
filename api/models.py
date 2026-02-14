@@ -48,6 +48,22 @@ class SelectorGateResult(Base):
     created_at = Column(DateTime, default=func.now())
 
 
+class GateResult(Base):
+    """Unified gate validation results for all change types."""
+    __tablename__ = "gate_results"
+    
+    gate_id = Column(String(36), primary_key=True)
+    change_type = Column(String(20), nullable=False)  # prompt/skill/config/selector
+    change_id = Column(String(128), nullable=False)  # e.g., "code_review@v3"
+    snapshot_used = Column(String(64))  # Snapshot ID used for validation
+    sessions_tested = Column(Integer, default=0)  # Number of golden sessions tested
+    error_rate = Column(Float, default=0.0)  # Error rate from replay
+    score_delta = Column(Float, default=0.0)  # Quality score change
+    passed = Column(TINYINT(1), nullable=False)  # Pass/fail verdict
+    metrics = Column(Text)  # JSON metrics (error_rate, score_delta, latency, tokens)
+    created_at = Column(DateTime, default=func.now())
+
+
 class Config(Base):
     __tablename__ = "configs"
     config_id = Column(String(64))
@@ -137,7 +153,7 @@ class Event(Base):
     embedding = Column(Text)  # VECF64(1536) stored as text for hybrid retrieval
     prompt_template_id = Column(String(64))
     skills_snapshot = Column(JSON)
-    quality_score = Column(String(10))
+    quality_score = Column(Float)  # Changed from String(10) to Float for aggregation
     is_flagged = Column(TINYINT(1), server_default="0")
     training_eligible = Column(TINYINT(1), server_default="0")
     llm_model_used = Column(String(50))
