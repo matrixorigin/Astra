@@ -9,7 +9,7 @@ from core.sandbox import Sandbox
 
 @pytest.fixture
 def sandbox(db_session):
-    return Sandbox(db=db_session)
+    return Sandbox(db=db_session, source_db="test_dev_agent_v3")
 
 
 def test_create_and_delete(sandbox):

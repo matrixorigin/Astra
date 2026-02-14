@@ -26,7 +26,7 @@ class SandboxService:
             db_session: SQLAlchemy session
         """
         self.db_session = db_session
-        self.sandbox = Sandbox(db=db_session)
+        self.sandbox = Sandbox(db=db_session, source_db="test_dev_agent_v3")
         self.audit = AuditLogger(db_session)
         self.permission = PermissionChecker(db_session)
     

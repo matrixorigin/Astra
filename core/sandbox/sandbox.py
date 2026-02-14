@@ -45,23 +45,28 @@ class Sandbox:
             validate_identifier(from_snapshot)
 
         # DDL commands need to be outside transaction
-        self.db.commit()  # Commit any pending transaction
+        self.db.commit()
         
-        self.db.execute(text(f"DROP DATABASE IF EXISTS {name}"))
-
-        if from_snapshot:
-            self.db.execute(
-                text(f"CREATE DATABASE {name} CLONE {self.source_db} {{SNAPSHOT = '{from_snapshot}'}}")
-            )
-        else:
-            self.db.execute(text(f"CREATE DATABASE {name} CLONE {self.source_db}"))
+        raw_conn = self.db.connection().connection
+        cursor = raw_conn.cursor()
+        try:
+            cursor.execute(f"DROP DATABASE IF EXISTS {name}")
+            raw_conn.commit()
+            
+            if from_snapshot:
+                cursor.execute(f"CREATE DATABASE {name} CLONE {self.source_db} {{SNAPSHOT = '{from_snapshot}'}}")
+            else:
+                cursor.execute(f"CREATE DATABASE {name} CLONE {self.source_db}")
+            raw_conn.commit()
+        finally:
+            cursor.close()
 
         # Store metadata with microsecond precision
         tags_json = json.dumps(tags) if tags else None
         
         self.db.execute(
-            text("""
-                INSERT INTO sandbox_metadata
+            text(f"""
+                INSERT INTO {self.source_db}.sandbox_metadata
                 (sandbox_name, user_id, data_source, description, created_by, created_at, updated_at, tags, source_database, source_snapshot, status)
                 VALUES (:name, :created_by, :data_source, :description, :created_by, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6),
                         :tags, :source_db, :snapshot, 'active')
