@@ -283,7 +283,7 @@ class SelfImprovingSelector:
             )
             self.session.add(learning)
         
-        self.session.commit()
+        self._persist_learning_updates()
 
     def apply_learnings(self, query: str, candidates: list) -> list:
         """Apply learned corrections to candidate selection with multi-dimensional scoring."""
@@ -325,9 +325,13 @@ class SelfImprovingSelector:
             learning_confidence = self._normalize_confidence(learning.confidence)
             weight = self._get_signal_weight(learning.signal_type)
             delta = learning_confidence * weight
+            if delta <= 0:
+                continue
 
             wrong_skills = learning.wrong_skills or []
             correct_skills = learning.correct_skills or []
+            if not wrong_skills and not correct_skills:
+                continue
 
             for skill in wrong_skills:
                 if skill in candidate_scores:
@@ -342,7 +346,7 @@ class SelfImprovingSelector:
             learning.applied_count += 1
             learning.last_applied_at = datetime.now(timezone.utc)
 
-        self.session.commit()
+        self._persist_learning_updates()
 
         scored = [
             (name, score) for name, score in candidate_scores.items() if score > 0.0
@@ -359,6 +363,16 @@ class SelfImprovingSelector:
         if value <= 1.0:
             return max(0.0, float(value))
         return min(1.0, float(value) / 100.0)
+
+    def _persist_learning_updates(self) -> None:
+        try:
+            if self.session.in_transaction():
+                self.session.flush()
+            else:
+                self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
 
     def _is_high_confidence(self, value: float | None) -> bool:
         if value is None:
