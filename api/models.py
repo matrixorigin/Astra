@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models."""
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, JSON, ForeignKey, Float
+from sqlalchemy import Column, DateTime, Integer, String, Text, JSON, ForeignKey, Float, Index
 from sqlalchemy.dialects.mysql import TINYINT
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
@@ -380,6 +380,35 @@ class KnowledgeEntry(Base):
     
     # Vector search (stored as text, converted to VECF64 in raw SQL)
     embedding = Column(Text)  # Will be VECF64(1536) in MatrixOne
+    
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class AgentScratchpad(Base):
+    """Working memory: structured notes for long-horizon tasks."""
+    __tablename__ = "agent_scratchpad"
+    __table_args__ = (
+        Index('idx_scratchpad_session', 'session_id'),
+        Index('idx_scratchpad_user', 'user_id'),
+        Index('idx_scratchpad_type', 'note_type'),
+    )
+    
+    note_id = Column(String(64), primary_key=True)
+    session_id = Column(String(64), nullable=False)
+    user_id = Column(String(64), nullable=False)
+    agent_id = Column(String(64))
+    
+    # Note content
+    note_type = Column(String(50), nullable=False)  # plan | hypothesis | finding | todo | decision
+    content = Column(Text, nullable=False)
+    
+    # Lifecycle
+    status = Column(String(20), default="active")  # active | completed | superseded
+    
+    # Linkage
+    related_event_ids = Column(JSON)
+    related_note_ids = Column(JSON)
     
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
