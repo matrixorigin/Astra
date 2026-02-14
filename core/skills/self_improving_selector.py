@@ -289,11 +289,15 @@ class SelfImprovingSelector:
         """Apply learned corrections to candidate selection with multi-dimensional scoring."""
         if not candidates:
             return candidates
+        if not query:
+            return candidates
+
+        query_lower = query.lower()
 
         learnings = self.session.query(LearningModel).all()
         matched = [
             learning for learning in learnings
-            if learning.query_pattern and learning.query_pattern.lower() in query.lower()
+            if learning.query_pattern and learning.query_pattern.lower() in query_lower
             and self._is_high_confidence(learning.confidence)
         ]
 
@@ -321,6 +325,7 @@ class SelfImprovingSelector:
 
         from core.agent.selector import SkillCandidate
 
+        applied_learnings = []
         for learning in matched:
             learning_confidence = self._normalize_confidence(learning.confidence)
             weight = self._get_signal_weight(learning.signal_type)
@@ -332,19 +337,31 @@ class SelfImprovingSelector:
             correct_skills = learning.correct_skills or []
             if not wrong_skills and not correct_skills:
                 continue
+            changed = False
 
             for skill in wrong_skills:
                 if skill in candidate_scores:
-                    candidate_scores[skill] = max(0.0, candidate_scores[skill] - delta)
+                    current_score = candidate_scores[skill]
+                    next_score = max(0.0, current_score - delta)
+                    if next_score != current_score:
+                        candidate_scores[skill] = next_score
+                        changed = True
 
             for skill in correct_skills:
                 if skill not in candidate_scores:
                     candidate_map[skill] = SkillCandidate(name=skill)
                     candidate_scores[skill] = min(1.0, delta)
+                    changed = True
                 candidate_scores[skill] = min(1.0, candidate_scores[skill] + delta)
+                changed = True
 
-            learning.applied_count += 1
-            learning.last_applied_at = datetime.now(timezone.utc)
+            if changed:
+                learning.applied_count += 1
+                learning.last_applied_at = datetime.now(timezone.utc)
+                applied_learnings.append(learning)
+
+        if not applied_learnings:
+            return candidates
 
         self._persist_learning_updates()
 
