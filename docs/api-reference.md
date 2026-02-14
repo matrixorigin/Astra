@@ -239,6 +239,142 @@ Full audit: decision + linked context snapshot + source events.
 
 ---
 
+## Learning
+
+### POST /api/v1/learning/trigger
+
+Trigger learning cycle from recent failures.
+
+```json
+// Request
+{
+  "days": 7,
+  "force": false,
+  "signal_types": ["wrong_skill", "slow_execution", "high_cost", "low_satisfaction"],
+  "weights": {
+    "accuracy": 0.4,
+    "speed": 0.3,
+    "cost": 0.2,
+    "satisfaction": 0.1
+  }
+}
+
+// Response 200
+{
+  "status": "success",
+  "learned": 15,
+  "signals_by_type": {
+    "wrong_skill": 8,
+    "slow_execution": 5,
+    "high_cost": 2
+  },
+  "gate_verdict": "pass",
+  "improvement_pct": 12.5,
+  "test_count": 20,
+  "model_version": "v1.0"
+}
+```
+
+### GET /api/v1/learning/signals
+
+Get available learning signal types.
+
+```json
+// Response 200
+{
+  "signal_types": ["wrong_skill", "slow_execution", "high_cost", "low_satisfaction"],
+  "descriptions": {
+    "wrong_skill": "Incorrect skill selection",
+    "slow_execution": "Execution time exceeds threshold",
+    "high_cost": "Execution cost exceeds budget",
+    "low_satisfaction": "User satisfaction below threshold"
+  }
+}
+```
+
+### GET /api/v1/learning/stats
+
+Get comprehensive learning statistics.
+
+```json
+// Response 200
+{
+  "total_learnings": 25,
+  "high_confidence": 15,
+  "low_confidence": 10,
+  "avg_confidence": 65.5,
+  "by_signal_type": {
+    "wrong_skill": 10,
+    "slow_execution": 8,
+    "high_cost": 5,
+    "low_satisfaction": 2
+  },
+  "weights": {
+    "accuracy": 0.4,
+    "speed": 0.3,
+    "cost": 0.2,
+    "satisfaction": 0.1
+  },
+  "weights_per_signal": {
+    "slow_execution": {
+      "accuracy": 0.3,
+      "speed": 0.5,
+      "cost": 0.1,
+      "satisfaction": 0.1
+    }
+  },
+  "decay": {
+    "enabled": false,
+    "half_life_days": 0.0,
+    "min_confidence": 0.0,
+    "per_signal": {}
+  },
+  "total_gates": 5,
+  "passed_gates": 4,
+  "failed_gates": 1,
+  "pass_rate": 0.8,
+  "avg_improvement_pct": 12.5,
+  "last_learning_time": "2026-02-14T10:30:00Z"
+}
+```
+
+### POST /api/v1/learning/feedback
+
+Submit feedback for a skill selection event.
+
+```json
+// Request
+{
+  "event_id": "evt_123",
+  "feedback_type": "wrong_skill",
+  "correct_skills": ["github_create_pr"],
+  "satisfaction_score": 4,
+  "comment": "Better skill selection needed"
+}
+
+// Response 200
+{
+  "status": "success",
+  "message": "Feedback recorded for event evt_123"
+}
+```
+
+### GET /api/v1/learning/health
+
+Health check for learning service.
+
+```json
+// Response 200
+{
+  "status": "healthy",
+  "service": "learning",
+  "version": "1.0.0",
+  "timestamp": "2026-02-14T23:00:00Z"
+}
+```
+
+---
+
 ## Error Format
 
 ```json

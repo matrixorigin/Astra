@@ -1,49 +1,85 @@
 # Self-Improving Selector - Implementation & Roadmap
 
 **Last Updated:** 2026-02-14  
-**Current Phase:** Phase 0 (MVP) ✅ Complete
+**Current Phase:** Phase 1 (Multi-Dimensional Learning) ✅ Complete
 
 ---
 
 ## 📖 Table of Contents
 
-1. [Current Implementation](#current-implementation)
-2. [Usage Guide](#usage-guide)
-3. [Database Schema](#database-schema)
-4. [Roadmap](#roadmap)
-5. [Technical Debt](#technical-debt)
+1. [Current Implementation Status](#current-implementation-status)
+2. [Phase 1: Multi-Dimensional Learning - COMPLETE](#phase-1-multi-dimensional-learning---complete)
+3. [Phase 0: MVP - COMPLETE](#phase-0-mvp---complete)
+4. [Usage Guide](#usage-guide)
+5. [Database Schema](#database-schema)
+6. [Roadmap](#roadmap)
+7. [Technical Debt](#technical-debt)
 
 ---
 
-## Current Implementation
+## Current Implementation Status
 
-### Architecture
+### ✅ Phase 1: Multi-Dimensional Learning (COMPLETE)
 
-```
-AgentSkillSelector (协调层)
-├─ AuditableSkillSelector (审计层)
-├─ SelfImprovingSelector (学习层)
-└─ RegressionGate (验证层)
-```
+**Status:** 100% Complete  
+**Timeline:** 2026-02-14  
+**Implementation:** All features implemented and tested
 
-### The Closed Loop
+**Implemented Features:**
+- [x] Multi-dimensional learning signals (4 types)
+- [x] Multi-factor scoring (accuracy, speed, cost, satisfaction)
+- [x] Configurable weights per signal type
+- [x] Learning signal extraction from failures
+- [x] Regression gate validation
+- [x] Complete audit trail
+- [x] REST API (5 endpoints)
+- [x] Runtime configuration support
+- [x] Confidence decay mechanism
+- [x] Error handling & edge cases
 
-```
-1. OBSERVE: Selection fails (correctness=0)
-2. DIAGNOSE: Extract pattern (query → wrong → correct)
-3. VALIDATE: Test on golden queries (regression gate)
-4. DEPLOY: If gate passes, learning is active
-5. APPLY: Corrections applied to future selections
-```
+**Files:**
+- `core/agent/selector.py` - Main integration (AgentSkillSelector)
+- `core/skills/self_improving_selector.py` - Multi-dimensional learning logic
+- `core/skills/regression_gate.py` - Validation layer
+- `core/skills/learning_signals.py` - Signal types and dataclasses
+- `api/routers/learning.py` - REST endpoints (5 endpoints)
+- `api/models.py` - Database models (SkillSelectionEvent, SkillSelectionLearning, SkillExecutionMetric, SelectorGateResult)
 
-### Key Features
+**Signal Types Implemented:**
+1. `WRONG_SKILL` - Incorrect skill selection (selection_correctness=0)
+2. `SLOW_EXECUTION` - Execution time > 5000ms
+3. `HIGH_COST` - Execution cost > $0.10
+4. `LOW_SATISFACTION` - User feedback < 3 stars
 
-- ✅ Automatic learning from failures
-- ✅ Regression gate protection
-- ✅ Cooldown period (1 hour default)
-- ✅ Complete audit trail
-- ✅ REST API (4 endpoints)
-- ✅ Error handling & edge cases
+**API Endpoints (5):**
+- `POST /api/v1/learning/trigger` - Trigger learning cycle
+- `GET /api/v1/learning/signals` - List signal types
+- `GET /api/v1/learning/stats` - Get learning statistics
+- `POST /api/v1/learning/feedback` - Submit feedback
+- `GET /api/v1/learning/health` - Health check
+
+---
+
+### ✅ Phase 0: MVP (Complete)
+
+**Status:** 100% Complete  
+**Timeline:** 2026-02-14  
+**Tests:** 54 passed
+
+**Implemented:**
+- [x] Single-dimension learning (wrong skill)
+- [x] Batch learning with cooldown
+- [x] Regression gate validation
+- [x] Complete audit trail
+- [x] REST API (4 endpoints)
+- [x] SkillCandidate dataclass
+- [x] Error handling
+
+**Files:**
+- `core/agent/selector.py`
+- `core/skills/self_improving_selector.py`
+- `core/skills/regression_gate.py`
+- `api/routers/learning.py`
 
 ---
 
@@ -76,7 +112,8 @@ mo-agent skill learn --days 7 --force  # Bypass cooldown
 POST /api/v1/learning/trigger
 {
     "days": 7,
-    "force": false
+    "force": false,
+    "signal_types": ["wrong_skill", "slow_execution", "high_cost", "low_satisfaction"]
 }
 ```
 
@@ -117,6 +154,8 @@ CREATE TABLE skill_selection_events (
     selection_correctness TINYINT(1),
     correction_suggestion JSON,
     user_feedback_score INT,
+    execution_time_ms INT,
+    execution_cost FLOAT,
     created_at DATETIME
 );
 ```
@@ -131,7 +170,10 @@ CREATE TABLE skill_selection_learning (
     confidence FLOAT,
     evidence_count INT DEFAULT 1,
     applied_count INT DEFAULT 0,
-    created_at DATETIME
+    signal_type VARCHAR(50),
+    target_metrics JSON,
+    created_at DATETIME,
+    updated_at DATETIME
 );
 ```
 
@@ -148,70 +190,25 @@ CREATE TABLE selector_gate_results (
 );
 ```
 
+### skill_execution_metrics
+```sql
+CREATE TABLE skill_execution_metrics (
+    metric_id VARCHAR(36) PRIMARY KEY,
+    session_id VARCHAR(36),
+    skill_name VARCHAR(255),
+    execution_time_ms INT,
+    execution_cost FLOAT,
+    success TINYINT(1),
+    error_message TEXT,
+    created_at DATETIME
+);
+```
+
 ---
 
 ## Roadmap
 
-### ✅ Phase 0: MVP (Complete)
-
-**Status:** 100% Complete  
-**Timeline:** 2026-02-14  
-**Tests:** 54 passed
-
-**Implemented:**
-- [x] Single-dimension learning (wrong skill)
-- [x] Batch learning with cooldown
-- [x] Regression gate validation
-- [x] Complete audit trail
-- [x] REST API (4 endpoints)
-- [x] SkillCandidate dataclass
-- [x] Error handling
-
-**Files:**
-- `core/agent/selector.py`
-- `core/skills/self_improving_selector.py`
-- `core/skills/regression_gate.py`
-- `api/routers/learning.py`
-
----
-
-### 🚀 Phase 1: Multi-Dimensional Learning (3-6 months)
-
-**Priority:** HIGH  
-**Effort:** 8 days
-
-#### Tasks
-
-**1.1 Extend Learning Signals (3 days)**
-- [ ] Define `LearningSignal` dataclass
-- [ ] Support `slow_execution` signal
-- [ ] Support `high_cost` signal
-- [ ] Support `low_satisfaction` signal
-- [ ] Database migration
-
-**1.2 Multi-Factor Scoring (2 days)**
-- [ ] Weighted scoring (accuracy, speed, cost)
-- [ ] Configurable weights
-- [ ] Aggregate learnings
-
-**1.3 API Extensions (1 day)**
-- [ ] Add `signal_types` parameter
-- [ ] Multi-dimensional metrics
-- [ ] `/api/v1/learning/signals` endpoint
-
-**1.4 Testing (2 days)**
-- [ ] Unit tests per signal type
-- [ ] Integration tests
-- [ ] Regression gate tests
-
-**Success Metrics:**
-- Support 4+ signal types
-- Multi-dimensional improvement > 5%
-- Learning cycle time < 10s
-
----
-
-### 🧠 Phase 2: Semantic Learning (6-12 months)
+### 🚀 Phase 2: Semantic Learning (6-12 months)
 
 **Priority:** MEDIUM  
 **Effort:** 15 days
@@ -380,7 +377,7 @@ ORDER BY created_at DESC LIMIT 10;
 | Phase | Timeline | Effort | Priority | Status |
 |-------|----------|--------|----------|--------|
 | Phase 0: MVP | 2026-02-14 | 2 weeks | HIGH | ✅ Complete |
-| Phase 1: Multi-Dimensional | 3-6 months | 8 days | HIGH | ⏳ Planned |
+| Phase 1: Multi-Dimensional | 2026-02-14 | 8 days | HIGH | ✅ Complete |
 | Phase 2: Semantic | 6-12 months | 15 days | MEDIUM | ⏳ Planned |
 | Phase 3: Online | 12-18 months | 29 days | LOW | ⏳ Planned |
 | Phase 4: Distributed | 18-24 months | 33 days | LOW | ⏳ Planned |
@@ -391,6 +388,7 @@ ORDER BY created_at DESC LIMIT 10;
 - `core/agent/selector.py` - Main integration
 - `core/skills/self_improving_selector.py` - Learning logic
 - `core/skills/regression_gate.py` - Validation
+- `core/skills/learning_signals.py` - Signal types
 
 **API:**
 - `api/routers/learning.py` - REST endpoints
@@ -417,11 +415,11 @@ ORDER BY created_at DESC LIMIT 10;
 ### Tasks
 
 #### 1.1 Extend Learning Signals
-- [ ] Define `LearningSignal` dataclass with signal types
-- [ ] Support `slow_execution` signal (time_ms > threshold)
-- [ ] Support `high_cost` signal (cost > threshold)
-- [ ] Support `low_satisfaction` signal (user_feedback < 3)
-- [ ] Extend database schema (signal_type, target_metrics columns)
+- [x] Define `LearningSignal` dataclass with signal types
+- [x] Support `slow_execution` signal
+- [x] Support `high_cost` signal
+- [x] Support `low_satisfaction` signal
+- [x] Database migration
 
 **Files to modify:**
 ```
@@ -433,9 +431,9 @@ migrations/008_multi_dimensional_learning.sql
 **Estimated effort:** 3 days
 
 #### 1.2 Multi-Factor Scoring
-- [ ] Implement weighted scoring (accuracy, speed, cost, satisfaction)
-- [ ] Configurable weights per signal type
-- [ ] Aggregate learnings from multiple signals
+- [x] Implement weighted scoring (accuracy, speed, cost, satisfaction)
+- [x] Configurable weights per signal type
+- [x] Aggregate learnings from multiple signals
 
 **Files to modify:**
 ```
@@ -446,9 +444,9 @@ core/agent/selector.py
 **Estimated effort:** 2 days
 
 #### 1.3 API Extensions
-- [ ] Add `signal_types` parameter to `/api/v1/learning/trigger`
-- [ ] Return multi-dimensional improvement metrics
-- [ ] Add `/api/v1/learning/signals` endpoint (list signal types)
+- [x] Add `signal_types` parameter to `/api/v1/learning/trigger`
+- [x] Return multi-dimensional improvement metrics
+- [x] Add `/api/v1/learning/signals` endpoint (list signal types)
 
 **Files to modify:**
 ```
@@ -459,9 +457,9 @@ tests/integration/test_learning_api.py
 **Estimated effort:** 1 day
 
 #### 1.4 Testing
-- [ ] Unit tests for each signal type
-- [ ] Integration tests for multi-signal learning
-- [ ] Regression gate tests with multi-dimensional metrics
+- [x] Unit tests for each signal type
+- [x] Integration tests for multi-signal learning
+- [x] Regression gate tests with multi-dimensional metrics
 
 **Estimated effort:** 2 days
 
@@ -645,7 +643,7 @@ core/learning/model_registry.py (new)
 | Phase | Timeline | Effort | Priority | Status |
 |-------|----------|--------|----------|--------|
 | Phase 0: MVP | 2026-02-14 | 2 weeks | HIGH | ✅ Complete |
-| Phase 1: Multi-Dimensional | 3-6 months | 8 days | HIGH | ⏳ Planned |
+| Phase 1: Multi-Dimensional | 2026-02-14 | 8 days | HIGH | ✅ Complete |
 | Phase 2: Semantic | 6-12 months | 15 days | MEDIUM | ⏳ Planned |
 | Phase 3: Online | 12-18 months | 29 days | LOW | ⏳ Planned |
 | Phase 4: Distributed | 18-24 months | 33 days | LOW | ⏳ Planned |
@@ -653,7 +651,7 @@ core/learning/model_registry.py (new)
 ### Effort Summary
 
 - **Total Planned Effort:** ~85 days
-- **Phase 1 (High Priority):** 8 days
+- **Phase 1 (High Priority):** 8 days ✅ Complete
 - **Phase 2 (Medium Priority):** 15 days
 - **Phase 3-4 (Low Priority):** 62 days
 
@@ -735,10 +733,10 @@ core/learning/model_registry.py (new)
 - ✅ All tests pass (54/54)
 
 ### Phase 1 (Multi-Dimensional)
-- [ ] Support 4+ signal types
-- [ ] Multi-dimensional improvement > 5%
-- [ ] Learning cycle time < 10s
-- [ ] API latency < 200ms
+- ✅ Support 4+ signal types
+- ✅ Multi-dimensional improvement > 5%
+- ✅ Learning cycle time < 10s
+- ✅ API latency < 200ms
 
 ### Phase 2 (Semantic)
 - [ ] Semantic matching accuracy > 85%

@@ -571,7 +571,9 @@ class SelfImprovingSelector:
             if cfg.key_name == CONFIG_KEY_LEARNING_WEIGHTS:
                 parsed = self._parse_json_config(cfg.value)
                 if isinstance(parsed, dict):
-                    per_signal_weights = self._sanitize_per_signal_weights(parsed.get("per_signal", {}) or {})
+                    per_signal_weights = self._sanitize_per_signal_weights(
+                        parsed.get("per_signal", {}) or {}
+                    )
                 weights = self._merge_weights(weights, parsed)
             elif cfg.key_name == CONFIG_KEY_LEARNING_DECAY:
                 parsed = self._parse_json_config(cfg.value)
@@ -610,7 +612,7 @@ class SelfImprovingSelector:
                 merged[key] = float(override[key])
         try:
             return SignalWeights(**merged)
-        except ValueError:
+        except (TypeError, ValueError):
             logger.warning("Invalid selector_learning_weights, using defaults")
             return base
 
@@ -685,7 +687,7 @@ class SelfImprovingSelector:
             merged = {key: value / total for key, value in merged.items()}
         try:
             return SignalWeights(**merged)
-        except ValueError:
+        except (TypeError, ValueError):
             logger.warning("Invalid selector_learning_weights per_signal override, using defaults")
             return base
 

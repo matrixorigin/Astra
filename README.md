@@ -22,6 +22,13 @@ Intelligent agent platform with auditable decisions, safe iteration, and version
 - Decision audit trail: decision type, output, model parameters, linked to snapshot
 - Time-travel capability: query exact state at any historical point
 
+### Self-Improving Selector (Phase 1 Complete)
+- **Multi-Dimensional Learning**: Learn from 4 signal types (wrong skill, slow execution, high cost, low satisfaction)
+- **Multi-Factor Scoring**: Weighted scoring across accuracy, speed, cost, satisfaction
+- **Regression Gate**: Validate learning before deployment
+- **REST API**: 5 endpoints for learning management
+- **Runtime Configuration**: Configurable weights and decay per signal type
+
 ### Additional Features
 - **Auditable Skill Selection**: Every skill selection is versioned and auditable
 - **Sandbox Pre-Validation**: Validate skill selections in isolated sandbox before execution
@@ -415,4 +422,3 @@ make format         # Format code
 ```
 
 See [STATIC_CHECK_SETUP.md](STATIC_CHECK_SETUP.md) for detailed static checking documentation.
-
