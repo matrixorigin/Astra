@@ -11,6 +11,9 @@ from sqlalchemy.orm import Session as DBSession
 from api.database import get_db_session
 from api.models import Session as SessionModel
 from core.events.session_models import Session, SessionStatus
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 
 class SessionManager:
@@ -116,7 +119,7 @@ class SessionManager:
             db.commit()
 
     def close_session(self, session_id: str) -> None:
-        """Close a session.
+        """Close a session and trigger knowledge extraction.
 
         Args:
             session_id: Session identifier
@@ -127,6 +130,25 @@ class SessionManager:
             db_session.status = SessionStatus.CLOSED
             db_session.updated_at = datetime.now(timezone.utc)
             db.commit()
+            
+            # Auto-trigger knowledge extraction
+            try:
+                from core.context.knowledge import KnowledgeExtractor
+                from api.models import Event
+                
+                extractor = KnowledgeExtractor(db)
+                
+                # Get all unique causal chains in this session
+                chains = db.query(Event.causal_chain_id).filter(
+                    Event.session_id == session_id
+                ).distinct().all()
+                
+                for (chain_id,) in chains:
+                    extractor.extract_from_chain(chain_id, db_session.user_id)
+                
+                logger.info(f"Extracted knowledge from {len(chains)} chains in session {session_id}")
+            except Exception as e:
+                logger.error(f"Knowledge extraction failed for session {session_id}: {e}")
 
     def get_user_sessions(
         self, user_id: str, status: SessionStatus | None = None, limit: int = 10

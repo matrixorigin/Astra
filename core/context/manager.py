@@ -243,6 +243,65 @@ class ContextManager:
             for e in events
         ]
 
+    def retrieve_semantic_knowledge(
+        self, user_id: str, query: str, limit: int = 5, min_confidence: float = 0.3
+    ) -> list[dict[str, Any]]:
+        """Retrieve relevant knowledge entries using keyword search.
+        
+        Note: This MVP implementation uses keyword matching.
+        Vector similarity search will be implemented in future release.
+        
+        Args:
+            user_id: User whose knowledge to search
+            query: Search query
+            limit: Max results
+            min_confidence: Minimum confidence threshold
+            
+        Returns:
+            List of knowledge entries with relevance scores
+        """
+        from api.models import KnowledgeEntry
+        
+        # Keyword-based retrieval (MVP)
+        entries = self.db.query(KnowledgeEntry).filter(
+            KnowledgeEntry.user_id == user_id,
+            KnowledgeEntry.confidence >= min_confidence
+        ).order_by(KnowledgeEntry.confidence.desc()).limit(limit * 2).all()  # Get more for filtering
+        
+        results = []
+        query_lower = query.lower()
+        
+        for entry in entries:
+            # Keyword matching with scoring
+            relevance = 0.3  # Base relevance
+            
+            # Exact match in value
+            if query_lower in entry.value.lower():
+                relevance = 0.9
+            # Match in key name
+            elif query_lower in entry.key_name.lower():
+                relevance = 0.7
+            # Partial word match
+            elif any(word in entry.value.lower() for word in query_lower.split() if len(word) > 3):
+                relevance = 0.5
+            
+            results.append({
+                "entry_id": entry.entry_id,
+                "category": entry.category,
+                "key_name": entry.key_name,
+                "value": entry.value,
+                "confidence": entry.confidence,
+                "trust_tier": entry.trust_tier,
+                "relevance": relevance,
+                "created_at": entry.created_at,
+            })
+        
+        # Sort by combined score: relevance * confidence
+        results.sort(key=lambda x: x["relevance"] * x["confidence"], reverse=True)
+        
+        logger.debug(f"Retrieved {len(results)} knowledge entries for query: {query[:50]}")
+        return results[:limit]
+
     def _score_candidates(
         self, query: str, candidates: list[dict[str, Any]], session_id: str, task_type: TaskType
     ) -> list[tuple[dict[str, Any], float]]:

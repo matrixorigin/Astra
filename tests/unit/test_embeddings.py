@@ -10,7 +10,7 @@ def db(request):
     """Database fixture with cleanup."""
     from api.database import get_db_session
     from sqlalchemy import text
-    
+
     database = next(get_db_session())
 
     yield database
@@ -29,7 +29,7 @@ def test_mock_embedding_deterministic(db):
     emb2 = service.embed_text(text)
 
     assert emb1 == emb2
-    assert len(emb1) == 1024
+    assert len(emb1) == 1536
 
 
 def test_mock_embedding_different_texts(db):
@@ -84,7 +84,7 @@ def test_cosine_similarity(db):
 
     user_id = str(uuid4())
     session_id = str(uuid4())
-    
+
     session = session_repo.create({
         "session_id": session_id,
         "user_id": user_id
@@ -93,7 +93,7 @@ def test_cosine_similarity(db):
     # Create events
     event1_id = str(uuid4())
     event2_id = str(uuid4())
-    
+
     event1 = event_repo.create({
         "event_id": event1_id,
         "user_id": user_id,
@@ -102,7 +102,7 @@ def test_cosine_similarity(db):
         "content": "Hello world",
         "causal_chain_id": str(uuid4())
     })
-    
+
     event2 = event_repo.create({
         "event_id": event2_id,
         "user_id": user_id,
@@ -143,7 +143,7 @@ def test_search_similar(db):
 
     user_id = str(uuid4())
     session_id = str(uuid4())
-    
+
     session = session_repo.create({
         "session_id": session_id,
         "user_id": user_id
@@ -202,7 +202,7 @@ def test_search_with_json_extract_filter(db):
 
     user_id = str(uuid4())
     session_id = str(uuid4())
-    
+
     session = session_repo.create({
         "session_id": session_id,
         "user_id": user_id

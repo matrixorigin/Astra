@@ -341,3 +341,38 @@ class SkillSelectionLearning(Base):
     last_applied_at = Column(DateTime)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class KnowledgeEntry(Base):
+    """Semantic memory: extracted knowledge that persists across sessions."""
+    __tablename__ = "knowledge_entries"
+    entry_id = Column(String(64), primary_key=True)
+    user_id = Column(String(64), nullable=False, index=True)
+    agent_id = Column(String(64))
+    
+    # What
+    category = Column(String(50), nullable=False, index=True)  # user_preference | codebase_pattern | domain_fact | tool_behavior | entity
+    key_name = Column(String(255), nullable=False, index=True)
+    value = Column(Text, nullable=False)
+    
+    # Provenance
+    source_event_ids = Column(JSON, nullable=False)
+    extraction_method = Column(String(50))  # llm_extraction | user_explicit | observation
+    
+    # Trust & Lifecycle
+    trust_tier = Column(String(10), default="T3")  # T1/T2/T3/T4
+    confidence = Column(Float, default=1.0)
+    initial_confidence = Column(Float, default=1.0)
+    last_validated_at = Column(DateTime, default=func.now())
+    last_accessed_at = Column(DateTime)
+    access_count = Column(Integer, default=0)
+    
+    # Versioning
+    version = Column(Integer, default=1)
+    superseded_by = Column(String(64))
+    
+    # Vector search (stored as text, converted to VECF64 in raw SQL)
+    embedding = Column(Text)  # Will be VECF64(1536) in MatrixOne
+    
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())

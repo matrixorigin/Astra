@@ -14,7 +14,7 @@ logger = get_logger(__name__)
 class EmbeddingService:
     """Generate and manage text embeddings."""
 
-    DIMENSION = 1024  # Fixed dimension for VECF32(1024)
+    DIMENSION = 1536  # OpenAI text-embedding-3-small dimension
 
     def __init__(
         self, db, provider: str = "openai", model: str = "text-embedding-3-small"
