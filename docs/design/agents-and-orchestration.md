@@ -372,7 +372,113 @@ The platform selects the best-fit agent based on skill overlap, current load, an
 
 ---
 
-## 6. Intelligent Model Routing
+## 6. Multi-Agent Conflict Resolution and Consensus
+
+### The Problem
+
+Agent Teams (§5) describe coordination — who does what. But they don't address what happens when agents **disagree**. A code agent says "refactor this function," a performance agent says "don't touch it, it's hot-path optimized," and a security agent says "rewrite it entirely, it has a vulnerability." Three valid perspectives, three incompatible actions. Without a conflict resolution mechanism, the lead agent either picks arbitrarily or deadlocks.
+
+### Conflict Detection
+
+Conflicts are detected structurally, not heuristically. When multiple agents produce results for related tasks, the framework checks for incompatibility:
+
+```
+Agent A result: "Modify function X → version A'"
+Agent B result: "Modify function X → version B'"
+Agent C result: "Do not modify function X"
+  │
+  ▼
+Conflict detector:
+  - Same target artifact (function X) → potential conflict
+  - Actions are mutually exclusive (modify vs don't modify) → confirmed conflict
+  - Log conflict_detected event with all competing proposals
+```
+
+Conflict detection is an event — it enters the causal chain and is auditable.
+
+### Resolution Strategies
+
+The lead agent selects a strategy based on team configuration and conflict type:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  RESOLUTION STRATEGIES                                      │
+│                                                             │
+│  1. AUTHORITY                                               │
+│     Pre-assigned priority: security > correctness > perf    │
+│     Highest-priority agent's proposal wins automatically    │
+│     Use when: clear domain hierarchy exists                 │
+│                                                             │
+│  2. EVIDENCE-BASED ARBITRATION                              │
+│     Each agent provides evidence (test results, metrics,    │
+│     references) alongside its proposal                      │
+│     Lead agent (or dedicated arbiter) evaluates evidence    │
+│     Use when: proposals can be objectively compared         │
+│                                                             │
+│  3. SYNTHESIS                                               │
+│     Lead agent receives all proposals + reasoning           │
+│     Generates a merged solution that satisfies constraints  │
+│     from all parties (e.g., rewrite for security BUT       │
+│     preserve hot-path optimization)                         │
+│     Use when: proposals are partially compatible            │
+│                                                             │
+│  4. SANDBOX TOURNAMENT                                      │
+│     Each proposal executed in its own clone                 │
+│     Run evaluation suite against each clone                 │
+│     Highest-scoring clone wins                              │
+│     Use when: objective quality metric exists               │
+│                                                             │
+│  5. HUMAN ESCALATION                                        │
+│     Conflict + all proposals surfaced to human              │
+│     Human decides (via HITL policy from trust-and-safety §9)│
+│     Use when: stakes too high for automated resolution      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Consensus Protocol for Critical Decisions
+
+For high-stakes actions (production deployment, data deletion, security-sensitive changes), simple majority isn't enough. The team uses a structured consensus:
+
+```
+Lead proposes action
+  │
+  ▼
+All relevant members vote: APPROVE / OBJECT (with reason)
+  │
+  ├── Unanimous APPROVE → execute
+  │
+  ├── Any OBJECT with severity=blocking
+  │   → Objection + reason injected into lead's context
+  │   → Lead must address objection (revise proposal or override with justification)
+  │   → Re-vote on revised proposal
+  │   → Max 3 rounds, then escalate to human
+  │
+  └── Non-blocking objections → execute + log objections for post-hoc review
+```
+
+Every vote is an event. The full deliberation is replayable.
+
+### Configuration
+
+```python
+TeamConfig = {
+    "conflict_resolution": {
+        "default_strategy": "evidence_based",
+        "priority_order": ["security_agent", "code_agent", "perf_agent"],
+        "consensus_required_for": ["production_deploy", "data_migration", "access_change"],
+        "max_resolution_rounds": 3,
+        "escalation_target": "human"  # or "senior_agent"
+    }
+}
+```
+
+### Why This Matters
+
+Without explicit conflict resolution, multi-agent systems degrade to "last writer wins" or "loudest agent wins." Both are invisible failure modes — the system appears to work but silently drops valid perspectives. Making conflict resolution a first-class protocol means disagreements are **visible, auditable, and systematically resolved**.
+
+---
+
+## 7. Intelligent Model Routing
 
 ### The Problem
 
@@ -398,7 +504,7 @@ User Request
 │     - Cost efficiency: quality_score / cost ratio            │
 │                                                             │
 │  3. Apply constraints                                       │
-│     - User/tenant budget remaining                          │
+│     - Budget remaining for this scope                    │
 │     - Latency requirements                                  │
 │     - Compliance requirements (some tasks require specific   │
 │       models for audit reasons)                             │
@@ -438,7 +544,7 @@ TeamConfig = {
 
 ---
 
-## 7. Sub-Agent Architecture for Long-Horizon Tasks
+## 8. Sub-Agent Architecture for Long-Horizon Tasks
 
 Following Anthropic's multi-agent research system pattern:
 
@@ -457,6 +563,192 @@ Lead Agent (coordinator, high-level plan)
 **Key insight**: Each sub-agent can explore extensively with a clean context window. The lead agent never sees the raw exploration — only distilled results. This achieves separation of concerns and prevents context pollution.
 
 This composes naturally with PAOR planning: a plan step can delegate to a sub-agent. A sub-agent can itself plan. Depth is bounded by `PlanConstraints.max_steps` at each level.
+
+---
+
+## 9. Agent Scheduling and Resource Management
+
+### The Problem
+
+Multi-agent parallelism (§5) creates resource contention: N agents competing for LLM API rate limits, database connections, and compute budget. Without scheduling, you get thundering herds, budget overruns, and priority inversions (a low-priority background task starves a user-facing request).
+
+### Scheduling Model
+
+```
+Incoming agent tasks
+  │
+  ▼
+┌─────────────────────────────────────────────────────────┐
+│  SCHEDULER                                              │
+│                                                         │
+│  Priority Queues (preemptive):                          │
+│    P0: User-facing interactive (< 2s latency target)    │
+│    P1: User-initiated background (< 30s)                │
+│    P2: System-initiated (evaluation, training, cleanup) │
+│    P3: Speculative (parallel exploration, pre-warming)  │
+│                                                         │
+│  Resource Pools:                                        │
+│    LLM tokens/min: allocated per priority tier          │
+│    DB connections: bounded pool per scope                │
+│    Clone slots: max concurrent clones per scope          │
+│                                                         │
+│  Admission Control:                                     │
+│    - Estimate cost BEFORE scheduling (from history)     │
+│    - Reject if budget remaining < estimated cost        │
+│    - Reject if resource pool exhausted → queue or shed  │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Cost Convergence
+
+The scheduler doesn't just limit spend — it **converges** toward a budget target:
+
+```python
+@dataclass
+class BudgetPolicy:
+    scope_id: str          # user, team, or account — deployment determines granularity
+    daily_budget: float
+    current_spend: float
+    remaining_hours: float
+
+    @property
+    def burn_rate_target(self) -> float:
+        """Target $/hour to stay within budget."""
+        remaining = self.daily_budget - self.current_spend
+        return remaining / max(self.remaining_hours, 1)
+
+    def should_downgrade_model(self, estimated_cost: float) -> bool:
+        """Switch to cheaper model if burn rate exceeds target."""
+        return estimated_cost > self.burn_rate_target * 0.5
+```
+
+When burn rate exceeds target: automatically downgrade non-critical tasks to cheaper models. When under budget: allow quality upgrades. The system self-balances.
+
+### Load Shedding
+
+When all resource pools are saturated:
+
+| Priority | Behavior |
+|---|---|
+| P0 (interactive) | Never shed. Preempt P2/P3 tasks if needed. |
+| P1 (background) | Queue with timeout. Notify user if delayed. |
+| P2 (system) | Defer to off-peak. Batch where possible. |
+| P3 (speculative) | Shed immediately. These are optional by definition. |
+
+For the full data flow architecture under multi-agent load — write batching, read path optimization, HTAP separation, and backpressure mechanisms — see [ARCHITECTURE.md § Data Flow Architecture](ARCHITECTURE.md#data-flow-architecture-throughput-under-multi-agent-load).
+
+---
+
+## 10. Cross-Model Consistency and Provider Resilience
+
+### The Problem
+
+The model router (§7) routes tasks to different models. But models disagree: Opus and Sonnet may produce structurally different outputs for the same prompt. And providers go down: if OpenAI is unavailable, can we failover to Anthropic without breaking the session? More fundamentally, even the **same model** is non-deterministic — the same input can produce different outputs across calls.
+
+### Non-Determinism Budget
+
+Not all non-determinism is equal. The framework assigns a **tolerance class** to each task type:
+
+| Tolerance Class | Acceptable Variation | Example Tasks | Enforcement |
+|---|---|---|---|
+| **Strict** | Structural identity (same tool calls, same schema) | Production deploys, data migrations, financial calculations | Retry up to 3x if output structure differs from expected |
+| **Semantic** | Same conclusion, different wording allowed | Code review, Q&A, explanations | Verify key assertions match via lightweight judge |
+| **Relaxed** | Different approaches acceptable if quality maintained | Brainstorming, exploration, creative writing | Quality score check only |
+
+Configuration per skill:
+
+```python
+class SkillConsistencyPolicy:
+    tolerance: Literal["strict", "semantic", "relaxed"]
+    verification_model: str | None  # cheaper model for consistency checks; None = skip
+    max_retries: int = 2            # retries on consistency failure
+    reference_output: str | None    # golden output for strict comparison (optional)
+```
+
+### Consistency Verification Mechanism
+
+```
+Agent produces output with Model A
+  │
+  ▼
+Step 1: STRUCTURAL CHECK (fast, no LLM call)
+  - Does output match expected schema? (tool_call format, JSON structure)
+  - Does output contain required fields?
+  - Are tool call parameters within declared bounds?
+  │
+  ├── Fail → retry with same model (malformed output, transient)
+  │
+  ▼
+Step 2: SEMANTIC CHECK (only for strict/semantic tolerance)
+  - Lightweight judge model compares output against:
+    a) Prior turns in this session (contradiction detection)
+    b) Reference output if available (semantic equivalence)
+    c) Known invariants for this task type
+  │
+  ├── Contradiction detected → log consistency_violation event
+  │   → If mid-session model switch caused it: mark model pair as incompatible for this task type
+  │   → Feed into router: "Model B is not a safe fallback for task type X"
+  │
+  ▼
+Step 3: CROSS-MODEL EQUIVALENCE TEST (offline, batch)
+  - Periodically replay golden sessions across all routable models
+  - Build compatibility matrix:
+
+    | Task Type      | Opus→Sonnet | Opus→GPT-4 | Sonnet→Haiku |
+    |----------------|-------------|------------|--------------|
+    | code_review    | 94% compat  | 87% compat | 72% compat   |
+    | deploy         | 99% compat  | 91% compat | N/A (blocked)|
+    | explanation    | 98% compat  | 96% compat | 93% compat   |
+
+  - Router uses this matrix for failover decisions
+  - Matrix auto-updates as new replay data accumulates
+```
+
+### Provider Failover
+
+```
+Primary provider unavailable
+  │
+  ▼
+Failover decision (informed by compatibility matrix):
+  │
+  ├── Check compatibility matrix for current task type
+  │   ├── Compatible fallback exists (>90%) → failover immediately
+  │   ├── Marginal compatibility (70-90%) → failover + run consistency check on first response
+  │   └── Low compatibility (<70%) → queue and wait for primary (with timeout)
+  │
+  ├── Mid-session: prefer same-family fallback (Opus → Sonnet, not Opus → GPT-4)
+  │   to minimize behavioral discontinuity
+  │
+  └── Post-failover:
+      - Log provider_failover event with original_model, fallback_model, compatibility_score
+      - If session continues on fallback: flag for post-hoc review
+      - When primary recovers: optionally switch back (configurable)
+```
+
+### Replay Consistency Across Models
+
+A session recorded with Model A must be replayable even if Model A is no longer available. The replay system handles this:
+
+```
+Replay session (originally Model A, now using Model B)
+  │
+  ▼
+For each LLM call in the session:
+  - Input: identical (from context snapshot)
+  - Output: Model B's response (will differ from original)
+  │
+  ▼
+Comparison (using task's tolerance class):
+  - Strict: same tool calls, same schema? → PASS/FAIL
+  - Semantic: same conclusion, different wording? → PASS/FAIL
+  - Relaxed: quality score within range? → PASS/FAIL
+  │
+  ▼
+Report: "Session replay with Model B: 47/50 steps consistent, 3 flagged"
+  → Flagged steps feed back into compatibility matrix
+  → Every replay automatically improves cross-model knowledge
+```
 
 ---
 

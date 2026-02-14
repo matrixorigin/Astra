@@ -75,23 +75,86 @@ Perceive → Encode → Store → Consolidate → Retrieve → Update → Decay/
 | **Update** | Revise beliefs based on new evidence | Knowledge entry versioning, confidence decay |
 | **Decay/Archive** | Remove or compress stale information | Intelligent decay based on recency × relevance × utility |
 
-### Intelligent Decay
+### Memory Lifecycle Governance
 
-Not all memories are equal. Following the research on intelligent decay mechanisms:
+Decay, trust, and cleanup are not ad-hoc — they're a formal governance model with explicit policies, automated enforcement, and audit trail.
+
+#### Retention Policy by Memory Type
+
+| Memory Type | Default TTL | Decay Behavior | Deletion |
+|---|---|---|---|
+| **Sensory** (raw stream chunks) | 1 hour | Auto-purge after consolidation into events | Hard delete (no audit need) |
+| **Working** (active plan state) | Session lifetime | Archived on session close | Soft delete (queryable via time-travel) |
+| **Episodic** (session summaries, events) | 90 days active | Compress: full events → summary after TTL | Never hard delete (audit requirement) |
+| **Semantic** (knowledge entries) | No TTL (explicit lifecycle) | Confidence decay over time (see below) | Quarantine → archive (never hard delete) |
+| **Procedural** (skills, prompt templates) | No TTL (versioned) | Never auto-decay | Deprecate → version tombstone |
+
+#### Automated Confidence Decay
+
+Knowledge entries lose confidence over time unless revalidated:
 
 ```
-retention_score = α × recency + β × relevance + γ × utility + δ × user_specified_importance
+confidence(t) = initial_confidence × decay_factor^(days_since_validation / half_life)
 
-if retention_score < threshold:
-    if memory.type == "episodic":
-        compress → session_summary (keep gist, drop details)
-    elif memory.type == "semantic":
-        mark as low_confidence (don't delete — might be needed for audit)
-    elif memory.type == "procedural":
-        never auto-decay (versioned, explicit deprecation only)
+where:
+  decay_factor = 0.5  (halves every half_life period)
+  half_life = varies by source trust tier (see below)
 ```
 
-This prevents memory bloat while preserving audit trail integrity.
+When `confidence(t)` drops below retrieval threshold (default 0.3):
+- Entry excluded from retrieval results
+- Queued for revalidation (automated or human)
+- If revalidated: confidence reset to validated level, timer restarts
+- If not revalidated within grace period: quarantined
+
+#### Source Trust Tiers
+
+Not all information sources are equally reliable. Trust tier determines initial confidence and decay rate:
+
+| Trust Tier | Sources | Initial Confidence | Half-Life | Verification |
+|---|---|---|---|---|
+| **T1: Verified** | Official docs, verified APIs, system-generated | 0.95 | 365 days | Auto-verified against source URL/API |
+| **T2: Curated** | Human-reviewed, team knowledge bases | 0.85 | 180 days | Periodic human review cycle |
+| **T3: Inferred** | Agent-extracted from conversations, LLM-generated summaries | 0.65 | 60 days | Cross-reference against T1/T2 sources |
+| **T4: Unverified** | Raw user input, unvalidated claims | 0.40 | 30 days | Must be promoted to T3+ or decays to quarantine |
+
+```sql
+-- Source trust enforcement in retrieval
+SELECT entry_id, content, 
+  confidence * POWER(0.5, DATEDIFF(NOW(), last_validated_at) / half_life_days) AS effective_confidence
+FROM knowledge_entries
+WHERE effective_confidence > 0.3  -- retrieval threshold
+ORDER BY effective_confidence DESC;
+```
+
+#### Automated Enforcement
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  MEMORY GOVERNANCE ENGINE (runs continuously)           │
+│                                                         │
+│  Every hour:                                            │
+│    - Purge expired sensory buffer entries                │
+│    - Archive closed working memory                      │
+│                                                         │
+│  Every day:                                             │
+│    - Recalculate effective_confidence for all entries    │
+│    - Quarantine entries below threshold                  │
+│    - Compress episodic events past TTL → summaries      │
+│    - Flag T4 entries approaching decay deadline          │
+│                                                         │
+│  Every week:                                            │
+│    - T1 auto-verification: re-fetch source URLs,        │
+│      compare against stored content                     │
+│    - Contradiction scan: find semantically similar       │
+│      entries with conflicting claims                    │
+│    - Generate memory health report per tenant            │
+│                                                         │
+│  All actions logged as governance_events (auditable)    │
+└─────────────────────────────────────────────────────────┘
+```
+
+This prevents memory bloat while preserving audit trail integrity. Hard deletes only happen for transient data (sensory buffer). Everything else is quarantined or archived — always recoverable via time-travel.
 
 ---
 
@@ -440,7 +503,7 @@ WHERE quality_score IS NULL;
 | Procedural memory | ❌ | ❌ | ✅ Skill learnings, prompt evolution |
 | Memory audit | ❌ | ❌ | ✅ Every retrieval recorded in context_snapshot |
 | Memory experimentation | ❌ | ❌ | ✅ Fix memory in sandbox, replay to verify |
-| Memory decay | ❌ | Manual eviction | Intelligent decay (recency × relevance × utility) |
+| Memory decay | ❌ | Manual eviction | Governed lifecycle: TTL per type, confidence decay, source trust tiers, automated enforcement |
 | Cross-session continuity | Vector search only | Archival search | Structured notes + session summaries + knowledge entries |
 | Vector + Fulltext + SQL | 3 separate systems | External vector DB | ✅ Single MatrixOne query — hybrid search native |
 | Vector time-travel | ❌ | ❌ | ✅ Snapshot restores vector indexes too |
@@ -507,7 +570,99 @@ Every LLM call produces a snapshot of exactly what the model saw. This is stored
 
 ---
 
-## 7. Open Research Directions
+## 7. Memory Hygiene: Pollution Detection and Systematic Cleanup
+
+### The Problem
+
+Memory is a long-lived, self-reinforcing system. A bad memory entry doesn't just produce one bad answer — it gets retrieved repeatedly, influences future decisions, and those decisions may themselves become memories. Left unchecked, a single poisoned entry can corrupt an entire knowledge domain through cascading retrieval.
+
+Sources of pollution:
+- **User injection**: user deliberately inserts false "facts" into conversation
+- **Hallucination crystallization**: agent hallucinates → low-quality response stored → retrieved as "knowledge" in future sessions
+- **Stale knowledge**: once-true facts that are now outdated (API changed, policy updated)
+- **Duplicate/contradictory entries**: same concept stored multiple times with conflicting content
+
+### Pollution Detection (Continuous)
+
+```sql
+-- Dynamic table: auto-refreshing pollution candidates
+CREATE DYNAMIC TABLE memory_pollution_candidates AS
+SELECT
+  ke.entry_id,
+  ke.content,
+  ke.source,
+  ke.created_at,
+  ke.retrieval_count,
+  -- Signal 1: retrieved often but leads to low-quality decisions
+  AVG(ce.quality_score) AS avg_downstream_quality,
+  -- Signal 2: contradicts other entries on same topic
+  COUNT(DISTINCT ke2.entry_id) AS contradicting_entries,
+  -- Signal 3: age without revalidation
+  DATEDIFF(NOW(), ke.last_validated_at) AS days_since_validation
+FROM knowledge_entries ke
+LEFT JOIN context_snapshots cs ON cs.snapshot_data LIKE CONCAT('%', ke.entry_id, '%')
+LEFT JOIN conversation_events ce ON ce.snapshot_id = cs.snapshot_id
+LEFT JOIN knowledge_entries ke2
+  ON ke2.topic = ke.topic
+  AND ke2.entry_id != ke.entry_id
+  AND l2_distance(ke.embedding, ke2.embedding) < 0.3  -- semantically similar
+GROUP BY ke.entry_id
+HAVING avg_downstream_quality < 2.5           -- leads to bad decisions
+    OR contradicting_entries > 2               -- multiple contradictions
+    OR days_since_validation > 90;             -- stale
+```
+
+This runs continuously as a Dynamic Table — pollution candidates surface automatically without scheduled jobs.
+
+### Cleanup Actions
+
+```
+Pollution candidate detected
+  │
+  ▼
+Severity classification:
+  │
+  ├── LOW (stale, no downstream harm)
+  │   → Mark for revalidation
+  │   → Reduce retrieval weight (decay factor)
+  │   → Queue for human review if retrieval_count > threshold
+  │
+  ├── MEDIUM (contradictions exist)
+  │   → Quarantine: exclude from retrieval but don't delete
+  │   → Surface contradicting entries to human for resolution
+  │   → Log quarantine event (auditable)
+  │
+  └── HIGH (confirmed downstream harm)
+      → Quarantine immediately
+      → Identify affected decisions (via context_snapshots)
+      → Flag affected decisions for re-evaluation
+      → Alert tenant admin
+```
+
+### Cascade Impact Analysis
+
+When a polluted entry is quarantined, trace its blast radius:
+
+```sql
+-- Find all decisions that used this memory entry
+SELECT ce.event_id, ce.content, ce.quality_score, ce.created_at
+FROM conversation_events ce
+JOIN context_snapshots cs ON ce.snapshot_id = cs.snapshot_id
+WHERE cs.snapshot_data LIKE CONCAT('%', @quarantined_entry_id, '%')
+ORDER BY ce.created_at DESC;
+```
+
+If any of those decisions themselves became memory entries (hallucination crystallization chain), quarantine those too. This is recursive — the system traces the full contamination graph.
+
+### Proactive Hygiene
+
+- **Revalidation cycle**: knowledge entries older than N days are re-scored by Python UDF against current context
+- **Contradiction detection on write**: before inserting a new knowledge entry, check for semantic near-duplicates; if found, flag for merge or resolution
+- **Source trust scoring**: entries from `source = 'user_input'` start with lower trust than `source = 'verified_documentation'`; trust score influences retrieval ranking
+
+---
+
+## 8. Open Research Directions
 
 ### Observational Memory
 

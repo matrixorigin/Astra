@@ -244,7 +244,11 @@ lineage.trace_downstream(event_id="evt_knowledge_update_456")
 
 The point is not "we use MatrixOne features." The point is that MatrixOne's capabilities **collapse entire categories of infrastructure into single operations**, creating workflows that are impossible or prohibitively expensive on traditional stacks.
 
-### Workflow 1: "Clone-Test-Merge" — Zero-Risk Agent Evolution
+These workflows fall into two categories:
+- **Platform-internal**: Operate on the platform's own state DB (always available)
+- **Enhanced service**: Operate on the user's data via passed `db` handle (available when user data is on MatrixOne)
+
+### Workflow 1: "Clone-Test-Merge" — Zero-Risk Agent Evolution (Platform-internal)
 
 **Industry pain point**: Changing a prompt, skill, or model is terrifying in production. No one knows if it will break existing behavior. Most teams ship and pray.
 
@@ -272,7 +276,7 @@ Quality regressed? → DROP DATABASE experiment -- discard, zero cleanup
 
 **What this replaces**: CI/CD pipelines with staging environments, manual QA, A/B testing infrastructure, feature flags, rollback procedures. All of that collapses into clone → test → merge/discard.
 
-### Workflow 2: "Snapshot-as-Ground-Truth" — Auditable Decisions
+### Workflow 2: "Snapshot-as-Ground-Truth" — Auditable Decisions (Platform-internal)
 
 **Industry pain point**: "Why did the agent say that?" is unanswerable because the data has changed since the decision was made.
 
@@ -299,7 +303,7 @@ Exact data state at T1 — including vector indexes, knowledge entries, event hi
 
 **What this replaces**: Application-level snapshot logic, separate audit databases, manual data archival, compliance reporting tools. The database IS the audit system.
 
-### Workflow 3: "Hybrid Memory Recall" — One Query, Three Signals
+### Workflow 3: "Hybrid Memory Recall" — One Query, Three Signals (Platform-internal)
 
 **Industry pain point**: Memory retrieval requires stitching together a vector DB (semantic), a search engine (keyword), and a relational DB (structured filters). Three systems, three sync problems, three failure modes.
 
@@ -321,7 +325,7 @@ LIMIT 10;
 
 **New concept this enables: "Memory with opinions."** Because quality_score lives next to the embedding, retrieval naturally prefers high-quality memories. Bad experiences decay not just by time, but by quality. The agent's memory is self-curating.
 
-### Workflow 4: "Publication-as-Marketplace" — Skill Distribution Without Infrastructure
+### Workflow 4: "Publication-as-Marketplace" — Skill Distribution Without Infrastructure (Platform-internal)
 
 **Industry pain point**: Sharing reusable agent capabilities across teams requires building a registry, an API, a distribution mechanism, version management, and access control.
 
@@ -342,7 +346,7 @@ CREATE CLONE pinned_skills FROM publisher_acct.skill_db;
 
 **What this replaces**: npm/pip-style package registries, API gateways, webhook-based update notifications, entitlement management. The database IS the distribution channel.
 
-### Workflow 5: "Clone-per-Agent" — Isolated Parallel Exploration
+### Workflow 5: "Clone-per-Agent" — Isolated Parallel Exploration (Enhanced service)
 
 **Industry pain point**: When multiple agents work in parallel, they can step on each other's data. Locking is complex. Isolation is expensive.
 
@@ -369,7 +373,7 @@ DROP DATABASE agent_b_workspace, agent_c_workspace, agent_d_workspace;
 
 **New concept: "Speculative Execution for Agents."** Like CPU branch prediction — run multiple approaches in parallel, keep the best one, discard the rest. Only possible when branching is free.
 
-### Workflow 6: "UDF-as-Guardrail" — Safety at the Data Layer
+### Workflow 6: "UDF-as-Guardrail" — Safety at the Data Layer (Platform-internal)
 
 **Industry pain point**: Guardrails are application-level middleware. They can be bypassed, they add latency, they're hard to audit.
 
@@ -394,7 +398,7 @@ WHERE NOT check_pii(content);
 
 **What this replaces**: Middleware guardrail layers, post-hoc scanning jobs, separate compliance databases. The guardrail IS the database constraint.
 
-### Workflow 7: "Stage-as-Training-Pipeline" — Data to Model Without ETL
+### Workflow 7: "Stage-as-Training-Pipeline" — Data to Model Without ETL (Platform-internal)
 
 **Industry pain point**: Getting training data from production to a fine-tuning pipeline requires ETL jobs, data warehouses, export scripts, format conversion.
 
@@ -420,7 +424,11 @@ WHERE t.event_id IS NULL AND p.quality_score >= 4.0;
 
 ### The Pattern
 
-Every workflow above follows the same principle: **what traditionally requires a separate system (audit DB, vector DB, search engine, package registry, ETL pipeline, guardrail middleware) collapses into a database operation.** This isn't about using database features. It's about eliminating entire categories of infrastructure, which means fewer failure modes, fewer sync problems, fewer bills, and faster iteration.
+Every workflow above follows the same principle: **what traditionally requires a separate system collapses into a database operation.**
+
+For the platform's own state (workflows 1-4, 6-7): this is always available — the platform runs on MatrixOne.
+
+For user business data (workflow 5, and workflows 1-3 applied to user data): this activates when the user's data is also on MatrixOne. The service accepts a `db` handle — like `Sandbox(db=user_db, source_db="user_database")` — and operates on the user's database. The agent code doesn't change; only the db handle determines what data the service operates on.
 
 ---
 

@@ -261,36 +261,272 @@ side_effect_profile = {
 
 ---
 
-## 7. Multi-Tenant Isolation as Database Guarantee
+## 8. Intrinsic Robustness: Self-Correction Within the Chain
 
-### The Problem
+### The Gap
 
-Application-level access control has bugs. Every SaaS company has had a cross-tenant data leak caused by a missing WHERE clause or a broken middleware check.
+Sections 1–7 address "external trust" — audit, replay, guardrails. But an agent can pass every guardrail and still be wrong: it misuses a tool, reasons from a false premise, or drifts because the underlying model changed. These are **chain-internal** failures that no output filter catches.
 
-### The Solution: MatrixOne Multi-Account
+### Three Self-Correction Mechanisms
 
-Tenant isolation is not enforced by application code. It's enforced by the database engine.
+**1. Tool-Use Verification (pre-execution)**
+
+Before executing a tool call, the framework validates the call against the skill's declared contract:
 
 ```
-Platform (sys account)
-  ├── Tenant A (account: tenant_a)
-  │   ├── conversation_events  ← invisible to Tenant B, enforced by engine
-  │   ├── knowledge_entries    ← isolated
-  │   └── skills_registry      ← tenant-specific + subscribed marketplace skills
+Agent proposes: git_merge(branch="main", target="main")
   │
-  ├── Tenant B (account: tenant_b)
-  │   └── ... completely separate namespace
+  ▼
+Contract check:
+  - branch == target → self-merge, nonsensical → BLOCK
+  - Required param "message" missing → BLOCK
+  - Param type mismatch → BLOCK
   │
-  └── Shared knowledge (via Publication)
-      └── Platform publishes curated knowledge bases
-          Tenants subscribe → read-only access, auto-updated
+  ▼
+Blocked calls → injected as error event into context
+  → Agent sees its own mistake → self-corrects on next turn
 ```
 
-**What this eliminates**: Row-level security policies, tenant_id columns on every table, middleware tenant checks, "forgot the WHERE clause" bugs. The isolation is structural, not logical.
+This is not a guardrail (guardrails filter outputs). This is **structural validation of the agent's reasoning artifact** before it becomes an action.
+
+**2. Reasoning Consistency Check (mid-chain)**
+
+For multi-step plans (PAOR loop), each step's output is checked against the plan's stated goal:
+
+```
+Plan: "Deploy service to staging"
+  Step 1 output: "Deleted production database"
+  │
+  ▼
+  Consistency check: step output vs plan goal
+  - Semantic similarity below threshold → HALT + escalate
+  - Destructive action not in plan scope → HALT + escalate
+  │
+  ▼
+  Agent receives: "Step 1 diverged from plan. Halted. Reason: ..."
+  → Re-plan or escalate to human
+```
+
+**3. Model Drift Detection (cross-session)**
+
+The same prompt + same context should produce similar quality over time. When it doesn't, the model has drifted.
+
+```sql
+-- Detect quality drift for a specific prompt template
+SELECT
+  DATE(created_at) AS day,
+  AVG(quality_score) AS avg_quality,
+  AVG(quality_score) - LAG(AVG(quality_score), 7) OVER (ORDER BY DATE(created_at)) AS week_delta
+FROM conversation_events
+WHERE metadata->>'$.prompt_template' = @template_id
+  AND event_type = 'llm_response'
+GROUP BY DATE(created_at)
+HAVING week_delta < -0.5;  -- quality dropped >0.5 in a week
+```
+
+When drift is detected:
+- Alert: "Prompt template X quality dropped 15% this week"
+- Auto-trigger: replay golden sessions with current model → compare
+- If confirmed regression: route to fallback model or pin to last-known-good model version
+
+### Drift Auto-Correction Pipeline
+
+Detection alone is insufficient. The system must **automatically correct** without waiting for human intervention:
+
+```
+Drift detected (quality_score week_delta < -0.5)
+  │
+  ▼
+Phase 1: CONFIRM (avoid false positives)
+  - Replay 20 golden sessions with current model in clone
+  - Compare quality scores vs historical baseline
+  - If delta < -0.3 confirmed → proceed
+  - If delta within noise → dismiss alert
+  │
+  ▼
+Phase 2: DIAGNOSE
+  - Which task types degraded? (code_review? planning? Q&A?)
+  - Which prompt templates affected?
+  - Is it model-wide or template-specific?
+  │
+  ▼
+Phase 3: CORRECT (automatic, ordered by risk)
+  ├── Template-specific drift:
+  │   → Try prompt variants from evolution history (§4 in evaluation-and-evolution.md)
+  │   → Replay golden sessions with each variant
+  │   → Best-scoring variant auto-promoted (if > baseline)
+  │
+  ├── Model-wide drift:
+  │   → Route affected task types to fallback model
+  │   → Log model_fallback event with reason
+  │   → Continue monitoring — if primary recovers, auto-restore
+  │
+  └── Persistent drift (>7 days, no auto-fix):
+      → Escalate to human (via HITL policy §9)
+      → Package: drift report + affected sessions + attempted corrections
+```
+
+Every correction action is an event — the system's self-repair is as auditable as its decisions.
+
+### The Pattern
+
+External trust (audit, guardrails) catches **what the agent did wrong**. Intrinsic robustness catches **that the agent is going wrong** — before the damage is done.
+
+---
+
+## 9. Human-in-the-Loop: Policy-Driven Supervision
+
+### Beyond "Confirm Side Effects"
+
+Current design requires human approval for destructive tool calls. That's necessary but insufficient. Real-world deployment needs a **policy engine** that determines when humans must be involved based on context, not just action type.
+
+### Supervision Policy Schema
+
+```python
+@dataclass
+class SupervisionPolicy:
+    name: str
+    trigger: SupervisionTrigger    # WHEN to involve human
+    action: SupervisionAction      # WHAT happens
+    scope: str                     # agent / tenant / global
+
+@dataclass
+class SupervisionTrigger:
+    # Any combination — evaluated as OR
+    cost_exceeds: float | None          # estimated cost > threshold
+    confidence_below: float | None      # agent confidence < threshold
+    affects_resources: list[str] | None # touches production / billing / auth
+    plan_depth_exceeds: int | None      # plan has > N steps
+    novel_skill_use: bool               # first time using this skill
+    escalated_by_agent: bool            # agent explicitly asked for help
+
+class SupervisionAction(Enum):
+    APPROVE_REJECT = "approve_reject"       # binary gate
+    REVIEW_AND_EDIT = "review_and_edit"     # human can modify before execution
+    OBSERVE_ONLY = "observe_only"           # human notified, execution continues
+    TAKEOVER = "takeover"                   # human takes control of session
+```
+
+### Example Policies
+
+```yaml
+policies:
+  - name: "high-cost-gate"
+    trigger: { cost_exceeds: 5.00 }
+    action: approve_reject
+    scope: global
+
+  - name: "production-deploy-review"
+    trigger: { affects_resources: ["production", "database"] }
+    action: review_and_edit
+    scope: global
+
+  - name: "low-confidence-escalation"
+    trigger: { confidence_below: 0.6 }
+    action: review_and_edit
+    scope: agent
+
+  - name: "long-plan-checkpoint"
+    trigger: { plan_depth_exceeds: 5 }
+    action: approve_reject  # approve plan before execution begins
+    scope: tenant
+
+  - name: "new-skill-observation"
+    trigger: { novel_skill_use: true }
+    action: observe_only
+    scope: agent
+```
+
+### Execution Flow
+
+```
+Agent proposes action
+  │
+  ▼
+Policy engine evaluates ALL active policies
+  │
+  ├── No policy triggered → execute
+  │
+  ├── OBSERVE_ONLY triggered → execute + notify human async
+  │
+  ├── APPROVE_REJECT triggered → pause execution
+  │   → Human approves → resume
+  │   → Human rejects → inject rejection reason into context → agent re-plans
+  │
+  ├── REVIEW_AND_EDIT triggered → pause execution
+  │   → Human edits action params → execute edited version
+  │
+  └── TAKEOVER triggered → pause agent
+      → Human operates directly → agent observes (learns from human actions)
+```
+
+### Key Design Decisions
+
+- Policies are **data, not code** — stored in MatrixOne, versioned, auditable
+- Multiple policies can trigger simultaneously — most restrictive action wins
+- Every policy evaluation is logged as an event — "why was the human involved?" is always answerable
+- Agent learns from human overrides: rejected actions become negative training signal, human edits become preference data
+
+---
+
+## 10. Deployment Isolation: Multi-Tenancy as Transparent Infrastructure
+
+### The Principle
+
+**Agents have no concept of tenants.** An agent's logic, memory, skills, and orchestration are identical whether running in a single-tenant deployment or a 1000-tenant SaaS platform. Multi-tenancy is a deployment-time isolation strategy — the platform provides it transparently, the agent never sees it.
+
+This is a deliberate design choice. If agent code contains `tenant_id` checks, you've leaked a deployment concern into the domain model. Every future feature must then ask "does this work in multi-tenant mode?" — a tax that compounds forever.
+
+### What the Agent Sees vs What the Platform Does
+
+| Agent's View | Platform's Reality (Multi-Tenant Deploy) | Platform's Reality (Single-Tenant Deploy) |
+|---|---|---|
+| `conversation_events` table | Tenant A's database, invisible to Tenant B | The only database |
+| `knowledge_entries` table | Scoped to this account's namespace | The only namespace |
+| Skill registry | Tenant-local + subscribed marketplace skills | All registered skills |
+| Sandbox (CREATE CLONE) | Clone within this account's scope | Clone of the database |
+| Snapshot / time-travel | Scoped to this account | Scoped to the database |
+
+The agent issues the same SQL, the same API calls, the same skill invocations. The platform's deployment layer determines the isolation boundary.
+
+### How MatrixOne Makes This Transparent
+
+MatrixOne Multi-Account provides database-level namespace isolation:
+
+```
+Single-tenant deployment:
+  └── Database: mo_agent
+      ├── conversation_events
+      ├── knowledge_entries
+      └── skills_registry
+
+Multi-tenant deployment:
+  ├── Account: tenant_a → Database: mo_agent  (same schema, same queries)
+  ├── Account: tenant_b → Database: mo_agent  (completely separate namespace)
+  └── Account: sys → Platform admin (cross-account visibility for ops)
+```
+
+The agent code connects to `mo_agent` database in both cases. The connection string determines which account — this is infrastructure configuration, not application logic.
+
+**What this eliminates**: `tenant_id` columns, `WHERE tenant_id = ?` on every query, application-level access control middleware, cross-tenant data leak bugs. The isolation is structural (database engine enforced), not logical (application code enforced).
+
+### Cross-Tenant Sharing (When Needed)
+
+Some resources are intentionally shared across tenants — skill marketplace, curated knowledge bases. This uses MatrixOne Publication:
+
+```sql
+-- Platform publishes shared resources (ops action, not agent action)
+CREATE PUBLICATION skill_marketplace DATABASE shared_skills ACCOUNT ALL;
+
+-- Tenant subscribes (admin action, not agent action)
+CREATE DATABASE marketplace_skills FROM sys PUBLICATION skill_marketplace;
+```
+
+The agent sees `marketplace_skills` as just another local database. It doesn't know the data comes from a cross-tenant publication.
 
 ### Within-Tenant Visibility
 
-For user-private vs team-shared memory within a single tenant:
+Within a single tenant, user-level visibility (private vs team-shared) is handled by views:
 
 ```sql
 CREATE VIEW my_knowledge AS
@@ -299,16 +535,102 @@ WHERE (visibility = 'user' AND user_id = CURRENT_USER())
    OR visibility IN ('team', 'public');
 ```
 
+This is the only place where "who can see what" appears in the data model — and it's user-level, not tenant-level.
+
 ### Audit Immutability
 
-MatrixOne's MVCC guarantees that historical events are never modified. Time-travel queries prove data integrity:
+Orthogonal to tenancy. Works identically in single-tenant and multi-tenant:
 
 ```sql
--- Verify no events were tampered with since audit checkpoint
 SELECT * FROM conversation_events {SNAPSHOT = 'audit_q1'}
 WHERE event_id = 'evt_suspicious';
 -- Compare with current state — any difference = tampering evidence
 ```
+
+---
+
+## 11. Agent-Level SLOs and Platform SLA
+
+### The Gap
+
+Traditional SLOs measure infrastructure (uptime, latency, error rate). Agent platforms need SLOs that measure **agent effectiveness** — did the agent actually help? How reliably? At what cost? Without these, "the platform is up" and "the platform is useful" are conflated.
+
+### Agent SLO Definitions
+
+| SLO | Metric | Target | Measurement |
+|---|---|---|---|
+| **Response Quality** | avg(quality_score) per agent per day | ≥ 4.0 / 5.0 | Auto-scored by evaluation pipeline (§1-2 in evaluation-and-evolution.md) |
+| **Task Completion** | tasks_completed / tasks_attempted | ≥ 95% | Tracked via PAOR loop terminal states |
+| **Response Latency** | p95 end-to-end (user query → final response) | < 10s (interactive), < 60s (background) | Measured from event timestamps |
+| **Hallucination Rate** | hallucination_detected / total_responses | < 2% | Hallucination firewall (§2) verdicts |
+| **Cost Efficiency** | quality_score / cost_per_task | Improving quarter-over-quarter | Router + quality data (§7 in agents-and-orchestration.md) |
+| **Regression Gate Pass Rate** | gate_passed / gate_runs | ≥ 98% | Replay gating results (§4) |
+| **Self-Correction Rate** | auto_corrected / errors_detected | ≥ 80% | Intrinsic robustness (§8) events |
+| **HITL Escalation Rate** | human_escalations / total_decisions | < 5% (trending down) | HITL policy (§9) events |
+
+### SLO Monitoring
+
+```sql
+-- Dynamic table: real-time SLO dashboard per agent
+CREATE DYNAMIC TABLE agent_slo_dashboard AS
+SELECT
+  agent_id,
+  DATE(created_at) AS day,
+  -- Quality SLO
+  AVG(quality_score) AS avg_quality,
+  AVG(quality_score) >= 4.0 AS quality_slo_met,
+  -- Hallucination SLO
+  SUM(CASE WHEN metadata->>'$.hallucination_detected' = 'true' THEN 1 ELSE 0 END) * 1.0
+    / COUNT(*) AS hallucination_rate,
+  -- Latency SLO (seconds between user_query and final response in same chain)
+  AVG(CAST(metadata->>'$.response_latency_ms' AS DECIMAL)) / 1000 AS avg_latency_s,
+  -- Cost efficiency
+  AVG(quality_score) / NULLIF(AVG(CAST(metadata->>'$.total_cost' AS DECIMAL)), 0) AS cost_efficiency
+FROM conversation_events
+WHERE event_type = 'llm_response'
+GROUP BY agent_id, DATE(created_at);
+```
+
+### SLO Burn Rate Alerts
+
+Borrowed from SRE practice — don't alert on instantaneous violations, alert on **burn rate** (how fast you're consuming your error budget):
+
+```
+Monthly error budget for quality SLO (target 4.0):
+  allowed_bad_days = 30 × (1 - 0.95) = 1.5 days
+
+Current burn rate:
+  bad_days_this_month / days_elapsed × 30
+
+If projected_bad_days > allowed_bad_days:
+  → Alert: "Agent X quality SLO at risk — burning error budget at 3x rate"
+  → Auto-action: increase model tier for this agent (cost vs quality tradeoff)
+```
+
+### Platform SLA (Composed from Agent SLOs)
+
+The platform SLA is not a single number — it's a composition:
+
+```
+Platform SLA = {
+  availability: 99.9%                    -- platform is reachable
+  agent_quality: 95% of agents meet quality SLO on any given day
+  task_completion: 95% platform-wide
+  data_durability: 99.999%               -- no event loss (MatrixOne guarantee)
+  audit_completeness: 100%               -- every decision has a snapshot
+  failover_time: < 30s                   -- provider failover (§10 in agents-and-orchestration.md)
+}
+```
+
+### SLO Violation Response
+
+| Severity | Condition | Auto-Response |
+|---|---|---|
+| **Warning** | Burn rate > 1.5x | Alert team, increase monitoring frequency |
+| **Critical** | Burn rate > 3x | Auto-upgrade model tier, trigger replay gate on recent sessions |
+| **Breach** | SLO violated for the period | Post-mortem event created, agent flagged for review, HITL policy tightened |
+
+Every SLO evaluation and violation response is an event — the platform's operational health is as auditable as its agent decisions.
 
 ---
 
