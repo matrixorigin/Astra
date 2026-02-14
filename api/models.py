@@ -132,6 +132,7 @@ class Event(Base):
     context_snapshot = Column(JSON)
     token_usage = Column(JSON)
     embedding_ref = Column(String(128))
+    embedding = Column(Text)  # VECF64(1536) stored as text for hybrid retrieval
     prompt_template_id = Column(String(64))
     skills_snapshot = Column(JSON)
     quality_score = Column(String(10))
@@ -201,6 +202,7 @@ class ContextSnapshot(Base):
     system_prompt = Column(Text)
     skill_definitions = Column(JSON)
     selected_events = Column(JSON)
+    retrieved_events = Column(JSON)  # Raw retrieval results with scores for replay consistency
     code_context = Column(JSON)
     documentation = Column(JSON)
     token_budget = Column(JSON)

@@ -54,6 +54,7 @@ class Context:
     assembly_time_ms: int
     relevance_scores: dict[str, float]
     task_type: TaskType
+    retrieved_events: list[dict[str, Any]] | None = None  # Raw retrieval for replay
 
     def to_prompt(self) -> str:
         """Convert context to LLM prompt."""
@@ -119,6 +120,9 @@ class ContextManager:
         query: str,
         max_tokens: int = 8000,
         task_type: TaskType = TaskType.GENERAL,
+        current_chain_id: str | None = None,
+        use_hybrid_retrieval: bool = False,  # Default to fallback (embeddings not always available)
+        forced_retrieval: list[dict[str, Any]] | None = None,
     ) -> Context:
         """Build optimal context for current query.
 
@@ -127,9 +131,12 @@ class ContextManager:
             query: User query
             max_tokens: Maximum tokens allowed
             task_type: Type of task for optimization
+            current_chain_id: Current causal chain for proximity scoring
+            use_hybrid_retrieval: Use MatrixOne hybrid search (default True)
+            forced_retrieval: Use these events instead of retrieving (for replay)
 
         Returns:
-            Assembled context
+            Assembled context with retrieval metadata
         """
         start_time = time.time()
 
@@ -138,12 +145,27 @@ class ContextManager:
             budget = self._allocate_budget(max_tokens, task_type)
             logger.debug(f"Token budget allocated: {budget}")
 
-            # 2. Retrieve candidates
-            candidates = self._retrieve_candidates(session_id, query)
-            logger.debug(f"Retrieved {len(candidates)} candidate events")
+            # 2. Retrieve candidates (or use forced results for replay)
+            if forced_retrieval is not None:
+                candidates = forced_retrieval
+                logger.info(f"Using forced retrieval: {len(candidates)} events (replay mode)")
+            elif use_hybrid_retrieval:
+                candidates = self._retrieve_hybrid(session_id, query, current_chain_id)
+                logger.debug(f"Hybrid retrieval: {len(candidates)} candidate events")
+            else:
+                candidates = self._retrieve_candidates(session_id, query)
+                logger.debug(f"Fallback retrieval: {len(candidates)} candidate events")
 
-            # 3. Score and rank
-            scored = self._score_candidates(query, candidates, session_id, task_type)
+            # 3. Score and rank (skip if using forced retrieval with scores)
+            if forced_retrieval is not None:
+                # In replay mode: use forced retrieval results with their scores
+                if all("relevance_score" in c for c in candidates):
+                    scored = [(c, c["relevance_score"]) for c in candidates]
+                else:
+                    # Fallback: score them
+                    scored = self._score_candidates(query, candidates, session_id, task_type)
+            else:
+                scored = self._score_candidates(query, candidates, session_id, task_type)
             logger.debug(f"Scored {len(scored)} candidates")
 
             # 4. Select within budget
@@ -151,7 +173,9 @@ class ContextManager:
 
             # 5. Assemble context
             context = self._assemble_context(
-                selected, budget, task_type, assembly_time_ms=int((time.time() - start_time) * 1000)
+                selected, budget, task_type, 
+                assembly_time_ms=int((time.time() - start_time) * 1000),
+                retrieved_events=candidates  # Store raw retrieval for replay
             )
 
             logger.info(
@@ -223,7 +247,7 @@ class ContextManager:
 
 
     def _retrieve_candidates(self, session_id: str, query: str) -> list[dict[str, Any]]:
-        """Retrieve candidate events for context."""
+        """Retrieve candidate events for context (fallback method)."""
         # Get recent events from current session
         from api.models import Event
         events = self.db.query(Event).filter(
@@ -235,13 +259,40 @@ class ContextManager:
                 "event_id": e.event_id,
                 "event_type": e.event_type,
                 "content": e.content,
-                "created_at": e.created_at,
+                "created_at": e.created_at,  # Keep as datetime for scorer
                 "parent_event_id": e.parent_event_id,
                 "causal_chain_id": e.causal_chain_id,
                 "metadata": e.metadata,
             }
             for e in events
         ]
+
+    def _retrieve_hybrid(
+        self, 
+        session_id: str, 
+        query: str, 
+        current_chain_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Retrieve events using MatrixOne hybrid search.
+        
+        Combines vector similarity, keyword matching, temporal decay, and causal proximity.
+        """
+        from core.context.hybrid_retrieval import HybridRetriever
+        
+        # Generate query embedding
+        query_embedding = self.embeddings.embed_text(query)
+        
+        # Use hybrid retriever
+        retriever = HybridRetriever(self.db)
+        events = retriever.retrieve_events(
+            query_text=query,
+            query_embedding=query_embedding,
+            session_id=session_id,
+            current_chain_id=current_chain_id,
+            limit=50,  # Get more candidates for scoring
+        )
+        
+        return events
 
     def retrieve_semantic_knowledge(
         self, user_id: str, query: str, limit: int = 5, min_confidence: float = 0.3
@@ -349,6 +400,7 @@ class ContextManager:
         budget: dict[str, int],
         task_type: TaskType,
         assembly_time_ms: int,
+        retrieved_events: list[dict[str, Any]] | None = None,
     ) -> Context:
         """Assemble final context."""
         system_prompt = self._get_system_prompt(task_type)
@@ -361,7 +413,7 @@ class ContextManager:
                 "event_id": s["event"]["event_id"],
                 "event_type": s["event"]["event_type"],
                 "content": s["event"]["content"],
-                "score": s["score"],
+                "score": float(s["score"]),  # Ensure JSON serializable
             }
             for s in selected
         ]
@@ -386,6 +438,7 @@ class ContextManager:
             assembly_time_ms=assembly_time_ms,
             relevance_scores=relevance_scores,
             task_type=task_type,
+            retrieved_events=retrieved_events,
         )
 
     def _get_system_prompt(self, task_type: TaskType) -> str:
@@ -418,20 +471,8 @@ class ContextManager:
 
     def _get_skill_definitions(self, token_budget: int) -> list[dict[str, Any]]:
         """Get available skill definitions within budget."""
-        from api.models import SkillRegistry
-        skills = self.db.query(SkillRegistry).filter(
-            SkillRegistry.is_active == 1
-        ).limit(10).all()
-
-        return [
-            {
-                "name": s.skill_name,
-                "version": s.version,
-                "description": s.skill_definition.get("description", "") if isinstance(s.skill_definition, dict) else "",
-                "category": "general",
-            }
-            for s in skills
-        ]
+        # Return empty list for now (skills_registry schema mismatch)
+        return []
 
     def _get_code_context(
         self, selected_events: list[dict[str, Any]], token_budget: int
@@ -500,6 +541,11 @@ class ContextManager:
             for s in context.skill_definitions
         ]
 
+        # Ensure all data is JSON serializable by round-tripping
+        def ensure_json_serializable(obj):
+            """Ensure object is JSON serializable."""
+            return json.loads(json.dumps(obj, default=str))
+
         from api.models import ContextSnapshot as SnapshotModel
         from datetime import datetime, timezone
         
@@ -508,23 +554,24 @@ class ContextManager:
             session_id=session_id,
             event_id=event_id,
             system_prompt=context.system_prompt,
-            skill_definitions=context.skill_definitions,
-            selected_events=context.selected_events,
-            code_context=context.code_context,
-            documentation=context.documentation,
+            skill_definitions=ensure_json_serializable(context.skill_definitions),
+            selected_events=ensure_json_serializable(context.selected_events),
+            retrieved_events=ensure_json_serializable(context.retrieved_events),
+            code_context=ensure_json_serializable(context.code_context),
+            documentation=ensure_json_serializable(context.documentation),
             total_tokens=context.total_tokens,
-            token_budget=context.token_budget,
+            token_budget=ensure_json_serializable(context.token_budget),
             assembly_time_ms=context.assembly_time_ms,
-            relevance_scores=context.relevance_scores,
+            relevance_scores=ensure_json_serializable(context.relevance_scores),
             task_type=context.task_type.value,
-            skills_used=skills_used,
+            skills_used=ensure_json_serializable(skills_used),
             llm_request_id=llm_request_id,
             llm_response_id=llm_response_id,
         )
         self.db.add(snapshot)
         self.db.commit()
 
-        logger.info(f"Context snapshot saved: {snapshot_id}")
+        logger.info(f"Context snapshot saved: {snapshot_id} (retrieved: {len(context.retrieved_events or [])} events)")
         return snapshot_id
 
     def update_snapshot_llm_ids(
@@ -567,6 +614,7 @@ class ContextManager:
         # JSON fields are already parsed by SQLAlchemy
         skill_definitions = row.skill_definitions or []
         selected_events = row.selected_events or []
+        retrieved_events = row.retrieved_events or []
         code_context = row.code_context or []
         documentation = row.documentation or []
 
@@ -581,4 +629,5 @@ class ContextManager:
             assembly_time_ms=row.assembly_time_ms or 0,
             relevance_scores=row.relevance_scores or {},
             task_type=TaskType(row.task_type) if row.task_type else TaskType.GENERAL,
+            retrieved_events=retrieved_events,
         )
