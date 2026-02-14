@@ -2,12 +2,16 @@
 
 Implements fan-out/fan-in, pipeline, and adversarial review patterns
 as described in agents-and-orchestration.md.
+
+Supports streaming for real-time multi-agent progress visualization.
 """
 
 import asyncio
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
+from core.events.models import StreamEvent
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -42,6 +46,48 @@ class CoordinationPatterns:
             delegation_skill: DelegateTaskSkill instance for task execution
         """
         self.delegate = delegation_skill
+
+    async def fan_out_stream(
+        self, tasks: list[Task], session_id: str, user_id: str
+    ) -> AsyncIterator[StreamEvent]:
+        """Execute tasks in parallel with streaming (fan-out pattern).
+        
+        Args:
+            tasks: List of tasks to execute in parallel
+            session_id: Session ID for event logging
+            user_id: User ID for event logging
+            
+        Yields:
+            StreamEvent: Multiplexed stream from all agents
+        """
+        from core.agent.stream_multiplexer import StreamMultiplexer
+        from core.skills.delegation import DelegateTaskInput
+        
+        async def execute_task_stream(task: Task) -> AsyncIterator[StreamEvent]:
+            """Execute task and yield stream events."""
+            try:
+                input_data = DelegateTaskInput(
+                    agent_id=task.agent_id,
+                    task=task.description,
+                    context=str(task.context) if task.context else None,
+                    session_id=session_id,
+                    user_id=user_id,
+                )
+                
+                # Get stream from delegation
+                async for event in self.delegate.execute_stream(input_data):
+                    yield event
+                    
+            except Exception as e:
+                logger.error(f"Task stream failed for {task.agent_id}: {e}")
+        
+        # Create streams for all tasks
+        streams = {task.agent_id: execute_task_stream(task) for task in tasks}
+        
+        # Multiplex streams
+        multiplexer = StreamMultiplexer()
+        async for event in multiplexer.merge_streams(streams):
+            yield event
 
     async def fan_out(self, tasks: list[Task], session_id: str, user_id: str) -> list[Result]:
         """Execute tasks in parallel (fan-out pattern).

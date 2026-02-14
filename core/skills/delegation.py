@@ -131,6 +131,51 @@ class DelegateTaskSkill(Skill):
             events_produced=0,  # Will be counted by the loop
         )
     
+    async def execute_stream(self, input: DelegateTaskInput):
+        """Execute delegation with streaming output.
+        
+        Args:
+            input: DelegateTaskInput with agent_id, task, and optional context
+            
+        Yields:
+            StreamEvent: Stream events from delegated agent
+        """
+        from core.events.models import StreamEvent, StreamEventType
+        
+        profile = self.registry.get(input.agent_id)
+
+        if not profile:
+            # Yield error event
+            yield StreamEvent(
+                event_type=StreamEventType.RUN_ERROR,
+                data={"error": f"Agent '{input.agent_id}' not found"},
+                agent_id=input.agent_id,
+            )
+            return
+
+        # Create a new ChatLoop for the delegated agent with its agent_id
+        loop = self.make_loop(
+            system_prompt=profile.system_prompt,
+            agent_id=input.agent_id,
+        )
+
+        # Build context with agent profile
+        context = {
+            "system_prompt": profile.system_prompt,
+            "agent_id": input.agent_id,
+        }
+        if input.context:
+            context["delegation_context"] = input.context
+
+        # Stream the task execution
+        async for event in loop.run_step_stream(
+            user_input=input.task,
+            session_id=input.session_id,
+            user_id=input.user_id,
+            context=context,
+        ):
+            yield event
+    
     async def execute_parallel(
         self, inputs: list[DelegateTaskInput]
     ) -> list[DelegateTaskOutput]:
