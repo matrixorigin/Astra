@@ -33,7 +33,6 @@ from api.models import SkillSelectionEvent as EventModel, SkillSelectionLearning
 from core.context.embeddings import EmbeddingService
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
-from core.skills.auditable_selector import AuditableSkillSelector, SkillSelectionEvent
 from core.skills.learning_signals import LearningSignal, SignalType, SignalWeights, SignalThresholds
 
 logger = get_logger(__name__)
@@ -63,7 +62,7 @@ class SelfImprovingSelector:
         self.account = account
         self.weights = weights or SignalWeights()
         self.thresholds = thresholds or SignalThresholds()
-        self.auditable_selector = AuditableSkillSelector(session, llm_client, account)
+        self.auditable_selector = None  # Removed: was unused
         self.sandbox = Sandbox(db=session, account=account)
         self.embedding_service: EmbeddingService | None = None
         self._runtime_config_cache: dict[str, Any] | None = None
@@ -74,37 +73,28 @@ class SelfImprovingSelector:
 
     def _ensure_tables(self):
         """Ensure learning tables exist and evolve schema if needed."""
-        from sqlalchemy import inspect, text
+        from sqlalchemy import text
 
         if not hasattr(self.session, "bind") or self.session.bind is None:
             return
-        inspector = inspect(self.session.bind)
-        if "skill_selection_learning" not in inspector.get_table_names():
+        
+        # Check if table exists using raw SQL
+        result = self.session.execute(
+            text("SELECT 1 FROM information_schema.tables WHERE table_name = 'skill_selection_learning' LIMIT 1")
+        ).fetchone()
+        if not result:
             return
-        columns_info = inspector.get_columns("skill_selection_learning")
-        columns = {col["name"] for col in columns_info}
+        
+        # Get columns using raw SQL to avoid SQLAlchemy type parsing issues
+        columns_result = self.session.execute(
+            text("SELECT column_name FROM information_schema.columns WHERE table_name = 'skill_selection_learning'")
+        ).fetchall()
+        columns = {row[0] for row in columns_result}
+        
         if "query_embedding" not in columns:
             self.session.execute(
                 text("ALTER TABLE skill_selection_learning ADD COLUMN query_embedding TEXT")
             )
-        else:
-            column_types = {
-                col["name"]: str(col.get("type", "")).lower() for col in columns_info
-            }
-            if "text" not in column_types.get("query_embedding", ""):
-                try:
-                    self.session.execute(
-                        text(
-                            "ALTER TABLE skill_selection_learning MODIFY COLUMN query_embedding TEXT"
-                        )
-                    )
-                    self.session.execute(
-                        text(
-                            "UPDATE skill_selection_learning SET query_embedding = CAST(query_embedding AS CHAR) WHERE query_embedding IS NOT NULL"
-                        )
-                    )
-                except Exception as exc:
-                    logger.warning(f"Failed to migrate query_embedding column to TEXT: {exc}")
         if "context_features" not in columns:
             self.session.execute(
                 text("ALTER TABLE skill_selection_learning ADD COLUMN context_features JSON")
@@ -430,7 +420,7 @@ class SelfImprovingSelector:
                 getattr(candidate, "confidence", 1.0) or 1.0
             )
 
-        from core.agent.selector import SkillCandidate
+        from core.skills.pipeline import SkillCandidate
 
         applied_learnings = []
         for learning in matched:

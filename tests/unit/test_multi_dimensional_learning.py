@@ -191,7 +191,7 @@ class TestMultiDimensionalLearning:
         db_session.add(learning)
         db_session.commit()
 
-        from core.agent.selector import SkillCandidate
+        from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
         selector.apply_learnings("review PR", candidates)
         learning_after = db_session.query(SkillSelectionLearning).filter(
@@ -230,7 +230,7 @@ class TestMultiDimensionalLearning:
         db_session.add(learning)
         db_session.commit()
 
-        from core.agent.selector import SkillCandidate
+        from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
         selector.apply_learnings("review PR", candidates)
         learning_after = db_session.query(SkillSelectionLearning).filter(
@@ -269,7 +269,7 @@ class TestMultiDimensionalLearning:
         db_session.add(learning)
         db_session.commit()
 
-        from core.agent.selector import SkillCandidate
+        from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
         selector.apply_learnings("review PR", candidates)
         learning_after = db_session.query(SkillSelectionLearning).filter(
@@ -308,7 +308,7 @@ class TestMultiDimensionalLearning:
         db_session.add(learning)
         db_session.commit()
 
-        from core.agent.selector import SkillCandidate
+        from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
         selector.apply_learnings("review PR", candidates)
         learning_after = db_session.query(SkillSelectionLearning).filter(
@@ -348,7 +348,7 @@ class TestMultiDimensionalLearning:
         db_session.add(learning)
         db_session.commit()
 
-        from core.agent.selector import SkillCandidate
+        from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
         corrected = selector.apply_learnings("review PR", candidates)
         assert [c.name for c in corrected] == [c.name for c in candidates]
@@ -386,7 +386,7 @@ class TestMultiDimensionalLearning:
         db_session.add(learning)
         db_session.commit()
 
-        from core.agent.selector import SkillCandidate
+        from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
         corrected = selector.apply_learnings("review PR", candidates)
         assert [c.name for c in corrected] == [c.name for c in candidates]

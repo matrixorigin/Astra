@@ -32,14 +32,14 @@ class TestStreamingAPI:
     @pytest.mark.asyncio
     @patch("api.routers.streaming.EventLogger")
     @patch("api.routers.streaming.LLMClient")
-    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.SkillPipeline")
     @patch("api.routers.streaming.AgentExecutor")
     @patch("api.routers.streaming.ContextManager")
     @patch("api.routers.streaming.HallucinationFirewall")
     @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_success(
         self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
-        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class,
+        mock_executor_class, mock_pipeline_class, mock_llm_class, mock_event_logger_class,
         mock_db, mock_auth
     ):
         """Test successful streaming chat."""
@@ -128,14 +128,14 @@ class TestStreamingAPI:
     @pytest.mark.asyncio
     @patch("api.routers.streaming.EventLogger")
     @patch("api.routers.streaming.LLMClient")
-    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.SkillPipeline")
     @patch("api.routers.streaming.AgentExecutor")
     @patch("api.routers.streaming.ContextManager")
     @patch("api.routers.streaming.HallucinationFirewall")
     @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_with_context(
         self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
-        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
+        mock_executor_class, mock_pipeline_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
     ):
         """Test streaming with custom context."""
         from api.routers.streaming import stream_chat, StreamChatRequest
@@ -171,14 +171,14 @@ class TestStreamingAPI:
     @pytest.mark.asyncio
     @patch("api.routers.streaming.EventLogger")
     @patch("api.routers.streaming.LLMClient")
-    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.SkillPipeline")
     @patch("api.routers.streaming.AgentExecutor")
     @patch("api.routers.streaming.ContextManager")
     @patch("api.routers.streaming.HallucinationFirewall")
     @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_error_handling(
         self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
-        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
+        mock_executor_class, mock_pipeline_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
     ):
         """Test error handling during streaming."""
         from api.routers.streaming import stream_chat, StreamChatRequest
@@ -221,14 +221,14 @@ class TestStreamingAPI:
     @pytest.mark.asyncio
     @patch("api.routers.streaming.EventLogger")
     @patch("api.routers.streaming.LLMClient")
-    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.SkillPipeline")
     @patch("api.routers.streaming.AgentExecutor")
     @patch("api.routers.streaming.ContextManager")
     @patch("api.routers.streaming.HallucinationFirewall")
     @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_tool_calls(
         self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
-        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
+        mock_executor_class, mock_pipeline_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
     ):
         """Test streaming with tool calls."""
         from api.routers.streaming import stream_chat, StreamChatRequest
@@ -292,14 +292,14 @@ class TestStreamingAPI:
     @pytest.mark.asyncio
     @patch("api.routers.streaming.EventLogger")
     @patch("api.routers.streaming.LLMClient")
-    @patch("api.routers.streaming.AgentSkillSelector")
+    @patch("api.routers.streaming.SkillPipeline")
     @patch("api.routers.streaming.AgentExecutor")
     @patch("api.routers.streaming.ContextManager")
     @patch("api.routers.streaming.HallucinationFirewall")
     @patch("api.routers.streaming.ChatLoop")
     async def test_stream_chat_planning_events(
         self, mock_chat_loop_class, mock_firewall_class, mock_context_class,
-        mock_executor_class, mock_selector_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
+        mock_executor_class, mock_pipeline_class, mock_llm_class, mock_event_logger_class, mock_db, mock_auth
     ):
         """Test streaming with planning events."""
         from api.routers.streaming import stream_chat, StreamChatRequest

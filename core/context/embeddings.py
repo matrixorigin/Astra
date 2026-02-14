@@ -108,17 +108,20 @@ class EmbeddingService:
         if len(embedding) != self.DIMENSION:
             raise ValueError(f"Embedding must be {self.DIMENSION} dimensions, got {len(embedding)}")
 
-        # Convert to MatrixOne vector format: "[0.1, 0.2, ...]"
+        # Convert to MatrixOne vecf32 format: "[0.1, 0.2, ...]"
         vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
         metadata_json = json.dumps(metadata or {})
 
         from sqlalchemy import text
-        # Use REPLACE INTO for MatrixOne compatibility
         self.db.execute(
             text("""
-            REPLACE INTO event_embeddings
+            INSERT INTO event_embeddings
             (event_id, embedding, model_name, model_version, metadata, created_at, updated_at)
             VALUES (:event_id, :embedding, :model_name, :model_version, :metadata, NOW(), NOW())
+            ON DUPLICATE KEY UPDATE
+            embedding = VALUES(embedding),
+            metadata = VALUES(metadata),
+            updated_at = NOW()
         """),
             {"event_id": event_id, "embedding": vec_str, "model_name": self.model, "model_version": "1.0", "metadata": metadata_json},
         )
@@ -147,7 +150,7 @@ class EmbeddingService:
                 f"Query embedding must be {self.DIMENSION} dimensions, got {len(query_embedding)}"
             )
 
-        # Convert to MatrixOne vector format
+        # Convert to MatrixOne vecf32 format
         vec_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
         where_clauses = []
@@ -167,7 +170,7 @@ class EmbeddingService:
 
         where_clause = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
-        # Use MatrixOne's native L2_DISTANCE function
+        # Use MatrixOne's native L2_DISTANCE function with vecf32
         query = f"""
             SELECT
                 e.event_id,
@@ -175,8 +178,8 @@ class EmbeddingService:
                 e.content,
                 e.event_type,
                 e.created_at,
-                L2_DISTANCE(emb.embedding, :vec1) AS distance,
-                1.0 / (1.0 + L2_DISTANCE(emb.embedding, :vec2)) AS similarity
+                L2_DISTANCE(CAST(emb.embedding AS vecf32), CAST(:vec1 AS vecf32)) AS distance,
+                1.0 / (1.0 + L2_DISTANCE(CAST(emb.embedding AS vecf32), CAST(:vec2 AS vecf32))) AS similarity
             FROM conversation_events e
             JOIN event_embeddings emb ON e.event_id = emb.event_id
             {where_clause}

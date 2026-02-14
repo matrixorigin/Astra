@@ -18,7 +18,7 @@ from core.events.event_logger import EventLogger
 from core.events.session_manager import SessionManager
 from core.replay.time_machine import TimeMachine
 from core.skills.registry import SkillRegistry
-from core.skills.auditable_selector import AuditableSkillSelector
+from core.skills.pipeline import SkillPipeline
 from core.skills.self_improving_selector import SelfImprovingSelector
 from core.skills.regression_gate import SkillSelectionRegressionGate
 from core.skills.selector import SkillSelector
@@ -72,16 +72,16 @@ class TestSessionInjection:
         registry = SkillRegistry(session=mock_session)
         assert registry.session is mock_session
 
-    def test_auditable_selector_requires_session(self):
-        """Test AuditableSkillSelector requires session parameter."""
-        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
-            AuditableSkillSelector(session=None)
+    def test_pipeline_requires_session(self):
+        """Test SkillPipeline requires session parameter."""
+        with pytest.raises(TypeError):
+            SkillPipeline(db=None, llm_client=None)
         
         # Should work with proper session
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
-        selector = AuditableSkillSelector(session=mock_session)
-        assert selector.session is mock_session
+        pipeline = SkillPipeline(mock_session, llm_client=None)
+        assert pipeline._db is mock_session
 
     def test_modern_selector_requires_session(self):
         """Test ModernSkillSelector requires session parameter."""
@@ -147,16 +147,15 @@ class TestSessionSharing:
         # GitForData inside sandbox should use the same session
         assert sandbox.git.db is mock_session
 
-    def test_auditable_selector_shares_session(self):
-        """Test AuditableSkillSelector shares session with dependencies."""
+    def test_pipeline_shares_session(self):
+        """Test SkillPipeline shares session with dependencies."""
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
         
-        selector = AuditableSkillSelector(session=mock_session)
+        pipeline = SkillPipeline(mock_session, llm_client=None)
         
-        # Dependencies should use the same session
-        assert selector.modern_selector.session is mock_session
-        assert selector.sandbox.db is mock_session
+        # Internal modern selector should use the same session
+        assert pipeline._modern.session is mock_session
 
     def test_self_improving_selector_shares_session(self):
         """Test SelfImprovingSelector shares session with dependencies."""
@@ -166,7 +165,6 @@ class TestSessionSharing:
         selector = SelfImprovingSelector(session=mock_session)
         
         # Dependencies should use the same session
-        assert selector.auditable_selector.session is mock_session
         assert selector.sandbox.db is mock_session
 
     def test_regression_gate_shares_session(self):
@@ -192,7 +190,7 @@ class TestNoSessionCreation:
             EventLogger,
             Sandbox,
             SkillRegistry,
-            AuditableSkillSelector,
+            SkillPipeline,
             ModernSkillSelector,
             SkillSelectionRegressionGate,
             SelfImprovingSelector,

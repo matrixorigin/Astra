@@ -8,11 +8,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
-from core.agent.selector import AgentSkillSelector
+from core.skills.pipeline import SkillPipeline
 from core.llm.client import LLMClient
 from core.logging_config import get_logger
 from core.skills.learning_signals import SignalType, SignalWeights
-from uuid_utils import uuid7
 
 logger = get_logger(__name__)
 
@@ -119,21 +118,22 @@ async def trigger_learning(
             weights = SignalWeights(**request.weights)
         
         llm_client = LLMClient(db)
-        selector = AgentSkillSelector(
-            db=db,
-            llm_client=llm_client,
-            auditable=True,
-            session_id=str(uuid7()),
-            enable_learning=True,
+        pipeline = SkillPipeline(
+            db, llm_client,
+            audit=False,
+            learning=True,
             learning_weights=weights,
         )
         
         # Trigger learning
-        result = selector.learn_from_failures(
-            days=request.days,
-            force=request.force,
-            signal_types=signal_types,
-        )
+        learn_result = pipeline.learn(days=request.days)
+        result = {
+            "learned": learn_result.learned,
+            "total_failures": learn_result.total_failures,
+            "signals_by_type": learn_result.signals_by_type,
+        }
+        if learn_result.error:
+            result["error"] = learn_result.error
         
         # Handle errors
         if result.get("error"):
@@ -197,22 +197,16 @@ async def get_learning_stats(
     """
     try:
         llm_client = LLMClient(db)
-        selector = AgentSkillSelector(
-            db=db,
-            llm_client=llm_client,
-            auditable=True,
-            session_id=str(uuid7()),
-            enable_learning=True,
-        )
+        pipeline = SkillPipeline(db, llm_client, audit=False, learning=True)
         
-        stats = selector.get_learning_stats()
+        stats = pipeline.stats()
         
         return LearningStatsResponse(
-            total_learnings=stats["learnings"]["total_learnings"],
-            high_confidence=stats["learnings"]["high_confidence"],
-            low_confidence=stats["learnings"]["low_confidence"],
-            avg_confidence=stats["learnings"]["avg_confidence"],
-            by_signal_type=stats["learnings"]["by_signal_type"],
+            total_learnings=stats["total_learnings"],
+            high_confidence=stats["high_confidence"],
+            low_confidence=stats["low_confidence"],
+            avg_confidence=stats["avg_confidence"],
+            by_signal_type=stats["by_signal_type"],
             weights=stats["learnings"]["weights"],
             weights_per_signal=stats["learnings"]["weights_per_signal"],
             decay=stats["learnings"]["decay"],

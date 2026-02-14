@@ -14,7 +14,6 @@ import json
 
 from core.agent.chat_loop import ChatLoop
 from core.agent.executor import AgentExecutor
-from core.agent.selector import AgentSkillSelector
 from core.context import ContextManager
 from core.events.event_logger import EventLogger
 from core.events.models import StreamEventType
@@ -22,6 +21,7 @@ from core.events.session_manager import SessionManager
 from core.llm.client import LLMClient
 from core.skills.builtin import register_builtin_skills
 from core.skills.mocking import MockMode
+from core.skills.pipeline import SkillPipeline
 from core.skills.registry import SkillRegistry
 from sqlalchemy.orm import Session
 from api.database import get_db_session
@@ -65,15 +65,15 @@ def chat(user_id, model, mode):
 
     firewall = HallucinationFirewall(db, context_mgr, threshold=0.7)
 
-    # Agent Components (with session_id for auditable selection)
-    selector = AgentSkillSelector(db, llm_client, auditable=True, session_id=session.session_id)
+    # Agent Components (with unified pipeline)
+    pipeline = SkillPipeline(db, llm_client, audit=True, learning=True)
     executor = AgentExecutor(
         db=db,
         registry=None,  # Will be set after skill registration
         mode=MockMode(mode),
     )
     chat_loop = ChatLoop(
-        selector=selector,
+        selector=pipeline,
         executor=executor,
         llm_client=llm_client,
         event_logger=logger,
@@ -112,10 +112,10 @@ def chat(user_id, model, mode):
     # Create chat_loop_factory for delegation (also with auditable selector)
     def create_chat_loop(system_prompt=None, agent_id="dev-agent"):
         from core.context.manager import ContextManager
-        from core.safety.firewall import HallucinationFirewall
+        from core.verification.firewall import HallucinationFirewall
         
         return ChatLoop(
-            selector=AgentSkillSelector(db, llm_client, auditable=True, session_id=session.session_id),
+            selector=SkillPipeline(db, llm_client, audit=True, learning=True),
             executor=AgentExecutor(db=db, registry=SkillRegistry(db), mode=MockMode(mode)),
             llm_client=llm_client,
             event_logger=EventLogger(db),
@@ -259,8 +259,7 @@ def skill_register(skill_file):
 def skill_learn(days, force):
     """Learn from historical skill selection failures with regression gating."""
     from core.llm.client import LLMClient
-    from core.agent.selector import AgentSkillSelector
-    from uuid_utils import uuid7
+    from core.skills.pipeline import SkillPipeline
     
     click.echo(f"🧠 Learning from failures (last {days} days)...")
     if force:
@@ -270,56 +269,34 @@ def skill_learn(days, force):
     db = next(get_db_session())
     llm_client = LLMClient(db)
     
-    # Use integrated AgentSkillSelector with learning enabled
-    selector = AgentSkillSelector(
-        db=db,
-        llm_client=llm_client,
-        auditable=True,
-        session_id=str(uuid7()),
-        enable_learning=True,
-    )
+    pipeline = SkillPipeline(db, llm_client, audit=False, learning=True)
     
     try:
-        # Trigger learning cycle with regression gating
-        result = selector.learn_from_failures(days=days, force=force)
+        learn_result = pipeline.learn(days=days)
         
-        # Handle errors
-        if result.get("error"):
-            if result["error"] == "cooldown":
-                click.echo(f"\n⏳ Learning in cooldown period")
-                click.echo(f"   Cooldown: {result['cooldown_hours']}h")
-                click.echo(f"   Message: {result['message']}")
-                click.echo(f"\n💡 Use --force to bypass cooldown")
-                return
-            elif result["error"] == "learning_failed":
-                click.echo(f"\n❌ Learning failed: {result['message']}")
-                raise click.Abort()
-            else:
-                click.echo(f"\n❌ Error: {result.get('message', result['error'])}")
-                raise click.Abort()
+        if learn_result.error:
+            click.echo(f"\n❌ Error: {learn_result.error}")
+            raise click.Abort()
         
         click.echo("\n✅ Learning cycle completed:")
-        click.echo(f"   Total failures: {result.get('total_failures', 0)}")
-        click.echo(f"   Learnings applied: {result['learned']}")
+        click.echo(f"   Total failures: {learn_result.total_failures}")
+        click.echo(f"   Learnings applied: {learn_result.learned}")
         
-        if result.get('gate_verdict'):
-            verdict_icon = "✅" if result['gate_verdict'] == 'pass' else "❌"
-            click.echo(f"\n🚪 Regression Gate: {verdict_icon} {result['gate_verdict'].upper()}")
-            click.echo(f"   Test queries: {result.get('test_count', 0)}")
-            click.echo(f"   Improvement: {result.get('improvement_pct', 0):.1f}%")
+        if learn_result.gate_verdict != "skipped":
+            verdict_icon = "✅" if learn_result.gate_verdict == "pass" else "❌"
+            click.echo(f"\n🚪 Regression Gate: {verdict_icon} {learn_result.gate_verdict.upper()}")
+            click.echo(f"   Improvement: {learn_result.improvement_pct:.1f}%")
             
             if result['gate_verdict'] == 'fail':
                 click.echo("\n⚠️  Learning rejected by regression gate - no changes deployed")
                 return
         
         # Show learning stats
-        stats = selector.get_learning_stats()
+        stats = pipeline.stats()
         click.echo(f"\n📊 Learning Statistics:")
-        click.echo(f"   Total learnings: {stats['learnings']['total_learnings']}")
-        click.echo(f"   High confidence: {stats['learnings']['high_confidence']}")
-        click.echo(f"   Avg confidence: {stats['learnings']['avg_confidence']:.1f}")
-        click.echo(f"\n   Total gates run: {stats['regression_gates']['total_gates']}")
-        click.echo(f"   Pass rate: {stats['regression_gates']['pass_rate']*100:.1f}%")
+        click.echo(f"   Total learnings: {stats.get('total_learnings', 0)}")
+        click.echo(f"   High confidence: {stats.get('high_confidence', 0)}")
+        click.echo(f"   Avg confidence: {stats.get('avg_confidence', 0):.1f}")
         
     except Exception as e:
         click.echo(f"❌ Learning failed: {e}", err=True)
@@ -334,24 +311,28 @@ def skill_learn(days, force):
 def skill_gate(version, min_improvement):
     """Run regression gate for skill selector changes."""
     from core.llm.client import LLMClient
-    from core.skills.auditable_selector import AuditableSkillSelector
     from core.skills.regression_gate import SkillSelectionRegressionGate
     
     click.echo(f"🚪 Running regression gate for selector {version}...")
     
     db = next(get_db_session())
     llm_client = LLMClient(db)
-    gate = SkillSelectionRegressionGate(db, llm_client)
+    gate = SkillSelectionRegressionGate(llm_client, db)
     
-    old_selector = AuditableSkillSelector(db, llm_client)
-    new_selector = AuditableSkillSelector(db, llm_client)
+    old_pipeline = SkillPipeline(db, llm_client, audit=False, learning=False)
+    new_pipeline = SkillPipeline(db, llm_client, audit=False, learning=True)
     
     try:
+        golden = gate.get_golden_queries(limit=20)
+        if not golden:
+            click.echo("⚠️  No golden queries found for regression testing")
+            return
+        
         result = gate.validate_selector_change(
-            new_selector=new_selector,
-            old_selector=old_selector,
-            selector_version=version,
-            min_improvement=min_improvement,
+            new_selector=new_pipeline,
+            old_selector=old_pipeline,
+            test_queries=golden,
+            min_improvement_pct=min_improvement,
         )
         
         click.echo(f"\n{'✅' if result['verdict'] == 'PASS' else '❌'} {result['verdict']}")
@@ -374,14 +355,13 @@ def skill_gate(version, min_improvement):
 def skill_history(session, limit):
     """View skill selection history with audit trail."""
     from core.llm.client import LLMClient
-    from core.skills.auditable_selector import AuditableSkillSelector
     
     db = next(get_db_session())
     llm_client = LLMClient(db)
-    selector = AuditableSkillSelector(db, llm_client)
+    pipeline = SkillPipeline(db, llm_client, audit=False, learning=False)
     
     try:
-        events = selector.get_selection_history(session_id=session, limit=limit)
+        events = pipeline.selection_history(session_id=session, limit=limit)
         
         if not events:
             click.echo("No selection history found")
@@ -391,18 +371,10 @@ def skill_history(session, limit):
         click.echo("=" * 80)
         
         for event in events:
-            click.echo(f"\n🔍 {event.event_id[:8]}... | {event.created_at}")
-            click.echo(f"   Query: {event.user_query[:60]}...")
-            click.echo(f"   Selected: {', '.join(event.selected_skills)}")
-            click.echo(f"   Method: {event.selection_method}")
-            
-            if event.execution_success is not None:
-                status = "✅" if event.execution_success else "❌"
-                click.echo(f"   Execution: {status}")
-            
-            if event.user_feedback_score:
-                stars = "⭐" * event.user_feedback_score
-                click.echo(f"   Feedback: {stars} ({event.user_feedback_score}/5)")
+            click.echo(f"\n🔍 {event['event_id'][:8]}... | {event['created_at']}")
+            click.echo(f"   Query: {event['user_query'][:60]}...")
+            click.echo(f"   Selected: {event['selected_skills']}")
+            click.echo(f"   Method: {event['selection_method']}")
                 
     except Exception as e:
         click.echo(f"❌ Failed to get history: {e}", err=True)

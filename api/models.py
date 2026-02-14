@@ -253,7 +253,7 @@ class DecisionAudit(Base):
 class EventEmbedding(Base):
     __tablename__ = "event_embeddings"
     event_id = Column(String(36), primary_key=True)
-    embedding = Column(Text)  # Vector string representation "[0.1, ...]"
+    embedding = Column(String(1024))  # vecf32 type
     model_name = Column(String(50))
     model_version = Column(String(32))
     embedding_metadata = Column("metadata", JSON)

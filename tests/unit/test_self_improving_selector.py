@@ -7,7 +7,6 @@ import uuid
 import pytest
 
 from core.skills.self_improving_selector import SelfImprovingSelector
-from core.skills.auditable_selector import SkillSelectionEvent, AuditableSkillSelector
 from core.skills.selector import SkillMetadata
 
 
@@ -27,16 +26,9 @@ def mock_llm():
 
 
 @pytest.fixture
-def selector(db, mock_llm):
-    """Auditable selector."""
-    return AuditableSkillSelector(db, mock_llm)
-
-
-@pytest.fixture
-def self_improving(db, mock_llm, selector):
+def self_improving(db, mock_llm):
     """Self-improving selector."""
     si = SelfImprovingSelector(db, mock_llm)
-    si.auditable_selector = selector
     si._ensure_tables()
     return si
 
@@ -90,34 +82,20 @@ class TestSelfImprovingSelector:
         
         assert stats["total_learnings"] == 0
 
-    def test_get_recent_failures(self, self_improving, selector, db):
+    def test_get_recent_failures(self, self_improving, db):
         """Test getting failures."""
         from api.models import SkillSelectionEvent as SkillSelectionEventModel
         
         for i in range(3):
-            event = SkillSelectionEvent(
-                event_id=f"evt-{i}-{uuid.uuid4().hex[:8]}",
-                session_id=f"sess-{i}",
-                user_query=f"Query {i}",
-                context_snapshot="snap",
-                available_skills=[],
-                selected_skills=["wrong_skill"],
-                selection_method="llm",
-                selection_reasoning="Test",
-                candidate_scores={},
-            )
-            selector._save_event(event)
-            
-            # Update using ORM
-            db.query(SkillSelectionEventModel).filter(
-                SkillSelectionEventModel.event_id == event.event_id
-            ).update({
-                "user_feedback_score": 2,
-                "selection_correctness": False
-            })
-            db.commit()
+            eid = f"evt-{i}-{uuid.uuid4().hex[:8]}"
+            db.add(SkillSelectionEventModel(
+                event_id=eid, session_id=f"sess-{i}",
+                user_query=f"Query {i}", selected_skills="wrong_skill",
+                selection_method="llm", user_feedback_score=2,
+                selection_correctness=False,
+            ))
+        db.commit()
         
-        # Verify data exists
         rows = db.query(SkillSelectionEventModel).filter(
             SkillSelectionEventModel.user_feedback_score <= 2
         ).all()
@@ -561,29 +539,17 @@ class TestSelfImprovingSelector:
         assert stats["avg_confidence"] > 0
         assert stats["semantic_similarity_threshold"] == 0.78
 
-    def test_learn_from_failures_with_failures(self, self_improving, selector, db):
+    def test_learn_from_failures_with_failures(self, self_improving, db):
         """Test learning from actual failures."""
-        event = SkillSelectionEvent(
-            event_id=f"evt-{uuid.uuid4().hex[:8]}",
-            session_id="sess-1",
-            user_query="Review PR #123",
-            context_snapshot="snap",
-            available_skills=[],
-            selected_skills=["wrong_skill"],
-            selection_method="llm",
-            selection_reasoning="Test",
-            candidate_scores={},
-        )
-        selector._save_event(event)
-        
-        # Update using ORM
         from api.models import SkillSelectionEvent as SkillSelectionEventModel
-        db.query(SkillSelectionEventModel).filter(
-            SkillSelectionEventModel.event_id == event.event_id
-        ).update({
-            "user_feedback_score": 1,
-            "selection_correctness": False
-        })
+        
+        eid = f"evt-{uuid.uuid4().hex[:8]}"
+        db.add(SkillSelectionEventModel(
+            event_id=eid, session_id="sess-1",
+            user_query="Review PR #123", selected_skills="wrong_skill",
+            selection_method="llm", user_feedback_score=1,
+            selection_correctness=False,
+        ))
         db.commit()
         
         result = self_improving.learn_from_failures(days=30)
@@ -591,29 +557,17 @@ class TestSelfImprovingSelector:
         # May be 0 if LLM doesn't find pattern
         assert result["learned"] >= 0
 
-    def test_learn_creates_and_cleans_sandbox(self, self_improving, selector, db):
+    def test_learn_creates_and_cleans_sandbox(self, self_improving, db):
         """Test sandbox lifecycle during learning."""
-        event = SkillSelectionEvent(
-            event_id=f"evt-{uuid.uuid4().hex[:8]}",
-            session_id="sess-1",
-            user_query="Test",
-            context_snapshot="snap",
-            available_skills=[],
-            selected_skills=["wrong_skill"],
-            selection_method="llm",
-            selection_reasoning="Test",
-            candidate_scores={},
-        )
-        selector._save_event(event)
-        
-        # Update using ORM
         from api.models import SkillSelectionEvent as SkillSelectionEventModel
-        db.query(SkillSelectionEventModel).filter(
-            SkillSelectionEventModel.event_id == event.event_id
-        ).update({
-            "user_feedback_score": 1,
-            "selection_correctness": False
-        })
+        
+        eid = f"evt-{uuid.uuid4().hex[:8]}"
+        db.add(SkillSelectionEventModel(
+            event_id=eid, session_id="sess-1",
+            user_query="Test", selected_skills="wrong_skill",
+            selection_method="llm", user_feedback_score=1,
+            selection_correctness=False,
+        ))
         db.commit()
         
         # Run learning

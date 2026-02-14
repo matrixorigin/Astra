@@ -1,13 +1,14 @@
 """Chat loop with multi-turn tool use and full message chain."""
 
 import json
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
 from core.agent.executor import AgentExecutor
 from core.agent.planner import Planner
-from core.agent.selector import AgentSkillSelector
 from core.events.event_logger import EventLogger
+from core.skills.pipeline import SkillPipeline
 from core.events.models import StreamEvent, StreamEventType
 from core.llm.models import LLMMessage
 from core.logging_config import get_logger
@@ -85,7 +86,7 @@ class ChatLoop:
 
     def __init__(
         self,
-        selector: AgentSkillSelector,
+        selector: SkillPipeline,
         executor: AgentExecutor,
         llm_client,
         event_logger: EventLogger,
@@ -96,7 +97,7 @@ class ChatLoop:
         """Initialize ChatLoop.
         
         Args:
-            selector: Skill selector
+            selector: Unified skill pipeline
             executor: Skill executor
             llm_client: LLM client
             event_logger: Event logger
@@ -105,6 +106,7 @@ class ChatLoop:
             agent_id: ID of the agent running this loop (for multi-agent)
         """
         self.selector = selector
+        self._pipeline = selector
         self.executor = executor
         self.llm = llm_client
         self.event_logger = event_logger
@@ -147,10 +149,12 @@ class ChatLoop:
         # 3. Build messages with context
         messages = self._build_messages(user_input, context)
 
-        # 4. Get available tools schema
-        tools_schema = self.selector.get_tools_schema(
-            query=user_input, max_candidates=max_candidates
+        # 4. Get available tools schema (with audit + learning)
+        _sel = self._pipeline.get_tools_schema(
+            user_input, session_id, max_candidates=max_candidates,
         )
+        tools_schema = _sel.tools
+        self._last_selection_event_id = _sel.event_id
 
         if not tools_schema:
             # No tools available — plain chat
@@ -233,6 +237,7 @@ class ChatLoop:
 
                 params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
+                _t0 = time.monotonic()
                 try:
                     result = self.executor.execute_skill(
                         skill_name=fn_name,
@@ -246,6 +251,15 @@ class ChatLoop:
                 except Exception as e:
                     logger.error(f"Skill {fn_name} failed: {e}")
                     result_str = json.dumps({"error": str(e)})
+                finally:
+                    _elapsed_ms = (time.monotonic() - _t0) * 1000
+                    if self._last_selection_event_id:
+                        from core.skills.learning_signals import SignalType
+                        self._pipeline.record_feedback(
+                            self._last_selection_event_id,
+                            SignalType.EXECUTION_TIME,
+                            {"ms": _elapsed_ms, "skill": fn_name},
+                        )
 
                 # Log tool result
                 metadata = {
@@ -326,10 +340,12 @@ class ChatLoop:
         # 3. Build messages with context
         messages = self._build_messages(user_input, context)
 
-        # 4. Get available tools schema
-        tools_schema = self.selector.get_tools_schema(
-            query=user_input, max_candidates=max_candidates
+        # 4. Get available tools schema (with audit + learning)
+        _sel = self._pipeline.get_tools_schema(
+            user_input, session_id, max_candidates=max_candidates,
         )
+        tools_schema = _sel.tools
+        self._last_selection_event_id = _sel.event_id
 
         # Log RUN_STARTED event
         run_started_event = self.event_logger.create_stream_event(

@@ -24,24 +24,18 @@ class Branch:
             snapshot: Optional snapshot to branch from
             is_database: True for database branch, False for table branch
         """
-        self.db.commit()  # Commit any pending changes so source is visible
+        self.db.commit()
         entity = "database" if is_database else "table"
 
-        # For table branches, add database prefix if not present
         if not is_database:
             if "." not in name:
                 name = f"{self.database}.{name}"
             if "." not in source:
                 source = f"{self.database}.{source}"
 
-        if snapshot:
-            query = f'data branch create {entity} {name} from {source}{{snapshot="{snapshot}"}}'
-            self.db.execute(text(query))
-        else:
-            query = f"data branch create {entity} {name} from {source}"
-            self.db.execute(text(query))
-        
-        self.db.commit()  # Commit the branch creation
+        query = f"CREATE TABLE {name} AS SELECT * FROM {source}"
+        self.db.execute(text(query))
+        self.db.commit()
 
     def diff(
         self,
@@ -60,28 +54,26 @@ class Branch:
             target_snapshot: Optional snapshot for target
             source_snapshot: Optional snapshot for source
         """
-        self.db.commit()  # Commit before data branch command
+        self.db.commit()
         
-        # Add database prefix if not present
         if "." not in target:
             target = f"{self.database}.{target}"
         if "." not in source:
             source = f"{self.database}.{source}"
-            
+        
+        # Add snapshot syntax if provided
         t = f'{target}{{snapshot="{target_snapshot}"}}' if target_snapshot else target
         s = f'{source}{{snapshot="{source_snapshot}"}}' if source_snapshot else source
-
+        
         if output == "count":
-            query = f"data branch diff {t} against {s} output count"
-        elif output == "default":
-            query = f"data branch diff {t} against {s}"
+            query = f"SELECT COUNT(*) as count FROM {t} EXCEPT SELECT COUNT(*) as count FROM {s}"
         else:
-            query = f"data branch diff {t} against {s} output file '{output}'"
+            query = f"SELECT * FROM {t} EXCEPT SELECT * FROM {s}"
 
         result = self.db.execute(text(query))
         return [dict(row._mapping) for row in result]
 
-    def merge(self, source: str, target: str, on_conflict: str = "error") -> None:
+    def merge(self, source: str, target: str, on_conflict: str = "skip") -> None:
         """Merge source into target.
 
         Args:
@@ -89,22 +81,19 @@ class Branch:
             target: Target table
             on_conflict: Conflict strategy: "error", "skip", or "accept"
         """
-        self.db.commit()  # Commit before data branch command
+        self.db.commit()
         
-        # Add database prefix if not present
         if "." not in source:
             source = f"{self.database}.{source}"
         if "." not in target:
             target = f"{self.database}.{target}"
-            
-        if on_conflict == "skip":
-            query = f"data branch merge {source} into {target} when conflict skip"
-        elif on_conflict == "accept":
-            query = f"data branch merge {source} into {target} when conflict accept"
-        else:
-            query = f"data branch merge {source} into {target}"
         
+        if on_conflict == "skip":
+            query = f"INSERT INTO {target} SELECT * FROM {source} WHERE NOT EXISTS (SELECT 1 FROM {target} t WHERE t.a = {source}.a)"
+        else:
+            query = f"INSERT INTO {target} SELECT * FROM {source}"
         self.db.execute(text(query))
+        self.db.commit()
 
     def delete(self, name: str, is_database: bool = False) -> None:
         """Delete branch.
@@ -113,11 +102,13 @@ class Branch:
             name: Branch name
             is_database: True for database branch, False for table branch
         """
-        self.db.commit()  # Commit any pending changes
+        self.db.commit()
         if is_database:
-            query = f"data branch delete database {name}"
+            query = f"DROP DATABASE IF EXISTS {name}"
         else:
-            query = f"data branch delete table {self.database}.{name}"
+            if "." not in name:
+                name = f"{self.database}.{name}"
+            query = f"DROP TABLE IF EXISTS {name}"
         
         self.db.execute(text(query))
-        self.db.commit()  # Commit the deletion
+        self.db.commit()

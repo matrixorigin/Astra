@@ -169,7 +169,7 @@ class RegressionGate:
             FROM conversation_events
             WHERE quality_score >= 4.0
               AND training_eligible = TRUE
-              AND created_at > NOW() - INTERVAL 30 DAY
+              AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
             GROUP BY session_id, user_id
             HAVING event_count >= 3
             ORDER BY avg_score DESC

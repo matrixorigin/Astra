@@ -77,6 +77,7 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Memory and Context](memory-and-context.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
 | [Trust and Safety](trust-and-safety.md) | Decision audit, hallucination firewall, uncertainty quantification, regression gate, observability, guardrails |
 | [Skills and Tools](skills-and-tools.md) | Skill system, MCP compatibility, tool design, side-effect profiles, progressive disclosure |
+| [Unified Selector Pipeline](unified-selector-pipeline.md) | Skill selection: retrieve → audit → feedback pipeline |
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, snapshot-scoped permissions, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt evolution, self-improving agents, meta-learning closed loop |

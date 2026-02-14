@@ -12,11 +12,11 @@ from api.dependencies import get_current_user
 from api.database import get_db_session
 from core.agent.chat_loop import ChatLoop
 from core.agent.executor import AgentExecutor
-from core.agent.selector import AgentSkillSelector
 from core.context.manager import ContextManager
 from core.events.event_logger import EventLogger
 from core.verification.firewall import HallucinationFirewall
 from core.llm.client import LLMClient
+from core.skills.pipeline import SkillPipeline
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -74,7 +74,7 @@ async def stream_chat(
     llm_client = LLMClient()
     skill_registry = SkillRegistry(db)
     context_manager = ContextManager(db)
-    selector = AgentSkillSelector(db, llm_client, auditable=True, session_id=request.session_id)
+    selector = SkillPipeline(db, llm_client, audit=True, learning=True)
     executor = AgentExecutor(db, skill_registry)
     firewall = HallucinationFirewall(db, context_manager)
     
