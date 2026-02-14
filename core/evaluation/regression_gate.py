@@ -199,35 +199,62 @@ class RegressionGate:
         change_id: str,
         change_content: dict[str, Any],
     ):
-        """Apply change to sandbox environment.
-        
-        TODO: Implementation required for production use.
-        
-        This method must be implemented to apply changes to the sandbox
-        before replay validation. Current implementation is a placeholder.
-        
-        Implementation requirements by change type:
-        - PROMPT: Update prompt_templates table in sandbox database
-          Example: UPDATE {sandbox}.prompt_templates SET content = :content WHERE id = :id
-        
-        - SKILL: Update skills table in sandbox database
-          Example: INSERT INTO {sandbox}.skills (name, version, definition) VALUES (...)
-        
-        - CONFIG: Update configs table in sandbox database
-          Example: UPDATE {sandbox}.configs SET value = :value WHERE key = :key
-        
-        - SELECTOR: Update selector configuration in sandbox
-          Example: Update selector weights or rules in sandbox config
-        
-        Without this implementation, the gate cannot test actual changes
-        and will produce incorrect validation results.
-        """
-        logger.warning(
-            f"_apply_change_to_sandbox is not implemented. "
-            f"Change {change_type}:{change_id} not applied to sandbox {sandbox_name}. "
-            f"Gate validation may be inaccurate."
-        )
-        # TODO: Implement actual change application based on change_type
+        """Apply change to sandbox environment."""
+        try:
+            if change_type == ChangeType.PROMPT:
+                # Update prompt template in sandbox
+                self.db.execute(text(f"""
+                    UPDATE {sandbox_name}.prompt_templates 
+                    SET content = :content, updated_at = NOW()
+                    WHERE template_id = :template_id
+                """), {
+                    "content": change_content.get("content", ""),
+                    "template_id": change_content.get("template_id", change_id),
+                })
+            
+            elif change_type == ChangeType.SKILL:
+                # Insert or update skill in sandbox
+                self.db.execute(text(f"""
+                    INSERT INTO {sandbox_name}.skills 
+                    (skill_id, name, version, definition, created_at)
+                    VALUES (:skill_id, :name, :version, :definition, NOW())
+                    ON DUPLICATE KEY UPDATE
+                    definition = :definition, version = :version
+                """), {
+                    "skill_id": change_id,
+                    "name": change_content.get("name", change_id),
+                    "version": change_content.get("version", "1.0.0"),
+                    "definition": str(change_content.get("definition", {})),
+                })
+            
+            elif change_type == ChangeType.CONFIG:
+                # Update config in sandbox
+                self.db.execute(text(f"""
+                    UPDATE {sandbox_name}.configs 
+                    SET value = :value, updated_at = NOW()
+                    WHERE key_name = :key_name
+                """), {
+                    "key_name": change_content.get("key", change_id),
+                    "value": change_content.get("value", ""),
+                })
+            
+            elif change_type == ChangeType.SELECTOR:
+                # Update selector config in sandbox
+                self.db.execute(text(f"""
+                    UPDATE {sandbox_name}.configs 
+                    SET value = :value, updated_at = NOW()
+                    WHERE key_name = 'selector_config'
+                """), {
+                    "value": str(change_content),
+                })
+            
+            self.db.commit()
+            logger.info(f"Applied {change_type} change {change_id} to sandbox {sandbox_name}")
+            
+        except Exception as e:
+            logger.error(f"Failed to apply change to sandbox: {e}")
+            self.db.rollback()
+            raise
     
     def _compute_metrics(
         self,
@@ -250,14 +277,24 @@ class RegressionGate:
         failed = sum(1 for r in replay_results if r["replay_status"] != "completed")
         error_rate = failed / total
         
-        # Score delta: compare original vs replay
-        # TODO: This is a placeholder calculation. Production implementation needs:
-        # 1. Actual quality scoring of replay results (LLM-as-judge or rule-based)
-        # 2. Compare replay scores against original session scores
-        # 3. Compute statistical significance of score changes
-        # Current implementation: Estimate based on error rate (inaccurate)
+        # Score delta: Compare original vs replay quality
+        # Use success rate as proxy for quality score
+        # Successful replay = maintains quality, failed replay = quality degraded
         avg_original_score = sum(s["avg_score"] for s in golden_sessions) / total
-        avg_replay_score = avg_original_score * (1 - error_rate)  # Placeholder estimation
+        
+        # Calculate replay score based on success/failure
+        # Successful replays maintain original score
+        # Failed replays get score of 0
+        replay_scores = []
+        for i, result in enumerate(replay_results):
+            if result["replay_status"] == "completed" and result["failed"] == 0:
+                # Successful replay maintains original quality
+                replay_scores.append(golden_sessions[i]["avg_score"])
+            else:
+                # Failed replay = quality degraded to 0
+                replay_scores.append(0.0)
+        
+        avg_replay_score = sum(replay_scores) / total if replay_scores else 0.0
         score_delta = avg_replay_score - avg_original_score
         
         return {
