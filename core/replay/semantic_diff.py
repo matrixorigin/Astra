@@ -3,7 +3,6 @@
 Provides high-level comparison of agent performance, not just data differences.
 """
 
-from core.events.causal_chain import CausalChainManager
 from core.events.event_reader import EventReader
 from sqlalchemy.orm import Session
 from api.database import SessionLocal, get_db_session
@@ -36,9 +35,13 @@ class SemanticDiff:
         """Close the session if owned"""
         if self._owns_session and self.db:
             self.db.close()
+            self.db = None
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def compare_sessions(self, session_id1: str, session_id2: str) -> dict:
         """Compare two sessions semantically.

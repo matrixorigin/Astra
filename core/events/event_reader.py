@@ -36,9 +36,13 @@ class EventReader:
         """Close the session if owned"""
         if self._owns_session and self.db:
             self.db.close()
+            self.db = None
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _row_to_event(self, row: dict) -> ConversationEvent:
         """Convert database row to ConversationEvent.

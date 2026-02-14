@@ -36,9 +36,13 @@ class CausalChainManager:
         """Close the session if owned"""
         if self._owns_session and self.db:
             self.db.close()
+            self.db = None
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def get_chain(self, event_id: str) -> list[ConversationEvent]:
         """Get all events in a causal chain.

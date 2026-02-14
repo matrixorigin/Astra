@@ -35,11 +35,15 @@ class Sandbox:
 
     def close(self):
         """Close the session if owned"""
-        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
+        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db") and self.db:
             self.db.close()
+            self.db = None
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def create(
         self,

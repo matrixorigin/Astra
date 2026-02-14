@@ -38,9 +38,13 @@ class TimeMachine:
         """Close the session if owned"""
         if self._owns_session and self.db:
             self.db.close()
+            self.db = None
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def create_checkpoint(self, checkpoint_name: str, description: str = "") -> dict:
         """Create a checkpoint at the current time.

@@ -58,7 +58,10 @@ class SkillSelector:
             self._session = None
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _load_skills(self):
         """Load skills with metadata from database."""

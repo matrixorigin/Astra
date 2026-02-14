@@ -38,9 +38,13 @@ class SessionManager:
         """Close the session if owned"""
         if self._owns_session and self._session:
             self._session.close()
+            self._session = None
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @property
     def session(self) -> DBSession:
