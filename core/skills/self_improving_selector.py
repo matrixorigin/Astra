@@ -311,7 +311,7 @@ class SelfImprovingSelector:
             learning for learning in learnings
             if learning.query_pattern and learning.query_pattern.lower() in query_lower
             and self._is_high_confidence_value(
-                self._effective_confidence(learning, decay)
+                self._effective_confidence(learning, decay, learning.signal_type)
             )
         ]
 
@@ -320,7 +320,7 @@ class SelfImprovingSelector:
 
         matched.sort(
             key=lambda learning: (
-                self._effective_confidence(learning, decay),
+                self._effective_confidence(learning, decay, learning.signal_type),
                 learning.evidence_count or 0,
                 learning.applied_count or 0,
             ),
@@ -341,7 +341,7 @@ class SelfImprovingSelector:
 
         applied_learnings = []
         for learning in matched:
-            learning_confidence = self._effective_confidence(learning, decay)
+            learning_confidence = self._effective_confidence(learning, decay, learning.signal_type)
             weight = self._get_signal_weight(learning.signal_type, weights)
             delta = learning_confidence * weight
             if delta <= 0:
@@ -486,7 +486,8 @@ class SelfImprovingSelector:
         learnings = self.session.query(LearningModel).all()
         total = len(learnings)
         effective_confidences = [
-            self._effective_confidence(learning, decay) for learning in learnings
+            self._effective_confidence(learning, decay, learning.signal_type)
+            for learning in learnings
         ]
         high_confidence = sum(1 for c in effective_confidences if c >= 0.7)
         avg_confidence = (
@@ -535,7 +536,12 @@ class SelfImprovingSelector:
                     return self._runtime_config_cache
 
         weights = self.weights
-        decay = {"enabled": False, "half_life_days": 0.0, "min_confidence": 0.0}
+        decay = {
+            "enabled": False,
+            "half_life_days": 0.0,
+            "min_confidence": 0.0,
+            "per_signal": {},
+        }
 
         from api.models import Config
 
@@ -558,6 +564,7 @@ class SelfImprovingSelector:
                         "enabled": bool(parsed.get("enabled", False)),
                         "half_life_days": float(parsed.get("half_life_days", 0.0) or 0.0),
                         "min_confidence": float(parsed.get("min_confidence", 0.0) or 0.0),
+                        "per_signal": parsed.get("per_signal", {}) or {},
                     }
 
         self._runtime_config_cache = {"weights": weights, "decay": decay}
@@ -587,9 +594,15 @@ class SelfImprovingSelector:
             logger.warning("Invalid selector_learning_weights, using defaults")
             return base
 
-    def _effective_confidence(self, learning: LearningModel, decay: dict[str, Any]) -> float:
+    def _effective_confidence(
+        self,
+        learning: LearningModel,
+        decay: dict[str, Any],
+        signal_type: str | None,
+    ) -> float:
         normalized = self._normalize_confidence(learning.confidence)
-        if not decay.get("enabled") or not decay.get("half_life_days"):
+        decay_config = self._resolve_decay_config(decay, signal_type)
+        if not decay_config.get("enabled") or not decay_config.get("half_life_days"):
             return normalized
         reference = learning.updated_at or learning.created_at
         if not reference:
@@ -597,8 +610,29 @@ class SelfImprovingSelector:
         if reference.tzinfo is None:
             reference = reference.replace(tzinfo=timezone.utc)
         age_days = (datetime.now(timezone.utc) - reference).total_seconds() / 86400.0
-        factor = 0.5 ** (age_days / float(decay["half_life_days"]))
+        factor = 0.5 ** (age_days / float(decay_config["half_life_days"]))
         decayed = normalized * factor
-        min_confidence = float(decay.get("min_confidence", 0.0) or 0.0)
+        min_confidence = float(decay_config.get("min_confidence", 0.0) or 0.0)
         decayed = max(min_confidence, decayed)
         return min(normalized, decayed)
+
+    def _resolve_decay_config(self, decay: dict[str, Any], signal_type: str | None) -> dict[str, Any]:
+        base = {
+            "enabled": bool(decay.get("enabled", False)),
+            "half_life_days": float(decay.get("half_life_days", 0.0) or 0.0),
+            "min_confidence": float(decay.get("min_confidence", 0.0) or 0.0),
+        }
+        if not signal_type:
+            return base
+        per_signal = decay.get("per_signal") or {}
+        override = per_signal.get(signal_type)
+        if not isinstance(override, dict):
+            return base
+        merged = base.copy()
+        if "enabled" in override:
+            merged["enabled"] = bool(override["enabled"])
+        if "half_life_days" in override:
+            merged["half_life_days"] = float(override["half_life_days"] or 0.0)
+        if "min_confidence" in override:
+            merged["min_confidence"] = float(override["min_confidence"] or 0.0)
+        return merged

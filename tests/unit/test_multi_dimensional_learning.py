@@ -200,6 +200,42 @@ class TestMultiDimensionalLearning:
             Config.key_name == "selector_learning_decay"
         ).delete()
         db_session.commit()
+
+    def test_per_signal_decay_blocks_match(self, db_session):
+        selector = SelfImprovingSelector(db_session, llm_client=None)
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_decay"
+        ).delete()
+        db_session.add(
+            Config(
+                key_name="selector_learning_decay",
+                value='{"enabled": false, "per_signal": {"wrong_skill": {"enabled": true, "half_life_days": 1}}}',
+            )
+        )
+        from api.models import SkillSelectionLearning
+        learning = SkillSelectionLearning(
+            learning_id="per_signal_decay_test",
+            query_pattern="review",
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            improvement_score=10.0,
+            confidence=80.0,
+            evidence_count=8,
+            signal_type="wrong_skill",
+            created_at=datetime.now(timezone.utc) - timedelta(days=3),
+            updated_at=datetime.now(timezone.utc) - timedelta(days=3),
+        )
+        db_session.add(learning)
+        db_session.commit()
+
+        from core.agent.selector import SkillCandidate
+        candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
+        corrected = selector.apply_learnings("review PR", candidates)
+        assert [c.name for c in corrected] == [c.name for c in candidates]
+        db_session.query(Config).filter(
+            Config.key_name == "selector_learning_decay"
+        ).delete()
+        db_session.commit()
     
     def test_extract_low_satisfaction_signal(self, selector):
         """Test extracting low_satisfaction signal."""
