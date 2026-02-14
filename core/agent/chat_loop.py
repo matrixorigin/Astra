@@ -218,6 +218,16 @@ class ChatLoop:
                 raw_args = tc["function"]["arguments"]
                 tc_id = tc.get("id", fn_name)
 
+                # Log tool start
+                self.event_logger.create_stream_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="stream_tool_call_start",
+                    content=json.dumps({"tool": fn_name, "call_id": tc_id}),
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
+
                 params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
                 try:
@@ -233,6 +243,16 @@ class ChatLoop:
                 except Exception as e:
                     logger.error(f"Skill {fn_name} failed: {e}")
                     result_str = json.dumps({"error": str(e)})
+
+                # Log tool result
+                self.event_logger.create_stream_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="stream_tool_result",
+                    content=json.dumps({"call_id": tc_id, "result": result_str[:500]}),
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
 
                 # Append tool result in OpenAI protocol format
                 messages.append(

@@ -75,13 +75,47 @@ class AuditableSkillSelector:
     """
 
     def __init__(self, session: Session | None = None, llm_client=None, account: str = "sys"):
+        self._session = session
         self._owns_session = session is None
-        self.session = session or SessionLocal()
+        self._lazy_session = None
+        
         self.llm = llm_client
         self.account = account
-        self.modern_selector = ModernSkillSelector(self.session, llm_client)
-        self.sandbox = Sandbox(db=self.session, account=account)
+        
+        # Lazy initialization
+        self._modern_selector = None
+        self._sandbox = None
+        
         self._ensure_table()
+
+    @property
+    def session(self) -> Session:
+        """Get current session (lazy init)."""
+        return self._get_session()
+
+    def _get_session(self) -> Session:
+        """Get session, creating one if needed."""
+        if self._session:
+            return self._session
+            
+        if not self._lazy_session:
+            self._lazy_session = SessionLocal()
+            
+        return self._lazy_session
+
+    @property
+    def modern_selector(self):
+        """Lazy init modern selector."""
+        if self._modern_selector is None:
+            self._modern_selector = ModernSkillSelector(self._get_session(), self.llm)
+        return self._modern_selector
+
+    @property
+    def sandbox(self):
+        """Lazy init sandbox."""
+        if self._sandbox is None:
+            self._sandbox = Sandbox(db=self._get_session(), account=self.account)
+        return self._sandbox
 
     def __enter__(self):
         return self
@@ -91,8 +125,9 @@ class AuditableSkillSelector:
 
     def close(self):
         """Close session if we own it."""
-        if self._owns_session:
-            self.session.close()
+        if self._owns_session and self._lazy_session:
+            self._lazy_session.close()
+            self._lazy_session = None
 
     def _ensure_table(self):
         """Ensure skill_selection_events table exists."""
