@@ -63,7 +63,7 @@ class SelfImprovingSelector:
         self.thresholds = thresholds or SignalThresholds()
         self.auditable_selector = AuditableSkillSelector(session, llm_client, account)
         self.sandbox = Sandbox(db=session, account=account)
-        self.embedding_service = EmbeddingService(session)
+        self.embedding_service: EmbeddingService | None = None
         self._runtime_config_cache: dict[str, Any] | None = None
         self._runtime_config_loaded_at: datetime | None = None
         self._runtime_config_last_updated_at: datetime | None = None
@@ -348,6 +348,8 @@ class SelfImprovingSelector:
 
         learnings = self.session.query(LearningModel).all()
         matched = []
+        semantic_matches = 0
+        substring_matches = 0
         for learning in learnings:
             if not learning.query_pattern:
                 continue
@@ -363,12 +365,19 @@ class SelfImprovingSelector:
                 similarity = self._cosine_similarity(query_embedding, learning_embedding)
                 if similarity >= similarity_threshold:
                     matched.append((learning, similarity))
+                    semantic_matches += 1
                     continue
             if learning.query_pattern.lower() in query_lower:
                 matched.append((learning, 1.0))
+                substring_matches += 1
 
         if not matched:
             return candidates
+        logger.info(
+            "Applied learnings match summary: semantic=%s substring=%s",
+            semantic_matches,
+            substring_matches,
+        )
 
         matched.sort(
             key=lambda item: (
@@ -445,6 +454,12 @@ class SelfImprovingSelector:
         if not query:
             return None
         try:
+            if self.embedding_service is None:
+                try:
+                    self.embedding_service = EmbeddingService(self.session)
+                except Exception as exc:
+                    logger.warning(f"Embedding service init failed: {exc}")
+                    return None
             return self.embedding_service.embed_text(query)
         except Exception as exc:
             logger.warning(f"Embedding generation failed: {exc}")
