@@ -81,15 +81,16 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, snapshot-scoped permissions, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt evolution, self-improving agents, meta-learning closed loop |
 
-### Supporting Documents (Operational)
+### Supporting Documents (Implementation)
 
 | Document | Scope |
 |----------|-------|
-| [LLM Integration](llm-integration.md) | Provider abstraction, routing, cost management, caching |
-| [Authentication & Authorization](authentication-authorization.md) | JWT, ownership model, permissions |
-| [Multi-tenancy](multi-tenancy-architecture.md) | Tenant isolation, data source flexibility |
-| [Deployment](deployment-architecture-proposal.md) | Docker, CI/CD, monitoring |
-| [Concurrency Model](concurrency-model.md) | Isolation guarantees, conflict resolution |
+| [Authentication](../implementation/authentication.md) | JWT, ownership-based authorization |
+| [LLM Integration](../implementation/llm-integration.md) | Provider abstraction, routing, cost tracking |
+| [GitHub Integration](../implementation/github-integration.md) | Repo operations, token management |
+| [Deployment](../implementation/deployment.md) | Project structure, Docker, configuration |
+| [Scope Configuration](../implementation/scope-configuration.md) | Scope-based config resolution |
+| [CI](../implementation/ci.md) | GitHub Actions workflows |
 
 ## Key Design Decisions
 

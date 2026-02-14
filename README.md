@@ -81,16 +81,9 @@ curl http://localhost:8000/health
 
 ## Documentation
 
-- **[API Usage Guide](docs/API_USAGE_GUIDE.md)** - Complete API guide with examples
-- **[API Implementation Summary](docs/API_IMPLEMENTATION_SUMMARY.md)** - Technical implementation details
-- **Interactive Swagger UI**: `http://localhost:8000/docs`
-- **ReDoc**: `http://localhost:8000/redoc`
-
-**API Documentation**:
+- [Getting Started](docs/getting-started.md) — setup and first steps
+- [API Reference](docs/api-reference.md) — full endpoint documentation
 - Interactive Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-- [API Reference](docs/API.md) - Detailed examples
-- [Quick Start Guide](docs/QUICKSTART.md)
 
 ## API Endpoints
 
@@ -335,38 +328,33 @@ See [examples/](examples/) for more detailed examples.
 
 ## Documentation
 
-- [Development Guide](docs/development.md) - Production setup, testing, deployment
+- [Getting Started](docs/getting-started.md) — setup and first steps
+- [Development Guide](docs/development.md) — testing, deployment, code quality
+- [API Reference](docs/api-reference.md) — endpoint documentation
 - [Design Documents](docs/design/)
-  - [Vision and Mission](docs/design/vision-and-mission.md)
-  - [Skills-First Architecture](docs/design/skills-first-architecture.md) ⭐ Phase 2 design
-  - [Context Management](docs/design/context-management.md) ⭐ Phase 3 design
-  - [Context, Memory, Session and Tables](docs/design/context-memory-session-and-tables.md)
-  - [Replay, Sandbox, Evaluation & Evolution](docs/design/replay-sandbox-evaluation-automation.md) ⭐ Engineering validation
-  - [Side-Effect Isolation](docs/design/replay-sandbox-evaluation-automation.md#1-side-effect-isolation-critical) ⭐ Critical safety
-  - [Multi-Agent Collaboration](docs/design/multi-agent-collaboration.md) ⭐ Event blackboard coordination
-  - [Autonomous Planning](docs/design/autonomous-planning.md) ⭐ Plan-Act-Observe-Reflect
-  - [Streaming Output](docs/design/streaming-output.md) ⭐ AG-UI protocol alignment
-  - [Deployment Architecture](docs/design/deployment-architecture-proposal.md)
-  - [GitHub Integration](docs/design/github-integration.md)
-  - [LLM Integration](docs/design/llm-integration.md)
-  - [Git for Data Features](docs/design/git-for-data-features.md)
-  - [Concurrency Model](docs/design/concurrency-model.md)
-  - [Hallucination Firewall](docs/design/git-for-data-features.md#5-hallucination-firewall)
-  - [Training Data Pipeline](docs/design/git-for-data-features.md#8-training-data-pipeline)
+  - [Architecture](docs/design/ARCHITECTURE.md) — system overview, data flow, key decisions
+  - [Memory and Context](docs/design/memory-and-context.md) — cognitive memory, context engineering, lifecycle governance
+  - [Trust and Safety](docs/design/trust-and-safety.md) — audit, guardrails, robustness, HITL, SLOs
+  - [Skills and Tools](docs/design/skills-and-tools.md) — skill architecture, marketplace, MCP compatibility
+  - [Agents and Orchestration](docs/design/agents-and-orchestration.md) — ChatLoop, planning, teams, scheduling, model routing
+  - [Data Versioning](docs/design/data-versioning.md) — snapshot, clone, branch, MatrixOne workflows
+  - [Evaluation and Evolution](docs/design/evaluation-and-evolution.md) — quality, replay gating, adversarial eval, CI/CD
+- [Implementation Details](docs/implementation/)
+  - [Authentication](docs/implementation/authentication.md) — JWT, ownership-based authorization
+  - [LLM Integration](docs/implementation/llm-integration.md) — providers, routing, cost tracking
+  - [GitHub Integration](docs/implementation/github-integration.md) — repo operations, token management
+  - [Deployment](docs/implementation/deployment.md) — project structure, Docker, configuration
+  - [Scope Configuration](docs/implementation/scope-configuration.md) — scope-based config resolution
+  - [CI](docs/implementation/ci.md) — GitHub Actions workflows
 - [Examples](examples/)
 
 ## Testing
 
 ```bash
-# Run all tests
-make test
-
-# Run specific test suites
+make test               # All tests (527 tests)
 make test-unit          # Unit tests
 make test-integration   # Integration tests
 ```
-
-Current test coverage: **509 tests, 100% passing**
 
 ---
 

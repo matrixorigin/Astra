@@ -334,5 +334,5 @@ See `tests/unit/test_scope_resolver.py` and `tests/unit/test_scope_integration.p
 
 ## See Also
 
-- [Admin & User Management Design](../design/admin-user-management.md)
-- [Open Scope Protocol](../design/admin-user-management.md#33-extensible-scope-strategy-open-scope-protocol)
+- [Authentication](authentication.md)
+- [LLM Integration](llm-integration.md)
