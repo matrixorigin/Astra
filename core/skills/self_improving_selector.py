@@ -654,6 +654,7 @@ class SelfImprovingSelector:
             "weights": runtime_config["weights"].to_dict(),
             "weights_per_signal": runtime_config["weights_per_signal"],
             "decay": runtime_config["decay"],
+            "semantic_similarity_threshold": runtime_config["semantic_similarity_threshold"],
         }
 
     def _load_runtime_config(self) -> dict[str, Any]:

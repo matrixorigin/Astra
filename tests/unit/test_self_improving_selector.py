@@ -435,7 +435,10 @@ class TestSelfImprovingSelector:
     def test_get_learning_stats_with_data(self, self_improving, db):
         """Test stats with data."""
         # Clear and insert using ORM
-        from api.models import SkillSelectionLearning
+        from api.models import Config, SkillSelectionLearning
+        db.query(Config).filter(
+            Config.key_name == "selector_semantic_similarity_threshold"
+        ).delete()
         db.query(SkillSelectionLearning).delete()
         db.commit()
         
@@ -455,6 +458,7 @@ class TestSelfImprovingSelector:
         
         assert stats["total_learnings"] == 3
         assert stats["avg_confidence"] > 0
+        assert stats["semantic_similarity_threshold"] == 0.78
 
     def test_learn_from_failures_with_failures(self, self_improving, selector, db):
         """Test learning from actual failures."""
