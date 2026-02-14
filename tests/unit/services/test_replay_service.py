@@ -19,16 +19,7 @@ from uuid import uuid4
 
 from api.services.replay_service import ReplayService
 from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
-from api.database import get_db_session
 from api.repositories.user_repository import UserRepository
-
-
-@pytest.fixture
-def db_session():
-    """数据库会话 fixture"""
-    session = next(get_db_session())
-    yield session
-    session.close()
 
 
 @pytest.fixture

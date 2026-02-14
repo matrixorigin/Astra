@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session as DBSession
 
-from api.database import SessionLocal, get_db_session
+from api.database import get_db_session
 from api.models import Session as SessionModel
 from core.events.session_models import Session, SessionStatus
 
@@ -25,8 +25,14 @@ class SessionManager:
         Args:
             session: SQLAlchemy session. If None, creates a new one.
         """
+        self._session = session
         self._owns_session = session is None
-        self._session = session or SessionLocal()
+
+    def _get_session(self) -> DBSession:
+        """Get or create session."""
+        if self._session is None:
+            self._session = next(get_db_session())
+        return self._session
 
     def __enter__(self):
         return self
@@ -35,29 +41,13 @@ class SessionManager:
         self.close()
 
     def close(self):
-        """Close the session if owned"""
+        """Close session if we own it."""
         if self._owns_session and self._session:
             self._session.close()
-            self._session = None
 
     def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
-
-    @property
-    def session(self) -> DBSession:
-        """Get the underlying database session."""
-        return self._get_session()
-
-    def _get_session(self) -> DBSession:
-        """Get database session."""
-        if self._session:
-            return self._session
-        self._session = SessionLocal()
-        self._owns_session = True
-        return self._session
+        """Close session if we own it."""
+        self.close()
 
     def create_session(
         self,

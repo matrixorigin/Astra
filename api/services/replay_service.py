@@ -203,15 +203,14 @@ class ReplayService:
                 skill_version = skill_version_override.get(skill_name) if skill_version_override else event.skill_version
                 
                 # Parse skill params from metadata
-                metadata = event.metadata if isinstance(event.metadata, dict) else (json.loads(event.metadata) if event.metadata else {})
+                metadata = json.loads(event.metadata) if event.metadata else {}
                 skill_params = metadata.get("skill_params", {})
                 
                 # Invoke skill through mocking layer
                 result = mocker.invoke_skill(
                     skill_name=skill_name,
                     params=skill_params,
-                    skill_version=skill_version,
-                    event_id=event.event_id  # Pass event_id for exact result lookup
+                    skill_version=skill_version
                 )
                 
                 return {

@@ -35,14 +35,11 @@ vcr_config = vcr.VCR(
 
 
 @pytest.fixture
-def github_client():
+def github_client(db_session):
     """GitHub client with real token (if available)."""
-    from api.database import get_db_session
-    session = next(get_db_session())
     token = os.getenv("GITHUB_TOKEN")
-    client = GitHubClient(session, token=token)
+    client = GitHubClient(db_session, token=token)
     yield client
-    session.close()
 
 
 @pytest.mark.skipif(

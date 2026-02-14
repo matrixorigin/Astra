@@ -5,17 +5,9 @@ from core.auth.audit_logger import AuditLogger
 from api.database import get_db_session
 
 
-@pytest.fixture
-def db():
-    """Get test database session."""
-    session = next(get_db_session())
-    yield session
-    session.close()
-
-
-def test_log(db):
+def test_log(db_session):
     """Test basic logging."""
-    logger = AuditLogger(db)
+    logger = AuditLogger(db_session)
 
     logger.log(
         user_id="admin",
@@ -32,9 +24,9 @@ def test_log(db):
     assert logs[0]["action"] == "test_action"
 
 
-def test_log_model_add(db):
+def test_log_model_add(db_session):
     """Test model addition logging."""
-    logger = AuditLogger(db)
+    logger = AuditLogger(db_session)
 
     logger.log_model_add("admin", "gpt-4", "global")
 
@@ -42,9 +34,9 @@ def test_log_model_add(db):
     assert any(log["action"] == "add_model" for log in logs)
 
 
-def test_log_model_remove(db):
+def test_log_model_remove(db_session):
     """Test model removal logging."""
-    logger = AuditLogger(db)
+    logger = AuditLogger(db_session)
 
     logger.log_model_remove("admin", "gpt-4", "global")
 
@@ -52,9 +44,9 @@ def test_log_model_remove(db):
     assert any(log["action"] == "remove_model" for log in logs)
 
 
-def test_log_model_update(db):
+def test_log_model_update(db_session):
     """Test model update logging."""
-    logger = AuditLogger(db)
+    logger = AuditLogger(db_session)
 
     logger.log_model_update("admin", "gpt-4", {"price": 0.01})
 
@@ -62,9 +54,9 @@ def test_log_model_update(db):
     assert any(log["action"] == "update_model" for log in logs)
 
 
-def test_log_skill_register(db):
+def test_log_skill_register(db_session):
     """Test skill registration logging."""
-    logger = AuditLogger(db)
+    logger = AuditLogger(db_session)
 
     logger.log_skill_register("alice", "my_skill", "user")
 
@@ -72,9 +64,9 @@ def test_log_skill_register(db):
     assert any(log["action"] == "register_skill" for log in logs)
 
 
-def test_log_token_create(db):
+def test_log_token_create(db_session):
     """Test token creation logging."""
-    logger = AuditLogger(db)
+    logger = AuditLogger(db_session)
 
     logger.log_token_create("admin", "llm", "openai", "global")
 
@@ -82,9 +74,9 @@ def test_log_token_create(db):
     assert any(log["action"] == "create_token" for log in logs)
 
 
-def test_get_logs(db):
+def test_get_logs(db_session):
     """Test log retrieval."""
-    logger = AuditLogger(db)
+    logger = AuditLogger(db_session)
 
     # Add some logs
     logger.log_model_add("admin", "gpt-4", "global")

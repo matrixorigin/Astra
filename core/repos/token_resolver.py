@@ -138,9 +138,9 @@ class TokenResolver:
         ).filter(TokenModel.is_active == 1)
         
         if repo_id:
-            query = query.filter(RepoModel.repo_id == repo_id, RepoModel.owner_id == user_id)
+            query = query.filter(RepoModel.repo_id == repo_id, RepoModel.user_id == user_id)
         elif repo_url:
-            query = query.filter(RepoModel.repo_url == repo_url, RepoModel.owner_id == user_id)
+            query = query.filter(RepoModel.repo_url == repo_url, RepoModel.user_id == user_id)
         else:
             return None
         

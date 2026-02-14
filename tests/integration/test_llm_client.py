@@ -12,9 +12,8 @@ from api.database import get_db_session
 
 
 @pytest.fixture
-def db():
+def db(db_session):
     """Database fixture."""
-    db = next(get_db_session())
     # Insert test config
     config_data = json.dumps({
         "provider": "openai",
@@ -22,7 +21,7 @@ def db():
         "temperature": 0.7,
         "max_tokens": 2000,
     })
-    db.execute(
+    db_session.execute(
         text("""
         INSERT INTO configs (config_id, key_name, value) 
         VALUES (:config_id, :key_name, :value) 
@@ -35,13 +34,12 @@ def db():
             "value2": config_data,
         },
     )
-    db.commit()
-    yield db
+    db_session.commit()
+    yield db_session
     # Cleanup
-    db.execute(text("DELETE FROM llm_call_logs WHERE event_id LIKE 'test_%'"))
-    db.execute(text("DELETE FROM configs WHERE config_id = 'llm_config'"))
-    db.commit()
-    db.close()
+    db_session.execute(text("DELETE FROM llm_call_logs WHERE event_id LIKE 'test_%'"))
+    db_session.execute(text("DELETE FROM configs WHERE config_id = 'llm_config'"))
+    db_session.commit()
 
 
 @pytest.fixture

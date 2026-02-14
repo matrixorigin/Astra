@@ -1,118 +1,115 @@
-"""Prompt template management with versioning and dynamic updates."""
+"""Prompt management and optimization.
+
+Handles system prompts, user prompts, and template management.
+Supports versioning and feedback collection for prompt optimization.
+"""
 
 from typing import Any
 
-from core.logging_config import get_logger
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from api.database import get_db_session
+
+from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
 class PromptManager:
-    """Manage versioned prompt templates."""
+    """Manage prompt templates and versions."""
 
     def __init__(self, db: Session):
         self.db = db
-        self._cache: dict[str, Any] = {}  # Simple in-memory cache
+        self._cache: dict[str, str] = {}
 
-    def get_prompt(
-        self,
-        template_id: str,
-        version: str | None = None,
-        variables: dict[str, str] | None = None,
-    ) -> str:
-        """Get prompt template by ID and version.
+    def get_system_prompt(self, template_id: str = "system_general", version: str | None = None) -> str:
+        """Get system prompt by ID and version.
 
         Args:
-            template_id: Template identifier (e.g., 'system_code_review')
-            version: Specific version (e.g., '1.0'), or None for latest active
-            variables: Variables to substitute in template
+            template_id: Template identifier
+            version: Specific version (default: latest active)
 
         Returns:
-            Rendered prompt content
+            Prompt content
         """
-        cache_key = f"{template_id}:{version or 'latest'}"
+        # Check cache first (only for latest version)
+        if not version and template_id in self._cache:
+            return self._cache[template_id]
 
-        # Check cache
-        if cache_key in self._cache:
-            content = self._cache[cache_key]
-        else:
-            # Load from database
-            from api.models import PromptTemplate
-            
+        try:
             if version:
-                row = self.db.query(PromptTemplate).filter(
-                    PromptTemplate.template_id == template_id,
-                    PromptTemplate.version == version
-                ).first()
+                query = text("""
+                    SELECT template_content FROM prompt_templates
+                    WHERE template_id = :template_id AND version = :version
+                """)
+                params = {"template_id": template_id, "version": version}
             else:
-                # Get latest active version
-                row = self.db.query(PromptTemplate).filter(
-                    PromptTemplate.template_id == template_id,
-                    PromptTemplate.is_active == 1
-                ).order_by(PromptTemplate.created_at.desc()).first()
+                query = text("""
+                    SELECT template_content FROM prompt_templates
+                    WHERE template_id = :template_id AND is_active = 1
+                    ORDER BY created_at DESC LIMIT 1
+                """)
+                params = {"template_id": template_id}
 
-            if not row:
-                logger.warning(f"Prompt template not found: {template_id}@{version}")
-                return self._get_fallback_prompt(template_id)
+            result = self.db.execute(query, params).first()
 
-            content = row.template_content
-            self._cache[cache_key] = content
+            if result:
+                content = result.template_content
+                if not version:
+                    self._cache[template_id] = content
+                return content
+            
+            # Fallback to hardcoded defaults if DB empty
+            logger.warning(f"Prompt template {template_id} not found in DB, using fallback")
+            return self._get_fallback_prompt(template_id)
 
-        # Substitute variables
-        if variables:
-            for key, value in variables.items():
-                content = content.replace(f"{{{key}}}", str(value))
-
-        return str(content)
+        except Exception as e:
+            logger.error(f"Failed to fetch prompt {template_id}: {e}")
+            return self._get_fallback_prompt(template_id)
 
     def register_prompt(
         self, template_id: str, version: str, content: str, is_active: bool = True
     ) -> None:
-        """Register a new prompt template version.
+        """Register a new prompt version.
 
         Args:
-            template_id: Template identifier
-            version: Version string (e.g., '1.0', '1.1')
-            content: Prompt content (can include {variables})
-            is_active: Whether this version is active
+            template_id: Template ID
+            version: Version string
+            content: Prompt content
+            is_active: Whether to make this the active version
         """
-        # Deactivate old versions if this is active
-        if is_active:
+        try:
+            # If active, deactivate others
+            if is_active:
+                self.db.execute(
+                    text("UPDATE prompt_templates SET is_active = 0 WHERE template_id = :template_id"),
+                    {"template_id": template_id}
+                )
+
             self.db.execute(
                 text("""
-                UPDATE prompt_templates
-                SET is_active = 0
-                WHERE template_id = :template_id
+                INSERT INTO prompt_templates (template_id, template_name, template_content, version, is_active, created_at)
+                VALUES (:template_id, :name, :content, :version, :is_active, NOW())
                 """),
-                {"template_id": template_id}
+                {
+                    "template_id": template_id,
+                    "name": template_id.replace("_", " ").title(),
+                    "content": content,
+                    "version": version,
+                    "is_active": 1 if is_active else 0
+                }
             )
+            self.db.commit()
+            
+            # Update cache
+            if is_active:
+                self._cache[template_id] = content
+            
+            logger.info(f"Registered prompt {template_id} version {version}")
 
-        # Insert new version
-        self.db.execute(
-            text("""
-            INSERT INTO prompt_templates
-            (template_id, version, content, is_active, effective_at)
-            VALUES (:template_id, :version, :content, :is_active, NOW())
-            ON DUPLICATE KEY UPDATE
-                content = VALUES(content),
-                is_active = VALUES(is_active),
-                effective_at = VALUES(effective_at)
-            """),
-            {
-                "template_id": template_id,
-                "version": version,
-                "content": content,
-                "is_active": is_active
-            }
-        )
-
-        # Clear cache
-        self._cache.clear()
-
-        logger.info(f"Registered prompt: {template_id}@{version} (active={is_active})")
+        except Exception as e:
+            logger.error(f"Failed to register prompt: {e}")
+            self.db.rollback()
+            raise
 
     def _get_fallback_prompt(self, template_id: str) -> str:
         """Get hardcoded fallback prompt."""
@@ -183,15 +180,18 @@ Be systematic and thorough in your analysis.""",
         (
             "system_general",
             "1.0",
-            """You are an intelligent development agent helping with software development tasks.
+            """You are an intelligent development agent.
 
 Your capabilities:
-- Answer technical questions
-- Write and review code
-- Debug issues
-- Explain concepts
+- Writing and refactoring code
+- Analyzing logs and errors
+- Planning tasks and architectures
+- Executing tools and skills
 
-Be helpful, accurate, and concise.""",
+Always:
+- Think before you act
+- Verify your changes
+- Explain your decisions""",
         ),
     ]
 
@@ -354,42 +354,3 @@ class PromptFeedback:
             if stats_a["avg_rating"] and stats_b["avg_rating"]
             else None,
         }
-
-
-# =============================================================================
-# TODO: Phase 3 - Automatic Optimization (Future - Complex Dependencies)
-# =============================================================================
-#
-# Automatically optimize prompts based on feedback data.
-#
-# ⚠️ WARNING: This is a complex feature with many dependencies:
-# - Large amount of feedback data (1000+ samples per prompt)
-# - LLM for analysis (GPT-4 or similar)
-# - A/B testing infrastructure
-# - Statistical significance testing
-# - Human review process
-#
-# DO NOT implement until:
-# 1. Phase 2 (Feedback Collection) is complete
-# 2. Sufficient feedback data is collected (6+ months)
-# 3. Clear ROI is demonstrated
-#
-# Placeholder design:
-#
-# class PromptOptimizer:
-#     def analyze_low_scores(self, template_id: str) -> Dict[str, Any]:
-#         """Analyze low-scoring cases to identify issues."""
-#         # Query low-score cases
-#         # Use LLM to analyze patterns
-#         # Return analysis report
-#         pass
-#
-#     def suggest_improvements(self, template_id: str) -> str:
-#         """Generate improved prompt based on analysis."""
-#         # Get current prompt
-#         # Get analysis report
-#         # Use LLM to generate improved version
-#         # Return new prompt (requires human review!)
-#         pass
-#
-# =============================================================================

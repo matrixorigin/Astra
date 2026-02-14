@@ -1,12 +1,9 @@
 """Shared test fixtures."""
 
 import pytest
-from api.database import get_db_session
 
 
 @pytest.fixture
-def db():
-    """Real database session for testing."""
-    session = next(get_db_session())
-    yield session
-    session.close()
+def db(db_session):
+    """Database session for testing (uses shared db_session from root conftest)."""
+    yield db_session

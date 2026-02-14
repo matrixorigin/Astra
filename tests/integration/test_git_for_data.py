@@ -35,7 +35,10 @@ def time_machine(db):
 @pytest.fixture
 def sandbox(db):
     """Sandbox fixture."""
-    return Sandbox(db=db)
+    from sqlalchemy import text
+    result = db.execute(text("SELECT DATABASE()"))
+    current_db = result.scalar()
+    return Sandbox(source_db=current_db, db=db)
 
 
 def test_snapshot_creation_and_listing(git):
@@ -72,8 +75,8 @@ def test_time_machine_checkpoint(time_machine, db):
     db.execute(
         text("""
         INSERT INTO conversation_events 
-        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, created_at)
-        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :created_at)
+        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
+        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
         """),
         {
             "event_id": str(uuid4()),
@@ -83,6 +86,7 @@ def test_time_machine_checkpoint(time_machine, db):
             "agent_version": "1.0.0",
             "event_type": "user_query",
             "content": "Initial query",
+            "causal_chain_id": str(uuid4()),
             "created_at": datetime.now(timezone.utc)
         }
     )
@@ -96,8 +100,8 @@ def test_time_machine_checkpoint(time_machine, db):
     db.execute(
         text("""
         INSERT INTO conversation_events 
-        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, created_at)
-        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :created_at)
+        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
+        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
         """),
         {
             "event_id": str(uuid4()),
@@ -105,8 +109,9 @@ def test_time_machine_checkpoint(time_machine, db):
             "user_id": user_id,
             "agent_id": "system",
             "agent_version": "1.0.0",
-            "event_type": "user_query",
-            "content": "Query after checkpoint",
+            "event_type": "agent_response",
+            "content": "Response after checkpoint",
+            "causal_chain_id": str(uuid4()),
             "created_at": datetime.now(timezone.utc)
         }
     )
@@ -148,8 +153,8 @@ def test_sandbox_experiment(sandbox, db):
     db.execute(
         text("""
         INSERT INTO conversation_events 
-        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, created_at)
-        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :created_at)
+        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
+        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
         """),
         {
             "event_id": str(uuid4()),
@@ -159,6 +164,7 @@ def test_sandbox_experiment(sandbox, db):
             "agent_version": "1.0.0",
             "event_type": "user_query",
             "content": "Before experiment",
+            "causal_chain_id": str(uuid4()),
             "created_at": datetime.now(timezone.utc)
         }
     )
@@ -171,8 +177,8 @@ def test_sandbox_experiment(sandbox, db):
     db.execute(
         text("""
         INSERT INTO conversation_events 
-        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, created_at)
-        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :created_at)
+        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
+        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
         """),
         {
             "event_id": str(uuid4()),
@@ -182,6 +188,7 @@ def test_sandbox_experiment(sandbox, db):
             "agent_version": "1.0.0",
             "event_type": "user_query",
             "content": "After sandbox creation",
+            "causal_chain_id": str(uuid4()),
             "created_at": datetime.now(timezone.utc)
         }
     )
@@ -214,8 +221,8 @@ def test_git_for_data_restore(git, db):
     db.execute(
         text("""
         INSERT INTO conversation_events 
-        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, created_at)
-        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :created_at)
+        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
+        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
         """),
         {
             "event_id": test_event_id,
@@ -225,6 +232,7 @@ def test_git_for_data_restore(git, db):
             "agent_version": "1.0.0",
             "event_type": "user_query",
             "content": "Original content",
+            "causal_chain_id": str(uuid4()),
             "created_at": datetime.now(timezone.utc)
         }
     )

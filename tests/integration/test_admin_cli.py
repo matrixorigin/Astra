@@ -28,6 +28,28 @@ def test_db():
     """Create a test database session."""
     db = next(get_db_session())
 
+    # Seed RBAC data
+    try:
+        # Clean up existing data first
+        db.execute(text("DELETE FROM user_roles WHERE user_id IN ('u_admin', 'u_alice')"))
+        db.execute(text("DELETE FROM users WHERE user_id IN ('u_admin', 'u_alice')"))
+        db.execute(text("DELETE FROM roles WHERE role_id IN ('r_admin', 'r_user')"))
+        db.commit()
+
+        # Create roles
+        db.execute(text("INSERT INTO roles (role_id, role_name, created_at) VALUES ('r_admin', 'mo_agent_admin', NOW()), ('r_user', 'mo_agent_user', NOW())"))
+        # Create users
+        db.execute(text("INSERT INTO users (user_id, username, email, password_hash, created_at) VALUES ('u_admin', 'test_admin', 'admin@test.com', 'hash', NOW())"))
+        db.execute(text("INSERT INTO users (user_id, username, email, password_hash, created_at) VALUES ('u_alice', 'alice', 'alice@test.com', 'hash', NOW())"))
+        
+        # Assign roles
+        db.execute(text("INSERT INTO user_roles (user_id, role_id, created_at) VALUES ('u_admin', 'r_admin', NOW()), ('u_alice', 'r_user', NOW())"))
+        
+        db.commit()
+    except Exception as e:
+        print(f"Failed to seed RBAC: {e}")
+        db.rollback()
+
     # Clean up test data
     try:
         db.execute(text("DELETE FROM configs WHERE key_name LIKE 'test-%'"))
@@ -44,6 +66,7 @@ def test_db():
         db.execute(text("DELETE FROM configs WHERE key_name LIKE 'test-%'"))
         db.execute(text("DELETE FROM tokens WHERE token_id LIKE 'token_%'"))
         db.execute(text("DELETE FROM audit_logs WHERE user_id = 'test_admin'"))
+        # Optional: Clean up users/roles? Maybe not needed as they are static test data
         db.commit()
     except:
         pass
@@ -55,6 +78,15 @@ class TestModelManagement:
 
     def test_model_add_global(self, runner, test_db):
         """Test adding a global model."""
+        # Debug: Check DB content
+        from api.models import User, Role, UserRole
+        users = test_db.query(User).all()
+        roles = test_db.query(Role).all()
+        user_roles = test_db.query(UserRole).all()
+        print(f"DEBUG: Users: {[u.username for u in users]}")
+        print(f"DEBUG: Roles: {[r.role_name for r in roles]}")
+        print(f"DEBUG: UserRoles: {[(ur.user_id, ur.role_id) for ur in user_roles]}")
+        
         result = runner.invoke(
             cli,
             [
@@ -79,6 +111,9 @@ class TestModelManagement:
         if "Permission denied" in result.output:
             pytest.skip("test_admin user needs mo_agent_admin role")
 
+        if result.exit_code != 0:
+            print(f"Command failed. Output: {result.output}")
+            print(f"Exception: {result.exception}")
         assert result.exit_code == 0
         assert "added successfully" in result.output
 
@@ -129,9 +164,9 @@ class TestPermissionEnforcement:
         )
 
         # In development mode: should succeed (exit_code == 0)
-        # In production mode: should fail (exit_code == 1)
-        assert result.exit_code == 0  # Development mode
-        assert "added successfully" in result.output  # Development mode allows it
+        # In production mode (now enabled): should fail (exit_code == 1)
+        assert result.exit_code == 1  # Permission denied
+        assert "Permission denied" in result.output or "Error" in result.output
 
 
 @pytest.mark.integration

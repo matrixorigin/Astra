@@ -13,11 +13,9 @@ from core.skills.selector import SkillMetadata
 
 
 @pytest.fixture
-def db():
+def db(db_session):
     """Real database session."""
-    session = next(get_db_session())
-    yield session
-    session.close()
+    yield db_session
 
 
 @pytest.fixture

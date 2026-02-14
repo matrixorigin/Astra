@@ -53,6 +53,7 @@ def test_create_user_query(event_repo, test_session):
         "content": "Test query",
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {},
+        "causal_chain_id": str(uuid4()),
     })
 
     assert event.event_type == "user_query"
@@ -71,6 +72,7 @@ def test_create_llm_response(event_repo, test_session):
         "content": "Test response",
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {"model": "gpt-4"},
+        "causal_chain_id": str(uuid4()),
     })
 
     assert event.event_type == "llm_response"
@@ -89,6 +91,7 @@ def test_get_event_by_id(event_repo, test_session):
         "content": "Test",
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {},
+        "causal_chain_id": str(uuid4()),
     })
 
     retrieved = event_repo.get_by_id(created.event_id, test_session.user_id)
@@ -108,6 +111,7 @@ def test_list_session_events(event_repo, test_session):
             "content": f"Query {i}",
             "created_at": datetime.now(timezone.utc),
             "event_metadata": {},
+            "causal_chain_id": str(uuid4()),
         })
 
     events = event_repo.list_by_session(test_session.session_id, test_session.user_id)
@@ -126,6 +130,7 @@ def test_event_with_parent(event_repo, test_session):
         "content": "Parent",
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {},
+        "causal_chain_id": str(uuid4()),
     })
 
     child = event_repo.create({
@@ -139,6 +144,7 @@ def test_event_with_parent(event_repo, test_session):
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {},
         "parent_event_id": parent.event_id,
+        "causal_chain_id": str(uuid4()),
     })
 
     assert child.parent_event_id == parent.event_id
@@ -176,6 +182,7 @@ def test_filter_events_by_type(event_repo, test_session):
         "content": "Query",
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {},
+        "causal_chain_id": str(uuid4()),
     })
 
     event_repo.create({
@@ -188,6 +195,7 @@ def test_filter_events_by_type(event_repo, test_session):
         "content": "Response",
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {},
+        "causal_chain_id": str(uuid4()),
     })
 
     queries = event_repo.list_by_session(

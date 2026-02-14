@@ -23,10 +23,22 @@ class EventLogger:
         """Initialize event logger.
 
         Args:
-            session: SQLAlchemy session. If None, creates a new one.
+            session: SQLAlchemy session. If None, creates a new one (not recommended).
         """
-        self._owns_session = session is None
-        self.session = session or SessionLocal()
+        if session:
+            self.session = session
+            self._owns_session = False
+        else:
+            # We enforce dependency injection for better resource management
+            # But if absolutely necessary, we can create one (and log warning)
+            from core.logging_config import get_logger
+            logger = get_logger(__name__)
+            logger.warning(
+                "EventLogger initialized without explicit session. "
+                "This may cause connection churn. Prefer passing a session."
+            )
+            self.session = SessionLocal()
+            self._owns_session = True
 
     def __enter__(self):
         return self
@@ -75,8 +87,6 @@ class EventLogger:
             causal_chain_id=event.causal_chain_id,
             llm_model_used=event.llm_model_used,
             llm_params=event.llm_params,
-            skill_name=event.skill_name,
-            skill_version=event.skill_version,
         )
         
         self.session.add(db_event)
@@ -150,8 +160,6 @@ class EventLogger:
         parent_event_id: str | None = None,
         causal_chain_id: str | None = None,
         metadata: dict | None = None,
-        skill_name: str | None = None,
-        skill_version: str | None = None,
     ) -> ConversationEvent:
         """Create and log a stream event to the database.
 
@@ -165,8 +173,6 @@ class EventLogger:
             parent_event_id: Parent event ID in causal chain
             causal_chain_id: Causal chain identifier
             metadata: Additional metadata
-            skill_name: Skill name (for tool events)
-            skill_version: Skill version (for tool events)
 
         Returns:
             ConversationEvent: Created event
@@ -188,8 +194,6 @@ class EventLogger:
             parent_event_id=parent_event_id,
             causal_chain_id=causal_chain_id or str(uuid7()),
             metadata=metadata,
-            skill_name=skill_name,
-            skill_version=skill_version,
         )
         self.log_event(event)
         return event

@@ -79,11 +79,11 @@ class TestResourceCleanup:
         # Should NOT be called
         mock_session.close.assert_not_called()
 
-    @patch("core.sandbox.sandbox.SessionLocal")
-    def test_sandbox_context_manager(self, mock_session_local):
+    @patch("core.sandbox.sandbox.get_db_session")
+    def test_sandbox_context_manager(self, mock_get_db_session):
         """Test Sandbox context manager closes session."""
         mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
+        mock_get_db_session.return_value = iter([mock_session])
 
         # Test with context manager
         with Sandbox() as sandbox:
@@ -96,11 +96,11 @@ class TestResourceCleanup:
         # Verify close was called
         mock_session.close.assert_called_once()
 
-    @patch("core.sandbox.sandbox.SessionLocal")
-    def test_sandbox_manual_close(self, mock_session_local):
+    @patch("core.sandbox.sandbox.get_db_session")
+    def test_sandbox_manual_close(self, mock_get_db_session):
         """Test Sandbox manual close."""
         mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
+        mock_get_db_session.return_value = iter([mock_session])
 
         sandbox = Sandbox()
         sandbox.close()
@@ -118,11 +118,11 @@ class TestResourceCleanup:
         # Should NOT be called
         mock_session.close.assert_not_called()
 
-    @patch("core.events.event_reader.SessionLocal")
-    def test_event_reader_context_manager(self, mock_session_local):
+    @patch("core.events.event_reader.get_db_session")
+    def test_event_reader_context_manager(self, mock_get_db_session):
         """Test EventReader context manager closes session."""
         mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
+        mock_get_db_session.return_value = iter([mock_session])
 
         with EventReader() as reader:
             assert reader._owns_session is True
@@ -130,11 +130,11 @@ class TestResourceCleanup:
             
         mock_session.close.assert_called_once()
 
-    @patch("core.replay.time_machine.SessionLocal")
-    def test_time_machine_context_manager(self, mock_session_local):
+    @patch("core.replay.time_machine.get_db_session")
+    def test_time_machine_context_manager(self, mock_get_db_session):
         """Test TimeMachine context manager closes session."""
         mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
+        mock_get_db_session.return_value = iter([mock_session])
 
         with TimeMachine() as tm:
             assert tm._owns_session is True
@@ -147,15 +147,17 @@ class TestResourceCleanup:
             
         mock_session.close.assert_called_once()
 
-    @patch("core.events.session_manager.SessionLocal")
-    def test_session_manager_context_manager(self, mock_session_local):
+    @patch("core.events.session_manager.get_db_session")
+    def test_session_manager_context_manager(self, mock_get_db_session):
         """Test SessionManager context manager closes session."""
         mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
+        mock_get_db_session.return_value = iter([mock_session])
 
         with SessionManager() as manager:
+            # Trigger session creation
+            manager._get_session()
             assert manager._owns_session is True
-            assert manager.session is mock_session
+            assert manager._session is mock_session
             
         mock_session.close.assert_called_once()
 
@@ -221,16 +223,18 @@ class TestResourceCleanup:
             
         mock_session.close.assert_called_once()
 
-    @patch("core.skills.selector.SessionLocal")
+    @patch("core.skills.selector.get_db_session")
     @patch("core.skills.selector.SkillSelector._load_skills")
-    def test_skill_selector_context_manager(self, mock_load, mock_session_local):
+    def test_skill_selector_context_manager(self, mock_load, mock_get_db_session):
         """Test SkillSelector context manager closes session."""
         mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
+        mock_get_db_session.return_value = iter([mock_session])
 
         with SkillSelector() as selector:
+            # Trigger session creation
+            selector._get_session()
             assert selector._owns_session is True
-            assert selector.session is mock_session
+            assert selector._session is mock_session
             
         mock_session.close.assert_called_once()
 
@@ -244,16 +248,16 @@ class TestResourceCleanup:
         with ModernSkillSelector() as selector:
             assert selector._owns_session is True
             assert selector.session is mock_session
-            assert selector.rule_selector.session is mock_session
+            assert selector.rule_selector._session is mock_session
             assert selector.rule_selector._owns_session is False
             
         mock_session.close.assert_called_once()
 
-    @patch("core.events.causal_chain.SessionLocal")
-    def test_causal_chain_manager_context_manager(self, mock_session_local):
+    @patch("core.events.causal_chain.get_db_session")
+    def test_causal_chain_manager_context_manager(self, mock_get_db_session):
         """Test CausalChainManager context manager closes session."""
         mock_session = MagicMock()
-        mock_session_local.return_value = mock_session
+        mock_get_db_session.return_value = iter([mock_session])
 
         with CausalChainManager() as manager:
             assert manager._owns_session is True

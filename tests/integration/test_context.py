@@ -9,16 +9,6 @@ from api.repositories.event_repository import EventRepository
 
 
 @pytest.fixture
-def db_session():
-    """SQLAlchemy Session fixture."""
-    session = next(get_db_session())
-    try:
-        yield session
-    finally:
-        session.close()
-
-
-@pytest.fixture
 def session_repo(db_session):
     """Session repository fixture."""
     return SessionRepository(db_session)

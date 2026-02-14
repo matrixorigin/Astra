@@ -67,20 +67,41 @@ class ToolMockingLayer:
         result_storage: ResultStorage | None = None,
         session_id: str | None = None,
     ):
+        """Initialize ToolMockingLayer.
+
+        Args:
+            mode: Execution mode
+            session: SQLAlchemy session (dependency injection)
+            result_storage: Optional result storage
+            session_id: Session ID (required for replay)
+        """
         self.mode = mode
-        self._session = session
-        self._owns_session = session is None
         self.result_storage = result_storage
         self.session_id = session_id
+        
+        if session:
+            self._session = session
+            self._owns_session = False
+        else:
+            # We enforce dependency injection for better resource management
+            # But if absolutely necessary, we can create one (and log warning)
+            # In production, this branch should be avoided.
+            logger.warning(
+                "ToolMockingLayer initialized without explicit session. "
+                "This may cause connection churn. Prefer passing a session."
+            )
+            self._session = SessionLocal()
+            self._owns_session = True
+            
+        if self.mode == MockMode.REPLAY and not self.session_id:
+            raise ValueError("session_id required for replay mode")
 
     def _get_session(self) -> Session:
-        """Get database session, creating if needed"""
-        if self._session:
-            return self._session
-        
-        # Lazy initialization
-        self._session = SessionLocal()
-        self._owns_session = True
+        """Get database session."""
+        if not self._session:
+             # Should not happen if __init__ is correct, but for safety
+             self._session = SessionLocal()
+             self._owns_session = True
         return self._session
 
     def __enter__(self):
@@ -92,11 +113,20 @@ class ToolMockingLayer:
     def close(self):
         """Close the session if owned"""
         if self._owns_session and self._session:
+            logger.debug("Closing ToolMockingLayer owned session")
             self._session.close()
             self._session = None
 
     def __del__(self):
-        self.close()
+        """Destructor to ensure cleanup (failsafe)."""
+        # Only try to close if we own it and it's not None
+        # Note: __del__ is unreliable, do not rely on it for logic
+        try:
+            if hasattr(self, '_owns_session') and self._owns_session and hasattr(self, '_session') and self._session:
+                logger.warning("ToolMockingLayer garbage collected without explicit close()")
+                self._session.close()
+        except Exception:
+            pass  # Suppress errors during destruction
 
     def execute(
         self,
@@ -284,6 +314,47 @@ class ToolMockingLayer:
             logger.error(f"Failed to get recorded result for {skill_name}: {e}")
             return None
 
+    def record_skill_invocation(
+        self,
+        event_id: str,
+        skill_id: str,
+        params: dict,
+        result: Any,
+        side_effects: dict | None = None,
+    ) -> None:
+        """Record skill invocation result (for testing/manual recording)."""
+        self._record_result(
+            skill_name=skill_id,
+            params=params,
+            result=result,
+            session_id=self.session_id or "unknown",  # Fallback if not set
+            parent_event_id=None, # Not used in this manual update path
+            event_id_override=event_id
+        )
+
+    @property
+    def recorded_results(self) -> dict:
+        """Get all recorded results for the current session (for testing)."""
+        if not self.session_id:
+            return {}
+        
+        from api.models import Event as EventModel
+        session = self._get_session()
+        events = session.query(EventModel).filter(
+            EventModel.session_id == self.session_id,
+            EventModel.skill_result.isnot(None)
+        ).all()
+        
+        results = {}
+        for event in events:
+            key = self._make_key(event.skill_name, event.event_metadata.get("skill_params", {}))
+            results[key] = event.skill_result
+        return results
+
+    def _make_key(self, skill_name: str, params: dict) -> str:
+        """Generate a consistent key for skill execution."""
+        return f"{skill_name}:{self._hash_params(params)}"
+
     def _record_result(
         self,
         skill_name: str,
@@ -291,6 +362,7 @@ class ToolMockingLayer:
         result: Any,
         session_id: str,
         parent_event_id: str | None,
+        event_id_override: str | None = None,
     ) -> None:
         """
         Record skill result in conversation_events metadata.
@@ -336,26 +408,35 @@ class ToolMockingLayer:
                     f"Metadata too large for {skill_name}: {metadata_size_mb:.2f}MB. "
                     f"Skipping record to prevent database error."
                 )
-                # TODO: Use self.result_storage if available
-                # if self.result_storage:
-                #     ref = self.result_storage.store(f"{session_id}:{skill_name}", result_data)
-                #     metadata["skill_result"] = {"stored_at": ref}
-                # else:
-                #     return
                 return
 
-            # Update most recent tool_result event for this skill
+            # Update event
             from api.models import Event as EventModel
             
             session = self._get_session()
-            event = session.query(EventModel).filter(
-                EventModel.session_id == session_id,
-                EventModel.skill_name == skill_name,
-                EventModel.event_type == 'tool_result'
-            ).order_by(EventModel.created_at.desc()).first()
+            query = session.query(EventModel)
+            
+            if event_id_override:
+                query = query.filter(EventModel.event_id == event_id_override)
+            else:
+                query = query.filter(
+                    EventModel.session_id == session_id,
+                    EventModel.skill_name == skill_name,
+                    EventModel.event_type == 'tool_result'
+                ).order_by(EventModel.created_at.desc())
+            
+            event = query.first()
             
             if event:
-                event.event_metadata = metadata
+                # Merge with existing metadata if present
+                existing_metadata = event.event_metadata or {}
+                # Update with new metadata
+                existing_metadata.update(metadata)
+                event.event_metadata = existing_metadata
+                
+                # Also update columns for easier access
+                event.skill_result = result_data
+                
                 session.commit()
 
             logger.debug(f"Recorded result for {skill_name} in session {session_id}")

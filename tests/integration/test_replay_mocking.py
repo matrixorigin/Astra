@@ -188,7 +188,7 @@ def test_replay_mode_uses_recorded_result(db, session_id, setup_recorded_result)
     setup_recorded_result("test_write_skill", params, recorded_result)
 
     # Create mock layer in replay mode
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
     skill = WriteSkill()
 
     # Mock the execute method to track if it's called
@@ -204,7 +204,7 @@ def test_replay_mode_uses_recorded_result(db, session_id, setup_recorded_result)
 
 def test_replay_mode_blocks_destructive_operations(db, session_id):
     """Replay mode blocks destructive operations"""
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
     skill = DestructiveSkill()
 
     params = {"user_id": "test", "session_id": session_id}
@@ -215,7 +215,7 @@ def test_replay_mode_blocks_destructive_operations(db, session_id):
 
 def test_replay_mode_fallback_for_read_operations(db, session_id):
     """Replay mode allows READ operations to execute (fallback)"""
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
     skill = ReadSkill()
 
     params = {"user_id": "test", "session_id": session_id, "query": "test"}
@@ -228,7 +228,7 @@ def test_replay_mode_fallback_for_read_operations(db, session_id):
 
 def test_replay_mode_fallback_when_no_recorded_result(db, session_id):
     """Replay mode falls back to execution when no recorded result found"""
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
     skill = WriteSkill()
 
     params = {"user_id": "test", "session_id": session_id}
@@ -247,7 +247,7 @@ def test_params_hash_matching(db, session_id, setup_recorded_result):
     recorded_result = {"success": True, "result": "Recorded", "error": None}
     setup_recorded_result("test_write_skill", params1, recorded_result)
 
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
     skill = WriteSkill()
 
     # Same params should match
@@ -268,7 +268,7 @@ def test_dangerous_fallback_warning(db, session_id, caplog):
 
     caplog.set_level(logging.WARNING)
 
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
     skill = WriteSkill()
 
     params = {"user_id": "test", "session_id": session_id}
@@ -287,7 +287,7 @@ def test_concurrency_warning_without_parent_event_id(db, session_id, caplog):
 
     caplog.set_level(logging.WARNING)
 
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
     skill = WriteSkill()
 
     params = {"user_id": "test", "session_id": session_id}

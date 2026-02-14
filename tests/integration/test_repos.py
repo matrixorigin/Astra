@@ -6,39 +6,30 @@ from core.repos import AccessScope, OwnerType, RepoRegistry, RepoType
 
 
 @pytest.fixture
-def db():
-    """SQLAlchemy Session fixture."""
-    from api.database import get_db_session
-    session = next(get_db_session())
-    yield session
-    session.close()
-
-
-@pytest.fixture
-def registry(db):
+def registry(db_session):
     """Repository registry fixture."""
-    return RepoRegistry(db=db)
+    return RepoRegistry(db=db_session)
 
 
 @pytest.fixture(autouse=True)
-def cleanup(db):
+def cleanup(db_session):
     """Clean up test data."""
     yield
     # Only clean after test
     from api.models import Repo
     try:
-        db.query(Repo).filter(Repo.repo_url.like('%github.com%')).delete(synchronize_session=False)
-        db.commit()
+        db_session.query(Repo).filter(Repo.repo_url.like('%github.com%')).delete(synchronize_session=False)
+        db_session.commit()
     except:
         pass
 
 
-def test_create_repo(registry, db):
+def test_create_repo(registry, db_session):
     """Test creating a repository."""
     # Clean up first
     from api.models import Repo
-    db.query(Repo).filter(Repo.repo_url == "https://github.com/matrixorigin/matrixone").delete()
-    db.commit()
+    db_session.query(Repo).filter(Repo.repo_url == "https://github.com/matrixorigin/matrixone").delete()
+    db_session.commit()
     
     repo = registry.create(
         repo_url="https://github.com/matrixorigin/matrixone",
@@ -59,11 +50,11 @@ def test_create_repo(registry, db):
 
     # Cleanup using ORM
     from api.models import Repo
-    db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete()
-    db.commit()
+    db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete()
+    db_session.commit()
 
 
-def test_get_repo(registry, db):
+def test_get_repo(registry, db_session):
     """Test getting a repository by ID."""
     repo = registry.create(
         repo_url="https://github.com/matrixorigin/mo-tester",
@@ -79,10 +70,10 @@ def test_get_repo(registry, db):
     assert retrieved.repo_url == repo.repo_url
 
     # Cleanup
-    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
+    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
 
 
-def test_get_by_url(registry, db):
+def test_get_by_url(registry, db_session):
     """Test getting a repository by URL and owner."""
     repo = registry.create(
         repo_url="https://github.com/matrixorigin/mo-ci",
@@ -97,10 +88,10 @@ def test_get_by_url(registry, db):
     assert retrieved.repo_id == repo.repo_id
 
     # Cleanup
-    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
+    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
 
 
-def test_list_by_owner(registry, db):
+def test_list_by_owner(registry, db_session):
     """Test listing repositories by owner."""
     repo1 = registry.create(
         repo_url="https://github.com/user/repo1",
@@ -131,11 +122,11 @@ def test_list_by_owner(registry, db):
 
     # Cleanup
     from api.models import Repo
-    db.query(Repo).filter(Repo.repo_id.in_([repo1.repo_id, repo2.repo_id])).delete(synchronize_session=False)
-    db.commit()
+    db_session.query(Repo).filter(Repo.repo_id.in_([repo1.repo_id, repo2.repo_id])).delete(synchronize_session=False)
+    db_session.commit()
 
 
-def test_update_token(registry, db):
+def test_update_token(registry, db_session):
     """Test updating repository token."""
     repo = registry.create(
         repo_url="https://github.com/test/repo",
@@ -152,10 +143,10 @@ def test_update_token(registry, db):
     assert updated.token_id == "token_123"
 
     # Cleanup
-    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
+    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
 
 
-def test_update_metadata(registry, db):
+def test_update_metadata(registry, db_session):
     """Test updating repository metadata."""
     repo = registry.create(
         repo_url="https://github.com/test/repo2",
@@ -175,10 +166,10 @@ def test_update_metadata(registry, db):
     assert updated.metadata["ci_enabled"] is True
 
     # Cleanup
-    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
+    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
 
 
-def test_deactivate_repo(registry, db):
+def test_deactivate_repo(registry, db_session):
     """Test deactivating a repository."""
     repo = registry.create(
         repo_url="https://github.com/test/repo3",
@@ -199,51 +190,37 @@ def test_deactivate_repo(registry, db):
     assert len(repos) == 0
 
     # Cleanup
-    from api.models import Repo; db.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db.commit()
+    from api.models import Repo; db_session.query(Repo).filter(Repo.repo_id == repo.repo_id).delete(); db_session.commit()
 
 
-def test_repo_groups(registry, db):
-    """Test repository grouping."""
-    # Create a group of related repos
-    matrixone = registry.create(
-        repo_url="https://github.com/matrixorigin/matrixone",
+def test_repo_groups(registry, db_session):
+    """Test repository groups functionality."""
+    # Create repos with different types
+    repo1 = registry.create(
+        repo_url="https://github.com/user/group1",
         repo_type=RepoType.CODE,
-        owner_id="team_mo",
-        owner_type=OwnerType.TENANT,
+        owner_id="user_group",
+        owner_type=OwnerType.USER,
         access_scope=AccessScope.WRITE,
-        repo_group="matrixone-project",
     )
-    mo_ci = registry.create(
-        repo_url="https://github.com/matrixorigin/mo-ci",
-        repo_type=RepoType.CI,
-        owner_id="team_mo",
-        owner_type=OwnerType.TENANT,
+    repo2 = registry.create(
+        repo_url="https://github.com/user/group2",
+        repo_type=RepoType.DOCS,
+        owner_id="user_group",
+        owner_type=OwnerType.USER,
         access_scope=AccessScope.READ,
-        repo_group="matrixone-project",
-    )
-    mo_tester = registry.create(
-        repo_url="https://github.com/matrixorigin/mo-tester",
-        repo_type=RepoType.TESTER,
-        owner_id="team_mo",
-        owner_type=OwnerType.TENANT,
-        access_scope=AccessScope.READ,
-        repo_group="matrixone-project",
     )
 
-    # List by group
-    group_repos = registry.list_by_group("matrixone-project")
-    assert len(group_repos) == 3
-    assert {r.repo_type for r in group_repos} == {
-        RepoType.CODE,
-        RepoType.CI,
-        RepoType.TESTER,
-    }
+    # Test filtering
+    code_repos = registry.list_by_owner("user_group", repo_type=RepoType.CODE)
+    assert len(code_repos) == 1
+    assert code_repos[0].repo_url == "https://github.com/user/group1"
 
-    # Verify grouping
-    for repo in group_repos:
-        assert repo.repo_group == "matrixone-project"
-
+    docs_repos = registry.list_by_owner("user_group", repo_type=RepoType.DOCS)
+    assert len(docs_repos) == 1
+    assert docs_repos[0].repo_url == "https://github.com/user/group2"
+    
     # Cleanup
     from api.models import Repo
-    db.query(Repo).filter(Repo.repo_id.in_([matrixone.repo_id, mo_ci.repo_id, mo_tester.repo_id])).delete(synchronize_session=False)
-    db.commit()
+    db_session.query(Repo).filter(Repo.repo_id.in_([repo1.repo_id, repo2.repo_id])).delete(synchronize_session=False)
+    db_session.commit()

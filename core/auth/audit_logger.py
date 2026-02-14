@@ -40,7 +40,7 @@ class AuditLogger:
                 resource_type=resource_type,
                 resource_id=resource_id,
                 details=details,
-                timestamp=datetime.now(),
+                created_at=datetime.now(),
             )
         )
         self.db.commit()
@@ -132,7 +132,7 @@ class AuditLogger:
         query = text(f"""
         SELECT * FROM audit_logs
         WHERE {where_clause}
-        ORDER BY timestamp DESC
+        ORDER BY created_at DESC
         LIMIT {limit}
         """)
 

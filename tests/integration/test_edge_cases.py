@@ -11,13 +11,6 @@ from api.repositories.event_repository import EventRepository
 
 
 @pytest.fixture
-def db_session():
-    session = next(get_db_session())
-    yield session
-    session.close()
-
-
-@pytest.fixture
 def session_repo(db_session):
     return SessionRepository(db_session)
 
@@ -55,6 +48,7 @@ def test_event_with_full_metadata(session_repo, event_repo):
             "user_agent": "test",
             "nested": {"key": "value"},
         },
+        "causal_chain_id": str(uuid4()),
     })
 
     assert event.event_metadata["source"] == "cli"
@@ -85,6 +79,7 @@ def test_large_event_content(session_repo, event_repo):
         "content": large_content,
         "created_at": datetime.now(timezone.utc),
         "event_metadata": {},
+        "causal_chain_id": str(uuid4()),
     })
 
     assert len(event.content) == 10000
@@ -197,6 +192,7 @@ def test_session_event_count_accuracy(session_repo, event_repo, db_session):
             "content": f"Event {i}",
             "created_at": datetime.now(timezone.utc),
             "event_metadata": {},
+            "causal_chain_id": str(uuid4()),
         })
         session.event_count += 1
         db_session.commit()
@@ -287,6 +283,7 @@ def test_user_cross_session_events(session_repo, event_repo):
             "content": f"Event in session {i}",
             "created_at": datetime.now(timezone.utc),
             "event_metadata": {},
+            "causal_chain_id": str(uuid4()),
         })
 
     user_sessions, total = session_repo.list_by_user(user_id)

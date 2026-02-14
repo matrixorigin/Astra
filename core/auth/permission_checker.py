@@ -1,27 +1,33 @@
-"""Permission checker using MatrixOne RBAC."""
+"""Permission checker using App-Layer RBAC."""
 
-from sqlalchemy import text
 from sqlalchemy.orm import Session
+from api.models import User, Role, UserRole
 
 
 class PermissionChecker:
-    """Check user permissions using MatrixOne RBAC."""
+    """Check user permissions using App-Layer RBAC."""
 
     def __init__(self, db: Session):
         self.db = db
 
     def has_role(self, user_id: str, role_name: str) -> bool:
-        """Check if user has a specific role."""
-        query = """
-        SELECT COUNT(*) as cnt
-        FROM mo_catalog.mo_user_grant ug
-        JOIN mo_catalog.mo_user u ON ug.user_id = u.user_id
-        JOIN mo_catalog.mo_role r ON ug.role_id = r.role_id
-        WHERE u.user_name = :user_id AND r.role_name = :role_name
+        """Check if user has a specific role.
+        
+        Args:
+            user_id: User UUID or Username
+            role_name: Role name (e.g., 'mo_agent_admin')
         """
-        result = self.db.execute(text(query), {"user_id": user_id, "role_name": role_name})
-        row = result.first()
-        return bool(row and row._mapping.get("cnt", 0) > 0)
+        query = (
+            self.db.query(UserRole)
+            .join(Role, UserRole.role_id == Role.role_id)
+            .join(User, UserRole.user_id == User.user_id)
+            .filter(Role.role_name == role_name)
+        )
+        
+        # Support both UUID (user_id) and Username
+        query = query.filter((User.user_id == user_id) | (User.username == user_id))
+        
+        return query.count() > 0
 
     def is_admin(self, user_id: str) -> bool:
         """Check if user is mo_agent_admin."""
@@ -34,35 +40,42 @@ class PermissionChecker:
     def can_manage_models(self, user_id: str, scope: str, scope_id: str | None = None) -> bool:
         """Check if user can manage models at given scope.
 
-        For development: simplified to allow all operations.
-        For production: uncomment RBAC checks below.
+        Enforces strict RBAC:
+        - Global scope: Admin only
+        - Account scope: Admin only (or account owner - simplified to admin for now)
+        - User scope: Self or Admin
         """
-        # Development mode: allow all
-        return True
+        if self.is_admin(user_id):
+            return True
 
-        # Production mode (uncomment when RBAC is set up):
-        # if scope == "global":
-        #     return self.is_admin(user_id)
-        # if scope == "account":
-        #     return self.is_admin(user_id)  # or check account membership
-        # if scope == "user" and scope_id == user_id:
-        #     return True
-        # return False
+        if scope == "global":
+            return False  # Only admin can manage global models
+            
+        if scope == "account":
+            return False  # Only admin can manage account models for now
+            
+        if scope == "user" and scope_id == user_id:
+            return self.is_user(user_id)
+            
+        return False
 
     def can_manage_skills(self, user_id: str, scope: str, scope_id: str | None = None) -> bool:
         """Check if user can manage skills at given scope.
-
-        For development: simplified to allow all operations.
+        
+        Enforces strict RBAC:
+        - Global/Account scope: Admin only
+        - User scope: Self or Admin
         """
-        # Development mode: allow all
-        return True
-
-        # Production mode (uncomment when RBAC is set up):
-        # if scope in ["global", "account"]:
-        #     return self.is_admin(user_id)
-        # if scope == "user" and scope_id == user_id:
-        #     return self.is_user(user_id)
-        # return False
+        if self.is_admin(user_id):
+            return True
+            
+        if scope in ["global", "account"]:
+            return False
+            
+        if scope == "user" and scope_id == user_id:
+            return self.is_user(user_id)
+            
+        return False
 
     def can_view_audit_logs(self, user_id: str, target_user: str | None = None) -> bool:
         """Check if user can view audit logs."""

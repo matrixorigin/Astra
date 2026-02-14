@@ -36,7 +36,8 @@ class TestEventRepositoryIntegration:
             "event_type": "user_query",
             "content": "Hello, world!",
             "created_at": datetime.now(timezone.utc),
-            "event_metadata": {"client": "test"}
+            "event_metadata": {"client": "test"},
+            "causal_chain_id": str(uuid4())
         }
         
         # Create
@@ -60,7 +61,8 @@ class TestEventRepositoryIntegration:
             "user_id": user_id,
             "event_type": "user_query",
             "content": "Test",
-            "created_at": datetime.now(timezone.utc)
+            "created_at": datetime.now(timezone.utc),
+            "causal_chain_id": str(uuid4())
         }
         event = event_repo.create(event_data)
         
@@ -85,7 +87,8 @@ class TestEventRepositoryIntegration:
                 "user_id": user_id,
                 "event_type": "user_query",
                 "content": f"Message {i}",
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
+                "causal_chain_id": str(uuid4())
             }
             event_repo.create(event_data)
         
@@ -106,7 +109,8 @@ class TestEventRepositoryIntegration:
                 "user_id": user_id,
                 "event_type": event_type,
                 "content": "Test",
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
+                "causal_chain_id": str(uuid4())
             }
             event_repo.create(event_data)
         
@@ -127,7 +131,8 @@ class TestEventRepositoryIntegration:
                 "user_id": user_id,
                 "event_type": "user_query",
                 "content": f"Message {i}",
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
+                "causal_chain_id": str(uuid4())
             }
             event_repo.create(event_data)
         
@@ -145,7 +150,8 @@ class TestEventRepositoryIntegration:
                 "user_id": user_id,
                 "event_type": "user_query",
                 "content": f"Message {i}",
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
+                "causal_chain_id": str(uuid4())
             }
             event_repo.create(event_data)
         
@@ -211,7 +217,8 @@ class TestEventRepositoryIntegration:
                 "user_id": str(uuid4()),
                 "event_type": "user_query",
                 "content": f"Message {i}",
-                "created_at": datetime.now(timezone.utc)
+                "created_at": datetime.now(timezone.utc),
+                "causal_chain_id": str(uuid4())
             }
             event_repo.create(event_data)
         
@@ -230,7 +237,8 @@ class TestEventRepositoryIntegration:
             "user_id": str(uuid4()),
             "event_type": "user_query",
             "content": "To delete",
-            "created_at": datetime.now(timezone.utc)
+            "created_at": datetime.now(timezone.utc),
+            "causal_chain_id": str(uuid4())
         }
         event = event_repo.create(event_data)
         

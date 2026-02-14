@@ -7,7 +7,7 @@ from sqlalchemy import text
 from core.events.event_reader import EventReader
 from core.events.models import ConversationEvent
 from sqlalchemy.orm import Session
-from api.database import SessionLocal, get_db_session
+from api.database import get_db_session
 
 
 class CausalChainManager:
@@ -23,7 +23,7 @@ class CausalChainManager:
             db: SQLAlchemy Session instance. If None, creates a new one.
         """
         self._owns_session = db is None
-        self.db = db or SessionLocal()
+        self.db = db or next(get_db_session())
         self.reader = EventReader(self.db)
 
     def __enter__(self):
@@ -33,18 +33,15 @@ class CausalChainManager:
         self.close()
 
     def close(self):
-        """Close the session if owned"""
-        if self._owns_session and self.db:
+        """Close session if owned."""
+        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
             self.db.close()
-            self.db = None
 
     def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
+        """Close session if owned."""
+        self.close()
 
-    def get_chain(self, event_id: str) -> list[ConversationEvent]:
+    def get_chain(self, causal_chain_id: str) -> list[ConversationEvent]:
         """Get all events in a causal chain.
 
         Args:

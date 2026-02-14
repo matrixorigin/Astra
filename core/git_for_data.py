@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from api.database import SessionLocal
+from core.validation import validate_identifier, QueryRequest
 
 
 class GitForData:
@@ -52,7 +53,12 @@ class GitForData:
             >>> print(snapshot["snapshot_name"])
         """
         self.db.commit()  # Commit before DDL
-        query = f"CREATE SNAPSHOT {snapshot_name} FOR ACCOUNT {account}"
+        
+        # Validate inputs to prevent SQL injection
+        safe_snapshot = validate_identifier(snapshot_name)
+        safe_account = validate_identifier(account)
+        
+        query = f"CREATE SNAPSHOT {safe_snapshot} FOR ACCOUNT {safe_account}"
         self.db.execute(text(query))
 
         # Get snapshot info
@@ -107,27 +113,38 @@ class GitForData:
             ...     {"session_id": "session_123"}
             ... )
         """
+        import re
+
+        # Validate snapshot name
+        validate_identifier(snapshot_name)
+        
+        # Validate query for basic safety
+        QueryRequest.validate_query(query)
+        
         # Inject snapshot syntax into query
         # Replace FROM table with FROM table {SNAPSHOT = 'name'}
         snapshot_clause = f"{{SNAPSHOT = '{snapshot_name}'}}"
 
-        # Simple injection: add after first FROM clause
-        # Note: This is a simplified implementation
-        # Production code should use proper SQL parsing
-        if "FROM" in query.upper():
-            parts = query.split()
-            result_parts = []
-            for i, part in enumerate(parts):
-                result_parts.append(part)
-                if part.upper() == "FROM" and i + 1 < len(parts):
-                    result_parts.append(parts[i + 1])
-                    result_parts.append(snapshot_clause)
-                    result_parts.extend(parts[i + 2 :])
-                    break
-            modified_query = " ".join(result_parts)
-        else:
-            modified_query = query
+        def replace_match(match):
+            full_match = match.group(0)
+            # If snapshot clause already exists, don't modify
+            if "{SNAPSHOT" in full_match.upper():
+                return full_match
+            # Otherwise append snapshot clause
+            return f"{full_match} {snapshot_clause}"
 
+        # Regex to find FROM/JOIN clause and the table name
+        # We also look ahead for existing snapshot clause to avoid double injection
+        # Pattern: (FROM|JOIN) + whitespace + table_name + optional snapshot clause
+        pattern = r'\b(FROM|JOIN)\s+([a-zA-Z0-9_.]+)(?:\s*\{SNAPSHOT\s*=[^}]+\})?'
+        
+        modified_query = re.sub(
+            pattern, 
+            replace_match, 
+            query, 
+            flags=re.IGNORECASE
+        )
+        
         result = self.db.execute(text(modified_query), params or {})
         return [dict(row._mapping) for row in result]
 
@@ -147,7 +164,12 @@ class GitForData:
             For testing, consider using query_snapshot() for read-only access.
         """
         self.db.commit()  # Commit before DDL
-        query = f"RESTORE ACCOUNT {account} FROM SNAPSHOT {snapshot_name}"
+        
+        # Validate inputs
+        safe_snapshot = validate_identifier(snapshot_name)
+        safe_account = validate_identifier(account)
+        
+        query = f"RESTORE ACCOUNT {safe_account} FROM SNAPSHOT {safe_snapshot}"
         self.db.execute(text(query))
 
     def restore_table_from_snapshot(self, table_name: str, snapshot_name: str) -> None:
@@ -160,29 +182,28 @@ class GitForData:
             table_name: Name of the table to restore
             snapshot_name: Name of the snapshot to restore from
         """
-        from core.validation import validate_identifier
-        
-        # Validate table name to prevent SQL injection
-        validate_identifier(table_name)
+        # Validate inputs to prevent SQL injection
+        safe_table = validate_identifier(table_name)
+        safe_snapshot = validate_identifier(snapshot_name)
         
         self.db.commit()  # Ensure clean transaction state
         
         # Step 1: Get snapshot timestamp
         snapshots = self.list_snapshots()
-        snapshot_info = next((s for s in snapshots if s["snapshot_name"] == snapshot_name), None)
+        snapshot_info = next((s for s in snapshots if s["snapshot_name"] == safe_snapshot), None)
         if not snapshot_info:
-            raise ValueError(f"Snapshot {snapshot_name} not found")
+            raise ValueError(f"Snapshot {safe_snapshot} not found")
         
         snapshot_ts = snapshot_info["timestamp"]
         
         # Step 2: Clear current table data
-        self.db.execute(text(f"DELETE FROM {table_name}"))
+        self.db.execute(text(f"DELETE FROM {safe_table}"))
         
         # Step 3: Insert data from snapshot using time-travel query
         # Note: This uses MatrixOne's {SNAPSHOT = 'name'} syntax
         insert_query = f"""
-        INSERT INTO {table_name} 
-        SELECT * FROM {table_name} {{SNAPSHOT = '{snapshot_name}'}}
+        INSERT INTO {safe_table} 
+        SELECT * FROM {safe_table} {{SNAPSHOT = '{safe_snapshot}'}}
         """
         self.db.execute(text(insert_query))
         self.db.commit()

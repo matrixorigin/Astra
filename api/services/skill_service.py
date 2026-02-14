@@ -2,23 +2,21 @@
 
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
-from sqlalchemy import text
-from sqlalchemy.orm import Session
 import hashlib
 import json
 
+from sqlalchemy import text, desc
+from sqlalchemy.orm import Session
+
 from api.services.exceptions import ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
-# from sqlalchemy.orm import Session
-from api.database import get_db_session
-
+from api.models import SkillRegistry
 
 class SkillService:
     """Skill 业务服务"""
     
     def __init__(self, db_session: Session):
         self.db_session = db_session
-        # self.db = next(get_db_session())
         self.audit = AuditLogger(db_session)
     
     def register_skill(
@@ -36,32 +34,35 @@ class SkillService:
             code_hash = hashlib.sha256(skill_code.encode()).hexdigest()
             
             # 停用旧版本
-            self.db_session.execute(text(
-                "UPDATE skills_registry SET is_active = 0 WHERE skill_name = :skill_name"),
-                {"skill_name": skill_name}
-            )
+            self.db_session.query(SkillRegistry).filter(
+                SkillRegistry.skill_name == skill_name
+            ).update({"is_active": 0})
             
             # 插入新版本
-            self.db_session.execute(text(
-                """
-                INSERT INTO skills_registry
-                (skill_id, skill_name, version, description, requirements,
-                 code_hash, is_active, status, category, subcategory,
-                 triggers, dependencies, priority, cost_estimate, side_effect_category)
-                VALUES (:skill_id, :skill_name, :version, :description, :requirements,
-                        :code_hash, 1, 'active', :category, 'default', '[]', '[]', 5, 'medium', 'read')
-                """),
-                {
-                    "skill_id": skill_id,
-                    "skill_name": skill_name,
-                    "version": skill_version,
-                    "description": description or "",
-                    "requirements": json.dumps(metadata or {}),
-                    "code_hash": code_hash,
-                    "category": metadata.get("category", "general") if metadata else "general"
-                }
+            # Map requirements/metadata to skill_definition
+            skill_definition = metadata or {}
+            
+            new_skill = SkillRegistry(
+                skill_id=skill_id,
+                skill_name=skill_name,
+                version=skill_version,
+                description=description or "",
+                skill_definition=skill_definition,
+                code_hash=code_hash,
+                is_active=1,
+                # status field does not exist in model
+                category=skill_definition.get("category", "general"),
+                subcategory="default",
+                triggers=[],
+                dependencies=[],
+                priority=5,
+                cost_estimate="medium",
+                side_effect_profile={"category": "read"}
             )
+            
+            self.db_session.add(new_skill)
             self.db_session.commit()
+            self.db_session.refresh(new_skill)
             
             self.audit.log(
                 user_id=user_id,
@@ -73,15 +74,16 @@ class SkillService:
             )
             
             return {
-                "skill_id": skill_id,
-                "skill_name": skill_name,
-                "version": skill_version,
-                "description": description or "",
-                "metadata": metadata or {},
-                "created_at": datetime.now(timezone.utc).isoformat()
+                "skill_id": new_skill.skill_id,
+                "skill_name": new_skill.skill_name,
+                "version": new_skill.version,
+                "description": new_skill.description,
+                "metadata": new_skill.skill_definition or {},
+                "created_at": new_skill.created_at.isoformat() if new_skill.created_at else None
             }
             
         except Exception as e:
+            self.db_session.rollback()
             self.audit.log(
                 user_id=user_id,
                 action="skill_register",
@@ -99,41 +101,25 @@ class SkillService:
     ) -> Dict[str, Any]:
         """获取技能信息"""
         try:
+            query = self.db_session.query(SkillRegistry).filter(SkillRegistry.skill_id == skill_id)
+            
             if version:
-                result = self.db_session.execute(
-                    text("""
-                        SELECT skill_id, skill_name, version, description, requirements, created_at
-                        FROM skills_registry
-                        WHERE skill_id = :skill_id AND version = :version
-                        """),
-                    {"skill_id": skill_id, "version": version}
-                )
+                query = query.filter(SkillRegistry.version == version)
             else:
-                result = self.db_session.execute(
-                    text("""
-                        SELECT skill_id, skill_name, version, description, requirements, created_at
-                        FROM skills_registry
-                        WHERE skill_id = :skill_id AND is_active = 1
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                        """),
-                    {"skill_id": skill_id}
-                    )
+                query = query.filter(SkillRegistry.is_active == 1).order_by(desc(SkillRegistry.created_at))
             
-            row = result.first()
+            skill = query.first()
             
-            if not row:
+            if not skill:
                 raise ResourceNotFoundError(f"Skill {skill_id} 不存在")
             
-            result_dict = dict(row._mapping)
-            
             return {
-                "skill_id": result_dict["skill_id"],
-                "skill_name": result_dict["skill_name"],
-                "version": result_dict["version"],
-                "description": result_dict["description"],
-                "metadata": json.loads(result_dict["requirements"]) if result_dict["requirements"] else {},
-                "created_at": result_dict["created_at"].isoformat() if result_dict.get("created_at") else None
+                "skill_id": skill.skill_id,
+                "skill_name": skill.skill_name,
+                "version": skill.version,
+                "description": skill.description,
+                "metadata": skill.skill_definition or {},
+                "created_at": skill.created_at.isoformat() if skill.created_at else None
             }
         except ResourceNotFoundError:
             raise
@@ -147,36 +133,26 @@ class SkillService:
     ) -> Dict[str, Any]:
         """列出所有技能"""
         try:
-            # with self.db.get_cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT skill_id, skill_name, version, description
-                    FROM skills_registry
-                    WHERE is_active = 1
-                    ORDER BY created_at DESC
-                    LIMIT %s OFFSET %s
-                    """,
-                    (limit, offset)
-                )
-                skills = cursor.fetchall()
-                
-                cursor.execute("SELECT COUNT(*) as total FROM skills_registry WHERE is_active = 1")
-                total = cursor.fetchone()["total"]
-                
-                return {
-                    "skills": [
-                        {
-                            "skill_id": s["skill_id"],
-                            "skill_name": s["skill_name"],
-                            "version": s["version"],
-                            "description": s["description"]
-                        }
-                        for s in skills
-                    ],
-                    "total": total,
-                    "limit": limit,
-                    "offset": offset
-                }
+            total = self.db_session.query(SkillRegistry).filter(SkillRegistry.is_active == 1).count()
+            
+            skills = self.db_session.query(SkillRegistry).filter(
+                SkillRegistry.is_active == 1
+            ).order_by(desc(SkillRegistry.created_at)).offset(offset).limit(limit).all()
+            
+            return {
+                "skills": [
+                    {
+                        "skill_id": s.skill_id,
+                        "skill_name": s.skill_name,
+                        "version": s.version,
+                        "description": s.description
+                    }
+                    for s in skills
+                ],
+                "total": total,
+                "limit": limit,
+                "offset": offset
+            }
         except Exception:
             return {"skills": [], "total": 0, "limit": limit, "offset": offset}
     
@@ -185,25 +161,24 @@ class SkillService:
         skill_id: str
     ) -> List[Dict[str, Any]]:
         """列出技能的所有版本"""
-        from sqlalchemy import text
-        
         try:
-            result = self.db.execute(
-                text("""
-                SELECT version, description, created_at
-                FROM skills_registry
-                WHERE skill_id = :skill_id
-                ORDER BY created_at DESC
-                """),
-                {"skill_id": skill_id}
-            )
-            versions = [dict(row._mapping) for row in result]
+            # First find the skill name from the ID
+            skill = self.db_session.query(SkillRegistry).filter(SkillRegistry.skill_id == skill_id).first()
+            if not skill:
+                # Fallback: try to match by ID only (though ID usually includes name)
+                versions = self.db_session.query(SkillRegistry).filter(
+                    SkillRegistry.skill_id == skill_id
+                ).order_by(desc(SkillRegistry.version)).all()
+            else:
+                versions = self.db_session.query(SkillRegistry).filter(
+                    SkillRegistry.skill_name == skill.skill_name
+                ).order_by(desc(SkillRegistry.version)).all()
             
             return [
                 {
-                    "version": v["version"],
-                    "description": v["description"],
-                    "created_at": v["created_at"].isoformat() if v.get("created_at") else None
+                    "version": v.version,
+                    "description": v.description,
+                    "created_at": v.created_at.isoformat() if v.created_at else None
                 }
                 for v in versions
             ]

@@ -345,11 +345,11 @@ class TestListAvailable:
         
         repo = Repo(
             repo_id=repo_id,
+            user_id="test_user",
             repo_url=unique_url,
+            repo_name="test-repo",
             repo_type="code",
             access_scope="read",
-            owner_id="test",
-            owner_type="user"
         )
         mock_db.add(repo)
         mock_db.commit()

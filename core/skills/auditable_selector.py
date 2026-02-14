@@ -94,10 +94,6 @@ class AuditableSkillSelector:
         if self._owns_session:
             self.session.close()
 
-    def _get_session(self) -> Session:
-        """Get database session."""
-        return self.session
-
     def _ensure_table(self):
         """Ensure skill_selection_events table exists."""
         # Table should already exist from schema
@@ -352,21 +348,24 @@ class AuditableSkillSelector:
         """Save selection event to database."""
         from api.models import SkillSelectionEvent as EventModel
         
-        session = self._get_session()
-        event_model = EventModel(
-            event_id=event.event_id,
-            session_id=event.session_id,
-            user_query=event.user_query,
-            context_snapshot=event.context_snapshot,
-            available_skills=event.available_skills,
-            selected_skills=event.selected_skills,
-            selection_method=event.selection_method,
-            selection_reasoning=event.selection_reasoning,
-            candidate_scores=event.candidate_scores,
-            created_at=event.created_at,
-        )
-        session.add(event_model)
-        session.commit()
+        try:
+            event_model = EventModel(
+                event_id=event.event_id,
+                session_id=event.session_id,
+                user_query=event.user_query,
+                context_snapshot=event.context_snapshot,
+                available_skills=event.available_skills,
+                selected_skills=event.selected_skills,
+                selection_method=event.selection_method,
+                selection_reasoning=event.selection_reasoning,
+                candidate_scores=event.candidate_scores,
+                created_at=event.created_at,
+            )
+            self.session.add(event_model)
+            self.session.commit()
+        except Exception as e:
+            logger.error(f"Failed to save selection event: {e}")
+            self.session.rollback()
 
     def update_execution_result(
         self,
@@ -382,14 +381,17 @@ class AuditableSkillSelector:
         """
         from api.models import SkillSelectionEvent as EventModel
         
-        session = self._get_session()
-        event = session.query(EventModel).filter(EventModel.event_id == event_id).first()
-        if event:
-            event.execution_success = success
-            event.execution_time_ms = time_ms
-            event.execution_cost = cost
-            event.execution_result = result
-            session.commit()
+        try:
+            event = self.session.query(EventModel).filter(EventModel.event_id == event_id).first()
+            if event:
+                event.execution_success = success
+                event.execution_time_ms = time_ms
+                event.execution_cost = cost
+                event.execution_result = result
+                self.session.commit()
+        except Exception as e:
+            logger.error(f"Failed to update execution result: {e}")
+            self.session.rollback()
 
     def update_user_feedback(self, event_id: str, score: int):
         """Update event with user feedback.
@@ -401,13 +403,16 @@ class AuditableSkillSelector:
 
         from api.models import SkillSelectionEvent as EventModel
         
-        session = self._get_session()
-        event = session.query(EventModel).filter(EventModel.event_id == event_id).first()
-        if event:
-            event.user_feedback_score = score
-            # Auto-evaluate correctness based on feedback
-            event.selection_correctness = score >= 4
-            session.commit()
+        try:
+            event = self.session.query(EventModel).filter(EventModel.event_id == event_id).first()
+            if event:
+                event.user_feedback_score = score
+                # Auto-evaluate correctness based on feedback
+                event.selection_correctness = score >= 4
+                self.session.commit()
+        except Exception as e:
+            logger.error(f"Failed to update user feedback: {e}")
+            self.session.rollback()
 
     def get_selection_history(
         self, session_id: str | None = None, limit: int = 100
@@ -427,39 +432,42 @@ class AuditableSkillSelector:
                 return [convert_decimals(item) for item in obj]
             return obj
         
-        session = self._get_session()
-        query = session.query(EventModel)
-        
-        if session_id:
-            query = query.filter(EventModel.session_id == session_id)
-        
-        events_data = query.order_by(EventModel.created_at.desc()).limit(limit).all()
+        try:
+            query = self.session.query(EventModel)
+            
+            if session_id:
+                query = query.filter(EventModel.session_id == session_id)
+            
+            events_data = query.order_by(EventModel.created_at.desc()).limit(limit).all()
 
-        events = []
-        for event in events_data:
-            events.append(
-                SkillSelectionEvent(
-                    event_id=event.event_id,
-                    session_id=event.session_id,
-                    user_query=event.user_query,
-                    context_snapshot=event.context_snapshot,
-                    available_skills=convert_decimals(event.available_skills),
-                    selected_skills=event.selected_skills,
-                    selection_method=event.selection_method,
-                    selection_reasoning=event.selection_reasoning,
-                    candidate_scores=convert_decimals(event.candidate_scores or {}),
-                    execution_result=convert_decimals(event.execution_result),
-                    execution_success=event.execution_success,
-                    execution_time_ms=float(event.execution_time_ms) if event.execution_time_ms else None,
-                    execution_cost=float(event.execution_cost) if event.execution_cost else None,
-                    user_feedback_score=event.user_feedback_score,
-                    selection_correctness=event.selection_correctness,
-                    correction_suggestion=event.correction_suggestion,
-                    created_at=event.created_at,
+            events = []
+            for event in events_data:
+                events.append(
+                    SkillSelectionEvent(
+                        event_id=event.event_id,
+                        session_id=event.session_id,
+                        user_query=event.user_query,
+                        context_snapshot=event.context_snapshot,
+                        available_skills=convert_decimals(event.available_skills),
+                        selected_skills=event.selected_skills,
+                        selection_method=event.selection_method,
+                        selection_reasoning=event.selection_reasoning,
+                        candidate_scores=convert_decimals(event.candidate_scores or {}),
+                        execution_result=convert_decimals(event.execution_result),
+                        execution_success=event.execution_success,
+                        execution_time_ms=float(event.execution_time_ms) if event.execution_time_ms else None,
+                        execution_cost=float(event.execution_cost) if event.execution_cost else None,
+                        user_feedback_score=event.user_feedback_score,
+                        selection_correctness=event.selection_correctness,
+                        correction_suggestion=event.correction_suggestion,
+                        created_at=event.created_at,
+                    )
                 )
-            )
 
-        return events
+            return events
+        except Exception as e:
+            logger.error(f"Failed to get selection history: {e}")
+            return []
 
     def select_and_execute(
         self, query: str, context: dict | None = None, max_candidates: int = 5

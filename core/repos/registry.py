@@ -28,49 +28,39 @@ class RepoRegistry:
         metadata: dict | None = None,
     ) -> Repo:
         """Create a new repository."""
+        from api.models import Repo as RepoModel
+        
         repo_id = str(uuid7())
         now = datetime.now(timezone.utc)
+        
+        # Derive repo name from URL
+        repo_name = repo_url.rstrip("/").split("/")[-1]
+        
+        # Prepare metadata (include repo_group if present)
+        final_metadata = metadata or {}
+        if repo_group:
+            final_metadata["repo_group"] = repo_group
 
-        from sqlalchemy import text
-        query = text("""
-            INSERT INTO repos (
-                repo_id, repo_url, repo_type, owner_id, owner_type,
-                repo_group, token_id, access_scope, metadata, created_at, updated_at
-            ) VALUES (:repo_id, :repo_url, :repo_type, :owner_id, :owner_type, 
-                      :repo_group, :token_id, :access_scope, :metadata, :created_at, :updated_at)
-        """)
-        self.db.execute(
-            query,
-            {
-                "repo_id": repo_id,
-                "repo_url": repo_url,
-                "repo_type": repo_type.value,
-                "owner_id": owner_id,
-                "owner_type": owner_type.value,
-                "repo_group": repo_group,
-                "token_id": token_id,
-                "access_scope": access_scope.value,
-                "metadata": json.dumps(metadata or {}),
-                "created_at": now,
-                "updated_at": now,
-            },
-        )
-        self.db.commit()
-
-        return Repo(
+        repo_model = RepoModel(
             repo_id=repo_id,
+            user_id=owner_id,  # Map owner_id to user_id
             repo_url=repo_url,
-            repo_type=repo_type,
-            owner_id=owner_id,
-            owner_type=owner_type,
-            repo_group=repo_group,
+            repo_name=repo_name,
+            repo_type=repo_type.value,
             token_id=token_id,
-            access_scope=access_scope,
-            metadata=metadata or {},
-            is_active=True,
+            access_scope=access_scope.value,
+            branch=final_metadata.get("default_branch", "main"),
+            status="active",
+            repo_metadata=final_metadata,
             created_at=now,
             updated_at=now,
         )
+        
+        self.db.add(repo_model)
+        self.db.commit()
+        self.db.refresh(repo_model)
+
+        return self._to_model(repo_model)
 
     def get(self, repo_id: str) -> Repo | None:
         """Get repository by ID."""
@@ -85,7 +75,7 @@ class RepoRegistry:
         from api.models import Repo as RepoModel
         result = self.db.query(RepoModel).filter(
             RepoModel.repo_url == repo_url,
-            RepoModel.owner_id == owner_id
+            RepoModel.user_id == owner_id  # Map owner_id to user_id
         ).first()
         if not result:
             return None
@@ -95,9 +85,10 @@ class RepoRegistry:
         """List repositories by owner."""
         from api.models import Repo as RepoModel
         query = self.db.query(RepoModel).filter(
-            RepoModel.owner_id == owner_id,
-            RepoModel.is_active == True
+            RepoModel.user_id == owner_id,  # Map owner_id to user_id
+            RepoModel.status == "active"
         )
+        
         if repo_type:
             query = query.filter(RepoModel.repo_type == repo_type.value)
         
@@ -106,93 +97,86 @@ class RepoRegistry:
 
     def list_by_group(self, repo_group: str) -> list[Repo]:
         """List repositories by group."""
+        # Note: We store repo_group in metadata now, so we can't efficiently query it 
+        # unless we extract it to a column or use JSON search.
+        # For now, we'll scan (inefficient) or deprecate this method.
+        # Given the user request "fix tests", and likely tests use this, 
+        # we will support it via JSON search if possible or just filter in memory for now.
         from api.models import Repo as RepoModel
+        # Basic implementation: list all active repos and filter
+        # Better: use JSON_EXTRACT or similar if DB supports it.
+        # Safe fallback: filter in python
+        
         results = self.db.query(RepoModel).filter(
-            RepoModel.repo_group == repo_group,
-            RepoModel.is_active == True
-        ).order_by(RepoModel.repo_type, RepoModel.created_at.desc()).all()
-        return [self._to_model(r) for r in results]
+            RepoModel.status == "active"
+        ).all()
+        
+        filtered = []
+        for r in results:
+            meta = r.repo_metadata or {}
+            if meta.get("repo_group") == repo_group:
+                filtered.append(r)
+                
+        return [self._to_model(r) for r in filtered]
 
     def update_token(self, repo_id: str, token_id: str) -> None:
         """Update repository token."""
-        from sqlalchemy import text
-        query = text("""
-            UPDATE repos
-            SET token_id = :token_id, updated_at = :updated_at
-            WHERE repo_id = :repo_id
-        """)
-        self.db.execute(query, {"token_id": token_id, "updated_at": datetime.now(timezone.utc), "repo_id": repo_id})
-        self.db.commit()
+        from api.models import Repo as RepoModel
+        repo = self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
+        if repo:
+            repo.token_id = token_id
+            repo.updated_at = datetime.now(timezone.utc)
+            self.db.commit()
 
     def update_metadata(self, repo_id: str, metadata: dict) -> None:
         """Update repository metadata."""
-        from sqlalchemy import text
-        query = text("""
-            UPDATE repos
-            SET metadata = :metadata, updated_at = :updated_at
-            WHERE repo_id = :repo_id
-        """)
-        self.db.execute(query, {"metadata": json.dumps(metadata), "updated_at": datetime.now(timezone.utc), "repo_id": repo_id})
-        self.db.commit()
+        from api.models import Repo as RepoModel
+        from sqlalchemy.orm.attributes import flag_modified
+        
+        repo = self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
+        if repo:
+            # Create a copy to ensure SQLAlchemy detects the change
+            current = dict(repo.repo_metadata or {})
+            current.update(metadata)
+            repo.repo_metadata = current
+            # Explicitly flag as modified to be safe with JSON types
+            flag_modified(repo, "repo_metadata")
+            repo.updated_at = datetime.now(timezone.utc)
+            self.db.commit()
 
     def deactivate(self, repo_id: str) -> None:
         """Deactivate repository."""
-        from sqlalchemy import text
-        query = text("""
-            UPDATE repos
-            SET is_active = FALSE, updated_at = :updated_at
-            WHERE repo_id = :repo_id
-        """)
-        self.db.execute(query, {"updated_at": datetime.now(timezone.utc), "repo_id": repo_id})
-        self.db.commit()
+        from api.models import Repo as RepoModel
+        repo = self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
+        if repo:
+            repo.status = "inactive"
+            repo.updated_at = datetime.now(timezone.utc)
+            self.db.commit()
 
     def delete(self, repo_id: str) -> None:
         """Delete repository."""
-        from sqlalchemy import text
-        query = text("DELETE FROM repos WHERE repo_id = :repo_id")
-        self.db.execute(query, {"repo_id": repo_id})
+        from api.models import Repo as RepoModel
+        self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).delete()
         self.db.commit()
 
     def _to_model(self, row) -> Repo:
         """Convert database row to Repo model."""
-        # Handle both dict and ORM object
-        if hasattr(row, '__dict__'):
-            # Use repo_metadata attribute (column is named 'metadata' but Python attr is 'repo_metadata')
-            metadata = getattr(row, 'repo_metadata', None)
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-            
-            return Repo(
-                repo_id=row.repo_id,
-                repo_url=row.repo_url,
-                repo_type=RepoType(row.repo_type),
-                owner_id=row.owner_id,
-                owner_type=OwnerType(row.owner_type),
-                repo_group=row.repo_group,
-                token_id=row.token_id,
-                access_scope=AccessScope(row.access_scope),
-                metadata=metadata or {},
-                is_active=bool(row.is_active),
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-            )
-        else:
-            # Dict format
-            metadata = row.get("metadata")
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-
-            return Repo(
-                repo_id=row["repo_id"],
-                repo_url=row["repo_url"],
-                repo_type=RepoType(row["repo_type"]),
-                owner_id=row["owner_id"],
-                owner_type=OwnerType(row["owner_type"]),
-                repo_group=row.get("repo_group"),
-                token_id=row.get("token_id"),
-                access_scope=AccessScope(row["access_scope"]),
-                metadata=metadata or {},
-            is_active=row.get("is_active", True),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+        # Row is an SQLAlchemy model instance (RepoModel)
+        
+        metadata = row.repo_metadata or {}
+        repo_group = metadata.get("repo_group")
+        
+        return Repo(
+            repo_id=row.repo_id,
+            repo_url=row.repo_url,
+            repo_type=RepoType(row.repo_type) if row.repo_type else RepoType.CODE,
+            owner_id=row.user_id,
+            owner_type=OwnerType.USER, # Hardcoded as DB only has user_id
+            repo_group=repo_group,
+            token_id=row.token_id,
+            access_scope=AccessScope(row.access_scope) if row.access_scope else AccessScope.READ,
+            metadata=metadata,
+            is_active=(row.status == "active"),
+            created_at=row.created_at,
+            updated_at=row.updated_at,
         )

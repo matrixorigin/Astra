@@ -11,40 +11,31 @@ from core.skills.github_client import GitHubClient
 
 
 @pytest.fixture
-def db():
-    """SQLAlchemy Session fixture"""
-    from api.database import get_db_session
-    session = next(get_db_session())
-    yield session
-    session.close()
-
-
-@pytest.fixture
-def registry(db):
+def registry(db_session):
     """Skill registry fixture"""
-    return SkillRegistry(db)
+    return SkillRegistry(db_session)
 
 
 @pytest.fixture
-def github(db):
+def github(db_session):
     """GitHub client fixture"""
-    return GitHubClient(db)
+    return GitHubClient(db_session)
 
 
 @pytest.fixture
-def llm(db):
+def llm(db_session):
     """LLM client fixture"""
-    return LLMClient(db)
+    return LLMClient(db_session)
 
 
-def test_skill_registry_register(db, registry, llm, github):
+def test_skill_registry_register(db_session, registry, llm, github):
     """Test skill registration"""
     # Clean up first
     from api.models import SkillRegistry as SkillModel
-    db.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").delete()
-    db.commit()
+    db_session.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").delete()
+    db_session.commit()
     
-    skill = SummarizePRSkill(db, llm, github)
+    skill = SummarizePRSkill(llm, github, db_session)
     registry.register(skill)
 
     # Check in-memory
@@ -52,26 +43,26 @@ def test_skill_registry_register(db, registry, llm, github):
     assert registry.get("summarize_pr").version == "1.0.0"
 
     # Check database using ORM
-    row = db.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").first()
+    row = db_session.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").first()
     assert row is not None
     assert row.version == "1.0.0"
     assert row.is_active in (1, True)
 
 
-def test_skill_registry_versioning(db, registry, llm, github):
+def test_skill_registry_versioning(db_session, registry, llm, github):
     """Test skill versioning"""
     # Clean up first
     from api.models import SkillRegistry as SkillModel
-    db.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").delete()
-    db.commit()
+    db_session.query(SkillModel).filter(SkillModel.skill_name == "summarize_pr").delete()
+    db_session.commit()
     
     # Register v1.0.0
-    skill_v1 = SummarizePRSkill(db, llm, github)
+    skill_v1 = SummarizePRSkill(llm, github, db_session)
     skill_v1.version = "1.0.0"
     registry.register(skill_v1)
 
     # Register v1.1.0 (should deactivate v1.0.0)
-    skill_v2 = SummarizePRSkill(db, llm, github)
+    skill_v2 = SummarizePRSkill(llm, github, db_session)
     skill_v2.version = "1.1.0"
     registry.register(skill_v2)
 
@@ -84,7 +75,7 @@ def test_skill_registry_versioning(db, registry, llm, github):
 
     # Check database using ORM
     from api.models import SkillRegistry as SkillModel
-    rows = db.query(SkillModel).filter(
+    rows = db_session.query(SkillModel).filter(
         SkillModel.skill_name == "summarize_pr"
     ).order_by(SkillModel.version).all()
     
@@ -95,12 +86,12 @@ def test_skill_registry_versioning(db, registry, llm, github):
     assert rows[1].is_active in (1, True)
 
 
-def test_skill_registry_list_available(db, registry, llm, github):
+def test_skill_registry_list_available(db_session, registry, llm, github):
     """Test listing available skills for a repo"""
     # Register skills
-    registry.register(SummarizePRSkill(db, llm, github))
-    registry.register(ListPRsSkill(db, github))
-    registry.register(CIStatusSkill(db, github))
+    registry.register(SummarizePRSkill(llm, github, db_session))
+    registry.register(ListPRsSkill(github, db_session))
+    registry.register(CIStatusSkill(github, db_session))
 
     # Create a CODE repo with unique URL
     import time
@@ -116,7 +107,7 @@ def test_skill_registry_list_available(db, registry, llm, github):
         RepoType as RepoTypeEnum,
     )
 
-    repo_registry = RepoRegistry(db)
+    repo_registry = RepoRegistry(db_session)
     repo = repo_registry.create(
         repo_url=f"https://github.com/test/repo-{int(time.time())}",
         repo_type=RepoTypeEnum.CODE,
@@ -138,7 +129,7 @@ def test_skill_registry_list_available(db, registry, llm, github):
 
 
 @pytest.mark.asyncio
-async def test_summarize_pr_skill(db, llm, github, monkeypatch):
+async def test_summarize_pr_skill(db_session, llm, github, monkeypatch):
     """Test summarize_pr skill execution"""
     # Mock LLM response
     from core.llm.models import LLMProvider, LLMResponse
@@ -178,7 +169,7 @@ async def test_summarize_pr_skill(db, llm, github, monkeypatch):
     monkeypatch.setattr(github, "get_pr", mock_get_pr)
     monkeypatch.setattr(github, "get_pr_diff", mock_get_pr_diff)
 
-    skill = SummarizePRSkill(llm, github, db)
+    skill = SummarizePRSkill(llm, github, db_session)
 
     input_data = {
         "repo_id": 1,
@@ -198,7 +189,7 @@ async def test_summarize_pr_skill(db, llm, github, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_list_prs_skill(db, github, monkeypatch):
+async def test_list_prs_skill(db_session, github, monkeypatch):
     """Test list_prs skill execution"""
 
     # Mock GitHub API call
@@ -217,7 +208,7 @@ async def test_list_prs_skill(db, github, monkeypatch):
 
     monkeypatch.setattr(github, "list_prs", mock_list_prs)
 
-    skill = ListPRsSkill(github, db)
+    skill = ListPRsSkill(github, db_session)
 
     input_data = {
         "repo_id": 1,
@@ -236,7 +227,7 @@ async def test_list_prs_skill(db, github, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ci_status_skill(db, github, monkeypatch):
+async def test_ci_status_skill(db_session, github, monkeypatch):
     """Test ci_status skill execution"""
 
     # Mock GitHub API call
@@ -254,7 +245,7 @@ async def test_ci_status_skill(db, github, monkeypatch):
 
     monkeypatch.setattr(github, "list_workflow_runs", mock_list_workflow_runs)
 
-    skill = CIStatusSkill(github, db)
+    skill = CIStatusSkill(github, db_session)
 
     input_data = {
         "repo_id": 1,

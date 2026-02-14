@@ -11,67 +11,63 @@ from core.skills.builtin import SummarizePRSkill
 from core.skills.github_client import GitHubClient
 
 
-@pytest.fixture
-def db():
-    """SQLAlchemy Session fixture with cleanup"""
-    from api.database import get_db_session
+@pytest.fixture(autouse=True)
+def cleanup(db_session):
+    """Cleanup fixture."""
     from sqlalchemy import text
-    
-    session = next(get_db_session())
     # Cleanup before test
-    session.execute(text("DELETE FROM conversation_events WHERE session_id LIKE 'test_session%'"))
-    session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'summarize_pr'"))
-    session.commit()
+    db_session.execute(text("DELETE FROM conversation_events WHERE session_id LIKE 'test_session%'"))
+    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'summarize_pr'"))
+    db_session.commit()
     
-    yield session
+    yield
     
     # Cleanup after test
-    session.execute(text("DELETE FROM conversation_events WHERE session_id LIKE 'test_session%'"))
-    session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'summarize_pr'"))
-    session.commit()
-    session.close()
+    db_session.execute(text("DELETE FROM conversation_events WHERE session_id LIKE 'test_session%'"))
+    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'summarize_pr'"))
+    db_session.commit()
 
 
 @pytest.fixture
-def registry(db):
+def registry(db_session):
     """Skill registry fixture with cleanup"""
-    registry = SkillRegistry(db)
+    registry = SkillRegistry(db_session)
     registry._skills.clear()  # Clear in-memory cache
     return registry
 
 
 @pytest.fixture
-def github(db):
+def github(db_session):
     """GitHub client fixture"""
-    return GitHubClient(db)
+    return GitHubClient(db_session)
 
 
 @pytest.fixture
-def llm(db):
+def llm(db_session):
     """LLM client fixture"""
-    return LLMClient(db)
+    return LLMClient(db_session)
 
 
 @pytest.fixture
-def logger(db):
+def logger(db_session):
     """Event logger fixture"""
-    return EventLogger(db)
+    return EventLogger(db_session)
 
 
 @pytest.fixture
-def replay_engine(db, registry, logger):
+def replay_engine(db_session, registry, logger):
     """Replay engine fixture"""
-    return ReplayEngine(db, registry, logger)
+    return ReplayEngine(db_session, registry, logger)
 
 
 @pytest.mark.asyncio
 async def test_e2e_skill_version_replay(
-    db, registry, github, llm, logger, replay_engine, monkeypatch
+    db_session, registry, github, llm, logger, replay_engine, monkeypatch
 ):
     """End-to-end test: Execute skill v1.0.0, upgrade to v1.1.0, replay with v1.0.0.
-
+    
     This test verifies the core promise: "10 years later, reproduce today's decision"
-
+    
     Steps:
     1. Register skill v1.0.0
     2. Execute skill and log to conversation_events
@@ -124,7 +120,7 @@ async def test_e2e_skill_version_replay(
     monkeypatch.setattr(github, "get_pr_diff", mock_get_pr_diff)
 
     # Step 1: Register skill v1.0.0
-    skill_v1 = SummarizePRSkill(llm, github, db)
+    skill_v1 = SummarizePRSkill(llm, github, db_session)
     skill_v1.version = "1.0.0"
     registry.register(skill_v1)
 
@@ -170,14 +166,14 @@ async def test_e2e_skill_version_replay(
         },
         created_at=datetime.now(timezone.utc),
     )
-    db.add(event)
-    db.commit()
+    db_session.add(event)
+    db_session.commit()
 
     # Verify v1.0.0 output
     assert "1.0.0" in output_v1.summary
 
     # Step 3: Register skill v1.1.0 (should deactivate v1.0.0)
-    skill_v2 = SummarizePRSkill(llm, github, db)
+    skill_v2 = SummarizePRSkill(llm, github, db_session)
     skill_v2.version = "1.1.0"
     registry.register(skill_v2)
 
@@ -212,7 +208,7 @@ async def test_e2e_skill_version_replay(
 
 
 @pytest.mark.asyncio
-async def test_replay_missing_skill_version(db, registry, github, llm, logger, replay_engine):
+async def test_replay_missing_skill_version(db_session, registry, github, llm, logger, replay_engine):
     """Test replay when skill version is missing."""
 
     # Use unique session ID
@@ -249,8 +245,8 @@ async def test_replay_missing_skill_version(db, registry, github, llm, logger, r
         },
         created_at=datetime.now(timezone.utc),
     )
-    db.add(event)
-    db.commit()
+    db_session.add(event)
+    db_session.commit()
 
     # Replay should handle missing skill gracefully
     replay_result = await replay_engine.replay_conversation(session_id)
@@ -265,7 +261,7 @@ async def test_replay_missing_skill_version(db, registry, github, llm, logger, r
 
 @pytest.mark.asyncio
 async def test_verify_reproducibility(
-    db, registry, github, llm, logger, replay_engine, monkeypatch
+    db_session, registry, github, llm, logger, replay_engine, monkeypatch
 ):
     """Test reproducibility verification."""
 
@@ -311,7 +307,7 @@ async def test_verify_reproducibility(
     monkeypatch.setattr(github, "get_pr_diff", mock_get_pr_diff)
 
     # Register skill
-    skill = SummarizePRSkill(llm, github, db)
+    skill = SummarizePRSkill(llm, github, db_session)
     registry.register(skill)
 
     # Execute skill
@@ -354,8 +350,8 @@ async def test_verify_reproducibility(
         },
         created_at=datetime.now(timezone.utc),
     )
-    db.add(event)
-    db.commit()
+    db_session.add(event)
+    db_session.commit()
 
     # Verify reproducibility
     verification = replay_engine.verify_reproducibility(session_id)
