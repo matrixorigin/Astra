@@ -62,7 +62,6 @@ class SelfImprovingSelector:
         self.account = account
         self.weights = weights or SignalWeights()
         self.thresholds = thresholds or SignalThresholds()
-        self.auditable_selector = None  # Removed: was unused
         self.sandbox = Sandbox(db=session, account=account)
         self.embedding_service: EmbeddingService | None = None
         self._runtime_config_cache: dict[str, Any] | None = None
