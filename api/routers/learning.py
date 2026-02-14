@@ -11,6 +11,7 @@ from api.database import get_db_session
 from core.agent.selector import AgentSkillSelector
 from core.llm.client import LLMClient
 from core.logging_config import get_logger
+from core.skills.learning_signals import SignalType, SignalWeights
 from uuid_utils import uuid7
 
 logger = get_logger(__name__)
@@ -27,12 +28,17 @@ class LearningTriggerRequest(BaseModel):
         default=["wrong_skill"],
         description="Learning signal types to process"
     )
+    weights: dict[str, float] | None = Field(
+        default=None,
+        description="Custom weights for multi-dimensional scoring"
+    )
 
 
 class LearningTriggerResponse(BaseModel):
     """Learning cycle response."""
     status: str
     learned: int
+    signals_by_type: dict[str, int] | None = None
     gate_verdict: str | None = None
     improvement_pct: float | None = None
     test_count: int | None = None
@@ -47,6 +53,8 @@ class LearningStatsResponse(BaseModel):
     high_confidence: int
     low_confidence: int
     avg_confidence: float
+    by_signal_type: dict[str, int]
+    weights: dict[str, float]
     total_gates: int
     passed_gates: int
     failed_gates: int
@@ -55,10 +63,18 @@ class LearningStatsResponse(BaseModel):
     last_learning_time: datetime | None = None
 
 
+class SignalTypesResponse(BaseModel):
+    """Available signal types response."""
+    signal_types: list[str]
+    descriptions: dict[str, str]
+
+
 class FeedbackRequest(BaseModel):
     """Submit feedback request."""
     event_id: str
-    feedback_type: str = Field(description="wrong_skill | slow_execution | high_cost")
+    feedback_type: str = Field(
+        description="Signal type: wrong_skill | slow_execution | high_cost | low_satisfaction"
+    )
     correct_skills: list[str] | None = None
     satisfaction_score: int | None = Field(default=None, ge=1, le=5)
     comment: str | None = None
@@ -80,7 +96,7 @@ async def trigger_learning(
     
     This endpoint initiates a learning cycle that:
     1. Analyzes recent selection failures
-    2. Extracts learning patterns
+    2. Extracts learning patterns (multi-dimensional)
     3. Validates through regression gate
     4. Deploys if gate passes
     
@@ -92,6 +108,14 @@ async def trigger_learning(
         Learning cycle results
     """
     try:
+        # Parse signal types
+        signal_types = [SignalType(st) for st in request.signal_types]
+        
+        # Parse weights if provided
+        weights = None
+        if request.weights:
+            weights = SignalWeights(**request.weights)
+        
         llm_client = LLMClient(db)
         selector = AgentSkillSelector(
             db=db,
@@ -99,12 +123,14 @@ async def trigger_learning(
             auditable=True,
             session_id=str(uuid7()),
             enable_learning=True,
+            learning_weights=weights,
         )
         
         # Trigger learning
         result = selector.learn_from_failures(
             days=request.days,
             force=request.force,
+            signal_types=signal_types,
         )
         
         # Handle errors
@@ -112,6 +138,7 @@ async def trigger_learning(
             return LearningTriggerResponse(
                 status="error",
                 learned=result.get("learned", 0),
+                signals_by_type=result.get("signals_by_type"),
                 error=result["error"],
                 message=result.get("message"),
             )
@@ -120,6 +147,7 @@ async def trigger_learning(
         return LearningTriggerResponse(
             status="success",
             learned=result["learned"],
+            signals_by_type=result.get("signals_by_type"),
             gate_verdict=result.get("gate_verdict"),
             improvement_pct=result.get("improvement_pct"),
             test_count=result.get("test_count"),
@@ -128,6 +156,24 @@ async def trigger_learning(
     except Exception as e:
         logger.error(f"Learning trigger failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/signals", response_model=SignalTypesResponse)
+async def get_signal_types() -> SignalTypesResponse:
+    """Get available learning signal types.
+    
+    Returns:
+        List of signal types with descriptions
+    """
+    return SignalTypesResponse(
+        signal_types=[st.value for st in SignalType],
+        descriptions={
+            SignalType.WRONG_SKILL.value: "Incorrect skill selection",
+            SignalType.SLOW_EXECUTION.value: "Execution time exceeds threshold",
+            SignalType.HIGH_COST.value: "Execution cost exceeds budget",
+            SignalType.LOW_SATISFACTION.value: "User satisfaction below threshold",
+        }
+    )
 
 
 @router.get("/stats", response_model=LearningStatsResponse)
@@ -164,6 +210,8 @@ async def get_learning_stats(
             high_confidence=stats["learnings"]["high_confidence"],
             low_confidence=stats["learnings"]["low_confidence"],
             avg_confidence=stats["learnings"]["avg_confidence"],
+            by_signal_type=stats["learnings"]["by_signal_type"],
+            weights=stats["learnings"]["weights"],
             total_gates=stats["regression_gates"]["total_gates"],
             passed_gates=stats["regression_gates"]["passed"],
             failed_gates=stats["regression_gates"]["failed"],

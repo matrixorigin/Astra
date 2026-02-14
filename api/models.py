@@ -343,6 +343,9 @@ class SkillSelectionLearning(Base):
     evidence_count = Column(Integer, default=1)
     applied_count = Column(Integer, default=0)
     last_applied_at = Column(DateTime)
+    # Multi-dimensional learning fields
+    signal_type = Column(String(50), default="wrong_skill", index=True)
+    target_metrics = Column(JSON)  # {"time_ms": 500, "cost": 0.01, "satisfaction": 4}
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

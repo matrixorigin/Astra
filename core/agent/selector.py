@@ -38,6 +38,7 @@ class AgentSkillSelector:
         session_id: str | None = None,
         enable_learning: bool = True,
         learning_cooldown_hours: int = 1,  # Cooldown period between learning cycles
+        learning_weights: "SignalWeights | None" = None,  # Multi-dimensional weights
     ):
         """Initialize skill selector with self-improvement.
         
@@ -48,6 +49,7 @@ class AgentSkillSelector:
             session_id: Session ID for auditable selections
             enable_learning: Enable self-improving selector (default True)
             learning_cooldown_hours: Hours between learning cycles (default 1)
+            learning_weights: Custom weights for multi-dimensional scoring
         """
         self.db = db
         self.llm_client = llm_client
@@ -61,7 +63,7 @@ class AgentSkillSelector:
         
         # Self-improving layer
         if enable_learning:
-            self.improving_selector = SelfImprovingSelector(db, llm_client)
+            self.improving_selector = SelfImprovingSelector(db, llm_client, weights=learning_weights)
             self.regression_gate = SkillSelectionRegressionGate(llm_client, db)
             logger.info("Self-improving selector enabled - learning from failures")
         
@@ -130,7 +132,9 @@ class AgentSkillSelector:
         # Delegate to modern selector for schema generation
         return self.auditable_selector.modern_selector.get_tools_schema(query, max_candidates)
     
-    def learn_from_failures(self, days: int = 7, force: bool = False) -> dict[str, Any]:
+    def learn_from_failures(
+        self, days: int = 7, force: bool = False, signal_types: list["SignalType"] | None = None
+    ) -> dict[str, Any]:
         """Trigger learning from recent failures with regression gating.
         
         This is the breakthrough: automatic learning with safety validation.
@@ -138,6 +142,7 @@ class AgentSkillSelector:
         Args:
             days: Look back N days for failures
             force: Force learning even if in cooldown period
+            signal_types: Types of signals to learn from (default: all)
             
         Returns:
             Learning results with gate validation
@@ -160,8 +165,10 @@ class AgentSkillSelector:
         logger.info(f"Starting learning cycle - analyzing last {days} days")
         
         try:
-            # Step 1: Learn from failures
-            learn_result = self.improving_selector.learn_from_failures(days=days)
+            # Step 1: Learn from failures (multi-dimensional)
+            learn_result = self.improving_selector.learn_from_failures(
+                days=days, signal_types=signal_types
+            )
             
             if learn_result["learned"] == 0:
                 logger.info("No new learnings")
@@ -169,6 +176,8 @@ class AgentSkillSelector:
                 return learn_result
             
             logger.info(f"Learned {learn_result['learned']} corrections")
+            if "signals_by_type" in learn_result:
+                logger.info(f"Signals by type: {learn_result['signals_by_type']}")
             
             # Step 2: Validate through regression gate
             golden_queries = self.regression_gate.get_golden_queries(limit=20)

@@ -241,7 +241,7 @@ class TestSelfImprovingSelectorIntegration:
         
         # Mock database failure
         original_learn = selector.improving_selector.learn_from_failures
-        selector.improving_selector.learn_from_failures = lambda days: (_ for _ in ()).throw(
+        selector.improving_selector.learn_from_failures = lambda days, signal_types=None: (_ for _ in ()).throw(
             Exception("Database connection failed")
         )
         
@@ -267,6 +267,82 @@ class TestSelfImprovingSelectorIntegration:
         assert candidate2.name == "test_skill2"
         assert candidate2.version == "2.0.0"
         assert candidate2.confidence == 0.8
+
+    def test_multi_signal_learning_cycle(self, db_session):
+        """Test full learning cycle with multiple signal types."""
+        from core.skills.learning_signals import SignalType
+        from api.models import SkillSelectionEvent
+        from uuid_utils import uuid7
+        
+        # Create failures for different signal types
+        events = [
+            # Wrong skill
+            SkillSelectionEvent(
+                event_id=str(uuid7()),
+                session_id="test_session",
+                user_query="Create a PR",
+                selected_skills=["wrong_skill"],
+                selection_correctness=0,
+                correction_suggestion=["github_create_pr"],
+            ),
+            # Slow execution
+            SkillSelectionEvent(
+                event_id=str(uuid7()),
+                session_id="test_session",
+                user_query="Run tests",
+                selected_skills=["slow_test"],
+                execution_time_ms=10000,  # 10 seconds
+                selection_correctness=1,
+            ),
+            # High cost
+            SkillSelectionEvent(
+                event_id=str(uuid7()),
+                session_id="test_session",
+                user_query="Analyze data",
+                selected_skills=["expensive_skill"],
+                execution_cost=0.50,  # $0.50
+                selection_correctness=1,
+            ),
+        ]
+        
+        for event in events:
+            db_session.add(event)
+        db_session.commit()
+        
+        # Create selector
+        selector = AgentSkillSelector(
+            db=db_session,
+            llm_client=None,
+            auditable=True,
+            session_id="test_session",
+            enable_learning=True,
+        )
+        
+        # Learn from specific signal types
+        result = selector.learn_from_failures(
+            days=7,
+            force=True,
+            signal_types=[SignalType.WRONG_SKILL, SignalType.SLOW_EXECUTION, SignalType.HIGH_COST],
+        )
+        
+        # Verify results
+        assert result["learned"] >= 1  # At least wrong_skill
+        assert "signals_by_type" in result
+        
+        # Check signal breakdown
+        signals = result["signals_by_type"]
+        assert signals.get("wrong_skill", 0) >= 1
+        # Note: slow/cost signals require failures (selection_correctness=0)
+        # or specific conditions to trigger
+        
+        # Verify learnings in database
+        from api.models import SkillSelectionLearning
+        learnings = db_session.query(SkillSelectionLearning).all()
+        assert len(learnings) >= 1
+        
+        # Check signal types are recorded
+        signal_types_found = {l.signal_type for l in learnings}
+        assert "wrong_skill" in signal_types_found
 
 
 if __name__ == "__main__":
