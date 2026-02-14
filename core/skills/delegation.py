@@ -138,7 +138,7 @@ class DelegateTaskSkill(Skill):
             input: DelegateTaskInput with agent_id, task, and optional context
             
         Yields:
-            StreamEvent: Stream events from delegated agent
+            StreamEvent: Stream events from delegated agent with agent_id tagged
         """
         from core.events.models import StreamEvent, StreamEventType
         
@@ -153,28 +153,53 @@ class DelegateTaskSkill(Skill):
             )
             return
 
-        # Create a new ChatLoop for the delegated agent with its agent_id
-        loop = self.make_loop(
-            system_prompt=profile.system_prompt,
+        # Yield delegation start marker
+        yield StreamEvent(
+            event_type=StreamEventType.AGENT_DELEGATED,
+            data={"agent_id": input.agent_id, "task": input.task},
             agent_id=input.agent_id,
         )
 
-        # Build context with agent profile
-        context = {
-            "system_prompt": profile.system_prompt,
-            "agent_id": input.agent_id,
-        }
-        if input.context:
-            context["delegation_context"] = input.context
+        try:
+            # Create a new ChatLoop for the delegated agent with its agent_id
+            loop = self.make_loop(
+                system_prompt=profile.system_prompt,
+                agent_id=input.agent_id,
+            )
 
-        # Stream the task execution
-        async for event in loop.run_step_stream(
-            user_input=input.task,
-            session_id=input.session_id,
-            user_id=input.user_id,
-            context=context,
-        ):
-            yield event
+            # Build context with agent profile
+            context = {
+                "system_prompt": profile.system_prompt,
+                "agent_id": input.agent_id,
+            }
+            if input.context:
+                context["delegation_context"] = input.context
+
+            # Stream the task execution - forward all events with agent_id tagged
+            async for event in loop.run_step_stream(
+                user_input=input.task,
+                session_id=input.session_id,
+                user_id=input.user_id,
+                context=context,
+            ):
+                # Ensure agent_id is set for stream multiplexing
+                event.agent_id = input.agent_id
+                yield event
+        
+        except Exception as e:
+            logger.error(f"Error in delegation to {input.agent_id}: {e}", exc_info=True)
+            yield StreamEvent(
+                event_type=StreamEventType.RUN_ERROR,
+                data={"error": str(e), "agent_id": input.agent_id},
+                agent_id=input.agent_id,
+            )
+        
+        # Yield delegation completion marker
+        yield StreamEvent(
+            event_type=StreamEventType.AGENT_COMPLETED,
+            data={"agent_id": input.agent_id},
+            agent_id=input.agent_id,
+        )
     
     async def execute_parallel(
         self, inputs: list[DelegateTaskInput]
@@ -206,3 +231,107 @@ class DelegateTaskSkill(Skill):
                 outputs.append(result)
         
         return outputs
+    
+    async def execute_parallel_stream(self, inputs: list[DelegateTaskInput]):
+        """Execute multiple delegations in parallel with streaming.
+        
+        Fan-out: Start all delegations in parallel
+        Stream: Multiplex events from all agents
+        Fan-in: Collect all results when complete
+        
+        Args:
+            inputs: List of delegation inputs
+            
+        Yields:
+            StreamEvent: Multiplexed stream events from all agents
+        """
+        from core.events.models import StreamEvent, StreamEventType
+        
+        if not inputs:
+            return
+        
+        # Track results and completion
+        results = {}
+        errors = set()  # Track which delegations had errors
+        completed_count = [0]  # Use list for closure
+        
+        # Create all streams
+        streams = [self.execute_stream(inp) for inp in inputs]
+        
+        # Use asyncio.Queue for event multiplexing
+        queue = asyncio.Queue()
+        
+        async def consume_stream(idx, stream):
+            """Consume a single stream and put events in queue."""
+            try:
+                async for event in stream:
+                    await queue.put((idx, event))
+                    
+                    # Track errors
+                    if event.event_type == StreamEventType.RUN_ERROR:
+                        errors.add(idx)
+                        results[idx] = event.data.get("error", "Unknown error")
+                    # Track completion - collect any final text
+                    elif event.event_type == StreamEventType.TEXT_DONE:
+                        if idx not in errors:  # Only if no error
+                            results[idx] = event.data.get("text", "")
+                    elif event.event_type == StreamEventType.AGENT_COMPLETED:
+                        # Ensure we mark as completed even without TEXT_DONE
+                        if idx not in results:
+                            results[idx] = ""  # Empty result but completed
+                        
+            except Exception as e:
+                logger.error(f"Error in delegation stream {idx} (agent={inputs[idx].agent_id}): {e}", exc_info=True)
+                errors.add(idx)
+                await queue.put((idx, StreamEvent(
+                    event_type=StreamEventType.RUN_ERROR,
+                    data={"error": str(e), "agent_id": inputs[idx].agent_id},
+                    agent_id=inputs[idx].agent_id,
+                )))
+                # Mark as failed
+                results[idx] = f"Error: {str(e)}"
+            finally:
+                completed_count[0] += 1
+                if completed_count[0] == len(inputs):
+                    await queue.put(None)  # Sentinel
+        
+        # Start all consumers
+        tasks = [asyncio.create_task(consume_stream(i, s)) for i, s in enumerate(streams)]
+        
+        # Yield events from queue
+        while True:
+            item = await queue.get()
+            if item is None:  # Sentinel
+                break
+            idx, event = item
+            yield event
+        
+        # Wait for all tasks to complete
+        results_with_exceptions = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Log any exceptions that weren't caught
+        for i, result in enumerate(results_with_exceptions):
+            if isinstance(result, Exception):
+                logger.error(f"Unhandled exception in delegation {i} (agent={inputs[i].agent_id}): {result}", exc_info=result)
+        
+        # Fan-in: Yield aggregated results
+        aggregated = {
+            "delegations": [
+                {
+                    "agent_id": inputs[i].agent_id,
+                    "task": inputs[i].task,
+                    "result": results.get(i, ""),
+                    "success": i in results and i not in errors,
+                }
+                for i in range(len(inputs))
+            ],
+            "total": len(inputs),
+            "successful": sum(1 for i in range(len(inputs)) if i in results and i not in errors),
+            "failed": len(errors),
+        }
+        
+        yield StreamEvent(
+            event_type=StreamEventType.AGENT_PROGRESS,
+            data={"aggregated_results": aggregated},
+            agent_id="orchestrator",
+        )

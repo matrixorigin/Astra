@@ -485,33 +485,30 @@ class ChatLoop:
             agent_id=self.agent_id,
                 )
 
-                # Handle delegation skill specially for multi-agent
+                # Handle delegation skill specially for multi-agent streaming
                 if fn_name == "delegate_task":
                     params = json.loads(tc["function"]["arguments"])
-                    agent_delegated_event = self.event_logger.create_stream_event(
-                        user_id=user_id,
-                        session_id=session_id,
-                        event_type="stream_agent_delegated",
-                        content=json.dumps({"agent": params.get("agent_id", "unknown")}),
-                        parent_event_id=user_event.event_id,
-                        causal_chain_id=user_event.causal_chain_id,
-                    )
-                    yield StreamEvent(
-                        event_type=StreamEventType.AGENT_DELEGATED,
-                        data={"agent": params.get("agent_id", "unknown")},
-                        event_id=agent_delegated_event.event_id,
-                        causal_chain_id=user_event.causal_chain_id,
-                    )
-                    # Execute delegation and stream results
-                    result = self.executor.execute_skill(
+                    delegated_agent_id = params.get("agent_id", "unknown")
+                    
+                    # Stream delegated agent's events
+                    result_text = ""
+                    has_output = False
+                    async for delegated_event in self.executor.execute_skill_stream(
                         skill_name=fn_name,
                         params=params,
                         session_id=session_id,
                         parent_event_id=user_event.event_id,
-                    )
-                    # For delegation, the result is a string from the delegated agent
-                    # In a full implementation, we would stream the delegated agent's events
-                    result_str = str(result) if not isinstance(result, str) else result
+                    ):
+                        # Forward delegated agent's events with agent_id tagged
+                        yield delegated_event
+                        
+                        # Collect final result
+                        if delegated_event.event_type == StreamEventType.TEXT_DONE:
+                            result_text = delegated_event.data.get("text", "")
+                            has_output = True
+                    
+                    # Use collected result or fallback message with agent_id
+                    result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
                 else:
                     result = self.executor.execute_skill(
                         skill_name=fn_name,

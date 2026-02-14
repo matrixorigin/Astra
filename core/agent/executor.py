@@ -54,3 +54,54 @@ class AgentExecutor:
         except Exception as e:
             logger.error(f"Error executing skill {skill_name}: {e}")
             raise
+    
+    async def execute_skill_stream(
+        self,
+        skill_name: str,
+        params: dict[str, Any],
+        session_id: str,
+        parent_event_id: str | None = None,
+    ):
+        """Execute a skill with streaming output.
+        
+        Args:
+            skill_name: Name of the skill to execute.
+            params: Parameters for the skill.
+            session_id: The current session ID.
+            parent_event_id: The ID of the parent event.
+            
+        Yields:
+            StreamEvent: Stream events from skill execution
+        """
+        logger.info(f"Executing skill (streaming): {skill_name} with params: {params}")
+
+        # 1. Get skill from registry
+        skill = self.registry.get(skill_name)
+        if not skill:
+            raise ValueError(f"Skill '{skill_name}' not found in registry.")
+
+        # 2. Check if skill supports streaming
+        if not hasattr(skill, 'execute_stream'):
+            # Fall back to non-streaming execution
+            result = self.mock_layer.execute(
+                skill=skill, params=params, session_id=session_id, parent_event_id=parent_event_id
+            )
+            # Yield result as single event
+            from core.events.models import StreamEvent, StreamEventType
+            yield StreamEvent(
+                event_type=StreamEventType.TOOL_RESULT,
+                data={"result": str(result)},
+            )
+            return
+        
+        # 3. Execute with streaming
+        try:
+            async for event in skill.execute_stream(skill.validate_input(params)):
+                yield event
+        except Exception as e:
+            logger.error(f"Error executing skill {skill_name}: {e}")
+            from core.events.models import StreamEvent, StreamEventType
+            yield StreamEvent(
+                event_type=StreamEventType.RUN_ERROR,
+                data={"error": str(e)},
+            )
