@@ -1,6 +1,7 @@
 """Chat loop with multi-turn tool use and full message chain."""
 
 import json
+import hashlib
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -484,6 +485,21 @@ class ChatLoop:
                         json.dumps(result, default=str) if not isinstance(result, str) else result
                     )
 
+                # Prepare metadata for replay
+                params_hash = hashlib.sha256(json.dumps(json.loads(tc["function"]["arguments"]), sort_keys=True).encode()).hexdigest()[:16]
+                result_data = result
+                if hasattr(result, "model_dump"):
+                    result_data = result.model_dump()
+                elif hasattr(result, "dict"):
+                    result_data = result.dict()
+                
+                metadata = {
+                    "skill_name": fn_name,
+                    "skill_params": json.loads(tc["function"]["arguments"]),
+                    "skill_params_hash": params_hash,
+                    "skill_result": result_data,
+                }
+
                 tool_result_event = self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
@@ -491,6 +507,8 @@ class ChatLoop:
                     content=json.dumps({"call_id": tc["id"], "result": result_str[:500]}),
                     parent_event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
+                    metadata=metadata,
+                    skill_name=fn_name,
                 )
                 yield StreamEvent(
                     event_type=StreamEventType.TOOL_RESULT,

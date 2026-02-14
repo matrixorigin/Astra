@@ -175,5 +175,11 @@ class ConversationEvent(BaseModel):
     llm_params: dict[str, Any] | None = Field(
         default=None, description="LLM parameters (temperature, max_tokens, etc.)"
     )
+    skill_name: str | None = Field(
+        default=None, description="Name of the skill (for tool_call/tool_result events)"
+    )
+    skill_version: str | None = Field(
+        default=None, description="Version of the skill (for tool_call/tool_result events)"
+    )
 
     model_config = {"use_enum_values": True}

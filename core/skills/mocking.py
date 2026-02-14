@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
+from api.database import SessionLocal, get_db_session
 from core.skills.base import SideEffectCategory, Skill
 
 logger = logging.getLogger(__name__)
@@ -24,11 +24,17 @@ class MockMode(str, Enum):
 
     PRODUCTION = "production"  # Real execution, record results
     REPLAY = "replay"  # Use recorded results, no execution
+    DRY_RUN = "dry_run"  # Validate inputs only (no execution, no side effects)
 
 
 class SecurityError(Exception):
     """Raised when dangerous operations are blocked in replay mode"""
 
+    pass
+
+
+class ReplayError(Exception):
+    """Raised when replay cannot proceed due to missing data"""
     pass
 
 
@@ -59,28 +65,37 @@ class ToolMockingLayer:
         mode: MockMode,
         session: Session | None = None,
         result_storage: ResultStorage | None = None,
+        session_id: str | None = None,
     ):
         self.mode = mode
         self._session = session
         self._owns_session = session is None
         self.result_storage = result_storage
+        self.session_id = session_id
 
     def _get_session(self) -> Session:
-        if self._session is None:
-            self._session = SessionLocal()
+        """Get database session, creating if needed"""
+        if self._session:
+            return self._session
+        
+        # Lazy initialization
+        self._session = SessionLocal()
+        self._owns_session = True
         return self._session
 
-    def close(self) -> None:
-        """Explicitly close the session if owned."""
-        if self._owns_session and self._session:
-            self._session.close()
-
-    def __enter__(self) -> "ToolMockingLayer":
-        """Context manager entry."""
+    def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit."""
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Close the session if owned"""
+        if self._owns_session and self._session:
+            self._session.close()
+            self._session = None
+
+    def __del__(self):
         self.close()
 
     def execute(
@@ -141,6 +156,69 @@ class ToolMockingLayer:
 
         return result
 
+    def get_mock_result(
+        self,
+        skill_name: str,
+        params: dict,
+        session_id: str,
+        parent_event_id: str | None = None,
+    ) -> Any | None:
+        """
+        Get recorded result for a skill execution without executing it.
+        Useful for ReplayService where Skill object might not be available.
+        """
+        return self._get_recorded_result(skill_name, params, session_id, parent_event_id)
+
+    def invoke_skill(
+        self,
+        skill_name: str,
+        params: dict,
+        skill_version: str | None = None,
+        event_id: str | None = None,
+    ) -> Any:
+        """
+        Invoke a skill by name (for ReplayService/external use).
+
+        Behavior depends on execution mode:
+        - REPLAY: Return recorded result (using get_mock_result)
+        - DRY_RUN: Validate params only (no execution)
+        - PRODUCTION: Raises NotImplementedError (requires Skill object, use execute())
+        """
+        if self.mode == MockMode.REPLAY:
+            if not self.session_id:
+                raise ValueError("session_id required for replay mode")
+            
+            result = self.get_mock_result(skill_name, params, self.session_id, parent_event_id=event_id)
+            if result is None:
+                # Fallback: check if result is stored in side_effects or somewhere else?
+                # core/replay/tool_mocking.py raised ReplayError.
+                raise ReplayError(
+                    f"No recorded result for skill '{skill_name}' with params {params}. "
+                    f"This skill may not have been executed in the original session."
+                )
+            return result
+
+        elif self.mode == MockMode.DRY_RUN:
+            # Validate only, return mock result
+            if not isinstance(params, dict):
+                raise ValueError(f"Invalid params type for {skill_name}: expected dict")
+            
+            return {
+                "status": "dry_run",
+                "skill_id": skill_name,
+                "params": params,
+                "note": "Validated successfully, no execution"
+            }
+
+        elif self.mode == MockMode.PRODUCTION:
+            raise NotImplementedError(
+                f"Real execution not supported via invoke_skill in production mode. "
+                f"Use execute() with Skill object instead."
+            )
+        
+        else:
+            raise ValueError(f"Unknown execution mode: {self.mode}")
+
     def _get_recorded_result(
         self,
         skill_name: str,
@@ -167,10 +245,12 @@ class ToolMockingLayer:
             session = self._get_session()
 
             if parent_event_id:
-                # Exact lookup by event ID (concurrency-safe)
+                # Exact lookup by parent event ID (concurrency-safe)
+                # Assumes tool_result event has parent_event_id pointing to invocation event
                 event = session.query(EventModel).filter(
-                    EventModel.event_id == parent_event_id,
-                    EventModel.skill_name == skill_name
+                    EventModel.parent_event_id == parent_event_id,
+                    EventModel.skill_name == skill_name,
+                    EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
                 ).first()
             else:
                 # Fuzzy lookup: most recent matching event in session
@@ -181,7 +261,7 @@ class ToolMockingLayer:
                 event = session.query(EventModel).filter(
                     EventModel.session_id == session_id,
                     EventModel.skill_name == skill_name,
-                    EventModel.event_type == 'tool_result'
+                    EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
                 ).order_by(EventModel.created_at.desc()).first()
 
             if event and event.event_metadata:

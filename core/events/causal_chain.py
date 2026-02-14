@@ -7,7 +7,7 @@ from sqlalchemy import text
 from core.events.event_reader import EventReader
 from core.events.models import ConversationEvent
 from sqlalchemy.orm import Session
-from api.database import SessionLocal
+from api.database import SessionLocal, get_db_session
 
 
 class CausalChainManager:
@@ -26,20 +26,21 @@ class CausalChainManager:
         self.db = db or SessionLocal()
         self.reader = EventReader(self.db)
 
-    def close(self) -> None:
-        """Explicitly close the session if owned."""
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Close the session if owned"""
         if self._owns_session and self.db:
             self.db.close()
 
-    def __enter__(self) -> "CausalChainManager":
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Context manager exit."""
+    def __del__(self):
         self.close()
 
-    def get_chain(self, causal_chain_id: str) -> list[ConversationEvent]:
+    def get_chain(self, event_id: str) -> list[ConversationEvent]:
         """Get all events in a causal chain.
 
         Args:

@@ -94,6 +94,10 @@ class AuditableSkillSelector:
         if self._owns_session:
             self.session.close()
 
+    def _get_session(self) -> Session:
+        """Get database session."""
+        return self.session
+
     def _ensure_table(self):
         """Ensure skill_selection_events table exists."""
         # Table should already exist from schema
@@ -348,6 +352,7 @@ class AuditableSkillSelector:
         """Save selection event to database."""
         from api.models import SkillSelectionEvent as EventModel
         
+        session = self._get_session()
         event_model = EventModel(
             event_id=event.event_id,
             session_id=event.session_id,
@@ -360,8 +365,8 @@ class AuditableSkillSelector:
             candidate_scores=event.candidate_scores,
             created_at=event.created_at,
         )
-        self.session.add(event_model)
-        self.session.commit()
+        session.add(event_model)
+        session.commit()
 
     def update_execution_result(
         self,
@@ -377,13 +382,14 @@ class AuditableSkillSelector:
         """
         from api.models import SkillSelectionEvent as EventModel
         
-        event = self.session.query(EventModel).filter(EventModel.event_id == event_id).first()
+        session = self._get_session()
+        event = session.query(EventModel).filter(EventModel.event_id == event_id).first()
         if event:
             event.execution_success = success
             event.execution_time_ms = time_ms
             event.execution_cost = cost
             event.execution_result = result
-            self.session.commit()
+            session.commit()
 
     def update_user_feedback(self, event_id: str, score: int):
         """Update event with user feedback.
@@ -395,12 +401,13 @@ class AuditableSkillSelector:
 
         from api.models import SkillSelectionEvent as EventModel
         
-        event = self.session.query(EventModel).filter(EventModel.event_id == event_id).first()
+        session = self._get_session()
+        event = session.query(EventModel).filter(EventModel.event_id == event_id).first()
         if event:
             event.user_feedback_score = score
             # Auto-evaluate correctness based on feedback
             event.selection_correctness = score >= 4
-            self.session.commit()
+            session.commit()
 
     def get_selection_history(
         self, session_id: str | None = None, limit: int = 100
@@ -420,7 +427,8 @@ class AuditableSkillSelector:
                 return [convert_decimals(item) for item in obj]
             return obj
         
-        query = self.session.query(EventModel)
+        session = self._get_session()
+        query = session.query(EventModel)
         
         if session_id:
             query = query.filter(EventModel.session_id == session_id)

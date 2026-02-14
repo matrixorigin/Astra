@@ -18,7 +18,7 @@ from uuid_utils import uuid7
 from api.repositories import SessionRepository, EventRepository
 from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
 from core.auth.audit_logger import AuditLogger
-from core.replay.tool_mocking import ToolMockingLayer, ExecutionMode
+from core.skills.mocking import ToolMockingLayer, MockMode
 
 
 class ReplayService:
@@ -189,10 +189,10 @@ class ReplayService:
             - error (str|None): Error message if failed
         """
         # Initialize ToolMockingLayer
-        execution_mode = ExecutionMode.REPLAY if mock_mode else ExecutionMode.PRODUCTION
+        execution_mode = MockMode.REPLAY if mock_mode else MockMode.PRODUCTION
         mocker = ToolMockingLayer(
             mode=execution_mode,
-            db=self.db_session,
+            session=self.db_session,
             session_id=event.session_id if mock_mode else None
         )
         
@@ -203,14 +203,15 @@ class ReplayService:
                 skill_version = skill_version_override.get(skill_name) if skill_version_override else event.skill_version
                 
                 # Parse skill params from metadata
-                metadata = json.loads(event.metadata) if event.metadata else {}
+                metadata = event.metadata if isinstance(event.metadata, dict) else (json.loads(event.metadata) if event.metadata else {})
                 skill_params = metadata.get("skill_params", {})
                 
                 # Invoke skill through mocking layer
                 result = mocker.invoke_skill(
-                    skill_id=skill_name,
+                    skill_name=skill_name,
                     params=skill_params,
-                    skill_version=skill_version
+                    skill_version=skill_version,
+                    event_id=event.event_id  # Pass event_id for exact result lookup
                 )
                 
                 return {

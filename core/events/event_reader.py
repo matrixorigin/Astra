@@ -8,7 +8,7 @@ import json
 from sqlalchemy import text
 from core.events.models import ContextSnapshot, ConversationEvent, TokenUsage
 from sqlalchemy.orm import Session
-from api.database import SessionLocal
+from api.database import SessionLocal, get_db_session
 
 
 class EventReader:
@@ -33,9 +33,12 @@ class EventReader:
         self.close()
 
     def close(self):
-        """Close session if owned."""
-        if self._owns_session:
+        """Close the session if owned"""
+        if self._owns_session and self.db:
             self.db.close()
+
+    def __del__(self):
+        self.close()
 
     def _row_to_event(self, row: dict) -> ConversationEvent:
         """Convert database row to ConversationEvent.
