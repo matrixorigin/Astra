@@ -37,11 +37,13 @@ class SelectorGateResult(Base):
     __tablename__ = "selector_gate_results"
     gate_id = Column(String(36), primary_key=True)
     selector_version = Column(String(32))
-    test_queries_count = Column(Integer)
-    new_selector_avg_score = Column(Float)
-    old_selector_avg_score = Column(Float)
-    improvement_pct = Column(Float)
+    test_queries = Column(JSON)  # Store test queries used
+    test_count = Column(Integer)  # Number of test queries
     verdict = Column(String(20), nullable=False)  # PASS/FAIL
+    new_avg_score = Column(Float)
+    old_avg_score = Column(Float)
+    improvement_pct = Column(Float)
+    learnings_applied = Column(Integer, default=0)  # Number of learnings applied
     details = Column(JSON)
     created_at = Column(DateTime, default=func.now())
 

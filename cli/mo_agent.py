@@ -249,32 +249,76 @@ def skill_register(skill_file):
 
 @skill.command("learn")
 @click.option("--days", default=7, help="Look back N days for failures")
-def skill_learn(days):
-    """Learn from historical skill selection failures."""
+@click.option("--force", is_flag=True, help="Force learning even in cooldown period")
+def skill_learn(days, force):
+    """Learn from historical skill selection failures with regression gating."""
     from core.llm.client import LLMClient
-    from core.skills.self_improving_selector import SelfImprovingSelector
+    from core.agent.selector import AgentSkillSelector
+    from uuid_utils import uuid7
     
     click.echo(f"🧠 Learning from failures (last {days} days)...")
+    if force:
+        click.echo("⚡ Force mode enabled - bypassing cooldown")
+    click.echo("=" * 70)
     
     db = next(get_db_session())
     llm_client = LLMClient(db)
-    learner = SelfImprovingSelector(db, llm_client)
+    
+    # Use integrated AgentSkillSelector with learning enabled
+    selector = AgentSkillSelector(
+        db=db,
+        llm_client=llm_client,
+        auditable=True,
+        session_id=str(uuid7()),
+        enable_learning=True,
+    )
     
     try:
-        stats = learner.learn_from_failures(days=days)
+        # Trigger learning cycle with regression gating
+        result = selector.learn_from_failures(days=days, force=force)
         
-        click.echo("\n✅ Learning completed:")
-        click.echo(f"   Failures analyzed: {stats['failures_analyzed']}")
-        click.echo(f"   Corrections found: {stats['corrections_found']}")
-        click.echo(f"   Learnings added: {stats['learnings_added']}")
+        # Handle errors
+        if result.get("error"):
+            if result["error"] == "cooldown":
+                click.echo(f"\n⏳ Learning in cooldown period")
+                click.echo(f"   Cooldown: {result['cooldown_hours']}h")
+                click.echo(f"   Message: {result['message']}")
+                click.echo(f"\n💡 Use --force to bypass cooldown")
+                return
+            elif result["error"] == "learning_failed":
+                click.echo(f"\n❌ Learning failed: {result['message']}")
+                raise click.Abort()
+            else:
+                click.echo(f"\n❌ Error: {result.get('message', result['error'])}")
+                raise click.Abort()
         
-        learning_stats = learner.get_learning_stats()
-        click.echo(f"\n📊 Total learnings: {learning_stats['total_learnings']}")
-        click.echo(f"   Avg confidence: {learning_stats['avg_confidence']:.2f}")
-        click.echo(f"   High confidence: {learning_stats['high_confidence_learnings']}")
+        click.echo("\n✅ Learning cycle completed:")
+        click.echo(f"   Total failures: {result.get('total_failures', 0)}")
+        click.echo(f"   Learnings applied: {result['learned']}")
+        
+        if result.get('gate_verdict'):
+            verdict_icon = "✅" if result['gate_verdict'] == 'pass' else "❌"
+            click.echo(f"\n🚪 Regression Gate: {verdict_icon} {result['gate_verdict'].upper()}")
+            click.echo(f"   Test queries: {result.get('test_count', 0)}")
+            click.echo(f"   Improvement: {result.get('improvement_pct', 0):.1f}%")
+            
+            if result['gate_verdict'] == 'fail':
+                click.echo("\n⚠️  Learning rejected by regression gate - no changes deployed")
+                return
+        
+        # Show learning stats
+        stats = selector.get_learning_stats()
+        click.echo(f"\n📊 Learning Statistics:")
+        click.echo(f"   Total learnings: {stats['learnings']['total_learnings']}")
+        click.echo(f"   High confidence: {stats['learnings']['high_confidence']}")
+        click.echo(f"   Avg confidence: {stats['learnings']['avg_confidence']:.1f}")
+        click.echo(f"\n   Total gates run: {stats['regression_gates']['total_gates']}")
+        click.echo(f"   Pass rate: {stats['regression_gates']['pass_rate']*100:.1f}%")
         
     except Exception as e:
         click.echo(f"❌ Learning failed: {e}", err=True)
+        import traceback
+        traceback.print_exc()
         raise click.Abort()
 
 

@@ -196,8 +196,8 @@ class TestSkillSelectionRegressionGate:
             verdict = "PASS" if i < 3 else "FAIL"
             db.execute(text("""
                 INSERT INTO selector_gate_results
-                (gate_id, selector_version, test_queries_count,
-                 new_selector_avg_score, old_selector_avg_score,
+                (gate_id, selector_version, test_count,
+                 new_avg_score, old_avg_score,
                  improvement_pct, verdict, details)
                 VALUES (:gate_id, :version, :count, :new_score, :old_score, :improvement, :verdict, :details)
             """), {

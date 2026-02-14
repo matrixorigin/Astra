@@ -104,6 +104,10 @@ app.include_router(context.router, prefix="/context", tags=["context"])
 app.include_router(decisions.router, prefix="/decisions", tags=["decisions"])
 app.include_router(streaming.router, tags=["streaming"])
 
+# Learning service API
+from api.routers import learning
+app.include_router(learning.router, tags=["learning"])
+
 
 @app.get("/health")
 def health_check():

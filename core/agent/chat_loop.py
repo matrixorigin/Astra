@@ -145,7 +145,7 @@ class ChatLoop:
         messages = self._build_messages(user_input, context)
 
         # 4. Get available tools schema
-        tools_schema = self.selector.selector.get_tools_schema(
+        tools_schema = self.selector.get_tools_schema(
             query=user_input, max_candidates=max_candidates
         )
 
@@ -324,7 +324,7 @@ class ChatLoop:
         messages = self._build_messages(user_input, context)
 
         # 4. Get available tools schema
-        tools_schema = self.selector.selector.get_tools_schema(
+        tools_schema = self.selector.get_tools_schema(
             query=user_input, max_candidates=max_candidates
         )
 
