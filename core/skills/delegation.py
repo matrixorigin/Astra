@@ -1,5 +1,7 @@
 """Delegation skill for multi-agent collaboration."""
 
+import asyncio
+
 from core.logging_config import get_logger
 from core.skills.base import (
     AccessScope,
@@ -16,7 +18,18 @@ logger = get_logger(__name__)
 
 
 class DelegateTaskInput(SkillInput):
-    """Input for delegation skill."""
+    """Input for delegation skill.
+    
+    Context Structure:
+        When delegating, the context is passed to the delegated agent as:
+        {
+            "system_prompt": str,           # Agent's system prompt
+            "agent_id": str,                # Delegated agent's ID
+            "delegation_context": str,      # Optional: context from parent (if provided)
+        }
+        
+        The delegated agent can access parent context via context["delegation_context"].
+    """
 
     agent_id: str
     task: str
@@ -89,15 +102,26 @@ class DelegateTaskSkill(Skill):
                 events_produced=0,
             )
 
-        # Create a new ChatLoop for the delegated agent
-        loop = self.make_loop(system_prompt=profile.system_prompt)
+        # Create a new ChatLoop for the delegated agent with its agent_id
+        loop = self.make_loop(
+            system_prompt=profile.system_prompt,
+            agent_id=input.agent_id,
+        )
+
+        # Build context with agent profile
+        context = {
+            "system_prompt": profile.system_prompt,
+            "agent_id": input.agent_id,
+        }
+        if input.context:
+            context["delegation_context"] = input.context
 
         # Execute the task
         result = await loop.run_step(
             user_input=input.task,
             session_id=input.session_id,
             user_id=input.user_id,
-            context={"system_prompt": profile.system_prompt},
+            context=context,
         )
 
         return DelegateTaskOutput(
@@ -106,3 +130,34 @@ class DelegateTaskSkill(Skill):
             agent_id=input.agent_id,
             events_produced=0,  # Will be counted by the loop
         )
+    
+    async def execute_parallel(
+        self, inputs: list[DelegateTaskInput]
+    ) -> list[DelegateTaskOutput]:
+        """Execute multiple delegations in parallel.
+        
+        Args:
+            inputs: List of delegation inputs
+            
+        Returns:
+            List of outputs in same order as inputs
+        """
+        tasks = [self.execute(inp) for inp in inputs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Convert exceptions to error outputs
+        outputs = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                outputs.append(
+                    DelegateTaskOutput(
+                        success=False,
+                        result=f"Error: {str(result)}",
+                        agent_id=inputs[i].agent_id,
+                        events_produced=0,
+                    )
+                )
+            else:
+                outputs.append(result)
+        
+        return outputs

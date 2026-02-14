@@ -92,13 +92,14 @@ class StreamEvent(BaseModel):
     """Stream event for real-time output.
 
     Each streamed chunk is also a logged event for auditability.
+    Includes agent_id for multi-agent stream multiplexing.
     """
 
     event_type: StreamEventType
     data: dict[str, Any] = Field(default_factory=dict)
     event_id: str | None = None
     causal_chain_id: str | None = None
-    agent_id: str | None = None
+    agent_id: str | None = None  # For multi-agent stream multiplexing
 
 
 class TokenUsage(BaseModel):

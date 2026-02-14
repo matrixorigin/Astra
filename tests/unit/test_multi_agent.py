@@ -111,8 +111,11 @@ class TestDelegateTaskSkill(unittest.IsolatedAsyncioTestCase):
         result = await self.skill.execute(input_data)
 
         self.assertTrue(result.success)
-        # Verify the loop was created with the correct system prompt
-        self.loop_factory.assert_called_once_with(system_prompt="You are a code reviewer.")
+        # Verify the loop was created with the correct system prompt and agent_id
+        self.loop_factory.assert_called_once_with(
+            system_prompt="You are a code reviewer.",
+            agent_id="code_reviewer",
+        )
 
 
 if __name__ == "__main__":

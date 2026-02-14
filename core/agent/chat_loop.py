@@ -91,6 +91,7 @@ class ChatLoop:
         event_logger: EventLogger,
         context_manager,
         firewall,
+        agent_id: str = "dev-agent",
     ):
         """Initialize ChatLoop.
         
@@ -101,6 +102,7 @@ class ChatLoop:
             event_logger: Event logger
             context_manager: Context manager (required for snapshots)
             firewall: Hallucination firewall (required for verification)
+            agent_id: ID of the agent running this loop (for multi-agent)
         """
         self.selector = selector
         self.executor = executor
@@ -108,6 +110,7 @@ class ChatLoop:
         self.event_logger = event_logger
         self.context_manager = context_manager
         self.firewall = firewall
+        self.agent_id = agent_id
 
     async def run_step(
         self,
@@ -343,6 +346,7 @@ class ChatLoop:
             data={"query": user_input},
             event_id=run_started_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
         )
 
         if not tools_schema:
@@ -361,6 +365,7 @@ class ChatLoop:
                     data={"chunk": chunk},
                     event_id=text_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
                 )
 
             text_done_event = self.event_logger.create_stream_event(
@@ -376,6 +381,7 @@ class ChatLoop:
                 data={},
                 event_id=text_done_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
             )
 
             run_finished_event = self.event_logger.create_stream_event(
@@ -391,6 +397,7 @@ class ChatLoop:
                 data={},
                 event_id=run_finished_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
             )
             return
 
@@ -415,6 +422,7 @@ class ChatLoop:
                         data={"chunk": chunk["content"]},
                         event_id=text_event.event_id,
                         causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
                     )
                 elif chunk["type"] == "tool_call":
                     # Accumulate tool calls (streamed in fragments)
@@ -434,6 +442,7 @@ class ChatLoop:
                     data={"full_text": full_text},
                     event_id=text_done_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
                 )
                 self._log_response(
                     user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id
@@ -452,6 +461,7 @@ class ChatLoop:
                     data={},
                     event_id=run_finished_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
                 )
                 return
 
@@ -472,6 +482,7 @@ class ChatLoop:
                     data={"tool": fn_name, "call_id": tc["id"]},
                     event_id=tool_start_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
                 )
 
                 # Handle delegation skill specially for multi-agent
@@ -525,6 +536,7 @@ class ChatLoop:
                     data={"call_id": tc["id"], "result": result_str[:500]},
                     event_id=tool_result_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
                 )
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 
@@ -543,6 +555,7 @@ class ChatLoop:
                 data={"chunk": chunk},
                 event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
             )
         self._log_response(
             user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id
@@ -552,6 +565,7 @@ class ChatLoop:
             data={},
             event_id=user_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
         )
 
     async def run_step_with_planning(

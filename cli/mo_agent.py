@@ -110,12 +110,18 @@ def chat(user_id, model, mode):
     )
 
     # Create chat_loop_factory for delegation (also with auditable selector)
-    def create_chat_loop(system_prompt=None):
+    def create_chat_loop(system_prompt=None, agent_id="dev-agent"):
+        from core.context.manager import ContextManager
+        from core.safety.firewall import HallucinationFirewall
+        
         return ChatLoop(
             selector=AgentSkillSelector(db, llm_client, auditable=True, session_id=session.session_id),
             executor=AgentExecutor(db=db, registry=SkillRegistry(db), mode=MockMode(mode)),
             llm_client=llm_client,
             event_logger=EventLogger(db),
+            context_manager=ContextManager(db),
+            firewall=HallucinationFirewall(db),
+            agent_id=agent_id,
         )
 
     # Register skills with agent registry
