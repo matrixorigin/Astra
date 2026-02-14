@@ -23,6 +23,7 @@ class LearningSignal:
     correct_skills: list[str]
     target_metrics: dict[str, float]  # e.g., {"time_ms": 500, "cost": 0.01}
     confidence: float = 10.0
+    context_features: dict[str, Any] | None = None
     
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage."""
@@ -33,6 +34,7 @@ class LearningSignal:
             "correct_skills": self.correct_skills,
             "target_metrics": self.target_metrics,
             "confidence": self.confidence,
+            "context_features": self.context_features,
         }
 
 

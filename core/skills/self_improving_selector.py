@@ -22,6 +22,7 @@ Target Improvements:
 """
 
 import json
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -29,6 +30,7 @@ from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
 from api.models import SkillSelectionEvent as EventModel, SkillSelectionLearning as LearningModel
+from core.context.embeddings import EmbeddingService
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
 from core.skills.auditable_selector import AuditableSkillSelector, SkillSelectionEvent
@@ -38,7 +40,9 @@ logger = get_logger(__name__)
 
 CONFIG_KEY_LEARNING_WEIGHTS = "selector_learning_weights"
 CONFIG_KEY_LEARNING_DECAY = "selector_learning_decay"
+CONFIG_KEY_SEMANTIC_SIMILARITY = "selector_semantic_similarity_threshold"
 RUNTIME_CONFIG_TTL_SECONDS = 30
+SEMANTIC_SIMILARITY_THRESHOLD = 0.78
 
 
 class SelfImprovingSelector:
@@ -59,6 +63,7 @@ class SelfImprovingSelector:
         self.thresholds = thresholds or SignalThresholds()
         self.auditable_selector = AuditableSkillSelector(session, llm_client, account)
         self.sandbox = Sandbox(db=session, account=account)
+        self.embedding_service = EmbeddingService(session)
         self._runtime_config_cache: dict[str, Any] | None = None
         self._runtime_config_loaded_at: datetime | None = None
         self._runtime_config_last_updated_at: datetime | None = None
@@ -66,8 +71,24 @@ class SelfImprovingSelector:
         self._ensure_tables()
 
     def _ensure_tables(self):
-        """Ensure learning tables exist - no-op as tables are created by ORM."""
-        pass
+        """Ensure learning tables exist and evolve schema if needed."""
+        from sqlalchemy import inspect, text
+
+        if not hasattr(self.session, "bind") or self.session.bind is None:
+            return
+        inspector = inspect(self.session.bind)
+        if "skill_selection_learning" not in inspector.get_table_names():
+            return
+        columns = {col["name"] for col in inspector.get_columns("skill_selection_learning")}
+        if "query_embedding" not in columns:
+            self.session.execute(
+                text("ALTER TABLE skill_selection_learning ADD COLUMN query_embedding JSON")
+            )
+        if "context_features" not in columns:
+            self.session.execute(
+                text("ALTER TABLE skill_selection_learning ADD COLUMN context_features JSON")
+            )
+        self.session.commit()
 
     def learn_from_failures(self, days: int = 7, signal_types: list[SignalType] | None = None) -> dict[str, Any]:
         """Analyze recent failures and learn corrections.
@@ -141,6 +162,9 @@ class SelfImprovingSelector:
                 "execution_cost": e.execution_cost,
                 "user_feedback_score": e.user_feedback_score,
                 "selection_correctness": e.selection_correctness,
+                "session_id": e.session_id,
+                "selection_method": e.selection_method,
+                "context_snapshot": e.context_snapshot,
             }
             for e in events
         ]
@@ -203,6 +227,7 @@ class SelfImprovingSelector:
         """
         query = failure["user_query"][:255]
         selected = failure.get("selected_skills", [])
+        context_features = self._extract_context_features_from_query(query)
         
         if signal_type == SignalType.WRONG_SKILL:
             correction = failure.get("correction_suggestion")
@@ -214,6 +239,7 @@ class SelfImprovingSelector:
                 wrong_skills=selected,
                 correct_skills=correction,
                 target_metrics={"accuracy": 1.0},
+                context_features=context_features,
             )
         
         elif signal_type == SignalType.SLOW_EXECUTION:
@@ -226,6 +252,7 @@ class SelfImprovingSelector:
                 wrong_skills=selected,
                 correct_skills=[],  # To be filled by optimization
                 target_metrics={"time_ms": exec_time * 0.5},  # Target: 50% faster
+                context_features=context_features,
             )
         
         elif signal_type == SignalType.HIGH_COST:
@@ -238,6 +265,7 @@ class SelfImprovingSelector:
                 wrong_skills=selected,
                 correct_skills=[],
                 target_metrics={"cost": cost * 0.5},  # Target: 50% cheaper
+                context_features=context_features,
             )
         
         elif signal_type == SignalType.LOW_SATISFACTION:
@@ -250,6 +278,7 @@ class SelfImprovingSelector:
                 wrong_skills=selected,
                 correct_skills=[],
                 target_metrics={"satisfaction": 4.0},  # Target: 4+ stars
+                context_features=context_features,
             )
         
         return None
@@ -261,10 +290,15 @@ class SelfImprovingSelector:
             LearningModel.query_pattern == signal.query_pattern,
             LearningModel.signal_type == signal.signal_type.value
         ).first()
+        embedding = self._embed_query(signal.query_pattern)
         
         if existing:
             existing.evidence_count += 1
             existing.confidence = min(99, existing.evidence_count * 10)
+            if existing.query_embedding is None and embedding is not None:
+                existing.query_embedding = embedding
+            if existing.context_features is None and signal.context_features is not None:
+                existing.context_features = signal.context_features
             # Update target metrics with weighted average
             if existing.target_metrics and signal.target_metrics:
                 weight_old = (existing.evidence_count - 1) / existing.evidence_count
@@ -282,12 +316,14 @@ class SelfImprovingSelector:
             learning = LearningModel(
                 learning_id=str(uuid7()),
                 query_pattern=signal.query_pattern,
+                query_embedding=embedding,
                 wrong_skills=signal.wrong_skills,
                 correct_skills=signal.correct_skills,
                 improvement_score=10.0,
                 confidence=signal.confidence,
                 signal_type=signal.signal_type.value,
                 target_metrics=signal.target_metrics,
+                context_features=signal.context_features,
             )
             self.session.add(learning)
         
@@ -301,33 +337,49 @@ class SelfImprovingSelector:
             return candidates
 
         query_lower = query.lower()
+        query_features = self._extract_context_features_from_query(query)
+        query_embedding = self._embed_query(query)
 
         runtime_config = self._load_runtime_config()
         weights = runtime_config["weights"]
         per_signal_weights = runtime_config["weights_per_signal"]
         decay = runtime_config["decay"]
+        similarity_threshold = runtime_config["semantic_similarity_threshold"]
 
         learnings = self.session.query(LearningModel).all()
-        matched = [
-            learning for learning in learnings
-            if learning.query_pattern and learning.query_pattern.lower() in query_lower
-            and self._is_high_confidence_value(
+        matched = []
+        for learning in learnings:
+            if not learning.query_pattern:
+                continue
+            if not self._is_high_confidence_value(
                 self._effective_confidence(learning, decay, learning.signal_type)
-            )
-        ]
+            ):
+                continue
+            if not self._context_matches(learning.context_features, query_features):
+                continue
+            similarity = None
+            learning_embedding = self._parse_embedding(learning.query_embedding)
+            if query_embedding is not None and learning_embedding is not None:
+                similarity = self._cosine_similarity(query_embedding, learning_embedding)
+                if similarity >= similarity_threshold:
+                    matched.append((learning, similarity))
+                    continue
+            if learning.query_pattern.lower() in query_lower:
+                matched.append((learning, 1.0))
 
         if not matched:
             return candidates
 
         matched.sort(
-            key=lambda learning: (
-                self._effective_confidence(learning, decay, learning.signal_type),
-                learning.evidence_count or 0,
-                learning.applied_count or 0,
+            key=lambda item: (
+                item[1],
+                self._effective_confidence(item[0], decay, item[0].signal_type),
+                item[0].evidence_count or 0,
+                item[0].applied_count or 0,
             ),
             reverse=True,
         )
-        matched = matched[:3]
+        matched = [item[0] for item in matched[:3]]
 
         candidate_map = {}
         candidate_scores = {}
@@ -388,6 +440,70 @@ class SelfImprovingSelector:
 
         scored.sort(key=lambda item: item[1], reverse=True)
         return [candidate_map[name] for name, _ in scored]
+
+    def _embed_query(self, query: str) -> list[float] | None:
+        if not query:
+            return None
+        try:
+            return self.embedding_service.embed_text(query)
+        except Exception as exc:
+            logger.warning(f"Embedding generation failed: {exc}")
+            return None
+
+    def _parse_embedding(self, value: Any) -> list[float] | None:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return None
+            if isinstance(parsed, list):
+                return parsed
+        return None
+
+    def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
+        if not left or not right:
+            return 0.0
+        if len(left) != len(right):
+            return 0.0
+        dot = 0.0
+        left_norm = 0.0
+        right_norm = 0.0
+        for i in range(len(left)):
+            lval = float(left[i])
+            rval = float(right[i])
+            dot += lval * rval
+            left_norm += lval * lval
+            right_norm += rval * rval
+        denom = math.sqrt(left_norm) * math.sqrt(right_norm)
+        if denom == 0:
+            return 0.0
+        return dot / denom
+
+    def _extract_context_features_from_query(self, query: str) -> dict[str, Any]:
+        length = len(query)
+        if length <= 50:
+            length_bucket = "short"
+        elif length <= 200:
+            length_bucket = "medium"
+        else:
+            length_bucket = "long"
+        contains_code = "```" in query or "def " in query or "class " in query or ";" in query
+        return {
+            "length_bucket": length_bucket,
+            "contains_code": contains_code,
+        }
+
+    def _context_matches(self, learning_features: dict[str, Any] | None, query_features: dict[str, Any]) -> bool:
+        if not learning_features:
+            return True
+        for key, value in learning_features.items():
+            if query_features.get(key) != value:
+                return False
+        return True
 
     def _normalize_confidence(self, value: float | None) -> float:
         if value is None:
@@ -535,7 +651,15 @@ class SelfImprovingSelector:
 
                 latest_updated_at = (
                     self.session.query(func.max(Config.updated_at))
-                    .filter(Config.key_name.in_([CONFIG_KEY_LEARNING_WEIGHTS, CONFIG_KEY_LEARNING_DECAY]))
+                    .filter(
+                        Config.key_name.in_(
+                            [
+                                CONFIG_KEY_LEARNING_WEIGHTS,
+                                CONFIG_KEY_LEARNING_DECAY,
+                                CONFIG_KEY_SEMANTIC_SIMILARITY,
+                            ]
+                        )
+                    )
                     .scalar()
                 )
                 if (
@@ -556,12 +680,21 @@ class SelfImprovingSelector:
             "min_confidence": 0.0,
             "per_signal": {},
         }
+        semantic_similarity_threshold = SEMANTIC_SIMILARITY_THRESHOLD
 
         from api.models import Config
 
         configs = (
             self.session.query(Config)
-            .filter(Config.key_name.in_([CONFIG_KEY_LEARNING_WEIGHTS, CONFIG_KEY_LEARNING_DECAY]))
+            .filter(
+                Config.key_name.in_(
+                    [
+                        CONFIG_KEY_LEARNING_WEIGHTS,
+                        CONFIG_KEY_LEARNING_DECAY,
+                        CONFIG_KEY_SEMANTIC_SIMILARITY,
+                    ]
+                )
+            )
             .all()
         )
         latest_updated_at = None
@@ -584,11 +717,18 @@ class SelfImprovingSelector:
                         "min_confidence": float(parsed.get("min_confidence", 0.0) or 0.0),
                         "per_signal": parsed.get("per_signal", {}) or {},
                     }
+            elif cfg.key_name == CONFIG_KEY_SEMANTIC_SIMILARITY:
+                parsed = self._parse_json_config(cfg.value)
+                if isinstance(parsed, dict) and "threshold" in parsed:
+                    semantic_similarity_threshold = float(parsed["threshold"])
+                elif isinstance(parsed, (int, float, str)):
+                    semantic_similarity_threshold = float(parsed)
 
         self._runtime_config_cache = {
             "weights": weights,
             "weights_per_signal": per_signal_weights,
             "decay": decay,
+            "semantic_similarity_threshold": semantic_similarity_threshold,
         }
         self._runtime_config_loaded_at = now
         self._runtime_config_last_updated_at = latest_updated_at

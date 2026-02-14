@@ -203,6 +203,155 @@ class TestSelfImprovingSelector:
         # Should prioritize code_review
         assert len(corrected) > 0
 
+    def test_apply_learnings_semantic_match(self, self_improving, db):
+        """Test applying learnings using semantic matching."""
+        from api.models import SkillSelectionLearning
+        from core.context.embeddings import EmbeddingService
+
+        service = EmbeddingService(db, provider="mock")
+        embedding = service.embed_text("Review PR #123")
+
+        learning = SkillSelectionLearning(
+            learning_id=f"learn-sem-{uuid.uuid4().hex[:8]}",
+            query_pattern="unrelated pattern",
+            query_embedding=embedding,
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            confidence=0.9,
+            evidence_count=5
+        )
+        db.add(learning)
+        db.commit()
+
+        candidates = [
+            SkillMetadata(
+                name="summarize_pr", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=6, cost_estimate="low"
+            ),
+            SkillMetadata(
+                name="code_review", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=8, cost_estimate="medium"
+            )
+        ]
+
+        corrected = self_improving.apply_learnings("Review PR #123", candidates)
+
+        assert corrected[0].name == "code_review"
+
+    def test_apply_learnings_context_mismatch(self, self_improving, db):
+        """Test context feature filtering blocks mismatched learnings."""
+        from api.models import SkillSelectionLearning
+
+        learning = SkillSelectionLearning(
+            learning_id=f"learn-ctx-{uuid.uuid4().hex[:8]}",
+            query_pattern="review",
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            confidence=0.9,
+            evidence_count=5,
+            context_features={"length_bucket": "short", "contains_code": False},
+        )
+        db.add(learning)
+        db.commit()
+
+        candidates = [
+            SkillMetadata(
+                name="summarize_pr", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=6, cost_estimate="low"
+            ),
+            SkillMetadata(
+                name="code_review", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=8, cost_estimate="medium"
+            )
+        ]
+
+        long_query = "review " + ("x" * 250)
+        corrected = self_improving.apply_learnings(long_query, candidates)
+
+        assert corrected == candidates
+
+    def test_semantic_threshold_config_blocks_match(self, self_improving, db):
+        """Test semantic similarity threshold is configurable."""
+        from api.models import Config, SkillSelectionLearning
+        from core.context.embeddings import EmbeddingService
+
+        db.query(Config).filter(
+            Config.key_name == "selector_semantic_similarity_threshold"
+        ).delete()
+        db.query(SkillSelectionLearning).delete()
+        db.commit()
+
+        db.add(
+            Config(
+                key_name="selector_semantic_similarity_threshold",
+                value="1.1",
+            )
+        )
+        db.commit()
+
+        service = EmbeddingService(db, provider="mock")
+        embedding = service.embed_text("Review PR #123")
+
+        learning = SkillSelectionLearning(
+            learning_id=f"learn-th-{uuid.uuid4().hex[:8]}",
+            query_pattern="unrelated pattern",
+            query_embedding=embedding,
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            confidence=0.9,
+            evidence_count=5
+        )
+        db.add(learning)
+        db.commit()
+
+        candidates = [
+            SkillMetadata(
+                name="summarize_pr", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=6, cost_estimate="low"
+            ),
+            SkillMetadata(
+                name="code_review", version="1.0.0", description="Test",
+                category="test", subcategory="sub", triggers=[],
+                dependencies=[], priority=8, cost_estimate="medium"
+            )
+        ]
+
+        self_improving._runtime_config_cache = None
+        self_improving._runtime_config_loaded_at = None
+        corrected = self_improving.apply_learnings("Review PR #123", candidates)
+
+        assert corrected == candidates
+
+    def test_parse_embedding(self, self_improving):
+        """Test parsing embeddings from various formats."""
+        raw_list = [0.1, 0.2]
+        assert self_improving._parse_embedding(raw_list) == raw_list
+
+        raw_json = "[0.3, 0.4]"
+        assert self_improving._parse_embedding(raw_json) == [0.3, 0.4]
+
+        assert self_improving._parse_embedding("not-json") is None
+        assert self_improving._parse_embedding(None) is None
+
+    def test_cosine_similarity(self, self_improving):
+        """Test cosine similarity calculations."""
+        assert self_improving._cosine_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0
+        assert self_improving._cosine_similarity([1.0, 0.0], [0.0, 1.0]) == 0.0
+
+    def test_extract_context_features(self, self_improving):
+        """Test context feature extraction."""
+        short = self_improving._extract_context_features_from_query("review")
+        assert short["length_bucket"] == "short"
+        assert short["contains_code"] is False
+
+        code = self_improving._extract_context_features_from_query("def foo():\n    return 1")
+        assert code["contains_code"] is True
+
     def test_apply_learnings_limits_matches(self, self_improving, db):
         """Test applying only top matching learnings."""
         from api.models import SkillSelectionLearning

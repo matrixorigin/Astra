@@ -352,6 +352,7 @@ class SkillSelectionLearning(Base):
     __tablename__ = "skill_selection_learning"
     learning_id = Column(String(36), primary_key=True)
     query_pattern = Column(String(255), nullable=False, index=True)
+    query_embedding = Column(JSON)
     wrong_skills = Column(JSON)
     correct_skills = Column(JSON)
     improvement_score = Column(Float)
@@ -359,6 +360,7 @@ class SkillSelectionLearning(Base):
     evidence_count = Column(Integer, default=1)
     applied_count = Column(Integer, default=0)
     last_applied_at = Column(DateTime)
+    context_features = Column(JSON)
     # Multi-dimensional learning fields
     signal_type = Column(String(50), default="wrong_skill", index=True)
     target_metrics = Column(JSON)  # {"time_ms": 500, "cost": 0.01, "satisfaction": 4}
