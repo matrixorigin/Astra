@@ -1,7 +1,7 @@
 """Unified skill selection pipeline: retrieve → audit → feedback.
 
-Replaces the 5-selector stack (SkillSelector, ModernSkillSelector,
-AuditableSkillSelector, SelfImprovingSelector wrapper, AgentSkillSelector)
+Replaces the 4-selector stack (SkillSelector, ModernSkillSelector,
+SelfImprovingSelector wrapper, AgentSkillSelector)
 with a single pipeline that ChatLoop calls for every selection.
 
 Design doc: docs/design/unified-selector-pipeline.md
