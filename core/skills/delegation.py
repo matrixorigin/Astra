@@ -34,6 +34,7 @@ class DelegateTaskInput(SkillInput):
     agent_id: str
     task: str
     context: str | None = None
+    timeout: float | None = None  # Timeout in seconds, None = no timeout
 
 
 class DelegateTaskOutput(SkillOutput):
@@ -175,19 +176,45 @@ class DelegateTaskSkill(Skill):
             if input.context:
                 context["delegation_context"] = input.context
 
-            # Stream the task execution - forward all events with agent_id tagged
-            async for event in loop.run_step_stream(
+            # Stream the task execution with optional timeout
+            stream = loop.run_step_stream(
                 user_input=input.task,
                 session_id=input.session_id,
                 user_id=input.user_id,
                 context=context,
-            ):
-                # Ensure agent_id is set for stream multiplexing
-                event.agent_id = input.agent_id
-                yield event
+            )
+            
+            # Apply timeout using asyncio.timeout() context manager (Python 3.11+)
+            if input.timeout:
+                try:
+                    async with asyncio.timeout(input.timeout):
+                        async for event in stream:
+                            event.agent_id = input.agent_id
+                            yield event
+                except TimeoutError:
+                    logger.error(f"Delegation to agent '{input.agent_id}' timed out after {input.timeout}s")
+                    yield StreamEvent(
+                        event_type=StreamEventType.RUN_ERROR,
+                        data={"error": f"Timeout after {input.timeout}s", "agent_id": input.agent_id},
+                        agent_id=input.agent_id,
+                    )
+                    return
+            else:
+                # No timeout - stream normally
+                async for event in stream:
+                    event.agent_id = input.agent_id
+                    yield event
         
+        except asyncio.CancelledError:
+            logger.warning(f"Delegation to agent '{input.agent_id}' was cancelled")
+            yield StreamEvent(
+                event_type=StreamEventType.RUN_ERROR,
+                data={"error": "Cancelled", "agent_id": input.agent_id},
+                agent_id=input.agent_id,
+            )
+            raise  # Re-raise to propagate cancellation
         except Exception as e:
-            logger.error(f"Error in delegation to {input.agent_id}: {e}", exc_info=True)
+            logger.error(f"Error in delegation to agent '{input.agent_id}': {e}", exc_info=True)
             yield StreamEvent(
                 event_type=StreamEventType.RUN_ERROR,
                 data={"error": str(e), "agent_id": input.agent_id},

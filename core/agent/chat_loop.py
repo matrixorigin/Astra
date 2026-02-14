@@ -467,75 +467,179 @@ class ChatLoop:
 
             # Execute tools
             messages.append({"role": "assistant", "content": full_text, "tool_calls": tool_calls})
-            for tc in tool_calls:
-                fn_name = tc["function"]["name"]
-                tool_start_event = self.event_logger.create_stream_event(
-                    user_id=user_id,
-                    session_id=session_id,
-                    event_type="stream_tool_call_start",
-                    content=json.dumps({"tool": fn_name, "call_id": tc["id"]}),
-                    parent_event_id=user_event.event_id,
-                    causal_chain_id=user_event.causal_chain_id,
-                )
-                yield StreamEvent(
-                    event_type=StreamEventType.TOOL_CALL_START,
-                    data={"tool": fn_name, "call_id": tc["id"]},
-                    event_id=tool_start_event.event_id,
-                    causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
-                )
-
-                # Handle delegation skill specially for multi-agent streaming
-                if fn_name == "delegate_task":
+            
+            # Check for parallel delegation (multiple delegate_task calls)
+            delegation_calls = [tc for tc in tool_calls if tc["function"]["name"] == "delegate_task"]
+            
+            if len(delegation_calls) > 1:
+                # Parallel delegation: fan-out/fan-in
+                from core.skills.delegation import DelegateTaskInput
+                
+                # Emit TOOL_CALL_START for all delegations
+                for tc in delegation_calls:
+                    tool_start_event = self.event_logger.create_stream_event(
+                        user_id=user_id,
+                        session_id=session_id,
+                        event_type="stream_tool_call_start",
+                        content=json.dumps({"tool": "delegate_task", "call_id": tc["id"]}),
+                        parent_event_id=user_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                    )
+                    yield StreamEvent(
+                        event_type=StreamEventType.TOOL_CALL_START,
+                        data={"tool": "delegate_task", "call_id": tc["id"]},
+                        event_id=tool_start_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                        agent_id=self.agent_id,
+                    )
+                
+                # Build inputs for parallel execution
+                inputs = []
+                for tc in delegation_calls:
                     params = json.loads(tc["function"]["arguments"])
-                    delegated_agent_id = params.get("agent_id", "unknown")
-                    
-                    # Stream delegated agent's events
-                    result_text = ""
-                    has_output = False
-                    async for delegated_event in self.executor.execute_skill_stream(
-                        skill_name=fn_name,
-                        params=params,
+                    inputs.append(DelegateTaskInput(
+                        agent_id=params.get("agent_id", "unknown"),
+                        task=params.get("task", ""),
+                        context=params.get("context"),
                         session_id=session_id,
-                        parent_event_id=user_event.event_id,
-                    ):
-                        # Forward delegated agent's events with agent_id tagged
-                        yield delegated_event
+                        user_id=user_id,
+                    ))
+                
+                # Execute parallel streaming
+                skill = self.executor.skill_registry.get("delegate_task")
+                results = {}  # call_id -> result_text
+                agent_to_call = {}  # agent_id -> call_id mapping
+                completed_agents = set()  # Track which agents have completed
+                
+                # Build agent_id to call_id mapping
+                for tc in delegation_calls:
+                    params = json.loads(tc["function"]["arguments"])
+                    agent_to_call[params.get("agent_id")] = tc["id"]
+                
+                try:
+                    async for event in skill.execute_parallel_stream(inputs):
+                        yield event
                         
-                        # Collect final result
-                        if delegated_event.event_type == StreamEventType.TEXT_DONE:
-                            result_text = delegated_event.data.get("text", "")
-                            has_output = True
-                    
-                    # Use collected result or fallback message with agent_id
-                    result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
-                else:
-                    result = self.executor.execute_skill(
-                        skill_name=fn_name,
-                        params=json.loads(tc["function"]["arguments"]),
+                        # Collect results from TEXT_DONE events (only first one per agent)
+                        if event.event_type == StreamEventType.TEXT_DONE:
+                            agent_id = event.agent_id
+                            call_id = agent_to_call.get(agent_id)
+                            if call_id and call_id not in results:  # Only collect first TEXT_DONE
+                                result_text = event.data.get("text", "")
+                                results[call_id] = result_text
+                        # Track completion
+                        elif event.event_type == StreamEventType.AGENT_COMPLETED:
+                            agent_id = event.agent_id
+                            completed_agents.add(agent_id)
+                            call_id = agent_to_call.get(agent_id)
+                            # Fallback: mark completion even without TEXT_DONE
+                            if call_id and call_id not in results:
+                                results[call_id] = f"Agent '{agent_id}' completed with no text output"
+                        # Track errors
+                        elif event.event_type == StreamEventType.RUN_ERROR:
+                            agent_id = event.agent_id
+                            call_id = agent_to_call.get(agent_id)
+                            if call_id and call_id not in results:  # Don't overwrite existing results
+                                error_msg = event.data.get("error", "Unknown error")
+                                results[call_id] = f"Error: {error_msg}"
+                
+                except Exception as e:
+                    logger.error(f"Error in parallel delegation: {e}", exc_info=True)
+                    # Mark all incomplete delegations as failed
+                    for tc in delegation_calls:
+                        if tc["id"] not in results:
+                            results[tc["id"]] = f"Error: Parallel execution failed - {str(e)}"
+                
+                # Emit TOOL_RESULT for each delegation
+                for tc in delegation_calls:
+                    result_str = results.get(tc["id"], "No result")
+                    tool_result_event = self.event_logger.create_stream_event(
+                        user_id=user_id,
                         session_id=session_id,
+                        event_type="stream_tool_result",
+                        content=json.dumps({"call_id": tc["id"], "result": result_str[:500]}),
                         parent_event_id=user_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
                     )
-                    result_str = (
-                        json.dumps(result, default=str) if not isinstance(result, str) else result
+                    yield StreamEvent(
+                        event_type=StreamEventType.TOOL_RESULT,
+                        data={"call_id": tc["id"], "result": result_str[:500]},
+                        event_id=tool_result_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                        agent_id=self.agent_id,
+                    )
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+            else:
+                # Sequential tool execution (existing logic)
+                for tc in tool_calls:
+                    fn_name = tc["function"]["name"]
+                    tool_start_event = self.event_logger.create_stream_event(
+                        user_id=user_id,
+                        session_id=session_id,
+                        event_type="stream_tool_call_start",
+                        content=json.dumps({"tool": fn_name, "call_id": tc["id"]}),
+                        parent_event_id=user_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                    )
+                    yield StreamEvent(
+                        event_type=StreamEventType.TOOL_CALL_START,
+                        data={"tool": fn_name, "call_id": tc["id"]},
+                        event_id=tool_start_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                        agent_id=self.agent_id,
                     )
 
-                tool_result_event = self.event_logger.create_stream_event(
-                    user_id=user_id,
-                    session_id=session_id,
-                    event_type="stream_tool_result",
-                    content=json.dumps({"call_id": tc["id"], "result": result_str[:500]}),
-                    parent_event_id=user_event.event_id,
-                    causal_chain_id=user_event.causal_chain_id,
-                )
-                yield StreamEvent(
-                    event_type=StreamEventType.TOOL_RESULT,
-                    data={"call_id": tc["id"], "result": result_str[:500]},
-                    event_id=tool_result_event.event_id,
-                    causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
-                )
-                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+                    # Handle delegation skill specially for multi-agent streaming
+                    if fn_name == "delegate_task":
+                        params = json.loads(tc["function"]["arguments"])
+                        delegated_agent_id = params.get("agent_id", "unknown")
+                        
+                        # Stream delegated agent's events
+                        result_text = ""
+                        has_output = False
+                        async for delegated_event in self.executor.execute_skill_stream(
+                            skill_name=fn_name,
+                            params=params,
+                            session_id=session_id,
+                            parent_event_id=user_event.event_id,
+                        ):
+                            # Forward delegated agent's events with agent_id tagged
+                            yield delegated_event
+                            
+                            # Collect final result
+                            if delegated_event.event_type == StreamEventType.TEXT_DONE:
+                                result_text = delegated_event.data.get("text", "")
+                                has_output = True
+                        
+                        # Use collected result or fallback message with agent_id
+                        result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
+                    else:
+                        result = self.executor.execute_skill(
+                            skill_name=fn_name,
+                            params=json.loads(tc["function"]["arguments"]),
+                            session_id=session_id,
+                            parent_event_id=user_event.event_id,
+                        )
+                        result_str = (
+                            json.dumps(result, default=str) if not isinstance(result, str) else result
+                        )
+
+                    tool_result_event = self.event_logger.create_stream_event(
+                        user_id=user_id,
+                        session_id=session_id,
+                        event_type="stream_tool_result",
+                        content=json.dumps({"call_id": tc["id"], "result": result_str[:500]}),
+                        parent_event_id=user_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                    )
+                    yield StreamEvent(
+                        event_type=StreamEventType.TOOL_RESULT,
+                        data={"call_id": tc["id"], "result": result_str[:500]},
+                        event_id=tool_result_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                        agent_id=self.agent_id,
+                    )
+                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 
         # Exhausted rounds — ask LLM for a final answer without tools
         messages.append(

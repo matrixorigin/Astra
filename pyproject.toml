@@ -7,7 +7,7 @@ readme = "README.md"
 packages = [{include = "core"}, {include = "api"}, {include = "config"}]
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.11"
 pymysql = "^1.1.0"
 sqlalchemy = "^2.0.0"
 pydantic = {extras = ["email"], version = "^2.5.0"}
@@ -87,7 +87,7 @@ ignore = ["E501"]
 "infra/scripts/**/*.py" = ["E402", "PTH123"]  # Allow module level imports and open() in scripts
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
