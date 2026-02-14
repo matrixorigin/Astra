@@ -130,23 +130,13 @@ class TestSelfImprovingSelectorCoverage:
                 SkillSelectionEventModel.event_id == event.event_id
             ).update({
                 "user_feedback_score": 1,
-                "selection_correctness": False
+                "selection_correctness": 0,  # Wrong skill
+                "correction_suggestion": ["correct_skill"]  # Add correction
             })
             db.commit()
         
-        # Mock sandbox operations
-        with patch.object(si.sandbox, 'create'):
-            with patch.object(si.sandbox, 'delete'):
-                with patch.object(si, '_analyze_failure') as mock_analyze:
-                    mock_analyze.return_value = {
-                        "query_pattern": "review pr",
-                        "wrong_skills": ["wrong_skill"],
-                        "correct_skills": ["correct_skill"],
-                        "improvement_score": 0.8,
-                        "evidence": "test"
-                    }
-                    
-                    result = si.learn_from_failures(days=1)
+        # Just run learn_from_failures - it will extract signals
+        result = si.learn_from_failures(days=1)
         
         assert result["learned"] >= 0
         assert "total_failures" in result
@@ -164,12 +154,13 @@ class TestSelfImprovingSelectorCoverage:
             "correction_suggestion": ["code_review"],  # Add correction
         }
         
-        result = si._analyze_failure(failure)
+        # Test signal extraction instead
+        from core.skills.learning_signals import SignalType
+        signal = si._extract_signal(failure, SignalType.WRONG_SKILL)
         
-        assert result is not None
-        assert "query_pattern" in result
-        assert "correct_skills" in result
-        assert result["correct_skills"] == ["code_review"]
+        assert signal is not None
+        assert signal.query_pattern == "Review PR #123"  # Uses actual query
+        assert signal.correct_skills == ["code_review"]
 
     def test_update_learnings_with_existing(self, db, mock_llm):
         """Test updating existing learnings."""
@@ -190,21 +181,24 @@ class TestSelfImprovingSelectorCoverage:
             correct_skills=["correct"],
             confidence=0.5,
             evidence_count=1,
-            improvement_score=0.7
+            improvement_score=0.7,
+            signal_type="wrong_skill"
         )
         db.add(existing_learning)
         db.commit()
         
-        # Update with new correction
-        correction = {
-            "query_pattern": "review pr",
-            "wrong_skills": ["wrong"],
-            "correct_skills": ["correct"],
-            "improvement_score": 0.8,
-            "evidence": "evt-2"
-        }
+        # Update with new signal
+        from core.skills.learning_signals import LearningSignal, SignalType
+        signal = LearningSignal(
+            signal_type=SignalType.WRONG_SKILL,
+            query_pattern="review pr",
+            wrong_skills=["wrong"],
+            correct_skills=["correct"],
+            target_metrics={"accuracy": 1.0},
+            confidence=10.0
+        )
         
-        si._update_learnings(correction)
+        si._update_learnings(signal)
         
         # Check that learning was updated
         updated = db.query(SkillSelectionLearning).filter(
@@ -403,23 +397,13 @@ class TestSelfImprovingSelectorDeepCoverage:
                 SkillSelectionEventModel.event_id == event.event_id
             ).update({
                 "user_feedback_score": 1,
-                "selection_correctness": False
+                "selection_correctness": 0,  # Wrong skill
+                "correction_suggestion": ["code_review"]  # Add correction
             })
             db.commit()
         
-        # Mock sandbox and analysis
-        with patch.object(si.sandbox, 'create'):
-            with patch.object(si.sandbox, 'delete'):
-                with patch.object(si, '_analyze_failure') as mock_analyze:
-                    mock_analyze.return_value = {
-                        "query_pattern": "review pr",
-                        "wrong_skills": ["wrong_skill"],
-                        "correct_skills": ["code_review"],
-                        "improvement_score": 0.8,
-                        "evidence": "test"
-                    }
-                    
-                    result = si.learn_from_failures(days=1)
+        # Just run learn_from_failures
+        result = si.learn_from_failures(days=1)
         
         assert result["learned"] >= 0
         assert "total_failures" in result
@@ -483,19 +467,8 @@ class TestSelfImprovingSelectorDeepCoverage:
             db.commit()
         
         # Mock all sandbox operations
-        with patch.object(si.sandbox, 'create'):
-            with patch.object(si.sandbox, 'delete'):
-                with patch.object(si, '_analyze_failure') as mock_analyze:
-                    # Return corrections for all failures (need enough values)
-                    mock_analyze.return_value = {
-                        "query_pattern": "review pr",
-                        "wrong_skills": ["wrong_skill"],
-                        "correct_skills": ["code_review"],
-                        "improvement_score": 0.8,
-                        "evidence": "test"
-                    }
-                    
-                    result = si.learn_from_failures(days=1)
+        # Just run learn_from_failures
+        result = si.learn_from_failures(days=1)
         
         assert result["learned"] >= 0
         assert "total_failures" in result

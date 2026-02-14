@@ -366,6 +366,19 @@ class SkillSelectionLearning(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
+class SkillExecutionMetric(Base):
+    """Records execution metrics for skills to enable multi-dimensional learning."""
+    __tablename__ = "skill_execution_metrics"
+    metric_id = Column(String(36), primary_key=True)
+    session_id = Column(String(36), index=True, nullable=False)
+    skill_name = Column(String(255), index=True, nullable=False)
+    execution_time_ms = Column(Integer, nullable=False)
+    execution_cost = Column(Float, default=0.0)
+    success = Column(TINYINT(1), nullable=False)
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+
 class KnowledgeEntry(Base):
     """Semantic memory: extracted knowledge that persists across sessions."""
     __tablename__ = "knowledge_entries"

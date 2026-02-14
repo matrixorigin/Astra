@@ -46,9 +46,9 @@ class TestSelfImprovingSelector:
 
     def test_learn_from_failures_no_failures(self, self_improving, db):
         """Test with no failures."""
-        # Clear all failures
+        # Clear all events that could trigger any signal type
         from api.models import SkillSelectionEvent
-        db.query(SkillSelectionEvent).filter(SkillSelectionEvent.user_feedback_score < 3).delete()
+        db.query(SkillSelectionEvent).delete()
         db.commit()
         
         result = self_improving.learn_from_failures(days=30)
@@ -59,18 +59,20 @@ class TestSelfImprovingSelector:
         """Test adding new learning."""
         # Clear any existing data
         from api.models import SkillSelectionLearning
+        from core.skills.learning_signals import LearningSignal, SignalType
         db.query(SkillSelectionLearning).delete()
         db.commit()
         
-        correction = {
-            "query_pattern": "review pr",
-            "wrong_skills": ["summarize_pr"],
-            "correct_skills": ["code_review"],
-            "improvement_score": 0.8,
-            "evidence": "evt-123"
-        }
+        signal = LearningSignal(
+            signal_type=SignalType.WRONG_SKILL,
+            query_pattern="review pr",
+            wrong_skills=["summarize_pr"],
+            correct_skills=["code_review"],
+            target_metrics={"accuracy": 1.0},
+            confidence=10.0,
+        )
         
-        self_improving._update_learnings(correction)
+        self_improving._update_learnings(signal)
         
         rows = db.query(SkillSelectionLearning).filter(
             SkillSelectionLearning.query_pattern == "review pr"
@@ -125,29 +127,32 @@ class TestSelfImprovingSelector:
         """Test updating learnings with multiple corrections."""
         # Clear data
         from api.models import SkillSelectionLearning
+        from core.skills.learning_signals import LearningSignal, SignalType
         db.query(SkillSelectionLearning).delete()
         db.commit()
         
-        corrections = [
-            {
-                "query_pattern": "pattern1",
-                "wrong_skills": ["skill1"],
-                "correct_skills": ["skill2"],
-                "improvement_score": 0.8,
-                "evidence": "evt-1"
-            },
-            {
-                "query_pattern": "pattern2",
-                "wrong_skills": ["skill3"],
-                "correct_skills": ["skill4"],
-                "improvement_score": 0.9,
-                "evidence": "evt-2"
-            }
+        signals = [
+            LearningSignal(
+                signal_type=SignalType.WRONG_SKILL,
+                query_pattern="pattern1",
+                wrong_skills=["skill1"],
+                correct_skills=["skill2"],
+                target_metrics={"accuracy": 1.0},
+                confidence=10.0,
+            ),
+            LearningSignal(
+                signal_type=SignalType.WRONG_SKILL,
+                query_pattern="pattern2",
+                wrong_skills=["skill3"],
+                correct_skills=["skill4"],
+                target_metrics={"accuracy": 1.0},
+                confidence=10.0,
+            )
         ]
         
         # Update learnings one by one
-        for correction in corrections:
-            self_improving._update_learnings(correction)
+        for signal in signals:
+            self_improving._update_learnings(signal)
         
         # Check that both were added
         learnings = db.query(SkillSelectionLearning).all()
@@ -252,20 +257,6 @@ class TestSelfImprovingSelector:
         # May be 0 if LLM doesn't find pattern
         assert result["learned"] >= 0
 
-    def test_analyze_failure_in_sandbox(self, self_improving, mock_llm):
-        """Test failure analysis in sandbox."""
-        failure = {
-            "event_id": "evt-1",
-            "user_query": "Review PR #123",
-            "selected_skills": ["wrong_skill"],
-            "correction_suggestion": ["correct_skill"]
-        }
-        
-        result = self_improving._analyze_failure(failure)
-        
-        # Should return parsed result or None
-        assert result is None or isinstance(result, dict)
-
     def test_learn_creates_and_cleans_sandbox(self, self_improving, selector, db):
         """Test sandbox lifecycle during learning."""
         event = SkillSelectionEvent(
@@ -308,19 +299,21 @@ class TestSelfImprovingSelector:
         # Clear data
         # Clear using ORM
         from api.models import SkillSelectionLearning
+        from core.skills.learning_signals import LearningSignal, SignalType
         db.query(SkillSelectionLearning).delete()
         db.commit()
         
         # Add same pattern multiple times
         for i in range(3):
-            correction = {
-                "query_pattern": "review pr",
-                "wrong_skills": ["wrong"],
-                "correct_skills": ["correct"],
-                "improvement_score": 0.7 + i * 0.1,
-                "evidence": f"evt-{i}"
-            }
-            self_improving._update_learnings(correction)
+            signal = LearningSignal(
+                signal_type=SignalType.WRONG_SKILL,
+                query_pattern="review pr",
+                wrong_skills=["wrong"],
+                correct_skills=["correct"],
+                target_metrics={"accuracy": 1.0},
+                confidence=10.0,
+            )
+            self_improving._update_learnings(signal)
         
         # Should accumulate evidence
         from api.models import SkillSelectionLearning

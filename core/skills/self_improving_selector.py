@@ -98,11 +98,28 @@ class SelfImprovingSelector:
         }
 
     def get_recent_failures(self, days: int = 7, limit: int = 10) -> list[dict]:
-        """Get recent failed selections for learning."""
+        """Get recent events with any learning signal (not just wrong_skill).
+        
+        This extracts events that triggered any of the 4 signal types:
+        - WRONG_SKILL: selection_correctness = 0
+        - SLOW_EXECUTION: execution_time_ms > threshold
+        - HIGH_COST: execution_cost > threshold
+        - LOW_SATISFACTION: user_feedback_score < threshold
+        """
+        from sqlalchemy import or_
+        
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         
+        # Build filter conditions for all signal types
+        conditions = [
+            EventModel.selection_correctness == 0,  # Wrong skill
+            EventModel.execution_time_ms > self.thresholds.slow_execution_ms,  # Slow
+            EventModel.execution_cost > self.thresholds.high_cost_usd,  # Expensive
+            EventModel.user_feedback_score < self.thresholds.low_satisfaction,  # Low satisfaction
+        ]
+        
         events = self.session.query(EventModel).filter(
-            EventModel.selection_correctness == 0,
+            or_(*conditions),
             EventModel.created_at >= cutoff
         ).order_by(EventModel.created_at.desc()).limit(limit).all()
         
@@ -112,23 +129,59 @@ class SelfImprovingSelector:
                 "user_query": e.user_query,
                 "selected_skills": e.selected_skills,
                 "correction_suggestion": e.correction_suggestion,
+                "execution_time_ms": e.execution_time_ms,
+                "execution_cost": e.execution_cost,
+                "user_feedback_score": e.user_feedback_score,
+                "selection_correctness": e.selection_correctness,
             }
             for e in events
         ]
-
-    def _analyze_failure(self, failure: dict) -> dict | None:
-        """Analyze a failure and extract learning (legacy method for backward compatibility)."""
-        signal = self._extract_signal(failure, SignalType.WRONG_SKILL)
-        if signal:
-            return {
-                "query_pattern": signal.query_pattern,
-                "wrong_skills": signal.wrong_skills,
-                "correct_skills": signal.correct_skills,
-                "improvement_score": 10,
-                "signal_type": signal.signal_type.value,
-                "target_metrics": signal.target_metrics,
+    
+    def get_slow_executions(self, days: int = 7, limit: int = 10) -> list[dict]:
+        """Get recent slow skill executions from metrics table.
+        
+        This complements get_recent_failures by extracting performance data
+        from the skill_execution_metrics table.
+        """
+        from api.models import SkillExecutionMetric
+        
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        
+        metrics = self.session.query(SkillExecutionMetric).filter(
+            SkillExecutionMetric.execution_time_ms > self.thresholds.slow_execution_ms,
+            SkillExecutionMetric.created_at >= cutoff
+        ).order_by(SkillExecutionMetric.created_at.desc()).limit(limit).all()
+        
+        return [
+            {
+                "skill_name": m.skill_name,
+                "execution_time_ms": m.execution_time_ms,
+                "execution_cost": m.execution_cost,
+                "session_id": m.session_id,
             }
-        return None
+            for m in metrics
+        ]
+    
+    def get_expensive_executions(self, days: int = 7, limit: int = 10) -> list[dict]:
+        """Get recent expensive skill executions from metrics table."""
+        from api.models import SkillExecutionMetric
+        
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        
+        metrics = self.session.query(SkillExecutionMetric).filter(
+            SkillExecutionMetric.execution_cost > self.thresholds.high_cost_usd,
+            SkillExecutionMetric.created_at >= cutoff
+        ).order_by(SkillExecutionMetric.created_at.desc()).limit(limit).all()
+        
+        return [
+            {
+                "skill_name": m.skill_name,
+                "execution_time_ms": m.execution_time_ms,
+                "execution_cost": m.execution_cost,
+                "session_id": m.session_id,
+            }
+            for m in metrics
+        ]
     
     def _extract_signal(self, failure: dict, signal_type: SignalType) -> LearningSignal | None:
         """Extract a learning signal from a failure event.
@@ -156,8 +209,8 @@ class SelfImprovingSelector:
             )
         
         elif signal_type == SignalType.SLOW_EXECUTION:
-            exec_time = failure.get("execution_time_ms", 0)
-            if exec_time < self.thresholds.slow_execution_ms:
+            exec_time = failure.get("execution_time_ms")
+            if exec_time is None or exec_time < self.thresholds.slow_execution_ms:
                 return None
             return LearningSignal(
                 signal_type=SignalType.SLOW_EXECUTION,
@@ -168,8 +221,8 @@ class SelfImprovingSelector:
             )
         
         elif signal_type == SignalType.HIGH_COST:
-            cost = failure.get("execution_cost", 0.0)
-            if cost < self.thresholds.high_cost_usd:
+            cost = failure.get("execution_cost")
+            if cost is None or cost < self.thresholds.high_cost_usd:
                 return None
             return LearningSignal(
                 signal_type=SignalType.HIGH_COST,
@@ -180,8 +233,8 @@ class SelfImprovingSelector:
             )
         
         elif signal_type == SignalType.LOW_SATISFACTION:
-            satisfaction = failure.get("user_feedback_score", 5)
-            if satisfaction >= self.thresholds.low_satisfaction:
+            satisfaction = failure.get("user_feedback_score")
+            if satisfaction is None or satisfaction >= self.thresholds.low_satisfaction:
                 return None
             return LearningSignal(
                 signal_type=SignalType.LOW_SATISFACTION,
@@ -193,62 +246,40 @@ class SelfImprovingSelector:
         
         return None
 
-    def _update_learnings(self, correction: dict | LearningSignal):
-        """Update learning database with new correction.
-        
-        Args:
-            correction: Either legacy dict or LearningSignal object
-        """
-        # Convert LearningSignal to dict if needed
-        if isinstance(correction, LearningSignal):
-            signal_type = correction.signal_type.value
-            query_pattern = correction.query_pattern
-            wrong_skills = correction.wrong_skills
-            correct_skills = correction.correct_skills
-            target_metrics = correction.target_metrics
-            confidence = correction.confidence
-        else:
-            # Legacy dict format
-            signal_type = correction.get("signal_type", "wrong_skill")
-            query_pattern = correction["query_pattern"]
-            wrong_skills = correction["wrong_skills"]
-            correct_skills = correction["correct_skills"]
-            target_metrics = correction.get("target_metrics", {})
-            confidence = 10.0
-        
+    def _update_learnings(self, signal: LearningSignal):
+        """Update learning database with new signal."""
         # Check if similar learning exists
         existing = self.session.query(LearningModel).filter(
-            LearningModel.query_pattern == query_pattern,
-            LearningModel.signal_type == signal_type
+            LearningModel.query_pattern == signal.query_pattern,
+            LearningModel.signal_type == signal.signal_type.value
         ).first()
         
         if existing:
             existing.evidence_count += 1
             existing.confidence = min(99, existing.evidence_count * 10)
-            # Update target metrics with weighted average based on evidence count
-            if existing.target_metrics and target_metrics:
+            # Update target metrics with weighted average
+            if existing.target_metrics and signal.target_metrics:
                 weight_old = (existing.evidence_count - 1) / existing.evidence_count
                 weight_new = 1 / existing.evidence_count
-                for key, value in target_metrics.items():
+                for key, value in signal.target_metrics.items():
                     if key in existing.target_metrics:
-                        # Weighted average: more evidence = more weight to existing
                         existing.target_metrics[key] = (
                             existing.target_metrics[key] * weight_old + value * weight_new
                         )
                     else:
                         existing.target_metrics[key] = value
-            elif target_metrics:
-                existing.target_metrics = target_metrics
+            elif signal.target_metrics:
+                existing.target_metrics = signal.target_metrics
         else:
             learning = LearningModel(
                 learning_id=str(uuid7()),
-                query_pattern=query_pattern,
-                wrong_skills=wrong_skills,
-                correct_skills=correct_skills,
+                query_pattern=signal.query_pattern,
+                wrong_skills=signal.wrong_skills,
+                correct_skills=signal.correct_skills,
                 improvement_score=10.0,
-                confidence=confidence,
-                signal_type=signal_type,
-                target_metrics=target_metrics,
+                confidence=signal.confidence,
+                signal_type=signal.signal_type.value,
+                target_metrics=signal.target_metrics,
             )
             self.session.add(learning)
         

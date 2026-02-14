@@ -167,7 +167,7 @@ class TestSelfImprovingSelectorIntegration:
         assert result["learned"] >= 0
 
     def test_analyze_failure_in_sandbox_with_llm(self, full_setup):
-        """Test failure analysis with LLM."""
+        """Test signal extraction with correction."""
         _, _, si = full_setup
         
         failure = {
@@ -177,10 +177,11 @@ class TestSelfImprovingSelectorIntegration:
             "correction_suggestion": ["correct_skill"]
         }
         
-        result = si._analyze_failure(failure)
+        from core.skills.learning_signals import SignalType
+        signal = si._extract_signal(failure, SignalType.WRONG_SKILL)
         
-        # Should return parsed result or None
-        assert result is None or isinstance(result, dict)
+        # Should return signal or None
+        assert signal is None or signal.correct_skills == ["correct_skill"]
 
     def test_update_learnings_accumulation(self, full_setup, db):
         """Test learning accumulation over multiple corrections."""
@@ -188,19 +189,21 @@ class TestSelfImprovingSelectorIntegration:
         
         # Clear data using ORM
         from api.models import SkillSelectionLearning
+        from core.skills.learning_signals import LearningSignal, SignalType
         db.query(SkillSelectionLearning).delete()
         db.commit()
         
         # Add same pattern multiple times
         for i in range(3):
-            correction = {
-                "query_pattern": "review pr",
-                "wrong_skills": ["summarize_pr"],
-                "correct_skills": ["code_review"],
-                "improvement_score": 0.7 + i * 0.05,
-                "evidence": f"evt-{i}"
-            }
-            si._update_learnings(correction)
+            signal = LearningSignal(
+                signal_type=SignalType.WRONG_SKILL,
+                query_pattern="review pr",
+                wrong_skills=["summarize_pr"],
+                correct_skills=["code_review"],
+                target_metrics={"accuracy": 1.0},
+                confidence=10.0
+            )
+            si._update_learnings(signal)
         
         # Check accumulation using ORM
         from api.models import SkillSelectionLearning
