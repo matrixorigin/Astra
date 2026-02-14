@@ -23,9 +23,21 @@ class SkillRegistry:
 
     def __init__(self, session: Session | None = None):
         self._owns_session = session is None
-        self.session = session or SessionLocal()
+        self._session = session
+        self._lazy_session = None
         self._skills: dict[str, Skill] = {}  # skill_name@version -> Skill
         self._cache_size = 100  # LRU cache size
+
+    @property
+    def session(self) -> Session:
+        """Get session, creating one if needed."""
+        if self._session:
+            return self._session
+        
+        if not self._lazy_session:
+            self._lazy_session = SessionLocal()
+        
+        return self._lazy_session
 
     def __enter__(self):
         return self
@@ -35,8 +47,9 @@ class SkillRegistry:
 
     def close(self):
         """Close session if we own it."""
-        if self._owns_session:
-            self.session.close()
+        if self._owns_session and self._lazy_session:
+            self._lazy_session.close()
+            self._lazy_session = None
 
     def register(
         self,

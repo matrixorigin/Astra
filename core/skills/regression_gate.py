@@ -23,11 +23,34 @@ class SkillSelectionRegressionGate:
 
     def __init__(self, llm_client, session: Session | None = None, account: str = "sys"):
         self._owns_session = session is None
-        self.session = session or SessionLocal()
+        self._session = session
+        self._lazy_session = None
         self.llm = llm_client
         self.account = account
-        self.sandbox = Sandbox(db=self.session, account=account)
+        self._sandbox = None
         self._ensure_tables()
+
+    @property
+    def session(self) -> Session:
+        """Get session, creating one if needed."""
+        if self._session:
+            return self._session
+        
+        if not self._lazy_session:
+            self._lazy_session = SessionLocal()
+        
+        return self._lazy_session
+
+    @property
+    def sandbox(self) -> Sandbox:
+        """Lazy init sandbox."""
+        if self._sandbox is None:
+            self._sandbox = Sandbox(db=self.session, account=self.account)
+        return self._sandbox
+
+    @sandbox.setter
+    def sandbox(self, value: Sandbox):
+        self._sandbox = value
 
     def __enter__(self):
         return self
@@ -36,8 +59,9 @@ class SkillSelectionRegressionGate:
         self.close()
 
     def close(self):
-        if self._owns_session:
-            self.session.close()
+        if self._owns_session and self._lazy_session:
+            self._lazy_session.close()
+            self._lazy_session = None
 
     def _ensure_tables(self):
         """Ensure gate tables exist - no-op as tables are created by ORM."""

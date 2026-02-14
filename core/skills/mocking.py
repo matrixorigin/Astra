@@ -79,30 +79,22 @@ class ToolMockingLayer:
         self.result_storage = result_storage
         self.session_id = session_id
         
-        if session:
-            self._session = session
-            self._owns_session = False
-        else:
-            # We enforce dependency injection for better resource management
-            # But if absolutely necessary, we can create one (and log warning)
-            # In production, this branch should be avoided.
-            logger.warning(
-                "ToolMockingLayer initialized without explicit session. "
-                "This may cause connection churn. Prefer passing a session."
-            )
-            self._session = SessionLocal()
-            self._owns_session = True
+        self._session = session
+        self._lazy_session = None
+        self._owns_session = session is None
             
         if self.mode == MockMode.REPLAY and not self.session_id:
             raise ValueError("session_id required for replay mode")
 
     def _get_session(self) -> Session:
         """Get database session."""
-        if not self._session:
-             # Should not happen if __init__ is correct, but for safety
-             self._session = SessionLocal()
-             self._owns_session = True
-        return self._session
+        if self._session:
+            return self._session
+        
+        if not self._lazy_session:
+            self._lazy_session = SessionLocal()
+            
+        return self._lazy_session
 
     def __enter__(self):
         return self
@@ -111,11 +103,10 @@ class ToolMockingLayer:
         self.close()
 
     def close(self):
-        """Close the session if owned"""
-        if self._owns_session and self._session:
-            logger.debug("Closing ToolMockingLayer owned session")
-            self._session.close()
-            self._session = None
+        """Close session if we own it."""
+        if self._owns_session and self._lazy_session:
+            self._lazy_session.close()
+            self._lazy_session = None
 
     def __del__(self):
         """Destructor to ensure cleanup (failsafe)."""
@@ -422,7 +413,7 @@ class ToolMockingLayer:
                 query = query.filter(
                     EventModel.session_id == session_id,
                     EventModel.skill_name == skill_name,
-                    EventModel.event_type == 'tool_result'
+                    EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
                 ).order_by(EventModel.created_at.desc())
             
             event = query.first()

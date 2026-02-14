@@ -17,9 +17,32 @@ class ModernSkillSelector:
 
     def __init__(self, session: Session | None = None, llm_client=None):
         self._owns_session = session is None
-        self.session = session or SessionLocal()
+        self._session = session
+        self._lazy_session = None
         self.llm = llm_client
-        self.rule_selector = SkillSelector(self.session)  # For retrieval
+        self._rule_selector = None  # Lazy init
+
+    @property
+    def session(self) -> Session:
+        """Get session, creating one if needed."""
+        if self._session:
+            return self._session
+        
+        if not self._lazy_session:
+            self._lazy_session = SessionLocal()
+        
+        return self._lazy_session
+
+    @property
+    def rule_selector(self) -> SkillSelector:
+        """Lazy init rule selector."""
+        if self._rule_selector is None:
+            self._rule_selector = SkillSelector(self.session)
+        return self._rule_selector
+
+    @rule_selector.setter
+    def rule_selector(self, value: SkillSelector):
+        self._rule_selector = value
 
     def __enter__(self):
         return self
@@ -28,8 +51,9 @@ class ModernSkillSelector:
         self.close()
 
     def close(self):
-        if self._owns_session:
-            self.session.close()
+        if self._owns_session and self._lazy_session:
+            self._lazy_session.close()
+            self._lazy_session = None
 
     def get_tools_schema(
         self,

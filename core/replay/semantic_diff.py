@@ -23,8 +23,31 @@ class SemanticDiff:
             db: SQLAlchemy Session instance. If None, creates a new one.
         """
         self._owns_session = db is None
-        self.db = db or SessionLocal()
-        self.reader = EventReader(self.db)
+        self._db = db
+        self._lazy_session = None
+        self._reader = None
+
+    @property
+    def db(self) -> Session:
+        """Get session, creating one if needed."""
+        if self._db:
+            return self._db
+        
+        if not self._lazy_session:
+            self._lazy_session = SessionLocal()
+        
+        return self._lazy_session
+    
+    @property
+    def reader(self) -> EventReader:
+        """Lazy init reader."""
+        if self._reader is None:
+            self._reader = EventReader(self.db)
+        return self._reader
+
+    @reader.setter
+    def reader(self, value: EventReader):
+        self._reader = value
 
     def __enter__(self):
         return self
@@ -34,8 +57,9 @@ class SemanticDiff:
 
     def close(self):
         """Close the session if owned"""
-        if self._owns_session and self.db:
-            self.db.close()
+        if self._owns_session and self._lazy_session:
+            self._lazy_session.close()
+            self._lazy_session = None
 
     def __del__(self):
         self.close()

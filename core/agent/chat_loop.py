@@ -245,6 +245,13 @@ class ChatLoop:
                     result_str = json.dumps({"error": str(e)})
 
                 # Log tool result
+                metadata = {
+                    "call_id": tc_id,
+                    "skill_result": result,  # Store structured result for Replay
+                    "skill_name": fn_name,
+                    "skill_params": params
+                }
+                
                 self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
@@ -252,6 +259,7 @@ class ChatLoop:
                     content=json.dumps({"call_id": tc_id, "result": result_str[:500]}),
                     parent_event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
+                    metadata=metadata
                 )
 
                 # Append tool result in OpenAI protocol format

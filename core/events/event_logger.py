@@ -23,22 +23,26 @@ class EventLogger:
         """Initialize event logger.
 
         Args:
-            session: SQLAlchemy session. If None, creates a new one (not recommended).
+            session: SQLAlchemy session. If None, creates one lazily when needed.
         """
-        if session:
-            self.session = session
-            self._owns_session = False
-        else:
-            # We enforce dependency injection for better resource management
-            # But if absolutely necessary, we can create one (and log warning)
-            from core.logging_config import get_logger
-            logger = get_logger(__name__)
-            logger.warning(
-                "EventLogger initialized without explicit session. "
-                "This may cause connection churn. Prefer passing a session."
-            )
-            self.session = SessionLocal()
-            self._owns_session = True
+        self._session = session
+        self._lazy_session = None
+        self._owns_session = session is None
+
+    def _get_session(self) -> Session:
+        """Get session, creating one if needed."""
+        if self._session:
+            return self._session
+        
+        if not self._lazy_session:
+            self._lazy_session = SessionLocal()
+        
+        return self._lazy_session
+
+    @property
+    def session(self) -> Session:
+        """Get session (alias for _get_session)."""
+        return self._get_session()
 
     def __enter__(self):
         return self
@@ -48,8 +52,9 @@ class EventLogger:
 
     def close(self):
         """Close session if we own it."""
-        if self._owns_session:
-            self.session.close()
+        if self._owns_session and self._lazy_session:
+            self._lazy_session.close()
+            self._lazy_session = None
 
     def log_event(self, event: ConversationEvent) -> str:
         """Log a conversation event to the database.
@@ -63,6 +68,7 @@ class EventLogger:
         Raises:
             Exception: If database operation fails
         """
+        session = self._get_session()
         
         db_event = EventModel(
             event_id=event.event_id,
@@ -89,8 +95,8 @@ class EventLogger:
             llm_params=event.llm_params,
         )
         
-        self.session.add(db_event)
-        self.session.commit()
+        session.add(db_event)
+        session.commit()
         return event.event_id
 
     def create_plan_event(

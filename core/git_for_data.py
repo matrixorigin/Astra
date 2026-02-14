@@ -24,7 +24,23 @@ class GitForData:
             db: Session instance. If None, creates a new one.
         """
         self._owns_session = db is None
-        self.db = db or SessionLocal()
+        self._db = db
+        self._lazy_session = None
+
+    @property
+    def db(self) -> Session:
+        """Get session, creating one if needed."""
+        if self._db:
+            return self._db
+        
+        if not self._lazy_session:
+            self._lazy_session = SessionLocal()
+        
+        return self._lazy_session
+
+    @db.setter
+    def db(self, value: Session):
+        self._db = value
 
     def __enter__(self):
         return self
@@ -34,8 +50,9 @@ class GitForData:
 
     def close(self):
         """Close the session if it was created by this instance."""
-        if self._owns_session:
-            self.db.close()
+        if self._owns_session and self._lazy_session:
+            self._lazy_session.close()
+            self._lazy_session = None
 
     def create_snapshot(self, snapshot_name: str, account: str = "sys") -> dict:
         """Create a snapshot of the current database state.

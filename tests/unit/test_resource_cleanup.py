@@ -64,6 +64,8 @@ class TestResourceCleanup:
         mock_session_local.return_value = mock_session
 
         git = GitForData()
+        # Trigger lazy session creation
+        _ = git.db
         git.close()
         
         mock_session.close.assert_called_once()
@@ -289,9 +291,9 @@ class TestResourceCleanup:
 
         with ToolMockingLayer(MockMode.PRODUCTION) as layer:
             # Trigger session creation
-            layer._get_session()
+            session = layer._get_session()
             assert layer._owns_session is True
-            assert layer._session is mock_session
+            assert session is mock_session
             
         mock_session.close.assert_called_once()
 
