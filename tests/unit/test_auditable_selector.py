@@ -177,13 +177,21 @@ class TestAuditableSkillSelector:
             
             assert len(event.selected_skills) > 0
 
-    def test_create_selection_snapshot_fallback(self, selector):
-        """Test snapshot creation fallback."""
-        # Snapshot functionality is disabled, should return timestamp-based ID
+    def test_create_selection_snapshot_fallback(self, selector, monkeypatch):
+        """Test snapshot creation fallback when Git for Data fails."""
+        # Mock GitForData to raise error
+        def mock_create_snapshot(*args, **kwargs):
+            raise Exception("Snapshot creation failed")
+        
+        from core import git_for_data
+        monkeypatch.setattr(git_for_data.GitForData, "create_snapshot", mock_create_snapshot)
+        
+        # Should fallback to timestamp-based ID
         snapshot_id = selector._create_selection_snapshot("sess-1", "evt-1")
         
-        # Should return timestamp-based snapshot
+        # Should return timestamp-based snapshot (fallback)
         assert "snapshot_" in snapshot_id
+        assert "T" in snapshot_id  # ISO timestamp format
 
     def test_get_available_skills_empty(self, selector, db):
         """Test getting skills when none exist."""

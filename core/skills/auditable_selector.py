@@ -171,9 +171,20 @@ class AuditableSkillSelector:
         This enables time-travel debugging - we can replay any selection
         with the exact data state the selector saw.
         """
-        # Snapshot functionality temporarily disabled during ORM migration
-        # TODO: Re-implement using raw SQL connection if needed
-        return f"snapshot_{datetime.now(timezone.utc).isoformat()}"
+        from core.git_for_data import GitForData
+        
+        # Use full event_id to ensure uniqueness (replace hyphens with underscores)
+        snapshot_name = f"skill_select_{event_id.replace('-', '_')}"
+        git = GitForData(self.session)
+        
+        try:
+            snapshot_info = git.create_snapshot(snapshot_name, account=self.account)
+            logger.info(f"Created snapshot {snapshot_name} for selection {event_id}")
+            return snapshot_name
+        except Exception as e:
+            logger.error(f"Failed to create snapshot: {e}")
+            # Fallback to timestamp-based identifier
+            return f"snapshot_{datetime.now(timezone.utc).isoformat()}"
 
     def _get_available_skills(self) -> list[SkillMetadata]:
         """Get all available skills at this moment."""
@@ -322,7 +333,7 @@ class AuditableSkillSelector:
         available_skills: list[SkillMetadata],
     ) -> SkillSelectionEvent:
         """Create an empty event when no skills are selected."""
-        return SkillSelectionEvent(
+        event = SkillSelectionEvent(
             event_id=event_id,
             session_id=session_id,
             user_query=query,
@@ -334,6 +345,9 @@ class AuditableSkillSelector:
             candidate_scores={},
             created_at=datetime.now(timezone.utc),
         )
+        # Save the event
+        self._save_event(event)
+        return event
 
     def _save_event(self, event: SkillSelectionEvent):
         """Save selection event to database."""
@@ -354,9 +368,11 @@ class AuditableSkillSelector:
             )
             self.session.add(event_model)
             self.session.commit()
+            logger.info(f"Saved selection event {event.event_id} to database")
         except Exception as e:
-            logger.error(f"Failed to save selection event: {e}")
+            logger.error(f"Failed to save selection event: {e}", exc_info=True)
             self.session.rollback()
+            raise  # Re-raise to make failures visible
 
     def update_execution_result(
         self,
