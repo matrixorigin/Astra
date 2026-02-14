@@ -55,6 +55,8 @@ class LearningStatsResponse(BaseModel):
     avg_confidence: float
     by_signal_type: dict[str, int]
     weights: dict[str, float]
+    weights_per_signal: dict[str, dict[str, float]]
+    decay: dict[str, Any]
     total_gates: int
     passed_gates: int
     failed_gates: int
@@ -212,6 +214,8 @@ async def get_learning_stats(
             avg_confidence=stats["learnings"]["avg_confidence"],
             by_signal_type=stats["learnings"]["by_signal_type"],
             weights=stats["learnings"]["weights"],
+            weights_per_signal=stats["learnings"]["weights_per_signal"],
+            decay=stats["learnings"]["decay"],
             total_gates=stats["regression_gates"]["total_gates"],
             passed_gates=stats["regression_gates"]["passed"],
             failed_gates=stats["regression_gates"]["failed"],

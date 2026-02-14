@@ -606,6 +606,8 @@ class TestLearningStats:
         # Check weights included
         assert "weights" in stats
         assert stats["weights"]["accuracy"] == 0.4
+        assert "weights_per_signal" in stats
+        assert "decay" in stats
 
 
 class TestSignalThresholds:

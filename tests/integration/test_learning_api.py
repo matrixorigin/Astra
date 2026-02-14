@@ -40,6 +40,8 @@ class TestLearningAPI:
         data = response.json()
         assert "total_learnings" in data
         assert "high_confidence" in data
+        assert "weights_per_signal" in data
+        assert "decay" in data
         assert "total_gates" in data
         assert "pass_rate" in data
 

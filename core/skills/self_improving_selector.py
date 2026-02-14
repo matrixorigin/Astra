@@ -571,7 +571,7 @@ class SelfImprovingSelector:
             if cfg.key_name == CONFIG_KEY_LEARNING_WEIGHTS:
                 parsed = self._parse_json_config(cfg.value)
                 if isinstance(parsed, dict):
-                    per_signal_weights = parsed.get("per_signal", {}) or {}
+                    per_signal_weights = self._sanitize_per_signal_weights(parsed.get("per_signal", {}) or {})
                 weights = self._merge_weights(weights, parsed)
             elif cfg.key_name == CONFIG_KEY_LEARNING_DECAY:
                 parsed = self._parse_json_config(cfg.value)
@@ -613,6 +613,33 @@ class SelfImprovingSelector:
         except ValueError:
             logger.warning("Invalid selector_learning_weights, using defaults")
             return base
+
+    def _sanitize_per_signal_weights(self, per_signal: Any) -> dict[str, dict[str, float]]:
+        if not isinstance(per_signal, dict):
+            logger.warning("Invalid selector_learning_weights per_signal, using defaults")
+            return {}
+        valid_signals = {st.value for st in SignalType}
+        allowed_keys = {"accuracy", "speed", "cost", "satisfaction"}
+        sanitized: dict[str, dict[str, float]] = {}
+        for signal_type, override in per_signal.items():
+            if signal_type not in valid_signals:
+                logger.warning("Unknown signal_type in per_signal weights, skipping")
+                continue
+            if not isinstance(override, dict):
+                logger.warning("Invalid per_signal override for signal_type, skipping")
+                continue
+            cleaned: dict[str, float] = {}
+            for key, value in override.items():
+                if key not in allowed_keys:
+                    logger.warning("Invalid weight key in per_signal override, skipping")
+                    continue
+                try:
+                    cleaned[key] = float(value)
+                except (TypeError, ValueError):
+                    logger.warning("Invalid weight value in per_signal override, skipping")
+            if cleaned:
+                sanitized[signal_type] = cleaned
+        return sanitized
 
     def _effective_confidence(
         self,
