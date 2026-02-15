@@ -273,6 +273,75 @@ class TestSkillLearningSignalTable:
         assert json.loads(result[3]) == {"reason": "test"}
 
 
+class TestSkillPipelineLearn:
+    """Test SkillPipeline learning functionality."""
+
+    def test_skill_pipeline_learn(self, db, clean_db):
+        """Test learning cycle."""
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=False,
+            learning=True,
+            learning_weights=SignalWeights()
+        )
+        
+        result = pipeline.learn(days=7)
+        
+        assert result.learned >= 0
+        assert result.total_failures >= 0
+        assert 'wrong_skill' in result.signals_by_type
+
+    def test_skill_pipeline_stats(self, db, clean_db):
+        """Test getting learning statistics."""
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=False,
+            learning=True
+        )
+        
+        stats = pipeline.stats()
+        
+        assert 'total_learnings' in stats
+        assert 'high_confidence' in stats
+        assert 'by_signal_type' in stats
+        assert 'regression_gates' in stats
+
+    def test_skill_pipeline_selection_history(self, db, clean_db):
+        """Test getting selection history."""
+        event_id = str(uuid7())
+        session_id = str(uuid7())
+        
+        event = SkillSelectionEvent(
+            event_id=event_id,
+            session_id=session_id,
+            user_query="test query",
+            context_snapshot="test",
+            available_skills=[],
+            selected_skills=["test_skill"],
+            selection_method="pipeline_v1",
+            selection_reasoning="test",
+            candidate_scores={},
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None)
+        )
+        db.add(event)
+        db.commit()
+        
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=False,
+            learning=False
+        )
+        
+        history = pipeline.selection_history(session_id=session_id, limit=10)
+        
+        assert len(history) > 0
+        assert history[0]['event_id'] == event_id
+        assert history[0]['user_query'] == "test query"
+
+
 class TestSkillPipelineIntegration:
     """Test SkillPipeline with real database."""
 
@@ -321,7 +390,170 @@ class TestSkillPipelineIntegration:
         
         assert result[0] == 1
 
-    def test_skill_pipeline_flush_on_close(self, db, clean_db):
+    def test_skill_pipeline_get_tools_schema(self, db, clean_db):
+        """Test get_tools_schema with audit enabled."""
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=True,
+            learning=False
+        )
+        
+        result = pipeline.get_tools_schema("test query", str(uuid7()))
+        
+        assert result.tools is not None
+        assert result.event_id is not None
+        assert result.candidates >= 0
+
+    def test_skill_pipeline_record_feedback_no_event_id(self, db, clean_db):
+        """Test record_feedback with None event_id (no-op)."""
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=False,
+            learning=True
+        )
+        
+        # Should not raise error
+        pipeline.record_feedback(None, SignalType.WRONG_SKILL, {"reason": "test"})
+        
+        flushed = pipeline.flush_feedback()
+        assert flushed == 0
+
+    def test_skill_pipeline_record_feedback_learning_disabled(self, db, clean_db):
+        """Test record_feedback with learning disabled (no-op)."""
+        event_id = str(uuid7())
+        
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=False,
+            learning=False
+        )
+        
+        # Should not raise error
+        pipeline.record_feedback(event_id, SignalType.WRONG_SKILL, {"reason": "test"})
+        
+        flushed = pipeline.flush_feedback()
+        assert flushed == 0
+
+    def test_feedback_buffer_error_handling(self, db, clean_db):
+        """Test feedback buffer error handling and re-queueing."""
+        buffer = _FeedbackBuffer(db, batch_size=2, flush_interval=3600)
+        
+        event_id = str(uuid7())
+        buffer.add(event_id, SignalType.WRONG_SKILL, {"reason": "test1"})
+        buffer.add(event_id, SignalType.SLOW_EXECUTION, {"ms": 5000})
+        
+        # Verify signals are in buffer before flush
+        assert len(buffer._buffer) == 0  # Auto-flushed at batch_size=2
+        
+        # Verify they were written to DB
+        result = db.execute(
+            text("SELECT COUNT(*) FROM skill_learning_signals WHERE selection_event_id = :eid"),
+            {"eid": event_id}
+        ).fetchone()
+        assert result[0] == 2
+
+    def test_skill_pipeline_maybe_flush_timing(self, db, clean_db):
+        """Test opportunistic flush timing."""
+        buffer = _FeedbackBuffer(db, batch_size=100, flush_interval=0.05)
+        
+        event_id = str(uuid7())
+        buffer.add(event_id, SignalType.WRONG_SKILL, {"reason": "test"})
+        
+        # Immediate flush should return 0
+        flushed = buffer.maybe_flush()
+        assert flushed == 0
+        
+        # Wait and flush should return 1
+        time.sleep(0.1)
+        flushed = buffer.maybe_flush()
+        assert flushed == 1
+
+    def test_skill_pipeline_all_signal_types(self, db, clean_db):
+        """Test all signal types are recorded."""
+        event_id = str(uuid7())
+        session_id = str(uuid7())
+        
+        event = SkillSelectionEvent(
+            event_id=event_id,
+            session_id=session_id,
+            user_query="test query",
+            context_snapshot="test",
+            available_skills=[],
+            selected_skills=["test_skill"],
+            selection_method="pipeline_v1",
+            selection_reasoning="test",
+            candidate_scores={},
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None)
+        )
+        db.add(event)
+        db.commit()
+        
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=False,
+            learning=True
+        )
+        
+        # Record all signal types
+        for signal_type in [SignalType.WRONG_SKILL, SignalType.SLOW_EXECUTION, 
+                           SignalType.HIGH_COST, SignalType.LOW_SATISFACTION]:
+            pipeline.record_feedback(event_id, signal_type, {"test": "data"})
+        
+        flushed = pipeline.flush_feedback()
+        assert flushed == 4
+        
+        # Verify all types in DB
+        result = db.execute(
+            text("SELECT COUNT(DISTINCT signal_type) FROM skill_learning_signals WHERE selection_event_id = :eid"),
+            {"eid": event_id}
+        ).fetchone()
+        assert result[0] == 4
+
+    def test_skill_pipeline_get_tools_schema_with_learning(self, db, clean_db):
+        """Test get_tools_schema with learning enabled."""
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=True,
+            learning=True,
+            learning_weights=SignalWeights()
+        )
+        
+        result = pipeline.get_tools_schema("test query", str(uuid7()))
+        
+        assert result.tools is not None
+        assert result.event_id is not None
+
+    def test_skill_pipeline_selection_history_empty(self, db, clean_db):
+        """Test selection_history with no results."""
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=False,
+            learning=False
+        )
+        
+        history = pipeline.selection_history(session_id=str(uuid7()), limit=10)
+        
+        assert len(history) == 0
+
+    def test_skill_pipeline_learn_with_no_data(self, db, clean_db):
+        """Test learn with no recent failure data."""
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=False,
+            learning=True
+        )
+        
+        # Learn from very old data (should find nothing)
+        result = pipeline.learn(days=0)
+        
+        assert result.error is None
         """Test that feedback is flushed when session closes."""
         event_id = str(uuid7())
         session_id = str(uuid7())
