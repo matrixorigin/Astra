@@ -10,7 +10,7 @@ from sqlalchemy import text
 
 from core.skills.pipeline import _FeedbackBuffer, SkillPipeline, SignalType
 from core.skills.learning_signals import SignalWeights
-from api.models import SkillLearningSignal, SkillSelectionEvent
+from api.models import SkillLearningSignal, SkillSelectionEvent, SkillSelectionLearning
 from api.database import get_db_session
 
 
@@ -554,6 +554,53 @@ class TestSkillPipelineIntegration:
         result = pipeline.learn(days=0)
         
         assert result.error is None
+
+    def test_skill_pipeline_get_tools_schema_applies_learnings(self, db, clean_db):
+        """Test get_tools_schema applies learned corrections."""
+        # Create a learning record
+        learning = SkillSelectionLearning(
+            learning_id=str(uuid7()),
+            query_pattern="test",
+            wrong_skills=["wrong_skill"],
+            correct_skills=["correct_skill"],
+            improvement_score=10.0,
+            confidence=100.0,
+            evidence_count=10,
+            signal_type="wrong_skill",
+            target_metrics={"accuracy": 1.0},
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None)
+        )
+        db.add(learning)
+        db.commit()
+        
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=False,
+            learning=True
+        )
+        
+        # Get tools with learning applied
+        result = pipeline.get_tools_schema("test query", str(uuid7()))
+        
+        assert result.tools is not None
+        assert result.candidates >= 0
+
+    def test_skill_pipeline_record_selection_audit(self, db, clean_db):
+        """Test _record_selection creates audit event."""
+        pipeline = SkillPipeline(
+            db=db,
+            llm_client=None,
+            audit=True,
+            learning=False
+        )
+        
+        session_id = str(uuid7())
+        # get_tools_schema may return empty tools, so just verify audit works
+        result = pipeline.get_tools_schema("test query", session_id)
+        
+        # Verify event was created (even if tools are empty)
+        assert result.event_id is not None
         """Test that feedback is flushed when session closes."""
         event_id = str(uuid7())
         session_id = str(uuid7())

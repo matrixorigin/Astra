@@ -304,13 +304,19 @@ class SkillPipeline:
 
         try:
             self._db.execute(
-                """INSERT INTO skill_selection_events
-                   (event_id, session_id, user_query, selected_skills,
-                    selection_method, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                (event_id, session_id, query,
-                 ",".join(skill_names), "pipeline_v1",
-                 datetime.now(timezone.utc).isoformat()),
+                text("""INSERT INTO skill_selection_events
+                       (event_id, session_id, user_query, selected_skills,
+                        selection_method, created_at)
+                       VALUES (:event_id, :session_id, :user_query, :selected_skills,
+                        :selection_method, :created_at)"""),
+                {
+                    "event_id": event_id,
+                    "session_id": session_id,
+                    "user_query": query,
+                    "selected_skills": ",".join(skill_names),
+                    "selection_method": "pipeline_v1",
+                    "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
+                },
             )
             self._db.commit()
         except Exception as e:
