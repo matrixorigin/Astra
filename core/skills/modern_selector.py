@@ -1,4 +1,10 @@
-"""Modern skill selector with native LLM function calling."""
+"""Internal modern skill selector with native LLM function calling.
+
+⚠️ DO NOT USE DIRECTLY - Use SkillPipeline instead.
+
+This module is an internal implementation detail used by SkillPipeline.
+External code should use SkillPipeline from core.skills.pipeline.
+"""
 
 import json
 from typing import Any

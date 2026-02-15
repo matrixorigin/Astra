@@ -1,4 +1,13 @@
-"""Skill selection and orchestration."""
+"""Internal skill selector implementation.
+
+⚠️ DO NOT USE DIRECTLY - Use SkillPipeline instead.
+
+This module contains internal implementation details used by ModernSkillSelector:
+- SkillMetadata: Core data structure for skill information
+- SkillSelector: Rule-based retrieval engine
+
+External code should use SkillPipeline from core.skills.pipeline.
+"""
 
 from dataclasses import dataclass
 from typing import Any

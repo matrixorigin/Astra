@@ -144,32 +144,34 @@ The change to ChatLoop is minimal — replace `self.selector` with `self.pipelin
 
 ## 5. Migration
 
-### Phase 1: Create SkillPipeline (new file)
+### Phase 1: Create SkillPipeline (new file) ✅ COMPLETE
 
-Create `core/skills/pipeline.py`:
-- Compose `SkillSelector` (retrieval), `ModernSkillSelector` (LLM ranking), `SelfImprovingSelector` (corrections) internally
-- Expose only `get_tools_schema()`, `record_feedback()`, `learn()`, `stats()`
+Created `core/skills/pipeline.py`:
+- Composes `SkillSelector` (retrieval), `ModernSkillSelector` (LLM ranking), `SelfImprovingSelector` (corrections) internally
+- Exposes only `get_tools_schema()`, `record_feedback()`, `learn()`, `stats()`
 - Audit event creation inlined (no separate AuditableSkillSelector)
 
-### Phase 2: Wire into ChatLoop
+### Phase 2: Wire into ChatLoop ✅ COMPLETE
 
-- `ChatLoop.__init__` accepts `pipeline: SkillPipeline` instead of `selector`
-- `cli/mo_agent.py` creates `SkillPipeline` instead of `AgentSkillSelector`
-- `api/routers/streaming.py` same change
-- `api/routers/learning.py` calls `pipeline.learn()` and `pipeline.stats()`
+- ✅ `ChatLoop.__init__` accepts `pipeline: SkillPipeline` instead of `selector`
+- ✅ `cli/mo_agent.py` creates `SkillPipeline` instead of `AgentSkillSelector`
+- ✅ `api/routers/streaming.py` same change
+- ✅ `api/routers/learning.py` calls `pipeline.learn()` and `pipeline.stats()`
 
-### Phase 3: Delete old code
+### Phase 3: Cleanup ✅ COMPLETE
 
-Remove after all tests pass:
-- `core/skills/selector.py` → retrieval logic moved into pipeline
-- `core/skills/auditable_selector.py` → audit logic moved into pipeline
-- `core/agent/selector.py` → replaced by pipeline
+**Deleted:**
+- ✅ `core/agent/selector.py` — `AgentSkillSelector` removed (was wrapper class)
+- ✅ `core/skills/auditable_selector.py` — audit logic moved into pipeline (never existed in final implementation)
 
-Keep (used internally by pipeline):
-- `core/skills/modern_selector.py` — LLM function calling engine
-- `core/skills/self_improving_selector.py` — learning engine
-- `core/skills/learning_signals.py` — signal types
-- `core/skills/regression_gate.py` — gate validation
+**Kept as Internal Implementation (not for external use):**
+- ✅ `core/skills/selector.py` — Contains `SkillMetadata` (core data structure) and `SkillSelector` (rule-based retrieval used by `ModernSkillSelector`)
+- ✅ `core/skills/modern_selector.py` — LLM function calling engine used by pipeline
+- ✅ `core/skills/self_improving_selector.py` — learning engine used by pipeline
+- ✅ `core/skills/learning_signals.py` — signal types
+- ✅ `core/skills/regression_gate.py` — gate validation
+
+**⚠️ Important**: `selector.py` and `modern_selector.py` are marked as internal implementation details. External code must use `SkillPipeline` only. These files contain docstring warnings against direct use.
 
 ## 6. What This Does NOT Change
 

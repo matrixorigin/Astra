@@ -9,20 +9,20 @@ Phase 1 of the self-improving selector adds multi-dimensional learning, enabling
 ### Basic Usage (Default Configuration)
 
 ```python
-from core.agent.selector import AgentSkillSelector
+from core.skills.pipeline import SkillPipeline
 
-# Create selector with learning enabled
-selector = AgentSkillSelector(
+# Create pipeline with learning enabled
+pipeline = SkillPipeline(
     db=db,
     llm_client=llm_client,
-    enable_learning=True,
+    learning=True,
 )
 
 # Trigger learning from recent failures
-result = selector.learn_from_failures(days=7)
+result = pipeline.learn(days=7)
 
-print(f"Learned {result['learned']} patterns")
-print(f"Signal breakdown: {result['signals_by_type']}")
+print(f"Learned {result.learned} patterns")
+print(f"Signal breakdown: {result.signals_by_type}")
 ```
 
 ## Custom Configuration
@@ -42,10 +42,10 @@ weights = SignalWeights(
     satisfaction=0.1   # 10% - lowest
 )
 
-selector = AgentSkillSelector(
+pipeline = SkillPipeline(
     db=db,
     llm_client=llm_client,
-    enable_learning=True,
+    learning=True,
     learning_weights=weights,
 )
 ```
@@ -55,18 +55,22 @@ selector = AgentSkillSelector(
 Adjust when signals are triggered:
 
 ```python
-from core.skills.learning_signals import SignalThresholds
-from core.skills.self_improving_selector import SelfImprovingSelector
+from core.skills.learning_signals import SignalThresholds, SignalWeights
+from core.skills.pipeline import SkillPipeline
 
-# Stricter thresholds
-thresholds = SignalThresholds(
-    slow_execution_ms=10000,  # 10 seconds (default: 5s)
-    high_cost_usd=0.50,       # $0.50 (default: $0.10)
-    low_satisfaction=2,       # < 2 stars (default: < 3 stars)
+# Stricter thresholds (configured via Config table)
+# See api/models.py Config for threshold configuration
+
+# Custom weights
+weights = SignalWeights(
+    accuracy=0.3,
+    speed=0.2,
+    cost=0.4,
+    satisfaction=0.1
 )
 
-selector = SelfImprovingSelector(
-    session=db,
+pipeline = SkillPipeline(
+    db=db,
     llm_client=llm_client,
     weights=weights,
     thresholds=thresholds,
@@ -81,13 +85,13 @@ Learn from specific signal types only:
 from core.skills.learning_signals import SignalType
 
 # Phase 1: Focus on accuracy
-result = selector.learn_from_failures(
+result = pipeline.learn(
     days=7,
     signal_types=[SignalType.WRONG_SKILL],
 )
 
 # Phase 2: Add performance optimization
-result = selector.learn_from_failures(
+result = pipeline.learn(
     days=7,
     signal_types=[
         SignalType.WRONG_SKILL,
@@ -96,7 +100,7 @@ result = selector.learn_from_failures(
 )
 
 # Phase 3: Full optimization
-result = selector.learn_from_failures(
+result = pipeline.learn(
     days=7,
     signal_types=[
         SignalType.WRONG_SKILL,
@@ -260,10 +264,10 @@ Begin with default thresholds and weights, then adjust based on your needs:
 
 ```python
 # Start with defaults
-selector = AgentSkillSelector(db, llm_client, enable_learning=True)
+pipeline = SkillPipeline(db, llm_client, enable_learning=True)
 
 # Monitor for 1 week
-result = selector.learn_from_failures(days=7)
+result = pipeline.learn(days=7)
 
 # Adjust if needed
 weights = SignalWeights(accuracy=0.5, speed=0.2, cost=0.2, satisfaction=0.1)
