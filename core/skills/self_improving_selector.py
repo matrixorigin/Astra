@@ -729,6 +729,17 @@ class SelfImprovingSelector:
             ).count()
             signal_breakdown[signal_type.value] = count
         
+        # Query regression gate results (validates selector changes before deployment)
+        # Key metrics: pass_rate (safety), avg_improvement_pct (effectiveness)
+        from api.models import SelectorGateResult
+        gate_results = self.session.query(SelectorGateResult).all()
+        total_gates = len(gate_results)
+        passed = sum(1 for g in gate_results if g.verdict == "PASS")
+        failed = total_gates - passed
+        pass_rate = passed / total_gates if total_gates > 0 else 0.0
+        improvements = [g.improvement_pct for g in gate_results if g.improvement_pct is not None]
+        avg_improvement_pct = sum(improvements) / len(improvements) if improvements else 0.0
+        
         return {
             "total_learnings": total,
             "high_confidence": high_confidence,
@@ -741,11 +752,11 @@ class SelfImprovingSelector:
                 "decay": runtime_config["decay"],
             },
             "regression_gates": {
-                "total_gates": 0,
-                "passed": 0,
-                "failed": 0,
-                "pass_rate": 0.0,
-                "avg_improvement_pct": 0.0,
+                "total_gates": total_gates,
+                "passed": passed,
+                "failed": failed,
+                "pass_rate": pass_rate,
+                "avg_improvement_pct": avg_improvement_pct,
             },
             "semantic_similarity_threshold": runtime_config["semantic_similarity_threshold"],
             "semantic_match_limit": runtime_config["semantic_match_limit"],

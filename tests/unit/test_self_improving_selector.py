@@ -74,13 +74,19 @@ class TestSelfImprovingSelector:
     def test_get_learning_stats_no_data(self, self_improving, db):
         """Test stats with no data."""
         # Clear any existing data
-        from api.models import SkillSelectionLearning
+        from api.models import SkillSelectionLearning, SelectorGateResult
         db.query(SkillSelectionLearning).delete()
+        db.query(SelectorGateResult).delete()
         db.commit()
         
         stats = self_improving.get_learning_stats()
         
         assert stats["total_learnings"] == 0
+        assert stats["regression_gates"]["total_gates"] == 0
+        assert stats["regression_gates"]["passed"] == 0
+        assert stats["regression_gates"]["failed"] == 0
+        assert stats["regression_gates"]["pass_rate"] == 0.0
+        assert stats["regression_gates"]["avg_improvement_pct"] == 0.0
 
     def test_get_recent_failures(self, self_improving, db):
         """Test getting failures."""
@@ -514,11 +520,12 @@ class TestSelfImprovingSelector:
     def test_get_learning_stats_with_data(self, self_improving, db):
         """Test stats with data."""
         # Clear and insert using ORM
-        from api.models import Config, SkillSelectionLearning
+        from api.models import Config, SkillSelectionLearning, SelectorGateResult
         db.query(Config).filter(
             Config.key_name == "selector_semantic_similarity_threshold"
         ).delete()
         db.query(SkillSelectionLearning).delete()
+        db.query(SelectorGateResult).delete()
         db.commit()
         
         for i in range(3):
@@ -531,6 +538,28 @@ class TestSelfImprovingSelector:
                 evidence_count=i + 1
             )
             db.add(learning)
+        
+        # Add gate results
+        db.add(SelectorGateResult(
+            gate_id=f"gate-1-{uuid.uuid4().hex[:8]}",
+            selector_version="v1",
+            test_queries=[],
+            test_count=10,
+            verdict="PASS",
+            new_avg_score=0.85,
+            old_avg_score=0.80,
+            improvement_pct=6.25,
+        ))
+        db.add(SelectorGateResult(
+            gate_id=f"gate-2-{uuid.uuid4().hex[:8]}",
+            selector_version="v2",
+            test_queries=[],
+            test_count=10,
+            verdict="FAIL",
+            new_avg_score=0.75,
+            old_avg_score=0.80,
+            improvement_pct=-6.25,
+        ))
         db.commit()
         
         stats = self_improving.get_learning_stats()
@@ -538,6 +567,66 @@ class TestSelfImprovingSelector:
         assert stats["total_learnings"] == 3
         assert stats["avg_confidence"] > 0
         assert stats["semantic_similarity_threshold"] == 0.78
+        assert stats["regression_gates"]["total_gates"] == 2
+        assert stats["regression_gates"]["passed"] == 1
+        assert stats["regression_gates"]["failed"] == 1
+        assert stats["regression_gates"]["pass_rate"] == 0.5
+        assert stats["regression_gates"]["avg_improvement_pct"] == 0.0  # (6.25 + -6.25) / 2
+
+    def test_get_learning_stats_with_null_improvement(self, self_improving, db):
+        """Test stats with NULL improvement_pct."""
+        from api.models import SkillSelectionLearning, SelectorGateResult
+        db.query(SkillSelectionLearning).delete()
+        db.query(SelectorGateResult).delete()
+        db.commit()
+        
+        # Add gate with NULL improvement_pct
+        db.add(SelectorGateResult(
+            gate_id=f"gate-null-{uuid.uuid4().hex[:8]}",
+            selector_version="v1",
+            test_queries=[],
+            test_count=10,
+            verdict="PASS",
+            new_avg_score=0.85,
+            old_avg_score=0.80,
+            improvement_pct=None,  # NULL case
+        ))
+        db.commit()
+        
+        stats = self_improving.get_learning_stats()
+        
+        assert stats["regression_gates"]["total_gates"] == 1
+        assert stats["regression_gates"]["passed"] == 1
+        assert stats["regression_gates"]["avg_improvement_pct"] == 0.0  # No valid improvements
+
+    def test_get_learning_stats_all_gates_passing(self, self_improving, db):
+        """Test stats with all gates passing."""
+        from api.models import SkillSelectionLearning, SelectorGateResult
+        db.query(SkillSelectionLearning).delete()
+        db.query(SelectorGateResult).delete()
+        db.commit()
+        
+        # Add 3 passing gates
+        for i in range(3):
+            db.add(SelectorGateResult(
+                gate_id=f"gate-pass-{i}-{uuid.uuid4().hex[:8]}",
+                selector_version=f"v{i}",
+                test_queries=[],
+                test_count=10,
+                verdict="PASS",
+                new_avg_score=0.85 + i * 0.01,
+                old_avg_score=0.80,
+                improvement_pct=5.0 + i,
+            ))
+        db.commit()
+        
+        stats = self_improving.get_learning_stats()
+        
+        assert stats["regression_gates"]["total_gates"] == 3
+        assert stats["regression_gates"]["passed"] == 3
+        assert stats["regression_gates"]["failed"] == 0
+        assert stats["regression_gates"]["pass_rate"] == 1.0
+        assert stats["regression_gates"]["avg_improvement_pct"] == 6.0  # (5 + 6 + 7) / 3
 
     def test_learn_from_failures_with_failures(self, self_improving, db):
         """Test learning from actual failures."""
