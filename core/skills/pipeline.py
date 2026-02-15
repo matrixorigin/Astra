@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from sqlalchemy import text
 
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
@@ -78,7 +79,7 @@ class _FeedbackBuffer:
                 "selection_event_id": event_id,
                 "signal_type": signal.value,
                 "signal_data": json.dumps(data),
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(timezone.utc),
             })
             if len(self._buffer) >= self._batch_size:
                 self._flush_locked()
@@ -104,11 +105,16 @@ class _FeedbackBuffer:
         try:
             for row in batch:
                 self._db.execute(
-                    """INSERT INTO skill_learning_signals
-                       (signal_id, selection_event_id, signal_type, signal_data, created_at)
-                       VALUES (%s, %s, %s, %s, %s)""",
-                    (row["signal_id"], row["selection_event_id"],
-                     row["signal_type"], row["signal_data"], row["created_at"]),
+                    text("""INSERT INTO skill_learning_signals
+                           (signal_id, selection_event_id, signal_type, signal_data, created_at)
+                           VALUES (:signal_id, :selection_event_id, :signal_type, :signal_data, :created_at)"""),
+                    {
+                        "signal_id": row["signal_id"],
+                        "selection_event_id": row["selection_event_id"],
+                        "signal_type": row["signal_type"],
+                        "signal_data": row["signal_data"],
+                        "created_at": row["created_at"],
+                    },
                 )
             self._db.commit()
             logger.debug("Flushed %d feedback signals", len(batch))
