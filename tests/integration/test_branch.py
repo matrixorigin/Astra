@@ -197,3 +197,35 @@ def test_diff_output_count(branch, db_session):
     db_session.commit()
     db_session.execute(text(f"DROP TABLE test_t0_{suffix}"))
     db_session.commit()
+
+
+def test_diff_with_snapshot_and_count(branch, db_session):
+    """Test diff with snapshot and count output."""
+    from core.git_for_data import GitForData
+    from uuid_utils import uuid7
+    import time
+    suffix = str(int(time.time() * 1000) % 10000)
+
+    git = GitForData(db=db_session)
+    snap1 = f"snap_{str(uuid7()).replace('-', '_')}"
+    snap2 = f"snap_{str(uuid7()).replace('-', '_')}"
+
+    db_session.execute(text(f"CREATE TABLE test_t0_{suffix} (a INT, b INT, PRIMARY KEY(a))"))
+    db_session.execute(text(f"INSERT INTO test_t0_{suffix} VALUES (1,1), (2,2)"))
+    db_session.commit()
+    git.create_snapshot(snap1)
+
+    db_session.execute(text(f"INSERT INTO test_t0_{suffix} VALUES (3,3)"))
+    db_session.commit()
+    git.create_snapshot(snap2)
+
+    # Diff with snapshot and count
+    result = branch.diff(f"test_t0_{suffix}", f"test_t0_{suffix}", output="count", target_snapshot=snap2, source_snapshot=snap1)
+    assert len(result) == 1
+    assert "COUNT(*)" in result[0] or "count" in result[0]
+
+    # Cleanup
+    git.drop_snapshot(snap1)
+    git.drop_snapshot(snap2)
+    db_session.execute(text(f"DROP TABLE test_t0_{suffix}"))
+    db_session.commit()

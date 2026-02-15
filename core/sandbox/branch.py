@@ -61,21 +61,21 @@ class Branch:
         if "." not in source:
             source = f"{self.database}.{source}"
         
-        # Try data branch diff first (for branch relationships)
+        # Use data branch diff when snapshots provided
         if target_snapshot or source_snapshot:
-            try:
-                t = f'{target}{{snapshot="{target_snapshot}"}}' if target_snapshot else target
-                s = f'{source}{{snapshot="{source_snapshot}"}}' if source_snapshot else source
-                query = f"data branch diff {t} against {s}"
-                result = self.db.execute(text(query))
-                return [dict(row._mapping) for row in result]
-            except Exception:
-                # Fall back to EXCEPT if data branch diff fails
-                pass
+            t = f'{target}{{snapshot="{target_snapshot}"}}' if target_snapshot else target
+            s = f'{source}{{snapshot="{source_snapshot}"}}' if source_snapshot else source
+            
+            query = f"data branch diff {t} against {s}"
+            if output == "count":
+                query += " output count"
+            
+            result = self.db.execute(text(query))
+            return [dict(row._mapping) for row in result]
         
         # Regular diff using EXCEPT
         if output == "count":
-            query = f"SELECT COUNT(*) as count FROM {target} EXCEPT SELECT COUNT(*) as count FROM {source}"
+            query = f"SELECT COUNT(*) as count FROM (SELECT * FROM {target} EXCEPT SELECT * FROM {source}) AS diff_result"
         else:
             query = f"SELECT * FROM {target} EXCEPT SELECT * FROM {source}"
 
