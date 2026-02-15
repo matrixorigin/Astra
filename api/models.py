@@ -368,6 +368,16 @@ class SkillSelectionLearning(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
+class SkillLearningSignal(Base):
+    """Raw learning signals collected from skill selection events."""
+    __tablename__ = "skill_learning_signals"
+    signal_id = Column(String(36), primary_key=True)
+    selection_event_id = Column(String(36), index=True, nullable=False)
+    signal_type = Column(String(50), nullable=False, index=True)  # wrong_skill, slow_execution, high_cost, low_satisfaction
+    signal_data = Column(JSON, nullable=False)  # Type-specific data
+    created_at = Column(DateTime, default=func.now(), index=True)
+
+
 class SkillExecutionMetric(Base):
     """Records execution metrics for skills to enable multi-dimensional learning."""
     __tablename__ = "skill_execution_metrics"
