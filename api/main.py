@@ -23,10 +23,16 @@ async def lifespan(app: FastAPI):
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.warning(f"Database init skipped (tables may already exist): {e}")
-    
+
+    # Start memory governance scheduler
+    from core.context.scheduler import MemoryGovernanceScheduler
+    scheduler = MemoryGovernanceScheduler()
+    await scheduler.start()
+
     yield
-    
-    # Shutdown (if needed)
+
+    # Shutdown
+    await scheduler.stop()
     logger.info("Shutting down...")
 
 

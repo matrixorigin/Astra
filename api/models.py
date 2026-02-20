@@ -267,6 +267,20 @@ class EventEmbedding(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
+class DistributedLock(Base):
+    """Distributed lock for multi-instance governance tasks.
+    
+    Used by MemoryGovernanceScheduler to ensure only one instance
+    executes a given task per cycle across N replicas.
+    """
+    __tablename__ = "distributed_locks"
+    lock_name = Column(String(64), primary_key=True)  # e.g. "governance_hourly"
+    instance_id = Column(String(64), nullable=False)  # hostname:pid or UUID
+    acquired_at = Column(DateTime, default=func.now(), nullable=False)
+    expires_at = Column(DateTime, nullable=False)  # heartbeat timeout
+    task_name = Column(String(64), nullable=False, index=True)  # hourly/daily/weekly
+
+
 class Repo(Base):
     __tablename__ = "repos"
     repo_id = Column(String(36), primary_key=True)

@@ -19,6 +19,7 @@ The breakthrough feature that enables automatic learning from failures.
 
 ### Other Features
 
+- **[memory-governance.md](memory-governance.md)** - Memory lifecycle governance & distributed scheduling ⭐
 - **[authentication.md](authentication.md)** - JWT-based authentication
 - **[llm-integration.md](llm-integration.md)** - LLM provider integration
 - **[github-integration.md](github-integration.md)** - GitHub operations
@@ -45,8 +46,9 @@ docs/
 │
 └── implementation/                  # Implementation details (this directory)
     ├── README.md                    # This file
+    ├── memory-governance.md         # Memory lifecycle & distributed scheduling ⭐
     ├── self-improving-selector.md   # Implementation guide
-    ├── self-improving-selector-TODO.md  # Roadmap & TODO ⭐
+    ├── self-improving-selector-TODO.md  # Roadmap & TODO
     ├── authentication.md
     ├── llm-integration.md
     ├── github-integration.md
@@ -118,6 +120,7 @@ High-level architecture and strategy:
 
 | Feature | Implementation | TODO | Status |
 |---------|---------------|------|--------|
+| Memory Governance | ✅ Complete | - | Stable ⭐ |
 | Self-Improving Selector | ✅ Complete | ✅ Complete | Phase 0 Done |
 | Authentication | ✅ Complete | - | Stable |
 | LLM Integration | ✅ Complete | - | Stable |
@@ -134,4 +137,4 @@ High-level architecture and strategy:
 
 ---
 
-**Last Updated:** 2026-02-14
+**Last Updated:** 2026-02-20

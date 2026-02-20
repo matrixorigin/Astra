@@ -126,3 +126,103 @@ class TestMemoryGovernanceEngine:
         assert stats["total_entries"] == 3
         assert stats["avg_confidence"] == pytest.approx(0.533, rel=0.01)
         assert stats["low_confidence"] == 1
+
+
+class TestGovernanceTaskRunner:
+    """Test distributed task runner with table-based locking."""
+
+    @pytest.fixture
+    def mock_db_ctx(self):
+        """Mock db context factory."""
+        from contextlib import contextmanager
+
+        db = Mock()
+        db.query.return_value.filter.return_value.all.return_value = []
+        db.query.return_value.filter.return_value.limit.return_value.all.return_value = []
+        db.query.return_value.all.return_value = []
+        db.query.return_value.filter.return_value.first.return_value = None
+
+        @contextmanager
+        def factory():
+            yield db
+
+        return factory, db
+
+    def test_run_acquires_lock(self, mock_db_ctx):
+        """Task runner acquires table-based lock before executing."""
+        from core.context.scheduler import GovernanceTaskRunner
+
+        factory, db = mock_db_ctx
+        # Simulate successful lock acquisition (no exception on add)
+        db.add.return_value = None
+
+        runner = GovernanceTaskRunner(factory)
+        result = runner.run("hourly")
+
+        assert result is not None
+        assert "archived_notes" in result
+        # Verify lock was added and committed
+        assert db.add.called
+        assert db.commit.called
+
+    def test_run_skips_when_lock_held(self, mock_db_ctx):
+        """Task runner skips execution when lock is held by another instance."""
+        from core.context.scheduler import GovernanceTaskRunner
+
+        factory, db = mock_db_ctx
+        # Simulate lock already held (exception on add)
+        db.add.side_effect = Exception("Duplicate key")
+        # Simulate lock not expired
+        mock_lock = Mock()
+        mock_lock.expires_at = datetime.now() + timedelta(hours=1)
+        db.query.return_value.filter.return_value.first.return_value = mock_lock
+
+        runner = GovernanceTaskRunner(factory)
+        result = runner.run("hourly")
+
+        assert result is None
+
+    def test_run_takes_expired_lock(self, mock_db_ctx):
+        """Task runner takes over an expired lock."""
+        from core.context.scheduler import GovernanceTaskRunner
+
+        factory, db = mock_db_ctx
+        # Simulate lock already held (exception on add)
+        db.add.side_effect = Exception("Duplicate key")
+        # Simulate lock expired
+        mock_lock = Mock()
+        mock_lock.expires_at = datetime.now() - timedelta(hours=1)
+        db.query.return_value.filter.return_value.first.return_value = mock_lock
+
+        runner = GovernanceTaskRunner(factory)
+        result = runner.run("hourly")
+
+        # Should succeed by taking over expired lock
+        assert result is not None
+        assert "archived_notes" in result
+
+
+class TestSchedulerBackendInterface:
+    """Test that custom backends can be plugged in."""
+
+    def test_custom_backend(self):
+        """MemoryGovernanceScheduler accepts any SchedulerBackend."""
+        from core.context.scheduler import MemoryGovernanceScheduler, SchedulerBackend
+
+        class StubBackend(SchedulerBackend):
+            started = False
+
+            async def start(self, tasks):
+                self.started = True
+
+            async def stop(self):
+                self.started = False
+
+        backend = StubBackend()
+        scheduler = MemoryGovernanceScheduler(backend=backend)
+
+        import asyncio
+        asyncio.get_event_loop().run_until_complete(scheduler.start())
+        assert backend.started
+        asyncio.get_event_loop().run_until_complete(scheduler.stop())
+        assert not backend.started

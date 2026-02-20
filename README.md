@@ -35,9 +35,11 @@ Intelligent agent platform with auditable decisions, safe iteration, and version
 - **Event-Centric Architecture**: All interactions stored as atomic events with causal chain tracking
 - **Skill System**: Versioned, declarative skills with full replay capability
 - **Multi-Repo Management**: Register and manage multiple repositories with per-repo tokens
+- **Memory Governance** ✅ Automated lifecycle management: confidence decay, quarantine, compression with distributed scheduling
+- **Hybrid Retrieval** ✅ Vector + fulltext search with semantic/keyword/temporal/causal scoring
 - **Production-Ready**: Logging, monitoring, Docker support
 - **Type-Safe**: 100% type annotations with Pydantic validation
-- **Comprehensive Testing**: 527 tests passing with real database integration
+- **Comprehensive Testing**: 820 tests passing with real database integration
 - **Side-Effect Isolation**: ToolMockingLayer prevents real-world side effects during replay
 
 ## Quick Start

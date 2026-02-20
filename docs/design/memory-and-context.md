@@ -156,6 +156,54 @@ ORDER BY effective_confidence DESC;
 
 This prevents memory bloat while preserving audit trail integrity. Hard deletes only happen for transient data (sensory buffer). Everything else is quarantined or archived — always recoverable via time-travel.
 
+#### Distributed Scheduling (Multi-Instance Deployment)
+
+For production deployments with N replicas, governance tasks must run exactly once per cycle across all instances:
+
+**Architecture:**
+- `MemoryGovernanceScheduler` — façade, wires task runner + backend
+- `SchedulerBackend` (abstract) — pluggable: AsyncIO (dev), Celery, Temporal, K8s CronJob, etc.
+- `GovernanceTaskRunner` — executes tasks with distributed locking
+
+**Distributed Lock Mechanism:**
+```
+distributed_locks table:
+  lock_name (PK)      — "governance_hourly" | "governance_daily" | "governance_weekly"
+  instance_id         — "hostname:pid" (unique per instance)
+  acquired_at         — when lock was taken
+  expires_at          — heartbeat timeout (5 min default)
+  task_name           — "hourly" | "daily" | "weekly"
+
+Lock acquisition:
+  1. Try INSERT new lock (lock_name is PK, duplicate fails)
+  2. If INSERT fails, check if existing lock expired
+  3. If expired: UPDATE to take over (instance crashed)
+  4. If not expired: SKIP (another instance holds it)
+
+Lock release:
+  DELETE lock after task completes
+```
+
+**Guarantees:**
+| Scenario | Behavior |
+|---|---|
+| 3 instances start simultaneously | Only 1 acquires lock; others skip |
+| Instance A crashes mid-task | Lock expires after 5 min; instance B takes over |
+| Instance A completes normally | Lock deleted immediately; next instance can acquire |
+
+**Usage:**
+```python
+# Default (AsyncIO, single-process):
+scheduler = MemoryGovernanceScheduler()
+await scheduler.start()
+
+# Custom backend (e.g., Celery):
+runner = GovernanceTaskRunner(get_db_context)
+backend = CeleryBackend(runner)  # you implement this
+scheduler = MemoryGovernanceScheduler(backend=backend)
+await scheduler.start()
+```
+
 ---
 
 ## 2. Context Engineering
