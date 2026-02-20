@@ -7,6 +7,7 @@ External code should use SkillPipeline from core.skills.pipeline.
 """
 
 import json
+import time
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -17,6 +18,26 @@ from core.skills.selector import SkillMetadata, SkillSelector
 logger = get_logger(__name__)
 
 _DEFAULT_CONTEXT_BUDGET = 2000  # tokens reserved for tool schemas
+
+
+# Simple metrics tracking (for monitoring embedding cache need)
+class _SelectorMetrics:
+    """Lightweight metrics for ModernSkillSelector construction."""
+    def __init__(self):
+        self.construction_count = 0
+        self.total_skills_indexed = 0
+        self.start_time = time.time()
+    
+    def record_construction(self, skill_count: int):
+        self.construction_count += 1
+        self.total_skills_indexed += skill_count
+    
+    def get_rate(self) -> float:
+        """Get constructions per minute."""
+        elapsed = time.time() - self.start_time
+        return self.construction_count / (elapsed / 60) if elapsed > 0 else 0
+
+_metrics = _SelectorMetrics()
 
 
 def _estimate_tokens(obj: Any) -> int:
@@ -36,10 +57,29 @@ class ModernSkillSelector:
         self.rule_selector = SkillSelector(session)
 
         # Semantic index — primary retrieval path when available
+        # TODO: Add embedding cache when (see docs/design/TODO-embedding-cache.md):
+        #       - Skill count >20, OR
+        #       - Construction frequency >1/min, OR
+        #       - Embedding API cost becomes significant
+        #       Currently rebuilds index on every construction, calling embed_fn N times.
         from core.skills.skill_index import SkillIndex
         self._index = SkillIndex(embed_fn=embed_fn)
         if embed_fn:
+            skill_count = len(self.rule_selector.skills)
             self._index.build(list(self.rule_selector.skills.values()))
+            
+            # Track metrics for monitoring cache need
+            _metrics.record_construction(skill_count)
+            rate = _metrics.get_rate()
+            if skill_count > 20 or rate > 1.0:
+                logger.warning(
+                    "Consider implementing embedding cache",
+                    extra={
+                        "skill_count": skill_count,
+                        "construction_rate_per_min": rate,
+                        "total_constructions": _metrics.construction_count,
+                    }
+                )
 
     def get_tools_schema(
         self,

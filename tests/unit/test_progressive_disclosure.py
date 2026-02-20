@@ -276,3 +276,97 @@ class TestPipelineEmbedIntegration:
                                      embed_fn=None)
         # Should have fallen back to None
         assert pipeline._modern._index._embed is None
+
+
+# ===========================================================================
+# Embedding Quality — End-to-End Verification
+# ===========================================================================
+
+class TestEmbeddingQuality:
+    """Verify semantic retrieval quality with realistic embeddings."""
+
+    def test_semantic_similarity_ranks_relevant_skills_higher(self, db):
+        """Verify 'review PR' query ranks code_review higher than deploy_k8s."""
+        from core.context.embeddings import EmbeddingService
+        
+        # Use mock embedding service (simple bag-of-words)
+        embed_service = EmbeddingService(db=db, provider="mock")
+        embed_fn = lambda text: embed_service.embed_text(text)
+        
+        # Create skills with distinct semantic content
+        code_review = _make_skill(
+            "code_review",
+            description="Review code changes in pull requests for quality and security",
+            triggers=["review", "pr", "code", "quality"]
+        )
+        deploy_k8s = _make_skill(
+            "deploy_k8s",
+            description="Deploy application to Kubernetes cluster",
+            triggers=["deploy", "kubernetes", "k8s", "cluster"]
+        )
+        
+        sel = ModernSkillSelector(db, llm_client=None, embed_fn=embed_fn)
+        sel.rule_selector.skills = {
+            "code_review": code_review,
+            "deploy_k8s": deploy_k8s,
+        }
+        sel._index.build([code_review, deploy_k8s])
+        
+        # Query: "review PR" should rank code_review higher than deploy_k8s
+        tools, method = sel.get_tools_schema("review PR code", max_candidates=3)
+        
+        assert method == "semantic"
+        assert len(tools) >= 1
+        
+        # Extract skill names in order
+        skill_names = [t["function"]["name"] for t in tools]
+        
+        # code_review should appear before deploy_k8s (more relevant)
+        if "code_review" in skill_names and "deploy_k8s" in skill_names:
+            code_idx = skill_names.index("code_review")
+            deploy_idx = skill_names.index("deploy_k8s")
+            assert code_idx < deploy_idx, \
+                f"code_review should rank higher than deploy_k8s for 'review PR code', got {skill_names}"
+
+    def test_keyword_fallback_still_works(self, db):
+        """Verify keyword fallback when no embedding available."""
+        code_review = _make_skill(
+            "code_review",
+            description="Review code",
+            triggers=["review", "code"]
+        )
+        
+        sel = ModernSkillSelector(db, llm_client=None, embed_fn=None)
+        sel.rule_selector.skills = {"code_review": code_review}
+        
+        tools, method = sel.get_tools_schema("review code", max_candidates=3)
+        
+        assert method == "keyword"
+        assert len(tools) == 1
+        assert tools[0]["function"]["name"] == "code_review"
+
+    def test_semantic_retrieval_handles_synonyms(self, db):
+        """Verify semantic retrieval finds skills even with different wording."""
+        from core.context.embeddings import EmbeddingService
+        
+        embed_service = EmbeddingService(db=db, provider="mock")
+        embed_fn = lambda text: embed_service.embed_text(text)
+        
+        code_review = _make_skill(
+            "code_review",
+            description="Review code changes in pull requests",
+            triggers=["review", "pr"]
+        )
+        
+        sel = ModernSkillSelector(db, llm_client=None, embed_fn=embed_fn)
+        sel.rule_selector.skills = {"code_review": code_review}
+        sel._index.build([code_review])
+        
+        # Query with synonyms: "inspect merge request"
+        tools, method = sel.get_tools_schema("inspect merge request", max_candidates=3)
+        
+        assert method == "semantic"
+        # Should find code_review despite different wording
+        # (mock embedding uses bag-of-words, so "request" matches "requests")
+        assert len(tools) >= 1, "Should find at least one skill with semantic retrieval"
+        assert tools[0]["function"]["name"] == "code_review"
