@@ -54,19 +54,34 @@ class EventType(str, Enum):
 class StreamEventType(str, Enum):
     """Stream event types for real-time output.
 
-    Follows AG-UI protocol conventions for streaming agent interactions.
+    AG-UI protocol compliant with backward-compatible aliases.
+    See: https://docs.ag-ui.com/concepts/events
     """
 
     # Lifecycle
     RUN_STARTED = "run_started"
     RUN_FINISHED = "run_finished"
     RUN_ERROR = "run_error"
+    STEP_STARTED = "step_started"
+    STEP_FINISHED = "step_finished"
 
-    # Text generation
+    # Text messages (AG-UI standard: Start → Content → End)
+    TEXT_MESSAGE_START = "text_message_start"
+    TEXT_MESSAGE_CONTENT = "text_message_content"
+    TEXT_MESSAGE_END = "text_message_end"
+
+    # Text generation (backward-compatible aliases)
     TEXT_DELTA = "text_delta"
     TEXT_DONE = "text_done"
 
-    # Thinking / reasoning (for reasoning models)
+    # Reasoning (AG-UI standard, replaces deprecated THINKING_*)
+    REASONING_START = "reasoning_start"
+    REASONING_MESSAGE_START = "reasoning_message_start"
+    REASONING_MESSAGE_CONTENT = "reasoning_message_content"
+    REASONING_MESSAGE_END = "reasoning_message_end"
+    REASONING_END = "reasoning_end"
+
+    # Thinking (deprecated → use REASONING_*)
     THINKING_DELTA = "thinking_delta"
     THINKING_DONE = "thinking_done"
 
@@ -76,23 +91,32 @@ class StreamEventType(str, Enum):
     TOOL_CALL_END = "tool_call_end"
     TOOL_RESULT = "tool_result"
 
-    # Planning
+    # State management (AG-UI standard)
+    STATE_SNAPSHOT = "state_snapshot"
+    STATE_DELTA = "state_delta"
+    MESSAGES_SNAPSHOT = "messages_snapshot"
+
+    # Planning (mo-agent-engine extension)
     PLAN_CREATED = "plan_created"
     PLAN_STEP_START = "plan_step_start"
     PLAN_STEP_DONE = "plan_step_done"
     PLAN_REVISED = "plan_revised"
 
-    # Multi-agent
+    # Multi-agent (mo-agent-engine extension)
     AGENT_DELEGATED = "agent_delegated"
     AGENT_PROGRESS = "agent_progress"
     AGENT_COMPLETED = "agent_completed"
+
+    # Special (AG-UI standard)
+    CUSTOM = "custom"
+    RAW = "raw"
 
 
 class StreamEvent(BaseModel):
     """Stream event for real-time output.
 
-    Each streamed chunk is also a logged event for auditability.
-    Includes agent_id for multi-agent stream multiplexing.
+    AG-UI protocol compliant. Each streamed chunk is also a logged event
+    for auditability. Includes agent_id for multi-agent stream multiplexing.
     """
 
     event_type: StreamEventType
@@ -100,6 +124,13 @@ class StreamEvent(BaseModel):
     event_id: str | None = None
     causal_chain_id: str | None = None
     agent_id: str | None = None  # For multi-agent stream multiplexing
+
+    # AG-UI base properties
+    timestamp: str | None = None
+    thread_id: str | None = None
+    run_id: str | None = None
+    message_id: str | None = None
+    tool_call_id: str | None = None
 
 
 class TokenUsage(BaseModel):

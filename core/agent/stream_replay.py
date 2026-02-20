@@ -118,9 +118,9 @@ class StreamReplay:
                 state["status"] = "finished"
             elif event_type == "run_error":
                 state["status"] = "error"
-            elif event_type == "text_delta":
+            elif event_type in ("text_delta", "text_message_content"):
                 state["text_accumulated"] += event_data.get("data", {}).get("delta", "")
-            elif event_type == "thinking_delta":
+            elif event_type in ("thinking_delta", "reasoning_message_content"):
                 state["thinking_accumulated"] += event_data.get("data", {}).get("delta", "")
             elif event_type == "tool_call_start":
                 state["active_tools"].append(event_data.get("data", {}).get("tool_name"))
@@ -151,14 +151,27 @@ class StreamReplay:
                     "stream_run_started",
                     "stream_run_finished",
                     "stream_run_error",
+                    "stream_step_started",
+                    "stream_step_finished",
                     "stream_text_delta",
                     "stream_text_done",
+                    "stream_text_message_start",
+                    "stream_text_message_content",
+                    "stream_text_message_end",
                     "stream_thinking_delta",
                     "stream_thinking_done",
+                    "stream_reasoning_start",
+                    "stream_reasoning_message_start",
+                    "stream_reasoning_message_content",
+                    "stream_reasoning_message_end",
+                    "stream_reasoning_end",
                     "stream_tool_call_start",
                     "stream_tool_call_args",
                     "stream_tool_call_end",
                     "stream_tool_result",
+                    "stream_state_snapshot",
+                    "stream_state_delta",
+                    "stream_messages_snapshot",
                     "stream_plan_created",
                     "stream_plan_step_start",
                     "stream_plan_step_done",
@@ -166,6 +179,8 @@ class StreamReplay:
                     "stream_agent_delegated",
                     "stream_agent_progress",
                     "stream_agent_completed",
+                    "stream_custom",
+                    "stream_raw",
                 ]
             ),
         ]
