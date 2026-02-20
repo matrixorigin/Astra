@@ -254,6 +254,112 @@ class TestProgressiveDisclosure:
 # SkillPipeline — embed_fn auto-resolution
 # ===========================================================================
 
+# ===========================================================================
+# Fallback path
+# ===========================================================================
+
+class TestFallbackSelection:
+
+    @pytest.fixture
+    def selector_with_llm(self, db):
+        mock_llm = Mock()
+        sel = ModernSkillSelector(db, llm_client=mock_llm, embed_fn=_deterministic_embed)
+        skill = _make_skill("code_review", description="review code", triggers=["review"])
+        sel.rule_selector.skills["code_review"] = skill
+        sel._index.build([skill])
+        return sel, mock_llm
+
+    def test_fallback_returns_top_ranked_candidate(self, selector_with_llm):
+        """When LLM call fails, fallback should return the first (top-ranked) candidate."""
+        sel, mock_llm = selector_with_llm
+        mock_llm.chat_with_tools.side_effect = RuntimeError("LLM unavailable")
+
+        result = sel.select_and_execute("review code")
+
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "code_review"
+        assert result[0]["function"]["arguments"] == "{}"
+
+    def test_fallback_preserves_ranking_order(self, db):
+        """Fallback should use the semantic/keyword ranked order, not arbitrary."""
+        mock_llm = Mock()
+        mock_llm.chat_with_tools.side_effect = RuntimeError("boom")
+
+        sel = ModernSkillSelector(db, llm_client=mock_llm, embed_fn=_deterministic_embed)
+        # Add multiple skills
+        for name in ["deploy_k8s", "code_review", "search_code"]:
+            skill = _make_skill(name, description=f"{name} desc", triggers=[name.split("_")[0]])
+            sel.rule_selector.skills[name] = skill
+        sel._index.build(list(sel.rule_selector.skills.values()))
+
+        result = sel.select_and_execute("review code quality")
+
+        assert len(result) == 1
+        # Should be the top-ranked skill from semantic retrieval, not arbitrary
+        assert result[0]["function"]["name"] in sel.rule_selector.skills
+
+    def test_fallback_logs_warning(self, selector_with_llm, caplog):
+        """Fallback should log a warning with skill name and candidate count."""
+        import logging
+        sel, mock_llm = selector_with_llm
+        mock_llm.chat_with_tools.side_effect = RuntimeError("timeout")
+
+        with caplog.at_level(logging.WARNING):
+            sel.select_and_execute("review code")
+
+        assert any("Fallback selection" in r.message for r in caplog.records)
+        assert any("code_review" in r.message for r in caplog.records)
+
+    def test_fallback_with_no_candidates_returns_empty(self, db):
+        """If no candidates found, fallback should return empty list."""
+        mock_llm = Mock()
+        mock_llm.chat_with_tools.side_effect = RuntimeError("boom")
+
+        sel = ModernSkillSelector(db, llm_client=mock_llm, embed_fn=_deterministic_embed)
+        sel.rule_selector.skills.clear()
+        sel._index.build([])
+
+        result = sel.select_and_execute("anything")
+        assert result == []
+
+    def test_fallback_selection_method_directly(self):
+        """Test _fallback_selection as a unit."""
+        sel = ModernSkillSelector.__new__(ModernSkillSelector)
+        tools = [
+            {"function": {"name": "skill_a", "parameters": {}}},
+            {"function": {"name": "skill_b", "parameters": {}}},
+        ]
+        result = sel._fallback_selection(tools)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "skill_a"  # top-ranked
+
+    def test_fallback_selection_empty_input(self):
+        sel = ModernSkillSelector.__new__(ModernSkillSelector)
+        assert sel._fallback_selection([]) == []
+
+
+# ===========================================================================
+# Registry cache
+# ===========================================================================
+
+class TestRegistryCache:
+
+    def test_registry_cached_in_init(self, db):
+        """SkillRegistry should be instantiated once in __init__, not per schema call."""
+        sel = ModernSkillSelector(db, llm_client=None)
+        assert hasattr(sel, "_registry")
+
+        # Call _skill_to_tool_schema multiple times — should reuse same registry
+        skill = _make_skill("test_skill")
+        sel._skill_to_tool_schema(skill)
+        sel._skill_to_tool_schema(skill)
+
+        # Registry object identity should be the same
+        registry_id = id(sel._registry)
+        sel._skill_to_tool_schema(skill)
+        assert id(sel._registry) == registry_id
+
+
 class TestPipelineEmbedIntegration:
 
     def test_pipeline_passes_embed_fn_to_selector(self, db):

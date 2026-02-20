@@ -155,11 +155,25 @@ class ModernSkillSelector:
             return tool_calls
 
         except Exception as e:
-            logger.error(f"Function calling failed: {e}")
-            # Fallback: return first tool as default selection
-            if tools_schema:
-                return [{"function": {"name": tools_schema[0]["function"]["name"], "arguments": "{}"}}]
+            logger.error(
+                "Function calling failed, falling back to top-ranked candidate: %s", e,
+            )
+            return self._fallback_selection(tools_schema)
+
+    def _fallback_selection(self, tools_schema: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return top-ranked candidate when LLM function calling fails.
+
+        Preserves the semantic/keyword ranking from retrieval stage.
+        Uses empty arguments — the caller (ChatLoop) can re-prompt the LLM
+        for parameter extraction if needed.
+        """
+        if not tools_schema:
             return []
+        top = tools_schema[0]["function"]
+        logger.warning(
+            "Fallback selection: %s (from %d candidates)", top["name"], len(tools_schema),
+        )
+        return [{"function": {"name": top["name"], "arguments": "{}"}}]
 
     def _skill_to_tool_schema(self, skill: SkillMetadata) -> dict[str, Any]:
         """Convert skill metadata to OpenAI tool schema.
