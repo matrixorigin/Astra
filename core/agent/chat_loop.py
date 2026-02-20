@@ -142,6 +142,7 @@ class ChatLoop:
         firewall,
         agent_id: str = "dev-agent",
         scratchpad=None,
+        continuity=None,
     ):
         """Initialize ChatLoop.
         
@@ -154,6 +155,7 @@ class ChatLoop:
             firewall: Hallucination firewall (required for verification)
             agent_id: ID of the agent running this loop (for multi-agent)
             scratchpad: AgentScratchpad instance for working memory (optional)
+            continuity: SessionContinuity instance for cross-session context (optional)
         """
         self.selector = selector
         self._pipeline = selector
@@ -164,6 +166,7 @@ class ChatLoop:
         self.firewall = firewall
         self.agent_id = agent_id
         self.scratchpad = scratchpad
+        self.continuity = continuity
 
     async def run_step(
         self,
@@ -200,7 +203,7 @@ class ChatLoop:
         logger.debug(f"Context snapshot: {context_capture_id}")
 
         # 3. Build messages with context
-        messages = self._build_messages(user_input, context, session_id=session_id)
+        messages = self._build_messages(user_input, context, session_id=session_id, user_id=user_id)
 
         # 4. Get available tools schema (with audit + learning)
         _sel = self._pipeline.get_tools_schema(
@@ -437,7 +440,7 @@ class ChatLoop:
             return
 
         # 4. Build messages with context
-        messages = self._build_messages(user_input, context, session_id=session_id)
+        messages = self._build_messages(user_input, context, session_id=session_id, user_id=user_id)
 
         # 5. Get available tools schema (with audit + learning)
         _sel = self._pipeline.get_tools_schema(
@@ -1201,6 +1204,7 @@ class ChatLoop:
     def _build_messages(
         self, user_input: str, context: dict[str, Any] | None,
         session_id: str | None = None,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the initial messages list, injecting context if available."""
         messages: list[dict[str, Any]] = []
@@ -1219,6 +1223,16 @@ class ChatLoop:
                     history_lines.append(f"{role}: {ev.get('content', '')}")
                 if history_lines:
                     system_parts.append("Recent conversation:\n" + "\n".join(history_lines))
+
+        # Inject cross-session prior context
+        if self.continuity and session_id and user_id:
+            prior = self.continuity.load_prior_context(
+                user_id=user_id,
+                current_session_id=session_id,
+            )
+            section = prior.to_prompt_section()
+            if section:
+                system_parts.append(section)
 
         # Inject active scratchpad notes into system prompt
         if self.scratchpad and session_id:
