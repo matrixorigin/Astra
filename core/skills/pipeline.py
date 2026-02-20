@@ -308,7 +308,7 @@ class SkillPipeline:
             self._db.execute(
                 text(
                     "DELETE FROM selector_learnings "
-                    "WHERE created_at > DATE_SUB(NOW(), INTERVAL :days DAY)"
+                    "WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)"
                 ),
                 {"days": days},
             )

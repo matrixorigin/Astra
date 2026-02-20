@@ -383,3 +383,244 @@ class TestGateHistory:
         assert len(history) == 2
         assert history[0]["gate_id"] in ["g1", "g2"]
         assert history[0]["change_type"] in ["prompt", "skill"]
+
+
+class TestSelectorChangeValidation:
+    """Test selector change type validation."""
+    
+    @patch.object(RegressionGate, '_apply_change_to_sandbox')
+    @patch.object(RegressionGate, '_create_snapshot')
+    @patch('core.evaluation.regression_gate.ReplayService')
+    @patch('core.evaluation.regression_gate.Sandbox')
+    def test_validate_selector_change(
+        self,
+        mock_sandbox_class,
+        mock_replay_class,
+        mock_snapshot,
+        mock_apply,
+        gate,
+        setup_tables,
+    ):
+        """Test that ChangeType.SELECTOR is properly validated."""
+        from core.events.event_logger import EventLogger
+        
+        logger = EventLogger(setup_tables)
+        
+        # Create a golden session
+        for i in range(3):
+            event = logger.create_user_query(
+                user_id="u1",
+                session_id="s1",
+                content=f"query {i}",
+            )
+            setup_tables.execute(text("""
+                UPDATE conversation_events 
+                SET quality_score = 4.5, training_eligible = 1
+                WHERE event_id = :event_id
+            """), {"event_id": event.event_id})
+        
+        setup_tables.commit()
+        
+        mock_snapshot.return_value = "snapshot_123"
+        
+        # Mock sandbox
+        mock_sandbox = MagicMock()
+        mock_sandbox_class.return_value = mock_sandbox
+        gate.sandbox = mock_sandbox
+        
+        # Mock replay service
+        mock_replay = MagicMock()
+        mock_replay.replay_session.return_value = {
+            "status": "completed",
+            "events_replayed": 3,
+            "result": {"successful": 3, "failed": 0},
+        }
+        mock_replay_class.return_value = mock_replay
+        gate.replay_service = mock_replay
+        
+        result = gate.validate_change(
+            change_type=ChangeType.SELECTOR,
+            change_id="selector_v2",
+            change_content={"learning_rate": 0.01, "threshold": 0.8},
+            golden_session_count=1,
+        )
+        
+        assert result["verdict"] in ["pass", "fail"]
+        assert result["change_type"] == "selector"
+        assert result["change_id"] == "selector_v2"
+        assert "metrics" in result
+
+
+class TestRollbackMechanism:
+    """Test rollback mechanism for failed gates."""
+    
+    def test_rollback_learnings_deletes_recent_records(self, setup_tables):
+        """Test that _rollback_learnings() deletes records from the specified time window."""
+        from core.skills.pipeline import SkillPipeline
+        from unittest.mock import Mock
+        
+        # Setup selector_learnings table
+        setup_tables.execute(text("DROP TABLE IF EXISTS selector_learnings"))
+        setup_tables.execute(text("""
+            CREATE TABLE selector_learnings (
+                learning_id VARCHAR(36) PRIMARY KEY,
+                query_pattern VARCHAR(255),
+                wrong_skills TEXT,
+                correct_skills TEXT,
+                improvement_score DOUBLE,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        setup_tables.commit()
+        
+        # Insert test data with different timestamps
+        setup_tables.execute(text("""
+            INSERT INTO selector_learnings 
+            (learning_id, query_pattern, wrong_skills, correct_skills, improvement_score, created_at)
+            VALUES
+            ('l1', 'pattern1', '[]', '["skill1"]', 0.8, DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 DAY)),
+            ('l2', 'pattern2', '[]', '["skill2"]', 0.9, DATE_SUB(UTC_TIMESTAMP(), INTERVAL 5 DAY)),
+            ('l3', 'pattern3', '[]', '["skill3"]', 0.7, DATE_SUB(UTC_TIMESTAMP(), INTERVAL 10 DAY))
+        """))
+        setup_tables.commit()
+        
+        # Create pipeline and call rollback
+        mock_improver = Mock()
+        pipeline = SkillPipeline(setup_tables, mock_improver)
+        pipeline._rollback_learnings(days=7)
+        
+        # Verify only records within 7 days are deleted
+        result = setup_tables.execute(text("SELECT learning_id FROM selector_learnings ORDER BY learning_id"))
+        remaining = [row[0] for row in result]
+        
+        assert "l3" in remaining  # 10 days old, should remain
+        assert "l1" not in remaining  # 2 days old, should be deleted
+        assert "l2" not in remaining  # 5 days old, should be deleted
+        
+        # Cleanup
+        setup_tables.execute(text("DROP TABLE IF EXISTS selector_learnings"))
+        setup_tables.commit()
+
+
+class TestSandboxCleanup:
+    """Test sandbox cleanup on gate failure."""
+    
+    @patch.object(RegressionGate, '_apply_change_to_sandbox')
+    @patch.object(RegressionGate, '_create_snapshot')
+    @patch('core.evaluation.regression_gate.ReplayService')
+    @patch('core.evaluation.regression_gate.Sandbox')
+    def test_sandbox_deleted_on_gate_failure(
+        self,
+        mock_sandbox_class,
+        mock_replay_class,
+        mock_snapshot,
+        mock_apply,
+        gate,
+        setup_tables,
+    ):
+        """Test that sandbox is deleted even when gate fails."""
+        from core.events.event_logger import EventLogger
+        
+        logger = EventLogger(setup_tables)
+        
+        # Create a golden session
+        for i in range(3):
+            event = logger.create_user_query(
+                user_id="u1",
+                session_id="s1",
+                content=f"query {i}",
+            )
+            setup_tables.execute(text("""
+                UPDATE conversation_events 
+                SET quality_score = 4.5, training_eligible = 1
+                WHERE event_id = :event_id
+            """), {"event_id": event.event_id})
+        
+        setup_tables.commit()
+        
+        mock_snapshot.return_value = "snapshot_123"
+        
+        # Mock sandbox
+        mock_sandbox = MagicMock()
+        mock_sandbox_class.return_value = mock_sandbox
+        gate.sandbox = mock_sandbox
+        
+        # Mock replay service to simulate failure
+        mock_replay = MagicMock()
+        mock_replay.replay_session.side_effect = Exception("Replay failed")
+        mock_replay_class.return_value = mock_replay
+        gate.replay_service = mock_replay
+        
+        try:
+            gate.validate_change(
+                change_type=ChangeType.PROMPT,
+                change_id="test_prompt",
+                change_content={"content": "new prompt"},
+                golden_session_count=1,
+            )
+        except Exception:
+            pass  # Expected to fail
+        
+        # Verify sandbox.delete() was called despite the failure
+        mock_sandbox.delete.assert_called_once()
+    
+    @patch.object(RegressionGate, '_apply_change_to_sandbox')
+    @patch.object(RegressionGate, '_create_snapshot')
+    @patch('core.evaluation.regression_gate.ReplayService')
+    @patch('core.evaluation.regression_gate.Sandbox')
+    def test_sandbox_deleted_on_successful_gate(
+        self,
+        mock_sandbox_class,
+        mock_replay_class,
+        mock_snapshot,
+        mock_apply,
+        gate,
+        setup_tables,
+    ):
+        """Test that sandbox is deleted after successful gate validation."""
+        from core.events.event_logger import EventLogger
+        
+        logger = EventLogger(setup_tables)
+        
+        # Create a golden session
+        for i in range(3):
+            event = logger.create_user_query(
+                user_id="u1",
+                session_id="s1",
+                content=f"query {i}",
+            )
+            setup_tables.execute(text("""
+                UPDATE conversation_events 
+                SET quality_score = 4.5, training_eligible = 1
+                WHERE event_id = :event_id
+            """), {"event_id": event.event_id})
+        
+        setup_tables.commit()
+        
+        mock_snapshot.return_value = "snapshot_123"
+        
+        # Mock sandbox
+        mock_sandbox = MagicMock()
+        mock_sandbox_class.return_value = mock_sandbox
+        gate.sandbox = mock_sandbox
+        
+        # Mock replay service for success
+        mock_replay = MagicMock()
+        mock_replay.replay_session.return_value = {
+            "status": "completed",
+            "events_replayed": 3,
+            "result": {"successful": 3, "failed": 0},
+        }
+        mock_replay_class.return_value = mock_replay
+        gate.replay_service = mock_replay
+        
+        result = gate.validate_change(
+            change_type=ChangeType.PROMPT,
+            change_id="test_prompt",
+            change_content={"content": "new prompt"},
+            golden_session_count=1,
+        )
+        
+        # Verify sandbox was created and deleted
+        mock_sandbox.create.assert_called_once()
+        mock_sandbox.delete.assert_called_once()
