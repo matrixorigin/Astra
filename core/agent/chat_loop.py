@@ -18,6 +18,53 @@ logger = get_logger(__name__)
 
 MAX_TOOL_ROUNDS = 10
 
+# Scratchpad tool schemas — injected alongside skill tools when scratchpad is enabled
+_SCRATCHPAD_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "scratchpad_write",
+            "description": "Write a note to working memory. Use for plans, hypotheses, findings, todos, decisions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_type": {"type": "string", "enum": ["plan", "hypothesis", "finding", "todo", "decision"]},
+                    "content": {"type": "string", "description": "Note content"},
+                },
+                "required": ["note_type", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scratchpad_read",
+            "description": "Read active notes from working memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_type": {"type": "string", "enum": ["plan", "hypothesis", "finding", "todo", "decision"], "description": "Filter by type (optional)"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scratchpad_close",
+            "description": "Close/complete a note in working memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["completed", "superseded"], "default": "completed"},
+                },
+                "required": ["note_id"],
+            },
+        },
+    },
+]
+
 
 async def _needs_planning(user_input: str, llm_client) -> bool:
     """Check if user input needs planning using LLM judgment.
@@ -94,6 +141,7 @@ class ChatLoop:
         context_manager,
         firewall,
         agent_id: str = "dev-agent",
+        scratchpad=None,
     ):
         """Initialize ChatLoop.
         
@@ -105,6 +153,7 @@ class ChatLoop:
             context_manager: Context manager (required for snapshots)
             firewall: Hallucination firewall (required for verification)
             agent_id: ID of the agent running this loop (for multi-agent)
+            scratchpad: AgentScratchpad instance for working memory (optional)
         """
         self.selector = selector
         self._pipeline = selector
@@ -114,6 +163,7 @@ class ChatLoop:
         self.context_manager = context_manager
         self.firewall = firewall
         self.agent_id = agent_id
+        self.scratchpad = scratchpad
 
     async def run_step(
         self,
@@ -150,7 +200,7 @@ class ChatLoop:
         logger.debug(f"Context snapshot: {context_capture_id}")
 
         # 3. Build messages with context
-        messages = self._build_messages(user_input, context)
+        messages = self._build_messages(user_input, context, session_id=session_id)
 
         # 4. Get available tools schema (with audit + learning)
         _sel = self._pipeline.get_tools_schema(
@@ -158,6 +208,10 @@ class ChatLoop:
         )
         tools_schema = _sel.tools
         self._last_selection_event_id = _sel.event_id
+
+        # Append scratchpad tools when scratchpad is enabled
+        if self.scratchpad:
+            tools_schema = list(tools_schema) + _SCRATCHPAD_TOOLS
 
         if not tools_schema:
             # No tools available — plain chat
@@ -259,13 +313,19 @@ class ChatLoop:
 
                 # Execute skill with automatic feedback recording
                 try:
-                    result = self.executor.execute_skill_with_feedback(
-                        skill_name=fn_name,
-                        params=params,
-                        session_id=session_id,
-                        parent_event_id=user_event.event_id,
-                        selection_event_id=self._last_selection_event_id,
-                    )
+                    # Intercept scratchpad tools — handle locally, don't go to executor
+                    if fn_name.startswith("scratchpad_") and self.scratchpad:
+                        result = self._handle_scratchpad_tool(
+                            fn_name, params, session_id, user_id,
+                        )
+                    else:
+                        result = self.executor.execute_skill_with_feedback(
+                            skill_name=fn_name,
+                            params=params,
+                            session_id=session_id,
+                            parent_event_id=user_event.event_id,
+                            selection_event_id=self._last_selection_event_id,
+                        )
                     result_str = (
                         json.dumps(result, default=str) if not isinstance(result, str) else result
                     )
@@ -377,7 +437,7 @@ class ChatLoop:
             return
 
         # 4. Build messages with context
-        messages = self._build_messages(user_input, context)
+        messages = self._build_messages(user_input, context, session_id=session_id)
 
         # 5. Get available tools schema (with audit + learning)
         _sel = self._pipeline.get_tools_schema(
@@ -385,6 +445,9 @@ class ChatLoop:
         )
         tools_schema = _sel.tools
         self._last_selection_event_id = _sel.event_id
+
+        if self.scratchpad:
+            tools_schema = list(tools_schema) + _SCRATCHPAD_TOOLS
 
         # Log RUN_STARTED event
         run_started_event = self.event_logger.create_stream_event(
@@ -764,13 +827,18 @@ class ChatLoop:
                             result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
                         else:
                             # Execute skill with automatic feedback recording
-                            result = self.executor.execute_skill_with_feedback(
-                                skill_name=fn_name,
-                                params=params,
-                                session_id=session_id,
-                                parent_event_id=user_event.event_id,
-                                selection_event_id=self._last_selection_event_id,
-                            )
+                            if fn_name.startswith("scratchpad_") and self.scratchpad:
+                                result = self._handle_scratchpad_tool(
+                                    fn_name, params, session_id, user_id,
+                                )
+                            else:
+                                result = self.executor.execute_skill_with_feedback(
+                                    skill_name=fn_name,
+                                    params=params,
+                                    session_id=session_id,
+                                    parent_event_id=user_event.event_id,
+                                    selection_event_id=self._last_selection_event_id,
+                                )
                             result_str = (
                                 json.dumps(result, default=str) if not isinstance(result, str) else result
                             )
@@ -1102,8 +1170,37 @@ class ChatLoop:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _handle_scratchpad_tool(
+        self, fn_name: str, params: dict, session_id: str, user_id: str,
+    ) -> dict:
+        """Execute a scratchpad tool call locally."""
+        if fn_name == "scratchpad_write":
+            note_id = self.scratchpad.create_note(
+                session_id=session_id,
+                user_id=user_id,
+                note_type=params["note_type"],
+                content=params["content"],
+                agent_id=self.agent_id,
+            )
+            return {"note_id": note_id, "status": "created"}
+
+        if fn_name == "scratchpad_read":
+            notes = self.scratchpad.get_active_notes(
+                session_id, note_type=params.get("note_type"),
+            )
+            return {"notes": notes}
+
+        if fn_name == "scratchpad_close":
+            ok = self.scratchpad.close_note(
+                params["note_id"], status=params.get("status", "completed"),
+            )
+            return {"success": ok}
+
+        return {"error": f"Unknown scratchpad tool: {fn_name}"}
+
     def _build_messages(
-        self, user_input: str, context: dict[str, Any] | None
+        self, user_input: str, context: dict[str, Any] | None,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the initial messages list, injecting context if available."""
         messages: list[dict[str, Any]] = []
@@ -1122,6 +1219,17 @@ class ChatLoop:
                     history_lines.append(f"{role}: {ev.get('content', '')}")
                 if history_lines:
                     system_parts.append("Recent conversation:\n" + "\n".join(history_lines))
+
+        # Inject active scratchpad notes into system prompt
+        if self.scratchpad and session_id:
+            notes = self.scratchpad.get_active_notes(session_id)
+            if notes:
+                note_lines = [
+                    f"[{n['note_type']}] {n['content']}" for n in notes
+                ]
+                system_parts.append(
+                    "Working memory (your active notes):\n" + "\n---\n".join(note_lines)
+                )
 
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
         messages.append({"role": "user", "content": user_input})
