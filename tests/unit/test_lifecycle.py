@@ -29,6 +29,7 @@ class TestMemoryGovernanceEngine:
         
         assert "archived_notes" in results
         assert results["archived_notes"] == 0
+        assert "sandbox_cleaned" in results
     
     def test_daily_tasks(self, engine, mock_db):
         """Test daily governance tasks."""

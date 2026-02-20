@@ -98,11 +98,11 @@ def cleanup_sandboxes():
     """Cleanup test sandboxes before and after"""
     # Cleanup before test
     db = next(get_db_session())
-    sandbox = Sandbox(db=db)
+    sandbox = Sandbox(db=db, source_db="test_dev_agent_v3")
     sandboxes = sandbox.list_sandboxes(prefix="", pattern="test_sandbox_%")
     for s in sandboxes:
         try:
-            sandbox.delete(s["sandbox_name"])
+            sandbox.delete(s["sandbox_name"], force=True)
         except:
             pass
     
@@ -112,13 +112,13 @@ def cleanup_sandboxes():
     sandboxes = sandbox.list_sandboxes(prefix="", pattern="test_sandbox_%")
     for s in sandboxes:
         try:
-            sandbox.delete(s["sandbox_name"])
+            sandbox.delete(s["sandbox_name"], force=True)
         except:
             pass
     sandboxes = sandbox.list_sandboxes(pattern="test_sandbox_%")
     for s in sandboxes:
         try:
-            sandbox.delete(s["sandbox_name"])
+            sandbox.delete(s["sandbox_name"], force=True)
         except:
             pass
 

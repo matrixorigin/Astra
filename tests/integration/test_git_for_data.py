@@ -142,14 +142,27 @@ def test_sandbox_creation(sandbox):
 
 
 def test_sandbox_experiment(sandbox, db):
-    """Test running an experiment in a sandbox."""
+    """Test running an experiment in a sandbox with table branching."""
     from sqlalchemy import text
     
-    user_id = str(uuid4())
-    session_id = str(uuid4())
     sandbox_name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
-    # Create initial event directly
+    # Create sandbox with conversation_events table branched
+    sandbox.create(sandbox_name, tables=["conversation_events"])
+
+    # Get counts — sandbox should have same data as source at branch point
+    result = db.execute(text("SELECT DATABASE() as db"))
+    current_db = result.first()._mapping["db"]
+
+    result = db.execute(text(f"select count(*) as count from {current_db}.conversation_events"))
+    main_count_before = result.first()._mapping["count"]
+
+    result = db.execute(text(f"select count(*) as count from {sandbox_name}.conversation_events"))
+    sandbox_count = result.first()._mapping["count"]
+
+    assert sandbox_count == main_count_before
+
+    # Add event to main AFTER sandbox creation — sandbox should NOT see it
     db.execute(
         text("""
         INSERT INTO conversation_events 
@@ -158,32 +171,8 @@ def test_sandbox_experiment(sandbox, db):
         """),
         {
             "event_id": str(uuid4()),
-            "session_id": session_id,
-            "user_id": user_id,
-            "agent_id": "system",
-            "agent_version": "1.0.0",
-            "event_type": "user_query",
-            "content": "Before experiment",
-            "causal_chain_id": str(uuid4()),
-            "created_at": datetime.now(timezone.utc)
-        }
-    )
-    db.commit()
-
-    # Create sandbox (clones current state)
-    sandbox.create(sandbox_name)
-
-    # Add more events to main (after sandbox creation)
-    db.execute(
-        text("""
-        INSERT INTO conversation_events 
-        (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
-        VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
-        """),
-        {
-            "event_id": str(uuid4()),
-            "session_id": session_id,
-            "user_id": user_id,
+            "session_id": "test_session",
+            "user_id": "test_user",
             "agent_id": "system",
             "agent_version": "1.0.0",
             "event_type": "user_query",
@@ -194,17 +183,15 @@ def test_sandbox_experiment(sandbox, db):
     )
     db.commit()
 
-    # Verify isolation: main has more events than sandbox
-    result = db.execute(text("SELECT DATABASE() as db"))
-    current_db = result.first()._mapping["db"]
-    
+    # Main has one more, sandbox unchanged
     result = db.execute(text(f"select count(*) as count from {current_db}.conversation_events"))
-    main_count = result.first()._mapping["count"]
-    
-    result = db.execute(text(f"select count(*) as count from {sandbox_name}.conversation_events"))
-    sandbox_count = result.first()._mapping["count"]
+    main_count_after = result.first()._mapping["count"]
 
-    assert main_count > sandbox_count
+    result = db.execute(text(f"select count(*) as count from {sandbox_name}.conversation_events"))
+    sandbox_count_after = result.first()._mapping["count"]
+
+    assert main_count_after == main_count_before + 1
+    assert sandbox_count_after == sandbox_count
 
     # Cleanup
     sandbox.delete(sandbox_name)

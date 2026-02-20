@@ -56,6 +56,7 @@ class DataContext:
         sandbox_name: str,
         source_db: str,
         access: DataAccessLevel,
+        session_id: str | None = None,
         db_host: str = "localhost",
         db_port: int = 6001,
     ):
@@ -64,6 +65,7 @@ class DataContext:
         self.sandbox_name = sandbox_name
         self.source_db = source_db
         self.access = access
+        self.session_id = session_id
         self.db_host = db_host
         self.db_port = db_port
         self._created = False
@@ -84,12 +86,35 @@ class DataContext:
         return self._created
 
     def ensure_created(self) -> None:
-        """Create empty sandbox DB (idempotent)."""
+        """Create empty sandbox DB and register metadata (idempotent)."""
         if self._created:
             return
         self.db.commit()
         self.db.execute(text(f"CREATE DATABASE IF NOT EXISTS {self.sandbox_name}"))
         self.db.commit()
+        # Register in sandbox_metadata for cleanup tracking
+        try:
+            import json
+            self.db.execute(
+                text(f"""
+                    INSERT INTO {self.source_db}.sandbox_metadata
+                    (sandbox_name, user_id, data_source, description, created_by,
+                     created_at, updated_at, tags, source_database, status, session_id)
+                    VALUES (:name, 'system', :ds, 'code_executor sandbox', 'system',
+                            CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6),
+                            NULL, :src, 'active', :sid)
+                """),
+                {
+                    "name": self.sandbox_name,
+                    "ds": json.dumps({"type": "matrixone", "database": self.sandbox_name}),
+                    "src": self.source_db,
+                    "sid": self.session_id,
+                },
+            )
+            self.db.commit()
+        except Exception:
+            # Metadata already exists (idempotent) or table missing
+            self.db.rollback()
         self._grant_permissions()
         self._created = True
 
@@ -148,20 +173,26 @@ class DataContext:
         return MergeResult(tables_merged=merged, tables_failed=failed)
 
     def destroy(self) -> None:
-        """Clean up: data branch delete per table, then DROP DATABASE."""
+        """Clean up: data branch delete per table, then DROP DATABASE + metadata."""
         if not self._created:
             return
         try:
-            # Delete branch metadata per table
             for table in self._branched_tables:
                 try:
                     self.branch.delete(f"{self.sandbox_name}.{table}")
                 except Exception:
                     pass
-            # Drop the sandbox database
             self.db.commit()
             self.db.execute(text(f"DROP DATABASE IF EXISTS {self.sandbox_name}"))
             self.db.commit()
+            # Clean metadata
+            try:
+                self.db.execute(text(
+                    f"DELETE FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :n"
+                ), {"n": self.sandbox_name})
+                self.db.commit()
+            except Exception:
+                pass
         except Exception:
             pass
         self._created = False

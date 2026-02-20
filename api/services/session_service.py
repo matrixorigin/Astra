@@ -221,6 +221,8 @@ class SessionService:
             update_data["status"] = status
             if status == "ended":
                 update_data["ended_at"] = datetime.now(timezone.utc)
+            if status in ("closed", "ended"):
+                self._cleanup_sandbox(session_id)
         
         if not update_data:
             # 没有更新内容，直接返回当前信息
@@ -335,3 +337,23 @@ class SessionService:
         except Exception as e:
             # 静默失败，不影响主流程
             pass
+
+    def _cleanup_sandbox(self, session_id: str) -> None:
+        """Clean up sandboxes associated with this session."""
+        try:
+            from sqlalchemy import text
+            from core.sandbox import Sandbox
+            result = self.db_session.execute(
+                text("SELECT sandbox_name FROM sandbox_metadata WHERE session_id = :sid AND status = 'active'"),
+                {"sid": session_id},
+            )
+            names = [row._mapping["sandbox_name"] for row in result]
+            if names:
+                sandbox = Sandbox(db=self.db_session)
+                for name in names:
+                    try:
+                        sandbox.delete(name, force=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass  # Best-effort, Tier 2 will catch any misses

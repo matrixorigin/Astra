@@ -4,6 +4,7 @@ Handles session creation, updates, and lifecycle management.
 """
 
 from datetime import datetime, timezone
+from typing import Callable
 from uuid import uuid4
 
 from sqlalchemy.orm import Session as DBSession
@@ -118,11 +119,12 @@ class SessionManager:
             db_session.updated_at = now
             db.commit()
 
-    def close_session(self, session_id: str) -> None:
+    def close_session(self, session_id: str, on_close: Callable[[str], None] | None = None) -> None:
         """Close a session and trigger knowledge extraction.
 
         Args:
             session_id: Session identifier
+            on_close: Optional callback(session_id) for resource cleanup (e.g. sandbox)
         """
         db = self._get_session()
         db_session = db.query(SessionModel).filter(SessionModel.session_id == session_id).first()
@@ -149,6 +151,13 @@ class SessionManager:
                 logger.info(f"Extracted knowledge from {len(chains)} chains in session {session_id}")
             except Exception as e:
                 logger.error(f"Knowledge extraction failed for session {session_id}: {e}")
+
+            # Resource cleanup (sandbox, etc.)
+            if on_close:
+                try:
+                    on_close(session_id)
+                except Exception as e:
+                    logger.error(f"on_close callback failed for session {session_id}: {e}")
 
     def get_user_sessions(
         self, user_id: str, status: SessionStatus | None = None, limit: int = 10

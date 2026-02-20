@@ -100,8 +100,8 @@ class TestSQLInjectionPrevention:
         with pytest.raises(ValueError):
             sandbox.use("'; DROP TABLE users--")
 
-    def test_clone_table_sql_injection(self):
-        """Test clone_table rejects SQL injection attempts."""
+    def test_add_table_sql_injection(self):
+        """Test add_table rejects SQL injection via Branch._qualify → validate_identifier."""
         from unittest.mock import Mock
         from sqlalchemy.orm import Session
         
@@ -109,10 +109,7 @@ class TestSQLInjectionPrevention:
         sandbox = Sandbox(db=mock_db)
         
         with pytest.raises(ValueError):
-            sandbox.clone_table("'; DROP TABLE users--", "source")
+            sandbox.add_table("'; DROP TABLE users--", "t1")
         
         with pytest.raises(ValueError):
-            sandbox.clone_table("target", "'; DROP TABLE users--")
-        
-        with pytest.raises(ValueError):
-            sandbox.clone_table("target", "source", "'; DROP TABLE users--")
+            sandbox.add_table("sandbox1", "'; DROP TABLE users--")

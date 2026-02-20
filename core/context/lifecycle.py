@@ -78,6 +78,17 @@ class MemoryGovernanceEngine:
         
         # Archive closed working memory (scratchpad notes)
         results["archived_notes"] = self._archive_closed_notes()
+
+        # Sandbox cleanup (expired, zombie sessions, orphans)
+        try:
+            from core.sandbox.cleanup import SandboxCleaner
+            cleaner = SandboxCleaner(db=self.db)
+            cleanup = cleaner.run()
+            results["sandbox_cleaned"] = cleanup.get("cleaned", 0)
+            results["sandbox_failed"] = cleanup.get("failed", 0)
+        except Exception as e:
+            logger.error(f"Sandbox cleanup failed: {e}")
+            results["sandbox_cleaned"] = 0
         
         logger.info(f"Hourly tasks: {results}")
         return results

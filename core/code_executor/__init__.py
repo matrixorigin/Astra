@@ -157,6 +157,7 @@ class CodeExecutor:
             sandbox_name=f"code_exec_{session_id[:8]}",
             source_db=source_db,
             access=DataAccessLevel.WRITE,
+            session_id=session_id,
         )
         self._session_contexts[session_id] = ctx
         return ctx

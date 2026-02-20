@@ -128,13 +128,13 @@ class TestSessionInjection:
 class TestSessionSharing:
     """Test that modules share the same session when passed."""
 
-    def test_sandbox_shares_session_with_git(self):
-        """Test Sandbox shares session with GitForData."""
+    def test_sandbox_shares_session_with_branch(self):
+        """Test Sandbox shares session with Branch."""
         mock_session = Mock(spec=Session)
         sandbox = Sandbox(db=mock_session)
         
-        # GitForData inside sandbox should use the same session
-        assert sandbox.git.db is mock_session
+        # Branch inside sandbox should use the same session
+        assert sandbox.branch.db is mock_session
 
     def test_pipeline_shares_session(self):
         """Test SkillPipeline shares session with dependencies."""
