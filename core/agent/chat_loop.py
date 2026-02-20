@@ -168,6 +168,7 @@ class ChatLoop:
         self.scratchpad = scratchpad
         self.continuity = continuity
         self.observer = None  # Set via set_observer()
+        self.mcp_bridge = None  # Set via set_mcp_bridge()
 
     async def run_step(
         self,
@@ -216,6 +217,11 @@ class ChatLoop:
         # Append scratchpad tools when scratchpad is enabled
         if self.scratchpad:
             tools_schema = list(tools_schema) + _SCRATCHPAD_TOOLS
+
+        # Append MCP tools when bridge is connected
+        if self.mcp_bridge and self.mcp_bridge.tool_count > 0:
+            mcp_tools = await self.mcp_bridge.get_tools_schema()
+            tools_schema = list(tools_schema) + mcp_tools
 
         if not tools_schema:
             # No tools available — plain chat
@@ -350,6 +356,8 @@ class ChatLoop:
                         result = self._handle_scratchpad_tool(
                             fn_name, params, session_id, user_id,
                         )
+                    elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
+                        result = await self.mcp_bridge.call_tool(fn_name, params)
                     else:
                         result = self.executor.execute_skill_with_feedback(
                             skill_name=fn_name,
@@ -481,6 +489,11 @@ class ChatLoop:
 
         if self.scratchpad:
             tools_schema = list(tools_schema) + _SCRATCHPAD_TOOLS
+
+        # Append MCP tools when bridge is connected
+        if self.mcp_bridge and self.mcp_bridge.tool_count > 0:
+            mcp_tools = await self.mcp_bridge.get_tools_schema()
+            tools_schema = list(tools_schema) + mcp_tools
 
         # Log RUN_STARTED event
         run_started_event = self.event_logger.create_stream_event(
@@ -890,6 +903,8 @@ class ChatLoop:
                                 result = self._handle_scratchpad_tool(
                                     fn_name, params, session_id, user_id,
                                 )
+                            elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
+                                result = await self.mcp_bridge.call_tool(fn_name, params)
                             else:
                                 result = self.executor.execute_skill_with_feedback(
                                     skill_name=fn_name,
@@ -1142,14 +1157,19 @@ class ChatLoop:
                     
                     if tool_found or tools_schema:
                         # Execute skill with automatic feedback recording
-                        result = self.executor.execute_skill_with_feedback(
-                            skill_name=skill_name,
-                            params={"input": step.description},
-                            session_id=session_id,
-                            parent_event_id=None,
-                            selection_event_id=selection_event_id,
-                            extra_feedback_data={"planning_step": step.step_id},
-                        )
+                        if self.mcp_bridge and self.mcp_bridge.is_mcp_tool(skill_name):
+                            result = await self.mcp_bridge.call_tool(
+                                skill_name, {"input": step.description},
+                            )
+                        else:
+                            result = self.executor.execute_skill_with_feedback(
+                                skill_name=skill_name,
+                                params={"input": step.description},
+                                session_id=session_id,
+                                parent_event_id=None,
+                                selection_event_id=selection_event_id,
+                                extra_feedback_data={"planning_step": step.step_id},
+                            )
                     else:
                         result = f"No suitable skill available for: {step.description}"
                 else:
@@ -1319,6 +1339,10 @@ class ChatLoop:
     def set_observer(self, observer) -> None:
         """Attach an Observer for post-turn observation extraction."""
         self.observer = observer
+
+    def set_mcp_bridge(self, bridge) -> None:
+        """Attach an MCPBridge for external MCP server tool access."""
+        self.mcp_bridge = bridge
 
     def _run_observer(
         self, session_id: str, user_id: str, messages: list[dict[str, Any]]
