@@ -80,6 +80,14 @@ class BaseProvider(ABC):
         raise last_error
 
 
+def _extract_openai_cached_tokens(usage) -> int:
+    """Extract cached tokens from OpenAI usage (automatic prefix caching)."""
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details:
+        return getattr(details, "cached_tokens", 0) or 0
+    return 0
+
+
 def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
     """Shared tool call accumulation for OpenAI-compatible streaming."""
     buf: dict[int, dict] = {}
@@ -89,6 +97,7 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
                 "type": "usage",
                 "prompt": chunk.usage.prompt_tokens,
                 "completion": chunk.usage.completion_tokens,
+                "cache_read": _extract_openai_cached_tokens(chunk.usage),
             }
             continue
         if not chunk.choices:
@@ -134,6 +143,7 @@ def _extract_usage(resp) -> dict:
         "prompt_tokens": resp.usage.prompt_tokens,
         "completion_tokens": resp.usage.completion_tokens,
         "total_tokens": resp.usage.total_tokens,
+        "cache_read_tokens": _extract_openai_cached_tokens(resp.usage),
     }
 
 
@@ -156,6 +166,7 @@ class OpenAIProvider(BaseProvider):
                 model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
             )
         )
+        cache_read = _extract_openai_cached_tokens(resp.usage)
         return LLMResponse(
             content=resp.choices[0].message.content or "",
             model=resp.model,
@@ -165,6 +176,7 @@ class OpenAIProvider(BaseProvider):
             tokens_total=resp.usage.total_tokens,
             latency_ms=0,
             cost_usd=0.0,
+            cache_read_tokens=cache_read,
         )
 
     def complete_stream(self, messages, model, temperature, max_tokens):
@@ -184,6 +196,7 @@ class OpenAIProvider(BaseProvider):
                     "type": "usage",
                     "prompt": chunk.usage.prompt_tokens,
                     "completion": chunk.usage.completion_tokens,
+                    "cache_read": _extract_openai_cached_tokens(chunk.usage),
                 }
             elif chunk.choices and chunk.choices[0].delta.content:
                 yield {"type": "text", "content": chunk.choices[0].delta.content}
@@ -299,7 +312,12 @@ class GroqProvider(BaseProvider):
 
 
 class AnthropicProvider(BaseProvider):
-    """Anthropic provider — different API shape, normalized to common interface."""
+    """Anthropic provider with prompt caching support.
+
+    Automatically marks system prompt and tool definitions as cacheable
+    using Anthropic's cache_control: {"type": "ephemeral"}.
+    Cache hits reduce input token cost by ~90%.
+    """
 
     provider = LLMProvider.ANTHROPIC
 
@@ -307,30 +325,48 @@ class AnthropicProvider(BaseProvider):
         import anthropic
 
         self._client = anthropic.Anthropic(api_key=api_key)
+        self.cache_enabled = True  # Set by LLMClient._dispatch from ModelConfig.enable_cache
 
-    def _split_system(self, messages: list[dict]) -> tuple[str, list[dict]]:
-        """Extract system message (Anthropic takes it as a separate param)."""
-        system = ""
+    def _split_system(self, messages: list[dict]) -> tuple[list[dict] | str, list[dict]]:
+        """Extract system message. Returns cacheable blocks if cache enabled, else plain string."""
+        system_parts = []
         user_msgs = []
         for m in messages:
             if m["role"] == "system":
-                system += (m.get("content") or "") + "\n"
+                system_parts.append(m.get("content") or "")
             else:
                 user_msgs.append(m)
-        return system.strip(), user_msgs
+
+        system_text = "\n".join(system_parts).strip() if system_parts else "You are a helpful assistant."
+
+        if not self.cache_enabled:
+            return system_text, user_msgs
+
+        system_blocks = [
+            {"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}
+        ]
+        return system_blocks, user_msgs
+
+    @staticmethod
+    def _extract_cache_usage(usage) -> tuple[int, int]:
+        """Extract cache_read and cache_creation tokens from Anthropic usage."""
+        cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+        cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
+        return cache_read, cache_creation
 
     def complete(self, messages, model, temperature, max_tokens) -> LLMResponse:
-        system, msgs = self._split_system(messages)
+        system_blocks, msgs = self._split_system(messages)
         resp = self._with_retry(
             lambda: self._client.messages.create(
                 model=model,
-                system=system or "You are a helpful assistant.",
+                system=system_blocks,
                 messages=msgs,
                 temperature=temperature,
                 max_tokens=max_tokens or 2000,
             )
         )
         text = "".join(b.text for b in resp.content if b.type == "text")
+        cache_read, cache_creation = self._extract_cache_usage(resp.usage)
         return LLMResponse(
             content=text,
             model=resp.model,
@@ -340,21 +376,30 @@ class AnthropicProvider(BaseProvider):
             tokens_total=resp.usage.input_tokens + resp.usage.output_tokens,
             latency_ms=0,
             cost_usd=0.0,
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=cache_creation,
         )
 
     def complete_stream(self, messages, model, temperature, max_tokens):
-        system, msgs = self._split_system(messages)
+        system_blocks, msgs = self._split_system(messages)
         with self._client.messages.stream(
             model=model,
-            system=system or "You are a helpful assistant.",
+            system=system_blocks,
             messages=msgs,
             temperature=temperature,
             max_tokens=max_tokens or 2000,
         ) as stream:
             for text in stream.text_stream:
                 yield {"type": "text", "content": text}
-            usage = stream.get_final_message().usage
-            yield {"type": "usage", "prompt": usage.input_tokens, "completion": usage.output_tokens}
+            final = stream.get_final_message()
+            cache_read, cache_creation = self._extract_cache_usage(final.usage)
+            yield {
+                "type": "usage",
+                "prompt": final.usage.input_tokens,
+                "completion": final.usage.output_tokens,
+                "cache_read": cache_read,
+                "cache_creation": cache_creation,
+            }
 
     def complete_with_tools(
         self,
@@ -365,19 +410,19 @@ class AnthropicProvider(BaseProvider):
         temperature: float,
         max_tokens: int | None,
     ) -> dict[str, Any]:
-        system, msgs = self._split_system(messages)
-        # Convert OpenAI tool format → Anthropic tool format
-        anthropic_tools = [self._convert_tool(t) for t in tools]
+        system_blocks, msgs = self._split_system(messages)
+        anthropic_tools = self._convert_tools_with_cache(tools)
         resp = self._with_retry(
             lambda: self._client.messages.create(
                 model=model,
-                system=system or "You are a helpful assistant.",
+                system=system_blocks,
                 messages=msgs,
                 tools=anthropic_tools,
                 temperature=temperature,
                 max_tokens=max_tokens or 2000,
             )
         )
+        cache_read, cache_creation = self._extract_cache_usage(resp.usage)
         result: dict[str, Any] = {
             "content": "",
             "tool_calls": [],
@@ -385,6 +430,8 @@ class AnthropicProvider(BaseProvider):
                 "prompt_tokens": resp.usage.input_tokens,
                 "completion_tokens": resp.usage.output_tokens,
                 "total_tokens": resp.usage.input_tokens + resp.usage.output_tokens,
+                "cache_read_tokens": cache_read,
+                "cache_creation_tokens": cache_creation,
             },
         }
         import json as _json
@@ -405,13 +452,13 @@ class AnthropicProvider(BaseProvider):
     def complete_with_tools_stream(
         self, messages, tools, model, tool_choice, temperature, max_tokens
     ):
-        system, msgs = self._split_system(messages)
-        anthropic_tools = [self._convert_tool(t) for t in tools]
+        system_blocks, msgs = self._split_system(messages)
+        anthropic_tools = self._convert_tools_with_cache(tools)
         import json as _json
 
         with self._client.messages.stream(
             model=model,
-            system=system or "You are a helpful assistant.",
+            system=system_blocks,
             messages=msgs,
             tools=anthropic_tools,
             temperature=temperature,
@@ -421,7 +468,6 @@ class AnthropicProvider(BaseProvider):
                 if hasattr(event, "type") and event.type == "content_block_delta":
                     if hasattr(event.delta, "text"):
                         yield {"type": "text", "content": event.delta.text}
-            # After stream, extract tool calls from final message
             msg = stream.get_final_message()
             for block in msg.content:
                 if block.type == "tool_use":
@@ -433,11 +479,21 @@ class AnthropicProvider(BaseProvider):
                             "function": {"name": block.name, "arguments": _json.dumps(block.input)},
                         },
                     }
+            cache_read, cache_creation = self._extract_cache_usage(msg.usage)
             yield {
                 "type": "usage",
                 "prompt": msg.usage.input_tokens,
                 "completion": msg.usage.output_tokens,
+                "cache_read": cache_read,
+                "cache_creation": cache_creation,
             }
+
+    def _convert_tools_with_cache(self, tools: list[dict]) -> list[dict]:
+        """Convert OpenAI tools to Anthropic format; mark last tool as cacheable if cache enabled."""
+        anthropic_tools = [self._convert_tool(t) for t in tools]
+        if anthropic_tools and self.cache_enabled:
+            anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
+        return anthropic_tools
 
     @staticmethod
     def _convert_tool(openai_tool: dict) -> dict:

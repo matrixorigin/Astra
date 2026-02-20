@@ -353,6 +353,9 @@ class LLMClient:
             try:
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
                 provider = self._get_provider(model_cfg.provider)
+                # Pass cache config to Anthropic provider
+                if hasattr(provider, 'cache_enabled'):
+                    provider.cache_enabled = model_cfg.enable_cache
                 result = getattr(provider, fn_name)(model=model_cfg.model_name, **kwargs)
                 breaker.record_success()
                 return result, model_cfg
@@ -398,7 +401,11 @@ class LLMClient:
             )
             response.latency_ms = int((time.time() - start) * 1000)
             response.cost_usd = self.router.calculate_cost(
-                model_cfg.model_name, response.tokens_prompt, response.tokens_completion
+                model_cfg.model_name,
+                response.tokens_prompt,
+                response.tokens_completion,
+                cache_read_tokens=response.cache_read_tokens,
+                cache_creation_tokens=response.cache_creation_tokens,
             )
             self._record_spend(response.cost_usd)
             self._log_call(
@@ -480,7 +487,7 @@ class LLMClient:
             try:
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
                 provider = self._get_provider(model_cfg.provider)
-                usage = {"prompt": 0, "completion": 0}
+                usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}
 
                 for chunk in provider.complete_stream(
                     messages, model_cfg.model_name, temp, max_tok
@@ -490,11 +497,17 @@ class LLMClient:
                     elif chunk["type"] == "usage":
                         usage["prompt"] = chunk["prompt"]
                         usage["completion"] = chunk["completion"]
+                        usage["cache_read"] = chunk.get("cache_read", 0)
+                        usage["cache_creation"] = chunk.get("cache_creation", 0)
 
                 breaker.record_success()
                 latency = int((time.time() - start) * 1000)
                 cost = self.router.calculate_cost(
-                    model_cfg.model_name, usage["prompt"], usage["completion"]
+                    model_cfg.model_name,
+                    usage["prompt"],
+                    usage["completion"],
+                    cache_read_tokens=usage["cache_read"],
+                    cache_creation_tokens=usage["cache_creation"],
                 )
                 self._record_spend(cost)
                 self._log_call(
@@ -510,6 +523,8 @@ class LLMClient:
                         tokens_total=usage["prompt"] + usage["completion"],
                         latency_ms=latency,
                         cost_usd=cost,
+                        cache_read_tokens=usage["cache_read"],
+                        cache_creation_tokens=usage["cache_creation"],
                     ),
                     "success",
                 )
@@ -550,6 +565,8 @@ class LLMClient:
             try:
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
                 provider = self._get_provider(model_cfg.provider)
+                if hasattr(provider, 'cache_enabled'):
+                    provider.cache_enabled = model_cfg.enable_cache
                 for chunk in provider.complete_with_tools_stream(
                     messages, tools, model_cfg.model_name, tool_choice, temp, max_tok
                 ):

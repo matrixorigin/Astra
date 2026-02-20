@@ -21,6 +21,12 @@ class ModelConfig(BaseModel):
     context_window: int = 128000
     price_per_1k_prompt: float = 0.0
     price_per_1k_completion: float = 0.0
+    # Prompt caching pricing (per 1k tokens)
+    # Anthropic: cache write = 1.25x base, cache read = 0.1x base
+    # OpenAI: cached = 0.5x base (automatic prefix caching)
+    price_per_1k_cache_read: float | None = None  # None = auto-derive from provider defaults
+    price_per_1k_cache_write: float | None = None
+    enable_cache: bool = True  # Set False to disable prompt caching for this model
     rpm_limit: int = 500
     tpm_limit: int = 150000
     fallback_to: str | None = None
@@ -317,12 +323,39 @@ class ModelRouter:
     def set_strategy(self, strategy: RoutingStrategy):
         self.strategy = strategy
 
-    def calculate_cost(self, model_name: str, tokens_prompt: int, tokens_completion: int) -> float:
+    def calculate_cost(
+        self,
+        model_name: str,
+        tokens_prompt: int,
+        tokens_completion: int,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+    ) -> float:
         cfg = self.registry.get(model_name)
         if not cfg:
             return 0.0
+
+        # Non-cached prompt tokens = total prompt - cache_read - cache_creation
+        regular_prompt = max(tokens_prompt - cache_read_tokens - cache_creation_tokens, 0)
+
+        # Cache pricing defaults by provider
+        cache_read_price = cfg.price_per_1k_cache_read
+        cache_write_price = cfg.price_per_1k_cache_write
+        if cache_read_price is None:
+            if cfg.provider == LLMProvider.ANTHROPIC:
+                cache_read_price = cfg.price_per_1k_prompt * 0.1  # 90% discount
+            else:
+                cache_read_price = cfg.price_per_1k_prompt * 0.5  # OpenAI 50% discount
+        if cache_write_price is None:
+            if cfg.provider == LLMProvider.ANTHROPIC:
+                cache_write_price = cfg.price_per_1k_prompt * 1.25  # 25% surcharge
+            else:
+                cache_write_price = cfg.price_per_1k_prompt  # OpenAI: no write surcharge
+
         cost = (
-            tokens_prompt * cfg.price_per_1k_prompt / 1000
+            regular_prompt * cfg.price_per_1k_prompt / 1000
+            + cache_read_tokens * cache_read_price / 1000
+            + cache_creation_tokens * cache_write_price / 1000
             + tokens_completion * cfg.price_per_1k_completion / 1000
         )
         return round(cost, 6)

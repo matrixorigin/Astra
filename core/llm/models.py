@@ -47,6 +47,9 @@ class LLMResponse(BaseModel):
     tokens_total: int
     latency_ms: int
     cost_usd: float
+    # Prompt caching stats (Anthropic cache_read/cache_creation; OpenAI cached_tokens)
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
