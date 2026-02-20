@@ -526,12 +526,14 @@ class ChatLoop:
                 results = {}  # call_id -> result_text
                 agent_to_call = {}  # agent_id -> call_id mapping
                 completed_agents = set()  # Track which agents have completed
+                execution_times = {}  # call_id -> execution time
                 
                 # Build agent_id to call_id mapping
                 for tc in delegation_calls:
                     params = json.loads(tc["function"]["arguments"])
                     agent_to_call[params.get("agent_id")] = tc["id"]
                 
+                _t0 = time.monotonic()
                 try:
                     async for event in skill.execute_parallel_stream(inputs):
                         yield event
@@ -565,6 +567,16 @@ class ChatLoop:
                     for tc in delegation_calls:
                         if tc["id"] not in results:
                             results[tc["id"]] = f"Error: Parallel execution failed - {str(e)}"
+                finally:
+                    # Record feedback for parallel execution
+                    _elapsed_ms = (time.monotonic() - _t0) * 1000
+                    if self._last_selection_event_id:
+                        from core.skills.learning_signals import SignalType
+                        self._pipeline.record_feedback(
+                            self._last_selection_event_id,
+                            SignalType.EXECUTION_TIME,
+                            {"ms": _elapsed_ms, "skill": "delegate_task", "parallel": True, "count": len(delegation_calls)},
+                        )
                 
                 # Emit TOOL_RESULT for each delegation
                 for tc in delegation_calls:
@@ -606,39 +618,50 @@ class ChatLoop:
                     )
 
                     # Handle delegation skill specially for multi-agent streaming
-                    if fn_name == "delegate_task":
-                        params = json.loads(tc["function"]["arguments"])
-                        delegated_agent_id = params.get("agent_id", "unknown")
-                        
-                        # Stream delegated agent's events
-                        result_text = ""
-                        has_output = False
-                        async for delegated_event in self.executor.execute_skill_stream(
-                            skill_name=fn_name,
-                            params=params,
-                            session_id=session_id,
-                            parent_event_id=user_event.event_id,
-                        ):
-                            # Forward delegated agent's events with agent_id tagged
-                            yield delegated_event
+                    _t0 = time.monotonic()
+                    try:
+                        if fn_name == "delegate_task":
+                            params = json.loads(tc["function"]["arguments"])
+                            delegated_agent_id = params.get("agent_id", "unknown")
                             
-                            # Collect final result
-                            if delegated_event.event_type == StreamEventType.TEXT_DONE:
-                                result_text = delegated_event.data.get("text", "")
-                                has_output = True
-                        
-                        # Use collected result or fallback message with agent_id
-                        result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
-                    else:
-                        result = self.executor.execute_skill(
-                            skill_name=fn_name,
-                            params=json.loads(tc["function"]["arguments"]),
-                            session_id=session_id,
-                            parent_event_id=user_event.event_id,
-                        )
-                        result_str = (
-                            json.dumps(result, default=str) if not isinstance(result, str) else result
-                        )
+                            # Stream delegated agent's events
+                            result_text = ""
+                            has_output = False
+                            async for delegated_event in self.executor.execute_skill_stream(
+                                skill_name=fn_name,
+                                params=params,
+                                session_id=session_id,
+                                parent_event_id=user_event.event_id,
+                            ):
+                                # Forward delegated agent's events with agent_id tagged
+                                yield delegated_event
+                                
+                                # Collect final result
+                                if delegated_event.event_type == StreamEventType.TEXT_DONE:
+                                    result_text = delegated_event.data.get("text", "")
+                                    has_output = True
+                            
+                            # Use collected result or fallback message with agent_id
+                            result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
+                        else:
+                            result = self.executor.execute_skill(
+                                skill_name=fn_name,
+                                params=json.loads(tc["function"]["arguments"]),
+                                session_id=session_id,
+                                parent_event_id=user_event.event_id,
+                            )
+                            result_str = (
+                                json.dumps(result, default=str) if not isinstance(result, str) else result
+                            )
+                    finally:
+                        _elapsed_ms = (time.monotonic() - _t0) * 1000
+                        if self._last_selection_event_id:
+                            from core.skills.learning_signals import SignalType
+                            self._pipeline.record_feedback(
+                                self._last_selection_event_id,
+                                SignalType.EXECUTION_TIME,
+                                {"ms": _elapsed_ms, "skill": fn_name},
+                            )
 
                     tool_result_event = self.event_logger.create_stream_event(
                         user_id=user_id,

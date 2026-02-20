@@ -301,13 +301,12 @@ class SelfImprovingSelector:
             LearningModel.signal_type == signal.signal_type.value
         ).first()
         embedding = self._embed_query(signal.query_pattern)
-        embedding_vec_str = self._embedding_to_vec_str(embedding)
         
         if existing:
             existing.evidence_count += 1
             existing.confidence = min(99, existing.evidence_count * 10)
-            if existing.query_embedding is None and embedding_vec_str is not None:
-                existing.query_embedding = embedding_vec_str
+            if existing.query_embedding is None and embedding is not None:
+                existing.query_embedding = embedding
             if existing.context_features is None and signal.context_features is not None:
                 existing.context_features = signal.context_features
             # Update target metrics with weighted average
@@ -327,7 +326,7 @@ class SelfImprovingSelector:
             learning = LearningModel(
                 learning_id=str(uuid7()),
                 query_pattern=signal.query_pattern,
-                query_embedding=embedding_vec_str,
+                query_embedding=embedding,
                 wrong_skills=signal.wrong_skills,
                 correct_skills=signal.correct_skills,
                 improvement_score=10.0,
@@ -498,9 +497,8 @@ class SelfImprovingSelector:
             return None
         if not hasattr(self.session, "bind") or self.session.bind is None:
             return None
-        vec_str = self._embedding_to_vec_str(query_embedding)
-        if vec_str is None:
-            return None
+        # Convert list to string format for L2_DISTANCE: [1.0,2.0,3.0]
+        vec_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
         from sqlalchemy import text
         if limit is None:
             limit = SEMANTIC_MATCH_LIMIT

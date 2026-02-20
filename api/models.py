@@ -4,6 +4,7 @@ from sqlalchemy import Column, DateTime, Integer, String, Text, JSON, ForeignKey
 from sqlalchemy.dialects.mysql import TINYINT
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
+from matrixone import VectorType, VectorPrecision
 
 Base = declarative_base()
 
@@ -150,7 +151,7 @@ class Event(Base):
     context_snapshot = Column(JSON)
     token_usage = Column(JSON)
     embedding_ref = Column(String(128))
-    embedding = Column(Text)  # VECF64(1536) stored as text for hybrid retrieval
+    embedding = Column(VectorType(1536, VectorPrecision.F32))  # Native VECF32 vector
     prompt_template_id = Column(String(64))
     skills_snapshot = Column(JSON)
     quality_score = Column(Float)  # Changed from String(10) to Float for aggregation
@@ -253,7 +254,7 @@ class DecisionAudit(Base):
 class EventEmbedding(Base):
     __tablename__ = "event_embeddings"
     event_id = Column(String(36), primary_key=True)
-    embedding = Column(String(1024))  # vecf32 type
+    embedding = Column(VectorType(1536, VectorPrecision.F32))  # Native VECF32 vector
     model_name = Column(String(50))
     model_version = Column(String(32))
     embedding_metadata = Column("metadata", JSON)
@@ -352,7 +353,7 @@ class SkillSelectionLearning(Base):
     __tablename__ = "skill_selection_learning"
     learning_id = Column(String(36), primary_key=True)
     query_pattern = Column(String(255), nullable=False, index=True)
-    query_embedding = Column(Text)
+    query_embedding = Column(VectorType(1536, VectorPrecision.F32))  # Native VECF32 vector
     wrong_skills = Column(JSON)
     correct_skills = Column(JSON)
     improvement_score = Column(Float)
@@ -360,10 +361,10 @@ class SkillSelectionLearning(Base):
     evidence_count = Column(Integer, default=1)
     applied_count = Column(Integer, default=0)
     last_applied_at = Column(DateTime)
-    context_features = Column(JSON)
     # Multi-dimensional learning fields
     signal_type = Column(String(50), default="wrong_skill", index=True)
     target_metrics = Column(JSON)  # {"time_ms": 500, "cost": 0.01, "satisfaction": 4}
+    context_features = Column(JSON)  # Context features for better matching
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -420,7 +421,7 @@ class KnowledgeEntry(Base):
     superseded_by = Column(String(64))
     
     # Vector search (stored as text, converted to VECF64 in raw SQL)
-    embedding = Column(Text)  # Will be VECF64(1536) in MatrixOne
+    embedding = Column(VectorType(1536, VectorPrecision.F32))  # Native VECF32 vector
     
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())

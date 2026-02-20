@@ -11,6 +11,7 @@ class SignalType(str, Enum):
     SLOW_EXECUTION = "slow_execution"
     HIGH_COST = "high_cost"
     LOW_SATISFACTION = "low_satisfaction"
+    EXECUTION_TIME = "execution_time"  # Raw execution time data for learning
 
 
 @dataclass
@@ -23,7 +24,7 @@ class LearningSignal:
     correct_skills: list[str]
     target_metrics: dict[str, float]  # e.g., {"time_ms": 500, "cost": 0.01}
     confidence: float = 10.0
-    context_features: dict[str, Any] | None = None
+    context_features: dict[str, Any] | None = None  # Optional context features
     
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage."""
