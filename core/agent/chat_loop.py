@@ -240,6 +240,20 @@ class ChatLoop:
 
                 params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
+                # CoT audit: check for goal hijacking before execution
+                from core.verification.cot_audit import audit_tool_call
+                audit = audit_tool_call(
+                    user_query=user_input,
+                    tool_name=fn_name,
+                    tool_args=params,
+                    assistant_reasoning=messages[-1].get("content", "") if messages else "",
+                )
+                if not audit.safe:
+                    logger.warning("CoT audit blocked tool %s: %s", fn_name, audit.reason)
+                    result_str = json.dumps({"error": f"Blocked by CoT audit: {audit.reason}"})
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": result_str})
+                    continue
+
                 # Execute skill with automatic feedback recording
                 try:
                     result = self.executor.execute_skill_with_feedback(
@@ -388,10 +402,12 @@ class ChatLoop:
         )
 
         if not tools_schema:
-            # Plain chat — stream text, accumulate for verification
-            full_text = ""
+            # Plain chat — stream text with sentence-level verification
+            from core.verification.streaming_verifier import StreamingVerifier
+            sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id)
+
             async for chunk in self.llm.chat_stream(messages, user_id, session_id):
-                full_text += chunk
+                warning = sv.check(chunk)
                 text_event = self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
@@ -407,8 +423,31 @@ class ChatLoop:
                     causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
                 )
+                if warning:
+                    sv.full_text += warning
+                    yield StreamEvent(
+                        event_type=StreamEventType.TEXT_DELTA,
+                        data={"chunk": warning},
+                        event_id=text_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
+                    )
 
-            # Verify with firewall before delivering
+            # Flush remaining buffer
+            remaining_warning = sv.flush()
+            if remaining_warning:
+                sv.full_text += remaining_warning
+                yield StreamEvent(
+                    event_type=StreamEventType.TEXT_DELTA,
+                    data={"chunk": remaining_warning},
+                    event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
+                )
+
+            full_text = sv.full_text
+
+            # Post-stream: full response-level verification for audit record
             verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn")
             self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
 
@@ -682,8 +721,20 @@ class ChatLoop:
                     # Handle delegation skill specially for multi-agent streaming
                     _t0 = time.monotonic()
                     try:
-                        if fn_name == "delegate_task":
-                            params = json.loads(tc["function"]["arguments"])
+                        params = json.loads(tc["function"]["arguments"])
+
+                        # CoT audit: check for goal hijacking before execution
+                        from core.verification.cot_audit import audit_tool_call
+                        audit = audit_tool_call(
+                            user_query=user_input,
+                            tool_name=fn_name,
+                            tool_args=params,
+                            assistant_reasoning=full_text,
+                        )
+                        if not audit.safe:
+                            logger.warning("CoT audit blocked tool %s: %s", fn_name, audit.reason)
+                            result_str = json.dumps({"error": f"Blocked by CoT audit: {audit.reason}"})
+                        elif fn_name == "delegate_task":
                             delegated_agent_id = params.get("agent_id", "unknown")
                             
                             # Stream delegated agent's events
@@ -709,7 +760,7 @@ class ChatLoop:
                             # Execute skill with automatic feedback recording
                             result = self.executor.execute_skill_with_feedback(
                                 skill_name=fn_name,
-                                params=json.loads(tc["function"]["arguments"]),
+                                params=params,
                                 session_id=session_id,
                                 parent_event_id=user_event.event_id,
                                 selection_event_id=self._last_selection_event_id,
@@ -754,9 +805,11 @@ class ChatLoop:
                 "content": "Please provide your final answer based on the tool results above.",
             }
         )
-        full_text = ""
+        from core.verification.streaming_verifier import StreamingVerifier
+        sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id)
+
         async for chunk in self.llm.chat_stream(messages, user_id, session_id):
-            full_text += chunk
+            warning = sv.check(chunk)
             yield StreamEvent(
                 event_type=StreamEventType.TEXT_DELTA,
                 data={"chunk": chunk},
@@ -764,6 +817,28 @@ class ChatLoop:
                 causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
             )
+            if warning:
+                sv.full_text += warning
+                yield StreamEvent(
+                    event_type=StreamEventType.TEXT_DELTA,
+                    data={"chunk": warning},
+                    event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
+                )
+
+        remaining_warning = sv.flush()
+        if remaining_warning:
+            sv.full_text += remaining_warning
+            yield StreamEvent(
+                event_type=StreamEventType.TEXT_DELTA,
+                data={"chunk": remaining_warning},
+                event_id=user_event.event_id,
+                causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
+            )
+
+        full_text = sv.full_text
 
         # Verify exhausted-rounds answer with firewall
         verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn")

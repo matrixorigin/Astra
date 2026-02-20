@@ -70,14 +70,31 @@ class SkillIndex:
             return 0
         self._entries.clear()
         for skill in skills:
-            text = _skill_text(skill)
-            try:
-                vec = self._embed(text)
-                self._entries.append(_Entry(name=skill.name, vector=vec))
-            except Exception as e:  # noqa: BLE001
-                logger.warning("Failed to embed skill %s: %s", skill.name, e)
+            self._add_one(skill)
         logger.info("SkillIndex built: %d skills indexed", len(self._entries))
         return len(self._entries)
+
+    def add(self, skill: Any) -> bool:
+        """Add or update a single skill. Returns True if indexed."""
+        if not self._embed:
+            return False
+        self.remove(skill.name)
+        return self._add_one(skill)
+
+    def remove(self, name: str) -> bool:
+        """Remove a skill by name. Returns True if found."""
+        before = len(self._entries)
+        self._entries = [e for e in self._entries if e.name != name]
+        return len(self._entries) < before
+
+    def _add_one(self, skill: Any) -> bool:
+        try:
+            vec = self._embed(_skill_text(skill))
+            self._entries.append(_Entry(name=skill.name, vector=vec))
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to embed skill %s: %s", skill.name, e)
+            return False
 
     # ------------------------------------------------------------------
     # Query

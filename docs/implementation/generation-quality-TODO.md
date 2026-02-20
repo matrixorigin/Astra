@@ -42,13 +42,15 @@
 
 ### 5. Streaming verification (hybrid approach)
 **Design ref**: trust-and-safety.md §2 "Streaming Verification (Roadmap)"  
-**Scope**: Sentence-boundary NLI checks during streaming, inline warnings.  
-**Status**: ⬜ Design only — implementation deferred until NLI model infrastructure available
+**File**: `core/verification/streaming_verifier.py` (new), `core/agent/chat_loop.py`  
+**Fix**: Created `StreamingVerifier` — accumulates streamed text, detects sentence boundaries, verifies each sentence against context snapshot via firewall. Integrated into `run_step_stream` plain-chat path and exhausted-rounds path. Inline `⚠️` warnings injected into stream when claims fail.  
+**Status**: ✅ Done (sentence-level; token-level NLI deferred)
 
 ### 6. CoT audit (AlignmentCheck)
 **Design ref**: trust-and-safety.md §2 "Chain-of-Thought Audit (Roadmap)"  
-**Scope**: Lightweight classifier on assistant CoT before tool execution.  
-**Status**: ⬜ Design only — implementation deferred
+**File**: `core/verification/cot_audit.py` (new), `core/agent/chat_loop.py`  
+**Fix**: Created `audit_tool_call()` — rule-based scanner for prompt injection patterns and goal hijacking signals. Integrated before tool execution in both `run_step` and `run_step_stream` sequential paths. Blocked calls return error to LLM for self-correction.  
+**Status**: ✅ Done (rule-based; fine-tuned classifier deferred)
 
 ---
 
@@ -64,8 +66,8 @@
 ### 8. SkillIndex incremental update
 **File**: `core/skills/skill_index.py`  
 **Problem**: `build()` re-embeds all skills every time. No incremental add/remove.  
-**Fix**: Add `add(skill)` / `remove(name)` methods. Rebuild only on registry change.  
-**Status**: ⬜ TODO (low priority — current brute-force is fine for <100 skills)
+**Fix**: Added `add(skill)` and `remove(name)` methods. `build()` refactored to use `_add_one()` internally. Existing tests pass unchanged.  
+**Status**: ✅ Done
 
 ---
 
@@ -75,3 +77,5 @@
 - ✅ `run_step_with_planning`: added user_event, context snapshot, RUN_STARTED, audit lineage
 - ✅ trust-and-safety.md: added streaming verification roadmap, CoT audit roadmap, claim-type weighting, fail-open/closed policy, new references
 - ✅ ChatLoop audit alignment table added to design doc
+- ✅ StreamingVerifier: sentence-level grounding checks during streaming output
+- ✅ SkillIndex: incremental add/remove support
