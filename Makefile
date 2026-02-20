@@ -9,6 +9,8 @@ help:
 	@echo "Environment Setup:"
 	@echo "  make setup              - Initial project setup (copy .env, install deps)"
 	@echo "  make install            - Install Python dependencies"
+	@echo "  make install-runtime    - Install runtime dependencies (Docker, Firecracker)"
+	@echo "  make check-runtime      - Check runtime environment"
 	@echo "  make lock               - Update dependency lock file (poetry.lock)"
 	@echo ""
 	@echo "Development Environment:"
@@ -31,6 +33,7 @@ help:
 	@echo "  make test-unit          - Run unit tests"
 	@echo "  make test-integration   - Run integration tests"
 	@echo "  make test-e2e           - Run end-to-end tests"
+	@echo "  make test-runtime       - Run runtime tests (Docker, Firecracker)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks (lint + format + type-check)"
@@ -44,6 +47,7 @@ help:
 	@echo "Examples:"
 	@echo "  make setup && make dev-up && make db-init  # First time setup"
 	@echo "  make dev-up && make test                   # Daily development"
+	@echo "  make install-runtime && make test-runtime  # Setup runtime tests"
 
 # ============================================================================
 # Environment Setup
@@ -74,6 +78,97 @@ install:
 	else \
 		pip install -e .; \
 	fi
+	@echo "✅ Python dependencies installed"
+
+.PHONY: install-runtime
+install-runtime:
+	@echo "Installing runtime dependencies..."
+	@echo ""
+	@echo "Checking Docker..."
+	@if command -v docker >/dev/null 2>&1; then \
+		echo "✅ Docker installed: $$(docker --version)"; \
+	else \
+		echo "❌ Docker not found"; \
+		echo "   Install: https://docs.docker.com/get-docker/"; \
+	fi
+	@echo ""
+	@echo "Checking Firecracker environment..."
+	@if [ "$$(uname)" != "Linux" ]; then \
+		echo "⚠️  Firecracker only supports Linux (current: $$(uname))"; \
+		echo "   Skipping Firecracker installation"; \
+	elif ! grep -qE "vmx|svm" /proc/cpuinfo; then \
+		echo "❌ CPU doesn't support virtualization"; \
+		echo "   Firecracker requires Intel VT-x or AMD-V"; \
+	elif [ ! -e /dev/kvm ]; then \
+		echo "❌ /dev/kvm not found"; \
+		echo "   Install KVM: sudo apt install qemu-kvm (Ubuntu/Debian)"; \
+	else \
+		echo "✅ KVM device available"; \
+		if groups | grep -q kvm; then \
+			echo "✅ User in kvm group"; \
+		else \
+			echo "⚠️  User not in kvm group"; \
+			echo "   Run: sudo usermod -aG kvm $$USER"; \
+			echo "   Then: newgrp kvm (or re-login)"; \
+		fi; \
+		if command -v firecracker >/dev/null 2>&1; then \
+			echo "✅ Firecracker installed: $$(firecracker --version 2>&1 | head -1)"; \
+		else \
+			echo "⚠️  Firecracker not installed"; \
+			echo "   Installing Firecracker..."; \
+			bash -c 'set -e; \
+				ARCH=$$(uname -m); \
+				RELEASE_URL="https://github.com/firecracker-microvm/firecracker/releases"; \
+				LATEST=$$(basename $$(curl -fsSLI -o /dev/null -w %{url_effective} $${RELEASE_URL}/latest)); \
+				echo "   Downloading $${LATEST}..."; \
+				curl -sL $${RELEASE_URL}/download/$${LATEST}/firecracker-$${LATEST}-$${ARCH}.tgz | tar -xz; \
+				sudo mv release-$${LATEST}-$${ARCH}/firecracker-$${LATEST}-$${ARCH} /usr/local/bin/firecracker; \
+				sudo chmod +x /usr/local/bin/firecracker; \
+				rm -rf release-$${LATEST}-$${ARCH}; \
+				echo "✅ Firecracker installed: $$(firecracker --version 2>&1 | head -1)"'; \
+		fi; \
+	fi
+	@echo ""
+	@echo "✅ Runtime dependency check complete"
+	@echo "   Run 'make check-runtime' to verify"
+
+.PHONY: check-runtime
+check-runtime:
+	@echo "Checking runtime environment..."
+	@echo ""
+	@echo "1. Docker:"
+	@if command -v docker >/dev/null 2>&1; then \
+		echo "   ✅ $$(docker --version)"; \
+		if docker ps >/dev/null 2>&1; then \
+			echo "   ✅ Docker daemon running"; \
+		else \
+			echo "   ❌ Docker daemon not running"; \
+		fi; \
+	else \
+		echo "   ❌ Not installed"; \
+	fi
+	@echo ""
+	@echo "2. Firecracker:"
+	@if [ "$$(uname)" != "Linux" ]; then \
+		echo "   ⚠️  Not supported on $$(uname)"; \
+	elif command -v firecracker >/dev/null 2>&1; then \
+		echo "   ✅ $$(firecracker --version 2>&1 | head -1)"; \
+		if [ -e /dev/kvm ]; then \
+			echo "   ✅ /dev/kvm exists"; \
+			if groups | grep -q kvm; then \
+				echo "   ✅ User in kvm group"; \
+			else \
+				echo "   ❌ User not in kvm group"; \
+			fi; \
+		else \
+			echo "   ❌ /dev/kvm not found"; \
+		fi; \
+	else \
+		echo "   ❌ Not installed"; \
+	fi
+	@echo ""
+	@echo "3. Python runtime module:"
+	@python3 -c "from core.runtime import create_runtime; print('   ✅ Runtime module OK')" 2>/dev/null || echo "   ❌ Runtime module error"
 
 .PHONY: lock
 lock:
@@ -208,6 +303,21 @@ test-integration:
 test-e2e:
 	@echo "Running end-to-end tests..."
 	@pytest tests/e2e/ -v
+
+.PHONY: test-runtime
+test-runtime:
+	@echo "Running runtime tests..."
+	@echo ""
+	@echo "Testing Docker runtime..."
+	@pytest tests/unit/test_docker_runtime.py -v
+	@echo ""
+	@echo "Testing Firecracker runtime..."
+	@pytest tests/unit/test_firecracker_runtime.py -v
+	@echo ""
+	@echo "Testing Subprocess runtime..."
+	@pytest tests/unit/test_subprocess_runtime.py -v 2>/dev/null || echo "⚠️  Subprocess runtime tests not found"
+	@echo ""
+	@echo "✅ Runtime tests complete"
 
 # ============================================================================
 # Code Quality

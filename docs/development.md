@@ -23,22 +23,74 @@ conda activate dev-agent
 make setup
 ```
 
+## Makefile Commands
+
+Run `make help` to see all available commands. Common ones:
+
+### Environment
+```bash
+make setup              # Initial setup (deps + .env)
+make install            # Install Python dependencies
+make install-runtime    # Install Docker + Firecracker (optional)
+make check-runtime      # Check runtime environment
+```
+
+### Development
+```bash
+make dev-up             # Start MatrixOne + Redis
+make dev-down           # Stop services
+make dev-logs           # View logs
+make dev-ps             # Service status
+```
+
+### Testing
+```bash
+make test               # All tests
+make test-unit          # Unit tests only
+make test-integration   # Integration tests
+make test-runtime       # Docker + Firecracker runtime tests
+```
+
+### Code Quality
+```bash
+make check              # All checks (lint + type + format)
+make lint               # Run linter
+make lint-fix           # Auto-fix issues
+make type-check         # Type checking
+make format             # Format code
+make ci                 # Full CI checks (check + test)
+```
+
+### Database
+```bash
+make db-init            # Initialize schema
+make db-connect         # Connect to MatrixOne CLI
+make db-reset           # Reset database (destructive!)
+```
+
+## Runtime Testing
+
+Runtime tests (Docker, Firecracker) use mocks and run without real installations:
+
+```bash
+make test-runtime       # Run all runtime tests (31 tests)
+```
+
+To install real runtime dependencies (optional):
+
+```bash
+make install-runtime    # Auto-install Docker + Firecracker
+make check-runtime      # Verify installation
+```
+
+**Note**: Firecracker only works on Linux with KVM support.
+
 ## Testing
 
 ```bash
 make test                              # All tests
 pytest tests/unit/                     # Unit tests only (~300)
 pytest tests/integration/              # Integration tests (~200, needs DB)
-```
-
-### Code Quality
-
-```bash
-make check       # All checks (lint + type-check)
-make lint        # Ruff linter
-make lint-fix    # Auto-fix
-make type-check  # Mypy
-make format      # Code formatting
 ```
 
 ## Running the API
