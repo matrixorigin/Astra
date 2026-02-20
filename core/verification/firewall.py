@@ -63,6 +63,7 @@ class HallucinationFirewall:
         self.context_manager = context_manager
         self.threshold = threshold
         self.use_llm_extraction = use_llm_extraction
+        self._skill_cache: dict[str, tuple[float, float]] = {}  # skill → (score, expire_ts)
 
         # Extractors
         self.regex_extractor = ClaimExtractor()
@@ -299,8 +300,8 @@ class HallucinationFirewall:
     def _context_coverage(snapshot, response: str) -> float:
         """How much of the response is grounded in available context.
 
-        Heuristic: ratio of response tokens that overlap with context tokens.
-        1.0 = response fully covered by context vocabulary.
+        Uses embedding cosine similarity between response and context.
+        Falls back to token overlap if embedding unavailable.
         """
         try:
             ctx_text = ""
@@ -314,6 +315,21 @@ class HallucinationFirewall:
             if not ctx_text.strip():
                 return 0.5  # no context → uncertain
 
+            # Primary: embedding cosine similarity
+            try:
+                from core.context.embeddings import EmbeddingService
+                svc = EmbeddingService()
+                resp_vec = svc.embed_text(response[:2000])
+                ctx_vec = svc.embed_text(ctx_text[:2000])
+                dot = sum(a * b for a, b in zip(resp_vec, ctx_vec))
+                norm_a = sum(a * a for a in resp_vec) ** 0.5
+                norm_b = sum(b * b for b in ctx_vec) ** 0.5
+                if norm_a and norm_b:
+                    return max(min(dot / (norm_a * norm_b), 1.0), 0.0)
+            except Exception:
+                pass
+
+            # Fallback: token overlap
             ctx_words = set(ctx_text.lower().split())
             resp_words = response.lower().split()
             if not resp_words:
@@ -342,11 +358,21 @@ class HallucinationFirewall:
             pass
         return 0.8  # default: reasonably fresh
 
+    _SKILL_CACHE_TTL = 30.0  # seconds
+
     def _skill_reliability(self, skill_name: str) -> float:
         """Historical success rate for a skill from skill_execution_metrics.
 
+        Cached with 30s TTL to avoid per-verify DB queries.
         Returns 0.8 default when no data available (optimistic prior).
         """
+        import time
+        now = time.monotonic()
+        cached = self._skill_cache.get(skill_name)
+        if cached and cached[1] > now:
+            return cached[0]
+
+        score = 0.8  # optimistic prior
         try:
             from sqlalchemy import text
             row = self.db.execute(
@@ -359,11 +385,13 @@ class HallucinationFirewall:
                 ),
                 {"name": skill_name},
             ).fetchone()
-            if row and row[0] >= 5:  # need ≥5 samples
-                return row[1] / row[0]
+            if row and row[0] >= 5:
+                score = row[1] / row[0]
         except Exception:
             pass
-        return 0.8  # optimistic prior
+
+        self._skill_cache[skill_name] = (score, now + self._SKILL_CACHE_TTL)
+        return score
 
     def log_verification(
         self, session_id: str, event_id: str, result: FirewallResult, context_capture_id: str
