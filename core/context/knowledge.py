@@ -102,6 +102,8 @@ class KnowledgeExtractor:
         
         # Simple extraction - in production use LLM
         if "typescript" in content.lower():
+            from core.context.lifecycle import trust_tier_defaults
+            defaults = trust_tier_defaults("T3")
             return {
                 "user_id": user_id,
                 "category": "user_preference",
@@ -110,7 +112,7 @@ class KnowledgeExtractor:
                 "source_event_ids": [event.event_id],
                 "extraction_method": "observation",
                 "trust_tier": "T3",
-                "confidence": 0.7,
+                "confidence": defaults["initial_confidence"],
             }
         return None
 
@@ -119,6 +121,8 @@ class KnowledgeExtractor:
         content = event.content.lower()
         
         if "dependency injection" in content:
+            from core.context.lifecycle import trust_tier_defaults
+            defaults = trust_tier_defaults("T3")
             return {
                 "user_id": user_id,
                 "category": "codebase_pattern",
@@ -127,7 +131,7 @@ class KnowledgeExtractor:
                 "source_event_ids": [event.event_id],
                 "extraction_method": "observation",
                 "trust_tier": "T3",
-                "confidence": 0.6,
+                "confidence": defaults["initial_confidence"],
             }
         return None
 

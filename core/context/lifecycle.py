@@ -21,6 +21,22 @@ TRUST_TIER_HALF_LIVES = {
     "T4": 30,   # Unverified: raw user input
 }
 
+# Trust tier → initial confidence (from design §1)
+TRUST_TIER_INITIAL_CONFIDENCE = {
+    "T1": 0.95,
+    "T2": 0.85,
+    "T3": 0.65,
+    "T4": 0.40,
+}
+
+
+def trust_tier_defaults(tier: str) -> dict[str, float]:
+    """Return initial_confidence and half_life for a trust tier."""
+    return {
+        "initial_confidence": TRUST_TIER_INITIAL_CONFIDENCE.get(tier, 0.65),
+        "half_life_days": TRUST_TIER_HALF_LIVES.get(tier, 60),
+    }
+
 # Retention policies by memory type
 RETENTION_POLICIES = {
     "sensory": {"ttl_hours": 1, "decay": "auto_purge"},

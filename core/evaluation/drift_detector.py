@@ -150,7 +150,7 @@ class DriftDetector:
         recent = float(recent_avg)
         previous = float(previous_avg)
         delta = recent - previous
-        severity = self._classify(delta, sample_count)
+        severity = DriftDetector._classify(delta, sample_count)
         return DriftSignal(
             model=model, template_id=template_id,
             current_avg=recent, previous_avg=previous,
@@ -159,14 +159,15 @@ class DriftDetector:
             detected_at=datetime.now(timezone.utc),
         )
 
-    def _classify(self, delta: float, sample_count: int) -> DriftSeverity:
-        if sample_count < self.MIN_SAMPLES:
+    @staticmethod
+    def _classify(delta: float, sample_count: int) -> DriftSeverity:
+        if sample_count < DriftDetector.MIN_SAMPLES:
             return DriftSeverity.NONE
-        if delta < self.SEVERE_THRESHOLD:
+        if delta < DriftDetector.SEVERE_THRESHOLD:
             return DriftSeverity.SEVERE
-        if delta < self.SIGNIFICANT_THRESHOLD:
+        if delta < DriftDetector.SIGNIFICANT_THRESHOLD:
             return DriftSeverity.SIGNIFICANT
-        if delta < self.MILD_THRESHOLD:
+        if delta < DriftDetector.MILD_THRESHOLD:
             return DriftSeverity.MILD
         return DriftSeverity.NONE
 

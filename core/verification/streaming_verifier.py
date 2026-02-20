@@ -140,7 +140,7 @@ class StreamingVerifier:
             if not self._context_text:
                 return []
 
-            from core.llm.base import LLMMessage
+            from core.llm.models import LLMMessage
 
             context = self._context_text[:MAX_CONTEXT_CHARS]
 
@@ -171,7 +171,7 @@ class StreamingVerifier:
     ) -> list[str]:
         """Verify a single sentence with the simpler prompt."""
         try:
-            from core.llm.base import LLMMessage
+            from core.llm.models import LLMMessage
 
             prompt = _ENTAILMENT_PROMPT.format(
                 context=context, sentence=sentence,
