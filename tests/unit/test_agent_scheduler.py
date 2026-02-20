@@ -96,6 +96,7 @@ class TestAgentScheduler:
         db = _mock_db()
         db.execute.side_effect = [
             Mock(fetchone=Mock(return_value=(100.0, 10.0))),  # Budget policy
+            Mock(fetchone=Mock(return_value=(5,))),  # Resource pool check (5 active < 50 limit)
             None,  # Record allocation
         ]
 

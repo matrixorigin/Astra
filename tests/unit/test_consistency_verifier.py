@@ -124,9 +124,12 @@ class TestConsistencyVerifier:
         check = verifier.check_semantic("output text")
         assert check.passed is True
 
-    def test_check_semantic_contradiction(self):
+    def test_check_semantic_contradiction_with_llm(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db, llm_client=Mock())
+        llm = Mock()
+        # LLM says "yes" these contradict
+        llm.chat.return_value = Mock(content="yes")
+        verifier = ConsistencyVerifier(db, llm_client=llm)
 
         output = "The function should not be modified"
         prior = ["The function should be refactored"]
@@ -221,14 +224,28 @@ class TestConsistencyVerifier:
         assert verifier._type_matches(42, "string") is False
         assert verifier._type_matches("hello", "integer") is False
 
-    def test_contradicts(self):
+    def test_contradicts_with_llm(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)
+        llm = Mock()
+        llm.chat.return_value = Mock(content="yes")
+        verifier = ConsistencyVerifier(db, llm_client=llm)
 
         assert verifier._contradicts("should not modify", "should modify") is True
-        assert verifier._contradicts("never deploy", "deploy now") is True
-        assert verifier._contradicts("cannot proceed", "proceed") is True
+        llm.chat.assert_called()
+
+    def test_contradicts_no_llm_uses_similarity(self):
+        db = _mock_db()
+        verifier = ConsistencyVerifier(db)  # No LLM
+
+        # Identical text → high similarity → no contradiction
         assert verifier._contradicts("same message", "same message") is False
+
+    def test_contradicts_no_llm_low_similarity(self):
+        db = _mock_db()
+        verifier = ConsistencyVerifier(db)  # No LLM
+
+        # Completely different → low similarity → contradiction
+        assert verifier._contradicts("alpha beta gamma", "x y z") is True
 
     def test_semantic_similarity(self):
         db = _mock_db()

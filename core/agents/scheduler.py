@@ -204,9 +204,28 @@ class AgentScheduler:
         )
 
     def _check_resource_pools(self, priority: Priority) -> bool:
-        """Check if resource pools have capacity."""
-        # Simplified: always return True for now
-        # In production: query resource pool usage from DB
+        """Check if resource pools have capacity.
+
+        Queries active (non-completed) task allocations in the last hour.
+        Each priority level has a concurrency limit.
+        """
+        limits = {Priority.P0: 50, Priority.P1: 30, Priority.P2: 20, Priority.P3: 10}
+        limit = limits.get(priority, 10)
+
+        row = self.db.execute(
+            text(
+                "SELECT COUNT(*) FROM task_allocations "
+                "WHERE priority = :priority "
+                "AND allocated_at > DATE_SUB(NOW(), INTERVAL 1 HOUR) "
+                "AND completed_at IS NULL"
+            ),
+            {"priority": priority.value},
+        ).fetchone()
+
+        active = row[0] if row else 0
+        if active >= limit:
+            logger.warning(f"Resource pool exhausted for {priority.name}: {active}/{limit}")
+            return False
         return True
 
     def _record_allocation(

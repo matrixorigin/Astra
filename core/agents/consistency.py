@@ -243,18 +243,45 @@ class ConsistencyVerifier:
         return isinstance(value, expected)
 
     def _contradicts(self, output: str, prior: str) -> bool:
-        """Simple heuristic: check for negation patterns."""
-        output_lower = output.lower()
-        prior_lower = prior.lower()
+        """Detect contradictions between output and prior.
 
-        # Check for explicit negations
-        negations = ["not ", "no ", "never ", "cannot", "don't", "doesn't"]
-        for neg in negations:
-            if neg in output_lower and neg not in prior_lower:
-                # Output negates something prior didn't
-                return True
+        Uses LLM if available, otherwise falls back to semantic similarity.
+        The old negation-word heuristic had too many false positives.
+        """
+        # If LLM available, use NLI-style contradiction detection
+        if self.llm_client:
+            return self._llm_contradiction_check(output, prior)
 
+        # Fallback: low semantic similarity suggests potential contradiction
+        # (not perfect, but better than negation-word matching)
+        similarity = self._semantic_similarity(output, prior)
+        # Very low similarity on the same topic suggests contradiction
+        if similarity < 0.3:
+            return True
         return False
+
+    def _llm_contradiction_check(self, output: str, prior: str) -> bool:
+        """Use LLM for NLI-style contradiction detection."""
+        import re as _re
+
+        prompt = (
+            "Do these two statements contradict each other? "
+            "Reply with ONLY 'yes' or 'no'.\n\n"
+            f"Statement A: {prior[:500]}\n\n"
+            f"Statement B: {output[:500]}"
+        )
+        try:
+            response = self.llm_client.chat(
+                messages=[{"role": "user", "content": prompt}],
+                user_id="consistency_verifier",
+                temperature=0.0,
+            )
+            answer = (response.content or "").strip().lower()
+            return answer.startswith("yes")
+        except Exception as e:
+            logger.warning(f"LLM contradiction check failed: {e}")
+            # Fallback to similarity
+            return self._semantic_similarity(output, prior) < 0.3
 
     def _semantic_similarity(self, text_a: str, text_b: str) -> float:
         """Estimate semantic similarity (0-1)."""
