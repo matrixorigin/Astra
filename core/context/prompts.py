@@ -17,8 +17,9 @@ logger = get_logger(__name__)
 class PromptManager:
     """Manage prompt templates and versions."""
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, gate_trigger=None):
         self.db = db
+        self.gate_trigger = gate_trigger
         self._cache: dict[str, str] = {}
 
     def get_system_prompt(self, template_id: str = "system_general", version: str | None = None) -> str:
@@ -103,6 +104,14 @@ class PromptManager:
             # Update cache
             if is_active:
                 self._cache[template_id] = content
+
+            # Auto-trigger regression gate (async, non-blocking)
+            if self.gate_trigger and is_active:
+                self.gate_trigger.on_prompt_change(
+                    template_id=template_id,
+                    version=version,
+                    content=content,
+                )
             
             logger.info(f"Registered prompt {template_id} version {version}")
 

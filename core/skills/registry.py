@@ -20,11 +20,12 @@ logger = get_logger(__name__)
 class SkillRegistry:
     """Manage skill metadata and lifecycle with versioning"""
 
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, gate_trigger=None):
         if not isinstance(session, Session):
             raise TypeError("session must be a SQLAlchemy Session")
         
         self.session = session
+        self.gate_trigger = gate_trigger
         self._skills: dict[str, Skill] = {}  # skill_name@version -> Skill
         self._cache_size = 100  # LRU cache size
 
@@ -113,6 +114,14 @@ class SkillRegistry:
 
             # 5. Clear LRU cache on new registration
             self._get_cached.cache_clear()
+
+            # 6. Auto-trigger regression gate (async, non-blocking)
+            if self.gate_trigger and is_active:
+                self.gate_trigger.on_skill_change(
+                    skill_name=skill.name,
+                    version=skill.version,
+                    definition=skill.requirements.model_dump(),
+                )
 
             logger.info(
                 f"Successfully registered skill: {skill.name}@{skill.version} (category={category}, priority={priority})"
