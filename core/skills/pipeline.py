@@ -241,21 +241,81 @@ class SkillPipeline:
     # Learning (called by scheduler / API, not by ChatLoop)
     # ------------------------------------------------------------------
 
-    def learn(self, *, days: int = 7) -> LearningResult:
-        """Run learning cycle with regression gate."""
+    def learn(self, *, days: int = 7, skip_gate: bool = False) -> LearningResult:
+        """Run learning cycle: learn → verify → activate.
+
+        Pipeline:
+            1. Extract signals from recent failures (staging)
+            2. Validate via RegressionGate (unless skip_gate=True)
+            3. Activate learnings only if gate passes
+
+        Args:
+            days: Look-back window for failure analysis.
+            skip_gate: Skip regression validation (dev/testing only).
+        """
         if not self._improver:
             return LearningResult(error="Learning disabled")
 
         try:
+            # Stage 1: Learn (writes to DB — learnings are "staged")
             result = self._improver.learn_from_failures(days=days)
+            learned = result.get("learned", 0)
+            if learned == 0:
+                return LearningResult(
+                    total_failures=result.get("total_failures", 0),
+                    gate_verdict="skipped",
+                )
+
+            # Stage 2: Validate via unified RegressionGate
+            gate_verdict = "skipped"
+            improvement_pct = 0.0
+
+            if not skip_gate:
+                try:
+                    from core.evaluation.regression_gate import RegressionGate, ChangeType
+                    gate = RegressionGate(self._db)
+                    gate_result = gate.validate_change(
+                        change_type=ChangeType.SELECTOR,
+                        change_id=f"learning_cycle_{days}d",
+                        change_content=result.get("signals_by_type", {}),
+                        golden_session_count=20,
+                    )
+                    gate_verdict = gate_result["verdict"]
+                    improvement_pct = gate_result.get("metrics", {}).get("score_delta", 0.0)
+
+                    # Stage 3: Rollback if gate fails
+                    if gate_verdict == "fail":
+                        self._rollback_learnings(days)
+                        logger.warning("Learning rolled back: gate failed (%s)", gate_result.get("reason"))
+                except Exception as e:
+                    logger.warning("Gate validation unavailable, learnings kept: %s", e)
+                    gate_verdict = "error"
+
             return LearningResult(
-                learned=result.get("learned", 0),
+                learned=learned,
                 total_failures=result.get("total_failures", 0),
                 signals_by_type=result.get("signals_by_type", {}),
+                gate_verdict=gate_verdict,
+                improvement_pct=improvement_pct,
             )
         except Exception as e:
             logger.error("Learning cycle failed: %s", e)
             return LearningResult(error=str(e))
+
+    def _rollback_learnings(self, days: int) -> None:
+        """Remove learnings created in the current cycle."""
+        try:
+            self._db.execute(
+                text(
+                    "DELETE FROM selector_learnings "
+                    "WHERE created_at > DATE_SUB(NOW(), INTERVAL :days DAY)"
+                ),
+                {"days": days},
+            )
+            self._db.commit()
+        except Exception as e:
+            logger.error("Learning rollback failed: %s", e)
+            self._db.rollback()
 
     def stats(self) -> dict[str, Any]:
         """Get learning statistics."""

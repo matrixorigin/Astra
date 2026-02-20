@@ -20,7 +20,6 @@ from core.replay.time_machine import TimeMachine
 from core.skills.registry import SkillRegistry
 from core.skills.pipeline import SkillPipeline
 from core.skills.self_improving_selector import SelfImprovingSelector
-from core.skills.regression_gate import SkillSelectionRegressionGate
 from core.skills.selector import SkillSelector
 from core.skills.modern_selector import ModernSkillSelector
 from core.events.causal_chain import CausalChainManager
@@ -94,16 +93,6 @@ class TestSessionInjection:
         selector = ModernSkillSelector(session=mock_session)
         assert selector.session is mock_session
 
-    def test_regression_gate_requires_session(self):
-        """Test SkillSelectionRegressionGate requires session parameter."""
-        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
-            SkillSelectionRegressionGate(llm_client=None, session=None)
-        
-        # Should work with proper session
-        mock_session = Mock(spec=Session)
-        gate = SkillSelectionRegressionGate(llm_client=None, session=mock_session)
-        assert gate.session is mock_session
-
     def test_self_improving_selector_requires_session(self):
         """Test SelfImprovingSelector requires session parameter."""
         with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
@@ -167,15 +156,6 @@ class TestSessionSharing:
         # Dependencies should use the same session
         assert selector.sandbox.db is mock_session
 
-    def test_regression_gate_shares_session(self):
-        """Test SkillSelectionRegressionGate shares session with sandbox."""
-        mock_session = Mock(spec=Session)
-        
-        gate = SkillSelectionRegressionGate(llm_client=None, session=mock_session)
-        
-        # Sandbox should use the same session
-        assert gate.sandbox.db is mock_session
-
 
 class TestNoSessionCreation:
     """Test that Core modules don't create their own sessions."""
@@ -192,7 +172,6 @@ class TestNoSessionCreation:
             SkillRegistry,
             SkillPipeline,
             ModernSkillSelector,
-            SkillSelectionRegressionGate,
             SelfImprovingSelector,
             ToolMockingLayer,
             SemanticDiff,

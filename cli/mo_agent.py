@@ -311,40 +311,33 @@ def skill_learn(days, force):
 @click.option("--min-improvement", default=-0.05, help="Minimum improvement threshold")
 def skill_gate(version, min_improvement):
     """Run regression gate for skill selector changes."""
-    from core.llm.client import LLMClient
-    from core.skills.regression_gate import SkillSelectionRegressionGate
+    from core.evaluation.regression_gate import RegressionGate, ChangeType
     
     click.echo(f"🚪 Running regression gate for selector {version}...")
     
     db = next(get_db_session())
-    llm_client = LLMClient(db)
-    gate = SkillSelectionRegressionGate(llm_client, db)
-    
-    old_pipeline = SkillPipeline(db, llm_client, audit=False, learning=False)
-    new_pipeline = SkillPipeline(db, llm_client, audit=False, learning=True)
+    gate = RegressionGate(db)
     
     try:
-        golden = gate.get_golden_queries(limit=20)
-        if not golden:
-            click.echo("⚠️  No golden queries found for regression testing")
-            return
-        
-        result = gate.validate_selector_change(
-            new_selector=new_pipeline,
-            old_selector=old_pipeline,
-            test_queries=golden,
-            min_improvement_pct=min_improvement,
+        result = gate.validate_change(
+            change_type=ChangeType.SELECTOR,
+            change_id=version,
+            change_content={"version": version},
+            score_regression_threshold=min_improvement,
         )
         
-        click.echo(f"\n{'✅' if result['verdict'] == 'PASS' else '❌'} {result['verdict']}")
-        click.echo(f"   Test queries: {result['test_queries_count']}")
-        click.echo(f"   New score: {result['new_selector_avg_score']:.2f}")
-        click.echo(f"   Old score: {result['old_selector_avg_score']:.2f}")
-        click.echo(f"   Improvement: {result['improvement_pct']:.1f}%")
+        verdict = result["verdict"]
+        metrics = result.get("metrics", {})
+        click.echo(f"\n{'✅' if verdict == 'pass' else '❌'} {verdict}")
+        click.echo(f"   Sessions tested: {result['sessions_tested']}")
+        click.echo(f"   Error rate: {metrics.get('error_rate', 0):.2%}")
+        click.echo(f"   Score delta: {metrics.get('score_delta', 0):.2f}")
         
-        if result['verdict'] != 'PASS':
+        if verdict != 'pass':
             raise click.Abort()
             
+    except click.Abort:
+        raise
     except Exception as e:
         click.echo(f"❌ Gate failed: {e}", err=True)
         raise click.Abort()
@@ -386,7 +379,7 @@ def skill_history(session, limit):
 def skill_stats():
     """Show skill selection learning statistics."""
     from core.llm.client import LLMClient
-    from core.skills.regression_gate import SkillSelectionRegressionGate
+    from core.evaluation.regression_gate import RegressionGate
     from core.skills.self_improving_selector import SelfImprovingSelector
     
     db = next(get_db_session())
@@ -395,8 +388,11 @@ def skill_stats():
     learner = SelfImprovingSelector(db, llm_client)
     learning_stats = learner.get_learning_stats()
     
-    gate = SkillSelectionRegressionGate(db, llm_client)
-    gate_stats = gate.get_gate_stats()
+    gate = RegressionGate(db)
+    gate_stats_raw = gate.get_gate_history(limit=100)
+    total = len(gate_stats_raw)
+    passed = sum(1 for r in gate_stats_raw if r.get("passed"))
+    failed = total - passed
     
     click.echo("\n📊 Skill Selection Statistics")
     click.echo("=" * 80)
@@ -409,11 +405,10 @@ def skill_stats():
     click.echo(f"   High confidence: {learning_stats['high_confidence_learnings']}")
     
     click.echo("\n🚪 Regression Gates:")
-    click.echo(f"   Total gates: {gate_stats['total_gates']}")
-    click.echo(f"   Passed: {gate_stats['passed']}")
-    click.echo(f"   Failed: {gate_stats['failed']}")
-    click.echo(f"   Pass rate: {gate_stats['pass_rate']:.1%}")
-    click.echo(f"   Avg improvement: {gate_stats['avg_improvement_pct']:.1f}%")
+    click.echo(f"   Total gates: {total}")
+    click.echo(f"   Passed: {passed}")
+    click.echo(f"   Failed: {failed}")
+    click.echo(f"   Pass rate: {passed / total if total else 0:.1%}")
 
 
 @cli.group()
