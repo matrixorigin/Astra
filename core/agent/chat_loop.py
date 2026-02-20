@@ -241,7 +241,15 @@ class ChatLoop:
             from core.context.compaction import compact, needs_compaction
             max_tokens = self.llm.config.get("max_context_tokens", 128000)
             if isinstance(max_tokens, int) and needs_compaction(messages, max_tokens):
-                messages = compact(messages, max_tokens)
+                # Use LLM for summarization if available
+                def llm_summarize(text: str) -> str:
+                    try:
+                        result = self.llm.chat([{"role": "user", "content": f"Summarize concisely:\n{text}"}])
+                        return result.get("content", text[:1000])
+                    except Exception:
+                        return text[:1000]  # Fallback to truncation
+                
+                messages = compact(messages, max_tokens, llm_summarize=llm_summarize)
 
             llm_result = self.llm.chat_with_tools(
                 messages=messages,
@@ -586,7 +594,14 @@ class ChatLoop:
             from core.context.compaction import compact, needs_compaction
             max_tokens = self.llm.config.get("max_context_tokens", 128000)
             if isinstance(max_tokens, int) and needs_compaction(messages, max_tokens):
-                messages = compact(messages, max_tokens)
+                def llm_summarize(text: str) -> str:
+                    try:
+                        result = self.llm.chat([{"role": "user", "content": f"Summarize concisely:\n{text}"}])
+                        return result.get("content", text[:1000])
+                    except Exception:
+                        return text[:1000]
+                
+                messages = compact(messages, max_tokens, llm_summarize=llm_summarize)
 
             full_text = ""
             tool_calls: list[dict] = []

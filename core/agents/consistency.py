@@ -56,9 +56,10 @@ class ConsistencyVerifier:
     Distributed-safe: all state in DB.
     """
 
-    def __init__(self, db: Session, llm_client=None) -> None:
+    def __init__(self, db: Session, llm_client=None, embedding_service=None) -> None:
         self.db = db
         self.llm_client = llm_client
+        self.embedding_service = embedding_service
 
     def check_structural(self, output: Any, expected_schema: dict[str, Any]) -> ConsistencyCheck:
         """Check if output matches expected schema.
@@ -257,7 +258,19 @@ class ConsistencyVerifier:
 
     def _semantic_similarity(self, text_a: str, text_b: str) -> float:
         """Estimate semantic similarity (0-1)."""
-        # Simple: word overlap
+        if self.embedding_service:
+            try:
+                emb_a = self.embedding_service.embed(text_a)
+                emb_b = self.embedding_service.embed(text_b)
+                # Cosine similarity
+                dot = sum(a * b for a, b in zip(emb_a, emb_b))
+                norm_a = sum(a * a for a in emb_a) ** 0.5
+                norm_b = sum(b * b for b in emb_b) ** 0.5
+                return dot / (norm_a * norm_b) if norm_a and norm_b else 0.5
+            except Exception:
+                pass  # Fallback to word overlap
+        
+        # Fallback: word overlap
         words_a = set(text_a.lower().split())
         words_b = set(text_b.lower().split())
         if not words_a or not words_b:

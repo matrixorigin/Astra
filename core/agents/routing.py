@@ -46,8 +46,9 @@ class ModelRouter:
     Distributed-safe: all state in DB.
     """
 
-    def __init__(self, db: Session) -> None:
+    def __init__(self, db: Session, llm_client=None) -> None:
         self.db = db
+        self.llm_client = llm_client
 
     def classify_complexity(self, task_type: str, query: str) -> TaskComplexity:
         """Classify task complexity from query.
@@ -59,19 +60,31 @@ class ModelRouter:
         Returns:
             TaskComplexity level
         """
+        # Try LLM classification first if available
+        if self.llm_client:
+            try:
+                result = self.llm_client.chat([{
+                    "role": "user",
+                    "content": f"Classify complexity (simple/medium/complex/critical):\n{query}"
+                }])
+                response = result.get("content", "").lower()
+                for complexity in TaskComplexity:
+                    if complexity.value in response:
+                        return complexity
+            except Exception:
+                pass  # Fallback to keyword matching
+
+        # Fallback: keyword matching
         query_lower = query.lower()
 
-        # Critical keywords
         critical_keywords = ["security", "production", "deploy", "delete", "migrate"]
         if any(kw in query_lower for kw in critical_keywords):
             return TaskComplexity.CRITICAL
 
-        # Complex keywords
         complex_keywords = ["refactor", "architecture", "design", "multi-file", "complex"]
         if any(kw in query_lower for kw in complex_keywords):
             return TaskComplexity.COMPLEX
 
-        # Medium keywords
         medium_keywords = ["edit", "fix", "explain", "review"]
         if any(kw in query_lower for kw in medium_keywords):
             return TaskComplexity.MEDIUM
