@@ -237,6 +237,12 @@ class ChatLoop:
         # 6. Multi-turn tool use loop
         last_skill_name: str | None = None
         for _round in range(MAX_TOOL_ROUNDS):
+            # Compact if approaching context limit
+            from core.context.compaction import compact, needs_compaction
+            max_tokens = self.llm.config.get("max_context_tokens", 128000)
+            if isinstance(max_tokens, int) and needs_compaction(messages, max_tokens):
+                messages = compact(messages, max_tokens)
+
             llm_result = self.llm.chat_with_tools(
                 messages=messages,
                 tools=tools_schema,
@@ -576,6 +582,12 @@ class ChatLoop:
         # Multi-turn tool use loop with streaming
         last_skill_name: str | None = None
         for _round in range(MAX_TOOL_ROUNDS):
+            # Compact if approaching context limit
+            from core.context.compaction import compact, needs_compaction
+            max_tokens = self.llm.config.get("max_context_tokens", 128000)
+            if isinstance(max_tokens, int) and needs_compaction(messages, max_tokens):
+                messages = compact(messages, max_tokens)
+
             full_text = ""
             tool_calls: list[dict] = []
 
