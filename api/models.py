@@ -340,7 +340,6 @@ class Token(Base):
     secret_ref = Column(String(255))
     is_active = Column(TINYINT(1), default=1)
     scope_user_id = Column(String(36), index=True)
-    scope_tenant_id = Column(String(36), index=True)
     scope_repo = Column(String(255), index=True)
     created_at = Column(DateTime, default=func.now())
     expires_at = Column(DateTime, nullable=True)

@@ -239,7 +239,7 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
         sys.exit(1)
 
     # Validate scope_id
-    if scope in ["account", "user"] and not scope_id:
+    if scope == "user" and not scope_id:
         click.echo(f"❌ --scope-id is required for {scope} scope")
         sys.exit(1)
 
@@ -247,32 +247,27 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
         from uuid_utils import uuid7
         token_id = str(uuid7())
 
-        # Map scope to tokens table columns
         scope_user_id = scope_id if scope == "user" else None
-        scope_tenant_id = scope_id if scope == "account" else None
 
-        # Insert into tokens table (not agent_config.api_tokens)
         from sqlalchemy import text
         db.execute(
             text("""
             INSERT INTO tokens
-            (token_id, type, provider, scope_user_id, scope_tenant_id, 
+            (token_id, type, provider, scope_user_id,
              encrypted_value, is_active, created_at)
-            VALUES (:token_id, :token_type, :provider, :scope_user_id, :scope_tenant_id, :token_value, TRUE, :created_at)
+            VALUES (:token_id, :token_type, :provider, :scope_user_id, :token_value, TRUE, :created_at)
             """),
             {
                 "token_id": token_id,
                 "token_type": token_type,
                 "provider": provider,
                 "scope_user_id": scope_user_id,
-                "scope_tenant_id": scope_tenant_id,
                 "token_value": token_value,
                 "created_at": datetime.now(),
             }
         )
         db.commit()
 
-        # Audit log
         audit.log_token_create(user, token_type, provider, scope)
 
         click.echo("✅ Token created successfully")
@@ -284,7 +279,7 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
 
 
 @token.command("list")
-@click.option("--scope", type=click.Choice(["global", "account", "user"]))
+@click.option("--scope", type=click.Choice(["global", "user"]))
 @click.option("--scope-id")
 @click.pass_context
 def token_list(ctx, scope, scope_id):
@@ -294,7 +289,7 @@ def token_list(ctx, scope, scope_id):
     db = ctx.obj["db"]
 
     query = """
-        SELECT token_id, type, provider, scope_user_id, scope_tenant_id, 
+        SELECT token_id, type, provider, scope_user_id,
                is_active, created_at 
         FROM tokens
         WHERE 1=1
@@ -304,11 +299,8 @@ def token_list(ctx, scope, scope_id):
     if scope == "user" and scope_id:
         query += " AND scope_user_id = :scope_id"
         params["scope_id"] = scope_id
-    elif scope == "account" and scope_id:
-        query += " AND scope_tenant_id = :scope_id"
-        params["scope_id"] = scope_id
     elif scope == "global":
-        query += " AND scope_user_id IS NULL AND scope_tenant_id IS NULL"
+        query += " AND scope_user_id IS NULL"
 
     query += " ORDER BY created_at DESC"
 
@@ -330,8 +322,6 @@ def token_list(ctx, scope, scope_id):
         # Determine scope
         if t["scope_user_id"]:
             scope_str = f"user ({t['scope_user_id']})"
-        elif t["scope_tenant_id"]:
-            scope_str = f"account ({t['scope_tenant_id']})"
         else:
             scope_str = "global"
         

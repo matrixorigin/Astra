@@ -1,7 +1,5 @@
 """Test scope-based model access control."""
 
-import json
-
 import pytest
 
 from core.llm.router import ModelRegistry
@@ -22,18 +20,6 @@ def test_global_scope_models(db_session):
     registry = ModelRegistry(use_defaults=False)
     registry.load_from_db(db_session)
     models = registry.list_models()
-    
-    # Should return models from DB (empty list from test DB)
-    assert isinstance(models, list)
-
-
-def test_tenant_scope_models(db_session):
-    """Test tenant scope includes tenant-specific models."""
-    registry = ModelRegistry(use_defaults=False)
-    registry.load_from_db(db_session, tenant_id="team_a")
-    models = registry.list_models()
-    
-    # Should return models for tenant (empty list from DB)
     assert isinstance(models, list)
 
 
@@ -42,31 +28,20 @@ def test_user_scope_models(db_session):
     registry = ModelRegistry(use_defaults=False)
     registry.load_from_db(db_session, user_id="alice")
     models = registry.list_models()
-    
-    # Should return models for user (empty list from DB)
     assert isinstance(models, list)
 
 
 def test_scope_hierarchy(db_session):
-    """Test scope hierarchy: user > tenant > global."""
-    # Global scope
+    """Test scope hierarchy: user > global."""
     global_registry = ModelRegistry(use_defaults=False)
     global_registry.load_from_db(db_session)
     global_models = global_registry.list_models()
-    
-    # Tenant scope
-    tenant_registry = ModelRegistry(use_defaults=False)
-    tenant_registry.load_from_db(db_session, tenant_id="team_a")
-    tenant_models = tenant_registry.list_models()
-    
-    # User scope
+
     user_registry = ModelRegistry(use_defaults=False)
-    user_registry.load_from_db(db_session, user_id="alice", tenant_id="team_a")
+    user_registry.load_from_db(db_session, user_id="alice")
     user_models = user_registry.list_models()
-    
-    # All should be lists (empty from test DB)
+
     assert isinstance(global_models, list)
-    assert isinstance(tenant_models, list)
     assert isinstance(user_models, list)
 
 
@@ -74,17 +49,11 @@ def test_model_not_found(db_session):
     """Test behavior when model is not found."""
     registry = ModelRegistry(use_defaults=False)
     registry.load_from_db(db_session, user_id="alice")
-    model = registry.get("nonexistent-model")
-    
-    # Should return None for non-existent model
-    assert model is None
+    assert registry.get("nonexistent-model") is None
 
 
 def test_empty_scope(db_session):
     """Test behavior with empty scope."""
     registry = ModelRegistry(use_defaults=False)
     registry.load_from_db(db_session, user_id="nonexistent_user")
-    models = registry.list_models()
-    
-    # Should return empty list
-    assert isinstance(models, list)
+    assert isinstance(registry.list_models(), list)

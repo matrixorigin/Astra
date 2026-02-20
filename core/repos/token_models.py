@@ -20,7 +20,6 @@ class Token(BaseModel):
     token_type: TokenType
     provider: str | None = None  # 'github', 'openai', 'groq'
     scope_user_id: str | None = None
-    scope_tenant_id: str | None = None
     scope_repo: str | None = None
     secret_ref: str | None = None  # Vault path (preferred)
     encrypted_value: str | None = None  # Fallback

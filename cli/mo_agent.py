@@ -430,13 +430,12 @@ def model():
 
 @model.command("list")
 @click.option("--user-id", help="Filter by user scope")
-@click.option("--tenant-id", help="Filter by tenant scope")
-def model_list(user_id, tenant_id):
+def model_list(user_id):
     """List available models."""
     db = next(get_db_session())
 
     # Get models from router
-    client = LLMClient(db=db, user_id=user_id, tenant_id=tenant_id)
+    client = LLMClient(db=db, user_id=user_id)
     models = client.router.list_models()
 
     if not models:
@@ -466,13 +465,12 @@ def model_list(user_id, tenant_id):
 @model.command("show")
 @click.argument("model_name")
 @click.option("--user-id", help="User scope")
-@click.option("--tenant-id", help="Tenant scope")
-def model_show(model_name, user_id, tenant_id):
+def model_show(model_name, user_id):
     """Show detailed information about a model."""
     db = next(get_db_session())
 
     try:
-        client = LLMClient(db=db, user_id=user_id, tenant_id=tenant_id)
+        client = LLMClient(db=db, user_id=user_id)
         model_config = client.router.registry.get(model_name)
 
         if not model_config:

@@ -3,8 +3,7 @@
 Implements the token resolution priority from design doc:
 1. Repo-specific token
 2. User default token
-3. Tenant default token
-4. Global fallback (if allowed)
+3. Global fallback (if allowed)
 """
 
 import json
@@ -27,7 +26,6 @@ class TokenResolver:
     def resolve_repo_token(
         self,
         user_id: str,
-        tenant_id: str | None = None,
         repo_url: str | None = None,
         repo_id: str | None = None,
     ) -> Token | None:
@@ -36,8 +34,7 @@ class TokenResolver:
         Priority:
         1. Repo-specific token (from repos.token_id)
         2. User default token (scope_user_id, no scope_repo)
-        3. Tenant default token (scope_tenant_id, no scope_repo)
-        4. Global fallback (if config allows)
+        3. Global fallback (if config allows)
         """
         # 1. Repo-specific token
         if repo_id or repo_url:
@@ -50,13 +47,7 @@ class TokenResolver:
         if token:
             return token
 
-        # 3. Tenant default token
-        if tenant_id:
-            token = self._get_tenant_default_token(tenant_id)
-            if token:
-                return token
-
-        # 4. Global fallback (check config)
+        # 3. Global fallback (check config)
         if self._allow_global_token():
             return self._get_global_token()
 
@@ -69,7 +60,6 @@ class TokenResolver:
         secret_ref: str | None = None,
         encrypted_value: str | None = None,
         scope_user_id: str | None = None,
-        scope_tenant_id: str | None = None,
         scope_repo: str | None = None,
         expires_at: datetime | None = None,
         metadata: dict | None = None,
@@ -84,7 +74,6 @@ class TokenResolver:
             type=token_type.value,
             provider=provider,
             scope_user_id=scope_user_id,
-            scope_tenant_id=scope_tenant_id,
             scope_repo=scope_repo,
             secret_ref=secret_ref,
             encrypted_value=encrypted_value,
@@ -102,7 +91,6 @@ class TokenResolver:
             token_type=token_type,
             provider=provider,
             scope_user_id=scope_user_id,
-            scope_tenant_id=scope_tenant_id,
             scope_repo=scope_repo,
             secret_ref=secret_ref,
             encrypted_value=encrypted_value,
@@ -158,24 +146,12 @@ class TokenResolver:
         ).order_by(TokenModel.created_at.desc()).first()
         return self._to_model(result) if result else None
 
-    def _get_tenant_default_token(self, tenant_id: str) -> Token | None:
-        """Get tenant default token (no scope_repo)."""
-        from api.models import Token as TokenModel
-        result = self.db.query(TokenModel).filter(
-            TokenModel.type == 'repo',
-            TokenModel.scope_tenant_id == tenant_id,
-            TokenModel.scope_repo.is_(None),
-            TokenModel.is_active == 1
-        ).order_by(TokenModel.created_at.desc()).first()
-        return self._to_model(result) if result else None
-
     def _get_global_token(self) -> Token | None:
         """Get global fallback token."""
         query = """
             SELECT * FROM tokens
             WHERE type = 'repo'
               AND scope_user_id IS NULL
-              AND scope_tenant_id IS NULL
               AND scope_repo IS NULL
               AND is_active = TRUE
             ORDER BY created_at DESC
@@ -213,7 +189,6 @@ class TokenResolver:
             token_type=TokenType(row.type),
             provider=row.provider,
             scope_user_id=row.scope_user_id,
-            scope_tenant_id=row.scope_tenant_id,
             scope_repo=row.scope_repo,
             secret_ref=row.secret_ref,
             encrypted_value=row.encrypted_value,

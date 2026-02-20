@@ -34,7 +34,6 @@ class LLMClient:
         self,
         db: Session | None = None,
         user_id: str | None = None,
-        tenant_id: str | None = None,
         use_default_models: bool = True,
         scope_context: dict | None = None,
     ) -> None:
@@ -48,16 +47,14 @@ class LLMClient:
         """
         self.db = db or next(get_db_session())
         self.user_id = user_id
-        self.tenant_id = tenant_id
         self.use_default_models = use_default_models
         self.scope_context = scope_context or {}
 
         # Initialize scope resolver
         self.scope_resolver: ScopeResolver | None = None
-        if user_id and tenant_id:
+        if user_id:
             scope_chain = ScopeChainBuilder.dev_agent(
                 user_id=user_id,
-                account_id=tenant_id,
                 repo=self.scope_context.get("repo"),
                 project=self.scope_context.get("project"),
             )
@@ -65,7 +62,7 @@ class LLMClient:
 
         self._providers: dict[LLMProvider, BaseProvider] = {}
         self.router = ModelRouter(
-            db=self.db, user_id=user_id, tenant_id=tenant_id, use_defaults=use_default_models
+            db=self.db, user_id=user_id, use_defaults=use_default_models
         )
         self.rate_limiter = RateLimiter()
         self.token_resolver = TokenResolver(db=self.db)
@@ -76,7 +73,6 @@ class LLMClient:
     def set_user_context(
         self,
         user_id: str | None = None,
-        tenant_id: str | None = None,
         scope_context: dict | None = None,
     ):
         """Update user context for scope-based access control.
@@ -85,22 +81,20 @@ class LLMClient:
             scope_context: Optional scope context, e.g., {'repo': 'matrixone', 'project': 'backend'}
         """
         self.user_id = user_id
-        self.tenant_id = tenant_id
         self.scope_context = scope_context or {}
 
         # Rebuild scope resolver
-        if user_id and tenant_id and scope_context:
+        if user_id:
             scope_chain = ScopeChainBuilder.dev_agent(
                 user_id=user_id,
-                account_id=tenant_id,
-                repo=scope_context.get("repo"),
-                project=scope_context.get("project"),
+                repo=(scope_context or {}).get("repo"),
+                project=(scope_context or {}).get("project"),
             )
             self.scope_resolver = ScopeResolver(self.db, scope_chain)
 
         # Reload router with new context
         self.router = ModelRouter(
-            db=self.db, user_id=user_id, tenant_id=tenant_id, use_defaults=self.use_default_models
+            db=self.db, user_id=user_id, use_defaults=self.use_default_models
         )
         # Re-initialize providers with new API keys
         self._init_providers()
@@ -167,7 +161,7 @@ class LLMClient:
     def _get_api_key(self, provider: str) -> str | None:
         """Get API key with scope-based resolution.
 
-        Priority: scope_resolver > user > tenant > configs table
+        Priority: scope_resolver > user > configs table
         """
         # 1. Try ScopeResolver (supports extended scopes like repo/project)
         if self.scope_resolver:
@@ -175,8 +169,8 @@ class LLMClient:
             if token:
                 return token.get("encrypted_value") or token.get("secret_ref")
 
-        # 2. Fallback to TokenResolver (user/tenant scope only)
-        if self.user_id or self.tenant_id:
+        # 2. Fallback to TokenResolver (user scope only)
+        if self.user_id:
             token = self._resolve_llm_token(provider)
             if token:
                 val = token.encrypted_value or token.secret_ref
@@ -198,7 +192,7 @@ class LLMClient:
 
     def _resolve_llm_token(self, provider: str):
         """Resolve LLM token using TokenResolver logic."""
-        # 1. User-scoped token
+        # User-scoped token
         if self.user_id:
             query = """
                 SELECT * FROM tokens
@@ -209,22 +203,6 @@ class LLMClient:
             result = self.db.execute(
                 text(query),
                 {"provider": provider, "user_id": self.user_id}
-            )
-            row = result.first()
-            if row:
-                return self._token_from_row(row)
-
-        # 2. Tenant-scoped token
-        if self.tenant_id:
-            query = """
-                SELECT * FROM tokens
-                WHERE type = 'llm' AND provider = :provider
-                AND scope_tenant_id = :tenant_id AND is_active = TRUE
-                ORDER BY created_at DESC LIMIT 1
-            """
-            result = self.db.execute(
-                text(query),
-                {"provider": provider, "tenant_id": self.tenant_id}
             )
             row = result.first()
             if row:
@@ -253,8 +231,6 @@ class LLMClient:
             scope_info = []
             if self.user_id:
                 scope_info.append(f"user '{self.user_id}'")
-            if self.tenant_id:
-                scope_info.append(f"tenant '{self.tenant_id}'")
             scope_str = " for " + " and ".join(scope_info) if scope_info else ""
 
             raise ValueError(
@@ -297,8 +273,6 @@ class LLMClient:
             scope_info = []
             if self.user_id:
                 scope_info.append(f"user '{self.user_id}'")
-            if self.tenant_id:
-                scope_info.append(f"tenant '{self.tenant_id}'")
 
             scope_str = " and ".join(scope_info) if scope_info else "current scope"
 

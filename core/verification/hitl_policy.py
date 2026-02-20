@@ -57,7 +57,7 @@ class SupervisionPolicy:
     name: str
     trigger: SupervisionTrigger
     action: SupervisionAction
-    scope: str = "global"  # global / tenant / agent
+    scope: str = "global"  # global / agent
     scope_id: str | None = None
     enabled: bool = True
 
@@ -73,7 +73,6 @@ class ActionContext:
     is_novel_skill: bool = False
     agent_escalated: bool = False
     agent_id: str | None = None
-    tenant_id: str | None = None
 
 
 @dataclass
@@ -90,7 +89,7 @@ class HITLPolicyEngine:
         self.db = db
         self._policies: list[SupervisionPolicy] = []
 
-    def load_policies(self, agent_id: str | None = None, tenant_id: str | None = None):
+    def load_policies(self, agent_id: str | None = None):
         """Load active policies from DB."""
         if not self.db:
             return
@@ -100,10 +99,9 @@ class HITLPolicyEngine:
                 FROM supervision_policies
                 WHERE enabled = TRUE
                   AND (scope = 'global'
-                       OR (scope = 'tenant' AND scope_id = :tenant_id)
                        OR (scope = 'agent' AND scope_id = :agent_id))
                 ORDER BY name
-            """), {"tenant_id": tenant_id or "", "agent_id": agent_id or ""}).fetchall()
+            """), {"agent_id": agent_id or ""}).fetchall()
 
             self._policies = []
             for row in rows:

@@ -1,9 +1,9 @@
 """Scope-based configuration resolver with Open Scope Protocol - ORM Version.
 
 Supports extensible scope chains for different business scenarios:
-- Dev Agent: repo > project > user > account > global
-- Sales Agent: region > sales_group > user > account > global
-- Deploy Agent: environment > project > account > global
+- Dev Agent: repo > project > user > global
+- Sales Agent: region > sales_group > user > global
+- Deploy Agent: environment > project > global
 """
 
 from sqlalchemy.orm import Session
@@ -21,7 +21,7 @@ class ScopeResolver:
             db: Session connection
             scope_chain: Priority chain from specific to general, e.g.,
                 [('repo', 'matrixone'), ('project', 'backend'),
-                 ('user', 'alice'), ('account', 'acme'), ('global', None)]
+                 ('user', 'alice'), ('global', None)]
         """
         self.db = db
         self.scope_chain = scope_chain
@@ -63,14 +63,11 @@ class ScopeResolver:
             # Match scope based on scope_type
             if scope_type == "user" and scope_id:
                 query = query.filter(Token.scope_user_id == scope_id)
-            elif scope_type == "account" and scope_id:
-                query = query.filter(Token.scope_tenant_id == scope_id)
             elif scope_type == "repo" and scope_id:
                 query = query.filter(Token.scope_repo == scope_id)
             elif scope_type == "global":
                 query = query.filter(
                     Token.scope_user_id.is_(None),
-                    Token.scope_tenant_id.is_(None),
                     Token.scope_repo.is_(None)
                 )
             
@@ -121,7 +118,7 @@ class ScopeChainBuilder:
     """Build scope chains for different contexts."""
 
     @staticmethod
-    def dev_agent(user_id: str | None = None, account_id: str | None = None, repo: str | None = None, project: str | None = None) -> list[tuple[str, str | None]]:
+    def dev_agent(user_id: str | None = None, repo: str | None = None, project: str | None = None) -> list[tuple[str, str | None]]:
         """Build scope chain for dev agent context."""
         chain = []
         if repo:
@@ -130,13 +127,11 @@ class ScopeChainBuilder:
             chain.append(("project", project))
         if user_id:
             chain.append(("user", user_id))
-        if account_id:
-            chain.append(("account", account_id))
         chain.append(("global", None))
         return chain
 
     @staticmethod
-    def sales_agent(user_id: str | None = None, account_id: str | None = None, region: str | None = None, sales_group: str | None = None) -> list[tuple[str, str | None]]:
+    def sales_agent(user_id: str | None = None, region: str | None = None, sales_group: str | None = None) -> list[tuple[str, str | None]]:
         """Build scope chain for sales agent context."""
         chain = []
         if region:
@@ -145,51 +140,41 @@ class ScopeChainBuilder:
             chain.append(("sales_group", sales_group))
         if user_id:
             chain.append(("user", user_id))
-        if account_id:
-            chain.append(("account", account_id))
         chain.append(("global", None))
         return chain
 
     @staticmethod
-    def deploy_agent(user_id: str | None = None, account_id: str | None = None, environment: str | None = None, project: str | None = None) -> list[tuple[str, str | None]]:
+    def deploy_agent(user_id: str | None = None, environment: str | None = None, project: str | None = None) -> list[tuple[str, str | None]]:
         """Build scope chain for deploy agent context."""
         chain = []
         if environment:
             chain.append(("environment", environment))
         if project:
             chain.append(("project", project))
-        if account_id:
-            chain.append(("account", account_id))
         chain.append(("global", None))
         return chain
 
     @staticmethod
-    def custom(user_id: str | None = None, account_id: str | None = None, custom_scopes: list[tuple[str, str]] | None = None) -> list[tuple[str, str | None]]:
+    def custom(user_id: str | None = None, custom_scopes: list[tuple[str, str]] | None = None) -> list[tuple[str, str | None]]:
         """Build custom scope chain."""
         chain = []
         if custom_scopes:
             chain.extend(custom_scopes)
         if user_id:
             chain.append(("user", user_id))
-        if account_id:
-            chain.append(("account", account_id))
         chain.append(("global", None))
         return chain
 
     @staticmethod
-    def for_user(user_id: str, tenant_id: str | None = None) -> list[tuple[str, str | None]]:
+    def for_user(user_id: str) -> list[tuple[str, str | None]]:
         """Build scope chain for user context."""
         chain = [("user", user_id)]
-        if tenant_id:
-            chain.append(("tenant", tenant_id))
         chain.append(("global", None))
         return chain
 
     @staticmethod
-    def for_repo(repo_id: str, user_id: str, tenant_id: str | None = None) -> list[tuple[str, str | None]]:
+    def for_repo(repo_id: str, user_id: str) -> list[tuple[str, str | None]]:
         """Build scope chain for repo context."""
         chain = [("repo", repo_id), ("user", user_id)]
-        if tenant_id:
-            chain.append(("tenant", tenant_id))
         chain.append(("global", None))
         return chain

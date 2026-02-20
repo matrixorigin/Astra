@@ -532,83 +532,11 @@ Policy engine evaluates ALL active policies
 
 ---
 
-## 10. Deployment Isolation: Multi-Tenancy as Transparent Infrastructure
+## 10. Deployment Isolation
 
-### The Principle
+> **Status**: Application layer cleaned — no `tenant_id` in agent code. Multi-tenancy is purely a deployment-time concern handled by MatrixOne Multi-Account namespace isolation. Agent code is identical in single-tenant and multi-tenant deployments.
 
-**Agents have no concept of tenants.** An agent's logic, memory, skills, and orchestration are identical whether running in a single-tenant deployment or a 1000-tenant SaaS platform. Multi-tenancy is a deployment-time isolation strategy — the platform provides it transparently, the agent never sees it.
-
-This is a deliberate design choice. If agent code contains `tenant_id` checks, you've leaked a deployment concern into the domain model. Every future feature must then ask "does this work in multi-tenant mode?" — a tax that compounds forever.
-
-### What the Agent Sees vs What the Platform Does
-
-| Agent's View | Platform's Reality (Multi-Tenant Deploy) | Platform's Reality (Single-Tenant Deploy) |
-|---|---|---|
-| `conversation_events` table | Tenant A's database, invisible to Tenant B | The only database |
-| `knowledge_entries` table | Scoped to this account's namespace | The only namespace |
-| Skill registry | Tenant-local + subscribed marketplace skills | All registered skills |
-| Sandbox (CREATE CLONE) | Clone within this account's scope | Clone of the database |
-| Snapshot / time-travel | Scoped to this account | Scoped to the database |
-
-The agent issues the same SQL, the same API calls, the same skill invocations. The platform's deployment layer determines the isolation boundary.
-
-### How MatrixOne Makes This Transparent
-
-MatrixOne Multi-Account provides database-level namespace isolation:
-
-```
-Single-tenant deployment:
-  └── Database: mo_agent
-      ├── conversation_events
-      ├── knowledge_entries
-      └── skills_registry
-
-Multi-tenant deployment:
-  ├── Account: tenant_a → Database: mo_agent  (same schema, same queries)
-  ├── Account: tenant_b → Database: mo_agent  (completely separate namespace)
-  └── Account: sys → Platform admin (cross-account visibility for ops)
-```
-
-The agent code connects to `mo_agent` database in both cases. The connection string determines which account — this is infrastructure configuration, not application logic.
-
-**What this eliminates**: `tenant_id` columns, `WHERE tenant_id = ?` on every query, application-level access control middleware, cross-tenant data leak bugs. The isolation is structural (database engine enforced), not logical (application code enforced).
-
-### Cross-Tenant Sharing (When Needed)
-
-Some resources are intentionally shared across tenants — skill marketplace, curated knowledge bases. This uses MatrixOne Publication:
-
-```sql
--- Platform publishes shared resources (ops action, not agent action)
-CREATE PUBLICATION skill_marketplace DATABASE shared_skills ACCOUNT ALL;
-
--- Tenant subscribes (admin action, not agent action)
-CREATE DATABASE marketplace_skills FROM sys PUBLICATION skill_marketplace;
-```
-
-The agent sees `marketplace_skills` as just another local database. It doesn't know the data comes from a cross-tenant publication.
-
-### Within-Tenant Visibility
-
-Within a single tenant, user-level visibility (private vs team-shared) is handled by views:
-
-```sql
-CREATE VIEW my_knowledge AS
-SELECT * FROM knowledge_entries
-WHERE (visibility = 'user' AND user_id = CURRENT_USER())
-   OR visibility IN ('team', 'public');
-```
-
-This is the only place where "who can see what" appears in the data model — and it's user-level, not tenant-level.
-
-### Audit Immutability
-
-Orthogonal to tenancy. Works identically in single-tenant and multi-tenant:
-
-```sql
-SELECT * FROM conversation_events {SNAPSHOT = 'audit_q1'}
-WHERE event_id = 'evt_suspicious';
--- Compare with current state — any difference = tampering evidence
-```
+When multi-tenant deployment is needed, MatrixOne Multi-Account provides database-level namespace isolation transparently — the agent connects to the same `mo_agent` database, the connection string determines the account scope. No application code changes required.
 
 ---
 

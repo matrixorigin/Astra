@@ -28,7 +28,6 @@ class OwnerType(str, Enum):
     """Owner type."""
 
     USER = "user"
-    TENANT = "tenant"
 
 
 class Repo(BaseModel):

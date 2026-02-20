@@ -221,10 +221,10 @@ class ModelRegistry:
             for m in DEFAULT_MODELS:
                 self._models[m.model_name] = m
 
-    def load_from_db(self, db, user_id: str | None = None, tenant_id: str | None = None):
+    def load_from_db(self, db, user_id: str | None = None):
         """Load model registry with scope-based access control.
 
-        Priority: user > tenant > global
+        Priority: user > global
         """
         try:
             # Try user scope first
@@ -233,20 +233,6 @@ class ModelRegistry:
                     text("SELECT value FROM configs WHERE key_name = 'model_registry' "
                          "AND scope_type = 'user' AND scope_id = :user_id LIMIT 1"),
                     {"user_id": user_id}
-                )
-                row = result.first()
-                if row:
-                    for c in json.loads(row.value):
-                        mc = ModelConfig(**c)
-                        self._models[mc.model_name] = mc
-                    return
-
-            # Try tenant scope
-            if tenant_id:
-                result = db.execute(
-                    text("SELECT value FROM configs WHERE key_name = 'model_registry' "
-                         "AND scope_type = 'tenant' AND scope_id = :tenant_id LIMIT 1"),
-                    {"tenant_id": tenant_id}
                 )
                 row = result.first()
                 if row:
@@ -286,7 +272,7 @@ class ModelRegistry:
 
     def reload(self, db):
         """Hot reload from DB (#4 动态配置)."""
-        self.load_from_db(db, self.user_id, self.tenant_id)
+        self.load_from_db(db, self.user_id)
 
 
 # ── ModelRouter (composes registry + strategy) ─────────────────
@@ -300,7 +286,6 @@ class ModelRouter:
         db=None,
         strategy: RoutingStrategy | None = None,
         user_id: str | None = None,
-        tenant_id: str | None = None,
         use_defaults: bool = True,
     ):
         """Initialize model router.
@@ -312,9 +297,8 @@ class ModelRouter:
         self.registry = ModelRegistry(use_defaults=use_defaults)
         self.strategy = strategy or FallbackChainStrategy()
         self.user_id = user_id
-        self.tenant_id = tenant_id
         if db:
-            self.registry.load_from_db(db, user_id, tenant_id)
+            self.registry.load_from_db(db, user_id)
 
     def route(self, model: str, task_hint: str | None = None) -> list[ModelConfig]:
         """Select models using current strategy."""
