@@ -16,11 +16,18 @@ from core.skills.selector import SkillMetadata, SkillSelector
 
 logger = get_logger(__name__)
 
+_DEFAULT_CONTEXT_BUDGET = 2000  # tokens reserved for tool schemas
+
+
+def _estimate_tokens(obj: Any) -> int:
+    """Estimate token count from serialized JSON size (~4 chars per token)."""
+    return len(json.dumps(obj, default=str)) // 4
+
 
 class ModernSkillSelector:
     """Skill selector using native LLM function calling (OpenAI/Gemini/DeepSeek)."""
 
-    def __init__(self, session: Session, llm_client=None):
+    def __init__(self, session: Session, llm_client=None, *, embed_fn=None):
         if not isinstance(session, Session):
             raise TypeError("session must be a SQLAlchemy Session")
         
@@ -28,16 +35,65 @@ class ModernSkillSelector:
         self.llm = llm_client
         self.rule_selector = SkillSelector(session)
 
+        # Semantic index — primary retrieval path when available
+        from core.skills.skill_index import SkillIndex
+        self._index = SkillIndex(embed_fn=embed_fn)
+        if embed_fn:
+            self._index.build(list(self.rule_selector.skills.values()))
+
     def get_tools_schema(
         self,
         query: str,
         max_candidates: int = 5,
+        *,
+        context_budget: int = _DEFAULT_CONTEXT_BUDGET,
     ) -> list[dict[str, Any]]:
-        """Return OpenAI tool schemas for candidate skills (no LLM call)."""
-        candidates = self.rule_selector.select_skills(query, max_skills=max_candidates)
+        """Return OpenAI tool schemas using progressive disclosure.
+
+        Stage 1 (Tier 1): Retrieve candidates via rule-based matching on
+                          lightweight metadata. Zero prompt tokens.
+        Stage 2 (Tier 3): Build full schema for each candidate, measure real
+                          token cost, include only if within budget.
+                          Skills that don't fit are excluded entirely —
+                          no empty stubs (they waste tokens and confuse LLMs).
+        """
+        # --- Stage 1: retrieve candidates ---
+        # Prefer semantic index; fall back to keyword matching
+        hit_names = self._index.query(query, top_k=max_candidates * 2)
+        if hit_names:
+            candidates = [
+                self.rule_selector.skills[n]
+                for n in hit_names
+                if n in self.rule_selector.skills
+            ]
+            logger.debug("Semantic retrieval: %d candidates", len(candidates))
+        else:
+            candidates = self.rule_selector.select_skills(query, max_skills=max_candidates * 2)
+            logger.debug("Keyword fallback: %d candidates", len(candidates))
         if not candidates:
             return []
-        return [self._skill_to_tool_schema(skill) for skill in candidates]
+
+        # --- Stage 2: budget-aware Tier 3 expansion ---
+        budget_remaining = context_budget
+        tools: list[dict[str, Any]] = []
+
+        for skill in candidates[:max_candidates]:
+            schema = self._skill_to_tool_schema(skill)
+            cost = _estimate_tokens(schema)
+            if budget_remaining < cost:
+                logger.debug(
+                    "Skipping %s (%d tokens, %d remaining)", skill.name, cost, budget_remaining,
+                )
+                continue
+            tools.append(schema)
+            budget_remaining -= cost
+
+        logger.info(
+            "Progressive disclosure: %d/%d candidates loaded, budget used %d/%d tokens",
+            len(tools), min(len(candidates), max_candidates),
+            context_budget - budget_remaining, context_budget,
+        )
+        return tools
 
     def select_and_execute(
         self, query: str, context: dict[str, Any] | None = None, max_candidates: int = 5

@@ -112,7 +112,7 @@
 │  │    SET confidence = 30 (3 evidence)             │            │
 │  │    WHERE learning_id = ...                      │            │
 │  │                                                  │            │
-│  │    INSERT INTO selector_gate_results            │            │
+│  │    INSERT INTO gate_results            │            │
 │  │    (verdict='PASS', improvement_pct=5.9, ...)   │            │
 │  └─────────────────────────────────────────────────┘            │
 │       ↓                                                           │
@@ -147,7 +147,7 @@
 │  └──────────────────────────────────────────────────┘           │
 │                    ↓                                              │
 │  ┌──────────────────────────────────────────────────┐           │
-│  │  selector_gate_results                            │           │
+│  │  gate_results                            │           │
 │  │  ─────────────────────────────────────────────   │           │
 │  │  Gate validations:                                │           │
 │  │  - Verdict (PASS/FAIL)                            │           │
@@ -256,7 +256,7 @@ SELECT
     COUNT(*) as total_gates,
     SUM(CASE WHEN verdict = 'PASS' THEN 1 ELSE 0 END) as passed,
     AVG(improvement_pct) as avg_improvement
-FROM selector_gate_results
+FROM gate_results
 GROUP BY DATE(created_at)
 ORDER BY date DESC;
 

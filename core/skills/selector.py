@@ -23,7 +23,13 @@ logger = get_logger(__name__)
 
 @dataclass
 class SkillMetadata:
-    """Extended skill metadata."""
+    """Skill metadata with progressive disclosure support.
+
+    Tier 1 (embedding index): name + description + triggers → vector.
+           Lives in SkillIndex, never in LLM context. 0 prompt tokens.
+    Tier 2 (candidate ranking): name + description sent to LLM.
+    Tier 3 (execution): full JSON schema loaded into LLM context.
+    """
 
     name: str
     version: str

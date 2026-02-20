@@ -40,7 +40,7 @@
 **Files:**
 - `core/agent/selector.py` - Main integration (AgentSkillSelector)
 - `core/skills/self_improving_selector.py` - Multi-dimensional learning logic
-- `core/skills/regression_gate.py` - Validation layer
+- `core/evaluation/regression_gate.py` - Validation layer
 - `core/skills/learning_signals.py` - Signal types and dataclasses
 - `api/routers/learning.py` - REST endpoints (5 endpoints)
 - `api/models.py` - Database models (SkillSelectionEvent, SkillSelectionLearning, SkillExecutionMetric, SelectorGateResult)
@@ -78,7 +78,7 @@
 **Files:**
 - `core/agent/selector.py`
 - `core/skills/self_improving_selector.py`
-- `core/skills/regression_gate.py`
+- `core/evaluation/regression_gate.py`
 - `api/routers/learning.py`
 
 ---
@@ -177,9 +177,9 @@ CREATE TABLE skill_selection_learning (
 );
 ```
 
-### selector_gate_results
+### gate_results
 ```sql
-CREATE TABLE selector_gate_results (
+CREATE TABLE gate_results (
     gate_id VARCHAR(36) PRIMARY KEY,
     verdict VARCHAR(20),  -- PASS/FAIL
     new_avg_score FLOAT,
@@ -364,7 +364,7 @@ WHERE confidence >= 70
 ORDER BY confidence DESC;
 
 -- Gate history
-SELECT * FROM selector_gate_results 
+SELECT * FROM gate_results 
 ORDER BY created_at DESC LIMIT 10;
 ```
 
@@ -387,7 +387,7 @@ ORDER BY created_at DESC LIMIT 10;
 **Core:**
 - `core/agent/selector.py` - Main integration
 - `core/skills/self_improving_selector.py` - Learning logic
-- `core/skills/regression_gate.py` - Validation
+- `core/evaluation/regression_gate.py` - Validation
 - `core/skills/learning_signals.py` - Signal types
 
 **API:**

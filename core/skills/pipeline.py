@@ -150,14 +150,24 @@ class SkillPipeline:
         audit: bool = True,
         learning: bool = True,
         learning_weights: SignalWeights | None = None,
+        embed_fn=None,
     ):
         self._db = db
         self._llm = llm_client
         self._audit = audit
         self._learning = learning
 
+        # Resolve embed_fn: explicit > EmbeddingService > None
+        if embed_fn is None:
+            try:
+                from core.context.embeddings import EmbeddingService
+                _svc = EmbeddingService(db)
+                embed_fn = _svc.embed_text
+            except Exception:  # noqa: BLE001
+                pass  # no embeddings available — keyword fallback
+
         # Internal engines (not exposed)
-        self._modern = ModernSkillSelector(db, llm_client)
+        self._modern = ModernSkillSelector(db, llm_client, embed_fn=embed_fn)
         self._improver: SelfImprovingSelector | None = None
         if learning:
             self._improver = SelfImprovingSelector(db, llm_client, weights=learning_weights)
@@ -174,6 +184,7 @@ class SkillPipeline:
         session_id: str,
         *,
         max_candidates: int = 5,
+        context_budget: int = 2000,
     ) -> ToolsResult:
         """Select skills and return tools schema for LLM.
 
@@ -181,8 +192,10 @@ class SkillPipeline:
                  Apply learned corrections if learning is enabled.
         Stage 2: Record audit event with selection metadata.
         """
-        # Stage 1a: retrieve + rank
-        tools = self._modern.get_tools_schema(query, max_candidates=max_candidates)
+        # Stage 1a: retrieve + rank (progressive disclosure)
+        tools = self._modern.get_tools_schema(
+            query, max_candidates=max_candidates, context_budget=context_budget,
+        )
         skill_names = [t["function"]["name"] for t in tools]
 
         # Stage 1b: apply learned corrections

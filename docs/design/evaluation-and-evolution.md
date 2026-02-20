@@ -247,7 +247,7 @@ RECORD: Store the learning signal for future pattern matching
 ### Already Implemented
 
 - **SelfImprovingSelector**: Learns from historical skill selection failures using time-travel replay
-- **SkillSelectionRegressionGate**: Validates selector changes before deployment
+- **RegressionGate (ChangeType.SELECTOR)**: Validates selector changes before deployment via unified gate
 - **AuditableSkillSelector**: Records every selection decision with full context
 
 ### The Generalization

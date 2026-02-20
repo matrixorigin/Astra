@@ -28,28 +28,34 @@ A skill is a **versioned, declarative capability** with:
 
 ### Progressive Disclosure (Anthropic-Aligned)
 
-Following Anthropic's Agent Skills pattern, skills load in three tiers:
+Following Anthropic's Agent Skills pattern and RAG-MCP research (Gan & Sun, 2025), skills load in three tiers with **real token accounting** and **semantic retrieval**:
 
 ```
-Tier 1: METADATA (always in context, ~20 tokens per skill)
+Tier 1: INDEX (always available, never in LLM context)
+  Embedding vector of name + description + triggers
+  Used by semantic retriever to find candidates — LLM never sees this tier.
+  Cost: 0 prompt tokens (lives in vector index only)
+
+Tier 2: SUMMARY (injected for LLM candidate ranking, ~50-150 tokens per skill)
   name: "code_review"
-  trigger_keywords: ["review", "PR", "pull request", "code quality"]
+  description: "Review code changes in a pull request for quality, security, and style"
+  parameters: {pr_number: int, focus_areas: list[str]}
   category: "github.pr_management"
   cost_estimate: "medium"
 
-Tier 2: SUMMARY (loaded when skill is a candidate, ~100 tokens)
-  description: "Review code changes in a pull request for quality, security, and style"
-  parameters: {pr_number: int, focus_areas: list[str]}
-  requirements: {repo_type: "code", access: "read"}
-
-Tier 3: FULL (loaded when skill is selected for execution)
-  detailed_instructions: "When reviewing code, check for..."
-  examples: [{input: ..., output: ...}]
-  edge_cases: [...]
-  output_format: {...}
+Tier 3: FULL SCHEMA (injected only for LLM-selected skills, measured tokens)
+  Complete OpenAI tool JSON schema (from Pydantic model or default)
+  detailed_instructions, examples, edge_cases, output_format
+  Token cost: measured per-skill via len(json) // 4
 ```
 
-**Why this matters**: With 50+ skills, putting all details in context wastes attention budget. Tier 1 metadata lets the LLM identify candidates. Tier 2 summaries let it choose. Tier 3 details are loaded only for the selected skill.
+**Key design principles** (learned from industry):
+- **Real token measurement, not constants**: Each skill's Tier 2/3 cost is computed from actual serialized size, not hardcoded estimates. Schema sizes vary 3-5× across skills.
+- **Budget is a hard cap**: If a skill doesn't fit the remaining budget, it is **excluded entirely** — no empty stubs. An empty-parameter stub wastes tokens and confuses the LLM.
+- **Semantic retrieval is mandatory at scale**: RAG-MCP (arXiv:2505.03275) empirically shows keyword matching collapses beyond ~30 tools. Embedding-based retrieval achieves 3.2× accuracy improvement.
+- **Semantic retrieval replaces LLM ranking**: The vector index does the candidate filtering (zero LLM cost). The LLM only sees budget-capped full schemas and selects via native function calling in a single pass.
+
+**Why this matters**: With 50+ skills, putting all details in context wastes attention budget. Tier 1 embeddings let the retriever find candidates without any prompt tokens. Tier 2 summaries let the LLM choose. Tier 3 details are loaded only for the selected skill.
 
 ### Skill Versioning
 
@@ -129,25 +135,35 @@ This is a future capability, but the architecture should not preclude it.
 
 ### The Problem
 
-With 50+ skills, the LLM can't efficiently choose from a flat list. Selection must be fast, accurate, and auditable.
+With 50+ skills, the LLM can't efficiently choose from a flat list. Selection must be fast, accurate, and auditable. Research shows keyword matching collapses beyond ~30 tools (RAG-MCP, 2025). Semantic retrieval is mandatory, not optional.
 
-### Multi-Stage Selection
+### Multi-Stage Selection (Retrieval → Budget-Controlled Load)
 
 ```
-Stage 1: FILTER (rule-based, <1ms)
-  - Match skill trigger_keywords against query
-  - Filter by repo type and permissions
-  - Result: 5-10 candidates from 50+ skills
+Stage 1: RETRIEVE (semantic vector search, <50ms, 0 prompt tokens)
+  - Encode query into embedding vector
+  - Cosine similarity against skill embedding index (SkillIndex)
+  - Return top-k candidates (k = 2× max_candidates for headroom)
+  - Fallback: keyword matching if vector index unavailable
 
-Stage 2: SELECT (LLM function calling)
-  - Present candidates as tool definitions (Tier 2 summaries)
-  - LLM selects via native function calling / structured output
-  - Result: 1-3 skills to execute
-
-Stage 3: LOAD (Tier 3 details for selected skills only)
-  - Full instructions, examples, edge cases
-  - Injected into context for execution
+Stage 2: LOAD (Tier 3 full schema, budget-controlled)
+  - Build full OpenAI tool schema for each candidate
+  - Measure real token cost per schema: len(json) // 4
+  - Include only if within remaining context_budget
+  - Skills that exceed budget are excluded entirely (no stubs)
+  - LLM selects + extracts parameters in a single function-calling pass
 ```
+
+**Why not a separate "Tier 2 ranking" LLM call?** OpenAI-style function calling requires full parameter schemas to generate valid calls. A two-pass approach (rank with summaries → load full schemas) would double LLM latency for marginal benefit. Instead, the semantic retrieval stage (zero LLM cost) does the heavy filtering, and the budget cap ensures only a controlled number of full schemas reach the LLM. This matches Anthropic's actual implementation: the meta-tool decides which skill to load (cheap), then the full skill content is injected (expensive but targeted).
+
+**Scaling behavior**:
+| Skill count | Stage 1 method | Prompt tokens (5 candidates) |
+|-------------|---------------|------------------------------|
+| <20         | keyword OK    | ~500-2000 (budget-capped)    |
+| 20-100      | semantic required | ~500-2000 (budget-capped)|
+| 100+        | semantic + hierarchical | ~500-2000 (budget-capped) |
+
+Note: prompt token cost stays **constant** regardless of total skill count — only the retrieval index grows.
 
 ### Auditable Selection
 
@@ -434,11 +450,12 @@ With MatrixOne: **Publication = distribution + auto-update. Clone = version pinn
 
 - [Anthropic: Equipping Agents with Agent Skills](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
 - [Anthropic: Writing Tools for AI Agents](https://www.anthropic.com/engineering/writing-tools-for-agents)
+- [RAG-MCP: Mitigating Prompt Bloat in LLM Tool Selection (arXiv:2505.03275)](https://arxiv.org/abs/2505.03275) — 3.2× accuracy, ~50% token reduction via retrieval-based tool selection
+- [Progressive Context Enrichment for LLMs (Inferable, 2025)](https://www.inferable.ai/blog/posts/llm-progressive-context-encrichment) — production validation of fetch-on-demand pattern
+- [Claude Skills: Breaking LLM Memory Barriers (Developers Digest)](https://www.developersdigest.tech/blog/claude-skills-breaking-llm-memory-barriers) — ~30-50 tokens per skill until activation
 - [MCP Specification](https://modelcontextprotocol.io/docs/getting-started/intro)
 - [A2A Protocol Guide](https://a2aprotocol.ai/blog/2025-full-guide-a2a-protocol)
 - [AI Agents 2026: Practical Architecture](https://www.andriifurmanets.com/blogs/ai-agents-2026-practical-architecture-tools-memory-evals-guardrails)
-
 - [Vercel: Agent Skills — Creating, Installing, and Sharing](https://vercel.com/kb/guide/agent-skills-creating-installing-and-sharing-reusable-agent-context)
-- [SpoonOS: Web3-Native Skills Marketplace](https://neonewstoday.com/ai/spoonos-launches-web3-native-skills-marketplace-to-accelerate-composable-ai/)
 
 Content was rephrased for compliance with licensing restrictions.

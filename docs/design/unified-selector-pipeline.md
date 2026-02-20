@@ -169,7 +169,7 @@ Created `core/skills/pipeline.py`:
 - ✅ `core/skills/modern_selector.py` — LLM function calling engine used by pipeline
 - ✅ `core/skills/self_improving_selector.py` — learning engine used by pipeline
 - ✅ `core/skills/learning_signals.py` — signal types
-- ✅ `core/skills/regression_gate.py` — gate validation
+- ✅ `core/evaluation/regression_gate.py` — gate validation
 
 **⚠️ Important**: `selector.py` and `modern_selector.py` are marked as internal implementation details. External code must use `SkillPipeline` only. These files contain docstring warnings against direct use.
 
