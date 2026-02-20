@@ -57,7 +57,7 @@ def test_firewall_no_claims(firewall):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id="test_snapshot",
+        context_capture_id="test_snapshot",
         mode="warn"
     )
     
@@ -94,7 +94,7 @@ def test_firewall_with_verified_claims(firewall, session_repo, event_repo):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id=session_id,
+        context_capture_id=session_id,
         mode="warn"
     )
     
@@ -130,7 +130,7 @@ def test_firewall_with_contradictions(firewall, session_repo, event_repo):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id=session_id,
+        context_capture_id=session_id,
         mode="warn"
     )
     
@@ -145,7 +145,7 @@ def test_firewall_block_mode(firewall):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id="test_snapshot",
+        context_capture_id="test_snapshot",
         mode="block"
     )
     
@@ -168,7 +168,7 @@ def test_firewall_logging(firewall, session_repo, event_repo):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id=session_id,
+        context_capture_id=session_id,
         mode="warn"
     )
     
@@ -183,7 +183,7 @@ def test_firewall_no_claims(firewall):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id="test_snapshot",
+        context_capture_id="test_snapshot",
         mode="warn"
     )
     
@@ -217,7 +217,7 @@ def test_firewall_with_verified_claims(firewall, session_repo, event_repo):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id=session_id,  # Use session as snapshot
+        context_capture_id=session_id,  # Use session as snapshot
         mode="warn"
     )
     
@@ -232,7 +232,7 @@ def test_firewall_confidence_threshold(firewall):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id="test_snapshot",
+        context_capture_id="test_snapshot",
         mode="warn"
     )
     
@@ -244,7 +244,7 @@ def test_firewall_empty_response(firewall):
     """Test firewall with empty response."""
     result = firewall.verify_response(
         response="",
-        snapshot_id="test_snapshot",
+        context_capture_id="test_snapshot",
         mode="warn"
     )
     
@@ -259,7 +259,7 @@ def test_firewall_invalid_snapshot_id(firewall):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id="invalid_snapshot_123",
+        context_capture_id="invalid_snapshot_123",
         mode="warn"
     )
     
@@ -272,7 +272,7 @@ def test_firewall_warn_mode(firewall):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id="test_snapshot",
+        context_capture_id="test_snapshot",
         mode="warn"
     )
     
@@ -286,7 +286,7 @@ def test_firewall_snapshot_load_failure(firewall):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id="nonexistent_snapshot",
+        context_capture_id="nonexistent_snapshot",
         mode="warn"
     )
     
@@ -297,7 +297,7 @@ def test_firewall_log_verification_missing_params(firewall):
     """Test firewall with missing parameters."""
     result = firewall.verify_response(
         response="Test response",
-        snapshot_id=None,
+        context_capture_id=None,
         mode="warn"
     )
     
@@ -315,7 +315,7 @@ def test_firewall_multiple_claims(firewall):
     
     result = firewall.verify_response(
         response=response,
-        snapshot_id="test_snapshot",
+        context_capture_id="test_snapshot",
         mode="warn"
     )
     

@@ -35,13 +35,13 @@ def test_context_snapshot_save_and_load(db_session, context_manager, event_logge
     )
 
     # Save snapshot with new parameters (llm_request_id, llm_response_id)
-    snapshot_id = context_manager.save_snapshot(
+    context_capture_id = context_manager.save_snapshot(
         context, session_id, event.event_id, llm_request_id="req_001", llm_response_id="resp_001"
     )
-    assert snapshot_id is not None
+    assert context_capture_id is not None
 
     # Load snapshot
-    loaded_context = context_manager.load_snapshot(snapshot_id)
+    loaded_context = context_manager.load_snapshot(context_capture_id)
 
     # Verify loaded context matches original
     assert loaded_context.system_prompt == context.system_prompt
@@ -51,7 +51,7 @@ def test_context_snapshot_save_and_load(db_session, context_manager, event_logge
 
     # Verify snapshot is in database
     from api.models import ContextSnapshot as SnapshotModel
-    row = db_session.query(SnapshotModel).filter(SnapshotModel.snapshot_id == snapshot_id).first()
+    row = db_session.query(SnapshotModel).filter(SnapshotModel.context_capture_id == context_capture_id).first()
     assert row is not None
     assert row.session_id == session_id
     assert row.event_id == event.event_id
@@ -87,13 +87,13 @@ def test_context_snapshot_with_events(db_session, context_manager, event_logger)
     )
 
     # Save snapshot with new parameters
-    snapshot_id = context_manager.save_snapshot(
+    context_capture_id = context_manager.save_snapshot(
         context, session_id, event2.event_id, llm_request_id="req_002", llm_response_id="resp_002"
     )
-    assert snapshot_id is not None
+    assert context_capture_id is not None
 
     # Load and verify
-    loaded = context_manager.load_snapshot(snapshot_id)
+    loaded = context_manager.load_snapshot(context_capture_id)
     assert len(loaded.selected_events) > 0
 
 
@@ -119,12 +119,12 @@ def test_context_snapshot_task_types(db_session, context_manager, event_logger):
             session_id=session_id, query=f"Test {task_type.value}", task_type=task_type
         )
 
-        snapshot_id = context_manager.save_snapshot(
+        context_capture_id = context_manager.save_snapshot(
             context, session_id, event.event_id, llm_request_id=f"req_{task_type.value}", llm_response_id=f"resp_{task_type.value}"
         )
-        assert snapshot_id is not None
+        assert context_capture_id is not None
 
-        loaded = context_manager.load_snapshot(snapshot_id)
+        loaded = context_manager.load_snapshot(context_capture_id)
         assert loaded.task_type == task_type
 
 
@@ -144,12 +144,12 @@ def test_context_snapshot_relevance_scores(db_session, context_manager, event_lo
     )
 
     # Save snapshot with new parameters
-    snapshot_id = context_manager.save_snapshot(
+    context_capture_id = context_manager.save_snapshot(
         context, session_id, event.event_id, llm_request_id="req_003", llm_response_id="resp_003"
     )
 
     # Load and verify relevance scores
-    loaded = context_manager.load_snapshot(snapshot_id)
+    loaded = context_manager.load_snapshot(context_capture_id)
     assert loaded.relevance_scores is not None
     assert isinstance(loaded.relevance_scores, dict)
 
@@ -170,16 +170,16 @@ def test_context_snapshot_update_llm_ids(db_session, context_manager, event_logg
     )
 
     # Save snapshot without LLM IDs
-    snapshot_id = context_manager.save_snapshot(context, session_id, event.event_id)
+    context_capture_id = context_manager.save_snapshot(context, session_id, event.event_id)
 
     # Update with LLM IDs
-    context_manager.update_snapshot_llm_ids(snapshot_id, llm_request_id="req_004", llm_response_id="resp_004")
+    context_manager.update_snapshot_llm_ids(context_capture_id, llm_request_id="req_004", llm_response_id="resp_004")
 
     # Verify update
     from api.models import ContextSnapshot as SnapshotModel
     # Expire session to ensure fresh data
     db_session.expire_all()
-    row = db_session.query(SnapshotModel).filter(SnapshotModel.snapshot_id == snapshot_id).first()
+    row = db_session.query(SnapshotModel).filter(SnapshotModel.context_capture_id == context_capture_id).first()
     assert row is not None
     assert row.llm_request_id == "req_004"
     assert row.llm_response_id == "resp_004"

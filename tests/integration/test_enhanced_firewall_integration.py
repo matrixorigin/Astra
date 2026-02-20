@@ -268,4 +268,4 @@ class TestEnhancedFirewallIntegration:
 
         # Should fail open
         assert result.safe_to_deliver is True
-        assert "Snapshot load failed" in result.warnings[0]
+        assert "Context capture load failed" in result.warnings[0]

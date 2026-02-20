@@ -40,6 +40,18 @@ class EventLogger:
         Raises:
             Exception: If database operation fails
         """
+        # Generate embedding for content
+        embedding = None
+        if event.content:
+            try:
+                from core.context.embeddings import EmbeddingService
+                embeddings = EmbeddingService(self.session, provider="mock")
+                embedding_vec = embeddings.embed_text(event.content)
+                # Convert to MatrixOne vector format: "[v1,v2,...]"
+                embedding = "[" + ",".join(str(v) for v in embedding_vec) + "]"
+            except Exception as e:
+                logger.warning(f"Failed to generate embedding: {e}")
+        
         db_event = EventModel(
             event_id=event.event_id,
             user_id=event.user_id,
@@ -53,6 +65,7 @@ class EventLogger:
             context_snapshot=event.context_snapshot.model_dump() if event.context_snapshot else None,
             token_usage=event.token_usage.model_dump() if event.token_usage else None,
             embedding_ref=event.embedding_ref,
+            embedding=embedding,
             created_at=event.created_at,
             prompt_template_id=event.prompt_template_id,
             skills_snapshot=event.skills_snapshot,

@@ -121,7 +121,7 @@ class ContextManager:
         max_tokens: int = 8000,
         task_type: TaskType = TaskType.GENERAL,
         current_chain_id: str | None = None,
-        use_hybrid_retrieval: bool = False,  # Default to fallback (embeddings not always available)
+        use_hybrid_retrieval: bool = True,  # Design default: hybrid retrieval as primary path
         forced_retrieval: list[dict[str, Any]] | None = None,
     ) -> Context:
         """Build optimal context for current query.
@@ -517,7 +517,12 @@ class ContextManager:
         llm_request_id: str | None = None,
         llm_response_id: str | None = None,
     ) -> str:
-        """Save context snapshot to database (always enabled).
+        """Save a business-level context snapshot to database.
+
+        This captures what the LLM saw at decision time (system prompt, selected
+        events, skill definitions, code context, documentation). It is NOT a
+        MatrixOne database-level snapshot — those are used for time-travel queries
+        and zero-cost branching at the storage layer.
 
         Args:
             context: Context object
@@ -527,13 +532,13 @@ class ContextManager:
             llm_response_id: LLM response identifier
 
         Returns:
-            snapshot_id
+            context_capture_id (business-level context capture ID)
         """
         import json
 
         from uuid_utils import uuid7
 
-        snapshot_id = str(uuid7())
+        context_capture_id = str(uuid7())
 
         # Extract skills used (name and version)
         skills_used = [
@@ -550,7 +555,7 @@ class ContextManager:
         from datetime import datetime, timezone
         
         snapshot = SnapshotModel(
-            snapshot_id=snapshot_id,
+            context_capture_id=context_capture_id,
             session_id=session_id,
             event_id=event_id,
             system_prompt=context.system_prompt,
@@ -571,16 +576,16 @@ class ContextManager:
         self.db.add(snapshot)
         self.db.commit()
 
-        logger.info(f"Context snapshot saved: {snapshot_id} (retrieved: {len(context.retrieved_events or [])} events)")
-        return snapshot_id
+        logger.info(f"Context snapshot saved: {context_capture_id} (retrieved: {len(context.retrieved_events or [])} events)")
+        return context_capture_id
 
     def update_snapshot_llm_ids(
-        self, snapshot_id: str, llm_request_id: str | None = None, llm_response_id: str | None = None
+        self, context_capture_id: str, llm_request_id: str | None = None, llm_response_id: str | None = None
     ) -> None:
-        """Update snapshot with LLM request/response IDs.
+        """Update context capture with LLM request/response IDs.
 
         Args:
-            snapshot_id: Snapshot identifier
+            context_capture_id: Context capture identifier
             llm_request_id: LLM request identifier
             llm_response_id: LLM response identifier
         """
@@ -596,20 +601,20 @@ class ContextManager:
             return
 
         self.db.query(SnapshotModel).filter(
-            SnapshotModel.snapshot_id == snapshot_id
+            SnapshotModel.context_capture_id == context_capture_id
         ).update(update_dict)
         self.db.commit()
 
-    def load_snapshot(self, snapshot_id: str) -> Context:
-        """Load context snapshot from database."""
+    def load_snapshot(self, context_capture_id: str) -> Context:
+        """Load context capture from database."""
         from api.models import ContextSnapshot as SnapshotModel
 
         row = self.db.query(SnapshotModel).filter(
-            SnapshotModel.snapshot_id == snapshot_id
+            SnapshotModel.context_capture_id == context_capture_id
         ).first()
 
         if not row:
-            raise ContextError(f"Snapshot not found: {snapshot_id}")
+            raise ContextError(f"Context capture not found: {context_capture_id}")
 
         # JSON fields are already parsed by SQLAlchemy
         skill_definitions = row.skill_definitions or []

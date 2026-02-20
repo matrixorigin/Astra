@@ -99,14 +99,14 @@ def test_replay_consistency():
     )
     
     # Save snapshot
-    snapshot_id = ctx_mgr.save_snapshot(
+    context_capture_id = ctx_mgr.save_snapshot(
         context=original_context,
         session_id=session_id,
         event_id=e1.event_id,
     )
     
     # Load snapshot
-    loaded_context = ctx_mgr.load_snapshot(snapshot_id)
+    loaded_context = ctx_mgr.load_snapshot(context_capture_id)
     
     # Verify retrieved_events are preserved
     assert loaded_context.retrieved_events is not None

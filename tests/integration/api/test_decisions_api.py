@@ -76,12 +76,12 @@ def test_data(client, auth_headers):
         "event_id": event_id,
         "context_data": {"system_prompt": "test", "task_type": "test"}
     })
-    snapshot_id = resp.json()["snapshot_id"]
+    context_capture_id = resp.json()["context_capture_id"]
     
     return {
         "session_id": session_id,
         "event_id": event_id,
-        "snapshot_id": snapshot_id
+        "context_capture_id": context_capture_id
     }
 
 
@@ -93,7 +93,7 @@ def test_record_decision_success(client, auth_headers, test_data):
         json={
             "session_id": test_data["session_id"],
             "event_id": test_data["event_id"],
-            "snapshot_id": test_data["snapshot_id"],
+            "context_capture_id": test_data["context_capture_id"],
             "decision_type": "skill_selection",
             "decision_output": {"selected_skill": "code_review"},
             "model_params": {"model": "gpt-4", "temperature": 0.7}
@@ -116,7 +116,7 @@ def test_get_decision_success(client, auth_headers, test_data):
         json={
             "session_id": test_data["session_id"],
             "event_id": test_data["event_id"],
-            "snapshot_id": test_data["snapshot_id"],
+            "context_capture_id": test_data["context_capture_id"],
             "decision_type": "response_generation",
             "decision_output": {"response": "test"}
         },
@@ -140,7 +140,7 @@ def test_audit_decision_success(client, auth_headers, test_data):
         json={
             "session_id": test_data["session_id"],
             "event_id": test_data["event_id"],
-            "snapshot_id": test_data["snapshot_id"],
+            "context_capture_id": test_data["context_capture_id"],
             "decision_type": "skill_selection",
             "decision_output": {"skill": "test"}
         },
@@ -167,7 +167,7 @@ def test_list_decisions_success(client, auth_headers, test_data):
             json={
                 "session_id": test_data["session_id"],
                 "event_id": test_data["event_id"],
-                "snapshot_id": test_data["snapshot_id"],
+                "context_capture_id": test_data["context_capture_id"],
                 "decision_type": "test",
                 "decision_output": {"index": i}
             },

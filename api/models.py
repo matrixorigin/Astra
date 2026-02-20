@@ -1,8 +1,9 @@
 """SQLAlchemy ORM models."""
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, JSON, ForeignKey, Float, Index
-from sqlalchemy.dialects.mysql import TINYINT
 from sqlalchemy.orm import declarative_base
+from sqlalchemy.dialects.mysql import TINYINT
+from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy.sql import func
 from matrixone import VectorType, VectorPrecision
 
@@ -136,6 +137,10 @@ class Session(Base):
 
 class Event(Base):
     __tablename__ = "conversation_events"
+    __table_args__ = (
+        FulltextIndex("ft_content_session", ["content", "session_id"], parser=FulltextParserType.NGRAM),
+    )
+    
     event_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), nullable=False, index=True)
     user_id = Column(String(36), nullable=False, index=True)
@@ -215,7 +220,7 @@ class PromptTemplate(Base):
 
 class ContextSnapshot(Base):
     __tablename__ = "context_snapshots"
-    snapshot_id = Column(String(36), primary_key=True)
+    context_capture_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), nullable=False, index=True)
     event_id = Column(String(36), nullable=False, index=True)
     system_prompt = Column(Text)
@@ -248,7 +253,7 @@ class DecisionAudit(Base):
     model_params = Column(JSON)
     confidence_score = Column(String(10))
     created_at = Column(DateTime, default=func.now())
-    snapshot_id = Column(String(36))
+    context_capture_id = Column(String(36))
 
 
 class EventEmbedding(Base):

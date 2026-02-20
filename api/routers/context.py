@@ -23,7 +23,7 @@ class CreateSnapshotRequest(BaseModel):
 
 class SnapshotResponse(BaseModel):
     """快照响应"""
-    snapshot_id: str
+    context_capture_id: str
     session_id: str
     event_id: str
     context_data: Dict[str, Any]
@@ -94,12 +94,12 @@ async def list_snapshots(
 
 
 @router.get(
-    "/{snapshot_id}",
+    "/{context_capture_id}",
     response_model=SnapshotResponse,
     summary="获取上下文快照"
 )
 async def get_snapshot(
-    snapshot_id: str,
+    context_capture_id: str,
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -107,7 +107,7 @@ async def get_snapshot(
     try:
         service = ContextService(db)
         return service.get_snapshot(
-            snapshot_id=snapshot_id,
+            context_capture_id=context_capture_id,
             user_id=current_user["user_id"]
         )
     except ResourceNotFoundError as e:

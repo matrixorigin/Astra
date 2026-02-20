@@ -38,21 +38,21 @@ class ContextService:
             raise PermissionDeniedError(f"无权限访问 Session {session_id}")
         
         try:
-            snapshot_id = str(uuid7())
+            context_capture_id = str(uuid7())
             
             # 插入快照 - 使用实际的表字段
             self.db_session.execute(
                 text("""
                 INSERT INTO context_snapshots
-                (snapshot_id, session_id, event_id, system_prompt, skill_definitions,
+                (context_capture_id, session_id, event_id, system_prompt, skill_definitions,
                  selected_events, code_context, documentation, total_tokens, 
                  token_budget, assembly_time_ms, relevance_scores, task_type, created_at)
-                VALUES (:snapshot_id, :session_id, :event_id, :system_prompt, :skill_definitions,
+                VALUES (:context_capture_id, :session_id, :event_id, :system_prompt, :skill_definitions,
                         :selected_events, :code_context, :documentation, :total_tokens,
                         :token_budget, :assembly_time_ms, :relevance_scores, :task_type, :created_at)
                 """),
                 {
-                    "snapshot_id": snapshot_id,
+                    "context_capture_id": context_capture_id,
                     "session_id": session_id,
                     "event_id": event_id,
                     "system_prompt": context_data.get("system_prompt"),
@@ -75,13 +75,13 @@ class ContextService:
                 user_id=user_id,
                 action="context_snapshot_create",
                 resource_type="context_snapshot",
-                resource_id=snapshot_id,
+                resource_id=context_capture_id,
                 details={"session_id": session_id, "event_id": event_id},
                 status="success"
             )
             
             return {
-                "snapshot_id": snapshot_id,
+                "context_capture_id": context_capture_id,
                 "session_id": session_id,
                 "event_id": event_id,
                 "context_data": context_data,
@@ -101,29 +101,29 @@ class ContextService:
     
     def get_snapshot(
         self,
-        snapshot_id: str,
+        context_capture_id: str,
         user_id: str
     ) -> Dict[str, Any]:
         """获取上下文快照"""
         try:
             result = self.db_session.execute(
                 text("""
-                    SELECT cs.snapshot_id, cs.session_id, cs.event_id, 
+                    SELECT cs.context_capture_id, cs.session_id, cs.event_id, 
                            cs.system_prompt, cs.skill_definitions, cs.selected_events,
                            cs.code_context, cs.documentation, cs.total_tokens,
                            cs.token_budget, cs.assembly_time_ms, cs.relevance_scores,
                            cs.task_type, cs.created_at
                     FROM context_snapshots cs
                     JOIN sessions s ON cs.session_id = s.session_id
-                    WHERE cs.snapshot_id = :snapshot_id AND s.user_id = :user_id
+                    WHERE cs.context_capture_id = :context_capture_id AND s.user_id = :user_id
                     """),
-                {"snapshot_id": snapshot_id, "user_id": user_id}
+                {"context_capture_id": context_capture_id, "user_id": user_id}
                 )
             
             row = result.first()
             
             if not row:
-                raise ResourceNotFoundError(f"Snapshot {snapshot_id} 不存在")
+                raise ResourceNotFoundError(f"Snapshot {context_capture_id} 不存在")
             
             result_dict = dict(row._mapping)
             
@@ -142,7 +142,7 @@ class ContextService:
             }
             
             return {
-                "snapshot_id": result_dict["snapshot_id"],
+                "context_capture_id": result_dict["context_capture_id"],
                 "session_id": result_dict["session_id"],
                 "event_id": result_dict["event_id"],
                 "context_data": context_data,
@@ -170,7 +170,7 @@ class ContextService:
                 
                 result = self.db_session.execute(
                     text("""
-                        SELECT snapshot_id, session_id, event_id, created_at
+                        SELECT context_capture_id, session_id, event_id, created_at
                         FROM context_snapshots
                         WHERE session_id = :session_id
                         ORDER BY created_at DESC
@@ -188,7 +188,7 @@ class ContextService:
             else:
                 result = self.db_session.execute(
                     text("""
-                        SELECT cs.snapshot_id, cs.session_id, cs.event_id, cs.created_at
+                        SELECT cs.context_capture_id, cs.session_id, cs.event_id, cs.created_at
                         FROM context_snapshots cs
                         JOIN sessions s ON cs.session_id = s.session_id
                         WHERE s.user_id = :user_id
@@ -213,7 +213,7 @@ class ContextService:
             return {
                 "snapshots": [
                     {
-                        "snapshot_id": s["snapshot_id"],
+                        "context_capture_id": s["context_capture_id"],
                         "session_id": s["session_id"],
                         "event_id": s["event_id"],
                         "created_at": s["created_at"].isoformat() if s.get("created_at") else None

@@ -138,14 +138,16 @@ class ChatLoop:
             content=user_input,
         )
 
-        # 2. Build context and save snapshot (always enabled)
+        # 2. Build context and save context snapshot (always enabled).
+        #    This is a *business-level* snapshot of what the LLM sees (system prompt,
+        #    selected events, skills, docs). NOT a MatrixOne database-level snapshot.
         from core.context.manager import TaskType
 
         ctx = self.context_manager.build_context(
             session_id=session_id, query=user_input, task_type=TaskType.GENERAL
         )
-        snapshot_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
-        logger.debug(f"Context snapshot: {snapshot_id}")
+        context_capture_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
+        logger.debug(f"Context snapshot: {context_capture_id}")
 
         # 3. Build messages with context
         messages = self._build_messages(user_input, context)
@@ -190,8 +192,8 @@ class ChatLoop:
                 final_content = llm_result.get("content", "")
 
                 # Always verify with firewall
-                verification = self.firewall.verify_response(final_content, snapshot_id, mode="warn")
-                self.firewall.log_verification(session_id, user_event.event_id, verification)
+                verification = self.firewall.verify_response(final_content, context_capture_id, mode="warn")
+                self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
 
                 if not verification.safe_to_deliver:
                     logger.warning(
@@ -321,19 +323,30 @@ class ChatLoop:
             content=user_input,
         )
 
-        # 2. Check if planning is needed
+        # 2. Build context and save context snapshot (same as non-stream path).
+        #    This is a *business-level* snapshot of what the LLM sees (system prompt,
+        #    selected events, skills, docs). NOT a MatrixOne database-level snapshot.
+        from core.context.manager import TaskType
+
+        ctx = self.context_manager.build_context(
+            session_id=session_id, query=user_input, task_type=TaskType.GENERAL
+        )
+        context_capture_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
+        logger.debug(f"[stream] Context snapshot: {context_capture_id}")
+
+        # 3. Check if planning is needed
         if await _needs_planning(user_input, self.llm):
-            # Use planning for complex tasks - stream events directly
             async for event in self.run_step_with_planning(
-                user_input, session_id, user_id, context, max_candidates
+                user_input, session_id, user_id, context, max_candidates,
+                context_capture_id=context_capture_id,
             ):
                 yield event
             return
 
-        # 3. Build messages with context
+        # 4. Build messages with context
         messages = self._build_messages(user_input, context)
 
-        # 4. Get available tools schema (with audit + learning)
+        # 5. Get available tools schema (with audit + learning)
         _sel = self._pipeline.get_tools_schema(
             user_input, session_id, max_candidates=max_candidates,
         )
@@ -345,22 +358,24 @@ class ChatLoop:
             user_id=user_id,
             session_id=session_id,
             event_type="stream_run_started",
-            content=json.dumps({"query": user_input}),
+            content=json.dumps({"query": user_input, "context_capture_id": str(context_capture_id)}),
             parent_event_id=user_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
         )
 
         yield StreamEvent(
             event_type=StreamEventType.RUN_STARTED,
-            data={"query": user_input},
+            data={"query": user_input, "context_capture_id": str(context_capture_id)},
             event_id=run_started_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
         )
 
         if not tools_schema:
-            # Plain chat — stream text
+            # Plain chat — stream text, accumulate for verification
+            full_text = ""
             async for chunk in self.llm.chat_stream(messages, user_id, session_id):
+                full_text += chunk
                 text_event = self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
@@ -377,20 +392,45 @@ class ChatLoop:
             agent_id=self.agent_id,
                 )
 
+            # Verify with firewall before delivering
+            verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn")
+            self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
+
+            if not verification.safe_to_deliver:
+                logger.warning(
+                    f"[stream/plain] Firewall: confidence={verification.confidence_score:.2f}, "
+                    f"failed={verification.claims_failed}"
+                )
+                warning = (
+                    f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
+                    f"{verification.claims_failed} unverified claims."
+                )
+                yield StreamEvent(
+                    event_type=StreamEventType.TEXT_DELTA,
+                    data={"chunk": warning},
+                    event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
+                )
+                full_text += warning
+
             text_done_event = self.event_logger.create_stream_event(
                 user_id=user_id,
                 session_id=session_id,
                 event_type="stream_text_done",
-                content="{}",
+                content=json.dumps({"full_text": full_text}),
                 parent_event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
             )
             yield StreamEvent(
                 event_type=StreamEventType.TEXT_DONE,
-                data={},
+                data={"full_text": full_text, "context_capture_id": context_capture_id},
                 event_id=text_done_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
+            )
+            self._log_response(
+                user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id
             )
 
             run_finished_event = self.event_logger.create_stream_event(
@@ -438,6 +478,20 @@ class ChatLoop:
                     tool_calls = _merge_tool_call_fragments(tool_calls, [chunk["data"]])
 
             if not tool_calls:
+                # Verify with firewall (same as non-stream path)
+                verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn")
+                self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
+
+                if not verification.safe_to_deliver:
+                    logger.warning(
+                        f"[stream] Firewall: confidence={verification.confidence_score:.2f}, "
+                        f"failed={verification.claims_failed}"
+                    )
+                    full_text += (
+                        f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
+                        f"{verification.claims_failed} unverified claims."
+                    )
+
                 text_done_event = self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
@@ -448,7 +502,7 @@ class ChatLoop:
                 )
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DONE,
-                    data={"full_text": full_text},
+                    data={"full_text": full_text, "context_capture_id": context_capture_id},
                     event_id=text_done_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
@@ -694,12 +748,35 @@ class ChatLoop:
                 causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
             )
+
+        # Verify exhausted-rounds answer with firewall
+        verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn")
+        self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
+
+        if not verification.safe_to_deliver:
+            logger.warning(
+                f"[stream/exhausted] Firewall: confidence={verification.confidence_score:.2f}, "
+                f"failed={verification.claims_failed}"
+            )
+            warning = (
+                f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
+                f"{verification.claims_failed} unverified claims."
+            )
+            yield StreamEvent(
+                event_type=StreamEventType.TEXT_DELTA,
+                data={"chunk": warning},
+                event_id=user_event.event_id,
+                causal_chain_id=user_event.causal_chain_id,
+            agent_id=self.agent_id,
+            )
+            full_text += warning
+
         self._log_response(
             user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id
         )
         yield StreamEvent(
             event_type=StreamEventType.RUN_FINISHED,
-            data={},
+            data={"context_capture_id": context_capture_id},
             event_id=user_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
@@ -712,6 +789,7 @@ class ChatLoop:
         user_id: str,
         context: dict[str, Any] | None = None,
         max_candidates: int = 5,
+        context_capture_id: str | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """PAOR: Plan → Act → Observe → Reflect loop.
 

@@ -4,6 +4,9 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 import os
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
 
 # Test database configuration - completely separate from production
 TEST_DATABASE_CONFIG = {
@@ -24,7 +27,14 @@ def test_engine():
     engine = create_engine(TEST_DATABASE_URL, echo=False, pool_pre_ping=True)
     
     # Create tables in test database
-    from api.models import Base
+    from api.models import Base, ContextSnapshot
+    
+    # Drop old context_snapshots table if it exists (schema migration)
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS context_snapshots"))
+        conn.execute(text("DROP TABLE IF EXISTS decision_audit"))
+        conn.commit()
+    
     Base.metadata.create_all(engine)
     
     yield engine

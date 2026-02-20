@@ -28,7 +28,7 @@ class DecisionService:
         user_id: str,
         session_id: str,
         event_id: str,
-        snapshot_id: str,
+        context_capture_id: str,
         decision_type: str,
         decision_output: Dict[str, Any],
         model_params: Optional[Dict[str, Any]] = None
@@ -60,7 +60,7 @@ class DecisionService:
                 "decision_id": decision_id,
                 "session_id": session_id,
                 "event_id": event_id,
-                "snapshot_id": snapshot_id,
+                "context_capture_id": context_capture_id,
                 "decision_type": decision_type,
                 "decision_output": decision_output,
                 "model_params": model_params or {}
@@ -86,7 +86,7 @@ class DecisionService:
                 "decision_id": decision.decision_id,
                 "session_id": decision.session_id,
                 "event_id": decision.event_id,
-                "snapshot_id": decision.snapshot_id,
+                "context_capture_id": decision.context_capture_id,
                 "decision_type": decision.decision_type,
                 "decision_output": decision.decision_output,
                 "model_params": decision.model_params,
@@ -119,7 +119,7 @@ class DecisionService:
             "decision_id": decision.decision_id,
             "session_id": decision.session_id,
             "event_id": decision.event_id,
-            "snapshot_id": decision.snapshot_id,
+            "context_capture_id": decision.context_capture_id,
             "decision_type": decision.decision_type,
             "decision_output": decision.decision_output,
             "model_params": decision.model_params,
@@ -139,7 +139,7 @@ class DecisionService:
         
         # 使用 ORM 获取上下文快照
         snapshot = self.db_session.query(ContextSnapshot).filter(
-            ContextSnapshot.snapshot_id == decision["snapshot_id"]
+            ContextSnapshot.context_capture_id == decision["context_capture_id"]
         ).first()
         
         if snapshot:
@@ -187,7 +187,7 @@ class DecisionService:
                     "decision_id": d.decision_id,
                     "session_id": d.session_id,
                     "event_id": d.event_id,
-                    "snapshot_id": d.snapshot_id,
+                    "context_capture_id": d.context_capture_id,
                     "decision_type": d.decision_type,
                     "created_at": d.created_at.isoformat()
                 }

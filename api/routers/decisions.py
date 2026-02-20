@@ -18,7 +18,7 @@ class RecordDecisionRequest(BaseModel):
     """记录决策请求"""
     session_id: str
     event_id: str
-    snapshot_id: str
+    context_capture_id: str
     decision_type: str
     decision_output: Dict[str, Any]
     model_params: Optional[Dict[str, Any]] = None
@@ -29,7 +29,7 @@ class DecisionResponse(BaseModel):
     decision_id: str
     session_id: str
     event_id: str
-    snapshot_id: str
+    context_capture_id: str
     decision_type: str
     decision_output: Dict[str, Any]
     model_params: Dict[str, Any]
@@ -41,7 +41,7 @@ class DecisionWithContextResponse(BaseModel):
     decision_id: str
     session_id: str
     event_id: str
-    snapshot_id: str
+    context_capture_id: str
     decision_type: str
     decision_output: Dict[str, Any]
     model_params: Dict[str, Any]
@@ -75,7 +75,7 @@ async def record_decision(
             user_id=current_user["user_id"],
             session_id=request.session_id,
             event_id=request.event_id,
-            snapshot_id=request.snapshot_id,
+            context_capture_id=request.context_capture_id,
             decision_type=request.decision_type,
             decision_output=request.decision_output,
             model_params=request.model_params

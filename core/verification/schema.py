@@ -24,7 +24,7 @@ def init_hallucination_tables(db):
                 check_id VARCHAR(255) PRIMARY KEY,
                 session_id VARCHAR(255) NOT NULL,
                 event_id VARCHAR(255) NOT NULL,
-                snapshot_id VARCHAR(255) NOT NULL,
+                context_capture_id VARCHAR(255) NOT NULL,
                 claims_total INT NOT NULL DEFAULT 0,
                 claims_verified INT NOT NULL DEFAULT 0,
                 claims_contradicted INT NOT NULL DEFAULT 0,
@@ -34,7 +34,7 @@ def init_hallucination_tables(db):
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_session (session_id),
                 INDEX idx_event (event_id),
-                INDEX idx_snapshot (snapshot_id),
+                INDEX idx_context_capture (context_capture_id),
                 INDEX idx_confidence (confidence_score),
                 INDEX idx_created (created_at)
             )

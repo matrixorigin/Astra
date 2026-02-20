@@ -109,7 +109,7 @@ def test_create_snapshot_success(client, auth_headers, test_session):
     
     assert response.status_code == 201
     data = response.json()
-    assert "snapshot_id" in data
+    assert "context_capture_id" in data
     assert data["session_id"] == test_session["session_id"]
     assert data["event_id"] == test_session["event_id"]
     assert "system_prompt" in data["context_data"]
@@ -130,14 +130,14 @@ def test_get_snapshot_success(client, auth_headers, test_session):
             }
         },
     )
-    snapshot_id = create_response.json()["snapshot_id"]
+    context_capture_id = create_response.json()["context_capture_id"]
 
     # Get snapshot
-    response = client.get(f"/context/{snapshot_id}", headers=auth_headers)
+    response = client.get(f"/context/{context_capture_id}", headers=auth_headers)
 
     assert response.status_code == 200
     data = response.json()
-    assert data["snapshot_id"] == snapshot_id
+    assert data["context_capture_id"] == context_capture_id
     assert data["context_data"]["system_prompt"] == "test"
 
 

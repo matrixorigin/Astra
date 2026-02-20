@@ -63,7 +63,29 @@ async def test_streaming_records_feedback(mock_needs_planning):
     ))
     
     mock_context_manager = Mock()
+    mock_context_manager.build_context = Mock(return_value=Mock(
+        system_prompt="test prompt",
+        skill_definitions=[],
+        selected_events=[],
+        retrieved_events=[],
+        code_context=[],
+        documentation=[],
+        total_tokens=100,
+        token_budget={},
+        assembly_time_ms=10,
+        relevance_scores={},
+        task_type="general"
+    ))
+    mock_context_manager.save_snapshot = Mock(return_value="snapshot_123")
+    
     mock_firewall = Mock()
+    mock_firewall.verify_response = Mock(return_value=Mock(
+        safe_to_deliver=True,
+        confidence_score=0.9,
+        claims_verified=0,
+        claims_failed=0
+    ))
+    mock_firewall.log_verification = Mock()
     
     # Create ChatLoop
     chat_loop = ChatLoop(

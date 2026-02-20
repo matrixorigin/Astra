@@ -75,9 +75,9 @@ class HallucinationFirewall:
         self._init_tables()
 
     def verify_response(
-        self, response: str, snapshot_id: str, mode: str = "warn"
+        self, response: str, context_capture_id: str, mode: str = "warn"
     ) -> FirewallResult:
-        """Verify LLM response against context snapshot.
+        """Verify LLM response against context capture.
 
         Enhanced with:
         - LLM-based claim extraction (if enabled)
@@ -86,7 +86,7 @@ class HallucinationFirewall:
 
         Args:
             response: LLM response text
-            snapshot_id: Context snapshot ID
+            context_capture_id: Context capture ID (business-level, not MatrixOne snapshot)
             mode: 'warn' (annotate) or 'block' (reject delivery)
 
         Returns:
@@ -104,15 +104,15 @@ class HallucinationFirewall:
                 warnings=["Empty response"],
             )
 
-        if not snapshot_id or not snapshot_id.strip():
-            logger.error("No snapshot_id provided to firewall")
+        if not context_capture_id or not context_capture_id.strip():
+            logger.error("No context_capture_id provided to firewall")
             return FirewallResult(
                 safe_to_deliver=True,  # Fail open
                 confidence_score=0.5,
                 claims_verified=0,
                 claims_failed=0,
                 contradictions=[],
-                warnings=["No snapshot_id provided"],
+                warnings=["No context_capture_id provided"],
             )
 
         if mode not in ("warn", "block"):
@@ -148,18 +148,18 @@ class HallucinationFirewall:
                 warnings=["No verifiable claims found"],
             )
 
-        # 2. Load context snapshot
+        # 2. Load context capture
         try:
-            snapshot = self.context_manager.load_snapshot(snapshot_id)
+            snapshot = self.context_manager.load_snapshot(context_capture_id)
         except Exception as e:
-            logger.error(f"Failed to load snapshot {snapshot_id}: {e}")
+            logger.error(f"Failed to load context capture {context_capture_id}: {e}")
             return FirewallResult(
                 safe_to_deliver=True,  # Fail open
                 confidence_score=0.5,
                 claims_verified=0,
                 claims_failed=0,
                 contradictions=[],
-                warnings=[f"Snapshot load failed: {e}"],
+                warnings=[f"Context capture load failed: {e}"],
             )
 
         # 3. Verify each claim (structured or simple)
@@ -249,7 +249,7 @@ class HallucinationFirewall:
         return "\n".join(parts)
 
     def log_verification(
-        self, session_id: str, event_id: str, result: FirewallResult, snapshot_id: str
+        self, session_id: str, event_id: str, result: FirewallResult, context_capture_id: str
     ) -> None:
         """Log verification result with evidence backlinks.
 
@@ -257,7 +257,7 @@ class HallucinationFirewall:
             session_id: Session ID
             event_id: Event ID being verified
             result: Verification result
-            snapshot_id: Context snapshot ID
+            context_capture_id: Context capture ID (business-level)
         """
         if not session_id or not event_id:
             logger.error("Missing session_id or event_id for verification logging")
@@ -270,7 +270,7 @@ class HallucinationFirewall:
             self.db.execute(
                 """
                 INSERT INTO hallucination_checks (
-                    check_id, session_id, event_id, snapshot_id,
+                    check_id, session_id, event_id, context_capture_id,
                     claims_total, claims_verified, claims_contradicted,
                     confidence_score, safe_to_deliver, evidence_count,
                     created_at
@@ -282,7 +282,7 @@ class HallucinationFirewall:
                     check_id,
                     session_id,
                     event_id,
-                    snapshot_id,
+                    context_capture_id,
                     result.claims_verified + result.claims_failed,
                     result.claims_verified,
                     result.claims_failed,

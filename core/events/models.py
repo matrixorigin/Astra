@@ -111,13 +111,14 @@ class TokenUsage(BaseModel):
 
 
 class ContextSnapshot(BaseModel):
-    """Context snapshot for reproducibility.
+    """Context capture for reproducibility.
 
     Captures the state needed to reproduce an LLM call.
+    This is a business-level capture, not a MatrixOne database snapshot.
     """
 
-    snapshot_id: str | None = Field(
-        default=None, description="Reference to context_snapshots table"
+    context_capture_id: str | None = Field(
+        default=None, description="Reference to context_captures table"
     )
     prompt_template_id: str | None = Field(
         default=None, description="Prompt template ID and version"

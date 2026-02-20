@@ -101,16 +101,16 @@ def test_retrieval_storage_and_replay():
     print(f"✓ Created context with {len(retrieved_events)} retrieved events")
     
     # Save snapshot
-    snapshot_id = ctx_mgr.save_snapshot(
+    context_capture_id = ctx_mgr.save_snapshot(
         context=context,
         session_id=session_id,
         event_id=e3.event_id,
     )
     
-    print(f"✓ Saved snapshot: {snapshot_id[:8]}")
+    print(f"✓ Saved snapshot: {context_capture_id[:8]}")
     
     # Load snapshot
-    loaded_context = ctx_mgr.load_snapshot(snapshot_id)
+    loaded_context = ctx_mgr.load_snapshot(context_capture_id)
     
     print(f"✓ Loaded snapshot")
     print(f"  - Retrieved events: {len(loaded_context.retrieved_events or [])}")

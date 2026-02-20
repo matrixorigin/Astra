@@ -46,13 +46,13 @@ class TestSaveSnapshot:
 
     def test_save_snapshot_basic(self, context_manager, mock_db, sample_context):
         """Test basic snapshot saving."""
-        snapshot_id = context_manager.save_snapshot(
+        context_capture_id = context_manager.save_snapshot(
             context=sample_context,
             session_id="session-123",
             event_id="event-456"
         )
 
-        assert snapshot_id is not None
+        assert context_capture_id is not None
         assert mock_db.add.called
         assert mock_db.commit.called
         
@@ -95,7 +95,7 @@ class TestUpdateSnapshotLlmIds:
         mock_filter = mock_query.filter.return_value
         
         context_manager.update_snapshot_llm_ids(
-            snapshot_id="snap-123",
+            context_capture_id="snap-123",
             llm_request_id="req-1",
             llm_response_id="res-1"
         )
@@ -114,7 +114,7 @@ class TestUpdateSnapshotLlmIds:
         mock_filter = mock_query.filter.return_value
         
         context_manager.update_snapshot_llm_ids(
-            snapshot_id="snap-123",
+            context_capture_id="snap-123",
             llm_request_id="req-1"
         )
 
