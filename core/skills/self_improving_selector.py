@@ -529,7 +529,7 @@ class SelfImprovingSelector:
         similarity_map = {
             str(row.learning_id): float(row.similarity)
             for row in rows
-            if row.similarity is not None and row.similarity >= threshold  # Safety check for floating point precision
+            if row.similarity is not None  # Protect against NULL values
         }
         if not similarity_map:
             return None
