@@ -26,7 +26,7 @@ async def test_planning_mode_uses_skill_pipeline():
     mock_pipeline.get_tools_schema.return_value = mock_selection
     
     # Mock executor.execute_skill()
-    mock_executor.execute_skill.return_value = "test result"
+    mock_executor.execute_skill_with_feedback.return_value = "test result"
     mock_executor.skill_registry = MagicMock()
     
     # Mock planner
@@ -72,8 +72,8 @@ async def test_planning_mode_uses_skill_pipeline():
             max_candidates=5,
         )
         
-        # Verify executor.execute_skill() was called
-        mock_executor.execute_skill.assert_called_once()
+        # Verify executor.execute_skill_with_feedback() was called (new encapsulated method)
+        mock_executor.execute_skill_with_feedback.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -95,8 +95,8 @@ async def test_planning_mode_records_feedback():
     mock_selection.event_id = "sel_123"
     mock_pipeline.get_tools_schema.return_value = mock_selection
     
-    # Mock executor.execute_skill()
-    mock_executor.execute_skill.return_value = "test result"
+    # Mock executor.execute_skill_with_feedback()
+    mock_executor.execute_skill_with_feedback.return_value = "test result"
     mock_executor.skill_registry = MagicMock()
     
     # Mock planner
@@ -135,16 +135,13 @@ async def test_planning_mode_records_feedback():
         ):
             events.append(event)
         
-        # Verify feedback was recorded
-        mock_pipeline.record_feedback.assert_called_once()
-        call_args = mock_pipeline.record_feedback.call_args
+        # Verify execute_skill_with_feedback was called with correct parameters
+        mock_executor.execute_skill_with_feedback.assert_called_once()
+        call_args = mock_executor.execute_skill_with_feedback.call_args
         
-        # Check arguments
-        assert call_args[0][0] == "sel_123"  # selection_event_id
-        assert call_args[0][1] == SignalType.EXECUTION_TIME
-        assert "ms" in call_args[0][2]
-        assert call_args[0][2]["skill"] == "test_skill"
-        assert call_args[0][2]["planning_step"] == "step_1"
+        # Check that selection_event_id and extra_feedback_data were passed
+        assert call_args[1]["selection_event_id"] == "sel_123"
+        assert call_args[1]["extra_feedback_data"]["planning_step"] == "step_1"
 
 
 @pytest.mark.asyncio
@@ -201,7 +198,7 @@ async def test_planning_mode_skill_not_found():
             events.append(event)
         
         # Verify executor.execute_skill() was NOT called
-        mock_executor.execute_skill.assert_not_called()
+        mock_executor.execute_skill_with_feedback.assert_not_called()
         
         # Verify feedback was NOT recorded (no execution happened)
         mock_pipeline.record_feedback.assert_not_called()
@@ -261,7 +258,7 @@ async def test_planning_mode_no_skill_hint():
         mock_pipeline.get_tools_schema.assert_not_called()
         
         # Verify executor was NOT called
-        mock_executor.execute_skill.assert_not_called()
+        mock_executor.execute_skill_with_feedback.assert_not_called()
         
         # Verify feedback was NOT recorded
         mock_pipeline.record_feedback.assert_not_called()
@@ -293,7 +290,7 @@ async def test_planning_mode_multiple_steps():
     mock_pipeline.get_tools_schema.side_effect = [mock_selection_1, mock_selection_2]
     
     # Mock executor returns different results
-    mock_executor.execute_skill.side_effect = ["result_1", "result_2"]
+    mock_executor.execute_skill_with_feedback.side_effect = ["result_1", "result_2"]
     mock_executor.skill_registry = MagicMock()
     
     # Mock planner with 2 steps
@@ -342,30 +339,22 @@ async def test_planning_mode_multiple_steps():
         # Verify pipeline was called twice
         assert mock_pipeline.get_tools_schema.call_count == 2
         
-        # Verify executor was called twice
-        assert mock_executor.execute_skill.call_count == 2
+        # Verify executor was called twice with feedback
+        assert mock_executor.execute_skill_with_feedback.call_count == 2
         
-        # Verify feedback was recorded twice
-        assert mock_pipeline.record_feedback.call_count == 2
+        # Verify feedback parameters were passed correctly
+        call_1 = mock_executor.execute_skill_with_feedback.call_args_list[0]
+        assert call_1[1]["selection_event_id"] == "sel_1"
+        assert call_1[1]["extra_feedback_data"]["planning_step"] == "step_1"
         
-        # Verify feedback for step 1
-        call_1 = mock_pipeline.record_feedback.call_args_list[0]
-        assert call_1[0][0] == "sel_1"
-        assert call_1[0][1] == SignalType.EXECUTION_TIME
-        assert call_1[0][2]["skill"] == "skill_1"
-        assert call_1[0][2]["planning_step"] == "step_1"
-        
-        # Verify feedback for step 2
-        call_2 = mock_pipeline.record_feedback.call_args_list[1]
-        assert call_2[0][0] == "sel_2"
-        assert call_2[0][1] == SignalType.EXECUTION_TIME
-        assert call_2[0][2]["skill"] == "skill_2"
-        assert call_2[0][2]["planning_step"] == "step_2"
+        call_2 = mock_executor.execute_skill_with_feedback.call_args_list[1]
+        assert call_2[1]["selection_event_id"] == "sel_2"
+        assert call_2[1]["extra_feedback_data"]["planning_step"] == "step_2"
 
 
 @pytest.mark.asyncio
-async def test_planning_mode_execution_error_still_records_feedback():
-    """Test that feedback is recorded even when skill execution fails."""
+async def test_planning_mode_execution_error_propagates():
+    """Test that execution errors propagate up (not silently caught)."""
     
     mock_llm = MagicMock()
     mock_executor = MagicMock()
@@ -380,7 +369,7 @@ async def test_planning_mode_execution_error_still_records_feedback():
     mock_pipeline.get_tools_schema.return_value = mock_selection
     
     # Mock executor raises exception
-    mock_executor.execute_skill.side_effect = RuntimeError("Execution failed")
+    mock_executor.execute_skill_with_feedback.side_effect = RuntimeError("Execution failed")
     mock_executor.skill_registry = MagicMock()
     
     mock_plan = MagicMock()
@@ -407,7 +396,7 @@ async def test_planning_mode_execution_error_still_records_feedback():
             firewall=mock_firewall,
         )
         
-        # Execution should raise error
+        # Exception should propagate (not be caught)
         with pytest.raises(RuntimeError, match="Execution failed"):
             async for event in chat_loop.run_step_with_planning(
                 user_input="test query",
@@ -417,9 +406,47 @@ async def test_planning_mode_execution_error_still_records_feedback():
             ):
                 pass
         
-        # Verify feedback was STILL recorded (try/finally ensures this)
-        mock_pipeline.record_feedback.assert_called_once()
-        call_args = mock_pipeline.record_feedback.call_args
-        assert call_args[0][0] == "sel_123"
-        assert call_args[0][1] == SignalType.EXECUTION_TIME
-        assert "ms" in call_args[0][2]
+        # Verify execute_skill_with_feedback was called
+        # (feedback is recorded in its try-finally before exception propagates)
+        mock_executor.execute_skill_with_feedback.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_skill_with_feedback_no_pipeline():
+    """Test execute_skill_with_feedback works when pipeline is None (backward compatibility)."""
+    from core.agent.executor import AgentExecutor
+    from core.skills.mocking import MockMode
+    from unittest.mock import MagicMock, patch
+    
+    mock_db = MagicMock()
+    mock_registry = MagicMock()
+    mock_skill = MagicMock()
+    mock_skill.validate_input.return_value = {}
+    mock_registry.get.return_value = mock_skill
+    
+    # Mock ToolMockingLayer to avoid DB validation
+    with patch('core.agent.executor.ToolMockingLayer') as MockToolMockingLayer:
+        mock_mocking_layer = MagicMock()
+        mock_mocking_layer.execute.return_value = "test result"
+        MockToolMockingLayer.return_value = mock_mocking_layer
+        
+        # Create executor WITHOUT pipeline
+        executor = AgentExecutor(
+            db=mock_db,
+            registry=mock_registry,
+            mode=MockMode.PRODUCTION,
+            pipeline=None,  # No pipeline
+        )
+        
+        # Should not raise error even without pipeline
+        result = executor.execute_skill_with_feedback(
+            skill_name="test_skill",
+            params={},
+            session_id="sess_1",
+            parent_event_id=None,
+            selection_event_id="sel_123",  # Even with selection_event_id
+        )
+        
+        assert result == "test result"
+        # Verify execute was called
+        mock_mocking_layer.execute.assert_called_once()

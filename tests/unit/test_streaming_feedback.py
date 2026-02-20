@@ -32,7 +32,7 @@ async def test_streaming_records_feedback(mock_needs_planning):
     mock_pipeline.record_feedback = Mock()
     
     mock_executor = Mock()
-    mock_executor.execute_skill = Mock(return_value="test result")
+    mock_executor.execute_skill_with_feedback = Mock(return_value="test result")
     
     mock_llm = Mock()
     
@@ -84,21 +84,12 @@ async def test_streaming_records_feedback(mock_needs_planning):
     ):
         events.append(event)
     
-    # Verify feedback was recorded
-    assert mock_pipeline.record_feedback.called, "record_feedback should be called"
+    # Verify execute_skill_with_feedback was called (feedback is handled internally)
+    assert mock_executor.execute_skill_with_feedback.called, "execute_skill_with_feedback should be called"
     
-    # Check the call arguments
-    calls = mock_pipeline.record_feedback.call_args_list
-    assert len(calls) > 0, "Should have at least one feedback call"
-    
-    # Verify the feedback contains execution time
-    for call in calls:
-        event_id, signal_type, data = call[0]
-        assert event_id == "test_event_123", "Should use selection event_id"
-        assert signal_type == SignalType.EXECUTION_TIME, "Should record execution time"
-        assert "ms" in data, "Should include execution time in ms"
-        assert "skill" in data, "Should include skill name"
-        assert data["ms"] >= 0, "Execution time should be non-negative"
+    # Check the call arguments include selection_event_id
+    call_args = mock_executor.execute_skill_with_feedback.call_args
+    assert call_args[1]["selection_event_id"] == "test_event_123", "Should pass selection event_id for feedback"
 
 
 @pytest.mark.asyncio

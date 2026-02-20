@@ -71,6 +71,7 @@ def chat(user_id, model, mode):
         db=db,
         registry=None,  # Will be set after skill registration
         mode=MockMode(mode),
+        pipeline=pipeline,  # Pass pipeline for automatic feedback recording
     )
     chat_loop = ChatLoop(
         selector=pipeline,

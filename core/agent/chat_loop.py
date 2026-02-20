@@ -238,13 +238,14 @@ class ChatLoop:
 
                 params = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
-                _t0 = time.monotonic()
+                # Execute skill with automatic feedback recording
                 try:
-                    result = self.executor.execute_skill(
+                    result = self.executor.execute_skill_with_feedback(
                         skill_name=fn_name,
                         params=params,
                         session_id=session_id,
                         parent_event_id=user_event.event_id,
+                        selection_event_id=self._last_selection_event_id,
                     )
                     result_str = (
                         json.dumps(result, default=str) if not isinstance(result, str) else result
@@ -252,14 +253,6 @@ class ChatLoop:
                 except Exception as e:
                     logger.error(f"Skill {fn_name} failed: {e}")
                     result_str = json.dumps({"error": str(e)})
-                finally:
-                    _elapsed_ms = (time.monotonic() - _t0) * 1000
-                    if self._last_selection_event_id:
-                        self._pipeline.record_feedback(
-                            self._last_selection_event_id,
-                            SignalType.EXECUTION_TIME,
-                            {"ms": _elapsed_ms, "skill": fn_name},
-                        )
 
                 # Log tool result
                 metadata = {
@@ -643,18 +636,24 @@ class ChatLoop:
                             # Use collected result or fallback message with agent_id
                             result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
                         else:
-                            result = self.executor.execute_skill(
+                            # Execute skill with automatic feedback recording
+                            result = self.executor.execute_skill_with_feedback(
                                 skill_name=fn_name,
                                 params=json.loads(tc["function"]["arguments"]),
                                 session_id=session_id,
                                 parent_event_id=user_event.event_id,
+                                selection_event_id=self._last_selection_event_id,
                             )
                             result_str = (
                                 json.dumps(result, default=str) if not isinstance(result, str) else result
                             )
+                    except Exception as e:
+                        logger.error(f"Parallel tool {fn_name} failed: {e}")
+                        result_str = json.dumps({"error": str(e)})
                     finally:
-                        _elapsed_ms = (time.monotonic() - _t0) * 1000
-                        if self._last_selection_event_id:
+                        # Record feedback for delegate_task streaming (non-delegate skills handled by execute_skill_with_feedback)
+                        if fn_name == "delegate_task" and self._last_selection_event_id:
+                            _elapsed_ms = (time.monotonic() - _t0) * 1000
                             self._pipeline.record_feedback(
                                 self._last_selection_event_id,
                                 SignalType.EXECUTION_TIME,
@@ -789,24 +788,15 @@ class ChatLoop:
                     # Find the tool in schema
                     tool_found = any(t["function"]["name"] == skill_name for t in tools_schema)
                     if tool_found:
-                        import time
-                        _t0 = time.monotonic()
-                        try:
-                            result = self.executor.execute_skill(
-                                skill_name=skill_name,
-                                params={"input": step.description},
-                                session_id=session_id,
-                                parent_event_id=None,
-                            )
-                        finally:
-                            # Record execution time feedback
-                            _elapsed_ms = (time.monotonic() - _t0) * 1000
-                            if selection_event_id:
-                                self._pipeline.record_feedback(
-                                    selection_event_id,
-                                    SignalType.EXECUTION_TIME,
-                                    {"ms": _elapsed_ms, "skill": skill_name, "planning_step": step.step_id},
-                                )
+                        # Execute skill with automatic feedback recording
+                        result = self.executor.execute_skill_with_feedback(
+                            skill_name=skill_name,
+                            params={"input": step.description},
+                            session_id=session_id,
+                            parent_event_id=None,
+                            selection_event_id=selection_event_id,
+                            extra_feedback_data={"planning_step": step.step_id},
+                        )
                     else:
                         result = f"Skill {skill_name} not available"
                 else:

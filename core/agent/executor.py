@@ -1,7 +1,7 @@
 """Agent skill execution logic with side-effect isolation."""
 
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from core.logging_config import get_logger
 from core.skills.mocking import MockMode, ToolMockingLayer
@@ -9,17 +9,27 @@ from core.skills.registry import SkillRegistry
 from sqlalchemy.orm import Session
 from api.database import get_db_session
 
+if TYPE_CHECKING:
+    from core.skills.pipeline import SkillPipeline
+
 logger = get_logger(__name__)
 
 
 class AgentExecutor:
     """Executes skills safely using the ToolMockingLayer."""
 
-    def __init__(self, db: Session, registry: SkillRegistry, mode: MockMode = MockMode.PRODUCTION):
+    def __init__(
+        self,
+        db: Session,
+        registry: SkillRegistry,
+        mode: MockMode = MockMode.PRODUCTION,
+        pipeline: "SkillPipeline | None" = None,
+    ):
         self.db = db
         self.registry = registry
         self.mode = mode
         self.mock_layer = ToolMockingLayer(mode, db)
+        self._pipeline = pipeline
 
     def execute_skill(
         self,
@@ -84,6 +94,55 @@ class AgentExecutor:
             )
         
         return result
+    
+    def execute_skill_with_feedback(
+        self,
+        skill_name: str,
+        params: dict[str, Any],
+        session_id: str,
+        parent_event_id: str | None = None,
+        selection_event_id: str | None = None,
+        extra_feedback_data: dict[str, Any] | None = None,
+    ) -> Any:
+        """Execute a skill and automatically record execution time feedback.
+        
+        This method encapsulates the execution + feedback recording pattern,
+        preventing responsibility leakage to the caller (ChatLoop).
+        
+        Args:
+            skill_name: Name of the skill to execute.
+            params: Parameters for the skill.
+            session_id: The current session ID.
+            parent_event_id: The ID of the parent event.
+            selection_event_id: Event ID from skill selection (for feedback).
+            extra_feedback_data: Additional data to include in feedback (e.g., planning_step).
+            
+        Returns:
+            The result of the skill execution.
+        """
+        _t0 = time.monotonic()
+        try:
+            return self.execute_skill(
+                skill_name=skill_name,
+                params=params,
+                session_id=session_id,
+                parent_event_id=parent_event_id,
+            )
+        finally:
+            # Always record feedback, even on failure
+            if self._pipeline and selection_event_id:
+                from core.skills.learning_signals import SignalType
+                
+                _elapsed_ms = (time.monotonic() - _t0) * 1000
+                feedback_data = {"ms": _elapsed_ms, "skill": skill_name}
+                if extra_feedback_data:
+                    feedback_data.update(extra_feedback_data)
+                
+                self._pipeline.record_feedback(
+                    selection_event_id,
+                    SignalType.EXECUTION_TIME,
+                    feedback_data,
+                )
     
     def _record_execution_metrics(
         self,
