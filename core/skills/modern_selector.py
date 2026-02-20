@@ -47,7 +47,7 @@ class ModernSkillSelector:
         max_candidates: int = 5,
         *,
         context_budget: int = _DEFAULT_CONTEXT_BUDGET,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], str]:
         """Return OpenAI tool schemas using progressive disclosure.
 
         Stage 1 (Tier 1): Retrieve candidates via rule-based matching on
@@ -56,6 +56,9 @@ class ModernSkillSelector:
                           token cost, include only if within budget.
                           Skills that don't fit are excluded entirely —
                           no empty stubs (they waste tokens and confuse LLMs).
+        
+        Returns:
+            (tools, retrieval_method) where retrieval_method is "semantic" or "keyword"
         """
         # --- Stage 1: retrieve candidates ---
         # Prefer semantic index; fall back to keyword matching
@@ -66,12 +69,14 @@ class ModernSkillSelector:
                 for n in hit_names
                 if n in self.rule_selector.skills
             ]
+            retrieval_method = "semantic"
             logger.debug("Semantic retrieval: %d candidates", len(candidates))
         else:
             candidates = self.rule_selector.select_skills(query, max_skills=max_candidates * 2)
+            retrieval_method = "keyword"
             logger.debug("Keyword fallback: %d candidates", len(candidates))
         if not candidates:
-            return []
+            return [], retrieval_method
 
         # --- Stage 2: budget-aware Tier 3 expansion ---
         budget_remaining = context_budget
@@ -93,7 +98,7 @@ class ModernSkillSelector:
             len(tools), min(len(candidates), max_candidates),
             context_budget - budget_remaining, context_budget,
         )
-        return tools
+        return tools, retrieval_method
 
     def select_and_execute(
         self, query: str, context: dict[str, Any] | None = None, max_candidates: int = 5
@@ -110,17 +115,14 @@ class ModernSkillSelector:
         Returns:
             List of tool calls with parameters
         """
-        # Step 1: Retrieval (粗筛) - Use rule-based selector
-        candidates = self.rule_selector.select_skills(query, max_skills=max_candidates)
+        # Step 1 & 2: Use get_tools_schema for consistent retrieval path
+        tools_schema, _ = self.get_tools_schema(query, max_candidates=max_candidates)
 
-        if not candidates:
+        if not tools_schema:
             logger.info("No candidate skills found")
             return []
 
-        logger.info(f"Retrieved {len(candidates)} candidate skills")
-
-        # Step 2: Convert to OpenAI tool schema (精调)
-        tools_schema = [self._skill_to_tool_schema(skill) for skill in candidates]
+        logger.info(f"Retrieved {len(tools_schema)} candidate skills")
 
         # Step 3: Native function calling (一步到位)
         messages = [

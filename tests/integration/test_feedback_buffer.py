@@ -734,10 +734,13 @@ class TestSkillPipelineIntegration:
         # Mock modern selector to return both skills
         class MockModern:
             def get_tools_schema(self, query, max_candidates=None, **kwargs):
-                return [
-                    {"function": {"name": "wrong_skill"}},
-                    {"function": {"name": "correct_skill"}},
-                ]
+                return (
+                    [
+                        {"function": {"name": "wrong_skill"}},
+                        {"function": {"name": "correct_skill"}},
+                    ],
+                    "keyword"
+                )
         
         pipeline._modern = MockModern()
         

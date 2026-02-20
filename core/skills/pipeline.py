@@ -43,6 +43,7 @@ class ToolsResult:
     tools: list[dict[str, Any]]          # OpenAI tools schema
     event_id: str | None = None          # Audit event ID (None if audit off)
     candidates: int = 0                  # Candidates considered
+    retrieval_method: str = "keyword"    # "semantic" or "keyword"
 
 
 @dataclass
@@ -193,7 +194,7 @@ class SkillPipeline:
         Stage 2: Record audit event with selection metadata.
         """
         # Stage 1a: retrieve + rank (progressive disclosure)
-        tools = self._modern.get_tools_schema(
+        tools, retrieval_method = self._modern.get_tools_schema(
             query, max_candidates=max_candidates, context_budget=context_budget,
         )
         skill_names = [t["function"]["name"] for t in tools]
@@ -214,13 +215,13 @@ class SkillPipeline:
                 # Add tools for newly-added skills (corrections may add skills)
                 existing = {t["function"]["name"] for t in tools}
                 for name in corrected_names - existing:
-                    extra = self._modern.get_tools_schema(name, max_candidates=1)
+                    extra, _ = self._modern.get_tools_schema(name, max_candidates=1)
                     tools.extend(extra)
 
         # Stage 2: audit
         event_id = None
         if self._audit:
-            event_id = self._record_selection(query, session_id, tools)
+            event_id = self._record_selection(query, session_id, tools, retrieval_method)
 
         # Opportunistic flush
         self._feedback.maybe_flush()
@@ -229,6 +230,7 @@ class SkillPipeline:
             tools=tools,
             event_id=event_id,
             candidates=len(tools),
+            retrieval_method=retrieval_method,
         )
 
     # ------------------------------------------------------------------
@@ -369,7 +371,7 @@ class SkillPipeline:
     # ------------------------------------------------------------------
 
     def _record_selection(
-        self, query: str, session_id: str, tools: list[dict],
+        self, query: str, session_id: str, tools: list[dict], retrieval_method: str,
     ) -> str:
         """Write audit event to DB. Returns event_id."""
         event_id = str(uuid7())
@@ -387,7 +389,7 @@ class SkillPipeline:
                     "session_id": session_id,
                     "user_query": query,
                     "selected_skills": ",".join(skill_names),
-                    "selection_method": "pipeline_v1",
+                    "selection_method": retrieval_method,
                     "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
                 },
             )

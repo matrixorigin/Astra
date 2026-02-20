@@ -180,7 +180,7 @@ class TestProgressiveDisclosure:
             return original_query(*a, **kw)
         sel._index.query = spy_query
 
-        tools = sel.get_tools_schema("review code", max_candidates=3)
+        tools, _ = sel.get_tools_schema("review code", max_candidates=3)
         assert len(called) > 0, "Semantic index should have been queried"
         assert len(tools) > 0
 
@@ -190,7 +190,7 @@ class TestProgressiveDisclosure:
         skill = _make_skill("code_review", triggers=["review", "code"])
         sel.rule_selector.skills["code_review"] = skill
 
-        tools = sel.get_tools_schema("review code", max_candidates=3)
+        tools, _ = sel.get_tools_schema("review code", max_candidates=3)
         # Should still find the skill via keyword matching
         names = [t["function"]["name"] for t in tools]
         assert "code_review" in names
@@ -199,7 +199,7 @@ class TestProgressiveDisclosure:
         """Skills exceeding budget are excluded entirely, not stubbed."""
         sel = selector_with_skills
         # Set a tiny budget that can fit ~1 skill
-        tools = sel.get_tools_schema("code", max_candidates=5, context_budget=50)
+        tools, _ = sel.get_tools_schema("code", max_candidates=5, context_budget=50)
         # With budget=50 tokens, at most 1-2 small schemas fit
         assert len(tools) <= 2
         # Every included tool has real parameters (no empty stubs)
@@ -210,14 +210,14 @@ class TestProgressiveDisclosure:
     def test_no_empty_stubs_in_output(self, selector_with_skills):
         """Budget exhaustion should never produce empty-parameter stubs."""
         sel = selector_with_skills
-        tools = sel.get_tools_schema("code", max_candidates=5, context_budget=1)
+        tools, _ = sel.get_tools_schema("code", max_candidates=5, context_budget=1)
         # Budget=1 token — nothing should fit
         assert tools == []
 
     def test_budget_allows_all_when_sufficient(self, selector_with_skills):
         """With large budget, all candidates are included."""
         sel = selector_with_skills
-        tools = sel.get_tools_schema("code", max_candidates=5, context_budget=100000)
+        tools, _ = sel.get_tools_schema("code", max_candidates=5, context_budget=100000)
         assert len(tools) > 0
 
     def test_real_token_measurement_varies_by_schema(self, db):
@@ -246,7 +246,7 @@ class TestProgressiveDisclosure:
         # Clear all skills to simulate empty registry
         sel.rule_selector.skills.clear()
         sel._index.build([])
-        tools = sel.get_tools_schema("anything")
+        tools, _ = sel.get_tools_schema("anything")
         assert tools == []
 
 
