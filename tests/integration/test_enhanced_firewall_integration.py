@@ -81,7 +81,8 @@ class TestEnhancedFirewallIntegration:
         # Assertions
         assert result.claims_verified == 1
         assert result.claims_failed == 1
-        assert result.confidence_score == 0.5  # 1/2 verified
+        # Weighted confidence: numeric(0.5) verified, causal(1.0) failed → 0.5/1.5 ≈ 0.333
+        assert abs(result.confidence_score - 1/3) < 0.01
         assert result.safe_to_deliver is True  # warn mode
         assert result.evidence_count > 0
 

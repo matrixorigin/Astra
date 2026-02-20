@@ -106,14 +106,7 @@ class HallucinationFirewall:
 
         if not context_capture_id or not context_capture_id.strip():
             logger.error("No context_capture_id provided to firewall")
-            return FirewallResult(
-                safe_to_deliver=True,  # Fail open
-                confidence_score=0.5,
-                claims_verified=0,
-                claims_failed=0,
-                contradictions=[],
-                warnings=["No context_capture_id provided"],
-            )
+            return self._degraded_result(mode, "No context_capture_id provided")
 
         if mode not in ("warn", "block"):
             logger.warning(f"Invalid mode '{mode}', defaulting to 'warn'")
@@ -129,14 +122,7 @@ class HallucinationFirewall:
                 logger.info(f"Extracted {len(claims)} claims using regex")
         except Exception as e:
             logger.error(f"Claim extraction failed: {e}")
-            return FirewallResult(
-                safe_to_deliver=True,  # Fail open
-                confidence_score=0.5,
-                claims_verified=0,
-                claims_failed=0,
-                contradictions=[],
-                warnings=[f"Claim extraction failed: {e}"],
-            )
+            return self._degraded_result(mode, f"Claim extraction failed: {e}")
 
         if not claims:
             return FirewallResult(
@@ -153,14 +139,7 @@ class HallucinationFirewall:
             snapshot = self.context_manager.load_snapshot(context_capture_id)
         except Exception as e:
             logger.error(f"Failed to load context capture {context_capture_id}: {e}")
-            return FirewallResult(
-                safe_to_deliver=True,  # Fail open
-                confidence_score=0.5,
-                claims_verified=0,
-                claims_failed=0,
-                contradictions=[],
-                warnings=[f"Context capture load failed: {e}"],
-            )
+            return self._degraded_result(mode, f"Context capture load failed: {e}")
 
         # 3. Verify each claim (structured or simple)
         results = []
@@ -189,11 +168,11 @@ class HallucinationFirewall:
                     )
                 )
 
-        # 4. Compute overall result
+        # 4. Compute overall result — weighted by claim type risk
         verified = [r for r in results if r.verified]
         failed = [r for r in results if not r.verified]
 
-        confidence = len(verified) / len(results) if results else 1.0
+        confidence = self._weighted_confidence(results) if results else 1.0
 
         safe = confidence >= self.threshold if mode == "block" else True
 
@@ -208,17 +187,14 @@ class HallucinationFirewall:
         )
 
     def _simple_verify_claim(self, claim: Claim, snapshot) -> VerificationResult:
-        """Simple verification fallback (string matching).
+        """Verification fallback: substring match → embedding similarity.
 
-        Args:
-            claim: Claim to verify
-            snapshot: Context snapshot
-
-        Returns:
-            VerificationResult
+        Uses embedding similarity when available to catch paraphrases
+        that substring matching misses.
         """
         context_text = self._context_to_text(snapshot)
 
+        # Fast path: exact substring match
         if claim.value.lower() in context_text.lower():
             return VerificationResult(
                 claim=claim,
@@ -227,6 +203,27 @@ class HallucinationFirewall:
                 evidence=[],
                 contradiction=None,
             )
+
+        # Slow path: embedding similarity (if available)
+        try:
+            from core.context.embeddings import EmbeddingService
+            svc = EmbeddingService(self.db)
+            claim_vec = svc.embed_text(claim.value)
+            ctx_vec = svc.embed_text(context_text[:2000])  # cap context length
+            dot = sum(a * b for a, b in zip(claim_vec, ctx_vec))
+            norm_a = sum(a * a for a in claim_vec) ** 0.5
+            norm_b = sum(b * b for b in ctx_vec) ** 0.5
+            sim = dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+            if sim >= 0.75:
+                return VerificationResult(
+                    claim=claim,
+                    verified=True,
+                    confidence=round(sim, 2),
+                    evidence=[],
+                    contradiction=None,
+                )
+        except Exception:
+            pass  # No embedding service — fall through to unverified
 
         return VerificationResult(
             claim=claim,
@@ -248,6 +245,37 @@ class HallucinationFirewall:
 
         return "\n".join(parts)
 
+    @staticmethod
+    def _degraded_result(mode: str, reason: str) -> FirewallResult:
+        """Return degraded result: fail-open in warn mode, fail-closed in block mode."""
+        return FirewallResult(
+            safe_to_deliver=(mode != "block"),
+            confidence_score=0.0 if mode == "block" else 0.5,
+            claims_verified=0,
+            claims_failed=0,
+            contradictions=[],
+            warnings=[reason],
+        )
+
+    # Claim type → risk weight (higher = more dangerous when failed)
+    _CLAIM_WEIGHTS: dict[str, float] = {
+        "causal": 1.0, "factual": 0.8, "temporal": 0.6, "numeric": 0.5,
+        # regex extractor types (mapped to equivalent weights)
+        "reference": 0.8, "boolean": 0.8, "number": 0.5, "date": 0.6,
+    }
+
+    @classmethod
+    def _weighted_confidence(cls, results: list) -> float:
+        """Compute confidence weighted by claim type risk."""
+        w_verified = 0.0
+        w_total = 0.0
+        for r in results:
+            w = cls._CLAIM_WEIGHTS.get(getattr(r.claim, "type", ""), 0.7)
+            w_total += w
+            if r.verified:
+                w_verified += w
+        return w_verified / w_total if w_total > 0 else 1.0
+
     def log_verification(
         self, session_id: str, event_id: str, result: FirewallResult, context_capture_id: str
     ) -> None:
@@ -264,57 +292,57 @@ class HallucinationFirewall:
             return
 
         try:
+            from sqlalchemy import text
+
             # 1. Insert hallucination check record
             check_id = f"check_{event_id}"
 
             self.db.execute(
-                """
-                INSERT INTO hallucination_checks (
-                    check_id, session_id, event_id, context_capture_id,
-                    claims_total, claims_verified, claims_contradicted,
-                    confidence_score, safe_to_deliver, evidence_count,
-                    created_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
-                )
-                """,
-                (
-                    check_id,
-                    session_id,
-                    event_id,
-                    context_capture_id,
-                    result.claims_verified + result.claims_failed,
-                    result.claims_verified,
-                    result.claims_failed,
-                    result.confidence_score,
-                    result.safe_to_deliver,
-                    result.evidence_count,
+                text(
+                    "INSERT INTO hallucination_checks "
+                    "(check_id, session_id, event_id, context_capture_id, "
+                    "claims_total, claims_verified, claims_contradicted, "
+                    "confidence_score, safe_to_deliver, evidence_count, created_at) "
+                    "VALUES (:check_id, :session_id, :event_id, :ctx_id, "
+                    ":total, :verified, :contradicted, :confidence, :safe, :evidence, NOW())"
                 ),
+                {
+                    "check_id": check_id,
+                    "session_id": session_id,
+                    "event_id": event_id,
+                    "ctx_id": context_capture_id,
+                    "total": result.claims_verified + result.claims_failed,
+                    "verified": result.claims_verified,
+                    "contradicted": result.claims_failed,
+                    "confidence": result.confidence_score,
+                    "safe": result.safe_to_deliver,
+                    "evidence": result.evidence_count,
+                },
             )
 
             # 2. Insert evidence backlinks for each contradiction
             for contradiction in result.contradictions:
                 for evidence in contradiction.evidence:
                     self.db.execute(
-                        """
-                        INSERT INTO claim_evidence (
-                            check_id, claim_type, claim_value,
-                            source_type, source_id, content, location,
-                            confidence, created_at
-                        ) VALUES (
-                            %s, %s, %s, %s, %s, %s, %s, %s, NOW()
-                        )
-                        """,
-                        (
-                            check_id,
-                            contradiction.claim.type,
-                            contradiction.claim.value,
-                            evidence.source_type,
-                            evidence.source_id,
-                            evidence.content,
-                            evidence.location,
-                            evidence.confidence,
+                        text(
+                            "INSERT INTO claim_evidence "
+                            "(check_id, claim_type, claim_value, "
+                            "source_type, source_id, content, location, "
+                            "confidence, created_at) "
+                            "VALUES (:check_id, :claim_type, :claim_value, "
+                            ":source_type, :source_id, :content, :location, "
+                            ":confidence, NOW())"
                         ),
+                        {
+                            "check_id": check_id,
+                            "claim_type": contradiction.claim.type,
+                            "claim_value": contradiction.claim.value,
+                            "source_type": evidence.source_type,
+                            "source_id": evidence.source_id,
+                            "content": evidence.content,
+                            "location": evidence.location,
+                            "confidence": evidence.confidence,
+                        },
                     )
 
             self.db.commit()

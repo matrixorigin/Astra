@@ -101,8 +101,6 @@ class TestModernSkillSelector:
         assert schema["function"]["description"] == "Review code changes"
         assert "parameters" in schema["function"]
         assert schema["function"]["parameters"]["type"] == "object"
-        assert "repo_id" in schema["function"]["parameters"]["properties"]
-        assert "pr_number" in schema["function"]["parameters"]["properties"]
 
     def test_fallback_to_rules(self, modern_selector, mock_llm):
         """Test fallback when function calling fails."""

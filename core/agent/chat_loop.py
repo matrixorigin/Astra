@@ -295,14 +295,29 @@ class ChatLoop:
             user_id=user_id,
             session_id=session_id,
         )
+        final_content = response.content or ""
+
+        # Firewall verification (aligned with normal exit path)
+        verification = self.firewall.verify_response(final_content, context_capture_id, mode="warn")
+        self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
+        if not verification.safe_to_deliver:
+            logger.warning(
+                f"Firewall: confidence={verification.confidence_score:.2f}, "
+                f"failed={verification.claims_failed}"
+            )
+            final_content += (
+                f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
+                f"{verification.claims_failed} unverified claims."
+            )
+
         self._log_response(
             user_id,
             session_id,
-            response.content or "",
+            final_content,
             user_event.event_id,
             user_event.causal_chain_id,
         )
-        return response.content or ""
+        return final_content
 
     async def run_step_stream(
         self,
@@ -339,6 +354,7 @@ class ChatLoop:
             async for event in self.run_step_with_planning(
                 user_input, session_id, user_id, context, max_candidates,
                 context_capture_id=context_capture_id,
+                parent_user_event=user_event,
             ):
                 yield event
             return
@@ -790,11 +806,52 @@ class ChatLoop:
         context: dict[str, Any] | None = None,
         max_candidates: int = 5,
         context_capture_id: str | None = None,
+        parent_user_event=None,
     ) -> AsyncIterator[StreamEvent]:
         """PAOR: Plan → Act → Observe → Reflect loop.
 
         For complex tasks that need multi-step planning.
         """
+        # ── Audit binding: user event + context snapshot ──────────
+        if parent_user_event is not None:
+            user_event = parent_user_event
+        else:
+            user_event = self.event_logger.create_user_query(
+                user_id=user_id,
+                session_id=session_id,
+                content=user_input,
+            )
+
+        if not context_capture_id:
+            from core.context.manager import TaskType
+            ctx = self.context_manager.build_context(
+                session_id=session_id, query=user_input, task_type=TaskType.GENERAL,
+            )
+            context_capture_id = self.context_manager.save_snapshot(
+                ctx, session_id, user_event.event_id,
+            )
+            logger.debug(f"[planning] Context snapshot: {context_capture_id}")
+
+        # ── RUN_STARTED (aligned with stream path) ───────────────
+        _event_id = str(user_event.event_id)
+        _chain_id = str(user_event.causal_chain_id or "")
+
+        run_started_event = self.event_logger.create_stream_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_type="stream_run_started",
+            content=json.dumps({"query": user_input, "context_capture_id": str(context_capture_id)}),
+            parent_event_id=user_event.event_id,
+            causal_chain_id=user_event.causal_chain_id,
+        )
+        yield StreamEvent(
+            event_type=StreamEventType.RUN_STARTED,
+            data={"query": user_input, "context_capture_id": str(context_capture_id)},
+            event_id=str(run_started_event.event_id),
+            causal_chain_id=_chain_id,
+            agent_id=self.agent_id,
+        )
+
         planner = Planner(self.llm)
         constraints = planner.constraints
 
@@ -816,6 +873,8 @@ class ChatLoop:
             session_id=session_id,
             event_type="stream_plan_created",
             content=plan.model_dump_json(),
+            parent_event_id=user_event.event_id,
+            causal_chain_id=user_event.causal_chain_id,
         )
 
         yield StreamEvent(
@@ -912,40 +971,51 @@ class ChatLoop:
                     data={"plan": plan.model_dump()},
                 )
 
-        # Final synthesis — with firewall verification + audit (aligned with non-stream path)
+        # Final synthesis — with firewall verification + audit (aligned with all paths)
         final_text = "Planning complete. Executing final synthesis..."
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DELTA,
             data={"chunk": final_text},
+            event_id=_event_id,
+            causal_chain_id=_chain_id,
+            agent_id=self.agent_id,
         )
 
-        if context_capture_id:
-            verification = self.firewall.verify_response(
-                final_text, context_capture_id, mode="warn",
+        verification = self.firewall.verify_response(
+            final_text, context_capture_id, mode="warn",
+        )
+        self.firewall.log_verification(
+            session_id, user_event.event_id, verification, context_capture_id,
+        )
+        if not verification.safe_to_deliver:
+            logger.warning(
+                "[planning] Firewall: confidence=%.2f, failed=%s",
+                verification.confidence_score, verification.claims_failed,
             )
-            self.firewall.log_verification(
-                session_id, None, verification, context_capture_id,
+            warning = (
+                f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
+                f"{verification.claims_failed} unverified claims."
             )
-            if not verification.safe_to_deliver:
-                logger.warning(
-                    "[planning] Firewall: confidence=%.2f, failed=%s",
-                    verification.confidence_score, verification.claims_failed,
-                )
-                warning = (
-                    f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
-                    f"{verification.claims_failed} unverified claims."
-                )
-                yield StreamEvent(
-                    event_type=StreamEventType.TEXT_DELTA,
-                    data={"chunk": warning},
-                )
-                final_text += warning
+            yield StreamEvent(
+                event_type=StreamEventType.TEXT_DELTA,
+                data={"chunk": warning},
+                event_id=_event_id,
+                causal_chain_id=_chain_id,
+                agent_id=self.agent_id,
+            )
+            final_text += warning
 
-        self._log_response(user_id, session_id, final_text, None, None)
+        self._log_response(
+            user_id, session_id, final_text,
+            user_event.event_id, user_event.causal_chain_id,
+        )
 
         yield StreamEvent(
             event_type=StreamEventType.RUN_FINISHED,
             data={"context_capture_id": context_capture_id},
+            event_id=_event_id,
+            causal_chain_id=_chain_id,
+            agent_id=self.agent_id,
         )
 
     # ------------------------------------------------------------------

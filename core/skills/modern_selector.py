@@ -182,7 +182,7 @@ class ModernSkillSelector:
         """
         # Try to load skill class and extract schema
         try:
-            skill_def = self._registry.get_skill(skill.name)
+            skill_def = self._registry.get(skill.name)
 
             if skill_def and hasattr(skill_def, "requirements"):
                 # Use Pydantic model's schema
@@ -212,70 +212,8 @@ class ModernSkillSelector:
         }
 
     def _get_default_schema(self, skill_name: str) -> dict[str, Any]:
-        """Get default schema for known skills (fallback)."""
-        schemas = {
-            "summarize_pr": {
-                "type": "object",
-                "properties": {
-                    "repo_id": {"type": "string", "description": "Repository ID"},
-                    "pr_number": {"type": "integer", "description": "Pull request number"},
-                },
-                "required": ["repo_id", "pr_number"],
-            },
-            "code_review": {
-                "type": "object",
-                "properties": {
-                    "repo_id": {"type": "string", "description": "Repository ID"},
-                    "pr_number": {"type": "integer", "description": "Pull request number"},
-                    "focus": {
-                        "type": "string",
-                        "enum": ["all", "security", "performance", "style"],
-                        "description": "Review focus area",
-                    },
-                },
-                "required": ["repo_id", "pr_number"],
-            },
-            "list_prs": {
-                "type": "object",
-                "properties": {
-                    "repo_id": {"type": "string", "description": "Repository ID"},
-                    "state": {
-                        "type": "string",
-                        "enum": ["open", "closed", "all"],
-                        "description": "PR state filter",
-                    },
-                    "limit": {"type": "integer", "description": "Max number of PRs"},
-                },
-                "required": ["repo_id"],
-            },
-            "ci_status": {
-                "type": "object",
-                "properties": {
-                    "repo_id": {"type": "string", "description": "Repository ID"},
-                    "limit": {"type": "integer", "description": "Max number of runs"},
-                },
-                "required": ["repo_id"],
-            },
-            "search_code": {
-                "type": "object",
-                "properties": {
-                    "repo_id": {"type": "string", "description": "Repository ID"},
-                    "query": {"type": "string", "description": "Search query"},
-                    "file_pattern": {"type": "string", "description": "File pattern filter"},
-                },
-                "required": ["repo_id", "query"],
-            },
-            "analyze_bug": {
-                "type": "object",
-                "properties": {
-                    "repo_id": {"type": "string", "description": "Repository ID"},
-                    "issue_number": {"type": "integer", "description": "Issue number"},
-                },
-                "required": ["repo_id", "issue_number"],
-            },
-        }
-
-        return schemas.get(skill_name, {"type": "object", "properties": {}, "required": []})
+        """Default schema for skills without a Pydantic model."""
+        return {"type": "object", "properties": {}, "required": []}
 
 
 class ModelRouter:

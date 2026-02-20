@@ -1,7 +1,7 @@
 # Trust and Safety
 
 > **Status**: Core Design — single source of truth for audit, verification, and safety  
-> **Last Updated**: 2026-02-14
+> **Last Updated**: 2026-02-20
 
 ---
 
@@ -97,6 +97,59 @@ claims = llm.extract_claims(
 
 This catches claims that regex misses: implicit assertions, comparative statements, causal reasoning.
 
+### Fail-Open vs Fail-Closed
+
+The firewall must handle infrastructure failures (snapshot load fails, claim extraction errors) gracefully:
+
+| Mode | Infrastructure Failure | Verification Failure |
+|------|----------------------|---------------------|
+| `warn` | Deliver with degraded-confidence warning | Deliver with claim annotations |
+| `block` | **Block delivery** — fail closed | Block if confidence < threshold |
+
+Current implementation fails open on all early returns regardless of mode. The correct behavior: `mode="block"` must fail closed when verification cannot complete — an unverifiable response is not a safe response.
+
+### Streaming Verification (Roadmap)
+
+Current design verifies after full response generation. The industry is moving to real-time token-level detection:
+
+```
+Response-level (current):
+  Generate full response → Extract claims → Verify → Deliver/Block
+  Latency: +200-500ms after generation
+  Problem: User sees unverified content in streaming mode
+
+Token-level (target, ref: HaluGate / vLLM 2025.12):
+  Generate token → NLI entailment check → Flag/Pass → Stream to user
+  Latency: +5-15ms per token (amortized via batching)
+  Advantage: Unsupported claims flagged inline during streaming
+
+Hybrid (pragmatic next step):
+  Stream tokens to user (low latency)
+  → Background: accumulate sentence boundaries
+  → Per-sentence NLI check against context snapshot
+  → If contradiction detected: inject inline warning into stream
+  → Post-completion: full response-level verification for audit record
+```
+
+The hybrid approach preserves streaming UX while adding sentence-level grounding checks. Full token-level detection (HaluGate-style) requires NLI model co-located with inference — a future infrastructure investment.
+
+### Chain-of-Thought Audit (Roadmap)
+
+LlamaFirewall (Meta, 2025) introduces AlignmentCheck: real-time auditing of the agent's reasoning process to detect goal hijacking and indirect prompt injection. This is orthogonal to output verification — a response can be factually correct but produced via compromised reasoning.
+
+```
+Current: Verify OUTPUT against context snapshot
+  → Catches: factual errors, hallucinated claims
+  → Misses: goal hijacking, reasoning manipulation
+
+Target: Verify REASONING PROCESS against declared intent
+  → For multi-step plans (PAOR): each step's CoT checked against plan goal
+  → For tool calls: reasoning for tool selection checked against query intent
+  → Scanner: lightweight classifier on CoT text (not full LLM-as-judge)
+```
+
+Integration point: `ChatLoop` already captures tool call reasoning in the message chain. Adding a CoT scanner between assistant message and tool execution is architecturally clean.
+
 ---
 
 ## 3. Uncertainty Quantification
@@ -107,7 +160,7 @@ Users treat all agent responses as equally reliable. They shouldn't.
 
 ### The Solution: Pre-Delivery Confidence Scoring
 
-Every response carries a `confidence_score` (0.0–1.0) computed from signals already in the pipeline:
+Every response carries a `confidence_score` (0.0–1.0) computed from multiple signals:
 
 ```
 confidence_score = weighted_average(
@@ -117,14 +170,24 @@ confidence_score = weighted_average(
   skill_reliability:     Historical success rate of the skills used?
   model_agreement:       (future) Do multiple models agree on this response?
 )
-
-uncertainty_factors = {
-  context_coverage: 0.92,
-  claim_verifiability: 0.85,
-  knowledge_freshness: 0.78,
-  skill_reliability: 0.95
-}
 ```
+
+### Claim-Type Weighting
+
+Not all claims carry equal risk. A failed causal claim ("the test fails because of X") is more dangerous than a failed numeric claim ("5 files changed"):
+
+```
+claim_weights = {
+  "causal":   1.0   -- Highest risk: wrong causation leads to wrong actions
+  "factual":  0.8   -- High risk: incorrect assertions about system state
+  "temporal": 0.6   -- Medium risk: wrong time references
+  "numeric":  0.5   -- Lower risk: wrong counts, usually obvious to user
+}
+
+weighted_confidence = Σ(claim_weight × verified) / Σ(claim_weight × total)
+```
+
+Current implementation uses unweighted `verified / total`. The weighted version prevents a response with 9 verified numeric claims and 1 failed causal claim from scoring 0.9 confidence.
 
 **Calibration**: `confidence` (pre-delivery prediction) is calibrated against `quality_score` (post-delivery evaluation from user feedback or auto-metrics). If the system consistently over- or under-estimates confidence, the scoring weights are adjusted. This measures how well the system knows what it doesn't know.
 
@@ -634,6 +697,25 @@ Every SLO evaluation and violation response is an event — the platform's opera
 
 ---
 
+## Implementation Status: ChatLoop Audit Alignment
+
+> **Last verified**: 2026-02-20
+
+The three ChatLoop execution paths in `core/agent/chat_loop.py` must satisfy the audit contract from §1 (Decision Audit Trail) and §2 (Hallucination Firewall). Current status:
+
+| Requirement | `run_step` | `run_step_stream` | `run_step_with_planning` |
+|---|---|---|---|
+| User event logged | ✅ | ✅ | ✅ (reuses parent when called from stream) |
+| Context snapshot saved | ✅ `save_snapshot` | ✅ `save_snapshot` | ✅ creates own if not passed |
+| Firewall verify (normal exit) | ✅ | ✅ | ✅ |
+| Firewall verify (exhausted rounds) | ✅ | ✅ | N/A |
+| `_log_response` with parent_event_id | ✅ | ✅ | ✅ |
+| `RUN_STARTED` event | N/A (non-stream) | ✅ | ✅ |
+| `RUN_FINISHED` with context_capture_id | N/A (non-stream) | ✅ | ✅ |
+| StreamEvent carries event_id + causal_chain_id | N/A | ✅ | ✅ |
+
+---
+
 ## References
 
 - [DataRobot: Agentic AI Observability](https://www.datarobot.com/blog/agentic-ai-observability/)
@@ -641,5 +723,9 @@ Every SLO evaluation and violation response is an event — the platform's opera
 - [Authority Partners: AI Agent Guardrails Production Guide 2026](https://authoritypartners.com/insights/ai-agent-guardrails-production-guide-for-2026/)
 - [Elixir Data: Decision Lineage](https://www.elixirdata.co/product/decision-lineage/)
 - [Portkey: Complete Guide to LLM Observability 2026](https://portkey.ai/blog/the-complete-guide-to-llm-observability/)
+- [HaluGate: Token-Level Hallucination Detection (vLLM, 2025.12)](https://blog.vllm.ai/2025/12/14/halugate.html)
+- [LlamaFirewall: Open-Source Guardrail System (Meta, 2025)](https://arxiv.org/html/2505.03574v1)
+- [Braintrust: AI Agent Evaluation Framework (2026)](https://www.braintrust.dev/articles/ai-agent-evaluation-framework)
+- [Microsoft: NIST-Based Security Governance for AI Agents](https://techcommunity.microsoft.com/blog/microsoftdefendercloudblog/architecting-trust-a-nist-based-security-governance-framework-for-ai-agents/4490556)
 
 Content was rephrased for compliance with licensing restrictions.
