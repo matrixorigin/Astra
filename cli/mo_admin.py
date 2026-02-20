@@ -221,41 +221,41 @@ def token():
 
 @token.command("create")
 @click.option("--type", "token_type", type=click.Choice(["llm", "github"]), required=True)
-@click.option("--provider", required=True, help="Provider name (e.g., openai, anthropic, groq)")
-@click.option("--scope", type=click.Choice(["global", "account", "user"]), required=True)
-@click.option("--scope-id", help="Account or user ID for scope")
-@click.option("--token-value", prompt=True, hide_input=True, help="API token value")
+@click.option("--provider", required=True, help="Provider name (e.g., openai, deepseek, anthropic)")
+@click.option("--scope", type=click.Choice(["global", "user"]), required=True)
+@click.option("--scope-id", help="User ID for user scope")
+@click.option("--base-url", help="API base URL (for OpenAI-compatible providers, e.g. https://api.deepseek.com/v1)")
+@click.option("--token-value", prompt="API Key", hide_input=True, help="API key")
 @click.pass_context
-def token_create(ctx, token_type, provider, scope, scope_id, token_value):
+def token_create(ctx, token_type, provider, scope, scope_id, base_url, token_value):
     """Create a new API token."""
     db = ctx.obj["db"]
     checker = ctx.obj["checker"]
     audit = ctx.obj["audit"]
     user = ctx.obj["user"]
 
-    # Permission check
     if not checker.is_admin(user):
         click.echo("❌ Permission denied: only admins can create tokens")
         sys.exit(1)
 
-    # Validate scope_id
     if scope == "user" and not scope_id:
-        click.echo(f"❌ --scope-id is required for {scope} scope")
+        click.echo("❌ --scope-id is required for user scope")
         sys.exit(1)
 
     try:
         from uuid_utils import uuid7
         token_id = str(uuid7())
-
         scope_user_id = scope_id if scope == "user" else None
+        metadata = json.dumps({"base_url": base_url}) if base_url else None
 
         from sqlalchemy import text
         db.execute(
             text("""
             INSERT INTO tokens
             (token_id, type, provider, scope_user_id,
-             encrypted_value, is_active, created_at)
-            VALUES (:token_id, :token_type, :provider, :scope_user_id, :token_value, TRUE, :created_at)
+             encrypted_value, is_active, metadata, created_at)
+            VALUES (:token_id, :token_type, :provider, :scope_user_id,
+                    :token_value, TRUE, :metadata, :created_at)
             """),
             {
                 "token_id": token_id,
@@ -263,6 +263,7 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
                 "provider": provider,
                 "scope_user_id": scope_user_id,
                 "token_value": token_value,
+                "metadata": metadata,
                 "created_at": datetime.now(),
             }
         )
@@ -272,6 +273,9 @@ def token_create(ctx, token_type, provider, scope, scope_id, token_value):
 
         click.echo("✅ Token created successfully")
         click.echo(f"   Token ID: {token_id}")
+        click.echo(f"   Provider: {provider}")
+        if base_url:
+            click.echo(f"   Base URL: {base_url}")
         click.echo(f"   Scope: {scope}" + (f" ({scope_id})" if scope_id else ""))
     except Exception as e:
         click.echo(f"❌ Failed to create token: {e}")
@@ -379,20 +383,108 @@ def audit_logs(ctx, user_id, action, resource_type, since, limit):
 
 
 @cli.command()
-def init():
-    """Initialize agent system (database + RBAC)."""
-    import subprocess
+@click.option("--reset", is_flag=True, help="Drop and recreate database")
+def init(reset):
+    """Initialize agent system: database, tables, admin user, RBAC."""
+    import pymysql
+    from config.settings import get_settings
+
+    settings = get_settings()
+    db_name = settings.matrixone_database
 
     click.echo("🔧 Initializing agent system...")
 
-    result = subprocess.run(["make", "db-init-agent"], capture_output=True, text=True)
+    # 1. Connect without database to create it
+    conn = pymysql.connect(
+        host=settings.matrixone_host,
+        port=settings.matrixone_port,
+        user=settings.matrixone_user,
+        password=settings.matrixone_password,
+        autocommit=True,
+    )
+    cursor = conn.cursor()
 
+    if reset:
+        if click.confirm(f"⚠️  Drop database '{db_name}' and recreate?", abort=True):
+            cursor.execute(f"DROP DATABASE IF EXISTS {db_name}")
+            click.echo(f"   Dropped {db_name}")
+
+    cursor.execute(f"CREATE DATABASE IF NOT EXISTS {db_name}")
+    click.echo(f"✅ Database '{db_name}' ready")
+    cursor.close()
+    conn.close()
+
+    # 2. Create tables via MatrixOne dialect (supports vecf32)
+    from matrixone import Client as MoClient
+    from api.models import Base
+    from sqlalchemy import text
+    from sqlalchemy.schema import CreateTable
+
+    client = MoClient(
+        host=settings.matrixone_host,
+        port=settings.matrixone_port,
+        user=settings.matrixone_user,
+        password=settings.matrixone_password,
+        database=db_name,
+        sql_log_mode="off",
+    )
+    eng = client._engine
+
+    with eng.connect() as c:
+        existing = {row[0] for row in c.execute(text("SHOW TABLES")).fetchall()}
+        created = 0
+        for table in Base.metadata.sorted_tables:
+            if table.name in existing:
+                continue
+            try:
+                ddl = str(CreateTable(table).compile(dialect=eng.dialect))
+                c.execute(text(ddl))
+                c.execute(text("COMMIT"))
+                created += 1
+            except Exception as e:
+                click.echo(f"   ⚠️  {table.name}: {e}", err=True)
+
+        click.echo(f"✅ Tables ready ({created} created, {len(existing)} existed)")
+
+        # 3. Fulltext index
+        try:
+            c.execute(text("CREATE FULLTEXT INDEX ft_content_session ON conversation_events (content, session_id) WITH PARSER ngram"))
+            c.execute(text("COMMIT"))
+            click.echo("✅ Fulltext index created")
+        except Exception:
+            pass  # already exists
+
+        # 4. Admin user + role
+        c.execute(text("INSERT IGNORE INTO users (user_id, username, email, password_hash, is_active, created_at) VALUES ('admin', 'admin', 'admin@local', 'x', 1, NOW())"))
+        c.execute(text("INSERT IGNORE INTO roles (role_id, role_name, description, created_at) VALUES ('role_admin', 'mo_agent_admin', 'System admin', NOW())"))
+        c.execute(text("INSERT IGNORE INTO user_roles (user_id, role_id, created_at) VALUES ('admin', 'role_admin', NOW())"))
+        c.execute(text("COMMIT"))
+        click.echo("✅ Admin user ready")
+
+        # 5. Default prompt templates
+        _prompts = [
+            ("system_general", "You are an intelligent development agent. Help users with code, architecture, debugging, and documentation. Be concise and accurate."),
+            ("system_code_review", "You are an expert code reviewer. Focus on code quality, security, and best practices."),
+            ("system_planning", "You are a technical architect. Help plan and design solutions."),
+            ("system_debugging", "You are a debugging expert. Help identify and fix issues."),
+        ]
+        for tid, content in _prompts:
+            c.execute(text(
+                "INSERT IGNORE INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at) "
+                "VALUES (:tid, '1.0', :content, 1, NOW(), NOW())"
+            ), {"tid": tid, "content": content})
+        c.execute(text("COMMIT"))
+        click.echo("✅ Prompt templates ready")
+
+    # 5. Agent config (existing script)
+    import subprocess
+    result = subprocess.run(["make", "db-init-agent"], capture_output=True, text=True)
     if result.returncode == 0:
-        click.echo("✅ Agent system initialized successfully")
+        click.echo("✅ Agent config ready")
     else:
-        click.echo("❌ Initialization failed", err=True)
-        click.echo(result.stderr, err=True)
-        sys.exit(1)
+        click.echo(f"   ⚠️  Agent config: {result.stderr.strip()}", err=True)
+
+    click.echo("\n🎉 System initialized. Next: mo-admin token create --type llm --provider openai --scope global --token-value sk-...")
 
 
 if __name__ == "__main__":

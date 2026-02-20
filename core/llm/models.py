@@ -11,6 +11,7 @@ class LLMProvider(str, Enum):
     """LLM provider."""
 
     OPENAI = "openai"
+    DEEPSEEK = "deepseek"
     GROQ = "groq"
     ANTHROPIC = "anthropic"
     SELF_HOSTED = "self_hosted"

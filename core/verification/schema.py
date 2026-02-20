@@ -3,6 +3,7 @@
 Auto-creates tables on first use - no migration needed.
 """
 
+from sqlalchemy import text
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -19,7 +20,7 @@ def init_hallucination_tables(db):
     try:
         # Create hallucination_checks table
         db.execute(
-            """
+            text("""
             CREATE TABLE IF NOT EXISTS hallucination_checks (
                 check_id VARCHAR(255) PRIMARY KEY,
                 session_id VARCHAR(255) NOT NULL,
@@ -38,12 +39,11 @@ def init_hallucination_tables(db):
                 INDEX idx_confidence (confidence_score),
                 INDEX idx_created (created_at)
             )
-            """
+            """)
         )
 
-        # Create claim_evidence table
         db.execute(
-            """
+            text("""
             CREATE TABLE IF NOT EXISTS claim_evidence (
                 evidence_id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 check_id VARCHAR(255) NOT NULL,
@@ -60,7 +60,7 @@ def init_hallucination_tables(db):
                 INDEX idx_source (source_type, source_id),
                 INDEX idx_confidence (confidence)
             )
-            """
+            """)
         )
 
         db.commit()

@@ -79,13 +79,13 @@ class SkillSelector:
             metadata = SkillMetadata(
                 name=skill.skill_name,
                 version=skill.version,
-                description="",
-                category="general",
-                subcategory="default",
-                triggers=[],
-                dependencies=[],
-                priority=5,
-                cost_estimate="medium",
+                description=skill.description or "",
+                category=skill.category or "general",
+                subcategory=skill.subcategory or "default",
+                triggers=skill.triggers or [],
+                dependencies=skill.dependencies or [],
+                priority=skill.priority or 5,
+                cost_estimate=skill.cost_estimate or "medium",
             )
             self.skills[metadata.name] = metadata
 

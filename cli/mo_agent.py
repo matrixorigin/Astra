@@ -36,7 +36,7 @@ def cli():
 
 @cli.command()
 @click.option("--user-id", default="cli_user", help="User identifier")
-@click.option("--model", default="gpt-4", help="LLM model to use")
+@click.option("--model", default=None, help="LLM model to use (auto-detected from DB if not set)")
 @click.option(
     "--mode",
     type=click.Choice(["production", "replay"]),
@@ -141,6 +141,9 @@ def chat(user_id, model, mode):
         skill_registry, db, agent_registry=agent_registry,
         chat_loop_factory=create_chat_loop, code_executor=code_executor,
     )
+
+    # Reload skills into pipeline after registration
+    pipeline.reload_skills(registry=skill_registry)
 
     # Update executor with registered skills
     executor.registry = skill_registry

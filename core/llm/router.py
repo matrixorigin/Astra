@@ -17,7 +17,7 @@ class ModelConfig(BaseModel):
     """Model configuration — one entry per deployable model."""
 
     model_name: str
-    provider: LLMProvider
+    provider: LLMProvider | str
     context_window: int = 128000
     price_per_1k_prompt: float = 0.0
     price_per_1k_completion: float = 0.0
@@ -202,6 +202,26 @@ DEFAULT_MODELS: list[ModelConfig] = [
         rpm_limit=100,
         tpm_limit=50000,
         tags=["fast", "cheap"],
+    ),
+    ModelConfig(
+        model_name="deepseek-chat",
+        provider=LLMProvider.DEEPSEEK,
+        context_window=64000,
+        price_per_1k_prompt=0.00014,
+        price_per_1k_completion=0.00028,
+        rpm_limit=60,
+        tpm_limit=100000,
+        tags=["code", "reasoning", "cheap"],
+    ),
+    ModelConfig(
+        model_name="deepseek-reasoner",
+        provider=LLMProvider.DEEPSEEK,
+        context_window=64000,
+        price_per_1k_prompt=0.00055,
+        price_per_1k_completion=0.00219,
+        rpm_limit=60,
+        tpm_limit=100000,
+        tags=["reasoning"],
     ),
 ]
 

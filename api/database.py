@@ -31,15 +31,18 @@ DATABASE_URL = (
     "?charset=utf8mb4"
 )
 
-# Create engine with JSON serializer and deserializer
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_recycle=3600,
-    echo=False,
-    json_serializer=lambda obj: json.dumps(obj, default=decimal_default),
-    json_deserializer=lambda s: json.loads(s) if isinstance(s, (str, bytes, bytearray)) else s,
+from matrixone import Client as _MoClient  # noqa: E402
+
+# Use MatrixOne client's engine (supports vecf32/vecf64 and FulltextIndex DDL)
+_mo_client = _MoClient(
+    host=settings.matrixone_host,
+    port=settings.matrixone_port,
+    user=settings.matrixone_user,
+    password=settings.matrixone_password,
+    database=settings.matrixone_database,
+    sql_log_mode="off",
 )
+engine = _mo_client._engine
 
 # Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -79,24 +82,20 @@ def get_db_context():
 def init_db():
     """Initialize database - create tables if not exist."""
     from api.models import Base
-    from sqlalchemy import inspect
-    
+    from sqlalchemy import inspect, text
+    from sqlalchemy.schema import CreateTable
+
     inspector = inspect(engine)
-    existing_tables = inspector.get_table_names()
-    
-    # Check if our tables exist
-    required_tables = [
-        'users', 'agents', 'refresh_tokens', 'sessions', 'conversation_events',
-        'prompt_templates', 'skills_registry', 'context_snapshots', 'decision_audit',
-        'event_embeddings', 'knowledge_entries', 'repos', 'sandbox_metadata', 'audit_logs',
-        'roles', 'user_roles'
-    ]
-    missing = [t for t in required_tables if t not in existing_tables]
-    
-    if not missing:
-        print(f"All required tables exist")
-        return
-    
-    print(f"Creating missing tables: {missing}")
-    Base.metadata.create_all(bind=engine)
-    print("Tables created successfully")
+    existing_tables = set(inspector.get_table_names())
+
+    with engine.connect() as conn:
+        for table in Base.metadata.sorted_tables:
+            if table.name in existing_tables:
+                continue
+            try:
+                ddl = str(CreateTable(table).compile(dialect=engine.dialect))
+                conn.execute(text(ddl))
+                conn.execute(text("COMMIT"))
+                print(f"Created table: {table.name}")
+            except Exception as e:
+                print(f"Warning: could not create {table.name}: {e}")

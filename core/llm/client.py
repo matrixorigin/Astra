@@ -27,6 +27,18 @@ class BudgetExceededError(Exception):
     pass
 
 
+_PROVIDER_DEFAULT_MODELS = {
+    "openai": "gpt-4o",
+    "deepseek": "deepseek-chat",
+    "anthropic": "claude-3-5-sonnet-20241022",
+    "groq": "llama3-70b",
+}
+
+
+def _default_model_for_provider(provider: str) -> str:
+    return _PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o")
+
+
 class LLMClient:
     """LLM client with routing, rate limiting, circuit breaker, budget control, and logging."""
 
@@ -60,7 +72,7 @@ class LLMClient:
             )
             self.scope_resolver = ScopeResolver(self.db, scope_chain)
 
-        self._providers: dict[LLMProvider, BaseProvider] = {}
+        self._providers: dict[str, BaseProvider] = {}
         self.router = ModelRouter(
             db=self.db, user_id=user_id, use_defaults=use_default_models
         )
@@ -102,7 +114,7 @@ class LLMClient:
     # ── Config (#4 动态配置) ───────────────────────────────────────
 
     def _load_config(self) -> None:
-        """Load config: DB → env → defaults."""
+        """Load config: DB → env → auto-detect from registered tokens."""
         config = None
         try:
             result = self.db.execute(
@@ -114,12 +126,27 @@ class LLMClient:
         except Exception:
             pass
         if not config:
+            # Auto-detect default provider/model from first active token
+            provider = os.getenv("LLM_PROVIDER", "")
+            model = os.getenv("LLM_MODEL", "")
+            if not provider:
+                try:
+                    row = self.db.execute(
+                        text("SELECT provider FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
+                    ).first()
+                    if row:
+                        provider = row[0]
+                except Exception:
+                    pass
+            provider = provider or "openai"
+            if not model:
+                model = _default_model_for_provider(provider)
             config = {
-                "provider": os.getenv("LLM_PROVIDER", "openai"),
-                "model": os.getenv("LLM_MODEL", "gpt-4o"),
+                "provider": provider,
+                "model": model,
                 "temperature": float(os.getenv("LLM_TEMPERATURE", "0.7")),
                 "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2000")),
-                "budget_usd": float(os.getenv("LLM_BUDGET_USD", "0")),  # 0 = unlimited
+                "budget_usd": float(os.getenv("LLM_BUDGET_USD", "0")),
             }
         self.config = config
         self._total_spend_usd = 0.0
@@ -134,29 +161,59 @@ class LLMClient:
     # ── Provider init (#3 异构) ────────────────────────────────────
 
     def _init_providers(self) -> None:
-        """Initialize provider clients once (connection pooling)."""
-        for provider_name, cls, extra in [
-            (
-                "openai",
-                OpenAIProvider,
-                lambda k: {
-                    "base_url": self.config.get("openai_base_url") or os.getenv("OPENAI_BASE_URL")
-                },
-            ),
-            ("groq", GroqProvider, lambda k: {}),
-            ("anthropic", AnthropicProvider, lambda k: {}),
-        ]:
+        """Initialize provider clients once (connection pooling).
+
+        All providers use OpenAI-compatible protocol. base_url from token metadata.
+        """
+        # Discover all active LLM tokens from DB
+        providers_to_init = set()
+        try:
+            rows = self.db.execute(
+                text("SELECT DISTINCT provider FROM tokens WHERE type='llm' AND is_active=TRUE")
+            ).fetchall()
+            for row in rows:
+                providers_to_init.add(row[0])
+        except Exception:
+            pass
+
+        # Always try well-known providers
+        for p in ["openai", "groq", "anthropic"]:
+            providers_to_init.add(p)
+
+        for provider_name in providers_to_init:
             api_key = self._get_api_key(provider_name)
-            if api_key:
-                try:
-                    kwargs = extra(api_key)
-                    kwargs = {k: v for k, v in kwargs.items() if v}
-                    self._providers[LLMProvider(provider_name)] = cls(api_key, **kwargs)
-                    logger.debug(f"Initialized {provider_name} provider")
-                except Exception as e:
-                    logger.warning(f"Failed to initialize {provider_name} provider: {e}")
-            else:
+            if not api_key:
                 logger.debug(f"No API key found for {provider_name}, skipping")
+                continue
+            try:
+                base_url = self._get_provider_base_url(provider_name)
+                # Groq and Anthropic have their own clients
+                if provider_name == "groq" and not base_url:
+                    self._providers[provider_name] = GroqProvider(api_key)
+                elif provider_name == "anthropic" and not base_url:
+                    self._providers[provider_name] = AnthropicProvider(api_key)
+                else:
+                    # Everything else: OpenAI-compatible with optional base_url
+                    kwargs = {"base_url": base_url} if base_url else {}
+                    self._providers[provider_name] = OpenAIProvider(api_key, **kwargs)
+                logger.debug(f"Initialized {provider_name} provider" + (f" (base_url={base_url})" if base_url else ""))
+            except Exception as e:
+                logger.warning(f"Failed to initialize {provider_name} provider: {e}")
+
+    def _get_provider_base_url(self, provider: str) -> str | None:
+        """Get base_url from token metadata or config."""
+        try:
+            row = self.db.execute(
+                text("SELECT metadata FROM tokens WHERE type='llm' AND provider=:provider AND is_active=TRUE ORDER BY created_at DESC LIMIT 1"),
+                {"provider": provider},
+            ).first()
+            if row and row.metadata:
+                meta = json.loads(row.metadata) if isinstance(row.metadata, str) else row.metadata
+                if meta.get("base_url"):
+                    return meta["base_url"]
+        except Exception:
+            pass
+        return self.config.get(f"{provider}_base_url")
 
     def _get_api_key(self, provider: str) -> str | None:
         """Get API key with scope-based resolution.
@@ -169,12 +226,11 @@ class LLMClient:
             if token:
                 return token.get("encrypted_value") or token.get("secret_ref")
 
-        # 2. Fallback to TokenResolver (user scope only)
-        if self.user_id:
-            token = self._resolve_llm_token(provider)
-            if token:
-                val = token.encrypted_value or token.secret_ref
-                return str(val) if val else None
+        # 2. Fallback to TokenResolver (user → global)
+        token = self._resolve_llm_token(provider)
+        if token:
+            val = token.encrypted_value or token.secret_ref
+            return str(val) if val else None
 
         # 3. Fallback to configs table (global)
         try:
@@ -191,23 +247,22 @@ class LLMClient:
         return None
 
     def _resolve_llm_token(self, provider: str):
-        """Resolve LLM token using TokenResolver logic."""
-        # User-scoped token
+        """Resolve LLM token: user-scoped first, then global."""
+        queries = []
         if self.user_id:
-            query = """
-                SELECT * FROM tokens
-                WHERE type = 'llm' AND provider = :provider
-                AND scope_user_id = :user_id AND is_active = TRUE
-                ORDER BY created_at DESC LIMIT 1
-            """
-            result = self.db.execute(
-                text(query),
-                {"provider": provider, "user_id": self.user_id}
-            )
+            queries.append((
+                "SELECT * FROM tokens WHERE type='llm' AND provider=:provider AND scope_user_id=:user_id AND is_active=TRUE ORDER BY created_at DESC LIMIT 1",
+                {"provider": provider, "user_id": self.user_id},
+            ))
+        queries.append((
+            "SELECT * FROM tokens WHERE type='llm' AND provider=:provider AND scope_user_id IS NULL AND is_active=TRUE ORDER BY created_at DESC LIMIT 1",
+            {"provider": provider},
+        ))
+        for sql, params in queries:
+            result = self.db.execute(text(sql), params)
             row = result.first()
             if row:
                 return self._token_from_row(row)
-
         return None
 
     def _token_from_row(self, row):
@@ -225,20 +280,13 @@ class LLMClient:
         for m in self.router.list_models():
             self.rate_limiter.configure(m.model_name, m.rpm_limit, m.tpm_limit)
 
-    def _get_provider(self, p: LLMProvider) -> BaseProvider:
-        provider = self._providers.get(p)
+    def _get_provider(self, p) -> BaseProvider:
+        name = p.value if isinstance(p, LLMProvider) else str(p)
+        provider = self._providers.get(name)
         if not provider:
-            scope_info = []
-            if self.user_id:
-                scope_info.append(f"user '{self.user_id}'")
-            scope_str = " for " + " and ".join(scope_info) if scope_info else ""
-
             raise ValueError(
-                f"Provider '{p.value}' is not configured{scope_str}.\n"
-                f"Please set the API key using one of:\n"
-                f"  1. Database: INSERT INTO tokens (type, provider, scope_user_id, encrypted_value) VALUES ('llm', '{p.value}', '{self.user_id or 'USER_ID'}', 'YOUR_KEY')\n"
-                f"  2. Environment: export {p.value.upper()}_API_KEY=YOUR_KEY\n"
-                f"  3. Config: Add '{p.value}_api_key' to configs table"
+                f"Provider '{name}' is not configured.\n"
+                f"Register via: mo-admin token create --type llm --provider {name} --scope global"
             )
         return provider
 
@@ -311,16 +359,17 @@ class LLMClient:
             # Unknown model — try direct with default provider
             chain = [
                 ModelConfig(
-                    model_name=model, provider=LLMProvider(self.config.get("provider", "openai"))
+                    model_name=model, provider=self.config.get("provider", "openai")
                 )
             ]
 
         last_error = None
         for model_cfg in chain:
-            breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
+            provider_name = model_cfg.provider.value if isinstance(model_cfg.provider, LLMProvider) else str(model_cfg.provider)
+            breaker = self.rate_limiter.get_breaker(provider_name)
             if not breaker.allow_request():
                 logger.warning(
-                    f"Circuit open for {model_cfg.provider.value}, skipping {model_cfg.model_name}"
+                    f"Circuit open for {provider_name}, skipping {model_cfg.model_name}"
                 )
                 continue
 
@@ -394,7 +443,7 @@ class LLMClient:
             self._log_call(
                 event_id,
                 user_id,
-                LLMProvider(self.config.get("provider", "openai")),
+                self.config.get("provider", "openai"),
                 None,
                 "failed",
                 error_message=str(e),
@@ -450,7 +499,7 @@ class LLMClient:
         if not chain:
             chain = [
                 ModelConfig(
-                    model_name=model, provider=LLMProvider(self.config.get("provider", "openai"))
+                    model_name=model, provider=self.config.get("provider", "openai")
                 )
             ]
 
@@ -528,7 +577,7 @@ class LLMClient:
         if not chain:
             chain = [
                 ModelConfig(
-                    model_name=model, provider=LLMProvider(self.config.get("provider", "openai"))
+                    model_name=model, provider=self.config.get("provider", "openai")
                 )
             ]
 
@@ -569,53 +618,41 @@ class LLMClient:
         metadata=None,
     ):
         log_id = str(uuid7())
+        provider_str = provider.value if isinstance(provider, LLMProvider) else str(provider)
         try:
             if response:
                 self.db.execute(
-                    """INSERT INTO llm_call_logs (
+                    text("""INSERT INTO llm_call_logs (
                         log_id, event_id, user_id, provider, model,
                         tokens_prompt, tokens_completion, tokens_total,
                         cost_usd, latency_ms, status, metadata, created_at
-                    ) VALUES (:p0, :p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8, :p9, :p10, :p11, :p12)""",
-                    (
-                        log_id,
-                        event_id,
-                        user_id,
-                        provider.value,
-                        response.model,
-                        response.tokens_prompt,
-                        response.tokens_completion,
-                        response.tokens_total,
-                        response.cost_usd,
-                        response.latency_ms,
-                        status,
-                        json.dumps(metadata) if metadata else None,
-                        datetime.now(timezone.utc),
-                    ),
+                    ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
+                        :tp, :tc, :tt, :cost, :lat, :status, :meta, :ts)"""),
+                    {
+                        "log_id": log_id, "event_id": event_id, "user_id": user_id,
+                        "provider": provider_str, "model": response.model,
+                        "tp": response.tokens_prompt, "tc": response.tokens_completion,
+                        "tt": response.tokens_total, "cost": response.cost_usd,
+                        "lat": response.latency_ms, "status": status,
+                        "meta": json.dumps(metadata) if metadata else None,
+                        "ts": datetime.now(timezone.utc),
+                    },
                 )
             else:
                 self.db.execute(
-                    """INSERT INTO llm_call_logs (
+                    text("""INSERT INTO llm_call_logs (
                         log_id, event_id, user_id, provider, model,
                         tokens_prompt, tokens_completion, tokens_total,
                         cost_usd, latency_ms, status, error_message, metadata, created_at
-                    ) VALUES (:p0, :p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8, :p9, :p10, :p11, :p12, :p13)""",
-                    (
-                        log_id,
-                        event_id,
-                        user_id,
-                        provider.value,
-                        "unknown",
-                        0,
-                        0,
-                        0,
-                        0.0,
-                        latency_ms,
-                        status,
-                        error_message,
-                        json.dumps(metadata) if metadata else None,
-                        datetime.now(timezone.utc),
-                    ),
+                    ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
+                        0, 0, 0, 0.0, :lat, :status, :err, :meta, :ts)"""),
+                    {
+                        "log_id": log_id, "event_id": event_id, "user_id": user_id,
+                        "provider": provider_str, "model": "unknown",
+                        "lat": latency_ms, "status": status, "err": error_message,
+                        "meta": json.dumps(metadata) if metadata else None,
+                        "ts": datetime.now(timezone.utc),
+                    },
                 )
         except Exception as e:
             logger.error(f"Failed to log LLM call: {e}")
@@ -643,7 +680,7 @@ class LLMClient:
                 log_id=r.log_id,
                 event_id=r.event_id,
                 user_id=r.user_id,
-                provider=LLMProvider(r.provider),
+                provider=r.provider,
                 model=r.model,
                 tokens_prompt=r.tokens_prompt,
                 tokens_completion=r.tokens_completion,

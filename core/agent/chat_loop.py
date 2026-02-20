@@ -93,10 +93,10 @@ Answer:"""
     try:
         response = llm_client.chat(
             messages=[{"role": "user", "content": prompt}],
+            user_id="system",
             temperature=0.0,  # Deterministic
-            max_tokens=10,
         )
-        answer = response.strip().lower()
+        answer = (response.content if hasattr(response, "content") else str(response)).strip().lower()
         return answer.startswith("yes")
     except Exception as e:
         logger.warning(f"Planning check failed: {e}, defaulting to no planning")

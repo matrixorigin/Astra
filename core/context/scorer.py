@@ -183,7 +183,14 @@ class RelevanceScorer:
         semantic_score = semantic_raw * weights.semantic
 
         # 2. Temporal score (exponential decay)
-        age_hours = (time.time() - candidate["created_at"].timestamp()) / 3600
+        created_at = candidate["created_at"]
+        if isinstance(created_at, str):
+            from datetime import datetime
+            try:
+                created_at = datetime.fromisoformat(created_at)
+            except (ValueError, TypeError):
+                created_at = None
+        age_hours = (time.time() - created_at.timestamp()) / 3600 if created_at else 24.0
         temporal_raw = 0.5 ** (age_hours / 24.0)  # Half-life of 24 hours
         temporal_score = temporal_raw * weights.temporal
 

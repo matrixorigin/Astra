@@ -450,7 +450,7 @@ class ContextManager:
 
         # Try to get from database first
         try:
-            return self.prompts.get_prompt(template_id)
+            return self.prompts.get_system_prompt(template_id)
         except Exception as e:
             logger.warning(f"Failed to load prompt from DB: {e}, using fallback")
             # Fallback to hardcoded

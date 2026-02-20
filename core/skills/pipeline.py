@@ -175,6 +175,12 @@ class SkillPipeline:
 
         self._feedback = _FeedbackBuffer(db)
 
+    def reload_skills(self, registry=None):
+        """Reload skills from DB after registration."""
+        self._modern.rule_selector._load_skills()
+        if registry is not None:
+            self._modern._registry = registry
+
     # ------------------------------------------------------------------
     # Stage 1 + 2: retrieve → rank → (apply corrections) → audit
     # ------------------------------------------------------------------

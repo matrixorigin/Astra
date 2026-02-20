@@ -39,13 +39,13 @@ class PromptManager:
         try:
             if version:
                 query = text("""
-                    SELECT template_content FROM prompt_templates
+                    SELECT content FROM prompt_templates
                     WHERE template_id = :template_id AND version = :version
                 """)
                 params = {"template_id": template_id, "version": version}
             else:
                 query = text("""
-                    SELECT template_content FROM prompt_templates
+                    SELECT content FROM prompt_templates
                     WHERE template_id = :template_id AND is_active = 1
                     ORDER BY created_at DESC LIMIT 1
                 """)
@@ -54,7 +54,7 @@ class PromptManager:
             result = self.db.execute(query, params).first()
 
             if result:
-                content = result.template_content
+                content = result.content
                 if not version:
                     self._cache[template_id] = content
                 return content
@@ -88,12 +88,11 @@ class PromptManager:
 
             self.db.execute(
                 text("""
-                INSERT INTO prompt_templates (template_id, template_name, template_content, version, is_active, created_at)
-                VALUES (:template_id, :name, :content, :version, :is_active, NOW())
+                INSERT INTO prompt_templates (template_id, version, content, is_active, created_at)
+                VALUES (:template_id, :version, :content, :is_active, NOW())
                 """),
                 {
                     "template_id": template_id,
-                    "name": template_id.replace("_", " ").title(),
                     "content": content,
                     "version": version,
                     "is_active": 1 if is_active else 0

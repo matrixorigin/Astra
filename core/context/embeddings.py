@@ -40,7 +40,48 @@ class EmbeddingService:
             try:
                 import openai
 
-                self.client = openai.OpenAI()
+                api_key = None
+                base_url = None
+                actual_provider = None
+                if self.db:
+                    try:
+                        from sqlalchemy import text
+                        # Try openai first, then any available provider
+                        for prov in ("openai", None):
+                            where = "type='llm' AND is_active=TRUE"
+                            if prov:
+                                where += f" AND provider='{prov}'"
+                            row = self.db.execute(
+                                text(f"SELECT encrypted_value, provider, metadata FROM tokens WHERE {where} ORDER BY created_at DESC LIMIT 1")
+                            ).first()
+                            if row:
+                                api_key = row[0]
+                                actual_provider = row[1]
+                                # Extract base_url from metadata
+                                meta = row[2]
+                                if meta:
+                                    import json as _json
+                                    try:
+                                        meta_dict = _json.loads(meta) if isinstance(meta, str) else meta
+                                        base_url = meta_dict.get("base_url")
+                                    except Exception:
+                                        pass
+                                break
+                    except Exception:
+                        pass
+                # Providers that don't support OpenAI-compatible embeddings
+                _NO_EMBED = {"deepseek", "groq"}
+                if not api_key or actual_provider in _NO_EMBED:
+                    if actual_provider in _NO_EMBED:
+                        logger.info(f"Provider '{actual_provider}' does not support embeddings, using mock")
+                    else:
+                        logger.info("No embedding-capable API key found, using mock")
+                    self.provider = "mock"
+                else:
+                    kwargs = {"api_key": api_key}
+                    if base_url:
+                        kwargs["base_url"] = base_url
+                    self.client = openai.OpenAI(**kwargs)
             except ImportError:
                 logger.warning("OpenAI not available, falling back to mock")
                 self.provider = "mock"
