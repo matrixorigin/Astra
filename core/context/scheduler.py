@@ -99,7 +99,9 @@ class GovernanceTaskRunner:
 
             try:
                 from core.context.lifecycle import MemoryGovernanceEngine
-                result = getattr(MemoryGovernanceEngine(db), f"run_{task_name}_tasks")()
+                engine = MemoryGovernanceEngine(db)
+                result = getattr(engine, f"run_{task_name}_tasks")()
+                self._persist_run(db, task_name, result)
                 logger.info(f"Governance [{task_name}]: {result}")
                 return result
             except Exception as e:
@@ -155,6 +157,30 @@ class GovernanceTaskRunner:
             db.commit()
         except Exception as e:
             logger.error(f"Lock release failed: {e}")
+
+    # ── Audit persistence ──────────────────────────────────────
+
+    @staticmethod
+    def _persist_run(db: Session, task_name: str, result: dict[str, int]) -> None:
+        """Write governance run result to governance_runs for trend tracking."""
+        import json
+        try:
+            db.execute(
+                text(
+                    "INSERT INTO governance_runs (task_name, result, created_at) "
+                    "VALUES (:task, :result, :ts)"
+                ),
+                {
+                    "task": task_name,
+                    "result": json.dumps(result),
+                    "ts": datetime.now(),
+                },
+            )
+            db.commit()
+        except Exception as e:
+            # Table may not exist yet — log and continue, don't break governance
+            logger.debug("governance_runs write skipped: %s", e)
+            db.rollback()
 
     # ── Heartbeat ───────────────────────────────────────────────
 

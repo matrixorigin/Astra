@@ -912,14 +912,40 @@ class ChatLoop:
                     data={"plan": plan.model_dump()},
                 )
 
-        # Final synthesis
+        # Final synthesis — with firewall verification + audit (aligned with non-stream path)
+        final_text = "Planning complete. Executing final synthesis..."
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DELTA,
-            data={"chunk": "Planning complete. Executing final synthesis..."},
+            data={"chunk": final_text},
         )
+
+        if context_capture_id:
+            verification = self.firewall.verify_response(
+                final_text, context_capture_id, mode="warn",
+            )
+            self.firewall.log_verification(
+                session_id, None, verification, context_capture_id,
+            )
+            if not verification.safe_to_deliver:
+                logger.warning(
+                    "[planning] Firewall: confidence=%.2f, failed=%s",
+                    verification.confidence_score, verification.claims_failed,
+                )
+                warning = (
+                    f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
+                    f"{verification.claims_failed} unverified claims."
+                )
+                yield StreamEvent(
+                    event_type=StreamEventType.TEXT_DELTA,
+                    data={"chunk": warning},
+                )
+                final_text += warning
+
+        self._log_response(user_id, session_id, final_text, None, None)
+
         yield StreamEvent(
             event_type=StreamEventType.RUN_FINISHED,
-            data={},
+            data={"context_capture_id": context_capture_id},
         )
 
     # ------------------------------------------------------------------

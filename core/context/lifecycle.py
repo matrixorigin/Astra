@@ -269,33 +269,63 @@ class MemoryGovernanceEngine:
         return reports
     
     def _get_user_memory_stats(self, user_id: str) -> dict[str, Any]:
-        """Get memory statistics for a user.
-        
-        Args:
-            user_id: User ID
-            
-        Returns:
-            Memory statistics
-        """
+        """Get memory statistics for a user."""
         from api.models import KnowledgeEntry
-        
+
         entries = self.db.query(KnowledgeEntry).filter(
             KnowledgeEntry.user_id == user_id
         ).all()
-        
+
         if not entries:
             return {
                 "total_entries": 0,
                 "avg_confidence": 0.0,
                 "low_confidence": 0,
             }
-        
+
         total = len(entries)
         avg_conf = sum(e.confidence for e in entries) / total
         low_conf = sum(1 for e in entries if e.confidence < 0.3)
-        
+
         return {
             "total_entries": total,
             "avg_confidence": avg_conf,
             "low_confidence": low_conf,
+        }
+
+    # ------------------------------------------------------------------
+    # Observable governance stats
+    # ------------------------------------------------------------------
+
+    def governance_stats(self) -> dict[str, Any]:
+        """Return verifiable governance health indicators.
+
+        Queries live DB state — suitable for dashboards, CLI output,
+        and automated acceptance checks.
+        """
+        from api.models import KnowledgeEntry
+
+        entries = self.db.query(KnowledgeEntry).all()
+        total = len(entries)
+        if total == 0:
+            return {"total_entries": 0}
+
+        confidences = [e.confidence for e in entries]
+        tier_counts: dict[str, int] = {}
+        quarantined = 0
+        for e in entries:
+            tier_counts[e.trust_tier] = tier_counts.get(e.trust_tier, 0) + 1
+            if e.confidence < 0.3:
+                quarantined += 1
+
+        contradictions = self._scan_contradictions()
+
+        return {
+            "total_entries": total,
+            "avg_confidence": sum(confidences) / total,
+            "min_confidence": min(confidences),
+            "quarantined": quarantined,
+            "quarantine_pct": round(quarantined / total * 100, 1),
+            "tier_distribution": tier_counts,
+            "contradictions": contradictions,
         }

@@ -186,7 +186,51 @@ TRUST_TIER_HALF_LIVES = {
 }
 ```
 
-## Monitoring
+## Monitoring & Observability
+
+### Governance Stats (Acceptance Indicators)
+
+```python
+from core.context.lifecycle import MemoryGovernanceEngine
+
+engine = MemoryGovernanceEngine(db)
+stats = engine.governance_stats()
+# {
+#   "total_entries": 1200,
+#   "avg_confidence": 0.72,
+#   "min_confidence": 0.08,
+#   "quarantined": 45,
+#   "quarantine_pct": 3.8,
+#   "tier_distribution": {"T1": 120, "T2": 400, "T3": 580, "T4": 100},
+#   "contradictions": 2
+# }
+```
+
+**Acceptance criteria:**
+- `avg_confidence` should stay above 0.5 (decay is working but not over-aggressive)
+- `quarantine_pct` < 10% (healthy knowledge base)
+- `contradictions` trending toward 0 (weekly scan is resolving conflicts)
+
+### Governance Run History (Trend Tracking)
+
+Every `GovernanceTaskRunner.run()` persists results to `governance_runs`:
+
+```sql
+CREATE TABLE governance_runs (
+  task_name VARCHAR(32) NOT NULL,
+  result JSON NOT NULL,
+  created_at DATETIME NOT NULL,
+  INDEX idx_task_created (task_name, created_at)
+);
+
+-- Trend query: daily quarantine count over last 30 days
+SELECT DATE(created_at) AS day,
+       JSON_EXTRACT(result, '$.quarantined') AS quarantined
+FROM governance_runs
+WHERE task_name = 'daily'
+  AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+ORDER BY day;
+```
 
 ### Logs
 
