@@ -167,6 +167,7 @@ class ChatLoop:
         self.agent_id = agent_id
         self.scratchpad = scratchpad
         self.continuity = continuity
+        self.observer = None  # Set via set_observer()
 
     async def run_step(
         self,
@@ -231,12 +232,25 @@ class ChatLoop:
                 response.content or "",
                 user_event.event_id,
                 user_event.causal_chain_id,
+                messages=messages,
             )
             return response.content or ""
 
         # 6. Multi-turn tool use loop
+        # Pre-fetch observations once (avoid N+1 in tool loop)
+        _obs_section = None
+        if self.observer and user_id:
+            _obs = self.observer.get_observations(user_id, session_id)
+            _obs_section = self.observer.format_for_context(_obs) if _obs else None
+
         last_skill_name: str | None = None
         for _round in range(MAX_TOOL_ROUNDS):
+            # Replace observed messages with observations (before compaction)
+            if _obs_section:
+                messages = self.observer.build_context_with_observations(
+                    messages, user_id, session_id, _cached_obs_section=_obs_section,
+                )
+
             # Compact if approaching context limit
             from core.context.compaction import compact, needs_compaction
             max_tokens = self.llm.config.get("max_context_tokens", 128000)
@@ -283,6 +297,7 @@ class ChatLoop:
                     final_content,
                     user_event.event_id,
                     user_event.causal_chain_id,
+                    messages=messages,
                 )
                 return final_content or ""
 
@@ -410,6 +425,7 @@ class ChatLoop:
             final_content,
             user_event.event_id,
             user_event.causal_chain_id,
+            messages=messages,
         )
         return final_content
 
@@ -567,7 +583,8 @@ class ChatLoop:
             agent_id=self.agent_id,
             )
             self._log_response(
-                user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id
+                user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
+                messages=messages,
             )
 
             run_finished_event = self.event_logger.create_stream_event(
@@ -588,8 +605,19 @@ class ChatLoop:
             return
 
         # Multi-turn tool use loop with streaming
+        # Pre-fetch observations once
+        _obs_section = None
+        if self.observer and user_id:
+            _obs = self.observer.get_observations(user_id, session_id)
+            _obs_section = self.observer.format_for_context(_obs) if _obs else None
+
         last_skill_name: str | None = None
         for _round in range(MAX_TOOL_ROUNDS):
+            if _obs_section:
+                messages = self.observer.build_context_with_observations(
+                    messages, user_id, session_id, _cached_obs_section=_obs_section,
+                )
+
             # Compact if approaching context limit
             from core.context.compaction import compact, needs_compaction
             max_tokens = self.llm.config.get("max_context_tokens", 128000)
@@ -659,7 +687,8 @@ class ChatLoop:
             agent_id=self.agent_id,
                 )
                 self._log_response(
-                    user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id
+                    user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
+                    messages=messages,
                 )
 
                 run_finished_event = self.event_logger.create_stream_event(
@@ -966,7 +995,8 @@ class ChatLoop:
             full_text += warning
 
         self._log_response(
-            user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id
+            user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
+            messages=messages,
         )
         yield StreamEvent(
             event_type=StreamEventType.RUN_FINISHED,
@@ -1261,6 +1291,16 @@ class ChatLoop:
             if section:
                 system_parts.append(section)
 
+        # Inject observational memory: replace observed messages with observations
+        # (done after full message assembly via build_context_with_observations)
+        # Observations are injected in system prompt here for the initial build;
+        # message replacement happens in the tool loop via observer.build_context_with_observations
+        if self.observer and user_id:
+            observations = self.observer.get_observations(user_id, session_id)
+            obs_section = self.observer.format_for_context(observations)
+            if obs_section:
+                system_parts.append(obs_section)
+
         # Inject active scratchpad notes into system prompt
         if self.scratchpad and session_id:
             notes = self.scratchpad.get_active_notes(session_id)
@@ -1276,6 +1316,40 @@ class ChatLoop:
         messages.append({"role": "user", "content": user_input})
         return messages
 
+    def set_observer(self, observer) -> None:
+        """Attach an Observer for post-turn observation extraction."""
+        self.observer = observer
+
+    def _run_observer(
+        self, session_id: str, user_id: str, messages: list[dict[str, Any]]
+    ) -> None:
+        """Post-turn hook: run Observer on conversation messages.
+
+        Runs in a background thread with its own DB session.
+        No shared mutable state — observed index is DB-backed.
+        """
+        if not self.observer:
+            return
+        import threading
+
+        # Capture LLM reference (immutable) — no shared mutable state
+        llm_client = self.observer.llm
+
+        def _bg():
+            try:
+                from api.database import get_db_session
+                bg_db = next(get_db_session())
+                try:
+                    from core.memory.observer import Observer
+                    bg_observer = Observer(bg_db, llm_client=llm_client)
+                    bg_observer.observe(session_id=session_id, user_id=user_id, messages=messages)
+                finally:
+                    bg_db.close()
+            except Exception as e:
+                logger.warning(f"Observer failed (non-fatal): {e}")
+
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _log_response(
         self,
         user_id: str,
@@ -1283,8 +1357,9 @@ class ChatLoop:
         content: str,
         parent_event_id: str,
         causal_chain_id: str | None,
+        messages: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Log the final agent response as an event."""
+        """Log the final agent response as an event, then run Observer."""
         self.event_logger.create_llm_response(
             user_id=user_id,
             session_id=session_id,
@@ -1295,3 +1370,6 @@ class ChatLoop:
             causal_chain_id=causal_chain_id or "",
             llm_model_used=self.llm.config.get("model", "unknown"),
         )
+        # Post-turn: run Observer on the conversation messages
+        if messages:
+            self._run_observer(session_id, user_id, messages)

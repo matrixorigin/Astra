@@ -473,3 +473,31 @@ class AgentScratchpad(Base):
     
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class Observation(Base):
+    """Observational memory: structured observations extracted by Observer agent."""
+    __tablename__ = "observations"
+
+    observation_id = Column(String(64), primary_key=True)
+    user_id = Column(String(64), nullable=False, index=True)
+    session_id = Column(String(64), nullable=False, index=True)
+
+    # Content
+    content = Column(Text, nullable=False)          # Structured observation text
+    priority = Column(String(10), default="medium")  # high / medium / low
+    observation_type = Column(String(50))            # preference / decision / fact / action / pattern
+
+    # Temporal anchoring (Mastra's 3-date model)
+    observed_at = Column(DateTime, nullable=False)   # When observation was created
+    referenced_at = Column(DateTime)                 # Date mentioned in content (e.g. "my flight is Jan 31")
+
+    # Provenance
+    source_event_ids = Column(JSON, nullable=False)  # Events that produced this observation
+
+    # Lifecycle
+    is_reflected = Column(TINYINT(1), server_default="0")  # Consumed by Reflector
+    version = Column(Integer, default=1)             # Bumped on reflection rewrite
+    observed_msg_index = Column(Integer, default=0)  # Messages observed up to this index
+
+    created_at = Column(DateTime, default=func.now())

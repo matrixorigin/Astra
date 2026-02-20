@@ -132,6 +132,11 @@ def chat(user_id, model, mode):
     from core.code_executor import CodeExecutor
     code_executor = CodeExecutor(runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db=db)
 
+    # Observational memory
+    from core.memory.observer import Observer
+    observer = Observer(db, llm_client=llm_client)
+    chat_loop.set_observer(observer)
+
     register_builtin_skills(
         skill_registry, db, agent_registry=agent_registry,
         chat_loop_factory=create_chat_loop, code_executor=code_executor,

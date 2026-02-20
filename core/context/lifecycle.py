@@ -65,8 +65,9 @@ class MemoryGovernanceEngine:
         >>> engine.run_weekly_tasks()
     """
     
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, llm_client=None):
         self.db = db
+        self.llm_client = llm_client
     
     def run_hourly_tasks(self) -> dict[str, int]:
         """Run hourly governance tasks.
@@ -78,6 +79,13 @@ class MemoryGovernanceEngine:
         
         # Archive closed working memory (scratchpad notes)
         results["archived_notes"] = self._archive_closed_notes()
+
+        # Run Reflector on accumulated observations (condense if over threshold)
+        try:
+            results["observations_reflected"] = self._run_reflector()
+        except Exception as e:
+            logger.error(f"Reflector failed: {e}")
+            results["observations_reflected"] = 0
 
         # Sandbox cleanup (expired, zombie sessions, orphans)
         try:
@@ -145,6 +153,25 @@ class MemoryGovernanceEngine:
         
         logger.debug(f"Archived {count} completed notes")
         return count
+
+    def _run_reflector(self) -> int:
+        """Run Reflector on all users with accumulated observations."""
+        from api.models import Observation
+        from sqlalchemy import distinct
+
+        user_ids = self.db.query(distinct(Observation.user_id)).filter(
+            Observation.is_reflected == 0
+        ).all()
+
+        total = 0
+        for (user_id,) in user_ids:
+            from core.memory.reflector import Reflector
+            reflector = Reflector(self.db, llm_client=self.llm_client)
+            result = reflector.reflect(user_id)
+            if result.get("reflected"):
+                total += result.get("before", 0) - result.get("after", 0)
+
+        return total
     
     def _apply_confidence_decay(self) -> int:
         """Apply confidence decay to all knowledge entries.

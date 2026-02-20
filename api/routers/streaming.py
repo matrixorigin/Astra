@@ -95,6 +95,10 @@ async def stream_chat(
         firewall=firewall,
     )
 
+    # Observational memory
+    from core.memory.observer import Observer
+    chat_loop.set_observer(Observer(db, llm_client=llm_client))
+
     async def event_generator():
         """Generate SSE events."""
         try:
