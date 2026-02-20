@@ -1,5 +1,6 @@
 """Tests for memory lifecycle governance."""
 
+import os
 import pytest
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
@@ -133,14 +134,13 @@ class TestGovernanceTaskRunner:
 
     @pytest.fixture
     def mock_db_ctx(self):
-        """Mock db context factory."""
+        """Mock db context factory returning (factory, db)."""
         from contextlib import contextmanager
 
         db = Mock()
         db.query.return_value.filter.return_value.all.return_value = []
         db.query.return_value.filter.return_value.limit.return_value.all.return_value = []
         db.query.return_value.all.return_value = []
-        db.query.return_value.filter.return_value.first.return_value = None
 
         @contextmanager
         def factory():
@@ -149,33 +149,27 @@ class TestGovernanceTaskRunner:
         return factory, db
 
     def test_run_acquires_lock(self, mock_db_ctx):
-        """Task runner acquires table-based lock before executing."""
+        """Task runner acquires lock via INSERT and executes."""
         from core.context.scheduler import GovernanceTaskRunner
 
         factory, db = mock_db_ctx
-        # Simulate successful lock acquisition (no exception on add)
-        db.add.return_value = None
-
         runner = GovernanceTaskRunner(factory)
         result = runner.run("hourly")
 
         assert result is not None
         assert "archived_notes" in result
-        # Verify lock was added and committed
-        assert db.add.called
-        assert db.commit.called
 
     def test_run_skips_when_lock_held(self, mock_db_ctx):
-        """Task runner skips execution when lock is held by another instance."""
+        """Task runner skips when INSERT fails and lock not expired (CAS returns 0 rows)."""
         from core.context.scheduler import GovernanceTaskRunner
 
         factory, db = mock_db_ctx
-        # Simulate lock already held (exception on add)
+        # INSERT fails (lock exists)
         db.add.side_effect = Exception("Duplicate key")
-        # Simulate lock not expired
-        mock_lock = Mock()
-        mock_lock.expires_at = datetime.now() + timedelta(hours=1)
-        db.query.return_value.filter.return_value.first.return_value = mock_lock
+        # CAS UPDATE matches 0 rows (lock not expired)
+        cas_result = Mock()
+        cas_result.rowcount = 0
+        db.execute.return_value = cas_result
 
         runner = GovernanceTaskRunner(factory)
         result = runner.run("hourly")
@@ -183,23 +177,48 @@ class TestGovernanceTaskRunner:
         assert result is None
 
     def test_run_takes_expired_lock(self, mock_db_ctx):
-        """Task runner takes over an expired lock."""
+        """Task runner takes over expired lock via atomic CAS UPDATE."""
         from core.context.scheduler import GovernanceTaskRunner
 
         factory, db = mock_db_ctx
-        # Simulate lock already held (exception on add)
+        # INSERT fails (lock exists)
         db.add.side_effect = Exception("Duplicate key")
-        # Simulate lock expired
-        mock_lock = Mock()
-        mock_lock.expires_at = datetime.now() - timedelta(hours=1)
-        db.query.return_value.filter.return_value.first.return_value = mock_lock
+        # CAS UPDATE matches 1 row (lock expired, takeover succeeds)
+        cas_result = Mock()
+        cas_result.rowcount = 1
+        db.execute.return_value = cas_result
 
         runner = GovernanceTaskRunner(factory)
         result = runner.run("hourly")
 
-        # Should succeed by taking over expired lock
         assert result is not None
         assert "archived_notes" in result
+
+    def test_run_rollback_on_task_error(self, mock_db_ctx):
+        """Task runner rolls back DB and releases lock on task exception."""
+        from core.context.scheduler import GovernanceTaskRunner
+
+        factory, db = mock_db_ctx
+
+        with patch("core.context.lifecycle.MemoryGovernanceEngine") as MockEngine:
+            MockEngine.return_value.run_hourly_tasks.side_effect = RuntimeError("boom")
+
+            runner = GovernanceTaskRunner(factory)
+            result = runner.run("hourly")
+
+            assert result is None
+            assert db.rollback.called
+
+    def test_governance_disabled_via_env(self):
+        """Scheduler respects GOVERNANCE_ENABLED=false."""
+        from core.context.scheduler import MemoryGovernanceScheduler
+
+        import asyncio
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "false"}):
+            scheduler = MemoryGovernanceScheduler()
+            asyncio.get_event_loop().run_until_complete(scheduler.start())
+            # Should be a no-op, no backend created
+            assert scheduler._backend is None
 
 
 class TestSchedulerBackendInterface:

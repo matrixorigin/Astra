@@ -1,7 +1,7 @@
 """Memory governance scheduler — abstract interface + pluggable backends.
 
 Architecture:
-    GovernanceTaskRunner  (abstract)  — what to run
+    GovernanceTaskRunner  — what to run (with distributed locking)
     SchedulerBackend      (abstract)  — how to schedule
     MemoryGovernanceScheduler         — wires them together
 
@@ -10,9 +10,10 @@ Backends:
     (pluggable)      — Celery, APScheduler, Temporal, K8s CronJob, etc.
 
 Distributed safety:
-    TaskRunner acquires a DB lock (distributed_locks table) before executing.
-    Multiple instances can run the same schedule — only one wins per cycle.
-    Lock expires after heartbeat_timeout to handle crashed instances.
+    - DB table lock (distributed_locks) with heartbeat renewal
+    - Atomic CAS for expired lock takeover
+    - Safe across multi-worker / multi-instance deployments
+    - Controlled via GOVERNANCE_ENABLED env var
 """
 
 from __future__ import annotations
@@ -20,11 +21,12 @@ from __future__ import annotations
 import asyncio
 import os
 import socket
+import threading
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
@@ -39,8 +41,8 @@ GOVERNANCE_TASKS: dict[str, dict[str, Any]] = {
     "weekly":  {"interval": 604800, "lock_name": "governance_weekly"},
 }
 
-# Lock expiry: if instance crashes, lock auto-expires after this
-LOCK_HEARTBEAT_TIMEOUT = 300  # 5 minutes
+LOCK_TTL = 300          # 5 min — lock expires if no heartbeat
+HEARTBEAT_INTERVAL = 60  # renew every 60s during task execution
 
 
 # ── Abstract interfaces ────────────────────────────────────────────
@@ -61,104 +63,121 @@ class SchedulerBackend(ABC):
         """Gracefully stop all scheduled tasks."""
 
 
-class GovernanceTaskRunner:
-    """Executes governance tasks with distributed locking.
+# ── Task runner with distributed locking ────────────────────────────
 
-    Each task acquires a DB-level lock (distributed_locks table) so that
-    across N replicas, only one instance runs a given task per cycle.
+class GovernanceTaskRunner:
+    """Executes governance tasks with distributed locking + heartbeat.
+
+    Safety guarantees:
+    - Atomic lock acquisition (INSERT) and takeover (UPDATE ... WHERE)
+    - Heartbeat thread renews expires_at during long tasks
+    - Rollback on exception before lock release
+    - Multiple workers/instances safe — only one wins per cycle
     """
 
     def __init__(self, db_context_factory: Callable):
-        """Args:
-            db_context_factory: callable returning a context-manager that yields a Session.
-                                e.g. ``api.database.get_db_context``
-        """
         self._db_ctx = db_context_factory
-        self._instance_id = self._get_instance_id()
-
-    @staticmethod
-    def _get_instance_id() -> str:
-        """Generate unique instance ID: hostname:pid"""
-        return f"{socket.gethostname()}:{os.getpid()}"
+        self._instance_id = f"{socket.gethostname()}:{os.getpid()}"
 
     def run(self, task_name: str) -> dict[str, int] | None:
-        """Run a governance task if lock is acquired.
-
-        Returns:
-            Task results dict, or None if another instance holds the lock.
-        """
+        """Run a governance task if lock is acquired."""
         lock_name = GOVERNANCE_TASKS[task_name]["lock_name"]
-        method = f"run_{task_name}_tasks"
 
         with self._db_ctx() as db:
-            if not self._try_acquire_lock(db, lock_name):
-                logger.debug(f"Governance [{task_name}]: skipped (lock held by another instance)")
+            if not self._try_acquire(db, lock_name):
+                logger.debug(f"Governance [{task_name}]: skipped (lock held)")
                 return None
+
+            # Start heartbeat thread to renew lock during execution
+            stop_heartbeat = threading.Event()
+            hb = threading.Thread(
+                target=self._heartbeat_loop,
+                args=(lock_name, self._instance_id, stop_heartbeat),
+                daemon=True,
+            )
+            hb.start()
 
             try:
                 from core.context.lifecycle import MemoryGovernanceEngine
-                result = getattr(MemoryGovernanceEngine(db), method)()
+                result = getattr(MemoryGovernanceEngine(db), f"run_{task_name}_tasks")()
                 logger.info(f"Governance [{task_name}]: {result}")
                 return result
+            except Exception as e:
+                logger.error(f"Governance [{task_name}] task error: {e}")
+                db.rollback()
+                return None
             finally:
-                self._release_lock(db, lock_name)
+                stop_heartbeat.set()
+                hb.join(timeout=5)
+                self._release(db, lock_name)
 
-    def _try_acquire_lock(self, db: Session, lock_name: str) -> bool:
-        """Try to acquire a distributed lock.
-        
-        Returns True if lock acquired, False if held by another instance.
-        """
-        from api.models import DistributedLock
+    # ── Lock operations ─────────────────────────────────────────
 
+    def _try_acquire(self, db: Session, lock_name: str) -> bool:
+        """Try INSERT; on conflict, atomic CAS takeover if expired."""
         now = datetime.now()
-        expires_at = now + timedelta(seconds=LOCK_HEARTBEAT_TIMEOUT)
+        expires_at = now + timedelta(seconds=LOCK_TTL)
 
+        # Fast path: try insert
         try:
-            # Try to insert new lock (will fail if lock_name already exists)
-            lock = DistributedLock(
+            from api.models import DistributedLock
+            db.add(DistributedLock(
                 lock_name=lock_name,
                 instance_id=self._instance_id,
                 acquired_at=now,
                 expires_at=expires_at,
-                task_name=lock_name.split("_", 1)[1],  # e.g. "hourly" from "governance_hourly"
-            )
-            db.add(lock)
+                task_name=lock_name.split("_", 1)[1],
+            ))
             db.commit()
             return True
         except Exception:
-            # Lock already exists; check if expired
-            try:
-                existing = db.query(DistributedLock).filter(
-                    DistributedLock.lock_name == lock_name
-                ).first()
-                
-                if existing and existing.expires_at < now:
-                    # Lock expired; take it over
-                    existing.instance_id = self._instance_id
-                    existing.acquired_at = now
-                    existing.expires_at = expires_at
-                    db.commit()
-                    return True
-                
-                return False
-            except Exception as e:
-                logger.error(f"Lock check failed: {e}")
-                return False
+            db.rollback()
+
+        # Slow path: atomic CAS — take over only if expired
+        result = db.execute(
+            text(
+                "UPDATE distributed_locks "
+                "SET instance_id = :iid, acquired_at = :now, expires_at = :exp "
+                "WHERE lock_name = :name AND expires_at < :now"
+            ),
+            {"iid": self._instance_id, "now": now, "exp": expires_at, "name": lock_name},
+        )
+        db.commit()
+        return result.rowcount > 0
 
     @staticmethod
-    def _release_lock(db: Session, lock_name: str) -> None:
-        """Release a distributed lock."""
-        from api.models import DistributedLock
-
+    def _release(db: Session, lock_name: str) -> None:
         try:
-            db.query(DistributedLock).filter(
-                DistributedLock.lock_name == lock_name
-            ).delete()
+            db.execute(
+                text("DELETE FROM distributed_locks WHERE lock_name = :name"),
+                {"name": lock_name},
+            )
             db.commit()
         except Exception as e:
             logger.error(f"Lock release failed: {e}")
 
-# ── Default backend: asyncio (single-process) ──────────────────────
+    # ── Heartbeat ───────────────────────────────────────────────
+
+    def _heartbeat_loop(self, lock_name: str, instance_id: str, stop: threading.Event):
+        """Renew lock expires_at periodically during task execution."""
+        while not stop.wait(HEARTBEAT_INTERVAL):
+            try:
+                with self._db_ctx() as db:
+                    new_exp = datetime.now() + timedelta(seconds=LOCK_TTL)
+                    db.execute(
+                        text(
+                            "UPDATE distributed_locks "
+                            "SET expires_at = :exp "
+                            "WHERE lock_name = :name AND instance_id = :iid"
+                        ),
+                        {"exp": new_exp, "name": lock_name, "iid": instance_id},
+                    )
+                    db.commit()
+            except Exception as e:
+                logger.warning(f"Heartbeat renewal failed: {e}")
+
+
+# ── Default backend: asyncio ───────────────────────────────────────
 
 class AsyncIOBackend(SchedulerBackend):
     """Zero-dependency asyncio backend. Good for dev and small deploys."""
@@ -195,31 +214,36 @@ class AsyncIOBackend(SchedulerBackend):
 class MemoryGovernanceScheduler:
     """Façade: wires task runner + backend.
 
+    Controlled by GOVERNANCE_ENABLED env var (default: true).
+    Safe to start in every worker — lock ensures single execution.
+
     Usage (default — asyncio):
         scheduler = MemoryGovernanceScheduler()
         await scheduler.start()
-        ...
-        await scheduler.stop()
 
-    Usage (custom backend — e.g. Celery):
-        runner = GovernanceTaskRunner(get_db_context)
-        backend = CeleryBackend(runner)          # you implement this
-        scheduler = MemoryGovernanceScheduler(backend=backend)
+    Usage (custom backend):
+        scheduler = MemoryGovernanceScheduler(backend=my_celery_backend)
         await scheduler.start()
     """
 
     def __init__(self, backend: SchedulerBackend | None = None):
-        if backend is None:
+        self._enabled = os.environ.get("GOVERNANCE_ENABLED", "true").lower() == "true"
+        if backend is None and self._enabled:
             from api.database import get_db_context
             runner = GovernanceTaskRunner(get_db_context)
             backend = AsyncIOBackend(runner)
         self._backend = backend
 
     async def start(self) -> None:
+        if not self._enabled:
+            logger.info("Memory governance scheduler disabled (GOVERNANCE_ENABLED=false)")
+            return
         tasks = {name: cfg["interval"] for name, cfg in GOVERNANCE_TASKS.items()}
         await self._backend.start(tasks)
         logger.info("Memory governance scheduler started")
 
     async def stop(self) -> None:
+        if not self._enabled or not self._backend:
+            return
         await self._backend.stop()
         logger.info("Memory governance scheduler stopped")
