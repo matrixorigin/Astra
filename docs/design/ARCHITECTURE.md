@@ -79,7 +79,7 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Skills and Tools](skills-and-tools.md) | Skill system, MCP compatibility, tool design, side-effect profiles, progressive disclosure |
 | [Unified Selector Pipeline](unified-selector-pipeline.md) | Skill selection: retrieve → audit → feedback pipeline |
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
-| [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, snapshot-scoped permissions, training data pipeline |
+| [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt evolution, self-improving agents, meta-learning closed loop |
 
 ### Supporting Documents (Implementation)

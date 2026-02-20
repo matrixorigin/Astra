@@ -432,23 +432,9 @@ For user business data (workflow 5, and workflows 1-3 applied to user data): thi
 
 ---
 
-## 7. Snapshot-Scoped Permissions (Future)
+## 7. Cost-Aware Branching (Implemented)
 
-Bind access control to data versions:
-
-```python
-# Grant read access to a specific snapshot
-permissions.grant(user="auditor_bob", snapshot="audit_q1_2026", access="read")
-
-# Time-bounded access
-permissions.grant(user="contractor", snapshot="project_x", access="read", expires="2026-03-01")
-```
-
-This enables: auditors see only the data they need, contractors get time-limited access, experiments are isolated by permission scope.
-
----
-
-## 7. Cost-Aware Branching
+> **Implementation**: `core/sandbox/cost_predictor.py` — `BranchCostPredictor` class, 12 unit tests passing.
 
 Before creating branches or running experiments:
 

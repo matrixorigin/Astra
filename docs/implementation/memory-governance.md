@@ -356,5 +356,5 @@ GROUP BY lock_name;
 - [ ] Temporal backend implementation
 - [ ] K8s CronJob backend implementation
 - [ ] Governance event audit trail
-- [ ] Per-tenant governance policies
+- [ ] Per-user governance policies
 - [ ] Adaptive decay based on usage patterns

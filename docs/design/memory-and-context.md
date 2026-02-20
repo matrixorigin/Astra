@@ -148,7 +148,7 @@ ORDER BY effective_confidence DESC;
 │      compare against stored content                     │
 │    - Contradiction scan: find semantically similar       │
 │      entries with conflicting claims                    │
-│    - Generate memory health report per tenant            │
+│    - Generate memory health report per user               │
 │                                                         │
 │  All actions logged as governance_events (auditable)    │
 └─────────────────────────────────────────────────────────┘
@@ -684,7 +684,7 @@ Severity classification:
       → Quarantine immediately
       → Identify affected decisions (via context_snapshots)
       → Flag affected decisions for re-evaluation
-      → Alert tenant admin
+      → Alert admin
 ```
 
 ### Cascade Impact Analysis

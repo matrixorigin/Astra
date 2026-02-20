@@ -35,7 +35,6 @@ mo-agent-engine/
 │   ├── verification/       # HallucinationFirewall
 │   ├── query/              # Natural language query
 │   ├── git_for_data.py     # Snapshot, time-travel, clone
-│   ├── tenancy.py          # Tenant context (deployment-layer)
 │   └── validation.py       # Input validation utilities
 │
 ├── cli/                    # Command-line interfaces

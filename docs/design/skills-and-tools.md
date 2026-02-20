@@ -78,6 +78,8 @@ Upgrade  → New version triggers regression gate (see trust-and-safety.md)
 
 ## 2. MCP / A2A Compatibility Layer
 
+> **MCP Status**: ✅ Implemented — `core/skills/mcp_bridge.py` (`MCPBridge` class), supports stdio + streamable HTTP transports, namespaced tool names, integrated into ChatLoop (3 execution paths). 12 unit tests passing.
+
 MCP and A2A are interoperability protocols — useful for ecosystem integration, but not architectural drivers. Our Skill abstraction is strictly more powerful (versioned, auditable, sandboxable). MCP/A2A are thin adapters on top.
 
 ### Why Support MCP (But Not Center On It)

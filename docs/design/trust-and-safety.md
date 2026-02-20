@@ -451,7 +451,7 @@ class SupervisionPolicy:
     name: str
     trigger: SupervisionTrigger    # WHEN to involve human
     action: SupervisionAction      # WHAT happens
-    scope: str                     # agent / tenant / global
+    scope: str                     # agent / global
 
 @dataclass
 class SupervisionTrigger:
@@ -492,7 +492,7 @@ policies:
   - name: "long-plan-checkpoint"
     trigger: { plan_depth_exceeds: 5 }
     action: approve_reject  # approve plan before execution begins
-    scope: tenant
+    scope: global
 
   - name: "new-skill-observation"
     trigger: { novel_skill_use: true }
