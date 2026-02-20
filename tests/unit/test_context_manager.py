@@ -53,6 +53,38 @@ class TestTaskType:
         assert TaskType("planning") == TaskType.PLANNING
 
 
+class TestClassifyTask:
+    """Tests for auto task classification."""
+
+    def test_code_review_keywords(self):
+        assert ContextManager.classify_task("Please review this PR") == TaskType.CODE_REVIEW
+        assert ContextManager.classify_task("code review for auth module") == TaskType.CODE_REVIEW
+        assert ContextManager.classify_task("refactor the parser") == TaskType.CODE_REVIEW
+
+    def test_debugging_keywords(self):
+        assert ContextManager.classify_task("debug this error") == TaskType.DEBUGGING
+        assert ContextManager.classify_task("fix the crash in login") == TaskType.DEBUGGING
+        assert ContextManager.classify_task("there's a traceback here") == TaskType.DEBUGGING
+
+    def test_planning_keywords(self):
+        assert ContextManager.classify_task("plan the migration") == TaskType.PLANNING
+        assert ContextManager.classify_task("design a new API") == TaskType.PLANNING
+        assert ContextManager.classify_task("create a roadmap") == TaskType.PLANNING
+
+    def test_general_fallback(self):
+        assert ContextManager.classify_task("hello world") == TaskType.GENERAL
+        assert ContextManager.classify_task("what is this?") == TaskType.GENERAL
+
+    def test_case_insensitive(self):
+        assert ContextManager.classify_task("DEBUG this") == TaskType.DEBUGGING
+        assert ContextManager.classify_task("REVIEW my code") == TaskType.CODE_REVIEW
+
+    def test_first_match_wins(self):
+        """When multiple keywords match, first TaskType in iteration order wins."""
+        result = ContextManager.classify_task("review and debug this")
+        assert result in (TaskType.CODE_REVIEW, TaskType.DEBUGGING)
+
+
 class TestContextFragment:
     """Tests for ContextFragment dataclass."""
 
@@ -78,62 +110,55 @@ class TestAllocateBudget:
     """Test token budget allocation."""
 
     def test_code_review_budget(self, context_manager):
-        """Test CODE_REVIEW budget allocation (60% code, 20% history, 20% docs)."""
-        total_tokens = 10000
-        budget = context_manager._allocate_budget(total_tokens, TaskType.CODE_REVIEW)
+        """Test CODE_REVIEW budget allocation (design: code 50%, history 20%, docs 20%, logs 10%)."""
+        budget = context_manager._allocate_budget(10000, TaskType.CODE_REVIEW)
 
-        # Fixed allocations
-        assert budget["system"] == 500
-        assert budget["skills"] == 1000
-        assert budget["reserve"] == 500
+        assert budget["system"] == {"allocated": 500, "used": 0}
+        assert budget["skills"] == {"allocated": 1000, "used": 0}
+        assert budget["reserve"] == {"allocated": 500, "used": 0}
 
-        # Dynamic allocations (10000 - 2000 = 8000 available)
         available = 8000
-        assert budget["code"] == int(available * 0.6)  # 4800
-        assert budget["history"] == int(available * 0.2)  # 1600
-        assert budget["docs"] == int(available * 0.2)  # 1600
+        assert budget["code"]["allocated"] == int(available * 0.50)
+        assert budget["history"]["allocated"] == int(available * 0.20)
+        assert budget["docs"]["allocated"] == int(available * 0.20)
+        assert budget["logs"]["allocated"] == int(available * 0.10)
 
     def test_planning_budget(self, context_manager):
-        """Test PLANNING budget allocation (60% history, 20% code, 20% docs)."""
-        total_tokens = 10000
-        budget = context_manager._allocate_budget(total_tokens, TaskType.PLANNING)
-
+        """Test PLANNING budget allocation (design: history 50%, code 20%, docs 20%, logs 10%)."""
+        budget = context_manager._allocate_budget(10000, TaskType.PLANNING)
         available = 8000
-        assert budget["history"] == int(available * 0.6)  # 4800
-        assert budget["code"] == int(available * 0.2)  # 1600
-        assert budget["docs"] == int(available * 0.2)  # 1600
+        assert budget["history"]["allocated"] == int(available * 0.50)
+        assert budget["code"]["allocated"] == int(available * 0.20)
+        assert budget["docs"]["allocated"] == int(available * 0.20)
 
     def test_debugging_budget(self, context_manager):
-        """Test DEBUGGING budget allocation (40% code, 40% logs, 20% history)."""
-        total_tokens = 10000
-        budget = context_manager._allocate_budget(total_tokens, TaskType.DEBUGGING)
-
+        """Test DEBUGGING budget allocation (design: logs 40%, code 30%, history 20%, docs 10%)."""
+        budget = context_manager._allocate_budget(10000, TaskType.DEBUGGING)
         available = 8000
-        assert budget["code"] == int(available * 0.4)  # 3200
-        assert budget["docs"] == int(available * 0.2)  # 1600 (logs as docs)
-        assert budget["history"] == int(available * 0.2)  # 1600
+        assert budget["logs"]["allocated"] == int(available * 0.40)
+        assert budget["code"]["allocated"] == int(available * 0.30)
+        assert budget["history"]["allocated"] == int(available * 0.20)
 
     def test_general_budget(self, context_manager):
-        """Test GENERAL budget allocation (50% history, 30% code, 20% docs)."""
-        total_tokens = 10000
-        budget = context_manager._allocate_budget(total_tokens, TaskType.GENERAL)
-
+        """Test GENERAL budget allocation (history 40%, code 30%, docs 20%, logs 10%)."""
+        budget = context_manager._allocate_budget(10000, TaskType.GENERAL)
         available = 8000
-        assert budget["history"] == int(available * 0.5)  # 4000
-        assert budget["code"] == int(available * 0.3)  # 2400
-        assert budget["docs"] == int(available * 0.2)  # 1600
+        assert budget["history"]["allocated"] == int(available * 0.40)
+        assert budget["code"]["allocated"] == int(available * 0.30)
+        assert budget["docs"]["allocated"] == int(available * 0.20)
 
     def test_budget_with_small_total(self, context_manager):
         """Test budget allocation with small total tokens."""
-        total_tokens = 2000  # Less than fixed allocations
-        budget = context_manager._allocate_budget(total_tokens, TaskType.GENERAL)
+        budget = context_manager._allocate_budget(2000, TaskType.GENERAL)
+        assert budget["system"]["allocated"] == 500
+        assert budget["skills"]["allocated"] == 1000
+        assert budget["reserve"]["allocated"] == 500
+        assert budget["history"]["allocated"] >= 0
+        assert budget["code"]["allocated"] >= 0
+        assert budget["docs"]["allocated"] >= 0
 
-        # Fixed allocations remain
-        assert budget["system"] == 500
-        assert budget["skills"] == 1000
-        assert budget["reserve"] == 500
-
-        # Dynamic allocations should be 0 or minimal
-        assert budget["history"] >= 0
-        assert budget["code"] >= 0
-        assert budget["docs"] >= 0
+    def test_budget_returns_used_zero(self, context_manager):
+        """All sections start with used=0."""
+        budget = context_manager._allocate_budget(10000, TaskType.GENERAL)
+        for section in budget.values():
+            assert section["used"] == 0

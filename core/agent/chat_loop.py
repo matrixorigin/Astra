@@ -194,7 +194,7 @@ class ChatLoop:
         from core.context.manager import TaskType
 
         ctx = self.context_manager.build_context(
-            session_id=session_id, query=user_input, task_type=TaskType.GENERAL
+            session_id=session_id, query=user_input,
         )
         context_capture_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
         logger.debug(f"Context snapshot: {context_capture_id}")
@@ -421,7 +421,7 @@ class ChatLoop:
         from core.context.manager import TaskType
 
         ctx = self.context_manager.build_context(
-            session_id=session_id, query=user_input, task_type=TaskType.GENERAL
+            session_id=session_id, query=user_input,
         )
         context_capture_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
         logger.debug(f"[stream] Context snapshot: {context_capture_id}")
@@ -973,7 +973,7 @@ class ChatLoop:
         if not context_capture_id:
             from core.context.manager import TaskType
             ctx = self.context_manager.build_context(
-                session_id=session_id, query=user_input, task_type=TaskType.GENERAL,
+                session_id=session_id, query=user_input,
             )
             context_capture_id = self.context_manager.save_snapshot(
                 ctx, session_id, user_event.event_id,

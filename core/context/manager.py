@@ -28,6 +28,23 @@ class TaskType(str, Enum):
     GENERAL = "general"
 
 
+# Budget ratios per task type — aligned with design doc §2
+# Each maps section → fraction of available tokens (after fixed allocations)
+_BUDGET_RATIOS: dict[TaskType, dict[str, float]] = {
+    TaskType.CODE_REVIEW: {"code": 0.50, "history": 0.20, "docs": 0.20, "logs": 0.10},
+    TaskType.DEBUGGING:   {"logs": 0.40, "code": 0.30, "history": 0.20, "docs": 0.10},
+    TaskType.PLANNING:    {"history": 0.50, "code": 0.20, "docs": 0.20, "logs": 0.10},
+    TaskType.GENERAL:     {"history": 0.40, "code": 0.30, "docs": 0.20, "logs": 0.10},
+}
+
+# Keywords for auto-classification
+_TASK_KEYWORDS: dict[TaskType, list[str]] = {
+    TaskType.CODE_REVIEW: ["review", "code review", "PR", "pull request", "refactor", "clean up"],
+    TaskType.DEBUGGING:   ["debug", "error", "bug", "fix", "traceback", "exception", "crash", "fail"],
+    TaskType.PLANNING:    ["plan", "design", "architect", "roadmap", "strategy", "proposal"],
+}
+
+
 @dataclass
 class ContextFragment:
     """A piece of context with metadata."""
@@ -50,7 +67,7 @@ class Context:
     documentation: list[dict[str, Any]]
 
     total_tokens: int
-    token_budget: dict[str, int]
+    token_budget: dict[str, dict[str, int]]
     assembly_time_ms: int
     relevance_scores: dict[str, float]
     task_type: TaskType
@@ -114,12 +131,21 @@ class ContextManager:
 
         logger.info(f"ContextManager initialized (embeddings={embedding_provider})")
 
+    @staticmethod
+    def classify_task(query: str) -> TaskType:
+        """Auto-classify task type from query text using keyword matching."""
+        q = query.lower()
+        for task_type, keywords in _TASK_KEYWORDS.items():
+            if any(kw in q for kw in keywords):
+                return task_type
+        return TaskType.GENERAL
+
     def build_context(
         self,
         session_id: str,
         query: str,
         max_tokens: int = 8000,
-        task_type: TaskType = TaskType.GENERAL,
+        task_type: TaskType | None = None,
         current_chain_id: str | None = None,
         use_hybrid_retrieval: bool = True,  # Design default: hybrid retrieval as primary path
         forced_retrieval: list[dict[str, Any]] | None = None,
@@ -141,6 +167,10 @@ class ContextManager:
         start_time = time.time()
 
         try:
+            # 0. Auto-classify if not specified
+            if task_type is None:
+                task_type = self.classify_task(query)
+
             # 1. Allocate token budget
             budget = self._allocate_budget(max_tokens, task_type)
             logger.debug(f"Token budget allocated: {budget}")
@@ -190,60 +220,24 @@ class ContextManager:
             logger.error(f"Failed to build context: {e}")
             raise ContextError(f"Context assembly failed: {e}") from e
 
-    def _allocate_budget(self, total_tokens: int, task_type: TaskType) -> dict[str, int]:
+    def _allocate_budget(self, total_tokens: int, task_type: TaskType) -> dict[str, dict[str, int]]:
         """Allocate token budget based on task type.
-        
-        Follows design in context-management.md:
-        - CODE_REVIEW: 60% code, 20% history, 20% docs
-        - PLANNING: 60% history, 20% code, 20% docs
-        - DEBUGGING: 40% code, 40% logs, 20% history
-        - GENERAL: 50% history, 30% code, 20% docs
-        
-        Fixed allocations:
-        - system: 500 tokens (system prompt)
-        - skills: 1000 tokens (skill definitions)
-        - reserve: 500 tokens (safety buffer)
-        """
-        # Reserve fixed tokens
-        fixed_tokens = 500 + 1000 + 500  # system + skills + reserve
-        available_tokens = max(0, total_tokens - fixed_tokens)
-        
-        allocations = {
-            TaskType.CODE_REVIEW: {
-                "system": 500,
-                "skills": 1000,
-                "history": int(available_tokens * 0.2),
-                "code": int(available_tokens * 0.6),
-                "docs": int(available_tokens * 0.2),
-                "reserve": 500,
-            },
-            TaskType.PLANNING: {
-                "system": 500,
-                "skills": 1000,
-                "history": int(available_tokens * 0.6),
-                "code": int(available_tokens * 0.2),
-                "docs": int(available_tokens * 0.2),
-                "reserve": 500,
-            },
-            TaskType.DEBUGGING: {
-                "system": 500,
-                "skills": 1000,
-                "history": int(available_tokens * 0.2),
-                "code": int(available_tokens * 0.4),
-                "docs": int(available_tokens * 0.2),  # logs treated as docs
-                "reserve": 500,
-            },
-            TaskType.GENERAL: {
-                "system": 500,
-                "skills": 1000,
-                "history": int(available_tokens * 0.5),
-                "code": int(available_tokens * 0.3),
-                "docs": int(available_tokens * 0.2),
-                "reserve": 500,
-            },
-        }
 
-        return allocations[task_type]
+        Returns dict of section → {allocated: int, used: int} per design §2.
+        Fixed allocations: system 500, skills 1000, reserve 500.
+        """
+        fixed_tokens = 500 + 1000 + 500  # system + skills + reserve
+        available = max(0, total_tokens - fixed_tokens)
+
+        ratios = _BUDGET_RATIOS[task_type]
+        budget: dict[str, dict[str, int]] = {
+            "system":  {"allocated": 500,  "used": 0},
+            "skills":  {"allocated": 1000, "used": 0},
+            "reserve": {"allocated": 500,  "used": 0},
+        }
+        for section, ratio in ratios.items():
+            budget[section] = {"allocated": int(available * ratio), "used": 0}
+        return budget
 
 
     def _retrieve_candidates(self, session_id: str, query: str) -> list[dict[str, Any]]:
@@ -374,23 +368,22 @@ class ContextManager:
         return scored
 
     def _select_within_budget(
-        self, scored: list[tuple[dict[str, Any], float]], budget: dict[str, int]
+        self, scored: list[tuple[dict[str, Any], float]], budget: dict[str, dict[str, int]]
     ) -> list[dict[str, Any]]:
         """Select top events within token budget."""
         selected = []
         tokens_used = 0
-        history_budget = budget["history"]
+        history_limit = budget.get("history", {}).get("allocated", 0)
 
         for event, score in scored:
-            # Estimate tokens (rough: 1 token ≈ 4 chars)
             event_tokens = len(event["content"]) // 4
-
-            if tokens_used + event_tokens <= history_budget:
+            if tokens_used + event_tokens <= history_limit:
                 selected.append({"event": event, "score": score, "tokens": event_tokens})
                 tokens_used += event_tokens
             else:
                 break
 
+        budget.get("history", {})["used"] = tokens_used
         logger.debug(f"Selected {len(selected)} events using {tokens_used} tokens")
         return selected
 
@@ -406,7 +399,7 @@ class ContextManager:
         system_prompt = self._get_system_prompt(task_type)
 
         # Load skill definitions from registry
-        skill_definitions = self._get_skill_definitions(budget["skills"])
+        skill_definitions = self._get_skill_definitions(budget["skills"]["allocated"])
 
         selected_events = [
             {
@@ -421,9 +414,9 @@ class ContextManager:
         # Load code context for code-related tasks
         code_context = []
         if task_type in [TaskType.CODE_REVIEW, TaskType.DEBUGGING]:
-            code_context = self._get_code_context(selected_events, budget["code"])
+            code_context = self._get_code_context(selected_events, budget.get("code", {}).get("allocated", 0))
 
-        total_tokens = sum(s["tokens"] for s in selected) + budget["system"]
+        total_tokens = sum(s["tokens"] for s in selected) + budget["system"]["allocated"]
 
         relevance_scores = {s["event"]["event_id"]: s["score"] for s in selected}
 
