@@ -238,7 +238,7 @@ class TestProgressiveDisclosure:
     def test_max_candidates_limits_output(self, selector_with_skills):
         """max_candidates caps how many tools are returned."""
         sel = selector_with_skills
-        tools = sel.get_tools_schema("code", max_candidates=2, context_budget=100000)
+        tools, _ = sel.get_tools_schema("code", max_candidates=2, context_budget=100000)
         assert len(tools) <= 2
 
     def test_empty_skill_registry_returns_empty(self, db):
@@ -283,7 +283,13 @@ class TestPipelineEmbedIntegration:
 # ===========================================================================
 
 class TestEmbeddingQuality:
-    """Verify semantic retrieval quality with realistic embeddings."""
+    """Verify semantic retrieval mechanics with mock embeddings.
+
+    NOTE: Mock embeddings use SHA256 hashing, NOT real semantic similarity.
+    These tests verify the retrieval *pipeline* works correctly (index → query →
+    rank → return), not that semantically similar queries produce similar vectors.
+    True semantic quality requires integration tests with a real embedding model.
+    """
 
     def test_semantic_similarity_ranks_relevant_skills_higher(self, db):
         """Verify 'review PR' query ranks code_review higher than deploy_k8s."""

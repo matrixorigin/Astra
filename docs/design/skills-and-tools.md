@@ -169,15 +169,12 @@ Every selection is recorded:
 
 ```json
 {
-  "selection_event_id": "sel_01...",
-  "query": "Review PR #123",
-  "candidates": [
-    {"skill": "code_review@1.2.0", "score": 0.95, "reason": "keyword_match: review, PR"},
-    {"skill": "summarize_pr@1.0.0", "score": 0.72, "reason": "keyword_match: PR"}
-  ],
-  "selected": ["code_review@1.2.0"],
-  "selection_method": "llm_function_calling",
-  "filter_method": "keyword"
+  "event_id": "sel_01...",
+  "session_id": "sess_01...",
+  "user_query": "Review PR #123",
+  "selected_skills": ["code_review", "summarize_pr"],
+  "selection_method": "semantic",
+  "created_at": "2026-02-20T12:00:00Z"
 }
 ```
 

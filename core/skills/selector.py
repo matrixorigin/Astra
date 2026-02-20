@@ -27,8 +27,8 @@ class SkillMetadata:
 
     Tier 1 (embedding index): name + description + triggers → vector.
            Lives in SkillIndex, never in LLM context. 0 prompt tokens.
-    Tier 2 (candidate ranking): name + description sent to LLM.
-    Tier 3 (execution): full JSON schema loaded into LLM context.
+    Tier 2 (full schema):     complete OpenAI tool JSON schema loaded
+           into LLM context, budget-controlled. Token cost measured at runtime.
     """
 
     name: str
