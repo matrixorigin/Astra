@@ -81,8 +81,9 @@ class TestEnhancedFirewallIntegration:
         # Assertions
         assert result.claims_verified == 1
         assert result.claims_failed == 1
-        # Weighted confidence: numeric(0.5) verified, causal(1.0) failed → 0.5/1.5 ≈ 0.333
-        assert abs(result.confidence_score - 1/3) < 0.01
+        # Multi-dimensional confidence: claim_verifiability is low (0.333),
+        # blended with context_coverage and freshness
+        assert result.confidence_score < 0.7  # should be below threshold
         assert result.safe_to_deliver is True  # warn mode
         assert result.evidence_count > 0
 
@@ -190,7 +191,7 @@ class TestEnhancedFirewallIntegration:
         result = firewall.verify_response("The function is async", "snap_123")
 
         assert result.safe_to_deliver is True
-        assert result.confidence_score > 0.9
+        assert result.confidence_score > 0.7  # multi-dimensional, all claims verified
         assert result.evidence_count >= 1  # At least one evidence source
 
     def test_graceful_degradation_without_llm(self):

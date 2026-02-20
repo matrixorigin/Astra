@@ -168,17 +168,26 @@ class HallucinationFirewall:
                     )
                 )
 
-        # 4. Compute overall result — weighted by claim type risk
+        # 4. Compute overall result — multi-dimensional confidence (§3 design)
         verified = [r for r in results if r.verified]
         failed = [r for r in results if not r.verified]
 
-        confidence = self._weighted_confidence(results) if results else 1.0
+        claim_verifiability = self._weighted_confidence(results) if results else 1.0
+        context_coverage = self._context_coverage(snapshot, response)
+        knowledge_freshness = self._knowledge_freshness(snapshot)
+
+        # Weighted composite (design §3)
+        confidence = (
+            0.45 * claim_verifiability
+            + 0.30 * context_coverage
+            + 0.25 * knowledge_freshness
+        )
 
         safe = confidence >= self.threshold if mode == "block" else True
 
         return FirewallResult(
             safe_to_deliver=safe,
-            confidence_score=confidence,
+            confidence_score=round(confidence, 4),
             claims_verified=len(verified),
             claims_failed=len(failed),
             contradictions=failed,
@@ -275,6 +284,53 @@ class HallucinationFirewall:
             if r.verified:
                 w_verified += w
         return w_verified / w_total if w_total > 0 else 1.0
+
+    @staticmethod
+    def _context_coverage(snapshot, response: str) -> float:
+        """How much of the response is grounded in available context.
+
+        Heuristic: ratio of response tokens that overlap with context tokens.
+        1.0 = response fully covered by context vocabulary.
+        """
+        try:
+            ctx_text = ""
+            if hasattr(snapshot, "system_prompt"):
+                ctx_text += snapshot.system_prompt or ""
+            for ev in getattr(snapshot, "selected_events", []):
+                ctx_text += " " + ev.get("content", "")
+            for code in getattr(snapshot, "code_context", []):
+                ctx_text += " " + code.get("content", "")
+
+            if not ctx_text.strip():
+                return 0.5  # no context → uncertain
+
+            ctx_words = set(ctx_text.lower().split())
+            resp_words = response.lower().split()
+            if not resp_words:
+                return 1.0
+            overlap = sum(1 for w in resp_words if w in ctx_words)
+            return min(overlap / len(resp_words), 1.0)
+        except Exception:
+            return 0.5
+
+    @staticmethod
+    def _knowledge_freshness(snapshot) -> float:
+        """How current is the underlying data.
+
+        Uses snapshot metadata if available, otherwise defaults to 0.8.
+        """
+        try:
+            from datetime import datetime, timezone
+            created = getattr(snapshot, "created_at", None)
+            if created:
+                if isinstance(created, str):
+                    created = datetime.fromisoformat(created)
+                age_days = (datetime.now(timezone.utc) - created.replace(tzinfo=timezone.utc)).days
+                # Freshness decays: 1.0 at 0 days, 0.5 at 30 days, ~0.25 at 60 days
+                return max(0.5 ** (age_days / 30), 0.1)
+        except Exception:
+            pass
+        return 0.8  # default: reasonably fresh
 
     def log_verification(
         self, session_id: str, event_id: str, result: FirewallResult, context_capture_id: str

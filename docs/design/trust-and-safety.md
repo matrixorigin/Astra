@@ -713,6 +713,10 @@ The three ChatLoop execution paths in `core/agent/chat_loop.py` must satisfy the
 | `RUN_STARTED` event | N/A (non-stream) | ✅ | ✅ |
 | `RUN_FINISHED` with context_capture_id | N/A (non-stream) | ✅ | ✅ |
 | StreamEvent carries event_id + causal_chain_id | N/A | ✅ | ✅ |
+| Streaming sentence-level verification | N/A | ✅ plain-chat + exhausted | N/A |
+| CoT audit before tool execution | ✅ | ✅ sequential path | ✅ via pipeline |
+| Firewall `mode="block"` fail-closed | ✅ | ✅ | ✅ |
+| Claim-type weighted confidence | ✅ | ✅ | ✅ |
 
 ---
 

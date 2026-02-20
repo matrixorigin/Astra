@@ -40,7 +40,6 @@ class ModernSkillSelector:
         self._registry = SkillRegistry(session)
 
         # Semantic index — primary retrieval path when available
-        # TODO: add embedding cache when skill_count > 20 or construction frequency > 1/min
         from core.skills.skill_index import SkillIndex
         self._index = SkillIndex(embed_fn=embed_fn)
         if embed_fn:

@@ -200,7 +200,8 @@ class TestEnhancedFirewall:
         assert result.safe_to_deliver is True
         assert result.claims_verified == 1
         assert result.claims_failed == 0
-        assert result.confidence_score == 1.0
+        # Multi-dimensional: claim_verifiability(1.0)*0.45 + context_coverage*0.30 + freshness*0.25
+        assert result.confidence_score >= 0.7
         assert result.evidence_count > 0
 
     def test_verify_with_regex_fallback(self):

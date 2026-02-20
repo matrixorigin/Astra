@@ -247,6 +247,7 @@ class ChatLoop:
                     tool_name=fn_name,
                     tool_args=params,
                     assistant_reasoning=messages[-1].get("content", "") if messages else "",
+                    llm_client=self.llm,
                 )
                 if not audit.safe:
                     logger.warning("CoT audit blocked tool %s: %s", fn_name, audit.reason)
@@ -404,7 +405,7 @@ class ChatLoop:
         if not tools_schema:
             # Plain chat — stream text with sentence-level verification
             from core.verification.streaming_verifier import StreamingVerifier
-            sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id)
+            sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
             async for chunk in self.llm.chat_stream(messages, user_id, session_id):
                 warning = sv.check(chunk)
@@ -730,6 +731,7 @@ class ChatLoop:
                             tool_name=fn_name,
                             tool_args=params,
                             assistant_reasoning=full_text,
+                            llm_client=self.llm,
                         )
                         if not audit.safe:
                             logger.warning("CoT audit blocked tool %s: %s", fn_name, audit.reason)
@@ -806,7 +808,7 @@ class ChatLoop:
             }
         )
         from core.verification.streaming_verifier import StreamingVerifier
-        sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id)
+        sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
         async for chunk in self.llm.chat_stream(messages, user_id, session_id):
             warning = sv.check(chunk)
