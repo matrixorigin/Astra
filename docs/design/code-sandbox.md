@@ -58,7 +58,22 @@ Four independent concerns:
 
 ### Runtime
 
-An isolated environment that executes code. Pluggable via ABC. Default is `SubprocessRuntime` (zero dependencies). Production uses `DockerRuntime`.
+An isolated environment that executes code. Pluggable via ABC with **self-describing capabilities**.
+
+Each runtime declares its `RuntimeCapabilities`:
+
+| Property | Meaning | SubprocessRuntime | DockerRuntime | FirecrackerRuntime |
+|----------|---------|-------------------|---------------|-------------------|
+| `isolation` | Host boundary strength | PROCESS | CONTAINER | MICROVM |
+| `network_isolatable` | Can disable network per-execution | ❌ | ✅ | ✅ |
+| `filesystem_isolated` | Code cannot access host FS | ❌ | ✅ | ✅ |
+| `resource_limits` | Enforces memory/CPU limits | Linux only | ✅ | ✅ |
+| `reproducible` | Same code+env → same result | ❌ | ✅ | ✅ |
+
+Upper layers use capabilities for decisions:
+- **CodeExecutor**: injects capabilities as `MO_RUNTIME_*` env vars so executed code can adapt
+- **SecurityGuard**: could relax AST checks when isolation ≥ CONTAINER (defense-in-depth still applies)
+- **create_runtime()**: factory selects the best available runtime matching caller's requirements
 
 A runtime knows nothing about data, security, or orchestration. It takes code + env vars + resource limits, runs it, returns stdout/stderr/exit_code/started_at.
 
@@ -85,6 +100,20 @@ Orchestration service that composes the above three. Callers (skills, ChatLoop) 
 ### 4.1 Runtime Interface
 
 ```python
+class IsolationLevel(str, Enum):
+    NONE = "none"            # No isolation (e.g. eval in-process)
+    PROCESS = "process"      # Separate process, rlimit
+    CONTAINER = "container"  # Docker container
+    MICROVM = "microvm"      # Firecracker / gVisor
+
+@dataclass(frozen=True)
+class RuntimeCapabilities:
+    isolation: IsolationLevel
+    network_isolatable: bool
+    filesystem_isolated: bool
+    resource_limits: bool
+    reproducible: bool
+
 @dataclass
 class ResourceProfile:
     max_memory_mb: int = 256
@@ -101,7 +130,28 @@ class ExecutionResult:
     execution_time_ms: float
     truncated: bool = False             # True if stdout hit max_output_bytes
     started_at: datetime | None = None  # UTC timestamp when execution began (for PITR)
+
+class Runtime(ABC):
+    @property
+    @abstractmethod
+    def capabilities(self) -> RuntimeCapabilities: ...
+
+    @abstractmethod
+    def execute(self, code, language, resources, env) -> ExecutionResult: ...
+
+    @abstractmethod
+    def health_check(self) -> bool: ...
+
+def create_runtime(
+    *,
+    min_isolation: IsolationLevel = IsolationLevel.PROCESS,
+    require_network_isolation: bool = False,
+    image: str | None = None,
+) -> Runtime:
+    """Factory: tries Docker → Subprocess, raises if nothing satisfies constraints."""
 ```
+
+**Capability-aware code execution**: CodeExecutor injects runtime capabilities as environment variables (`MO_RUNTIME_ISOLATION`, `MO_RUNTIME_FS_ISOLATED`, etc.). Executed code can read these to adapt behavior — e.g., use in-memory buffers instead of temp files when filesystem is not isolated.
 
 ### 4.2 Data Access Model
 
@@ -278,13 +328,23 @@ No snapshots needed. The branch itself is the audit artifact.
 
 ## 6. Security Model
 
-Three independent layers:
+Three independent layers (defense-in-depth):
 
 | Layer | What | Enforced By |
 |-------|------|-------------|
 | **Static analysis** | Reject dangerous code patterns | SecurityGuard (AST) |
-| **Runtime isolation** | Process/container boundary, resource limits | Runtime |
+| **Runtime isolation** | Process/container/microVM boundary, resource limits | Runtime |
 | **Data isolation** | DB user permissions (read-only can't write) | DataContext + MatrixOne |
+
+**Capability-aware security**: When `runtime.capabilities.isolation >= CONTAINER`, the runtime itself is the primary security boundary. AST analysis remains as defense-in-depth but could be relaxed for known-safe patterns. When isolation is PROCESS only, AST analysis is critical.
+
+**Runtime selection per environment**:
+
+| Environment | Runtime | Isolation | Why |
+|-------------|---------|-----------|-----|
+| Local dev / CLI | SubprocessRuntime | PROCESS | No Docker dependency, fast |
+| API / staging | DockerRuntime | CONTAINER | Untrusted code, network isolation |
+| Production | FirecrackerRuntime | MICROVM | Strongest isolation, sub-second boot |
 
 ---
 
@@ -308,13 +368,21 @@ Three independent layers:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Tier 1: SESSION-SCOPED (session end)                    │
-│  `data branch delete` per table + DROP DATABASE.         │
-│  No snapshots to clean up.                               │
+│  Tier 0: SYNCHRONOUS (session close API)                 │
+│  SessionService._cleanup_sandbox() queries               │
+│  sandbox_metadata by session_id, deletes immediately.    │
 ├─────────────────────────────────────────────────────────┤
-│  Tier 2: SAFETY NET (TTL)                                │
-│  Background task drops sandbox DBs older than TTL with   │
-│  no active session. Catches abandoned sessions.          │
+│  Tier 1: SESSION-SCOPED (session end callback)           │
+│  SessionManager.close_session(on_close=...) triggers     │
+│  CodeExecutor.cleanup_session() → DataContext.destroy()  │
+│  `data branch delete` per table + DROP DATABASE.         │
+├─────────────────────────────────────────────────────────┤
+│  Tier 2: BACKGROUND SCAN (hourly, distributed lock)      │
+│  SandboxCleaner.run() via GovernanceTaskRunner:          │
+│  - Closed session sandboxes (Tier 0/1 missed)           │
+│  - Zombie sessions (active but no activity > TTL)        │
+│  - Expired unbound (no session_id, older than TTL)       │
+│  - Orphan databases (no metadata entry at all)           │
 ├─────────────────────────────────────────────────────────┤
 │  Tier 3: DATA PR PENDING (explicit)                      │
 │  Kept alive until human merges or discards.              │
@@ -328,38 +396,54 @@ Three independent layers:
 
 ```
 core/
-  sandbox/                          # Data versioning (existing)
-    sandbox.py                      #   CLONE / SNAPSHOT / RESTORE (legacy)
-    branch.py                       #   data branch create/diff/merge/delete (primary)
+  sandbox/                          # Data versioning
+    sandbox.py                      #   Sandbox (branch-based: create/delete/add_table/snapshot/restore/diff/merge)
+    branch.py                       #   Branch (data branch create/diff/merge/delete)
+    cleanup.py                      #   SandboxCleaner (4-tier background cleanup)
   runtime/                          # Code execution isolation
-    __init__.py                     #   Runtime ABC, ExecutionResult, ResourceProfile
-    subprocess_runtime.py           #   Default runtime
+    __init__.py                     #   Runtime ABC, RuntimeCapabilities, IsolationLevel, create_runtime()
+    subprocess_runtime.py           #   SubprocessRuntime (dev/trusted, rlimit)
+    docker_runtime.py               #   DockerRuntime (production, container isolation)
   code_executor/                    # Orchestration
     __init__.py                     #   CodeExecutor, Request/Result types, TimeTravelInfo
-    security.py                     #   SecurityGuard
-    data_context.py                 #   DataContext (session-scoped, table-level branch)
+    security.py                     #   SecurityGuard (AST static analysis)
+    data_context.py                 #   DataContext (session-scoped, table-level branch, metadata tracking)
   skills/
-    builtin.py                      #   + ExecuteCodeSkill
+    builtin.py                      #   ExecuteCodeSkill (registered via register_builtin_skills)
+  context/
+    lifecycle.py                    #   MemoryGovernanceEngine.run_hourly_tasks() → SandboxCleaner
+    scheduler.py                    #   GovernanceTaskRunner (distributed lock + heartbeat)
+api/
+  services/
+    session_service.py              #   _cleanup_sandbox() on session close (Tier 0)
+  routers/
+    streaming.py                    #   ChatLoop + CodeExecutor wiring
 ```
 
 ---
 
 ## 9. Implementation Plan
 
-### Phase 1: MVP (current)
+### Phase 1: MVP ✅
 - ✅ `Runtime` ABC + `SubprocessRuntime`
 - ✅ `SecurityGuard` with AST analysis
 - ✅ `CodeExecutor` orchestration
-- ✅ `ExecuteCodeSkill`
-- 🔄 `DataContext` — session-scoped, table-level clone, time-travel, transactional cleanup
+- ✅ `ExecuteCodeSkill` registered as ChatLoop tool
+- ✅ `DataContext` — session-scoped, table-level branch, time-travel, metadata tracking
 
-### Phase 2: Production
-- `DockerRuntime` with gVisor + container pool
-- Data PR workflow (diff visualization, merge/discard in ChatLoop)
-- Background cleanup task for orphaned sandbox DBs
+### Phase 2: Production ✅
+- ✅ `DockerRuntime` — container isolation, cap_drop=ALL, no-new-privileges, network isolation
+- ✅ `RuntimeCapabilities` — self-describing isolation/network/filesystem/resource properties
+- ✅ `create_runtime()` factory — capability-based selection with fallback
+- ✅ Capability injection — `MO_RUNTIME_*` env vars for code-level adaptation
+- ✅ `SandboxCleaner` — 4-tier background cleanup via GovernanceTaskRunner
+- ✅ Session close → sandbox cleanup (Tier 0)
+- ✅ CLI + API wiring — `CodeExecutor` → `register_builtin_skills` → ChatLoop
 
 ### Phase 3: Advanced
+- `FirecrackerRuntime` — microVM isolation (Firecracker is Apache 2.0 open source, requires Linux host)
+- Data PR workflow (diff visualization, merge/discard in ChatLoop)
 - Transparent sandbox (requires MatrixOne kernel: connection-level isolation)
 - Multi-database sandbox support
-- Cloud runtimes (E2B, Daytona)
+- Container pool (pre-warmed containers for sub-100ms cold start)
 - Interactive REPL mode

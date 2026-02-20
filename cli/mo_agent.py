@@ -127,8 +127,14 @@ def chat(user_id, model, mode):
 
     # Register skills with agent registry
     skill_registry = SkillRegistry(db)
+
+    from core.runtime import create_runtime, IsolationLevel
+    from core.code_executor import CodeExecutor
+    code_executor = CodeExecutor(runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db=db)
+
     register_builtin_skills(
-        skill_registry, db, agent_registry=agent_registry, chat_loop_factory=create_chat_loop
+        skill_registry, db, agent_registry=agent_registry,
+        chat_loop_factory=create_chat_loop, code_executor=code_executor,
     )
 
     # Update executor with registered skills

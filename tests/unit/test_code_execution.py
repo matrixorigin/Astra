@@ -667,9 +667,11 @@ class TestCodeExecutor:
         assert mock_runtime.execute.call_args[0][2] == profile
 
     # --- NONE access ---
-    def test_none_access_no_env(self, executor, mock_runtime):
+    def test_none_access_injects_runtime_caps(self, executor, mock_runtime):
         executor.execute(CodeExecutionRequest(code="print(1)"))
-        assert mock_runtime.execute.call_args[0][3] is None
+        env = mock_runtime.execute.call_args[0][3]
+        assert "MO_RUNTIME_ISOLATION" in env
+        assert "MO_DATABASE" not in env
 
     # --- READ access ---
     def test_read_access_passes_source_db(self, executor, mock_runtime):

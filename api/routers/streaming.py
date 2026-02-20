@@ -69,10 +69,18 @@ async def stream_chat(
 
     # Initialize components with injected db session
     from core.skills.registry import SkillRegistry
+    from core.skills.builtin import register_builtin_skills
+    from core.runtime import create_runtime, IsolationLevel
+    from core.code_executor import CodeExecutor
     
     event_logger = EventLogger(db)
     llm_client = LLMClient()
     skill_registry = SkillRegistry(db)
+    code_executor = CodeExecutor(
+        runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
+        db=db,
+    )
+    register_builtin_skills(skill_registry, db, code_executor=code_executor)
     context_manager = ContextManager(db)
     selector = SkillPipeline(db, llm_client, audit=True, learning=True)
     executor = AgentExecutor(db, skill_registry)

@@ -14,12 +14,11 @@ from datetime import datetime, timezone
 import docker
 from docker.errors import ContainerError, ImageNotFound, APIError
 
-from core.runtime import ExecutionResult, ResourceProfile, Runtime
+from core.runtime import ExecutionResult, ResourceProfile, Runtime, RuntimeCapabilities, IsolationLevel
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_IMAGE = "python:3.11-slim"
-# Network-disabled network mode
 _NO_NETWORK = "none"
 
 
@@ -39,6 +38,16 @@ class DockerRuntime(Runtime):
         if self._client is None:
             self._client = docker.from_env()
         return self._client
+
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        return RuntimeCapabilities(
+            isolation=IsolationLevel.CONTAINER,
+            network_isolatable=True,
+            filesystem_isolated=True,
+            resource_limits=True,
+            reproducible=True,
+        )
 
     @property
     def supported_languages(self) -> list[str]:

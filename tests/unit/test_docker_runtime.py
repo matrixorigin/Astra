@@ -2,7 +2,7 @@
 
 from unittest.mock import Mock, patch, MagicMock
 import pytest
-from core.runtime import ExecutionResult, ResourceProfile
+from core.runtime import ExecutionResult, ResourceProfile, IsolationLevel
 from core.runtime.docker_runtime import DockerRuntime
 
 
@@ -15,6 +15,14 @@ def runtime():
 
 
 class TestDockerRuntime:
+    def test_capabilities(self, runtime):
+        cap = runtime.capabilities
+        assert cap.isolation == IsolationLevel.CONTAINER
+        assert cap.network_isolatable is True
+        assert cap.filesystem_isolated is True
+        assert cap.resource_limits is True
+        assert cap.reproducible is True
+
     def test_supported_languages(self, runtime):
         assert runtime.supported_languages == ["python"]
 
@@ -131,3 +139,49 @@ class TestDockerRuntime:
         result = runtime.execute("print('ok')")
         runtime.client.images.pull.assert_called_once_with("python:3.11-slim")
         assert result.exit_code == 0
+
+
+class TestSubprocessRuntimeCapabilities:
+    def test_capabilities(self):
+        from core.runtime.subprocess_runtime import SubprocessRuntime
+        rt = SubprocessRuntime()
+        cap = rt.capabilities
+        assert cap.isolation == IsolationLevel.PROCESS
+        assert cap.network_isolatable is False
+        assert cap.filesystem_isolated is False
+
+
+class TestCreateRuntime:
+    """All tests mock both Firecracker and Docker to isolate selection logic."""
+
+    def _patch_fc_unavailable(self):
+        return patch("core.runtime.firecracker_runtime.FirecrackerRuntime",
+                      **{"return_value.health_check.return_value": False})
+
+    def test_fallback_to_subprocess(self):
+        """When Docker and Firecracker unavailable, falls back to SubprocessRuntime."""
+        from core.runtime import create_runtime
+        from core.runtime.subprocess_runtime import SubprocessRuntime
+        with self._patch_fc_unavailable(), \
+             patch("core.runtime.docker_runtime.DockerRuntime") as MockDocker:
+            MockDocker.return_value.health_check.return_value = False
+            rt = create_runtime(min_isolation=IsolationLevel.PROCESS)
+            assert isinstance(rt, SubprocessRuntime)
+
+    def test_raises_when_no_runtime_satisfies(self):
+        """Raises RuntimeError when no runtime meets requirements."""
+        from core.runtime import create_runtime
+        with self._patch_fc_unavailable(), \
+             patch("core.runtime.docker_runtime.DockerRuntime") as MockDocker:
+            MockDocker.return_value.health_check.return_value = False
+            with pytest.raises(RuntimeError, match="No runtime available"):
+                create_runtime(min_isolation=IsolationLevel.CONTAINER)
+
+    def test_subprocess_rejected_for_network_isolation(self):
+        """SubprocessRuntime can't isolate network, so it's rejected."""
+        from core.runtime import create_runtime
+        with self._patch_fc_unavailable(), \
+             patch("core.runtime.docker_runtime.DockerRuntime") as MockDocker:
+            MockDocker.return_value.health_check.return_value = False
+            with pytest.raises(RuntimeError):
+                create_runtime(require_network_isolation=True)

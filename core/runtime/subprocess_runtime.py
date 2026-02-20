@@ -8,7 +8,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-from core.runtime import ExecutionResult, ResourceProfile, Runtime
+from core.runtime import ExecutionResult, ResourceProfile, Runtime, RuntimeCapabilities, IsolationLevel
 
 _IS_LINUX = platform.system() == "Linux"
 
@@ -18,6 +18,16 @@ class SubprocessRuntime(Runtime):
 
     Suitable for dev/demo with trusted code. For untrusted code, use DockerRuntime.
     """
+
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        return RuntimeCapabilities(
+            isolation=IsolationLevel.PROCESS,
+            network_isolatable=False,
+            filesystem_isolated=False,
+            resource_limits=_IS_LINUX,  # rlimit only works on Linux
+            reproducible=False,
+        )
 
     @property
     def supported_languages(self) -> list[str]:

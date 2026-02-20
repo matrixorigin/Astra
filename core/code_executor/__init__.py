@@ -104,7 +104,13 @@ class CodeExecutor:
             env["MO_DSN"] = context.dsn
             env["MO_DATABASE"] = context.sandbox_name
 
-        # 3. EXECUTE
+        # 3. EXECUTE — inject runtime capabilities as env vars
+        cap = self.runtime.capabilities
+        env["MO_RUNTIME_ISOLATION"] = cap.isolation.value
+        env["MO_RUNTIME_NETWORK"] = "1" if cap.network_isolatable else "0"
+        env["MO_RUNTIME_FS_ISOLATED"] = "1" if cap.filesystem_isolated else "0"
+        env["MO_RUNTIME_RESOURCE_LIMITS"] = "1" if cap.resource_limits else "0"
+
         try:
             result = self.runtime.execute(
                 request.code, request.language, request.resources, env or None,
