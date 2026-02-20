@@ -35,6 +35,7 @@ yarn-error.log*
 # IDE / OS
 .idea/
 .vscode/
+.kiro
 *.swp
 *.swo
 *~
@@ -60,4 +61,3 @@ mo-data/
 
 # VCR cassettes (optional - commit them for CI)
 # fixtures/vcr_cassettes/*.yaml
-

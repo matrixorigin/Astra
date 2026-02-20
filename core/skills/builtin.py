@@ -220,8 +220,82 @@ class CIStatusSkill(Skill):
         return CIStatusOutput(success=True, result=workflows, workflows=workflows)
 
 
+# ============================================================================
+# Execute Code Skill
+# ============================================================================
+
+
+class ExecuteCodeInput(SkillInput):
+    """Input for execute_code skill"""
+    code: str
+    language: str = "python"
+    data_access: str = "none"  # "none", "read", "write"
+    session_id: str | None = None
+    allowed_imports: list[str] | None = None
+
+
+class ExecuteCodeOutput(SkillOutput):
+    """Output for execute_code skill"""
+    success: bool = False
+    result: str = ""
+    error: str | None = None
+    execution_time_ms: float = 0
+    data_diff: list[dict] | None = None
+
+
+class ExecuteCodeSkill(Skill):
+    """Execute Python code in isolated environment with optional database access."""
+
+    name = "execute_code"
+    version = "1.0.0"
+    description = "Execute Python code in isolated environment with optional database access"
+    requirements = SkillRequirement(
+        repo_types=[],
+        min_access=AccessScope.WRITE,
+        llm_required=False,
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.WRITE,
+        mock_strategy="recorded",
+    )
+
+    def __init__(self, code_executor):
+        self.code_executor = code_executor
+
+    def validate_input(self, input_data: dict) -> ExecuteCodeInput:
+        return ExecuteCodeInput(**input_data)
+
+    async def execute(self, input: ExecuteCodeInput) -> ExecuteCodeOutput:
+        from core.code_executor import CodeExecutionRequest
+        from core.code_executor.data_context import DataAccessLevel, DataContextScope
+
+        result = self.code_executor.execute(CodeExecutionRequest(
+            code=input.code,
+            language=input.language,
+            data_access=DataAccessLevel(input.data_access),
+            data_scope=(
+                DataContextScope.SESSION if input.session_id
+                else DataContextScope.EXECUTION
+            ),
+            session_id=input.session_id,
+            allowed_imports=input.allowed_imports,
+        ))
+
+        return ExecuteCodeOutput(
+            success=result.execution.exit_code == 0,
+            result=result.execution.stdout,
+            error=result.execution.stderr if result.execution.exit_code != 0 else None,
+            execution_time_ms=result.execution.execution_time_ms,
+            data_diff=[
+                {"table": d.table, "added": d.added, "removed": d.removed, "modified": d.modified}
+                for d in result.data_diff
+            ] if result.data_diff else None,
+        )
+
+
 def register_builtin_skills(
-    registry, db, llm=None, github=None, agent_registry=None, chat_loop_factory=None
+    registry, db, llm=None, github=None, agent_registry=None, chat_loop_factory=None,
+    code_executor=None,
 ):
     """Register all built-in skills.
 
@@ -289,6 +363,24 @@ def register_builtin_skills(
             logger.info(f"Registered {skill.name}@{skill.version}")
         except Exception as e:
             logger.warning(f"Failed to register {skill.name}: {e}")
+
+    # Register code execution skill
+    if code_executor:
+        try:
+            exec_skill = ExecuteCodeSkill(code_executor)
+            registry.register(
+                skill=exec_skill,
+                is_active=True,
+                category="code_execution",
+                subcategory="sandbox",
+                triggers=["execute", "run", "code", "python", "compute", "calculate"],
+                dependencies=[],
+                priority=9,
+                cost_estimate="medium",
+            )
+            logger.info(f"Registered {exec_skill.name}@{exec_skill.version}")
+        except Exception as e:
+            logger.warning(f"Failed to register execute_code skill: {e}")
 
     # Register delegation skill for multi-agent collaboration
     if agent_registry and chat_loop_factory:

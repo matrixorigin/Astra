@@ -1,0 +1,105 @@
+"""SubprocessRuntime — default runtime using subprocess + resource limits."""
+
+import os
+import platform
+import resource
+import subprocess
+import tempfile
+import time
+
+from core.runtime import ExecutionResult, ResourceProfile, Runtime
+
+_IS_LINUX = platform.system() == "Linux"
+
+
+class SubprocessRuntime(Runtime):
+    """Execute code in a subprocess with rlimit-based resource control.
+
+    Suitable for dev/demo with trusted code. For untrusted code, use DockerRuntime.
+    """
+
+    @property
+    def supported_languages(self) -> list[str]:
+        return ["python"]
+
+    def health_check(self) -> bool:
+        try:
+            r = subprocess.run(
+                ["python3", "-c", "print('ok')"],
+                capture_output=True, timeout=5, text=True,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def execute(
+        self,
+        code: str,
+        language: str = "python",
+        resources: ResourceProfile | None = None,
+        env: dict[str, str] | None = None,
+    ) -> ExecutionResult:
+        if language not in self.supported_languages:
+            return ExecutionResult(
+                stdout="", stderr=f"Unsupported language: {language}",
+                exit_code=1, execution_time_ms=0,
+            )
+
+        resources = resources or ResourceProfile()
+        exec_env = {**os.environ, **(env or {})}
+        for key in ("PYTHONSTARTUP", "PYTHONPATH"):
+            exec_env.pop(key, None)
+
+        with tempfile.TemporaryDirectory(prefix="mo_exec_") as tmpdir:
+            code_file = os.path.join(tmpdir, "code.py")
+            with open(code_file, "w") as f:
+                f.write(code)
+
+            mem_bytes = resources.max_memory_mb * 1024 * 1024
+            cpu_seconds = resources.max_cpu_seconds
+
+            def _set_limits():
+                # RLIMIT_AS only works on Linux; macOS raises in preexec_fn
+                if _IS_LINUX:
+                    resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
+                    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+                resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+
+            start = time.monotonic()
+            try:
+                proc = subprocess.run(
+                    ["python3", "-u", code_file],
+                    capture_output=True,
+                    timeout=resources.max_wall_seconds,
+                    text=True,
+                    cwd=tmpdir,
+                    env=exec_env,
+                    preexec_fn=_set_limits,
+                )
+                elapsed_ms = (time.monotonic() - start) * 1000
+
+                stdout = proc.stdout
+                truncated = False
+                if len(stdout.encode()) > resources.max_output_bytes:
+                    stdout = stdout[:resources.max_output_bytes]
+                    truncated = True
+
+                return ExecutionResult(
+                    stdout=stdout,
+                    stderr=proc.stderr,
+                    exit_code=proc.returncode,
+                    execution_time_ms=round(elapsed_ms, 2),
+                    truncated=truncated,
+                )
+            except subprocess.TimeoutExpired:
+                elapsed_ms = (time.monotonic() - start) * 1000
+                return ExecutionResult(
+                    stdout="", stderr=f"Execution timed out after {resources.max_wall_seconds}s",
+                    exit_code=137, execution_time_ms=round(elapsed_ms, 2),
+                )
+            except Exception as e:
+                elapsed_ms = (time.monotonic() - start) * 1000
+                return ExecutionResult(
+                    stdout="", stderr=str(e),
+                    exit_code=1, execution_time_ms=round(elapsed_ms, 2),
+                )
