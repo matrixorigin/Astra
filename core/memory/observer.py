@@ -163,12 +163,27 @@ class Observer:
         return result or 0
 
     def _advance_index(self, session_id: str, user_id: str, new_idx: int) -> None:
-        """Store a marker observation to advance the observed index without content."""
-        # We don't create a dummy row — the index is implicit from stored observations.
-        # If extraction returned nothing, we accept that the next call may re-process
-        # these messages. This is safe: the LLM will again return [] for the same content.
-        # This avoids polluting the observations table with empty markers.
-        pass
+        """Store a marker observation to advance the observed index.
+
+        Without this, LLM returning [] would cause the same messages to be
+        re-processed on every turn — wasting LLM calls.
+        """
+        from api.models import Observation
+
+        marker = Observation(
+            observation_id=str(uuid.uuid4()),
+            user_id=user_id,
+            session_id=session_id,
+            content="[no observations extracted]",
+            priority="low",
+            observation_type="marker",
+            observed_at=datetime.now(),
+            source_event_ids="[]",
+            is_reflected=1,  # Already "reflected" so it never shows in context
+            observed_msg_index=new_idx,
+        )
+        self.db.add(marker)
+        self.db.commit()
 
     def get_observed_index(self, session_id: str) -> int:
         """Public accessor for observed index."""

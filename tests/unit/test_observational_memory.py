@@ -139,6 +139,30 @@ class TestObserverExtraction:
         result = observer.observe("s1", "u1", _make_messages())
         assert result == []
 
+    def test_extract_empty_advances_index(self, observer, db):
+        """LLM returns [] → must write marker row to advance DB index, avoiding repeated LLM calls."""
+        self._setup_db_index(observer)
+        observer.llm.chat_with_tools.return_value = {"content": "[]"}
+        msgs = _make_messages(10)
+        observer.observe("s1", "u1", msgs)
+        # Marker row written: db.add called with is_reflected=1 marker
+        added = db.add.call_args[0][0]
+        assert added.observed_msg_index == 10
+        assert added.is_reflected == 1  # marker, won't appear in context
+        db.commit.assert_called()
+
+    def test_llm_failure_advances_index(self, observer, db):
+        """LLM exception → must still advance index so we don't retry same messages."""
+        self._setup_db_index(observer)
+        observer.llm.chat_with_tools.side_effect = RuntimeError("LLM down")
+        msgs = _make_messages(10)
+        result = observer.observe("s1", "u1", msgs)
+        assert result == []
+        # Marker row written even on LLM failure
+        added = db.add.call_args[0][0]
+        assert added.observed_msg_index == 10
+        assert added.is_reflected == 1
+
     def test_llm_failure_graceful(self, observer):
         self._setup_db_index(observer)
         observer.llm.chat_with_tools.side_effect = RuntimeError("LLM down")
