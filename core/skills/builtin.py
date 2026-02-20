@@ -230,6 +230,8 @@ class ExecuteCodeInput(SkillInput):
     code: str
     language: str = "python"
     data_access: str = "none"  # "none", "read", "write"
+    source_db: str | None = None          # Required for read/write
+    tables: list[str] | None = None       # Required for write
     session_id: str | None = None
     allowed_imports: list[str] | None = None
 
@@ -241,6 +243,7 @@ class ExecuteCodeOutput(SkillOutput):
     error: str | None = None
     execution_time_ms: float = 0
     data_diff: list[dict] | None = None
+    time_travel: dict | None = None
 
 
 class ExecuteCodeSkill(Skill):
@@ -267,19 +270,26 @@ class ExecuteCodeSkill(Skill):
 
     async def execute(self, input: ExecuteCodeInput) -> ExecuteCodeOutput:
         from core.code_executor import CodeExecutionRequest
-        from core.code_executor.data_context import DataAccessLevel, DataContextScope
+        from core.code_executor.data_context import DataAccessLevel
 
         result = self.code_executor.execute(CodeExecutionRequest(
             code=input.code,
             language=input.language,
             data_access=DataAccessLevel(input.data_access),
-            data_scope=(
-                DataContextScope.SESSION if input.session_id
-                else DataContextScope.EXECUTION
-            ),
+            source_db=input.source_db,
+            tables=input.tables,
             session_id=input.session_id,
             allowed_imports=input.allowed_imports,
         ))
+
+        time_travel_dict = None
+        if result.time_travel:
+            tt = result.time_travel
+            time_travel_dict = {
+                "started_at": tt.started_at.isoformat(),
+                "source_db": tt.source_db,
+                "sandbox_db": tt.sandbox_db,
+            }
 
         return ExecuteCodeOutput(
             success=result.execution.exit_code == 0,
@@ -287,9 +297,10 @@ class ExecuteCodeSkill(Skill):
             error=result.execution.stderr if result.execution.exit_code != 0 else None,
             execution_time_ms=result.execution.execution_time_ms,
             data_diff=[
-                {"table": d.table, "added": d.added, "removed": d.removed, "modified": d.modified}
+                {"table": d.table, "rows": d.rows}
                 for d in result.data_diff
             ] if result.data_diff else None,
+            time_travel=time_travel_dict,
         )
 
 

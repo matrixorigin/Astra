@@ -6,6 +6,7 @@ import resource
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 
 from core.runtime import ExecutionResult, ResourceProfile, Runtime
 
@@ -66,6 +67,7 @@ class SubprocessRuntime(Runtime):
                 resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
 
             start = time.monotonic()
+            started_at = datetime.now(timezone.utc)
             try:
                 proc = subprocess.run(
                     ["python3", "-u", code_file],
@@ -90,16 +92,19 @@ class SubprocessRuntime(Runtime):
                     exit_code=proc.returncode,
                     execution_time_ms=round(elapsed_ms, 2),
                     truncated=truncated,
+                    started_at=started_at,
                 )
             except subprocess.TimeoutExpired:
                 elapsed_ms = (time.monotonic() - start) * 1000
                 return ExecutionResult(
                     stdout="", stderr=f"Execution timed out after {resources.max_wall_seconds}s",
                     exit_code=137, execution_time_ms=round(elapsed_ms, 2),
+                    started_at=started_at,
                 )
             except Exception as e:
                 elapsed_ms = (time.monotonic() - start) * 1000
                 return ExecutionResult(
                     stdout="", stderr=str(e),
                     exit_code=1, execution_time_ms=round(elapsed_ms, 2),
+                    started_at=started_at,
                 )

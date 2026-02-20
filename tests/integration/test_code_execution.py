@@ -6,7 +6,7 @@ from core.runtime import ResourceProfile, PROFILE_LIGHTWEIGHT
 from core.runtime.subprocess_runtime import SubprocessRuntime
 from core.code_executor import CodeExecutor, CodeExecutionRequest
 from core.code_executor.security import SecurityGuard
-from core.code_executor.data_context import DataAccessLevel, DataContextScope
+from core.code_executor.data_context import DataAccessLevel
 
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def guard():
 @pytest.fixture
 def executor(runtime, guard):
     """CodeExecutor with real runtime, no DB (data_access=NONE only)."""
-    return CodeExecutor(runtime=runtime, db=None, sandbox=None, security=guard)
+    return CodeExecutor(runtime=runtime, db=None, branch=None, security=guard)
 
 
 # ===========================================================================
@@ -380,7 +380,7 @@ class TestMissingIntegration:
     @pytest.fixture
     def executor(self):
         return CodeExecutor(
-            runtime=SubprocessRuntime(), db=None, sandbox=None,
+            runtime=SubprocessRuntime(), db=None, branch=None,
             security=SecurityGuard(),
         )
 

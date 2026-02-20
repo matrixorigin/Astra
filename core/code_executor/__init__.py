@@ -2,20 +2,19 @@
 
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
 from core.code_executor.data_context import (
     DataAccessLevel,
     DataContext,
-    DataContextScope,
     TableDiff,
 )
 from core.code_executor.security import SecurityGuard, SecurityVerdict
 from core.runtime import ExecutionResult, ResourceProfile, Runtime
-from core.sandbox.sandbox import Sandbox
+from core.sandbox.branch import Branch
 
 
 @dataclass
@@ -25,8 +24,17 @@ class CodeExecutionRequest:
     resources: ResourceProfile = field(default_factory=ResourceProfile)
     session_id: str | None = None
     data_access: DataAccessLevel = DataAccessLevel.NONE
-    data_scope: DataContextScope = DataContextScope.EXECUTION
+    source_db: str | None = None          # Required for READ/WRITE
+    tables: list[str] | None = None       # Required for WRITE — declares accessed tables
     allowed_imports: list[str] | None = None
+
+
+@dataclass
+class TimeTravelInfo:
+    """Records what's needed to audit/reproduce an execution."""
+    started_at: datetime           # Execution start UTC (PITR within GC window)
+    source_db: str                 # Source database name
+    sandbox_db: str                # Sandbox database name
 
 
 @dataclass
@@ -34,31 +42,29 @@ class CodeExecutionResult:
     execution: ExecutionResult
     security: SecurityVerdict
     data_diff: list[TableDiff] | None = None
+    time_travel: TimeTravelInfo | None = None  # Only for WRITE mode
 
 
 class CodeExecutor:
-    """Orchestrates security check → data context → runtime execution → cleanup.
+    """Orchestrates security check → data context → runtime execution.
 
-    Callers (skills, ChatLoop) interact only with this service.
+    DataContext is session-scoped only. Uses data branch for zero-copy table branching.
     """
 
     def __init__(
         self,
         runtime: Runtime,
-        db: Session,
-        sandbox: Sandbox,
+        db: Session | None = None,
+        branch: Branch | None = None,
         security: SecurityGuard | None = None,
     ):
         self.runtime = runtime
         self.db = db
-        self.sandbox = sandbox
+        self.branch = branch
         self.security = security or SecurityGuard()
-        # Session-scoped DataContexts keyed by session_id
         self._session_contexts: dict[str, DataContext] = {}
 
     def execute(self, request: CodeExecutionRequest) -> CodeExecutionResult:
-        """Execute code with security check, optional data context, and cleanup."""
-
         # 1. GUARD
         verdict = self.security.analyze(
             request.code, request.language, request.allowed_imports,
@@ -78,13 +84,23 @@ class CodeExecutor:
         context: DataContext | None = None
         env: dict[str, str] = {}
 
-        if request.data_access != DataAccessLevel.NONE:
+        if request.data_access == DataAccessLevel.READ:
+            if request.source_db:
+                env["MO_DATABASE"] = request.source_db
+
+        elif request.data_access == DataAccessLevel.WRITE:
+            if not request.session_id:
+                raise ValueError("WRITE mode requires session_id")
+            if not request.source_db:
+                raise ValueError("WRITE mode requires source_db")
+            if not request.tables:
+                raise ValueError("WRITE mode requires tables")
+
             context = self._get_or_create_context(
-                request.session_id, request.data_access, request.data_scope,
+                request.session_id, request.source_db,
             )
             context.ensure_created()
-            if request.data_access == DataAccessLevel.WRITE:
-                context.checkpoint("pre_exec")
+            context.ensure_tables(request.tables)
             env["MO_DSN"] = context.dsn
             env["MO_DATABASE"] = context.sandbox_name
 
@@ -94,14 +110,6 @@ class CodeExecutor:
                 request.code, request.language, request.resources, env or None,
             )
         except Exception as e:
-            # Runtime failure — restore if WRITE
-            if context and request.data_access == DataAccessLevel.WRITE:
-                try:
-                    context.restore("pre_exec")
-                except Exception:
-                    pass
-            if context and request.data_scope == DataContextScope.EXECUTION:
-                context.destroy()
             return CodeExecutionResult(
                 execution=ExecutionResult(
                     stdout="", stderr=f"Runtime error: {e}",
@@ -112,23 +120,23 @@ class CodeExecutor:
 
         # 4. POST-EXECUTE
         data_diff: list[TableDiff] | None = None
-        if context and request.data_access == DataAccessLevel.WRITE:
-            if result.exit_code != 0:
-                try:
-                    context.restore("pre_exec")
-                except Exception:
-                    pass
-            else:
-                data_diff = context.diff()
+        time_travel: TimeTravelInfo | None = None
 
-        # 5. CLEANUP (execution-scoped only) — always runs
-        if context and request.data_scope == DataContextScope.EXECUTION:
-            context.destroy()
+        if context and request.data_access == DataAccessLevel.WRITE:
+            if result.exit_code == 0:
+                data_diff = context.diff(request.tables)
+            if result.started_at:
+                time_travel = TimeTravelInfo(
+                    started_at=result.started_at,
+                    source_db=request.source_db,
+                    sandbox_db=context.sandbox_name,
+                )
 
         return CodeExecutionResult(
             execution=result,
             security=verdict,
             data_diff=data_diff,
+            time_travel=time_travel,
         )
 
     def cleanup_session(self, session_id: str) -> None:
@@ -138,31 +146,17 @@ class CodeExecutor:
             ctx.destroy()
 
     def _get_or_create_context(
-        self,
-        session_id: str | None,
-        access: DataAccessLevel,
-        scope: DataContextScope,
+        self, session_id: str, source_db: str,
     ) -> DataContext:
-        # Session-scoped: reuse existing
-        if scope == DataContextScope.SESSION and session_id:
-            if session_id in self._session_contexts:
-                return self._session_contexts[session_id]
+        if session_id in self._session_contexts:
+            return self._session_contexts[session_id]
 
-            ctx = DataContext(
-                db=self.db,
-                sandbox=self.sandbox,
-                sandbox_name=f"code_exec_{session_id[:8]}",
-                access=access,
-                scope=scope,
-            )
-            self._session_contexts[session_id] = ctx
-            return ctx
-
-        # Execution-scoped: always create new
-        return DataContext(
+        ctx = DataContext(
             db=self.db,
-            sandbox=self.sandbox,
-            sandbox_name=f"code_exec_{uuid.uuid4().hex[:8]}",
-            access=access,
-            scope=scope,
+            branch=self.branch,
+            sandbox_name=f"code_exec_{session_id[:8]}",
+            source_db=source_db,
+            access=DataAccessLevel.WRITE,
         )
+        self._session_contexts[session_id] = ctx
+        return ctx

@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 
 
 @dataclass
@@ -27,6 +28,7 @@ class ExecutionResult:
     exit_code: int
     execution_time_ms: float
     truncated: bool = False  # True if stdout hit max_output_bytes
+    started_at: datetime | None = None  # UTC timestamp when execution began (for PITR)
 
 
 class Runtime(ABC):

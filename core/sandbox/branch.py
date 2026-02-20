@@ -1,4 +1,4 @@
-"""Branch manager for Git-like data workflows."""
+"""Branch manager for Git-like data workflows using MatrixOne's native data branch."""
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -7,34 +7,38 @@ from api.database import get_db_session
 
 
 class Branch:
-    """Branch manager using MatrixOne's data branch."""
+    """Branch manager using MatrixOne's native data branch commands.
+
+    Supports zero-copy branching with automatic LCA tracking,
+    three-way diff, and merge with conflict strategies.
+    """
 
     def __init__(self, database: str = "dev_agent", db: Session | None = None):
         self.database = database
         self.db = db or next(get_db_session())
 
+    def _qualify(self, name: str) -> str:
+        if "." not in name:
+            return f"{self.database}.{name}"
+        return name
+
     def create(
         self, name: str, source: str, snapshot: str | None = None, is_database: bool = False
     ) -> None:
-        """Create branch.
+        """Create branch (zero-copy).
 
-        Args:
-            name: Branch name
-            source: Source table/database name
-            snapshot: Optional snapshot to branch from
-            is_database: True for database branch, False for table branch
+        Uses `data branch create table/database ... from ...`.
+        Kernel records LCA for future diff/merge.
         """
         self.db.commit()
         entity = "database" if is_database else "table"
 
         if not is_database:
-            if "." not in name:
-                name = f"{self.database}.{name}"
-            if "." not in source:
-                source = f"{self.database}.{source}"
+            name = self._qualify(name)
+            source = self._qualify(source)
 
-        query = f"CREATE TABLE {name} AS SELECT * FROM {source}"
-        self.db.execute(text(query))
+        src = f'{source}{{snapshot="{snapshot}"}}' if snapshot else source
+        self.db.execute(text(f"data branch create {entity} {name} from {src}"))
         self.db.commit()
 
     def diff(
@@ -45,79 +49,57 @@ class Branch:
         target_snapshot: str | None = None,
         source_snapshot: str | None = None,
     ) -> list[dict]:
-        """Diff two tables.
+        """Diff two tables using native data branch diff.
 
-        Args:
-            target: Target table
-            source: Source table
-            output: Output mode: "default", "count", or file path
-            target_snapshot: Optional snapshot for target
-            source_snapshot: Optional snapshot for source
+        Kernel auto-detects LCA for three-way comparison.
+        Works with or without snapshots.
         """
         self.db.commit()
-        
-        if "." not in target:
-            target = f"{self.database}.{target}"
-        if "." not in source:
-            source = f"{self.database}.{source}"
-        
-        # Use data branch diff when snapshots provided
-        if target_snapshot or source_snapshot:
-            t = f'{target}{{snapshot="{target_snapshot}"}}' if target_snapshot else target
-            s = f'{source}{{snapshot="{source_snapshot}"}}' if source_snapshot else source
-            
-            query = f"data branch diff {t} against {s}"
-            if output == "count":
-                query += " output count"
-            
-            result = self.db.execute(text(query))
-            return [dict(row._mapping) for row in result]
-        
-        # Regular diff using EXCEPT
+
+        t = self._qualify(target)
+        s = self._qualify(source)
+
+        if target_snapshot:
+            t = f'{t}{{snapshot="{target_snapshot}"}}'
+        if source_snapshot:
+            s = f'{s}{{snapshot="{source_snapshot}"}}'
+
+        query = f"data branch diff {t} against {s}"
         if output == "count":
-            query = f"SELECT COUNT(*) as count FROM (SELECT * FROM {target} EXCEPT SELECT * FROM {source}) AS diff_result"
-        else:
-            query = f"SELECT * FROM {target} EXCEPT SELECT * FROM {source}"
+            query += " output count"
 
         result = self.db.execute(text(query))
         return [dict(row._mapping) for row in result]
 
-    def merge(self, source: str, target: str, on_conflict: str = "skip") -> None:
-        """Merge source into target.
+    def merge(
+        self, source: str, target: str, on_conflict: str = "skip"
+    ) -> None:
+        """Merge source into target using native data branch merge.
 
         Args:
-            source: Source table
-            target: Target table
-            on_conflict: Conflict strategy: "error", "skip", or "accept"
+            on_conflict: "error" (default, raises on conflict),
+                         "skip" (keep target), "accept" (take source)
         """
         self.db.commit()
-        
-        if "." not in source:
-            source = f"{self.database}.{source}"
-        if "." not in target:
-            target = f"{self.database}.{target}"
-        
-        if on_conflict == "skip":
-            query = f"INSERT INTO {target} SELECT * FROM {source} WHERE NOT EXISTS (SELECT 1 FROM {target} t WHERE t.a = {source}.a)"
-        else:
-            query = f"INSERT INTO {target} SELECT * FROM {source}"
+
+        s = self._qualify(source)
+        t = self._qualify(target)
+
+        query = f"data branch merge {s} into {t}"
+        if on_conflict in ("skip", "accept"):
+            query += f" when conflict {on_conflict}"
+
         self.db.execute(text(query))
         self.db.commit()
 
     def delete(self, name: str, is_database: bool = False) -> None:
-        """Delete branch.
+        """Delete branch using native data branch delete.
 
-        Args:
-            name: Branch name
-            is_database: True for database branch, False for table branch
+        Properly cleans up branch metadata in kernel.
         """
         self.db.commit()
-        if is_database:
-            query = f"DROP DATABASE IF EXISTS {name}"
-        else:
-            if "." not in name:
-                name = f"{self.database}.{name}"
-            query = f"DROP TABLE IF EXISTS {name}"
-        
-        self.db.execute(text(query))
+        entity = "database" if is_database else "table"
+        if not is_database:
+            name = self._qualify(name)
+        self.db.execute(text(f"data branch delete {entity} {name}"))
         self.db.commit()

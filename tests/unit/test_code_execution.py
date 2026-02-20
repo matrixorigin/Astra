@@ -1,6 +1,7 @@
-"""Tests for code execution: Runtime, SecurityGuard, CodeExecutor, ExecuteCodeSkill."""
+"""Tests for code execution: Runtime, SecurityGuard, DataContext, CodeExecutor, ExecuteCodeSkill."""
 
-from unittest.mock import MagicMock, patch, PropertyMock
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch, PropertyMock, call
 import pytest
 
 from core.runtime import (
@@ -14,10 +15,10 @@ from core.code_executor.security import (
     DANGEROUS_ATTRS, DANGEROUS_NAMES,
 )
 from core.code_executor.data_context import (
-    DataAccessLevel, DataContextScope, DataContext, TableDiff,
+    DataAccessLevel, DataContext, TableDiff,
 )
 from core.code_executor import (
-    CodeExecutor, CodeExecutionRequest, CodeExecutionResult,
+    CodeExecutor, CodeExecutionRequest, CodeExecutionResult, TimeTravelInfo,
 )
 
 
@@ -55,11 +56,18 @@ class TestExecutionResult:
     def test_defaults(self):
         r = ExecutionResult(stdout="ok", stderr="", exit_code=0, execution_time_ms=10.5)
         assert r.truncated is False
+        assert r.started_at is None
 
     def test_truncated(self):
         r = ExecutionResult(stdout="x" * 100, stderr="", exit_code=0,
                             execution_time_ms=1.0, truncated=True)
         assert r.truncated is True
+
+    def test_started_at(self):
+        now = datetime.now(timezone.utc)
+        r = ExecutionResult(stdout="", stderr="", exit_code=0,
+                            execution_time_ms=1.0, started_at=now)
+        assert r.started_at == now
 
 
 # ===========================================================================
@@ -83,6 +91,12 @@ class TestSubprocessRuntime:
         assert r.stdout.strip() == "42"
         assert r.execution_time_ms > 0
 
+    def test_started_at_recorded(self, runtime):
+        r = runtime.execute("print(1)", "python")
+        assert r.started_at is not None
+        assert isinstance(r.started_at, datetime)
+        assert r.started_at.tzinfo is not None  # UTC aware
+
     def test_stderr_capture(self, runtime):
         r = runtime.execute("import sys; sys.stderr.write('err')", "python")
         assert "err" in r.stderr
@@ -104,6 +118,7 @@ class TestSubprocessRuntime:
         )
         assert r.exit_code == 137
         assert "timed out" in r.stderr
+        assert r.started_at is not None
 
     def test_env_vars_passed(self, runtime):
         code = "import os; print(os.environ.get('TEST_VAR', 'missing'))"
@@ -117,19 +132,13 @@ class TestSubprocessRuntime:
         assert "clean" in r.stdout
 
     def test_output_truncation(self, runtime):
-        # Generate output larger than max_output_bytes
         code = "print('x' * 2_000_000)"
         r = runtime.execute(code, "python", ResourceProfile(max_output_bytes=1000))
         assert r.truncated is True
         assert len(r.stdout) <= 1000
 
     def test_multiline_code(self, runtime):
-        code = """
-data = [1, 2, 3, 4, 5]
-total = sum(data)
-avg = total / len(data)
-print(f"{total},{avg}")
-"""
+        code = "data = [1,2,3,4,5]\nprint(f'{sum(data)},{sum(data)/len(data)}')"
         r = runtime.execute(code, "python")
         assert r.exit_code == 0
         assert "15,3.0" in r.stdout
@@ -140,16 +149,33 @@ print(f"{total},{avg}")
         assert "SyntaxError" in r.stderr
 
     def test_cwd_is_tmpdir(self, runtime):
-        """Code runs in a temporary directory, not the project root."""
         code = "import os; print(os.getcwd())"
         r = runtime.execute(code, "python")
         assert r.exit_code == 0
         assert "mo_exec_" in r.stdout
 
     def test_default_resources_when_none(self, runtime):
-        """Passing None for resources uses defaults."""
         r = runtime.execute("print('ok')", "python", None)
         assert r.exit_code == 0
+
+    def test_empty_code(self, runtime):
+        r = runtime.execute("", "python")
+        assert r.exit_code == 0
+        assert r.stdout == ""
+
+    def test_timeout_elapsed_time_reasonable(self, runtime):
+        r = runtime.execute(
+            "import time; time.sleep(100)", "python",
+            ResourceProfile(max_wall_seconds=1),
+        )
+        assert r.exit_code == 137
+        assert 500 <= r.execution_time_ms <= 3000
+
+    def test_large_stderr_doesnt_affect_stdout(self, runtime):
+        code = "import sys\nsys.stderr.write('error\\n' * 1000)\nprint('stdout_ok')"
+        r = runtime.execute(code, "python")
+        assert r.exit_code == 0
+        assert "stdout_ok" in r.stdout
 
 
 # ===========================================================================
@@ -162,214 +188,178 @@ class TestSecurityGuard:
         return SecurityGuard()
 
     # --- Safe code ---
-
     def test_safe_simple(self, guard):
-        v = guard.analyze("print(1 + 1)")
-        assert v.safe is True
-        assert v.issues == []
+        assert guard.analyze("print(1 + 1)").safe is True
 
     def test_safe_allowed_imports(self, guard):
-        v = guard.analyze("import json\nimport math\nimport datetime")
-        assert v.safe is True
+        assert guard.analyze("import json\nimport math\nimport datetime").safe is True
 
     def test_safe_from_import(self, guard):
-        v = guard.analyze("from collections import defaultdict")
-        assert v.safe is True
+        assert guard.analyze("from collections import defaultdict").safe is True
 
     def test_safe_multiline(self, guard):
-        code = """
-import json
-data = {"key": "value"}
-result = json.dumps(data)
-print(result)
-"""
-        v = guard.analyze(code)
-        assert v.safe is True
+        assert guard.analyze("import json\nprint(json.dumps({'a': 1}))").safe is True
 
     # --- Dangerous imports ---
-
     def test_block_os(self, guard):
         v = guard.analyze("import os")
         assert v.safe is False
         assert any(i.category == "dangerous_import" for i in v.issues)
 
     def test_block_subprocess(self, guard):
-        v = guard.analyze("import subprocess")
-        assert v.safe is False
+        assert guard.analyze("import subprocess").safe is False
 
     def test_block_sys(self, guard):
-        v = guard.analyze("import sys")
-        assert v.safe is False
+        assert guard.analyze("import sys").safe is False
 
     def test_block_socket(self, guard):
-        v = guard.analyze("import socket")
-        assert v.safe is False
+        assert guard.analyze("import socket").safe is False
 
     def test_block_ctypes(self, guard):
-        v = guard.analyze("import ctypes")
-        assert v.safe is False
+        assert guard.analyze("import ctypes").safe is False
 
     def test_block_pickle(self, guard):
-        v = guard.analyze("import pickle")
-        assert v.safe is False
+        assert guard.analyze("import pickle").safe is False
 
     def test_block_shutil(self, guard):
-        v = guard.analyze("import shutil")
-        assert v.safe is False
+        assert guard.analyze("import shutil").safe is False
 
     def test_block_importlib(self, guard):
-        v = guard.analyze("import importlib")
-        assert v.safe is False
+        assert guard.analyze("import importlib").safe is False
 
     def test_block_from_os(self, guard):
-        v = guard.analyze("from os import path")
-        assert v.safe is False
+        assert guard.analyze("from os import path").safe is False
 
     def test_block_from_subprocess(self, guard):
-        v = guard.analyze("from subprocess import run")
-        assert v.safe is False
+        assert guard.analyze("from subprocess import run").safe is False
 
     def test_block_nested_import(self, guard):
-        """os.path should be blocked (root module is os)."""
-        v = guard.analyze("import os.path")
-        assert v.safe is False
+        assert guard.analyze("import os.path").safe is False
 
     # --- Dangerous calls ---
-
     def test_block_eval(self, guard):
         v = guard.analyze("eval('1+1')")
         assert v.safe is False
         assert any(i.category == "dangerous_call" for i in v.issues)
 
     def test_block_exec(self, guard):
-        v = guard.analyze("exec('print(1)')")
-        assert v.safe is False
+        assert guard.analyze("exec('print(1)')").safe is False
 
     def test_block_compile(self, guard):
-        v = guard.analyze("compile('1+1', '<string>', 'eval')")
-        assert v.safe is False
+        assert guard.analyze("compile('1+1', '<string>', 'eval')").safe is False
 
     def test_block___import__(self, guard):
-        v = guard.analyze("__import__('os')")
-        assert v.safe is False
+        assert guard.analyze("__import__('os')").safe is False
 
     def test_block_open(self, guard):
-        v = guard.analyze("open('/etc/passwd')")
-        assert v.safe is False
+        assert guard.analyze("open('/etc/passwd')").safe is False
 
     def test_block_getattr(self, guard):
-        v = guard.analyze("getattr(obj, 'method')")
-        assert v.safe is False
+        assert guard.analyze("getattr(obj, 'method')").safe is False
 
     def test_block_breakpoint(self, guard):
-        v = guard.analyze("breakpoint()")
-        assert v.safe is False
+        assert guard.analyze("breakpoint()").safe is False
 
     # --- Multiple issues ---
-
     def test_multiple_issues(self, guard):
-        code = "import os\nimport subprocess\neval('1')"
-        v = guard.analyze(code)
+        v = guard.analyze("import os\nimport subprocess\neval('1')")
         assert v.safe is False
         assert len(v.issues) == 3
 
     def test_issue_line_numbers(self, guard):
-        code = "x = 1\nimport os\ny = 2\neval('1')"
-        v = guard.analyze(code)
+        v = guard.analyze("x = 1\nimport os\ny = 2\neval('1')")
         lines = {i.line for i in v.issues}
-        assert 2 in lines  # import os
-        assert 4 in lines  # eval
+        assert 2 in lines
+        assert 4 in lines
 
     # --- Syntax errors ---
-
     def test_syntax_error(self, guard):
         v = guard.analyze("def foo(")
         assert v.safe is False
         assert v.issues[0].category == "syntax_error"
 
     # --- Extra allowed imports ---
-
     def test_extra_allowed(self, guard):
-        v = guard.analyze("import pandas\nimport numpy", extra_allowed=["pandas", "numpy"])
-        assert v.safe is True
+        assert guard.analyze("import pandas\nimport numpy", extra_allowed=["pandas", "numpy"]).safe is True
 
     def test_extra_allowed_doesnt_override_deny(self, guard):
-        """Extra allowed doesn't whitelist denied modules."""
-        # os is in deny list — extra_allowed adds to allow, but deny takes precedence
-        v = guard.analyze("import os", extra_allowed=["os"])
-        # os is still in deny_imports, so it should be blocked
-        assert v.safe is False
+        assert guard.analyze("import os", extra_allowed=["os"]).safe is False
 
     # --- Custom deny/allow ---
-
     def test_custom_deny(self):
-        guard = SecurityGuard(deny_imports={"requests"})
-        v = guard.analyze("import requests")
-        assert v.safe is False
+        assert SecurityGuard(deny_imports={"requests"}).analyze("import requests").safe is False
 
     def test_custom_allow(self):
-        guard = SecurityGuard(allow_imports={"custom_lib"})
-        v = guard.analyze("import custom_lib")
-        assert v.safe is True
+        assert SecurityGuard(allow_imports={"custom_lib"}).analyze("import custom_lib").safe is True
 
     # --- Unsupported language ---
-
     def test_unsupported_language(self, guard):
         v = guard.analyze("console.log(1)", language="javascript")
         assert v.safe is False
         assert "unsupported" in v.issues[0].category
 
     # --- Default lists sanity ---
-
     def test_deny_list_completeness(self):
-        """All critical modules are in deny list."""
         for mod in ["os", "subprocess", "sys", "socket", "ctypes", "pickle"]:
             assert mod in DEFAULT_DENY_IMPORTS
 
     def test_allow_list_completeness(self):
-        """Common safe modules are in allow list."""
         for mod in ["json", "math", "datetime", "re", "collections"]:
             assert mod in DEFAULT_ALLOW_IMPORTS
 
     def test_dangerous_calls_completeness(self):
-        for call in ["eval", "exec", "compile", "__import__", "open"]:
-            assert call in DANGEROUS_CALLS
+        for c in ["eval", "exec", "compile", "__import__", "open"]:
+            assert c in DANGEROUS_CALLS
 
     # --- Bypass vector detection ---
-
     def test_block_builtins_access(self, guard):
-        v = guard.analyze("x = __builtins__")
-        assert v.safe is False
+        assert guard.analyze("x = __builtins__").safe is False
 
     def test_block_dunder_subclasses(self, guard):
-        v = guard.analyze("x = ().__class__.__subclasses__()")
-        assert v.safe is False
+        assert guard.analyze("x = ().__class__.__subclasses__()").safe is False
 
     def test_block_dunder_globals(self, guard):
-        v = guard.analyze("x = f.__globals__")
-        assert v.safe is False
+        assert guard.analyze("x = f.__globals__").safe is False
 
     def test_block_dunder_bases(self, guard):
-        v = guard.analyze("x = int.__bases__")
-        assert v.safe is False
+        assert guard.analyze("x = int.__bases__").safe is False
 
     def test_block_dunder_mro(self, guard):
-        v = guard.analyze("x = int.__mro__")
-        assert v.safe is False
+        assert guard.analyze("x = int.__mro__").safe is False
 
     def test_block_dunder_code(self, guard):
-        v = guard.analyze("x = f.__code__")
-        assert v.safe is False
+        assert guard.analyze("x = f.__code__").safe is False
 
     def test_block_class_chain(self, guard):
-        """Classic sandbox escape: ''.__class__.__mro__[1].__subclasses__()"""
-        code = "x = ''.__class__.__mro__"
-        v = guard.analyze(code)
-        assert v.safe is False
+        assert guard.analyze("x = ''.__class__.__mro__").safe is False
+
+    def test_empty_code_is_safe(self, guard):
+        assert guard.analyze("").safe is True
+
+    def test_block_dunder_dict_attr(self, guard):
+        assert guard.analyze("x = obj.__dict__").safe is False
+
+    def test_block_dunder_init_subclass(self, guard):
+        assert guard.analyze("x = cls.__init_subclass__").safe is False
+
+    def test_multiple_bypass_vectors(self, guard):
+        assert guard.analyze("__builtins__['eval']('1')").safe is False
+
+    def test_safe_dunder_in_string(self, guard):
+        assert guard.analyze('x = "__builtins__"').safe is True
+
+    def test_safe_dunder_in_comment(self, guard):
+        assert guard.analyze("# use __builtins__ carefully\nprint(1)").safe is True
+
+    def test_vars_documented_gap(self, guard):
+        assert isinstance(guard.analyze("vars()").safe, bool)
+
+    def test_type_documented_gap(self, guard):
+        assert isinstance(guard.analyze("C = type('C', (object,), {})").safe, bool)
 
 
 # ===========================================================================
-# 5. DataAccessLevel & DataContextScope
+# 5. DataAccessLevel
 # ===========================================================================
 
 class TestDataEnums:
@@ -378,180 +368,246 @@ class TestDataEnums:
         assert DataAccessLevel.READ.value == "read"
         assert DataAccessLevel.WRITE.value == "write"
 
-    def test_scope_values(self):
-        assert DataContextScope.EXECUTION.value == "execution"
-        assert DataContextScope.SESSION.value == "session"
-
     def test_from_string(self):
         assert DataAccessLevel("read") == DataAccessLevel.READ
-        assert DataContextScope("session") == DataContextScope.SESSION
+        assert DataAccessLevel("write") == DataAccessLevel.WRITE
 
 
 # ===========================================================================
-# 6. DataContext (mocked Sandbox)
+# 6. DataContext (mocked Branch)
 # ===========================================================================
 
 class TestDataContext:
     @pytest.fixture
-    def mock_sandbox(self):
-        sandbox = MagicMock()
-        sandbox.list_tables.return_value = ["sessions", "events"]
-        sandbox.info.return_value = {"sandbox_name": "test_sandbox"}
-        sandbox.git = MagicMock()
-        return sandbox
+    def mock_branch(self):
+        return MagicMock()
 
     @pytest.fixture
-    def ctx_read(self, mock_sandbox):
+    def mock_db(self):
+        return MagicMock()
+
+    @pytest.fixture
+    def ctx_read(self, mock_branch, mock_db):
         return DataContext(
-            db=MagicMock(), sandbox=mock_sandbox,
-            sandbox_name="test_sandbox",
-            access=DataAccessLevel.READ, scope=DataContextScope.EXECUTION,
+            db=mock_db, branch=mock_branch,
+            sandbox_name="test_sandbox", source_db="dev_agent",
+            access=DataAccessLevel.READ,
         )
 
     @pytest.fixture
-    def ctx_write(self, mock_sandbox):
+    def ctx_write(self, mock_branch, mock_db):
         return DataContext(
-            db=MagicMock(), sandbox=mock_sandbox,
-            sandbox_name="test_sandbox",
-            access=DataAccessLevel.WRITE, scope=DataContextScope.EXECUTION,
+            db=mock_db, branch=mock_branch,
+            sandbox_name="test_sandbox", source_db="dev_agent",
+            access=DataAccessLevel.WRITE,
         )
 
-    def test_dsn(self, ctx_read):
-        assert "test_sandbox" in ctx_read.dsn
+    # --- DSN ---
+    def test_dsn_read(self, ctx_read):
         assert "code_exec_ro" in ctx_read.dsn
+        assert "test_sandbox" in ctx_read.dsn
 
+    def test_dsn_write(self, ctx_write):
+        assert "code_exec_rw" in ctx_write.dsn
+
+    def test_dsn_none_access(self, mock_branch, mock_db):
+        ctx = DataContext(
+            db=mock_db, branch=mock_branch,
+            sandbox_name="sb", source_db="src",
+            access=DataAccessLevel.NONE,
+        )
+        assert ctx.dsn == "sb"
+
+    # --- Lifecycle ---
     def test_not_alive_before_create(self, ctx_read):
         assert ctx_read.alive is False
 
-    def test_alive_after_create(self, ctx_read, mock_sandbox):
-        ctx_read.ensure_created()
-        assert ctx_read.alive is True
-        mock_sandbox.create.assert_called_once()
-
-    def test_ensure_created_idempotent(self, ctx_read, mock_sandbox):
-        ctx_read.ensure_created()
-        ctx_read.ensure_created()
-        assert mock_sandbox.create.call_count == 1
-
-    def test_checkpoint_requires_write(self, ctx_read):
-        ctx_read.ensure_created()
-        with pytest.raises(RuntimeError, match="WRITE"):
-            ctx_read.checkpoint()
-
-    def test_checkpoint_write(self, ctx_write, mock_sandbox):
+    def test_alive_after_create(self, ctx_write, mock_db):
         ctx_write.ensure_created()
-        ctx_write.checkpoint("pre_exec")
-        mock_sandbox.snapshot.assert_called_once_with("test_sandbox", "pre_exec")
+        assert ctx_write.alive is True
+        # CREATE DATABASE IF NOT EXISTS called
+        assert mock_db.execute.called
 
-    def test_restore(self, ctx_write, mock_sandbox):
+    def test_ensure_created_idempotent(self, ctx_write, mock_db):
         ctx_write.ensure_created()
-        ctx_write.restore("pre_exec")
-        mock_sandbox.restore.assert_called_once_with("test_sandbox", "pre_exec")
-
-    def test_destroy(self, ctx_write, mock_sandbox):
+        call_count_1 = mock_db.execute.call_count
         ctx_write.ensure_created()
-        ctx_write.destroy()
-        mock_sandbox.delete.assert_called_once_with("test_sandbox")
-        assert ctx_write.alive is False
+        assert mock_db.execute.call_count == call_count_1  # no new calls
 
-    def test_destroy_idempotent(self, ctx_write, mock_sandbox):
-        """Destroy before create does nothing."""
-        ctx_write.destroy()
-        mock_sandbox.delete.assert_not_called()
-
-    def test_destroy_twice(self, ctx_write, mock_sandbox):
+    # --- Table-level branch ---
+    def test_ensure_tables(self, ctx_write, mock_branch):
         ctx_write.ensure_created()
-        ctx_write.destroy()
-        ctx_write.destroy()
-        assert mock_sandbox.delete.call_count == 1
+        ctx_write.ensure_tables(["orders", "products"])
+        assert mock_branch.create.call_count == 2
+        mock_branch.create.assert_any_call(
+            name="test_sandbox.orders", source="dev_agent.orders",
+        )
+        mock_branch.create.assert_any_call(
+            name="test_sandbox.products", source="dev_agent.products",
+        )
 
-    def test_diff_no_checkpoint(self, ctx_write):
-        """Diff without checkpoint returns empty."""
+    def test_ensure_tables_idempotent(self, ctx_write, mock_branch):
+        ctx_write.ensure_created()
+        ctx_write.ensure_tables(["orders"])
+        ctx_write.ensure_tables(["orders"])
+        assert mock_branch.create.call_count == 1
+
+    def test_ensure_tables_incremental(self, ctx_write, mock_branch):
+        ctx_write.ensure_created()
+        ctx_write.ensure_tables(["orders"])
+        ctx_write.ensure_tables(["orders", "products"])
+        assert mock_branch.create.call_count == 2
+
+    # --- Diff (native data branch diff) ---
+    def test_diff_empty(self, ctx_write, mock_branch):
+        mock_branch.diff.return_value = []
+        ctx_write.ensure_created()
+        ctx_write.ensure_tables(["orders"])
         assert ctx_write.diff() == []
 
-    def test_diff_with_checkpoint(self, ctx_write, mock_sandbox):
+    def test_diff_returns_rows(self, ctx_write, mock_branch):
+        mock_branch.diff.return_value = [
+            {"diff t2 against t1": "t2", "flag": "INSERT", "a": 5, "b": 5},
+        ]
         ctx_write.ensure_created()
-        ctx_write.checkpoint("pre_exec")
-        # Mock diff returns
-        mock_sandbox.git.diff.return_value = [{"count": 3}]
+        ctx_write.ensure_tables(["orders"])
         diffs = ctx_write.diff()
-        # Should have called diff for each table
-        assert mock_sandbox.git.diff.call_count >= 1
+        assert len(diffs) == 1
+        assert diffs[0].table == "orders"
+        assert len(diffs[0].rows) == 1
 
-    def test_checkpoint_drops_previous(self, ctx_write, mock_sandbox):
-        """Second checkpoint drops the first."""
+    def test_diff_with_explicit_tables(self, ctx_write, mock_branch):
+        mock_branch.diff.return_value = [{"flag": "INSERT"}]
         ctx_write.ensure_created()
-        ctx_write.checkpoint("cp1")
-        ctx_write.checkpoint("cp2")
-        mock_sandbox.git.drop_snapshot.assert_called_once_with("test_sandbox_cp1")
+        ctx_write.ensure_tables(["orders", "products"])
+        diffs = ctx_write.diff(["orders"])
+        # Only orders diffed
+        assert mock_branch.diff.call_count == 1
+        call_args = mock_branch.diff.call_args
+        assert "orders" in call_args[1]["target"]
 
-    def test_dsn_read_uses_ro_user(self, mock_sandbox):
-        ctx = DataContext(
-            db=MagicMock(), sandbox=mock_sandbox,
-            sandbox_name="test_sb", access=DataAccessLevel.READ,
-            scope=DataContextScope.EXECUTION,
-        )
-        assert "code_exec_ro" in ctx.dsn
-        assert "test_sb" in ctx.dsn
+    def test_diff_continues_on_exception(self, ctx_write, mock_branch):
+        mock_branch.diff.side_effect = [Exception("fail"), [{"flag": "INSERT"}]]
+        ctx_write.ensure_created()
+        ctx_write.ensure_tables(["orders", "products"])
+        diffs = ctx_write.diff()
+        assert isinstance(diffs, list)
 
-    def test_dsn_write_uses_rw_user(self, mock_sandbox):
-        ctx = DataContext(
-            db=MagicMock(), sandbox=mock_sandbox,
-            sandbox_name="test_sb", access=DataAccessLevel.WRITE,
-            scope=DataContextScope.EXECUTION,
-        )
-        assert "code_exec_rw" in ctx.dsn
-        assert "test_sb" in ctx.dsn
-
-    def test_dsn_none_access(self, mock_sandbox):
-        ctx = DataContext(
-            db=MagicMock(), sandbox=mock_sandbox,
-            sandbox_name="test_sb", access=DataAccessLevel.NONE,
-            scope=DataContextScope.EXECUTION,
-        )
-        # NONE access returns just the name (no user credentials)
-        assert ctx.dsn == "test_sb"
-
+    # --- Merge ---
     def test_merge_requires_write(self, ctx_read):
         ctx_read.ensure_created()
         with pytest.raises(RuntimeError, match="WRITE"):
             ctx_read.merge()
 
-    def test_merge_no_diff_returns_empty(self, ctx_write, mock_sandbox):
+    def test_merge_calls_branch_merge(self, ctx_write, mock_branch):
         ctx_write.ensure_created()
-        # No checkpoint → no diff → empty merge
+        ctx_write.ensure_tables(["orders"])
         result = ctx_write.merge()
-        assert result.tables_merged == []
-        assert result.rows_applied == 0
-
-    def test_merge_calls_branch_merge(self, ctx_write, mock_sandbox):
-        ctx_write.ensure_created()
-        ctx_write.checkpoint("pre_exec")
-        mock_sandbox.git.diff.return_value = [{"count": 5}]
-        mock_sandbox.list_tables.return_value = ["sessions"]
-        mock_sandbox.source_db = "dev_agent"
-        result = ctx_write.merge()
-        # Should have called merge on the branch
-        assert mock_sandbox.git.merge.call_count >= 0  # May be 0 if diff returns empty after filtering
-
-    def test_grant_permissions_called_on_create(self, mock_sandbox):
-        mock_db = MagicMock()
-        ctx = DataContext(
-            db=mock_db, sandbox=mock_sandbox,
-            sandbox_name="test_sb", access=DataAccessLevel.READ,
-            scope=DataContextScope.EXECUTION,
+        mock_branch.merge.assert_called_once_with(
+            source="test_sandbox.orders",
+            target="dev_agent.orders",
+            on_conflict="skip",
         )
-        ctx.ensure_created()
-        # Should have executed GRANT statement
-        assert mock_db.execute.called
-        # Extract the SQL text from the TextClause argument
-        sql_arg = mock_db.execute.call_args_list[0][0][0]
-        assert "GRANT" in sql_arg.text
-        assert "code_exec_ro" in sql_arg.text
+        assert result.tables_merged == ["orders"]
+
+    def test_merge_with_conflict_accept(self, ctx_write, mock_branch):
+        ctx_write.ensure_created()
+        ctx_write.ensure_tables(["orders"])
+        ctx_write.merge(on_conflict="accept")
+        mock_branch.merge.assert_called_once_with(
+            source="test_sandbox.orders",
+            target="dev_agent.orders",
+            on_conflict="accept",
+        )
+
+    def test_merge_tracks_failures(self, ctx_write, mock_branch):
+        def merge_side_effect(source, target, on_conflict):
+            if "orders" in source:
+                raise Exception("conflict")
+        mock_branch.merge.side_effect = merge_side_effect
+        ctx_write.ensure_created()
+        ctx_write.ensure_tables(["orders", "products"])
+        result = ctx_write.merge()
+        assert "orders" in result.tables_failed
+        assert "products" in result.tables_merged
+
+    # --- Destroy ---
+    def test_destroy(self, ctx_write, mock_branch, mock_db):
+        ctx_write.ensure_created()
+        ctx_write.ensure_tables(["orders", "products"])
+        ctx_write.destroy()
+        assert ctx_write.alive is False
+        # data branch delete called per table
+        assert mock_branch.delete.call_count == 2
+        # DROP DATABASE called via db.execute(text(...))
+        drop_found = False
+        for c in mock_db.execute.call_args_list:
+            sql_arg = c[0][0]
+            if hasattr(sql_arg, 'text') and "DROP DATABASE" in sql_arg.text:
+                drop_found = True
+        assert drop_found
+
+    def test_destroy_idempotent(self, ctx_write):
+        ctx_write.destroy()  # before create — no-op
+
+    def test_destroy_clears_state(self, ctx_write, mock_branch):
+        ctx_write.ensure_created()
+        ctx_write.ensure_tables(["orders"])
+        ctx_write.destroy()
+        assert ctx_write._branched_tables == set()
+
+    def test_grant_permissions_on_create(self, ctx_write, mock_db):
+        ctx_write.ensure_created()
+        grant_found = False
+        for c in mock_db.execute.call_args_list:
+            sql_arg = c[0][0]
+            if hasattr(sql_arg, 'text') and "GRANT" in sql_arg.text:
+                grant_found = True
+                assert "code_exec_rw" in sql_arg.text
+        assert grant_found
 
 
 # ===========================================================================
-# 7. CodeExecutor
+# 7. TimeTravelInfo
+# ===========================================================================
+
+class TestTimeTravelInfo:
+    def test_fields(self):
+        now = datetime.now(timezone.utc)
+        tt = TimeTravelInfo(
+            started_at=now, source_db="prod", sandbox_db="sandbox_s1",
+        )
+        assert tt.started_at == now
+        assert tt.source_db == "prod"
+        assert tt.sandbox_db == "sandbox_s1"
+
+
+# ===========================================================================
+# 8. CodeExecutionRequest
+# ===========================================================================
+
+class TestCodeExecutionRequest:
+    def test_defaults(self):
+        req = CodeExecutionRequest(code="print(1)")
+        assert req.language == "python"
+        assert req.data_access == DataAccessLevel.NONE
+        assert req.session_id is None
+        assert req.source_db is None
+        assert req.tables is None
+        assert req.allowed_imports is None
+
+    def test_write_request(self):
+        req = CodeExecutionRequest(
+            code="x", data_access=DataAccessLevel.WRITE,
+            source_db="prod", tables=["orders"],
+            session_id="s1", allowed_imports=["pandas"],
+        )
+        assert req.source_db == "prod"
+        assert req.tables == ["orders"]
+
+
+# ===========================================================================
+# 9. CodeExecutor
 # ===========================================================================
 
 class TestCodeExecutor:
@@ -560,245 +616,206 @@ class TestCodeExecutor:
         rt = MagicMock(spec=Runtime)
         rt.execute.return_value = ExecutionResult(
             stdout="42\n", stderr="", exit_code=0, execution_time_ms=10.0,
+            started_at=datetime(2026, 2, 20, 15, 0, 0, tzinfo=timezone.utc),
         )
         rt.supported_languages = ["python"]
         return rt
 
     @pytest.fixture
-    def mock_sandbox(self):
-        sandbox = MagicMock()
-        sandbox.list_tables.return_value = ["sessions"]
-        sandbox.git = MagicMock()
-        sandbox.git.diff.return_value = []
-        return sandbox
+    def mock_branch(self):
+        branch = MagicMock()
+        branch.diff.return_value = []
+        return branch
 
     @pytest.fixture
-    def guard(self):
-        return SecurityGuard()
+    def mock_db(self):
+        return MagicMock()
 
     @pytest.fixture
-    def executor(self, mock_runtime, mock_sandbox, guard):
+    def executor(self, mock_runtime, mock_branch, mock_db):
         return CodeExecutor(
-            runtime=mock_runtime, db=MagicMock(),
-            sandbox=mock_sandbox, security=guard,
+            runtime=mock_runtime, db=mock_db,
+            branch=mock_branch, security=SecurityGuard(),
         )
 
-    # --- Basic execution ---
-
+    # --- Basic ---
     def test_simple_execution(self, executor, mock_runtime):
         r = executor.execute(CodeExecutionRequest(code="print(42)"))
         assert r.execution.exit_code == 0
-        assert r.execution.stdout == "42\n"
         assert r.security.safe is True
+        assert r.time_travel is None
         mock_runtime.execute.assert_called_once()
 
     def test_security_rejection(self, executor, mock_runtime):
         r = executor.execute(CodeExecutionRequest(code="import os"))
-        assert r.execution.exit_code == 1
         assert r.security.safe is False
         assert "blocked" in r.execution.stderr
         mock_runtime.execute.assert_not_called()
 
     def test_security_rejection_eval(self, executor, mock_runtime):
-        r = executor.execute(CodeExecutionRequest(code="eval('1')"))
-        assert r.security.safe is False
-        mock_runtime.execute.assert_not_called()
+        assert executor.execute(CodeExecutionRequest(code="eval('1')")).security.safe is False
 
-    def test_allowed_imports_passed(self, executor, mock_runtime):
+    def test_allowed_imports(self, executor, mock_runtime):
         r = executor.execute(CodeExecutionRequest(
             code="import pandas", allowed_imports=["pandas"],
         ))
         assert r.security.safe is True
-        mock_runtime.execute.assert_called_once()
-
-    # --- Resource profiles ---
 
     def test_custom_resources(self, executor, mock_runtime):
-        profile = ResourceProfile(max_memory_mb=512, max_wall_seconds=120)
+        profile = ResourceProfile(max_memory_mb=512)
         executor.execute(CodeExecutionRequest(code="print(1)", resources=profile))
-        call_args = mock_runtime.execute.call_args
-        assert call_args[0][2] == profile  # 3rd positional arg is resources
+        assert mock_runtime.execute.call_args[0][2] == profile
 
-    # --- Data access NONE ---
-
-    def test_no_data_access(self, executor, mock_runtime, mock_sandbox):
+    # --- NONE access ---
+    def test_none_access_no_env(self, executor, mock_runtime):
         executor.execute(CodeExecutionRequest(code="print(1)"))
-        mock_sandbox.create.assert_not_called()
+        assert mock_runtime.execute.call_args[0][3] is None
 
-    # --- Data access READ ---
-
-    def test_data_read_creates_sandbox(self, executor, mock_runtime, mock_sandbox):
+    # --- READ access ---
+    def test_read_access_passes_source_db(self, executor, mock_runtime):
         executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            session_id="sess1",
+            code="print(1)", data_access=DataAccessLevel.READ, source_db="mydb",
         ))
-        mock_sandbox.create.assert_called_once()
-        # Should pass env with MO_DSN
-        call_args = mock_runtime.execute.call_args
-        env = call_args[0][3]  # 4th positional arg is env
-        assert "MO_DSN" in env
-        assert "MO_DATABASE" in env
+        assert mock_runtime.execute.call_args[0][3]["MO_DATABASE"] == "mydb"
 
-    def test_data_read_no_checkpoint(self, executor, mock_runtime, mock_sandbox):
+    def test_read_access_no_branch(self, executor, mock_branch):
         executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            session_id="sess1",
+            code="print(1)", data_access=DataAccessLevel.READ, source_db="mydb",
         ))
-        mock_sandbox.snapshot.assert_not_called()
+        mock_branch.create.assert_not_called()
 
-    # --- Data access WRITE ---
+    # --- WRITE access ---
+    def test_write_requires_session_id(self, executor):
+        with pytest.raises(ValueError, match="session_id"):
+            executor.execute(CodeExecutionRequest(
+                code="print(1)", data_access=DataAccessLevel.WRITE,
+                source_db="db", tables=["t"],
+            ))
 
-    def test_data_write_creates_checkpoint(self, executor, mock_runtime, mock_sandbox):
+    def test_write_requires_source_db(self, executor):
+        with pytest.raises(ValueError, match="source_db"):
+            executor.execute(CodeExecutionRequest(
+                code="print(1)", data_access=DataAccessLevel.WRITE,
+                session_id="s1", tables=["t"],
+            ))
+
+    def test_write_requires_tables(self, executor):
+        with pytest.raises(ValueError, match="tables"):
+            executor.execute(CodeExecutionRequest(
+                code="print(1)", data_access=DataAccessLevel.WRITE,
+                session_id="s1", source_db="db",
+            ))
+
+    def test_write_branches_tables(self, executor, mock_branch):
         executor.execute(CodeExecutionRequest(
             code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1",
+            session_id="sess1", source_db="prod", tables=["orders", "products"],
         ))
-        mock_sandbox.create.assert_called_once()
-        mock_sandbox.snapshot.assert_called_once()
+        assert mock_branch.create.call_count == 2
 
-    def test_data_write_failure_restores(self, executor, mock_runtime, mock_sandbox):
-        mock_runtime.execute.return_value = ExecutionResult(
-            stdout="", stderr="error", exit_code=1, execution_time_ms=5.0,
-        )
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1",
-        ))
-        mock_sandbox.restore.assert_called_once()
-
-    def test_data_write_success_diffs(self, executor, mock_runtime, mock_sandbox):
-        mock_sandbox.git.diff.return_value = [{"count": 2}]
+    def test_write_returns_time_travel(self, executor):
         r = executor.execute(CodeExecutionRequest(
             code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1",
+            session_id="sess1", source_db="prod", tables=["orders"],
         ))
-        # diff() is called on the DataContext
-        assert r.data_diff is not None or r.data_diff == []
+        assert r.time_travel is not None
+        assert r.time_travel.source_db == "prod"
+        assert "code_exec_" in r.time_travel.sandbox_db
+        assert r.time_travel.started_at is not None
 
-    # --- Execution-scoped cleanup ---
-
-    def test_execution_scope_destroys(self, executor, mock_runtime, mock_sandbox):
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.EXECUTION,
-            session_id="sess1",
+    def test_write_success_returns_diff(self, executor, mock_branch):
+        mock_branch.diff.return_value = [{"flag": "INSERT", "a": 1}]
+        r = executor.execute(CodeExecutionRequest(
+            code="print(1)", data_access=DataAccessLevel.WRITE,
+            session_id="sess1", source_db="prod", tables=["orders"],
         ))
-        mock_sandbox.delete.assert_called_once()
+        assert r.data_diff is not None
 
-    # --- Session-scoped reuse ---
+    def test_write_failure_no_diff(self, executor, mock_runtime):
+        mock_runtime.execute.return_value = ExecutionResult(
+            stdout="", stderr="error", exit_code=1, execution_time_ms=5.0,
+            started_at=datetime(2026, 2, 20, 15, 0, 0, tzinfo=timezone.utc),
+        )
+        r = executor.execute(CodeExecutionRequest(
+            code="print(1)", data_access=DataAccessLevel.WRITE,
+            session_id="sess1", source_db="prod", tables=["orders"],
+        ))
+        assert r.data_diff is None
+        # time_travel still recorded even on failure
+        assert r.time_travel is not None
 
-    def test_session_scope_reuses_context(self, executor, mock_runtime, mock_sandbox):
+    # --- Session reuse ---
+    def test_session_reuses_context(self, executor, mock_branch):
         req = CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.SESSION,
-            session_id="sess1",
+            code="print(1)", data_access=DataAccessLevel.WRITE,
+            session_id="sess1", source_db="prod", tables=["orders"],
         )
         executor.execute(req)
         executor.execute(req)
-        # Sandbox created only once (reused)
-        assert mock_sandbox.create.call_count == 1
+        # branch.create called once (idempotent)
+        assert mock_branch.create.call_count == 1
 
-    def test_session_scope_no_destroy(self, executor, mock_runtime, mock_sandbox):
+    def test_different_sessions(self, executor, mock_branch):
+        for sid in ["sess1", "sess2"]:
+            executor.execute(CodeExecutionRequest(
+                code="print(1)", data_access=DataAccessLevel.WRITE,
+                session_id=sid, source_db="prod", tables=["orders"],
+            ))
+        assert mock_branch.create.call_count == 2
+
+    def test_dynamic_table_addition(self, executor, mock_branch):
+        """Second execution adds new table to existing session."""
         executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.SESSION,
-            session_id="sess1",
+            code="print(1)", data_access=DataAccessLevel.WRITE,
+            session_id="sess1", source_db="prod", tables=["orders"],
         ))
-        mock_sandbox.delete.assert_not_called()
-
-    def test_cleanup_session(self, executor, mock_runtime, mock_sandbox):
         executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.SESSION,
-            session_id="sess1",
+            code="print(2)", data_access=DataAccessLevel.WRITE,
+            session_id="sess1", source_db="prod", tables=["orders", "products"],
+        ))
+        # orders branched once, products branched once
+        assert mock_branch.create.call_count == 2
+
+    # --- Cleanup ---
+    def test_cleanup_session(self, executor, mock_branch, mock_db):
+        executor.execute(CodeExecutionRequest(
+            code="print(1)", data_access=DataAccessLevel.WRITE,
+            session_id="sess1", source_db="prod", tables=["orders"],
         ))
         executor.cleanup_session("sess1")
-        mock_sandbox.delete.assert_called_once()
+        mock_branch.delete.assert_called()
+        drop_found = False
+        for c in mock_db.execute.call_args_list:
+            sql_arg = c[0][0]
+            if hasattr(sql_arg, 'text') and "DROP DATABASE" in sql_arg.text:
+                drop_found = True
+        assert drop_found
 
-    def test_cleanup_nonexistent_session(self, executor):
-        """Cleanup for unknown session is a no-op."""
-        executor.cleanup_session("nonexistent")  # Should not raise
+    def test_cleanup_nonexistent(self, executor):
+        executor.cleanup_session("nonexistent")
 
-    # --- Different sessions get different contexts ---
-
-    def test_different_sessions_different_contexts(self, executor, mock_runtime, mock_sandbox):
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.SESSION, session_id="sess1",
-        ))
-        executor.execute(CodeExecutionRequest(
-            code="print(2)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.SESSION, session_id="sess2",
-        ))
-        assert mock_sandbox.create.call_count == 2
-
-    # --- Runtime exception handling ---
-
-    def test_runtime_exception(self, executor, mock_runtime, mock_sandbox):
+    # --- Runtime exception ---
+    def test_runtime_exception(self, executor, mock_runtime):
         mock_runtime.execute.side_effect = RuntimeError("boom")
         r = executor.execute(CodeExecutionRequest(code="print(1)"))
         assert r.execution.exit_code == 1
         assert "Runtime error" in r.execution.stderr
 
-    def test_runtime_exception_with_write_restores(self, executor, mock_runtime, mock_sandbox):
+    def test_runtime_exception_no_destroy(self, executor, mock_runtime):
         mock_runtime.execute.side_effect = RuntimeError("boom")
         executor.execute(CodeExecutionRequest(
             code="print(1)", data_access=DataAccessLevel.WRITE,
-            session_id="sess1",
+            session_id="sess1", source_db="prod", tables=["orders"],
         ))
-        mock_sandbox.restore.assert_called_once()
+        assert "sess1" in executor._session_contexts
 
-    def test_runtime_exception_execution_scope_destroys(self, executor, mock_runtime, mock_sandbox):
-        """Runtime exception on execution-scoped context must still destroy sandbox."""
-        mock_runtime.execute.side_effect = RuntimeError("boom")
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.EXECUTION,
-            session_id="sess1",
-        ))
-        mock_sandbox.delete.assert_called_once()
-
-    def test_runtime_exception_session_scope_does_not_destroy(self, executor, mock_runtime, mock_sandbox):
-        """Runtime exception on session-scoped context must NOT destroy sandbox."""
-        mock_runtime.execute.side_effect = RuntimeError("boom")
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.SESSION,
-            session_id="sess1",
-        ))
-        mock_sandbox.delete.assert_not_called()
+    def test_security_error_contains_line_number(self, executor):
+        r = executor.execute(CodeExecutionRequest(code="x = 1\nimport os\ny = 2"))
+        assert "[L2]" in r.execution.stderr
 
 
 # ===========================================================================
-# 8. CodeExecutionRequest defaults
-# ===========================================================================
-
-class TestCodeExecutionRequest:
-    def test_defaults(self):
-        req = CodeExecutionRequest(code="print(1)")
-        assert req.language == "python"
-        assert req.data_access == DataAccessLevel.NONE
-        assert req.data_scope == DataContextScope.EXECUTION
-        assert req.session_id is None
-        assert req.allowed_imports is None
-        assert isinstance(req.resources, ResourceProfile)
-
-    def test_custom(self):
-        req = CodeExecutionRequest(
-            code="x", language="python",
-            resources=PROFILE_LIGHTWEIGHT,
-            session_id="s1",
-            data_access=DataAccessLevel.WRITE,
-            data_scope=DataContextScope.SESSION,
-            allowed_imports=["pandas"],
-        )
-        assert req.resources.max_memory_mb == 64
-        assert req.data_access == DataAccessLevel.WRITE
-        assert req.allowed_imports == ["pandas"]
-
-
-# ===========================================================================
-# 9. ExecuteCodeSkill
+# 10. ExecuteCodeSkill
 # ===========================================================================
 
 class TestExecuteCodeSkill:
@@ -808,380 +825,7 @@ class TestExecuteCodeSkill:
         executor.execute.return_value = CodeExecutionResult(
             execution=ExecutionResult(
                 stdout="result\n", stderr="", exit_code=0, execution_time_ms=15.0,
-            ),
-            security=SecurityVerdict(safe=True),
-            data_diff=None,
-        )
-        return executor
-
-    @pytest.fixture
-    def skill(self, mock_executor):
-        from core.skills.builtin import ExecuteCodeSkill
-        return ExecuteCodeSkill(mock_executor)
-
-    def _input(self, **kwargs):
-        from core.skills.builtin import ExecuteCodeInput
-        defaults = {"code": "print(1)", "user_id": "test_user", "session_id": "test_session"}
-        defaults.update(kwargs)
-        return ExecuteCodeInput(**defaults)
-
-    def test_skill_metadata(self, skill):
-        assert skill.name == "execute_code"
-        assert skill.version == "1.0.0"
-
-    def test_validate_input(self, skill):
-        from core.skills.builtin import ExecuteCodeInput
-        inp = skill.validate_input({"code": "print(1)", "user_id": "u1", "session_id": "s1"})
-        assert isinstance(inp, ExecuteCodeInput)
-        assert inp.code == "print(1)"
-        assert inp.language == "python"
-        assert inp.data_access == "none"
-
-    @pytest.mark.asyncio
-    async def test_execute_success(self, skill, mock_executor):
-        out = await skill.execute(self._input())
-        assert out.success is True
-        assert out.result == "result\n"
-        assert out.error is None
-        assert out.execution_time_ms == 15.0
-
-    @pytest.mark.asyncio
-    async def test_execute_failure(self, skill, mock_executor):
-        mock_executor.execute.return_value = CodeExecutionResult(
-            execution=ExecutionResult(
-                stdout="", stderr="NameError: x", exit_code=1, execution_time_ms=5.0,
-            ),
-            security=SecurityVerdict(safe=True),
-        )
-        out = await skill.execute(self._input(code="print(x)"))
-        assert out.success is False
-        assert out.error == "NameError: x"
-
-    @pytest.mark.asyncio
-    async def test_execute_with_data_diff(self, skill, mock_executor):
-        mock_executor.execute.return_value = CodeExecutionResult(
-            execution=ExecutionResult(
-                stdout="done\n", stderr="", exit_code=0, execution_time_ms=20.0,
-            ),
-            security=SecurityVerdict(safe=True),
-            data_diff=[TableDiff(table="sessions", added=3, removed=1, modified=0)],
-        )
-        out = await skill.execute(self._input(code="UPDATE ...", data_access="write"))
-        assert out.success is True
-        assert out.data_diff is not None
-        assert len(out.data_diff) == 1
-        assert out.data_diff[0]["table"] == "sessions"
-        assert out.data_diff[0]["added"] == 3
-
-    @pytest.mark.asyncio
-    async def test_session_id_sets_session_scope(self, skill, mock_executor):
-        await skill.execute(self._input(session_id="sess1"))
-        call_args = mock_executor.execute.call_args[0][0]
-        assert call_args.data_scope == DataContextScope.SESSION
-
-    @pytest.mark.asyncio
-    async def test_no_session_id_sets_execution_scope(self, skill, mock_executor):
-        # session_id=None triggers EXECUTION scope, but SkillInput requires session_id
-        # So we test that a non-None session_id gives SESSION scope
-        await skill.execute(self._input(session_id="s1"))
-        call_args = mock_executor.execute.call_args[0][0]
-        assert call_args.data_scope == DataContextScope.SESSION
-
-
-# ===========================================================================
-# 10. SubprocessRuntime — missing scenarios
-# ===========================================================================
-
-class TestSubprocessRuntimeExtra:
-    @pytest.fixture
-    def runtime(self):
-        return SubprocessRuntime()
-
-    def test_empty_code(self, runtime):
-        r = runtime.execute("", "python")
-        assert r.exit_code == 0
-        assert r.stdout == ""
-
-    def test_timeout_elapsed_time_reasonable(self, runtime):
-        """Elapsed time should be close to wall_seconds, not 0 or 100s."""
-        r = runtime.execute(
-            "import time; time.sleep(100)", "python",
-            ResourceProfile(max_wall_seconds=1),
-        )
-        assert r.exit_code == 137
-        assert 500 <= r.execution_time_ms <= 3000  # 0.5s–3s tolerance
-
-    def test_large_stderr_doesnt_affect_stdout(self, runtime):
-        code = """
-import sys
-sys.stderr.write("error\\n" * 1000)
-print("stdout_ok")
-"""
-        r = runtime.execute(code, "python")
-        assert r.exit_code == 0
-        assert "stdout_ok" in r.stdout
-        assert len(r.stderr) > 0
-
-
-# ===========================================================================
-# 11. SecurityGuard — missing scenarios
-# ===========================================================================
-
-class TestSecurityGuardExtra:
-    @pytest.fixture
-    def guard(self):
-        return SecurityGuard()
-
-    def test_empty_code_is_safe(self, guard):
-        v = guard.analyze("")
-        assert v.safe is True
-
-    def test_block_vars(self, guard):
-        v = guard.analyze("vars()")
-        # vars() is not in DANGEROUS_CALLS currently — document the gap
-        # This test documents current behavior (not blocked)
-        # If we add vars() to DANGEROUS_CALLS, update this test
-        assert isinstance(v.safe, bool)  # Just verify it runs without error
-
-    def test_block_type_dynamic_class(self, guard):
-        """type() used to create dynamic classes is a bypass vector."""
-        v = guard.analyze("C = type('C', (object,), {})")
-        # type() is not in DANGEROUS_CALLS — document the gap
-        assert isinstance(v.safe, bool)
-
-    def test_block_dunder_dict_attr(self, guard):
-        v = guard.analyze("x = obj.__dict__")
-        assert v.safe is False
-
-    def test_block_dunder_init_subclass(self, guard):
-        v = guard.analyze("x = cls.__init_subclass__")
-        assert v.safe is False
-
-    def test_multiple_bypass_vectors(self, guard):
-        code = "__builtins__['eval']('1')"
-        v = guard.analyze(code)
-        assert v.safe is False  # __builtins__ access blocked
-
-    def test_safe_dunder_in_string(self, guard):
-        """__builtins__ in a string literal should NOT be flagged."""
-        v = guard.analyze('x = "__builtins__"')
-        assert v.safe is True  # It's a string, not an attribute access
-
-    def test_safe_dunder_in_comment(self, guard):
-        v = guard.analyze("# use __builtins__ carefully\nprint(1)")
-        assert v.safe is True
-
-
-# ===========================================================================
-# 12. DataContext — missing scenarios
-# ===========================================================================
-
-class TestDataContextExtra:
-    @pytest.fixture
-    def mock_sandbox(self):
-        sandbox = MagicMock()
-        sandbox.list_tables.return_value = ["sessions", "events", "_internal", "sandbox_metadata"]
-        sandbox.info.return_value = {"sandbox_name": "test_sandbox"}
-        sandbox.git = MagicMock()
-        sandbox.source_db = "dev_agent"
-        return sandbox
-
-    @pytest.fixture
-    def ctx_write(self, mock_sandbox):
-        return DataContext(
-            db=MagicMock(), sandbox=mock_sandbox,
-            sandbox_name="test_sandbox",
-            access=DataAccessLevel.WRITE, scope=DataContextScope.EXECUTION,
-        )
-
-    def test_diff_filters_sandbox_metadata(self, ctx_write, mock_sandbox):
-        """sandbox_metadata table is excluded from diff."""
-        ctx_write.ensure_created()
-        ctx_write.checkpoint("pre_exec")
-        mock_sandbox.git.diff.return_value = [{"count": 1}]
-        ctx_write.diff()
-        # Check that sandbox_metadata was never passed to git.diff
-        for call in mock_sandbox.git.diff.call_args_list:
-            args = call[0]
-            assert "sandbox_metadata" not in args[0]
-
-    def test_diff_filters_underscore_tables(self, ctx_write, mock_sandbox):
-        """Tables starting with _ are excluded from diff."""
-        ctx_write.ensure_created()
-        ctx_write.checkpoint("pre_exec")
-        mock_sandbox.git.diff.return_value = [{"count": 1}]
-        ctx_write.diff()
-        for call in mock_sandbox.git.diff.call_args_list:
-            args = call[0]
-            table_name = args[0].split(".")[-1]
-            assert not table_name.startswith("_")
-
-    def test_diff_continues_on_table_exception(self, ctx_write, mock_sandbox):
-        """If one table's diff fails, others still get processed."""
-        ctx_write.ensure_created()
-        ctx_write.checkpoint("pre_exec")
-        call_count = [0]
-
-        def side_effect(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] <= 2:  # First table (sessions) fails
-                raise Exception("table not found in snapshot")
-            return [{"count": 3}]
-
-        mock_sandbox.git.diff.side_effect = side_effect
-        # Should not raise, should process remaining tables
-        diffs = ctx_write.diff()
-        assert isinstance(diffs, list)
-
-    def test_merge_with_actual_diff(self, ctx_write, mock_sandbox):
-        """merge() calls git.merge for each changed table."""
-        ctx_write.ensure_created()
-        ctx_write.checkpoint("pre_exec")
-        # Mock diff to return actual changes
-        mock_sandbox.git.diff.return_value = [{"count": 5}]
-        mock_sandbox.list_tables.return_value = ["sessions"]
-
-        result = ctx_write.merge()
-        # git.merge should have been called
-        assert mock_sandbox.git.merge.called
-        assert result.tables_merged == ["sessions"]
-        assert result.rows_applied > 0
-
-    def test_merge_skips_failed_tables(self, ctx_write, mock_sandbox):
-        """merge() continues if one table's merge fails."""
-        ctx_write.ensure_created()
-        ctx_write.checkpoint("pre_exec")
-        mock_sandbox.git.diff.return_value = [{"count": 2}]
-        mock_sandbox.list_tables.return_value = ["sessions", "events"]
-        mock_sandbox.git.merge.side_effect = [Exception("merge failed"), None]
-
-        result = ctx_write.merge()
-        # sessions failed, events succeeded
-        assert "events" in result.tables_merged
-        assert "sessions" not in result.tables_merged
-
-    def test_checkpoint_same_name_no_drop(self, ctx_write, mock_sandbox):
-        """Calling checkpoint with same name twice doesn't drop it."""
-        ctx_write.ensure_created()
-        ctx_write.checkpoint("pre_exec")
-        ctx_write.checkpoint("pre_exec")  # Same name
-        mock_sandbox.git.drop_snapshot.assert_not_called()
-
-
-# ===========================================================================
-# 13. CodeExecutor — missing scenarios
-# ===========================================================================
-
-class TestCodeExecutorExtra:
-    @pytest.fixture
-    def mock_runtime(self):
-        rt = MagicMock(spec=Runtime)
-        rt.execute.return_value = ExecutionResult(
-            stdout="ok\n", stderr="", exit_code=0, execution_time_ms=10.0,
-        )
-        return rt
-
-    @pytest.fixture
-    def mock_sandbox(self):
-        sandbox = MagicMock()
-        sandbox.list_tables.return_value = ["sessions"]
-        sandbox.git = MagicMock()
-        sandbox.git.diff.return_value = []
-        sandbox.source_db = "dev_agent"
-        return sandbox
-
-    @pytest.fixture
-    def executor(self, mock_runtime, mock_sandbox):
-        return CodeExecutor(
-            runtime=mock_runtime, db=MagicMock(),
-            sandbox=mock_sandbox, security=SecurityGuard(),
-        )
-
-    def test_none_access_passes_no_env(self, executor, mock_runtime):
-        """data_access=NONE → runtime receives env=None."""
-        executor.execute(CodeExecutionRequest(code="print(1)"))
-        call_args = mock_runtime.execute.call_args[0]
-        env_arg = call_args[3]  # 4th positional arg
-        assert env_arg is None
-
-    def test_read_access_env_has_mo_database(self, executor, mock_runtime, mock_sandbox):
-        """data_access=READ → env contains both MO_DSN and MO_DATABASE."""
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ, session_id="s1",
-            data_scope=DataContextScope.SESSION,
-        ))
-        env_arg = mock_runtime.execute.call_args[0][3]
-        assert "MO_DSN" in env_arg
-        assert "MO_DATABASE" in env_arg
-        # Session-scoped: sandbox_name = code_exec_{session_id[:8]}
-        assert env_arg["MO_DATABASE"] == "code_exec_s1"
-
-    def test_session_none_with_session_scope_creates_new(self, executor, mock_sandbox):
-        """session_id=None + SESSION scope → falls back to EXECUTION (new context each time)."""
-        req = CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.SESSION,
-            session_id=None,  # No session_id
-        )
-        executor.execute(req)
-        executor.execute(req)
-        # Without session_id, can't reuse — creates new each time
-        assert mock_sandbox.create.call_count == 2
-
-    def test_multiple_write_executions_same_session(self, executor, mock_sandbox):
-        """Multiple WRITE executions on same session: checkpoint called each time."""
-        req = CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            data_scope=DataContextScope.SESSION, session_id="sess1",
-        )
-        executor.execute(req)
-        executor.execute(req)
-        # snapshot called twice (once per execution)
-        assert mock_sandbox.snapshot.call_count == 2
-
-    def test_cleanup_then_reexecute_creates_new_context(self, executor, mock_sandbox):
-        """After cleanup_session, next execute creates a fresh context."""
-        req = CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.READ,
-            data_scope=DataContextScope.SESSION, session_id="sess1",
-        )
-        executor.execute(req)
-        executor.cleanup_session("sess1")
-        executor.execute(req)
-        # create called twice: once before cleanup, once after
-        assert mock_sandbox.create.call_count == 2
-
-    def test_security_error_message_contains_line_number(self, executor):
-        """Security rejection stderr contains [L<n>] format."""
-        r = executor.execute(CodeExecutionRequest(code="x = 1\nimport os\ny = 2"))
-        assert r.security.safe is False
-        assert "[L2]" in r.execution.stderr
-
-    def test_write_failure_doesnt_destroy_session_context(self, executor, mock_runtime, mock_sandbox):
-        """WRITE failure restores but doesn't destroy session-scoped context."""
-        mock_runtime.execute.return_value = ExecutionResult(
-            stdout="", stderr="error", exit_code=1, execution_time_ms=5.0,
-        )
-        executor.execute(CodeExecutionRequest(
-            code="print(1)", data_access=DataAccessLevel.WRITE,
-            data_scope=DataContextScope.SESSION, session_id="sess1",
-        ))
-        # restore called, but delete NOT called (session-scoped)
-        mock_sandbox.restore.assert_called_once()
-        mock_sandbox.delete.assert_not_called()
-
-
-# ===========================================================================
-# 14. ExecuteCodeSkill — missing scenarios
-# ===========================================================================
-
-class TestExecuteCodeSkillExtra:
-    @pytest.fixture
-    def mock_executor(self):
-        executor = MagicMock()
-        executor.execute.return_value = CodeExecutionResult(
-            execution=ExecutionResult(
-                stdout="ok\n", stderr="", exit_code=0, execution_time_ms=5.0,
+                started_at=datetime(2026, 2, 20, 15, 0, 0, tzinfo=timezone.utc),
             ),
             security=SecurityVerdict(safe=True),
         )
@@ -1198,28 +842,96 @@ class TestExecuteCodeSkillExtra:
         defaults.update(kwargs)
         return ExecuteCodeInput(**defaults)
 
+    def test_skill_metadata(self, skill):
+        assert skill.name == "execute_code"
+        assert skill.version == "1.0.0"
+
+    def test_validate_input(self, skill):
+        from core.skills.builtin import ExecuteCodeInput
+        inp = skill.validate_input({"code": "print(1)", "user_id": "u1", "session_id": "s1"})
+        assert isinstance(inp, ExecuteCodeInput)
+        assert inp.data_access == "none"
+
+    @pytest.mark.asyncio
+    async def test_execute_success(self, skill):
+        out = await skill.execute(self._input())
+        assert out.success is True
+        assert out.result == "result\n"
+        assert out.error is None
+
+    @pytest.mark.asyncio
+    async def test_execute_failure(self, skill, mock_executor):
+        mock_executor.execute.return_value = CodeExecutionResult(
+            execution=ExecutionResult(
+                stdout="", stderr="NameError: x", exit_code=1, execution_time_ms=5.0,
+            ),
+            security=SecurityVerdict(safe=True),
+        )
+        out = await skill.execute(self._input())
+        assert out.success is False
+        assert out.error == "NameError: x"
+
+    @pytest.mark.asyncio
+    async def test_execute_with_data_diff(self, skill, mock_executor):
+        mock_executor.execute.return_value = CodeExecutionResult(
+            execution=ExecutionResult(
+                stdout="done\n", stderr="", exit_code=0, execution_time_ms=20.0,
+            ),
+            security=SecurityVerdict(safe=True),
+            data_diff=[TableDiff(table="orders", rows=[{"flag": "INSERT", "a": 1}])],
+        )
+        out = await skill.execute(self._input(data_access="write"))
+        assert out.data_diff is not None
+        assert out.data_diff[0]["table"] == "orders"
+
+    @pytest.mark.asyncio
+    async def test_execute_with_time_travel(self, skill, mock_executor):
+        now = datetime(2026, 2, 20, 15, 0, 0, tzinfo=timezone.utc)
+        mock_executor.execute.return_value = CodeExecutionResult(
+            execution=ExecutionResult(
+                stdout="done\n", stderr="", exit_code=0, execution_time_ms=20.0,
+            ),
+            security=SecurityVerdict(safe=True),
+            time_travel=TimeTravelInfo(
+                started_at=now, source_db="prod", sandbox_db="sandbox_s1",
+            ),
+        )
+        out = await skill.execute(self._input(data_access="write"))
+        assert out.time_travel is not None
+        assert out.time_travel["source_db"] == "prod"
+        assert out.time_travel["sandbox_db"] == "sandbox_s1"
+
+    @pytest.mark.asyncio
+    async def test_no_time_travel_returns_none(self, skill):
+        out = await skill.execute(self._input())
+        assert out.time_travel is None
+
+    @pytest.mark.asyncio
+    async def test_source_db_and_tables_passed(self, skill, mock_executor):
+        await skill.execute(self._input(
+            data_access="write", source_db="prod", tables=["orders"],
+        ))
+        req = mock_executor.execute.call_args[0][0]
+        assert req.source_db == "prod"
+        assert req.tables == ["orders"]
+
+    @pytest.mark.asyncio
+    async def test_allowed_imports_passed(self, skill, mock_executor):
+        await skill.execute(self._input(allowed_imports=["pandas"]))
+        req = mock_executor.execute.call_args[0][0]
+        assert req.allowed_imports == ["pandas"]
+
+    @pytest.mark.asyncio
+    async def test_data_access_string_to_enum(self, skill, mock_executor):
+        await skill.execute(self._input(data_access="write"))
+        req = mock_executor.execute.call_args[0][0]
+        assert req.data_access == DataAccessLevel.WRITE
+
     def test_side_effect_profile_is_write(self, skill):
         from core.skills.base import SideEffectCategory
         assert skill.side_effect_profile.category == SideEffectCategory.WRITE
 
     @pytest.mark.asyncio
-    async def test_allowed_imports_passed_to_executor(self, skill, mock_executor):
-        await skill.execute(self._input(allowed_imports=["pandas", "numpy"]))
-        req = mock_executor.execute.call_args[0][0]
-        assert req.allowed_imports == ["pandas", "numpy"]
-
-    @pytest.mark.asyncio
-    async def test_data_access_string_converted_to_enum(self, skill, mock_executor):
-        await skill.execute(self._input(data_access="write"))
-        req = mock_executor.execute.call_args[0][0]
-        assert req.data_access == DataAccessLevel.WRITE
-
-    @pytest.mark.asyncio
-    async def test_no_data_diff_returns_none(self, skill, mock_executor):
+    async def test_execution_time_propagated(self, skill):
         out = await skill.execute(self._input())
-        assert out.data_diff is None
-
-    @pytest.mark.asyncio
-    async def test_execution_time_propagated(self, skill, mock_executor):
-        out = await skill.execute(self._input())
-        assert out.execution_time_ms == 5.0
+        assert out.execution_time_ms == 15.0

@@ -1,90 +1,76 @@
-"""DataContext — manages data environment lifecycle for code execution."""
+"""DataContext — manages data environment lifecycle for code execution.
+
+Session-scoped. Table-level zero-copy branch. No snapshots needed.
+Uses MatrixOne's native `data branch` for create/diff/merge/delete.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from core.sandbox.sandbox import Sandbox
+from core.sandbox.branch import Branch
 
 
 class DataAccessLevel(Enum):
     NONE = "none"       # No database access
-    READ = "read"       # Clone with read-only queries
-    WRITE = "write"     # Clone with read-write + auto-checkpoint
-
-
-class DataContextScope(Enum):
-    EXECUTION = "execution"  # Destroyed after single execution
-    SESSION = "session"      # Persists across executions within session
+    READ = "read"       # Direct source DB with read-only user
+    WRITE = "write"     # Session-scoped sandbox with table-level branch
 
 
 @dataclass
 class TableDiff:
     table: str
-    added: int
-    removed: int
-    modified: int
+    rows: list[dict]   # raw diff rows from `data branch diff`
 
 
 @dataclass
 class MergeResult:
     tables_merged: list[str]
-    rows_applied: int
+    tables_failed: list[str]
 
 
 # DB user credentials for access control.
-# In production, these are created once during deployment.
-# READ user has SELECT only; WRITE user has full DML.
 _DB_USERS = {
-    DataAccessLevel.READ: {
-        "user": "code_exec_ro",
-        "password": "code_exec_ro_pass",
-    },
-    DataAccessLevel.WRITE: {
-        "user": "code_exec_rw",
-        "password": "code_exec_rw_pass",
-    },
+    DataAccessLevel.READ: {"user": "code_exec_ro", "password": "code_exec_ro_pass"},
+    DataAccessLevel.WRITE: {"user": "code_exec_rw", "password": "code_exec_rw_pass"},
 }
 
 
 class DataContext:
-    """Wraps Sandbox for code execution lifecycle.
+    """Session-scoped sandbox with table-level zero-copy branch.
 
-    Provides DSN for the sandbox DB, checkpoint/restore, diff/merge.
-    Access control is enforced at the DB user level (not AST).
+    - Creates empty sandbox DB on first use
+    - Branches declared tables from source DB (zero-copy, LCA tracked by kernel)
+    - diff/merge use native `data branch diff/merge` (three-way, conflict-aware)
+    - Cleanup: `data branch delete` per table + DROP DATABASE
     """
 
     def __init__(
         self,
         db: Session,
-        sandbox: Sandbox,
+        branch: Branch,
         sandbox_name: str,
+        source_db: str,
         access: DataAccessLevel,
-        scope: DataContextScope,
         db_host: str = "localhost",
         db_port: int = 6001,
     ):
         self.db = db
-        self.sandbox = sandbox
+        self.branch = branch
         self.sandbox_name = sandbox_name
+        self.source_db = source_db
         self.access = access
-        self.scope = scope
         self.db_host = db_host
         self.db_port = db_port
         self._created = False
-        self._checkpoint_name: str | None = None
+        self._branched_tables: set[str] = set()
 
     @property
     def dsn(self) -> str:
-        """Connection string for the sandbox DB with access-appropriate user.
-
-        READ access → code_exec_ro user (SELECT only)
-        WRITE access → code_exec_rw user (full DML)
-        """
         creds = _DB_USERS.get(self.access)
         if not creds:
             return self.sandbox_name
@@ -95,32 +81,93 @@ class DataContext:
 
     @property
     def alive(self) -> bool:
-        """Whether the sandbox DB still exists."""
-        if not self._created:
-            return False
-        try:
-            self.sandbox.info(self.sandbox_name)
-            return True
-        except Exception:
-            return False
+        return self._created
 
     def ensure_created(self) -> None:
-        """Create sandbox DB if not yet created (idempotent).
-
-        Also grants appropriate permissions to the access-level DB user.
-        """
+        """Create empty sandbox DB (idempotent)."""
         if self._created:
             return
-        self.sandbox.create(
-            name=self.sandbox_name,
-            description=f"code_exec ({self.access.value}/{self.scope.value})",
-            created_by="code_executor",
-        )
+        self.db.commit()
+        self.db.execute(text(f"CREATE DATABASE IF NOT EXISTS {self.sandbox_name}"))
+        self.db.commit()
         self._grant_permissions()
         self._created = True
 
+    def ensure_tables(self, tables: list[str]) -> None:
+        """Branch declared tables into sandbox (zero-copy, idempotent per table).
+
+        Uses `data branch create table` — kernel tracks LCA automatically.
+        """
+        for table in tables:
+            if table not in self._branched_tables:
+                self.branch.create(
+                    name=f"{self.sandbox_name}.{table}",
+                    source=f"{self.source_db}.{table}",
+                )
+                self._branched_tables.add(table)
+
+    def diff(self, tables: list[str] | None = None) -> list[TableDiff]:
+        """Diff sandbox tables against source using native data branch diff.
+
+        Three-way diff with automatic LCA detection by kernel.
+        """
+        target_tables = tables or list(self._branched_tables)
+        diffs: list[TableDiff] = []
+        for table in target_tables:
+            try:
+                rows = self.branch.diff(
+                    target=f"{self.sandbox_name}.{table}",
+                    source=f"{self.source_db}.{table}",
+                )
+                if rows:
+                    diffs.append(TableDiff(table=table, rows=rows))
+            except Exception:
+                continue
+        return diffs
+
+    def merge(
+        self, tables: list[str] | None = None, on_conflict: str = "skip"
+    ) -> MergeResult:
+        """Merge sandbox changes back to source using native data branch merge."""
+        if self.access != DataAccessLevel.WRITE:
+            raise RuntimeError("Merge requires WRITE access")
+
+        target_tables = tables or list(self._branched_tables)
+        merged: list[str] = []
+        failed: list[str] = []
+        for table in target_tables:
+            try:
+                self.branch.merge(
+                    source=f"{self.sandbox_name}.{table}",
+                    target=f"{self.source_db}.{table}",
+                    on_conflict=on_conflict,
+                )
+                merged.append(table)
+            except Exception:
+                failed.append(table)
+        return MergeResult(tables_merged=merged, tables_failed=failed)
+
+    def destroy(self) -> None:
+        """Clean up: data branch delete per table, then DROP DATABASE."""
+        if not self._created:
+            return
+        try:
+            # Delete branch metadata per table
+            for table in self._branched_tables:
+                try:
+                    self.branch.delete(f"{self.sandbox_name}.{table}")
+                except Exception:
+                    pass
+            # Drop the sandbox database
+            self.db.commit()
+            self.db.execute(text(f"DROP DATABASE IF EXISTS {self.sandbox_name}"))
+            self.db.commit()
+        except Exception:
+            pass
+        self._created = False
+        self._branched_tables.clear()
+
     def _grant_permissions(self) -> None:
-        """Grant DB-level permissions based on access level."""
         try:
             if self.access == DataAccessLevel.READ:
                 self.db.execute(text(
@@ -133,100 +180,4 @@ class DataContext:
                 ))
             self.db.commit()
         except Exception:
-            pass  # User may not exist yet (dev mode) — fail open for MVP
-
-    def checkpoint(self, name: str = "pre_exec") -> None:
-        """SNAPSHOT current state. Only valid for WRITE access."""
-        if self.access != DataAccessLevel.WRITE:
-            raise RuntimeError("Checkpoint requires WRITE access")
-        # Drop previous checkpoint if exists (keep only latest)
-        if self._checkpoint_name and self._checkpoint_name != name:
-            try:
-                self.sandbox.git.drop_snapshot(f"{self.sandbox_name}_{self._checkpoint_name}")
-            except Exception:
-                pass
-        self.sandbox.snapshot(self.sandbox_name, name)
-        self._checkpoint_name = name
-
-    def restore(self, name: str = "pre_exec") -> None:
-        """RESTORE to checkpoint. Atomic rollback."""
-        self.sandbox.restore(self.sandbox_name, name)
-
-    def diff(self, tables: list[str] | None = None) -> list[TableDiff]:
-        """Compare sandbox vs source using snapshot-based comparison."""
-        if not self._checkpoint_name:
-            return []
-
-        target_tables = tables or self.sandbox.list_tables(self.sandbox_name)
-        diffs: list[TableDiff] = []
-
-        for table in target_tables:
-            if table.startswith("_") or table == "sandbox_metadata":
-                continue
-            try:
-                # Rows in sandbox but not in snapshot (added/modified)
-                added = self.sandbox.git.diff(
-                    f"{self.sandbox_name}.{table}",
-                    f"{self.sandbox_name}.{table}",
-                    source_snapshot=f"{self.sandbox_name}_{self._checkpoint_name}",
-                    output="count",
-                )
-                # Rows in snapshot but not in sandbox (removed/modified)
-                removed = self.sandbox.git.diff(
-                    f"{self.sandbox_name}.{table}",
-                    f"{self.sandbox_name}.{table}",
-                    target_snapshot=f"{self.sandbox_name}_{self._checkpoint_name}",
-                    output="count",
-                )
-                added_count = added[0].get("count", 0) if added else 0
-                removed_count = removed[0].get("count", 0) if removed else 0
-
-                if added_count > 0 or removed_count > 0:
-                    diffs.append(TableDiff(
-                        table=table,
-                        added=added_count,
-                        removed=removed_count,
-                        modified=0,  # Precise modified count requires PK-based join
-                    ))
-            except Exception:
-                continue  # Table may not exist in snapshot
-
-        return diffs
-
-    def merge(self, tables: list[str] | None = None) -> MergeResult:
-        """Apply sandbox changes back to source DB.
-
-        Uses Branch.merge() for each changed table. Only valid for WRITE access.
-        This is the MERGE step of the Data PR workflow (CLONE → EXECUTE → DIFF → MERGE).
-        """
-        if self.access != DataAccessLevel.WRITE:
-            raise RuntimeError("Merge requires WRITE access")
-
-        diffs = self.diff(tables)
-        if not diffs:
-            return MergeResult(tables_merged=[], rows_applied=0)
-
-        merged: list[str] = []
-        total_rows = 0
-
-        for d in diffs:
-            try:
-                source_table = f"{self.sandbox_name}.{d.table}"
-                target_table = f"{self.sandbox.source_db}.{d.table}"
-                self.sandbox.git.merge(source_table, target_table, on_conflict="accept")
-                merged.append(d.table)
-                total_rows += d.added + d.removed
-            except Exception:
-                continue
-
-        return MergeResult(tables_merged=merged, rows_applied=total_rows)
-
-    def destroy(self) -> None:
-        """DROP sandbox database. Idempotent."""
-        if not self._created:
-            return
-        try:
-            self.sandbox.delete(self.sandbox_name)
-        except Exception:
             pass
-        self._created = False
