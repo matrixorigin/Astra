@@ -749,3 +749,77 @@ class TestSkillPipelineIntegration:
         # Should have applied learning
         assert result.tools is not None
         assert len(result.tools) >= 0  # May be reordered or filtered
+
+
+class TestAuditDBVerification:
+    """Test audit event recording to database."""
+
+    def test_retrieval_method_recorded_in_audit_db(self, db, clean_db):
+        """Verify retrieval_method is correctly recorded in skill_selection_events."""
+        pipeline = SkillPipeline(db=db, llm_client=None, audit=True, learning=False)
+        
+        # Mock modern selector to return semantic retrieval
+        class MockModernSemantic:
+            def get_tools_schema(self, query, max_candidates=None, **kwargs):
+                return (
+                    [{"function": {"name": "test_skill"}}],
+                    "semantic"
+                )
+        
+        pipeline._modern = MockModernSemantic()
+        
+        result = pipeline.get_tools_schema("test query", "session_semantic")
+        
+        # Verify event was recorded with semantic method
+        event = db.execute(
+            text("SELECT selection_method FROM skill_selection_events WHERE event_id = :event_id"),
+            {"event_id": result.event_id}
+        ).fetchone()
+        
+        assert event is not None
+        assert event[0] == "semantic"
+
+    def test_keyword_fallback_recorded_in_audit_db(self, db, clean_db):
+        """Verify keyword fallback is recorded in audit DB."""
+        pipeline = SkillPipeline(db=db, llm_client=None, audit=True, learning=False)
+        
+        # Mock modern selector to return keyword retrieval
+        class MockModernKeyword:
+            def get_tools_schema(self, query, max_candidates=None, **kwargs):
+                return (
+                    [{"function": {"name": "test_skill"}}],
+                    "keyword"
+                )
+        
+        pipeline._modern = MockModernKeyword()
+        
+        result = pipeline.get_tools_schema("test query", "session_keyword")
+        
+        # Verify event was recorded with keyword method
+        event = db.execute(
+            text("SELECT selection_method FROM skill_selection_events WHERE event_id = :event_id"),
+            {"event_id": result.event_id}
+        ).fetchone()
+        
+        assert event is not None
+        assert event[0] == "keyword"
+
+    def test_retrieval_method_in_tools_result(self, db, clean_db):
+        """Verify retrieval_method is returned in ToolsResult."""
+        pipeline = SkillPipeline(db=db, llm_client=None, audit=False, learning=False)
+        
+        class MockModern:
+            def get_tools_schema(self, query, max_candidates=None, **kwargs):
+                return (
+                    [{"function": {"name": "test_skill"}}],
+                    "semantic"
+                )
+        
+        pipeline._modern = MockModern()
+        
+        result = pipeline.get_tools_schema("test query", "session_test")
+        
+        # Verify retrieval_method is in result
+        assert result.retrieval_method == "semantic"
+        assert result.tools is not None
+        assert len(result.tools) == 1

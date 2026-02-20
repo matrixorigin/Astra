@@ -43,7 +43,7 @@ class ToolsResult:
     tools: list[dict[str, Any]]          # OpenAI tools schema
     event_id: str | None = None          # Audit event ID (None if audit off)
     candidates: int = 0                  # Candidates considered
-    retrieval_method: str = "keyword"    # "semantic" or "keyword"
+    retrieval_method: str | None = None  # "semantic" or "keyword", None if unknown
 
 
 @dataclass
@@ -388,7 +388,7 @@ class SkillPipeline:
                     "event_id": event_id,
                     "session_id": session_id,
                     "user_query": query,
-                    "selected_skills": ",".join(skill_names),
+                    "selected_skills": json.dumps(skill_names),
                     "selection_method": retrieval_method,
                     "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
                 },

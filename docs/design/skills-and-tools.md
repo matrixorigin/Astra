@@ -28,7 +28,7 @@ A skill is a **versioned, declarative capability** with:
 
 ### Progressive Disclosure (Anthropic-Aligned)
 
-Following Anthropic's Agent Skills pattern and RAG-MCP research (Gan & Sun, 2025), skills load in three tiers with **real token accounting** and **semantic retrieval**:
+Following Anthropic's Agent Skills pattern and RAG-MCP research (Gan & Sun, 2025), skills load in two tiers with **real token accounting** and **semantic retrieval**:
 
 ```
 Tier 1: INDEX (always available, never in LLM context)
@@ -36,26 +36,24 @@ Tier 1: INDEX (always available, never in LLM context)
   Used by semantic retriever to find candidates — LLM never sees this tier.
   Cost: 0 prompt tokens (lives in vector index only)
 
-Tier 2: SUMMARY (injected for LLM candidate ranking, ~50-150 tokens per skill)
-  name: "code_review"
-  description: "Review code changes in a pull request for quality, security, and style"
-  parameters: {pr_number: int, focus_areas: list[str]}
-  category: "github.pr_management"
-  cost_estimate: "medium"
-
-Tier 3: FULL SCHEMA (injected only for LLM-selected skills, measured tokens)
+Tier 2: FULL SCHEMA (injected only for LLM-selected skills, measured tokens)
   Complete OpenAI tool JSON schema (from Pydantic model or default)
-  detailed_instructions, examples, edge_cases, output_format
+  Includes: name, description, parameters, detailed_instructions, examples, edge_cases
   Token cost: measured per-skill via len(json) // 4
+  
+  Note: The schema's name + description fields serve as the "summary" tier
+        for LLM candidate ranking. There is no separate Tier 2 LLM ranking pass —
+        semantic retrieval filters candidates, then LLM sees full schemas and
+        selects via native function calling in a single pass.
 ```
 
 **Key design principles** (learned from industry):
-- **Real token measurement, not constants**: Each skill's Tier 2/3 cost is computed from actual serialized size, not hardcoded estimates. Schema sizes vary 3-5× across skills.
+- **Real token measurement, not constants**: Each skill's Tier 2 cost is computed from actual serialized size, not hardcoded estimates. Schema sizes vary 3-5× across skills.
 - **Budget is a hard cap**: If a skill doesn't fit the remaining budget, it is **excluded entirely** — no empty stubs. An empty-parameter stub wastes tokens and confuses the LLM.
 - **Semantic retrieval is mandatory at scale**: RAG-MCP (arXiv:2505.03275) empirically shows keyword matching collapses beyond ~30 tools. Embedding-based retrieval achieves 3.2× accuracy improvement.
 - **Semantic retrieval replaces LLM ranking**: The vector index does the candidate filtering (zero LLM cost). The LLM only sees budget-capped full schemas and selects via native function calling in a single pass.
 
-**Why this matters**: With 50+ skills, putting all details in context wastes attention budget. Tier 1 embeddings let the retriever find candidates without any prompt tokens. Tier 2 summaries let the LLM choose. Tier 3 details are loaded only for the selected skill.
+**Why this matters**: With 50+ skills, putting all details in context wastes attention budget. Tier 1 embeddings let the retriever find candidates without any prompt tokens. Tier 2 full schemas are loaded only for budget-available skills, and the LLM selects directly.
 
 ### Skill Versioning
 
