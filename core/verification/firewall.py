@@ -75,7 +75,8 @@ class HallucinationFirewall:
         self._init_tables()
 
     def verify_response(
-        self, response: str, context_capture_id: str, mode: str = "warn"
+        self, response: str, context_capture_id: str, mode: str = "warn",
+        skill_name: str | None = None,
     ) -> FirewallResult:
         """Verify LLM response against context capture.
 
@@ -175,13 +176,22 @@ class HallucinationFirewall:
         claim_verifiability = self._weighted_confidence(results) if results else 1.0
         context_coverage = self._context_coverage(snapshot, response)
         knowledge_freshness = self._knowledge_freshness(snapshot)
+        skill_rel = self._skill_reliability(skill_name) if skill_name else None
 
-        # Weighted composite (design §3)
-        confidence = (
-            0.45 * claim_verifiability
-            + 0.30 * context_coverage
-            + 0.25 * knowledge_freshness
-        )
+        # Weighted composite (design §3) — 4D when skill known, 3D otherwise
+        if skill_rel is not None:
+            confidence = (
+                0.35 * claim_verifiability
+                + 0.25 * context_coverage
+                + 0.20 * knowledge_freshness
+                + 0.20 * skill_rel
+            )
+        else:
+            confidence = (
+                0.45 * claim_verifiability
+                + 0.30 * context_coverage
+                + 0.25 * knowledge_freshness
+            )
 
         safe = confidence >= self.threshold if mode == "block" else True
 
@@ -331,6 +341,29 @@ class HallucinationFirewall:
         except Exception:
             pass
         return 0.8  # default: reasonably fresh
+
+    def _skill_reliability(self, skill_name: str) -> float:
+        """Historical success rate for a skill from skill_execution_metrics.
+
+        Returns 0.8 default when no data available (optimistic prior).
+        """
+        try:
+            from sqlalchemy import text
+            row = self.db.execute(
+                text(
+                    "SELECT COUNT(*) AS total, "
+                    "SUM(success) AS wins "
+                    "FROM skill_execution_metrics "
+                    "WHERE skill_name = :name "
+                    "AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
+                ),
+                {"name": skill_name},
+            ).fetchone()
+            if row and row[0] >= 5:  # need ≥5 samples
+                return row[1] / row[0]
+        except Exception:
+            pass
+        return 0.8  # optimistic prior
 
     def log_verification(
         self, session_id: str, event_id: str, result: FirewallResult, context_capture_id: str

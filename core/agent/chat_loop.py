@@ -178,6 +178,7 @@ class ChatLoop:
             return response.content or ""
 
         # 6. Multi-turn tool use loop
+        last_skill_name: str | None = None
         for _round in range(MAX_TOOL_ROUNDS):
             llm_result = self.llm.chat_with_tools(
                 messages=messages,
@@ -192,7 +193,7 @@ class ChatLoop:
                 final_content = llm_result.get("content", "")
 
                 # Always verify with firewall
-                verification = self.firewall.verify_response(final_content, context_capture_id, mode="warn")
+                verification = self.firewall.verify_response(final_content, context_capture_id, mode="warn", skill_name=last_skill_name)
                 self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
 
                 if not verification.safe_to_deliver:
@@ -225,6 +226,7 @@ class ChatLoop:
             # Execute each tool and append results
             for tc in tool_calls:
                 fn_name = tc["function"]["name"]
+                last_skill_name = fn_name
                 raw_args = tc["function"]["arguments"]
                 tc_id = tc.get("id", fn_name)
 
@@ -313,7 +315,7 @@ class ChatLoop:
         final_content = response.content or ""
 
         # Firewall verification (aligned with normal exit path)
-        verification = self.firewall.verify_response(final_content, context_capture_id, mode="warn")
+        verification = self.firewall.verify_response(final_content, context_capture_id, mode="warn", skill_name=last_skill_name)
         self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
         if not verification.safe_to_deliver:
             logger.warning(
@@ -507,6 +509,7 @@ class ChatLoop:
             return
 
         # Multi-turn tool use loop with streaming
+        last_skill_name: str | None = None
         for _round in range(MAX_TOOL_ROUNDS):
             full_text = ""
             tool_calls: list[dict] = []
@@ -535,7 +538,7 @@ class ChatLoop:
 
             if not tool_calls:
                 # Verify with firewall (same as non-stream path)
-                verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn")
+                verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn", skill_name=last_skill_name)
                 self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
 
                 if not verification.safe_to_deliver:
@@ -591,6 +594,7 @@ class ChatLoop:
             delegation_calls = [tc for tc in tool_calls if tc["function"]["name"] == "delegate_task"]
             
             if len(delegation_calls) > 1:
+                last_skill_name = "delegate_task"
                 # Parallel delegation: fan-out/fan-in
                 from core.skills.delegation import DelegateTaskInput
                 
@@ -703,6 +707,7 @@ class ChatLoop:
                 # Sequential tool execution (existing logic)
                 for tc in tool_calls:
                     fn_name = tc["function"]["name"]
+                    last_skill_name = fn_name
                     tool_start_event = self.event_logger.create_stream_event(
                         user_id=user_id,
                         session_id=session_id,
@@ -843,7 +848,7 @@ class ChatLoop:
         full_text = sv.full_text
 
         # Verify exhausted-rounds answer with firewall
-        verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn")
+        verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn", skill_name=last_skill_name)
         self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
 
         if not verification.safe_to_deliver:
