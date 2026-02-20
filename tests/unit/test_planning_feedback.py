@@ -146,7 +146,7 @@ async def test_planning_mode_records_feedback():
 
 @pytest.mark.asyncio
 async def test_planning_mode_skill_not_found():
-    """Test when skill_hint is not in available tools."""
+    """Test when skill_hint is not in available tools - should fallback to selector's recommendation."""
     
     mock_llm = MagicMock()
     mock_executor = MagicMock()
@@ -161,6 +161,7 @@ async def test_planning_mode_skill_not_found():
     mock_selection.event_id = "sel_123"
     mock_pipeline.get_tools_schema.return_value = mock_selection
     
+    mock_executor.execute_skill_with_feedback.return_value = "fallback result"
     mock_executor.skill_registry = MagicMock()
     
     # Mock planner
@@ -197,14 +198,79 @@ async def test_planning_mode_skill_not_found():
         ):
             events.append(event)
         
-        # Verify executor.execute_skill() was NOT called
+        # Verify executor used fallback skill (selector's recommendation)
+        mock_executor.execute_skill_with_feedback.assert_called_once_with(
+            skill_name="other_skill",  # Fallback to first candidate
+            params={"input": "test description"},
+            session_id="sess_1",
+            parent_event_id=None,
+            selection_event_id="sel_123",
+            extra_feedback_data={"planning_step": "step_1"},
+        )
+        
+        # Verify step completed with fallback result
+        assert mock_step.result == "fallback result"
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_no_candidates_available():
+    """Test when pipeline returns empty candidates list."""
+    
+    mock_llm = MagicMock()
+    mock_executor = MagicMock()
+    mock_pipeline = MagicMock()
+    mock_event_logger = MagicMock()
+    mock_context_manager = MagicMock()
+    mock_firewall = MagicMock()
+    
+    # Mock pipeline returns empty tools list
+    mock_selection = MagicMock()
+    mock_selection.tools = []  # No candidates
+    mock_selection.event_id = "sel_123"
+    mock_pipeline.get_tools_schema.return_value = mock_selection
+    
+    mock_executor.skill_registry = MagicMock()
+    
+    # Mock planner
+    mock_plan = MagicMock()
+    mock_step = MagicMock()
+    mock_step.step_id = "step_1"
+    mock_step.skill_hint = "some_skill"
+    mock_step.description = "test description"
+    mock_plan.steps = [mock_step]
+    
+    with patch("core.agent.chat_loop.Planner") as MockPlanner:
+        mock_planner_instance = MagicMock()
+        mock_planner_instance.create_plan = AsyncMock(return_value=mock_plan)
+        mock_planner_instance.check_constraints.return_value = (True, None)
+        mock_planner_instance.get_next_steps.side_effect = [[mock_step], []]
+        mock_planner_instance.constraints = MagicMock(max_steps=10)
+        MockPlanner.return_value = mock_planner_instance
+        
+        chat_loop = ChatLoop(
+            selector=mock_pipeline,
+            executor=mock_executor,
+            llm_client=mock_llm,
+            event_logger=mock_event_logger,
+            context_manager=mock_context_manager,
+            firewall=mock_firewall,
+        )
+        
+        events = []
+        async for event in chat_loop.run_step_with_planning(
+            user_input="test query",
+            session_id="sess_1",
+            user_id="user_1",
+            max_candidates=5,
+        ):
+            events.append(event)
+        
+        # Verify executor was NOT called (no candidates available)
         mock_executor.execute_skill_with_feedback.assert_not_called()
         
-        # Verify feedback was NOT recorded (no execution happened)
-        mock_pipeline.record_feedback.assert_not_called()
-        
         # Verify step completed with error message
-        assert mock_step.result == "Skill missing_skill not available"
+        assert mock_step.result == "No suitable skill available for: test description"
+
 
 
 @pytest.mark.asyncio

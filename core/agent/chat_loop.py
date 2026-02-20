@@ -787,7 +787,15 @@ class ChatLoop:
                     
                     # Find the tool in schema
                     tool_found = any(t["function"]["name"] == skill_name for t in tools_schema)
-                    if tool_found:
+                    if not tool_found and tools_schema:
+                        # Fallback: use selector's top recommendation
+                        skill_name = tools_schema[0]["function"]["name"]
+                        logger.info(
+                            f"Skill hint '{step.skill_hint}' not in candidates, "
+                            f"using selector recommendation: {skill_name}"
+                        )
+                    
+                    if tool_found or tools_schema:
                         # Execute skill with automatic feedback recording
                         result = self.executor.execute_skill_with_feedback(
                             skill_name=skill_name,
@@ -798,7 +806,7 @@ class ChatLoop:
                             extra_feedback_data={"planning_step": step.step_id},
                         )
                     else:
-                        result = f"Skill {skill_name} not available"
+                        result = f"No suitable skill available for: {step.description}"
                 else:
                     # Use plain chat for step execution
                     result = "Step executed"
