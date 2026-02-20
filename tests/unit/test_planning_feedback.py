@@ -1,0 +1,425 @@
+"""Test that planning mode records feedback for learning."""
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+from core.agent.chat_loop import ChatLoop
+from core.skills.learning_signals import SignalType
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_uses_skill_pipeline():
+    """Verify planning mode calls SkillPipeline.get_tools_schema()."""
+    
+    # Mock dependencies
+    mock_llm = MagicMock()
+    mock_db = MagicMock()
+    mock_executor = MagicMock()
+    mock_pipeline = MagicMock()
+    mock_event_logger = MagicMock()
+    mock_context_manager = MagicMock()
+    mock_firewall = MagicMock()
+    
+    # Mock pipeline.get_tools_schema() return value
+    mock_selection = MagicMock()
+    mock_selection.tools = [{"function": {"name": "test_skill"}}]
+    mock_selection.event_id = "sel_123"
+    mock_pipeline.get_tools_schema.return_value = mock_selection
+    
+    # Mock executor.execute_skill()
+    mock_executor.execute_skill.return_value = "test result"
+    mock_executor.skill_registry = MagicMock()
+    
+    # Mock planner
+    mock_plan = MagicMock()
+    mock_step = MagicMock()
+    mock_step.step_id = "step_1"
+    mock_step.skill_hint = "test_skill"
+    mock_step.description = "test description"
+    mock_plan.steps = [mock_step]
+    
+    with patch("core.agent.chat_loop.Planner") as MockPlanner:
+        mock_planner_instance = MagicMock()
+        mock_planner_instance.create_plan = AsyncMock(return_value=mock_plan)
+        mock_planner_instance.check_constraints.return_value = (True, None)
+        mock_planner_instance.get_next_steps.side_effect = [[mock_step], []]  # First call returns step, second returns empty
+        mock_planner_instance.constraints = MagicMock(max_steps=10)
+        MockPlanner.return_value = mock_planner_instance
+        
+        # Create ChatLoop
+        chat_loop = ChatLoop(
+            selector=mock_pipeline,
+            executor=mock_executor,
+            llm_client=mock_llm,
+            event_logger=mock_event_logger,
+            context_manager=mock_context_manager,
+            firewall=mock_firewall,
+        )
+        
+        # Run planning
+        events = []
+        async for event in chat_loop.run_step_with_planning(
+            user_input="test query",
+            session_id="sess_1",
+            user_id="user_1",
+            max_candidates=5,
+        ):
+            events.append(event)
+        
+        # Verify pipeline.get_tools_schema() was called
+        mock_pipeline.get_tools_schema.assert_called_once_with(
+            query="test description",
+            session_id="sess_1",
+            max_candidates=5,
+        )
+        
+        # Verify executor.execute_skill() was called
+        mock_executor.execute_skill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_records_feedback():
+    """Verify planning mode records execution time feedback."""
+    
+    # Mock dependencies
+    mock_llm = MagicMock()
+    mock_db = MagicMock()
+    mock_executor = MagicMock()
+    mock_pipeline = MagicMock()
+    mock_event_logger = MagicMock()
+    mock_context_manager = MagicMock()
+    mock_firewall = MagicMock()
+    
+    # Mock pipeline.get_tools_schema() return value
+    mock_selection = MagicMock()
+    mock_selection.tools = [{"function": {"name": "test_skill"}}]
+    mock_selection.event_id = "sel_123"
+    mock_pipeline.get_tools_schema.return_value = mock_selection
+    
+    # Mock executor.execute_skill()
+    mock_executor.execute_skill.return_value = "test result"
+    mock_executor.skill_registry = MagicMock()
+    
+    # Mock planner
+    mock_plan = MagicMock()
+    mock_step = MagicMock()
+    mock_step.step_id = "step_1"
+    mock_step.skill_hint = "test_skill"
+    mock_step.description = "test description"
+    mock_plan.steps = [mock_step]
+    
+    with patch("core.agent.chat_loop.Planner") as MockPlanner:
+        mock_planner_instance = MagicMock()
+        mock_planner_instance.create_plan = AsyncMock(return_value=mock_plan)
+        mock_planner_instance.check_constraints.return_value = (True, None)
+        mock_planner_instance.get_next_steps.side_effect = [[mock_step], []]
+        mock_planner_instance.constraints = MagicMock(max_steps=10)
+        MockPlanner.return_value = mock_planner_instance
+        
+        # Create ChatLoop
+        chat_loop = ChatLoop(
+            selector=mock_pipeline,
+            executor=mock_executor,
+            llm_client=mock_llm,
+            event_logger=mock_event_logger,
+            context_manager=mock_context_manager,
+            firewall=mock_firewall,
+        )
+        
+        # Run planning
+        events = []
+        async for event in chat_loop.run_step_with_planning(
+            user_input="test query",
+            session_id="sess_1",
+            user_id="user_1",
+            max_candidates=5,
+        ):
+            events.append(event)
+        
+        # Verify feedback was recorded
+        mock_pipeline.record_feedback.assert_called_once()
+        call_args = mock_pipeline.record_feedback.call_args
+        
+        # Check arguments
+        assert call_args[0][0] == "sel_123"  # selection_event_id
+        assert call_args[0][1] == SignalType.EXECUTION_TIME
+        assert "ms" in call_args[0][2]
+        assert call_args[0][2]["skill"] == "test_skill"
+        assert call_args[0][2]["planning_step"] == "step_1"
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_skill_not_found():
+    """Test when skill_hint is not in available tools."""
+    
+    mock_llm = MagicMock()
+    mock_executor = MagicMock()
+    mock_pipeline = MagicMock()
+    mock_event_logger = MagicMock()
+    mock_context_manager = MagicMock()
+    mock_firewall = MagicMock()
+    
+    # Mock pipeline returns tools but NOT the requested skill
+    mock_selection = MagicMock()
+    mock_selection.tools = [{"function": {"name": "other_skill"}}]
+    mock_selection.event_id = "sel_123"
+    mock_pipeline.get_tools_schema.return_value = mock_selection
+    
+    mock_executor.skill_registry = MagicMock()
+    
+    # Mock planner
+    mock_plan = MagicMock()
+    mock_step = MagicMock()
+    mock_step.step_id = "step_1"
+    mock_step.skill_hint = "missing_skill"
+    mock_step.description = "test description"
+    mock_plan.steps = [mock_step]
+    
+    with patch("core.agent.chat_loop.Planner") as MockPlanner:
+        mock_planner_instance = MagicMock()
+        mock_planner_instance.create_plan = AsyncMock(return_value=mock_plan)
+        mock_planner_instance.check_constraints.return_value = (True, None)
+        mock_planner_instance.get_next_steps.side_effect = [[mock_step], []]
+        mock_planner_instance.constraints = MagicMock(max_steps=10)
+        MockPlanner.return_value = mock_planner_instance
+        
+        chat_loop = ChatLoop(
+            selector=mock_pipeline,
+            executor=mock_executor,
+            llm_client=mock_llm,
+            event_logger=mock_event_logger,
+            context_manager=mock_context_manager,
+            firewall=mock_firewall,
+        )
+        
+        events = []
+        async for event in chat_loop.run_step_with_planning(
+            user_input="test query",
+            session_id="sess_1",
+            user_id="user_1",
+            max_candidates=5,
+        ):
+            events.append(event)
+        
+        # Verify executor.execute_skill() was NOT called
+        mock_executor.execute_skill.assert_not_called()
+        
+        # Verify feedback was NOT recorded (no execution happened)
+        mock_pipeline.record_feedback.assert_not_called()
+        
+        # Verify step completed with error message
+        assert mock_step.result == "Skill missing_skill not available"
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_no_skill_hint():
+    """Test when step has no skill_hint (plain chat execution)."""
+    
+    mock_llm = MagicMock()
+    mock_executor = MagicMock()
+    mock_pipeline = MagicMock()
+    mock_event_logger = MagicMock()
+    mock_context_manager = MagicMock()
+    mock_firewall = MagicMock()
+    
+    mock_executor.skill_registry = MagicMock()
+    
+    # Mock planner
+    mock_plan = MagicMock()
+    mock_step = MagicMock()
+    mock_step.step_id = "step_1"
+    mock_step.skill_hint = None  # No skill hint
+    mock_step.description = "test description"
+    mock_plan.steps = [mock_step]
+    
+    with patch("core.agent.chat_loop.Planner") as MockPlanner:
+        mock_planner_instance = MagicMock()
+        mock_planner_instance.create_plan = AsyncMock(return_value=mock_plan)
+        mock_planner_instance.check_constraints.return_value = (True, None)
+        mock_planner_instance.get_next_steps.side_effect = [[mock_step], []]
+        mock_planner_instance.constraints = MagicMock(max_steps=10)
+        MockPlanner.return_value = mock_planner_instance
+        
+        chat_loop = ChatLoop(
+            selector=mock_pipeline,
+            executor=mock_executor,
+            llm_client=mock_llm,
+            event_logger=mock_event_logger,
+            context_manager=mock_context_manager,
+            firewall=mock_firewall,
+        )
+        
+        events = []
+        async for event in chat_loop.run_step_with_planning(
+            user_input="test query",
+            session_id="sess_1",
+            user_id="user_1",
+            max_candidates=5,
+        ):
+            events.append(event)
+        
+        # Verify pipeline was NOT called (no skill to select)
+        mock_pipeline.get_tools_schema.assert_not_called()
+        
+        # Verify executor was NOT called
+        mock_executor.execute_skill.assert_not_called()
+        
+        # Verify feedback was NOT recorded
+        mock_pipeline.record_feedback.assert_not_called()
+        
+        # Verify step completed with default message
+        assert mock_step.result == "Step executed"
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_multiple_steps():
+    """Test planning with multiple steps executes all and records feedback for each."""
+    
+    mock_llm = MagicMock()
+    mock_executor = MagicMock()
+    mock_pipeline = MagicMock()
+    mock_event_logger = MagicMock()
+    mock_context_manager = MagicMock()
+    mock_firewall = MagicMock()
+    
+    # Mock pipeline returns different tools for each step
+    mock_selection_1 = MagicMock()
+    mock_selection_1.tools = [{"function": {"name": "skill_1"}}]
+    mock_selection_1.event_id = "sel_1"
+    
+    mock_selection_2 = MagicMock()
+    mock_selection_2.tools = [{"function": {"name": "skill_2"}}]
+    mock_selection_2.event_id = "sel_2"
+    
+    mock_pipeline.get_tools_schema.side_effect = [mock_selection_1, mock_selection_2]
+    
+    # Mock executor returns different results
+    mock_executor.execute_skill.side_effect = ["result_1", "result_2"]
+    mock_executor.skill_registry = MagicMock()
+    
+    # Mock planner with 2 steps
+    mock_plan = MagicMock()
+    mock_step_1 = MagicMock()
+    mock_step_1.step_id = "step_1"
+    mock_step_1.skill_hint = "skill_1"
+    mock_step_1.description = "description_1"
+    
+    mock_step_2 = MagicMock()
+    mock_step_2.step_id = "step_2"
+    mock_step_2.skill_hint = "skill_2"
+    mock_step_2.description = "description_2"
+    
+    mock_plan.steps = [mock_step_1, mock_step_2]
+    
+    with patch("core.agent.chat_loop.Planner") as MockPlanner:
+        mock_planner_instance = MagicMock()
+        mock_planner_instance.create_plan = AsyncMock(return_value=mock_plan)
+        mock_planner_instance.check_constraints.return_value = (True, None)
+        mock_planner_instance.get_next_steps.side_effect = [
+            [mock_step_1, mock_step_2],  # First call returns both steps
+            []  # Second call returns empty (all done)
+        ]
+        mock_planner_instance.constraints = MagicMock(max_steps=10)
+        MockPlanner.return_value = mock_planner_instance
+        
+        chat_loop = ChatLoop(
+            selector=mock_pipeline,
+            executor=mock_executor,
+            llm_client=mock_llm,
+            event_logger=mock_event_logger,
+            context_manager=mock_context_manager,
+            firewall=mock_firewall,
+        )
+        
+        events = []
+        async for event in chat_loop.run_step_with_planning(
+            user_input="test query",
+            session_id="sess_1",
+            user_id="user_1",
+            max_candidates=5,
+        ):
+            events.append(event)
+        
+        # Verify pipeline was called twice
+        assert mock_pipeline.get_tools_schema.call_count == 2
+        
+        # Verify executor was called twice
+        assert mock_executor.execute_skill.call_count == 2
+        
+        # Verify feedback was recorded twice
+        assert mock_pipeline.record_feedback.call_count == 2
+        
+        # Verify feedback for step 1
+        call_1 = mock_pipeline.record_feedback.call_args_list[0]
+        assert call_1[0][0] == "sel_1"
+        assert call_1[0][1] == SignalType.EXECUTION_TIME
+        assert call_1[0][2]["skill"] == "skill_1"
+        assert call_1[0][2]["planning_step"] == "step_1"
+        
+        # Verify feedback for step 2
+        call_2 = mock_pipeline.record_feedback.call_args_list[1]
+        assert call_2[0][0] == "sel_2"
+        assert call_2[0][1] == SignalType.EXECUTION_TIME
+        assert call_2[0][2]["skill"] == "skill_2"
+        assert call_2[0][2]["planning_step"] == "step_2"
+
+
+@pytest.mark.asyncio
+async def test_planning_mode_execution_error_still_records_feedback():
+    """Test that feedback is recorded even when skill execution fails."""
+    
+    mock_llm = MagicMock()
+    mock_executor = MagicMock()
+    mock_pipeline = MagicMock()
+    mock_event_logger = MagicMock()
+    mock_context_manager = MagicMock()
+    mock_firewall = MagicMock()
+    
+    mock_selection = MagicMock()
+    mock_selection.tools = [{"function": {"name": "test_skill"}}]
+    mock_selection.event_id = "sel_123"
+    mock_pipeline.get_tools_schema.return_value = mock_selection
+    
+    # Mock executor raises exception
+    mock_executor.execute_skill.side_effect = RuntimeError("Execution failed")
+    mock_executor.skill_registry = MagicMock()
+    
+    mock_plan = MagicMock()
+    mock_step = MagicMock()
+    mock_step.step_id = "step_1"
+    mock_step.skill_hint = "test_skill"
+    mock_step.description = "test description"
+    mock_plan.steps = [mock_step]
+    
+    with patch("core.agent.chat_loop.Planner") as MockPlanner:
+        mock_planner_instance = MagicMock()
+        mock_planner_instance.create_plan = AsyncMock(return_value=mock_plan)
+        mock_planner_instance.check_constraints.return_value = (True, None)
+        mock_planner_instance.get_next_steps.side_effect = [[mock_step], []]
+        mock_planner_instance.constraints = MagicMock(max_steps=10)
+        MockPlanner.return_value = mock_planner_instance
+        
+        chat_loop = ChatLoop(
+            selector=mock_pipeline,
+            executor=mock_executor,
+            llm_client=mock_llm,
+            event_logger=mock_event_logger,
+            context_manager=mock_context_manager,
+            firewall=mock_firewall,
+        )
+        
+        # Execution should raise error
+        with pytest.raises(RuntimeError, match="Execution failed"):
+            async for event in chat_loop.run_step_with_planning(
+                user_input="test query",
+                session_id="sess_1",
+                user_id="user_1",
+                max_candidates=5,
+            ):
+                pass
+        
+        # Verify feedback was STILL recorded (try/finally ensures this)
+        mock_pipeline.record_feedback.assert_called_once()
+        call_args = mock_pipeline.record_feedback.call_args
+        assert call_args[0][0] == "sel_123"
+        assert call_args[0][1] == SignalType.EXECUTION_TIME
+        assert "ms" in call_args[0][2]

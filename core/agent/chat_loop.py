@@ -9,6 +9,7 @@ from core.agent.executor import AgentExecutor
 from core.agent.planner import Planner
 from core.events.event_logger import EventLogger
 from core.skills.pipeline import SkillPipeline
+from core.skills.learning_signals import SignalType
 from core.events.models import StreamEvent, StreamEventType
 from core.llm.models import LLMMessage
 from core.logging_config import get_logger
@@ -254,7 +255,6 @@ class ChatLoop:
                 finally:
                     _elapsed_ms = (time.monotonic() - _t0) * 1000
                     if self._last_selection_event_id:
-                        from core.skills.learning_signals import SignalType
                         self._pipeline.record_feedback(
                             self._last_selection_event_id,
                             SignalType.EXECUTION_TIME,
@@ -571,7 +571,6 @@ class ChatLoop:
                     # Record feedback for parallel execution
                     _elapsed_ms = (time.monotonic() - _t0) * 1000
                     if self._last_selection_event_id:
-                        from core.skills.learning_signals import SignalType
                         self._pipeline.record_feedback(
                             self._last_selection_event_id,
                             SignalType.EXECUTION_TIME,
@@ -656,7 +655,6 @@ class ChatLoop:
                     finally:
                         _elapsed_ms = (time.monotonic() - _t0) * 1000
                         if self._last_selection_event_id:
-                            from core.skills.learning_signals import SignalType
                             self._pipeline.record_feedback(
                                 self._last_selection_event_id,
                                 SignalType.EXECUTION_TIME,
@@ -775,15 +773,42 @@ class ChatLoop:
                     data={"step": step.step_id},
                 )
 
-                # Execute step using existing skill execution
+                # Execute step through SkillPipeline to enable learning
                 skill_name = step.skill_hint
+                
                 if skill_name:
-                    result = self.executor.execute_skill(
-                        skill_name=skill_name,
-                        params={"input": step.description},
+                    # Get tools schema through pipeline (includes selector/auditor/validator)
+                    _sel = self._pipeline.get_tools_schema(
+                        query=step.description,
                         session_id=session_id,
-                        parent_event_id=None,
+                        max_candidates=max_candidates,
                     )
+                    tools_schema = _sel.tools
+                    selection_event_id = _sel.event_id
+                    
+                    # Find the tool in schema
+                    tool_found = any(t["function"]["name"] == skill_name for t in tools_schema)
+                    if tool_found:
+                        import time
+                        _t0 = time.monotonic()
+                        try:
+                            result = self.executor.execute_skill(
+                                skill_name=skill_name,
+                                params={"input": step.description},
+                                session_id=session_id,
+                                parent_event_id=None,
+                            )
+                        finally:
+                            # Record execution time feedback
+                            _elapsed_ms = (time.monotonic() - _t0) * 1000
+                            if selection_event_id:
+                                self._pipeline.record_feedback(
+                                    selection_event_id,
+                                    SignalType.EXECUTION_TIME,
+                                    {"ms": _elapsed_ms, "skill": skill_name, "planning_step": step.step_id},
+                                )
+                    else:
+                        result = f"Skill {skill_name} not available"
                 else:
                     # Use plain chat for step execution
                     result = "Step executed"
