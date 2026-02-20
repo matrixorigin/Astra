@@ -410,7 +410,7 @@ class ChatLoop:
             sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
             async for chunk in self.llm.chat_stream(messages, user_id, session_id):
-                warning = sv.check(chunk)
+                warnings = sv.check(chunk)
                 text_event = self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
@@ -426,7 +426,7 @@ class ChatLoop:
                     causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
                 )
-                if warning:
+                for warning in warnings:
                     sv.full_text += warning
                     yield StreamEvent(
                         event_type=StreamEventType.TEXT_DELTA,
@@ -436,13 +436,12 @@ class ChatLoop:
             agent_id=self.agent_id,
                     )
 
-            # Flush remaining buffer
-            remaining_warning = sv.flush()
-            if remaining_warning:
-                sv.full_text += remaining_warning
+            # Flush remaining buffer + pending sentences
+            for warning in sv.flush():
+                sv.full_text += warning
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DELTA,
-                    data={"chunk": remaining_warning},
+                    data={"chunk": warning},
                     event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
@@ -816,7 +815,7 @@ class ChatLoop:
         sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
         async for chunk in self.llm.chat_stream(messages, user_id, session_id):
-            warning = sv.check(chunk)
+            warnings = sv.check(chunk)
             yield StreamEvent(
                 event_type=StreamEventType.TEXT_DELTA,
                 data={"chunk": chunk},
@@ -824,7 +823,7 @@ class ChatLoop:
                 causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
             )
-            if warning:
+            for warning in warnings:
                 sv.full_text += warning
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DELTA,
@@ -834,12 +833,11 @@ class ChatLoop:
             agent_id=self.agent_id,
                 )
 
-        remaining_warning = sv.flush()
-        if remaining_warning:
-            sv.full_text += remaining_warning
+        for warning in sv.flush():
+            sv.full_text += warning
             yield StreamEvent(
                 event_type=StreamEventType.TEXT_DELTA,
-                data={"chunk": remaining_warning},
+                data={"chunk": warning},
                 event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
