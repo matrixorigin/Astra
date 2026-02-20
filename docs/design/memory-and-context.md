@@ -1,7 +1,7 @@
 # Memory and Context
 
 > **Status**: Core Design — single source of truth for memory and context architecture  
-> **Last Updated**: 2026-02-14
+> **Last Updated**: 2026-02-21
 
 ---
 
@@ -710,11 +710,68 @@ If any of those decisions themselves became memory entries (hallucination crysta
 
 ---
 
-## 8. Open Research Directions
+## 8. Observational Memory (Implemented)
 
-### Observational Memory
+Inspired by Mastra's Observational Memory (95% on LongMemEval), we implement two background agents as "subconscious":
 
-Mastra's Observational Memory (95% on LongMemEval) uses two background agents as "subconscious" — one observing and compressing conversations, one reflecting and reorganizing long-term memory. We should explore this pattern for our post-chain consolidation hooks.
+### Observer (`core/memory/observer.py`)
+
+Runs post-turn in a daemon thread. Extracts structured observations from new (unobserved) messages via LLM.
+
+- **DB-backed tracking**: `observed_msg_index` column on `observations` table — survives restarts, multi-instance safe
+- **Gating**: only triggers when unobserved messages exceed token threshold (default 2000)
+- **Marker rows**: when LLM returns no observations, writes `is_reflected=1` marker to advance index — prevents repeated LLM calls
+- **No shared mutable state**: background thread creates its own DB session + Observer instance
+- **Robust JSON parsing**: `_parse_json_array()` handles bare JSON, code blocks, garbage-wrapped output
+
+### Reflector (`core/memory/reflector.py`)
+
+Runs hourly via `MemoryGovernanceEngine`. Condenses accumulated observations when they exceed token threshold (default 8000).
+
+- **Transaction-safe**: mark old as reflected + insert condensed in single commit, rollback on failure
+- **Cross-session**: reflects all unreflected observations per user, not per session
+- **Version tracking**: condensed observations get `version=2`
+
+### Context Assembly
+
+`Observer.build_context_with_observations()` replaces observed messages with dense observation summaries:
+
+1. Inject `## Memory (Observations)` section into system prompt
+2. Drop messages already covered by observations (based on `observed_msg_index`)
+3. Preserve recent N messages verbatim (default 4)
+4. Dedup check: won't re-inject if observations already in system prompt
+
+### Integration Points
+
+- `ChatLoop._log_response()` → triggers `_run_observer()` (daemon thread)
+- `ChatLoop._build_messages()` → injects observations into system prompt
+- `ChatLoop.run_step/run_step_stream` → pre-fetches observations once before tool loop (`_cached_obs_section`)
+- `MemoryGovernanceEngine.run_hourly_tasks()` → runs Reflector
+- CLI (`mo_agent.py`) and API (`streaming.py`) wire Observer into ChatLoop
+
+### Storage: observations table
+
+```sql
+CREATE TABLE observations (
+  observation_id   VARCHAR(64) PRIMARY KEY,
+  user_id          VARCHAR(64) NOT NULL,
+  session_id       VARCHAR(64) NOT NULL,
+  content          TEXT NOT NULL,
+  priority         VARCHAR(10) DEFAULT 'medium',   -- high/medium/low
+  observation_type VARCHAR(50),                     -- preference/decision/fact/action/pattern/marker
+  observed_at      DATETIME NOT NULL,
+  referenced_at    DATETIME,
+  source_event_ids JSON NOT NULL,
+  is_reflected     TINYINT(1) DEFAULT 0,
+  version          INT DEFAULT 1,
+  observed_msg_index INT DEFAULT 0,                 -- DB-backed tracking
+  created_at       DATETIME DEFAULT NOW()
+);
+```
+
+---
+
+## 9. Open Research Directions
 
 ### Knowledge Graphs for Semantic Memory
 

@@ -290,6 +290,72 @@ class TestObserverContext:
         # Should NOT have two "## Memory (Observations)" sections
         assert result[0]["content"].count("## Memory (Observations)") == 1
 
+    def test_build_context_exact_message_boundaries(self, observer, db):
+        """Verify exactly which messages are kept vs dropped.
+
+        Setup: system + 10 msgs (idx 0-9), observed_idx=7 (system + 6 non-system observed).
+        Expected: system(+obs) + msgs[6:] (4 unobserved: idx 6,7,8,9).
+        adj_idx = 7 - 1(system) = 6, remaining[6:] = msgs at original idx 7,8,9,10.
+        """
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(10):
+            msgs.append({"role": "user" if i % 2 == 0 else "assistant", "content": f"msg-{i}"})
+        # 11 total messages. observed_idx=7 means system + first 6 non-system are observed.
+        db.query.return_value.filter.return_value.scalar.return_value = 7
+        obs_section = "## Memory (Observations)\n- obs"
+
+        with patch.object(observer, "get_observations", return_value=[{"content": "x"}]):
+            result = observer.build_context_with_observations(
+                msgs, "u1", "s1", _cached_obs_section=obs_section,
+            )
+
+        # System + 4 unobserved messages
+        assert len(result) == 5
+        assert result[0]["role"] == "system"
+        # The kept messages should be msg-6, msg-7, msg-8, msg-9
+        kept_contents = [m["content"] for m in result[1:]]
+        assert kept_contents == ["msg-6", "msg-7", "msg-8", "msg-9"]
+
+    def test_build_context_preserve_recent_minimum(self, observer, db):
+        """When fewer unobserved msgs than preserve_recent, keep preserve_recent from tail."""
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(10):
+            msgs.append({"role": "user" if i % 2 == 0 else "assistant", "content": f"msg-{i}"})
+        # observed_idx=10 means only msg-9 is unobserved (1 < preserve_recent=4)
+        db.query.return_value.filter.return_value.scalar.return_value = 10
+        obs_section = "## Memory (Observations)\n- obs"
+
+        with patch.object(observer, "get_observations", return_value=[{"content": "x"}]):
+            result = observer.build_context_with_observations(
+                msgs, "u1", "s1", _cached_obs_section=obs_section,
+            )
+
+        # Should keep at least 4 recent messages (preserve_recent default)
+        non_system = [m for m in result if m["role"] != "system"]
+        assert len(non_system) == 4
+        # Last 4: msg-6, msg-7, msg-8, msg-9
+        assert [m["content"] for m in non_system] == ["msg-6", "msg-7", "msg-8", "msg-9"]
+
+    def test_build_context_no_system_message(self, observer, db):
+        """Messages without system prompt: observations become system message."""
+        msgs = [
+            {"role": "user", "content": "msg-0"},
+            {"role": "assistant", "content": "msg-1"},
+            {"role": "user", "content": "msg-2"},
+        ]
+        db.query.return_value.filter.return_value.scalar.return_value = 2
+        obs_section = "## Memory (Observations)\n- obs"
+
+        with patch.object(observer, "get_observations", return_value=[{"content": "x"}]):
+            result = observer.build_context_with_observations(
+                msgs, "u1", "s1", _cached_obs_section=obs_section,
+            )
+
+        assert result[0]["role"] == "system"
+        assert "## Memory (Observations)" in result[0]["content"]
+        # msg-2 is unobserved (idx 2), should be kept
+        assert any("msg-2" in m.get("content", "") for m in result)
+
 
 # ---------------------------------------------------------------------------
 # Reflector
@@ -458,3 +524,58 @@ class TestLifecycleReflector:
         llm = MagicMock()
         engine = MemoryGovernanceEngine(db, llm_client=llm)
         assert engine.llm_client is llm
+
+
+# ---------------------------------------------------------------------------
+# Edge cases: concurrent observers, DB failure degradation
+# ---------------------------------------------------------------------------
+
+class TestObserverEdgeCases:
+    def test_concurrent_observers_no_data_loss(self, db, llm):
+        """Two observers on same session: both succeed, no crash.
+
+        With DB-backed index, worst case is duplicate observations (not data loss).
+        Reflector will deduplicate on next pass.
+        """
+        # Both observers see index=0
+        db.query.return_value.filter.return_value.scalar.return_value = 0
+        llm.chat_with_tools.return_value = {
+            "content": json.dumps([{"content": "obs", "priority": "low", "type": "fact"}])
+        }
+
+        obs1 = Observer(db, llm)
+        obs2 = Observer(db, llm)
+
+        r1 = obs1.observe("s1", "u1", _make_messages())
+        r2 = obs2.observe("s1", "u1", _make_messages())
+
+        # Both succeed — no crash, both produce observations
+        assert len(r1) == 1
+        assert len(r2) == 1
+        # db.add called twice (once per observer)
+        assert db.add.call_count == 2
+
+    def test_advance_index_db_failure_degrades_gracefully(self, observer, db):
+        """If _advance_index DB write fails, observe() propagates the exception.
+
+        The outer _run_observer catches it — next turn will retry same messages.
+        """
+        observer.db.query.return_value.filter.return_value.scalar.return_value = 0
+        observer.llm.chat_with_tools.return_value = {"content": "[]"}
+
+        # Make commit fail (simulating DB down)
+        db.commit.side_effect = RuntimeError("DB connection lost")
+
+        with pytest.raises(RuntimeError, match="DB connection lost"):
+            observer.observe("s1", "u1", _make_messages())
+
+    def test_store_observations_db_failure(self, observer, db):
+        """If DB commit fails during store, exception propagates (caught by bg thread)."""
+        observer.db.query.return_value.filter.return_value.scalar.return_value = 0
+        observer.llm.chat_with_tools.return_value = {
+            "content": json.dumps([{"content": "test", "priority": "low", "type": "fact"}])
+        }
+        db.commit.side_effect = RuntimeError("DB error")
+
+        with pytest.raises(RuntimeError, match="DB error"):
+            observer.observe("s1", "u1", _make_messages())
