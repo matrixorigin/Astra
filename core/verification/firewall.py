@@ -98,12 +98,12 @@ class HallucinationFirewall:
         if not response or not response.strip():
             logger.warning("Empty response provided to firewall")
             return FirewallResult(
-                safe_to_deliver=True,
-                confidence_score=1.0,
+                safe_to_deliver=(mode != "block"),
+                confidence_score=0.0,
                 claims_verified=0,
                 claims_failed=0,
                 contradictions=[],
-                warnings=["Empty response"],
+                warnings=["Empty response — blocked" if mode == "block" else "Empty response"],
             )
 
         if not context_capture_id or not context_capture_id.strip():
@@ -128,12 +128,13 @@ class HallucinationFirewall:
 
         if not claims:
             return FirewallResult(
-                safe_to_deliver=True,
-                confidence_score=1.0,
+                safe_to_deliver=(mode != "block"),
+                confidence_score=0.0,
                 claims_verified=0,
                 claims_failed=0,
                 contradictions=[],
-                warnings=["No verifiable claims found"],
+                warnings=["No verifiable claims — blocked" if mode == "block"
+                          else "No verifiable claims found"],
             )
 
         # 2. Load context capture

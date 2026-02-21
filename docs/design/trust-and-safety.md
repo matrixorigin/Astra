@@ -106,9 +106,9 @@ The firewall must handle infrastructure failures (snapshot load fails, claim ext
 | `warn` | Deliver with degraded-confidence warning | Deliver with claim annotations |
 | `block` | **Block delivery** — fail closed | Block if confidence < threshold |
 
-Current implementation fails open on all early returns regardless of mode. The correct behavior: `mode="block"` must fail closed when verification cannot complete — an unverifiable response is not a safe response.
+Current implementation: `mode="block"` fails closed on all early-return paths (empty response, no claims, extraction failure, snapshot load failure). `mode="warn"` fails open with degraded-confidence warnings. `ChatLoop` accepts `firewall_mode` parameter (default `"warn"`) and propagates it to all `verify_response` calls.
 
-### Streaming Verification (Roadmap)
+### Streaming Verification (Implemented)
 
 Current design verifies after full response generation. The industry is moving to real-time token-level detection:
 
@@ -627,7 +627,7 @@ Every SLO evaluation and violation response is an event — the platform's opera
 
 ## Implementation Status: ChatLoop Audit Alignment
 
-> **Last verified**: 2026-02-20
+> **Last verified**: 2026-02-21
 
 The three ChatLoop execution paths in `core/agent/chat_loop.py` must satisfy the audit contract from §1 (Decision Audit Trail) and §2 (Hallucination Firewall). Current status:
 
@@ -643,7 +643,7 @@ The three ChatLoop execution paths in `core/agent/chat_loop.py` must satisfy the
 | StreamEvent carries event_id + causal_chain_id | N/A | ✅ | ✅ |
 | Streaming NLI entailment verification | N/A | ✅ LLM primary + firewall fallback | N/A |
 | CoT audit (pattern + LLM semantic) | ✅ | ✅ sequential path | ✅ via pipeline |
-| Firewall `mode="block"` fail-closed | ✅ | ✅ | ✅ |
+| Firewall `mode="block"` fail-closed | ✅ via `firewall_mode` | ✅ via `firewall_mode` | ✅ via `firewall_mode` |
 | 4D confidence (claim + coverage + freshness + skill) | ✅ | ✅ | ✅ |
 
 ---

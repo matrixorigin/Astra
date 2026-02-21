@@ -138,6 +138,7 @@ class StreamingVerifier:
             if self._context_text is None:
                 self._context_text = self._load_context()
             if not self._context_text:
+                logger.warning("No context available for streaming verification — skipping batch")
                 return []
 
             from core.llm.models import LLMMessage
@@ -163,7 +164,7 @@ class StreamingVerifier:
                 response.content or "", sentences,
             )
         except Exception as e:
-            logger.debug("LLM batch entailment check skipped: %s", e)
+            logger.warning("LLM batch entailment check failed: %s", e)
             return []
 
     def _llm_single_check(
@@ -190,7 +191,7 @@ class StreamingVerifier:
                 )
                 return [" ⚠️[contradicts context] "]
         except Exception as e:
-            logger.debug("LLM single entailment check skipped: %s", e)
+            logger.warning("LLM single entailment check failed: %s", e)
         return []
 
     def _parse_batch_verdicts(
@@ -241,7 +242,7 @@ class StreamingVerifier:
                         f"{'s' if result.claims_failed > 1 else ''}] "
                     )
             except Exception as e:
-                logger.debug("Streaming firewall check skipped: %s", e)
+                logger.warning("Streaming firewall check failed: %s", e)
         return warnings
 
     def _load_context(self) -> str:
@@ -257,5 +258,5 @@ class StreamingVerifier:
                 parts.append(code.get("content", ""))
             return "\n".join(p for p in parts if p)
         except Exception as e:
-            logger.debug("Context load for streaming verify failed: %s", e)
+            logger.warning("Context load for streaming verify failed: %s", e)
             return ""

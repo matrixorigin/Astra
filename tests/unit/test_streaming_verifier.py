@@ -181,3 +181,37 @@ class TestExtractClaimIndex:
 
     def test_no_number_returns_none(self):
         assert StreamingVerifier._extract_claim_index("CONTRADICTED", 3) is None
+
+
+class TestStreamingVerifierLogging:
+    """Verify that verification failures log at warning level, not debug."""
+
+    def test_llm_batch_failure_logs_warning(self, caplog):
+        sv = _make_sv(llm_response="SUPPORTED")
+        sv.llm_client.chat.side_effect = RuntimeError("LLM down")
+        sv._context_text = "some context"
+        import logging
+        with caplog.at_level(logging.WARNING, logger="core.verification.streaming_verifier"):
+            # Single sentence → _llm_single_check path
+            warnings = sv._llm_batch_check(["Test sentence one."])
+        assert warnings == []  # graceful degradation
+        assert any("LLM down" in r.message for r in caplog.records)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    def test_context_load_failure_logs_warning(self, caplog):
+        sv = _make_sv(llm_response="SUPPORTED")
+        sv._context_text = None  # force reload
+        sv.firewall.context_manager.load_snapshot.side_effect = RuntimeError("DB down")
+        import logging
+        with caplog.at_level(logging.DEBUG):
+            result = sv._llm_batch_check(["Test sentence."])
+        assert result == []
+
+    def test_firewall_fallback_failure_logs_warning(self, caplog):
+        sv = _make_sv()  # no LLM → uses firewall fallback
+        sv.firewall.verify_response.side_effect = RuntimeError("firewall down")
+        import logging
+        with caplog.at_level(logging.WARNING):
+            result = sv._firewall_batch_check(["Test sentence."])
+        assert result == []
+        assert any("failed" in r.message.lower() for r in caplog.records)

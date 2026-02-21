@@ -143,6 +143,7 @@ class ChatLoop:
         agent_id: str = "dev-agent",
         scratchpad=None,
         continuity=None,
+        firewall_mode: str = "warn",
     ):
         """Initialize ChatLoop.
         
@@ -156,6 +157,7 @@ class ChatLoop:
             agent_id: ID of the agent running this loop (for multi-agent)
             scratchpad: AgentScratchpad instance for working memory (optional)
             continuity: SessionContinuity instance for cross-session context (optional)
+            firewall_mode: 'warn' (annotate) or 'block' (fail-closed). Default: 'warn'.
         """
         self.selector = selector
         self._pipeline = selector
@@ -164,6 +166,7 @@ class ChatLoop:
         self.event_logger = event_logger
         self.context_manager = context_manager
         self.firewall = firewall
+        self.firewall_mode = firewall_mode if firewall_mode in ("warn", "block") else "warn"
         self.agent_id = agent_id
         self.scratchpad = scratchpad
         self.continuity = continuity
@@ -291,7 +294,7 @@ class ChatLoop:
                 final_content = llm_result.get("content", "")
 
                 # Always verify with firewall
-                verification = self.firewall.verify_response(final_content, context_capture_id, mode="warn", skill_name=last_skill_name)
+                verification = self.firewall.verify_response(final_content, context_capture_id, mode=self.firewall_mode, skill_name=last_skill_name)
                 self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
 
                 if not verification.safe_to_deliver:
@@ -427,7 +430,7 @@ class ChatLoop:
         final_content = response.content or ""
 
         # Firewall verification (aligned with normal exit path)
-        verification = self.firewall.verify_response(final_content, context_capture_id, mode="warn", skill_name=last_skill_name)
+        verification = self.firewall.verify_response(final_content, context_capture_id, mode=self.firewall_mode, skill_name=last_skill_name)
         self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
         if not verification.safe_to_deliver:
             logger.warning(
@@ -586,7 +589,7 @@ class ChatLoop:
             full_text = sv.full_text
 
             # Post-stream: full response-level verification for audit record
-            verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn")
+            verification = self.firewall.verify_response(full_text, context_capture_id, mode=self.firewall_mode)
             self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
 
             if not verification.safe_to_deliver:
@@ -698,7 +701,7 @@ class ChatLoop:
 
             if not tool_calls:
                 # Verify with firewall (same as non-stream path)
-                verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn", skill_name=last_skill_name)
+                verification = self.firewall.verify_response(full_text, context_capture_id, mode=self.firewall_mode, skill_name=last_skill_name)
                 self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
 
                 if not verification.safe_to_deliver:
@@ -1028,7 +1031,7 @@ class ChatLoop:
         full_text = sv.full_text
 
         # Verify exhausted-rounds answer with firewall
-        verification = self.firewall.verify_response(full_text, context_capture_id, mode="warn", skill_name=last_skill_name)
+        verification = self.firewall.verify_response(full_text, context_capture_id, mode=self.firewall_mode, skill_name=last_skill_name)
         self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
 
         if not verification.safe_to_deliver:
@@ -1249,9 +1252,7 @@ class ChatLoop:
             agent_id=self.agent_id,
         )
 
-        verification = self.firewall.verify_response(
-            final_text, context_capture_id, mode="warn",
-        )
+        verification = self.firewall.verify_response(final_text, context_capture_id, mode=self.firewall_mode)
         self.firewall.log_verification(
             session_id, user_event.event_id, verification, context_capture_id,
         )
