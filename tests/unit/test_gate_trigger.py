@@ -262,3 +262,45 @@ class TestPromptManagerIntegration:
 
         pm.register_prompt("system_prompt", "v2", "content", is_active=True)
         # must not raise
+
+    def test_rollback_reactivates_previous_version(self):
+        from core.context.prompts import PromptManager
+        from unittest.mock import call
+
+        db = Mock()
+        pm = PromptManager(db=db)
+
+        # Current active version
+        current = Mock()
+        current.version = "v2"
+        current.created_at = "2026-01-02"
+
+        # Previous inactive version
+        previous = Mock()
+        previous.version = "v1"
+
+        # First query returns current, second returns previous
+        db.execute.return_value.first.side_effect = [current, previous]
+
+        result = pm.rollback_prompt("system_general")
+
+        assert result == "v1"
+        db.commit.assert_called_once()
+        # Cache should be invalidated
+        assert "system_general" not in pm._cache
+
+    def test_rollback_returns_none_when_no_prior_version(self):
+        from core.context.prompts import PromptManager
+
+        db = Mock()
+        pm = PromptManager(db=db)
+
+        current = Mock()
+        current.version = "v1"
+        # First call returns current, second returns None (no prior)
+        db.execute.return_value.first.side_effect = [current, None]
+
+        result = pm.rollback_prompt("system_general")
+
+        assert result is None
+        db.commit.assert_not_called()

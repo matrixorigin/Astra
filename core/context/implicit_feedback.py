@@ -181,22 +181,21 @@ class ImplicitFeedbackMiner:
         """
         results = self.analyze_batch(session_id=session_id)
         count = 0
+        from core.context.prompts import PromptFeedback
+        pf = PromptFeedback(self.db)
         for r in results:
-            if r["rating"] <= 3:  # Only store non-positive as actionable feedback
-                try:
-                    from core.context.prompts import PromptFeedback
-                    pf = PromptFeedback(self.db)
-                    pf.record_feedback(
-                        prompt_template_id=template_id,
-                        prompt_version="auto",
-                        llm_request_id=r["event_id"],
-                        user_rating=r["rating"],
-                        user_comment=f"[implicit:{r['signal_type']}] {r['evidence']}",
-                        metadata={"source": "implicit_mining", "confidence": str(r["confidence"])},
-                    )
-                    count += 1
-                except Exception as e:
-                    logger.debug(f"Failed to store implicit feedback: {e}")
+            try:
+                pf.record_feedback(
+                    prompt_template_id=template_id,
+                    prompt_version="auto",
+                    llm_request_id=r["event_id"],
+                    user_rating=r["rating"],
+                    user_comment=f"[implicit:{r['signal_type']}] {r['evidence']}",
+                    metadata={"source": "implicit_mining", "confidence": str(r["confidence"])},
+                )
+                count += 1
+            except Exception as e:
+                logger.debug(f"Failed to store implicit feedback: {e}")
         if count:
             self.db.commit()
             logger.info(f"Stored {count} implicit feedback records")

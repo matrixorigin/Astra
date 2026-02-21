@@ -139,6 +139,66 @@ class PromptManager:
         self._cache.clear()
         logger.info("Prompt cache cleared")
 
+    def rollback_prompt(self, template_id: str) -> str | None:
+        """Rollback to the previous active version of a prompt.
+
+        Deactivates the current version and reactivates the most recent
+        prior version.
+
+        Returns:
+            The version string that was reactivated, or None if no prior version exists.
+        """
+        try:
+            # Find current active version
+            current = self.db.execute(
+                text("""
+                    SELECT version, created_at FROM prompt_templates
+                    WHERE template_id = :tid AND is_active = 1
+                    ORDER BY created_at DESC LIMIT 1
+                """),
+                {"tid": template_id},
+            ).first()
+
+            if not current:
+                logger.warning("No active version to rollback for %s", template_id)
+                return None
+
+            # Find previous version
+            previous = self.db.execute(
+                text("""
+                    SELECT version FROM prompt_templates
+                    WHERE template_id = :tid AND is_active = 0
+                    ORDER BY created_at DESC LIMIT 1
+                """),
+                {"tid": template_id},
+            ).first()
+
+            if not previous:
+                logger.warning("No prior version to rollback to for %s", template_id)
+                return None
+
+            # Deactivate current, activate previous
+            self.db.execute(
+                text("UPDATE prompt_templates SET is_active = 0 WHERE template_id = :tid AND version = :ver"),
+                {"tid": template_id, "ver": current.version},
+            )
+            self.db.execute(
+                text("UPDATE prompt_templates SET is_active = 1 WHERE template_id = :tid AND version = :ver"),
+                {"tid": template_id, "ver": previous.version},
+            )
+            self.db.commit()
+
+            # Invalidate cache
+            self._cache.pop(template_id, None)
+
+            logger.info("Rolled back %s from %s to %s", template_id, current.version, previous.version)
+            return previous.version
+
+        except Exception as e:
+            logger.error("Failed to rollback prompt %s: %s", template_id, e)
+            self.db.rollback()
+            raise
+
 
 def init_default_prompts(db: Session):
     """Initialize default prompt templates."""

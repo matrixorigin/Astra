@@ -439,7 +439,7 @@ class KnowledgeEntry(Base):
     version = Column(Integer, default=1)
     superseded_by = Column(String(64))
     
-    # Vector search (stored as text, converted to VECF64 in raw SQL)
+    # Vector search
     embedding = Column(VectorType(1536, VectorPrecision.F32))  # Native VECF32 vector
     
     created_at = Column(DateTime, default=func.now())

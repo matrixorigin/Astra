@@ -96,7 +96,7 @@ class EmbeddingService:
             text: Input text
 
         Returns:
-            Embedding vector (1024 dimensions)
+            Embedding vector ({DIMENSION} dimensions)
         """
         if self.provider == "openai":
             return self._embed_openai(text)
@@ -143,7 +143,7 @@ class EmbeddingService:
 
         Args:
             event_id: Event identifier
-            embedding: Embedding vector (must be 1024 dimensions)
+            embedding: Embedding vector (must match DIMENSION)
             metadata: Optional metadata
         """
         if len(embedding) != self.DIMENSION:
@@ -178,7 +178,7 @@ class EmbeddingService:
         """Search for similar events using L2_DISTANCE.
 
         Args:
-            query_embedding: Query vector (1024 dimensions)
+            query_embedding: Query vector (must match DIMENSION)
             limit: Max results
             session_id: Optional session filter
             filters: Optional metadata filters
