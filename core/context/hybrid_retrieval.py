@@ -283,4 +283,45 @@ class HybridRetriever:
             from core.context.knowledge import update_access_tracking
             update_access_tracking(self.db, [e["entry_id"] for e in entries])
 
+        # 1-hop graph expansion: find related entries not already in results
+        if entries:
+            try:
+                from core.context.knowledge_graph import expand_with_graph
+                seed_ids = [e["entry_id"] for e in entries[:5]]  # top-5 seeds
+                expanded_ids = expand_with_graph(self.db, seed_ids, limit_per_entry=2)
+                if expanded_ids:
+                    existing_ids = {e["entry_id"] for e in entries}
+                    new_ids = [eid for eid in expanded_ids if eid not in existing_ids]
+                    if new_ids:
+                        ph = ", ".join(f":g{i}" for i in range(len(new_ids)))
+                        params = {f"g{i}": eid for i, eid in enumerate(new_ids)}
+                        params["uid"] = user_id
+                        params["thr"] = confidence_threshold
+                        graph_rows = self.db.execute(
+                            text(f"""
+                                SELECT entry_id, category, key_name, value, confidence, trust_tier,
+                                       created_at, last_validated_at
+                                FROM knowledge_entries
+                                WHERE entry_id IN ({ph}) AND user_id = :uid AND confidence > :thr
+                            """),
+                            params,
+                        ).fetchall()
+                        for row in graph_rows:
+                            entries.append({
+                                "entry_id": row.entry_id,
+                                "category": row.category,
+                                "key_name": row.key_name,
+                                "value": row.value,
+                                "confidence": float(row.confidence),
+                                "trust_tier": row.trust_tier,
+                                "created_at": row.created_at.isoformat() if row.created_at else None,
+                                "last_validated_at": row.last_validated_at.isoformat() if row.last_validated_at else None,
+                                "relevance_score": 0.0,  # graph-expanded, no direct score
+                                "source": "graph_expansion",
+                            })
+                        if graph_rows:
+                            update_access_tracking(self.db, [r.entry_id for r in graph_rows])
+            except Exception as e:
+                logger.warning("Knowledge graph expansion failed (non-fatal): %s", e)
+
         return entries

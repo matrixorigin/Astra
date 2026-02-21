@@ -174,12 +174,13 @@ class QualityAssessment(Base):
     __tablename__ = "quality_assessments"
     __table_args__ = (
         UniqueConstraint("level", "target_id", name="uq_level_target"),
+        Index("ix_qa_session_level", "session_id", "level"),
     )
 
     assessment_id = Column(String(36), primary_key=True)
-    level = Column(String(10), nullable=False, index=True)  # "chain" | "session"
-    target_id = Column(String(36), nullable=False, index=True)  # causal_chain_id or session_id
-    session_id = Column(String(36), nullable=False, index=True)
+    level = Column(String(10), nullable=False)  # "chain" | "session"
+    target_id = Column(String(36), nullable=False)  # causal_chain_id or session_id
+    session_id = Column(String(36), nullable=False)
     score = Column(Float, nullable=False)  # 0-5
     step_count = Column(Integer, nullable=False, default=0)
     failure_count = Column(Integer, nullable=False, default=0)
@@ -463,6 +464,22 @@ class KnowledgeEntry(Base):
     
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class KnowledgeRelation(Base):
+    """Entity-relationship layer over knowledge_entries (knowledge graph edges)."""
+    __tablename__ = "knowledge_relations"
+    __table_args__ = (
+        UniqueConstraint("subject_id", "predicate", "object_id", name="uq_spo"),
+    )
+
+    relation_id = Column(String(36), primary_key=True)
+    subject_id = Column(String(64), nullable=False)   # knowledge_entry.entry_id (covered by uq_spo prefix)
+    predicate = Column(String(100), nullable=False)    # e.g. "related_to", "depends_on", "supersedes"
+    object_id = Column(String(64), nullable=False, index=True)  # reverse lookups need separate index
+    weight = Column(Float, default=1.0)  # relationship strength 0-1
+    source = Column(String(50))  # "extraction" | "user_explicit" | "contradiction_scan"
+    created_at = Column(DateTime, default=func.now(), nullable=False)
 
 
 class AgentScratchpad(Base):
