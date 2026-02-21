@@ -106,6 +106,11 @@ curl http://localhost:8000/health
 - `POST /chat` - Send message, get response (auto-creates session if omitted)
 - `POST /chat/stream` - Stream chat response as SSE (auto-creates session if omitted)
 
+### Background Jobs
+- `POST /jobs` - Submit background job (training, data collection, etc.)
+- `GET /jobs/{job_id}` - Get job status and result
+- `DELETE /jobs/{job_id}` - Cancel running job
+
 ### Agents
 - `POST /agents` - Create agent
 - `GET /agents` - List agents

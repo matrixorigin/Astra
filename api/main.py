@@ -114,6 +114,9 @@ app.include_router(streaming.router, tags=["streaming (deprecated)"])
 from api.routers import chat
 app.include_router(chat.router, tags=["chat"])
 
+from api.routers import jobs
+app.include_router(jobs.router, tags=["jobs"])
+
 # Learning service API
 from api.routers import learning
 app.include_router(learning.router, tags=["learning"])

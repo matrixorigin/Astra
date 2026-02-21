@@ -229,25 +229,54 @@ helm install mo-agent ./charts/mo-agent-engine \
 
 ---
 
-## 3. Execution Backend Abstraction
+## 3. Execution Model: Tools vs Background Jobs
 
-### The Problem
+### Two Distinct Execution Contexts
 
-Skills have vastly different resource needs:
+The system has two fundamentally different execution contexts that must NOT be conflated:
 
-| Skill | CPU | GPU | Memory | Duration | Frequency |
-|-------|-----|-----|--------|----------|-----------|
-| `list_prs` | 0.1 core | ❌ | 50MB | <1s | Every chat turn |
-| `feedback_classifier` | 1 core | ❌ | 200MB | <100ms | Every chat turn |
-| `feedback_trainer` | 4 cores | ✅ 1 GPU | 8GB | 30min-2hr | Weekly |
+#### Context 1: Agent Tool Execution (Synchronous, In-Loop)
+
+Agent tools are called during the ChatLoop decision cycle. They must be fast and return results
+for the LLM to continue reasoning.
+
+| Execution Path | Isolation | Latency | Example |
+|---------------|-----------|---------|---------|
+| **Built-in Skill** | None (in-process function call) | <1s | `code_review`, `search_code` |
+| **MCP Tool** | Process-level (MCP server is a separate process via stdio/HTTP) | <5s | filesystem, database, SaaS tools |
+| **Scratchpad** | None (in-memory) | <1ms | `scratchpad_write`, `scratchpad_read` |
+
+**No tool-level containerization needed.** This matches industry practice:
+- Claude Code / Kiro CLI: in-process function calls, permission-based safety
+- Cursor: in-process, no isolation
+- LangChain / CrewAI: in-process
+- MCP: process-level isolation (separate server process), not security sandbox
+
+Safety is handled by:
+1. `SideEffectCategory` (READ/WRITE/DESTRUCTIVE) → approval gates
+2. `ToolMockingLayer` → replay mode blocks destructive ops, records results
+3. MCP tools → naturally isolated in separate process
+
+#### Context 2: Background Jobs (Asynchronous, Out-of-Loop)
+
+Heavy workloads that run outside the chat loop. These are NOT agent tools — they are
+scheduled tasks triggered by API calls, cron, or events.
+
+| Job | CPU | GPU | Memory | Duration | Trigger |
+|-----|-----|-----|--------|----------|---------|
+| `feedback_trainer` | 4 cores | ✅ 1 GPU | 8GB | 30min-2hr | Weekly / on-demand |
 | `corpus_collector` | 0.5 core | ❌ | 500MB | 5-30min | On-demand |
+| `drift_detection` | 1 core | ❌ | 1GB | 1-5min | Hourly |
+| `model_evaluation` | 2 cores | ✅ | 4GB | 10-60min | On-demand |
 
-Running `feedback_trainer` in the API server process would block all requests for 2 hours.
+These need a job execution backend for scheduling, progress tracking, and resource allocation.
 
-### Solution: Pluggable ExecutionBackend
+### Background Job Backend (Pluggable)
+
+Only applies to Context 2 (background jobs). Agent tool execution stays in-process.
 
 ```python
-# core/agent/execution_backend.py
+# core/jobs/backend.py
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -267,16 +296,24 @@ class JobResult:
     error: str | None = None
     progress: float = 0.0  # 0.0 - 1.0
 
-class ExecutionBackend(ABC):
-    """Abstract execution backend for skill workloads"""
+@dataclass
+class JobRequirements:
+    """Resource requirements for a background job."""
+    gpu_required: bool = False
+    min_cpus: int = 1
+    min_memory_gb: float = 2.0
+    timeout_seconds: int = 3600
+    conda_env: str | None = None
+
+class JobBackend(ABC):
+    """Abstract backend for background job execution.
+    
+    NOT for agent tool execution (which is always in-process).
+    This is for heavy async workloads: training, data collection, evaluation.
+    """
     
     @abstractmethod
-    async def submit(
-        self,
-        skill_id: str,
-        inputs: dict,
-        requirements: "SkillRequirement"
-    ) -> str:
+    async def submit(self, job_type: str, inputs: dict, requirements: JobRequirements) -> str:
         """Submit job, return job_id"""
     
     @abstractmethod
@@ -292,38 +329,35 @@ class ExecutionBackend(ABC):
         """Wait for job completion"""
 ```
 
-### Backend Implementations
+### Job Backend Implementations
 
-#### LocalBackend (Single Machine)
+#### LocalJobBackend (Single Machine)
 
 ```python
-# core/agent/backends/local.py
-class LocalBackend(ExecutionBackend):
-    """In-process or subprocess execution"""
+# core/jobs/local.py
+class LocalJobBackend(JobBackend):
+    """Subprocess execution for background jobs on single machine"""
     
-    async def submit(self, skill_id, inputs, requirements):
+    async def submit(self, job_type, inputs, requirements):
         job_id = str(uuid7())
         
         if requirements.conda_env:
-            # Subprocess with different conda env
             self._jobs[job_id] = asyncio.create_task(
-                self._run_in_env(skill_id, inputs, requirements.conda_env)
+                self._run_in_env(job_type, inputs, requirements.conda_env)
             )
         else:
-            # In-process (fast path for lightweight skills)
-            skill = self.registry.get(skill_id)
             self._jobs[job_id] = asyncio.create_task(
-                skill.execute(**inputs)
+                self._run_subprocess(job_type, inputs)
             )
         
         return job_id
     
-    async def _run_in_env(self, skill_id, inputs, conda_env):
-        """Execute skill in a subprocess with different conda environment"""
+    async def _run_in_env(self, job_type, inputs, conda_env):
+        """Execute job in a subprocess with different conda environment"""
         cmd = [
             "conda", "run", "-n", conda_env, "--no-capture-output",
-            "python", "-m", "core.skills.runner",
-            "--skill-id", skill_id,
+            "python", "-m", "core.jobs.runner",
+            "--job-type", job_type,
             "--inputs", json.dumps(inputs)
         ]
         proc = await asyncio.create_subprocess_exec(
@@ -332,16 +366,16 @@ class LocalBackend(ExecutionBackend):
         stdout, stderr = await proc.communicate()
         
         if proc.returncode != 0:
-            raise SkillExecutionError(f"Skill failed: {stderr.decode()}")
+            raise JobExecutionError(f"Job failed: {stderr.decode()}")
         
         return json.loads(stdout.decode())
 ```
 
-#### RayBackend (Distributed Compute)
+#### RayJobBackend (Distributed Compute)
 
 ```python
-# core/agent/backends/ray_backend.py
-class RayBackend(ExecutionBackend):
+# core/jobs/ray_backend.py
+class RayJobBackend(JobBackend):
     """Ray cluster execution for distributed/GPU workloads"""
     
     def __init__(self, address: str = "auto"):
@@ -387,11 +421,11 @@ class RayBackend(ExecutionBackend):
             return JobResult(job_id=job_id, status=JobStatus.RUNNING)
 ```
 
-#### KubernetesBackend (Cloud Native)
+#### K8sJobBackend (Cloud Native)
 
 ```python
-# core/agent/backends/kubernetes_backend.py
-class KubernetesBackend(ExecutionBackend):
+# core/jobs/k8s_backend.py
+class K8sJobBackend(JobBackend):
     """Kubernetes Job execution for cloud-native deployments"""
     
     def __init__(self, namespace: str = "mo-agent", image_registry: str = ""):
@@ -501,155 +535,64 @@ class KubernetesBackend(ExecutionBackend):
 
 ---
 
-## 4. Backend Selection & Routing
-
-### Auto-Detection
+## 4. Job Router
 
 ```python
-# core/agent/execution_backend.py
-class BackendRouter:
-    """Selects the best backend based on environment and skill requirements"""
+# core/jobs/router.py
+class JobRouter:
+    """Selects the best backend based on environment and job requirements."""
     
     def __init__(self, config: dict = None):
         self.config = config or {}
-        self.backends = {}
+        self.backends: dict[str, JobBackend] = {}
         self._detect_backends()
     
     def _detect_backends(self):
-        """Auto-detect available backends"""
-        # Always available
-        self.backends["local"] = LocalBackend()
+        self.backends["local"] = LocalJobBackend()
         
-        # Ray: check if cluster is reachable
-        try:
-            import ray
-            ray_addr = os.getenv("RAY_ADDRESS", self.config.get("ray", {}).get("address"))
-            if ray_addr:
-                self.backends["ray"] = RayBackend(address=ray_addr)
-        except ImportError:
-            pass
+        # Ray: optional
+        ray_addr = os.getenv("RAY_ADDRESS")
+        if ray_addr:
+            self.backends["ray"] = RayJobBackend(address=ray_addr)
         
-        # Kubernetes: check if running in cluster or kubeconfig exists
-        try:
-            from kubernetes import config as k8s_config
-            try:
-                k8s_config.load_incluster_config()
-                self.backends["kubernetes"] = KubernetesBackend(
-                    namespace=self.config.get("kubernetes", {}).get("namespace", "mo-agent")
-                )
-            except k8s_config.ConfigException:
-                if Path("~/.kube/config").expanduser().exists():
-                    self.backends["kubernetes"] = KubernetesBackend()
-        except ImportError:
-            pass
+        # K8s: auto-detect in-cluster or kubeconfig
+        if os.getenv("KUBERNETES_SERVICE_HOST") or Path("~/.kube/config").expanduser().exists():
+            self.backends["k8s"] = K8sJobBackend()
     
-    def select(self, requirements: "SkillRequirement") -> ExecutionBackend:
-        """Select best backend for given requirements"""
-        
-        # 1. Explicit preference
-        if requirements.preferred_backend and requirements.preferred_backend in self.backends:
-            return self.backends[requirements.preferred_backend]
-        
-        # 2. GPU required → prefer Ray > K8s > Local
+    def select(self, requirements: JobRequirements) -> JobBackend:
         if requirements.gpu_required:
-            for name in ["ray", "kubernetes", "local"]:
+            for name in ["ray", "k8s", "local"]:
                 if name in self.backends:
                     return self.backends[name]
-        
-        # 3. Long-running async → prefer K8s > Ray > Local
-        if requirements.async_execution:
-            for name in ["kubernetes", "ray", "local"]:
-                if name in self.backends:
-                    return self.backends[name]
-        
-        # 4. Default: local (fastest for lightweight skills)
         return self.backends["local"]
 ```
 
-### Integration with AgentExecutor
+### Relationship to AgentExecutor
+
+**AgentExecutor is NOT changed.** It continues to execute tools in-process via `ToolMockingLayer`.
+
+JobRouter is used by **API endpoints** or **scheduled tasks** that submit background jobs:
 
 ```python
-# core/agent/executor.py (updated)
-class AgentExecutor:
-    def __init__(self, db, registry, mode=MockMode.PRODUCTION, pipeline=None):
-        self.db = db
-        self.registry = registry
-        self.mode = mode
-        self.mock_layer = ToolMockingLayer(mode, db)
-        self._pipeline = pipeline
-        self._backend_router = BackendRouter()  # Auto-detect backends
-    
-    async def execute_skill(self, skill_name, params, session_id, parent_event_id=None):
-        skill = self.registry.get(skill_name)
-        
-        # Lightweight skills: in-process (current behavior, zero overhead)
-        if self._is_lightweight(skill):
-            return self._execute_inline(skill, params, session_id, parent_event_id)
-        
-        # Heavy skills: route to appropriate backend
-        backend = self._backend_router.select(skill.requirements)
-        job_id = await backend.submit(skill_name, params, skill.requirements)
-        
-        # Sync skills: wait for result
-        if not skill.requirements.async_execution:
-            result = await backend.wait(job_id, timeout=skill.requirements.timeout_seconds)
-            if result.status == JobStatus.FAILED:
-                raise SkillExecutionError(result.error)
-            return result.result
-        
-        # Async skills: return job_id for polling
-        return {"job_id": job_id, "status": "submitted", "backend": type(backend).__name__}
-    
-    def _is_lightweight(self, skill) -> bool:
-        """Determine if skill can run in-process"""
-        req = skill.requirements
-        return (
-            not req.gpu_required
-            and not req.conda_env
-            and not req.async_execution
-            and (req.timeout_seconds or 0) < 60
-        )
+# api/routers/jobs.py
+@router.post("/jobs")
+async def submit_job(request: JobRequest, ...):
+    router = JobRouter()
+    job_id = await router.select(request.requirements).submit(
+        job_type=request.job_type,
+        inputs=request.inputs,
+        requirements=request.requirements,
+    )
+    return {"job_id": job_id}
+
+@router.get("/jobs/{job_id}")
+async def get_job_status(job_id: str, ...):
+    ...
 ```
 
 ---
 
-## 5. Skill Requirements (Extended)
-
-```python
-# core/skills/base.py (extended)
-class SkillRequirement(BaseModel):
-    """Declarative resource requirements for skill execution"""
-    
-    # Current fields (unchanged)
-    repo_types: list[RepoType] = []
-    min_access: AccessScope = AccessScope.READ
-    llm_required: bool = True
-    
-    # Environment isolation
-    conda_env: Optional[str] = None          # e.g., "agent-engine-train"
-    optional_packages: list[str] = []         # pip packages for runtime env
-    fallback_mode: Optional[str] = None       # "heuristic" — degrade if deps missing
-    
-    # Compute resources
-    gpu_required: bool = False
-    min_cpus: Optional[int] = None            # CPU cores
-    min_memory_gb: Optional[int] = None       # RAM in GB
-    min_disk_gb: Optional[int] = None         # Disk in GB
-    
-    # Execution mode
-    async_execution: bool = False             # True = return job_id, poll for result
-    timeout_seconds: Optional[int] = None     # Max execution time
-    max_retries: int = 0                      # Retry on failure
-    
-    # Scheduling
-    preferred_backend: Optional[str] = None   # "local", "ray", "kubernetes"
-    node_selector: dict[str, str] = {}        # K8s node selector labels
-    priority: int = 0                         # Higher = scheduled first
-```
-
----
-
-## 6. Docker Images
+## 5. Docker Images
 
 ### Multi-Stage Build
 
@@ -685,7 +628,7 @@ COPY . .
 
 ---
 
-## 7. Kubernetes Manifests
+## 6. Kubernetes Manifests
 
 All components except API are optional. Helm values control what gets deployed.
 
@@ -857,7 +800,7 @@ spec:
 
 ---
 
-## 8. Ray Integration [opt]
+## 7. Ray Integration [opt]
 
 ### When to Use Ray vs Kubernetes
 
@@ -962,7 +905,7 @@ class DistributedFeedbackTrainer:
 
 ---
 
-## 9. Topology Comparison
+## 8. Topology Comparison
 
 | Dimension | Single Machine | Docker Compose | Kubernetes |
 |-----------|---------------|----------------|------------|
@@ -981,7 +924,7 @@ class DistributedFeedbackTrainer:
 
 ---
 
-## 10. Configuration
+## 9. Configuration
 
 ### Unified Config
 
@@ -1048,7 +991,7 @@ class DeploymentDetector:
 
 ---
 
-## 11. Migration Path
+## 10. Migration Path
 
 ### 单机 → Docker Compose
 
@@ -1108,7 +1051,7 @@ helm upgrade mo-agent ./charts/mo-agent-engine \
 
 ---
 
-## 12. Skill Runner (Standalone Process)
+## 11. Job Runner (Standalone Process)
 
 For K8s Jobs and subprocess execution, skills need a standalone entry point:
 

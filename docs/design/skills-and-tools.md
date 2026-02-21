@@ -26,6 +26,26 @@ A skill is a **versioned, declarative capability** with:
 - **Execution logic**: the actual code
 - **Audit trail**: every invocation recorded with version, params, result
 
+### Execution Model
+
+Skills are **always executed in-process** as function calls within the ChatLoop. This is the
+same approach used by Claude Code, Cursor, LangChain, and CrewAI. No containerization or
+subprocess isolation for individual tool calls.
+
+Three execution paths in ChatLoop:
+1. **Built-in Skill** → `AgentExecutor.execute_skill()` → `ToolMockingLayer.execute()` → `skill.execute()`
+2. **MCP Tool** → `MCPBridge.call_tool()` → MCP server (separate process via stdio/HTTP)
+3. **Scratchpad** → in-memory, no external call
+
+Safety is NOT achieved through isolation, but through:
+- `SideEffectCategory` (READ/WRITE/DESTRUCTIVE) → approval gates
+- `ToolMockingLayer` → replay mode blocks destructive ops
+- MCP tools → naturally process-isolated
+
+For **heavy background workloads** (model training, data collection), see
+[Deployment Architecture § Background Jobs](deployment-architecture.md#3-execution-model-tools-vs-background-jobs).
+These are NOT skills — they are jobs submitted via `/jobs` API.
+
 ### Progressive Disclosure (Anthropic-Aligned)
 
 Following Anthropic's Agent Skills pattern and RAG-MCP research (Gan & Sun, 2025), skills load in two tiers with **real token accounting** and **semantic retrieval**:
