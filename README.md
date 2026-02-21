@@ -113,6 +113,12 @@ curl http://localhost:8000/health
 - `POST /jobs` - Submit background job (training, data collection, etc.)
 - `GET /jobs/{job_id}` - Get job status and result
 - `DELETE /jobs/{job_id}` - Cancel running job
+- `POST /jobs/webhook` - Job completion webhook (resumes waiting agent runs)
+
+### Workflows
+- `GET /workflows` - List registered workflow definitions
+- `GET /workflows/runs/{run_id}` - Get workflow run status and step results
+- `POST /workflows/runs/{run_id}/resolve` - Resolve a wait step (e.g. human approval)
 
 ### Agents
 - `POST /agents` - Create agent

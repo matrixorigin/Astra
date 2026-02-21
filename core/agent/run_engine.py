@@ -64,25 +64,21 @@ class RunEngine:
             loop = _build_chat_loop(self.db)
             loop._current_run_id = run.run_id  # For async tools to link jobs
 
-            async for event in loop.run_step_stream(
-                user_input=run.user_input,
-                session_id=run.session_id,
-                user_id=run.user_id,
-                context=run.context,
-            ):
-                sse = self._stream_event_to_dict(event, run.run_id)
-                _run_events.setdefault(run.run_id, []).append(sse)
+            coro = self._consume_stream(loop, run)
+            # Run-level timeout: 30 min default, prevents ChatLoop from hanging forever
+            timeout = (run.context or {}).get("run_timeout_seconds", 1800)
+            await asyncio.wait_for(coro, timeout=timeout)
 
-                # Check for async wait signal
-                if event.data.get("wait_for"):
-                    run.status = RunStatus.WAITING
-                    run.waiting_for = event.data["wait_for"]
-                    self._log_run_event(run, EventType.RUN_WAITING, {
-                        "waiting_for": run.waiting_for,
-                    })
-                    return  # Park the run
-
-            self._complete_run(run)
+            if run.status == RunStatus.RUNNING:
+                self._complete_run(run)
+        except asyncio.TimeoutError:
+            logger.error(f"Run {run.run_id} timed out after {timeout}s")
+            run.status = RunStatus.FAILED
+            self._log_run_event(run, EventType.RUN_FAILED, {"error": f"Run timed out after {timeout}s"})
+            _run_events.setdefault(run.run_id, []).append({
+                "event_type": "run_error", "data": {"error": f"Run timed out after {timeout}s"},
+                "run_id": run.run_id,
+            })
         except asyncio.CancelledError:
             run.status = RunStatus.CANCELLED
             self._log_run_event(run, EventType.RUN_CANCELLED)
@@ -96,6 +92,26 @@ class RunEngine:
             })
         finally:
             _run_waiters.get(run.run_id, asyncio.Event()).set()
+
+    async def _consume_stream(self, loop, run: AgentRun) -> None:
+        """Consume ChatLoop stream, parking on wait_for signals."""
+        async for event in loop.run_step_stream(
+            user_input=run.user_input,
+            session_id=run.session_id,
+            user_id=run.user_id,
+            context=run.context,
+        ):
+            sse = self._stream_event_to_dict(event, run.run_id)
+            _run_events.setdefault(run.run_id, []).append(sse)
+
+            # Check for async wait signal
+            if event.data.get("wait_for"):
+                run.status = RunStatus.WAITING
+                run.waiting_for = event.data["wait_for"]
+                self._log_run_event(run, EventType.RUN_WAITING, {
+                    "waiting_for": run.waiting_for,
+                })
+                return  # Park the run
 
     async def resume_run(self, run_id: str, result: dict) -> None:
         """Resume a waiting run when its async event arrives."""
@@ -144,7 +160,13 @@ class RunEngine:
 
     async def resolve_handle(self, handle: str, result: dict) -> bool:
         """Resolve any wait handle. Resumes the run waiting for it."""
-        from core.agent.async_tools import get_async_tool_registry
+        from core.agent.async_tools import get_async_tool_registry, resume_workflow
+
+        # First check if this handle is for a workflow's inner wait step
+        if await resume_workflow(handle, result):
+            return True
+
+        # Otherwise resolve directly to a run
         run_id = get_async_tool_registry().resolve_handle(handle)
         if not run_id:
             logger.warning(f"No run waiting for handle {handle}")

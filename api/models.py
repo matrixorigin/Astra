@@ -500,3 +500,36 @@ class Observation(Base):
     observed_msg_index = Column(Integer, default=0)  # Messages observed up to this index
 
     created_at = Column(DateTime, default=func.now())
+
+
+class WorkflowDefinition(Base):
+    """Registered workflow templates — versioned, reusable."""
+    __tablename__ = "workflow_definitions"
+    workflow_id = Column(String(255), primary_key=True)  # name@version
+    name = Column(String(255), nullable=False, index=True)
+    version = Column(String(32), nullable=False)
+    description = Column(Text)
+    definition = Column(JSON, nullable=False)  # Workflow.model_dump()
+    created_by = Column(String(255))
+    is_active = Column(TINYINT(1), default=1)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class WorkflowRun(Base):
+    """Runtime state of a workflow execution."""
+    __tablename__ = "workflow_runs"
+    run_id = Column(String(255), primary_key=True)
+    workflow_id = Column(String(255), nullable=False, index=True)
+    agent_run_id = Column(String(255), index=True)  # linked AgentRun
+    status = Column(String(32), nullable=False, default="pending")  # pending/running/waiting/completed/failed/cancelled
+    waiting_for = Column(String(255))  # handle for external wait
+    waiting_step_id = Column(String(255))
+    current_step_idx = Column(Integer, default=0)
+    step_results = Column(JSON, default={})  # {step_id: StepResult.model_dump()}
+    inputs = Column(JSON, default={})
+    error = Column(Text)
+    created_by = Column(String(255))
+    started_at = Column(DateTime, default=func.now())
+    completed_at = Column(DateTime)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())

@@ -543,7 +543,7 @@ child_run_created — Parent created a child run
 - `/chat/runs/{run_id}` status + stream + cancel endpoints
 - SSE reconnection via `last_index`
 
-### Phase 2: Async Tools ✅
+### Phase 2: Async Tools + Workflow Engine ✅
 - `AsyncToolRegistry` — extensible registry for tools that park runs
 - `wait_for` handle protocol: any `"<type>:<id>"` string
 - `resolve_handle()` — unified resume mechanism for any handle type
@@ -553,7 +553,29 @@ child_run_created — Parent created a child run
 - `LocalJobBackend.on_completed` callback for in-process job completion
 - Resume injects async result into `user_input` so LLM sees what happened
 
-**Extensibility:** New async tool types (workflow, approval, webhook) require only:
+**Self-built Workflow Engine** (`core/workflow/engine.py`):
+- JSON-serializable DSL (Pydantic) — LLM can generate workflow definitions directly
+- Step types: `job`, `parallel` (fan-out/fan-in), `condition` (safe_eval), `wait` (parks for external event), `workflow` (nested), `loop` (repeat until)
+- Step-level retry with exponential backoff, workflow-level timeout
+- Data flow via `inputs_from` (step output → next step input)
+- Condition jumps skip intermediate steps (marks SKIPPED)
+- Safe expression evaluator: regex-based, no eval/exec, resolves `steps.step_id.field` paths
+- Full state serialization — `WorkflowRun` is JSON-serializable for DB persistence
+
+**Workflow Lifecycle:**
+- `submit_workflow` tool → creates `WorkflowDefinition` + `WorkflowRun` in DB → executes in background
+- If workflow hits a `wait` step → parks, stores `waiting_for` handle in `_workflow_waits`
+- External event → `resume_workflow(handle, result)` → continues execution → persists state
+- On completion → `_resolve_workflow()` → resumes parent agent run with workflow result
+- Crash recovery: `restore_waiting_workflows()` on startup, loads from DB
+- Stale cleanup: `cleanup_stale_workflows()` runs hourly, fails workflows stuck >24h
+
+**API Endpoints:**
+- `GET /workflows` — list registered workflow definitions
+- `GET /workflows/runs/{run_id}` — workflow run status + step results
+- `POST /workflows/runs/{run_id}/resolve` — resolve a wait step (human approval, external event)
+
+**Extensibility:** New async tool types require only:
 ```python
 reg = get_async_tool_registry()
 reg.register("start_workflow", my_executor, my_schema)
@@ -563,7 +585,7 @@ ChatLoop and RunEngine require zero changes.
 
 **Built-in async tools:**
 - `submit_job` — single background job, parks until job completes
-- `submit_dag` — multi-step pipeline (sequential), each step's output feeds next, parks until entire DAG completes. Use when steps are predetermined and don't need LLM decisions between them.
+- `submit_workflow` — multi-step workflow with branching/parallel/wait/loop, parks until entire workflow completes
 
 **Integration examples (zero core changes):**
 ```python

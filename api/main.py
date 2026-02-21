@@ -29,9 +29,24 @@ async def lifespan(app: FastAPI):
     scheduler = MemoryGovernanceScheduler()
     await scheduler.start()
 
+    # Restore workflows that were waiting when process died
+    from core.agent.async_tools import restore_waiting_workflows, cleanup_stale_workflows
+    restored = restore_waiting_workflows()
+    if restored:
+        logger.info(f"Restored {restored} waiting workflow(s)")
+
+    # Periodic workflow cleanup (every hour)
+    import asyncio
+    async def _cleanup_loop():
+        while True:
+            await asyncio.sleep(3600)
+            await cleanup_stale_workflows(max_age_hours=24)
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+
     yield
 
     # Shutdown
+    cleanup_task.cancel()
     await scheduler.stop()
     logger.info("Shutting down...")
 
@@ -116,6 +131,9 @@ app.include_router(chat.router, tags=["chat"])
 
 from api.routers import jobs
 app.include_router(jobs.router, tags=["jobs"])
+
+from api.routers import workflows
+app.include_router(workflows.router, tags=["workflows"])
 
 # Learning service API
 from api.routers import learning
