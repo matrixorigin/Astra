@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from core.agent.executor import AgentExecutor
-from core.agent.planner import Planner
+from core.agent.planner import Planner, PlanStatus, restore_plan_from_events
 from core.events.event_logger import EventLogger
 from core.skills.pipeline import SkillPipeline
 from core.skills.learning_signals import SignalType
@@ -1118,22 +1118,55 @@ class ChatLoop:
             agent_id=self.agent_id,
         )
 
-        planner = Planner(self.llm)
+        _db = self.event_logger.session
+        planner = Planner(
+            self.llm,
+            event_logger=self.event_logger,
+            db=_db,
+        )
         constraints = planner.constraints
 
-        # P: Plan
-        plan = await planner.create_plan(goal=user_input, context=str(context))
+        # P: Plan — try cross-session restore first, then create new
+        try:
+            plan = restore_plan_from_events(_db, user_input)
+        except Exception as e:
+            logger.warning("[planning] Failed to restore plan: %s", e)
+            plan = None
+        _resumed = plan is not None
+
+        # Skip restore if plan has no pending steps (all completed)
+        if _resumed and all(s.status == PlanStatus.COMPLETED for s in plan.steps):
+            logger.info("[planning] Plan %s already completed, creating new", plan.plan_id)
+            plan = None
+            _resumed = False
+
+        if _resumed:
+            logger.info("[planning] Resumed plan %s from events", plan.plan_id)
+        else:
+            plan = await planner.create_plan(
+                goal=user_input,
+                context=str(context),
+                user_id=user_id,
+                session_id=session_id,
+                parent_event_id=user_event.event_id,
+                causal_chain_id=user_event.causal_chain_id,
+            )
 
         # Check constraints
         is_valid, error_msg = planner.check_constraints(plan)
         if not is_valid:
+            planner.log_plan_failed(
+                plan, user_id, session_id, error_msg or "constraint violation",
+                parent_event_id=user_event.event_id,
+                causal_chain_id=user_event.causal_chain_id,
+            )
             yield StreamEvent(
                 event_type=StreamEventType.RUN_ERROR,
                 data={"error": error_msg},
             )
             return
 
-        # Log plan created event
+        # Log plan created event (stream event for UI)
         self.event_logger.create_stream_event(
             user_id=user_id,
             session_id=session_id,
@@ -1145,11 +1178,10 @@ class ChatLoop:
 
         yield StreamEvent(
             event_type=StreamEventType.PLAN_CREATED,
-            data={"plan": plan.model_dump()},
+            data={"plan": plan.model_dump(), "resumed": _resumed},
         )
 
-        max_revisions = self.llm.config.get("max_revisions", 3)
-        for _rev in range(max_revisions):
+        for _rev in range(constraints.max_revisions):
             step_results = []
 
             # A: Act — execute ready steps
@@ -1160,6 +1192,12 @@ class ChatLoop:
 
             # Check step count constraint
             if len(plan.steps) > constraints.max_steps:
+                planner.log_plan_failed(
+                    plan, user_id, session_id,
+                    f"Step count {len(plan.steps)} exceeds max {constraints.max_steps}",
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.RUN_ERROR,
                     data={
@@ -1170,6 +1208,11 @@ class ChatLoop:
 
             for step in next_steps:
                 step.status = "in_progress"  # type: ignore
+                planner.log_step_start(
+                    step, plan.plan_id, user_id, session_id,
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.PLAN_STEP_START,
                     data={"step": step.step_id},
@@ -1223,6 +1266,11 @@ class ChatLoop:
                 step.result = str(result)
                 step_results.append({"step_id": step.step_id, "result": result})
 
+                planner.log_step_done(
+                    step, plan.plan_id, user_id, session_id,
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
                 yield StreamEvent(
                     event_type=StreamEventType.PLAN_STEP_DONE,
                     data={"step": step.step_id, "result": str(result)},
@@ -1236,11 +1284,24 @@ class ChatLoop:
             # R: Reflect — should we revise?
             _assessment, revised_plan = await planner.reflect(plan, step_results)
             if revised_plan is not None:
+                planner.log_plan_revised(
+                    revised_plan, user_id, session_id,
+                    parent_event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                )
                 plan = revised_plan
                 yield StreamEvent(
                     event_type=StreamEventType.PLAN_REVISED,
                     data={"plan": plan.model_dump()},
                 )
+
+        # Log plan completion
+        planner.log_plan_completed(
+            plan, user_id, session_id,
+            summary=f"Completed {sum(1 for s in plan.steps if s.status == PlanStatus.COMPLETED)}/{len(plan.steps)} steps",
+            parent_event_id=user_event.event_id,
+            causal_chain_id=user_event.causal_chain_id,
+        )
 
         # Final synthesis — with firewall verification + audit (aligned with all paths)
         final_text = "Planning complete. Executing final synthesis..."

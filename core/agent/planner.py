@@ -207,7 +207,7 @@ Output format (JSON):
             logger.error(f"Failed to parse plan JSON: {e}")
             # Fallback: create a simple single-step plan
             plan = Plan(
-                plan_id="plan_001",
+                plan_id=f"plan_{uuid7()}",
                 goal=goal,
                 steps=[
                     PlanStep(
@@ -238,8 +238,8 @@ Output format (JSON):
         except ValidationError as e:
             logger.error(f"Plan validation failed: {e}")
             # Fallback: create a simple single-step plan
-            return Plan(
-                plan_id="plan_001",
+            plan = Plan(
+                plan_id=f"plan_{uuid7()}",
                 goal=goal,
                 steps=[
                     PlanStep(
@@ -249,6 +249,23 @@ Output format (JSON):
                 ],
                 constraints=self.constraints.model_dump(),
             )
+
+            if self.event_logger and user_id and session_id:
+                plan_dict = plan.model_dump()
+                if "created_at" in plan_dict and isinstance(plan_dict["created_at"], datetime):
+                    plan_dict["created_at"] = plan_dict["created_at"].isoformat()
+
+                self.event_logger.create_plan_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="plan_created",
+                    plan_data=plan_dict,
+                    parent_event_id=parent_event_id,
+                    causal_chain_id=causal_chain_id,
+                    metadata={"fallback": True, "error": str(e)},
+                )
+
+            return plan
 
     async def reflect(self, plan: Plan, step_results: list[dict]) -> tuple[str, Plan | None]:
         """Evaluate progress and decide whether to revise plan.
@@ -599,16 +616,18 @@ Sub-steps format:
 def restore_plan_from_events(db, goal_id: str) -> Plan | None:
     """Restore plan state from events by goal_id.
 
+    Only restores plans that have NOT been completed or failed.
+
     Args:
         db: SQLAlchemy Session instance
         goal_id: Goal identifier (stored in metadata)
 
     Returns:
-        Latest plan state or None if not found
+        Latest plan state or None if not found / already finished
     """
     from sqlalchemy import text
     
-    # Query all plan events for this goal
+    # Query the latest plan for this goal
     result = db.execute(
         text("""
         SELECT event_id, event_type, content, created_at, metadata
@@ -625,9 +644,22 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
     if not rows:
         return None
 
-    # Get the latest plan
     latest = rows[0]
     plan_data = json.loads(latest["content"])
+    plan_id = plan_data["plan_id"]
+
+    # Check if this plan was already completed or failed
+    finished = db.execute(
+        text("""
+        SELECT 1 FROM conversation_events
+        WHERE event_type IN ('plan_completed', 'plan_failed')
+          AND JSON_UNQUOTE(JSON_EXTRACT(content, '$.plan_id')) = :plan_id
+        LIMIT 1
+        """),
+        {"plan_id": plan_id},
+    )
+    if finished.fetchone() is not None:
+        return None
 
     # Restore step statuses from step events
     result = db.execute(

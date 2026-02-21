@@ -302,6 +302,70 @@ class TestRestorePlanFromEvents:
         assert plan.plan_id == "plan_002"
         assert plan.steps[0].description == "Revised step"
 
+    def test_restore_skips_completed_plan(self, db):
+        """Completed plans should not be restored."""
+        from uuid_utils import uuid7
+
+        chain_id = str(uuid7())
+
+        db.add(Event(
+            event_id=str(uuid7()),
+            session_id="session_001",
+            event_type="plan_created",
+            content=json.dumps({
+                "plan_id": "plan_done",
+                "goal": "Finished goal",
+                "steps": [{"step_id": "s1", "description": "Done", "status": "completed"}],
+            }),
+            event_metadata={"goal": "Finished goal"},
+            user_id="user_001",
+            causal_chain_id=chain_id,
+        ))
+        db.add(Event(
+            event_id=str(uuid7()),
+            session_id="session_001",
+            event_type="plan_completed",
+            content=json.dumps({"plan_id": "plan_done", "summary": "all done"}),
+            user_id="user_001",
+            causal_chain_id=chain_id,
+        ))
+        db.commit()
+
+        plan = restore_plan_from_events(db, "Finished goal")
+        assert plan is None
+
+    def test_restore_skips_failed_plan(self, db):
+        """Failed plans should not be restored."""
+        from uuid_utils import uuid7
+
+        chain_id = str(uuid7())
+
+        db.add(Event(
+            event_id=str(uuid7()),
+            session_id="session_001",
+            event_type="plan_created",
+            content=json.dumps({
+                "plan_id": "plan_fail",
+                "goal": "Failed goal",
+                "steps": [{"step_id": "s1", "description": "Fail", "status": "pending"}],
+            }),
+            event_metadata={"goal": "Failed goal"},
+            user_id="user_001",
+            causal_chain_id=chain_id,
+        ))
+        db.add(Event(
+            event_id=str(uuid7()),
+            session_id="session_001",
+            event_type="plan_failed",
+            content=json.dumps({"plan_id": "plan_fail", "reason": "constraint violation"}),
+            user_id="user_001",
+            causal_chain_id=chain_id,
+        ))
+        db.commit()
+
+        plan = restore_plan_from_events(db, "Failed goal")
+        assert plan is None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

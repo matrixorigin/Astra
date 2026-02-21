@@ -127,11 +127,12 @@ Complex task ("Fix the failing CI and run regression") → Enter PAOR loop
 Plans are stored as events — no new tables, no special runtime:
 
 ```
-event_type = "plan_created"    → content = JSON plan structure
-event_type = "plan_revised"    → content = revised plan, metadata.revision_of = previous
-event_type = "plan_step_start" → content = step description
-event_type = "plan_step_done"  → content = outcome + reflection
-event_type = "plan_completed"  → content = final summary
+event_type = "plan_created"    → content = JSON plan structure        ✅ Implemented
+event_type = "plan_revised"    → content = revised plan, revision_of  ✅ Implemented
+event_type = "plan_step_start" → content = step description           ✅ Implemented
+event_type = "plan_step_done"  → content = outcome + reflection       ✅ Implemented
+event_type = "plan_completed"  → content = final summary              ✅ Implemented
+event_type = "plan_failed"     → content = reason                     ✅ Implemented
 ```
 
 All linked by `causal_chain_id`. All replayable. All auditable.
@@ -146,14 +147,14 @@ Plan v2: [A → B' → C → D]    revision_of = v1
 Plan v3: [A → B' → C → E → D]  revision_of = v2
 ```
 
-Every revision is queryable. Time-travel to any plan state.
+Every revision is queryable. Time-travel to any plan state. ✅ Revision events persisted via `Planner.log_plan_revised()`.
 
 ### Safety Boundaries
 
 ```python
 PlanConstraints = {
-    max_steps: 20,           # No runaway plans
-    max_revisions: 5,        # Don't revise forever
+    max_steps: 20,           # No runaway plans          ✅ Enforced
+    max_revisions: 5,        # Don't revise forever      ✅ Enforced (was reading from llm.config)
     max_cost_budget: 10.0,   # Dollar limit
     requires_approval: [...], # Skills needing human OK
     timeout_minutes: 30,     # Wall-clock limit
@@ -163,7 +164,7 @@ PlanConstraints = {
 
 ### Cross-Session Plans
 
-Long-horizon goals persist in the database:
+Long-horizon goals persist in the database. ✅ Implemented via `restore_plan_from_events()`:
 
 ```sql
 -- Resume a long-running plan
