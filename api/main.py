@@ -108,7 +108,11 @@ app.include_router(replay.router, tags=["replay"])
 app.include_router(skills.router, prefix="/skills", tags=["skills"])
 app.include_router(context.router, prefix="/context", tags=["context"])
 app.include_router(decisions.router, prefix="/decisions", tags=["decisions"])
-app.include_router(streaming.router, tags=["streaming"])
+app.include_router(streaming.router, tags=["streaming (deprecated)"])
+
+# Chat API — unified conversation entry point
+from api.routers import chat
+app.include_router(chat.router, tags=["chat"])
 
 # Learning service API
 from api.routers import learning

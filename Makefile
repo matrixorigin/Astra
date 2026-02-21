@@ -33,6 +33,7 @@ help:
 	@echo "  make test               - Run all tests"
 	@echo "  make test-unit          - Run unit tests"
 	@echo "  make test-integration   - Run integration tests"
+	@echo "  make test-api          - Run API integration tests"
 	@echo "  make test-e2e           - Run end-to-end tests"
 	@echo "  make test-runtime       - Run runtime tests (Docker, Firecracker)"
 	@echo ""
@@ -304,6 +305,11 @@ test-unit:
 test-integration:
 	@echo "Running integration tests..."
 	@python -m pytest tests/integration/ -v
+
+.PHONY: test-api
+test-api:
+	@echo "Running API integration tests..."
+	@python -m pytest tests/integration/api/ -v
 
 .PHONY: test-e2e
 test-e2e:

@@ -102,6 +102,10 @@ curl http://localhost:8000/health
 - `POST /auth/refresh` - Refresh access token
 - `GET /auth/me` - Get current user info
 
+### Chat
+- `POST /chat` - Send message, get response (auto-creates session if omitted)
+- `POST /chat/stream` - Stream chat response as SSE (auto-creates session if omitted)
+
 ### Agents
 - `POST /agents` - Create agent
 - `GET /agents` - List agents
