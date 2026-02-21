@@ -1283,58 +1283,69 @@ class ChatLoop:
         session_id: str | None = None,
         user_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Build the initial messages list, injecting context if available."""
-        messages: list[dict[str, Any]] = []
+        """Build messages with structured prompt composition.
 
-        system_parts = [
-            "You are a development assistant. Use the available tools to help the user."
-        ]
+        Layout (cache-friendly — stable prefix, dynamic suffix):
+          [STABLE]  §1 Role & capabilities  (cacheable across turns)
+          [STABLE]  §2 Constraints & format
+          [DYNAMIC] §3 Observations / prior context
+          [DYNAMIC] §4 Working memory (scratchpad)
+          [DYNAMIC] §5 Conversation history
+        """
+        # §1 Role — from DB prompt template or fallback
+        role = "You are a development assistant. Use the available tools to help the user."
+        if context and context.get("system_prompt"):
+            role = context["system_prompt"]
 
-        if context:
-            if context.get("system_prompt"):
-                system_parts = [context["system_prompt"]]
-            if context.get("selected_events"):
-                history_lines = []
-                for ev in context["selected_events"]:
-                    role = "User" if ev.get("event_type") == "user_query" else "Agent"
-                    history_lines.append(f"{role}: {ev.get('content', '')}")
-                if history_lines:
-                    system_parts.append("Recent conversation:\n" + "\n".join(history_lines))
+        # §2 Constraints (stable, always present)
+        constraints = (
+            "Rules:\n"
+            "- Think step-by-step before acting\n"
+            "- Verify changes before presenting\n"
+            "- If uncertain, say so rather than guess\n"
+            "- Prefer using tools over generating untested answers"
+        )
 
-        # Inject cross-session prior context
+        # Stable prefix (§1 + §2) — benefits from prompt caching
+        sections = [role, constraints]
+
+        # §3 Observations + prior context (semi-stable, changes across sessions)
         if self.continuity and session_id and user_id:
             prior = self.continuity.load_prior_context(
-                user_id=user_id,
-                current_session_id=session_id,
+                user_id=user_id, current_session_id=session_id,
             )
             section = prior.to_prompt_section()
             if section:
-                system_parts.append(section)
+                sections.append(section)
 
-        # Inject observational memory: replace observed messages with observations
-        # (done after full message assembly via build_context_with_observations)
-        # Observations are injected in system prompt here for the initial build;
-        # message replacement happens in the tool loop via observer.build_context_with_observations
         if self.observer and user_id:
             observations = self.observer.get_observations(user_id, session_id)
             obs_section = self.observer.format_for_context(observations)
             if obs_section:
-                system_parts.append(obs_section)
+                sections.append(obs_section)
 
-        # Inject active scratchpad notes into system prompt
+        # §4 Working memory (changes within session)
         if self.scratchpad and session_id:
             notes = self.scratchpad.get_active_notes(session_id)
             if notes:
-                note_lines = [
-                    f"[{n['note_type']}] {n['content']}" for n in notes
-                ]
-                system_parts.append(
+                note_lines = [f"[{n['note_type']}] {n['content']}" for n in notes]
+                sections.append(
                     "Working memory (your active notes):\n" + "\n---\n".join(note_lines)
                 )
 
-        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
-        messages.append({"role": "user", "content": user_input})
-        return messages
+        # §5 Conversation history (changes every turn)
+        if context and context.get("selected_events"):
+            history_lines = []
+            for ev in context["selected_events"]:
+                role_label = "User" if ev.get("event_type") == "user_query" else "Agent"
+                history_lines.append(f"{role_label}: {ev.get('content', '')}")
+            if history_lines:
+                sections.append("Recent conversation:\n" + "\n".join(history_lines))
+
+        return [
+            {"role": "system", "content": "\n\n".join(sections)},
+            {"role": "user", "content": user_input},
+        ]
 
     def set_observer(self, observer) -> None:
         """Attach an Observer for post-turn observation extraction."""

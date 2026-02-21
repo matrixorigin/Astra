@@ -154,11 +154,13 @@ class TestAgentScheduler:
 
     def test_get_model_recommendation_high_burn(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchone=Mock(return_value=(100.0, 95.0))  # High burn rate
-        )
-
         scheduler = AgentScheduler(db)
+        # High burn: spent 95 of 100, 12h remaining
+        # burn_rate = 95/(24-12)=7.9, target = 5/12=0.42 → downgrade
+        scheduler._get_budget_policy = Mock(return_value=BudgetPolicy(
+            scope_id="user-1", daily_budget=100.0, current_spend=95.0, remaining_hours=12.0,
+        ))
+
         model = scheduler.get_model_recommendation(
             scope_id="user-1",
             task_type="code_review",
@@ -170,11 +172,13 @@ class TestAgentScheduler:
 
     def test_get_model_recommendation_low_burn(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchone=Mock(return_value=(100.0, 10.0))  # Low burn rate
-        )
-
         scheduler = AgentScheduler(db)
+        # Low burn: spent 10 of 100, 12h remaining
+        # burn_rate = 10/(24-12)=0.83, target = 90/12=7.5 → no downgrade
+        scheduler._get_budget_policy = Mock(return_value=BudgetPolicy(
+            scope_id="user-1", daily_budget=100.0, current_spend=10.0, remaining_hours=12.0,
+        ))
+
         model = scheduler.get_model_recommendation(
             scope_id="user-1",
             task_type="code_review",

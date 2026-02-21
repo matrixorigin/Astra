@@ -122,9 +122,9 @@ class PromptManager:
     def _get_fallback_prompt(self, template_id: str) -> str:
         """Get hardcoded fallback prompt."""
         fallbacks = {
-            "system_code_review": "You are an expert code reviewer. Focus on code quality, security, and best practices.",
-            "system_planning": "You are a technical architect. Help plan and design solutions.",
-            "system_debugging": "You are a debugging expert. Help identify and fix issues.",
+            "system_code_review": "You are an expert code reviewer. Focus on correctness, security, performance, and maintainability.",
+            "system_planning": "You are a technical architect. Clarify requirements, identify trade-offs, propose solutions.",
+            "system_debugging": "You are a debugging expert. Reproduce, isolate, root-cause, fix, verify.",
             "system_general": "You are an intelligent development agent.",
         }
         return fallbacks.get(template_id, "You are a helpful AI assistant.")
