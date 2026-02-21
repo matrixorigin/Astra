@@ -567,3 +567,20 @@ class Trigger(Base):
     next_fire_at = Column(DateTime)  # next scheduled fire time
     is_active = Column(TINYINT(1), default=1)
     created_at = Column(DateTime, default=func.now())
+
+
+class ModelArtifact(Base):
+    """Trained model artifacts with versioning and lifecycle."""
+    __tablename__ = "model_artifacts"
+    artifact_id = Column(String(36), primary_key=True)
+    model_name = Column(String(128), nullable=False, index=True)  # e.g. "feedback_classifier"
+    version = Column(String(32), nullable=False)  # semver: "1.0.0"
+    base_model = Column(String(128))  # e.g. "bert-base-multilingual-cased"
+    artifact_path = Column(Text, nullable=False)  # local path or s3:// URI
+    artifact_format = Column(String(32), default="onnx")  # onnx | pytorch | safetensors
+    metrics = Column(JSON)  # {"accuracy": 0.87, "f1": 0.85, "val_loss": 0.32}
+    training_config = Column(JSON)  # {"epochs": 5, "lr": 2e-5, "batch_size": 16}
+    dataset_size = Column(Integer)  # number of training samples
+    is_active = Column(TINYINT(1), default=0, index=True)  # only 1 active per model_name
+    created_by = Column(String(36))
+    created_at = Column(DateTime, default=func.now())

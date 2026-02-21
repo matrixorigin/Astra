@@ -483,6 +483,221 @@ def prompt_mine_feedback(session_id, use_llm):
     click.echo(f"✅ Stored {count} feedback records")
 
 
+@cli.group()
+def feedback():
+    """Manage feedback data for model training."""
+    pass
+
+
+@feedback.command("export")
+@click.option("--output", "-o", required=True, help="Output file path (.jsonl)")
+@click.option("--min-confidence", default=0.5, help="Minimum confidence threshold")
+@click.option("--limit", default=None, type=int, help="Max records to export")
+@click.pass_context
+def feedback_export(ctx, output, min_confidence, limit):
+    """Export labeled feedback data for classifier training.
+
+    Joins llm_feedback + conversation_events to produce training triples:
+    (user_query, agent_response, followup_query) → signal_type
+    """
+    import json as _json
+    from sqlalchemy import text
+
+    db = ctx.obj["db"]
+
+    # Query: feedback records joined with conversation events to get the triple
+    sql = """
+        SELECT
+            f.feedback_id,
+            f.llm_request_id AS event_id,
+            f.rating,
+            f.comment,
+            f.feedback_metadata AS meta,
+            e.content AS agent_response,
+            e.session_id,
+            e.parent_event_id,
+            e.created_at
+        FROM llm_feedback f
+        JOIN conversation_events e ON f.llm_request_id = e.event_id
+        ORDER BY e.created_at DESC
+    """
+    params = {}
+    if limit:
+        sql += " LIMIT :lim"
+        params["lim"] = int(limit)
+
+    rows = db.execute(text(sql), params).fetchall()
+    if not rows:
+        click.echo("No feedback records found.")
+        return
+
+    # For each feedback record, find the user query (parent) and followup
+    exported = []
+    for row in rows:
+        event_id = row[1]
+        rating = row[2]
+        comment = row[3] or ""
+        meta = row[4] if row[4] else {}
+        agent_response = row[5]
+        session_id = row[6]
+        parent_event_id = row[7]
+
+        if isinstance(meta, str):
+            try:
+                meta = _json.loads(meta)
+            except (ValueError, _json.JSONDecodeError):
+                meta = {}
+
+        # Parse signal_type from comment: "[implicit:correction] ..."
+        signal_type = "neutral"
+        confidence = float(meta.get("confidence", "0.5")) if meta else 0.5
+        if comment.startswith("[implicit:") and "]" in comment:
+            signal_type = comment[10:comment.index("]")]
+
+        if confidence < min_confidence:
+            continue
+
+        # Get user query (parent event)
+        user_query = ""
+        if parent_event_id:
+            parent = db.execute(text(
+                "SELECT content FROM conversation_events WHERE event_id = :eid"
+            ), {"eid": parent_event_id}).fetchone()
+            if parent:
+                user_query = parent[0]
+
+        # Get followup (next user event in same session after this agent response)
+        followup_row = db.execute(text("""
+            SELECT content FROM conversation_events
+            WHERE session_id = :sid AND event_type = 'user_query'
+              AND created_at > (SELECT created_at FROM conversation_events WHERE event_id = :eid)
+            ORDER BY created_at ASC LIMIT 1
+        """), {"sid": session_id, "eid": event_id}).fetchone()
+        followup = followup_row[0] if followup_row else ""
+
+        # Determine source weight
+        source = meta.get("source", "heuristic") if meta else "heuristic"
+        weight_map = {"implicit_mining_llm": 1.0, "explicit": 0.9, "implicit_mining": 0.7, "heuristic": 0.7}
+        weight = weight_map.get(source, 0.7)
+
+        exported.append({
+            "user_query": user_query[:2000],
+            "agent_response": agent_response[:2000],
+            "followup": followup[:2000],
+            "label": signal_type,
+            "confidence": confidence,
+            "weight": weight,
+            "source": source,
+            "rating": rating,
+        })
+
+    # Write JSONL
+    with open(output, "w") as f:
+        for record in exported:
+            f.write(_json.dumps(record, ensure_ascii=False) + "\n")
+
+    click.echo(f"✅ Exported {len(exported)} records to {output}")
+
+    # Stats
+    from collections import Counter
+    label_counts = Counter(r["label"] for r in exported)
+    for label, count in label_counts.most_common():
+        click.echo(f"  {label}: {count}")
+
+
+@feedback.command("stats")
+@click.pass_context
+def feedback_stats(ctx):
+    """Show feedback data statistics."""
+    from sqlalchemy import text
+
+    db = ctx.obj["db"]
+    total = db.execute(text("SELECT COUNT(*) FROM llm_feedback")).fetchone()[0]
+    click.echo(f"Total feedback records: {total}")
+
+    if total == 0:
+        return
+
+    rows = db.execute(text("""
+        SELECT
+            CASE WHEN comment LIKE '[implicit:%' THEN 'implicit' ELSE 'explicit' END AS source,
+            COUNT(*) AS cnt
+        FROM llm_feedback GROUP BY source
+    """)).fetchall()
+    for row in rows:
+        click.echo(f"  {row[0]}: {row[1]}")
+
+
+@feedback.command("check")
+@click.pass_context
+def feedback_check(ctx):
+    """Check if retraining is needed."""
+    from core.models.retraining_monitor import RetrainingMonitor
+
+    db = ctx.obj["db"]
+    monitor = RetrainingMonitor(db)
+    result = monitor.should_retrain()
+
+    if result["needed"]:
+        click.echo(f"🔄 Retraining needed: {result['reason']}")
+    else:
+        click.echo(f"✅ No retraining needed: {result['reason']}")
+
+    stats = result.get("stats", {})
+    for k, v in stats.items():
+        click.echo(f"  {k}: {v}")
+
+
+@feedback.command("retrain")
+@click.option("--force", is_flag=True, help="Force retrain even if not needed")
+@click.option("--dry-run", is_flag=True, help="Check only, don't actually train")
+@click.option("--export-path", default="/tmp/feedback_train.jsonl", help="Temp export path")
+@click.pass_context
+def feedback_retrain(ctx, force, dry_run, export_path):
+    """Retrain feedback classifier if needed."""
+    from core.models.retraining_monitor import RetrainingMonitor
+
+    db = ctx.obj["db"]
+    monitor = RetrainingMonitor(db)
+    check = monitor.should_retrain()
+
+    if not check["needed"] and not force:
+        click.echo(f"✅ No retraining needed: {check['reason']}")
+        click.echo("Use --force to retrain anyway.")
+        return
+
+    click.echo(f"🔄 Retraining triggered: {check['reason']}")
+    stats = check.get("stats", {})
+    click.echo(f"  Feedback records: {stats.get('feedback_count', '?')}")
+
+    if dry_run:
+        click.echo("🏁 Dry run — would retrain here.")
+        return
+
+    # 1. Export data
+    click.echo(f"📦 Exporting training data to {export_path}...")
+    ctx.invoke(feedback_export, output=export_path, min_confidence=0.5, limit=None)
+
+    # 2. Train via skill
+    click.echo("🚀 Starting training (this may take a while)...")
+    import asyncio
+    from skills.feedback_trainer.skill import FeedbackTrainerSkill, TrainerInput
+
+    skill = FeedbackTrainerSkill(db=db)
+    inp = TrainerInput(dataset_path=export_path)
+    result = asyncio.run(skill.execute(inp))
+
+    if result.success:
+        click.echo(f"✅ Training complete!")
+        click.echo(f"  Artifact: {result.artifact_id}")
+        click.echo(f"  Model: {result.model_path}")
+        if result.metrics:
+            for k, v in result.metrics.items():
+                click.echo(f"  {k}: {v}")
+    else:
+        click.echo(f"❌ Training failed: {result.error}")
+
+
 @cli.command()
 @click.option("--reset", is_flag=True, help="Drop and recreate database")
 def init(reset):
