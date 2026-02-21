@@ -24,6 +24,8 @@ class ChangeType(str, Enum):
     SKILL = "skill"
     CONFIG = "config"
     SELECTOR = "selector"
+    CONTEXT_BUDGET = "context_budget"
+    KNOWLEDGE = "knowledge"
 
 
 class RegressionGate:
@@ -247,6 +249,38 @@ class RegressionGate:
                 """), {
                     "value": str(change_content),
                 })
+
+            elif change_type == ChangeType.CONTEXT_BUDGET:
+                # Update context budget ratios in sandbox
+                self.db.execute(text(f"""
+                    INSERT INTO {sandbox_name}.configs (key_name, value, updated_at)
+                    VALUES ('context_budget_ratios', :value, NOW())
+                    ON DUPLICATE KEY UPDATE value = :value, updated_at = NOW()
+                """), {
+                    "value": str(change_content),
+                })
+
+            elif change_type == ChangeType.KNOWLEDGE:
+                # Apply knowledge change (quarantine/restore) in sandbox
+                entry_id = change_content.get("entry_id")
+                if not entry_id:
+                    raise ValueError("KNOWLEDGE change requires entry_id")
+                action = change_content.get("action", "quarantine")
+                if action == "quarantine":
+                    self.db.execute(text(f"""
+                        UPDATE {sandbox_name}.knowledge_entries
+                        SET confidence = 0.0
+                        WHERE entry_id = :entry_id
+                    """), {"entry_id": entry_id})
+                elif action == "restore":
+                    self.db.execute(text(f"""
+                        UPDATE {sandbox_name}.knowledge_entries
+                        SET confidence = :confidence
+                        WHERE entry_id = :entry_id
+                    """), {
+                        "entry_id": entry_id,
+                        "confidence": change_content.get("confidence", 0.8),
+                    })
             
             self.db.commit()
             logger.info(f"Applied {change_type} change {change_id} to sandbox {sandbox_name}")

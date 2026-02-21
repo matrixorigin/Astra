@@ -180,3 +180,44 @@ class TestDriftCorrector:
         report = corrector.confirm_and_correct(signals)
         assert len(report.confirmed) == 0
         assert len(report.corrections) == 0
+
+    def test_template_drift_triggers_prompt_optimization(self):
+        """Template-level drift should try prompt optimization before fallback."""
+        optimizer = Mock()
+        optimizer.optimize.return_value = Mock(activated=True, old_version="1.0", new_version="1.1")
+        db = Mock()
+        db.execute.return_value = Mock()
+        corrector = DriftCorrector(db=db, prompt_optimizer=optimizer)
+        sig = _signal(current_avg=3.0, previous_avg=4.0, template_id="system_general")
+        correction = corrector._correct(sig)
+        assert correction["action"] == CorrectionAction.OPTIMIZE_PROMPT.value
+        optimizer.optimize.assert_called_once_with(template_id="system_general", min_cases=2)
+
+    def test_prompt_optimization_failure_falls_through_to_fallback(self):
+        """If prompt optimization fails, should try model fallback."""
+        optimizer = Mock()
+        optimizer.optimize.return_value = Mock(activated=False)
+        router = Mock()
+        router.get.return_value = Mock(fallback_to="gpt-3.5", is_active=True)
+        db = Mock()
+        db.execute.return_value = Mock()
+        corrector = DriftCorrector(db=db, prompt_optimizer=optimizer, router=router)
+        sig = _signal(current_avg=3.0, previous_avg=4.0, template_id="system_general")
+        correction = corrector._correct(sig)
+        assert correction["action"] == CorrectionAction.FALLBACK_MODEL.value
+
+    def test_no_template_id_skips_prompt_optimization(self):
+        """Model-level drift (no template_id) should not try prompt optimization."""
+        optimizer = Mock()
+        router = Mock()
+        router.get.return_value = Mock(fallback_to="gpt-3.5", is_active=True)
+        db = Mock()
+        db.execute.return_value = Mock()
+        corrector = DriftCorrector(db=db, prompt_optimizer=optimizer, router=router)
+        sig = _signal(current_avg=3.0, previous_avg=4.0, template_id=None)
+        correction = corrector._correct(sig)
+        optimizer.optimize.assert_not_called()
+        assert correction["action"] == CorrectionAction.FALLBACK_MODEL.value
+
+    def test_optimize_prompt_in_correction_action_enum(self):
+        assert CorrectionAction.OPTIMIZE_PROMPT.value == "optimize_prompt"

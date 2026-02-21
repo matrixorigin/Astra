@@ -624,3 +624,123 @@ class TestSandboxCleanup:
         # Verify sandbox was created and deleted
         mock_sandbox.create.assert_called_once()
         mock_sandbox.delete.assert_called_once()
+
+
+class TestNewChangeTypes:
+    """Tests for CONTEXT_BUDGET and KNOWLEDGE change types."""
+
+    def test_change_type_context_budget_exists(self):
+        assert ChangeType.CONTEXT_BUDGET.value == "context_budget"
+
+    def test_change_type_knowledge_exists(self):
+        assert ChangeType.KNOWLEDGE.value == "knowledge"
+
+    def test_apply_context_budget_to_sandbox(self, gate, setup_tables):
+        """CONTEXT_BUDGET change should execute upsert SQL."""
+        gate_mock = RegressionGate.__new__(RegressionGate)
+        gate_mock.db = Mock()
+        gate_mock.db.execute = Mock()
+        gate_mock.db.commit = Mock()
+        gate_mock._apply_change_to_sandbox(
+            sandbox_name="test_sb",
+            change_type=ChangeType.CONTEXT_BUDGET,
+            change_id="context_budget_ratios",
+            change_content={"debugging": {"logs": 0.50}},
+        )
+        # Verify execute was called with the right SQL pattern
+        call_args = gate_mock.db.execute.call_args
+        sql_text = call_args[0][0].text
+        assert "context_budget_ratios" in sql_text
+        assert "test_sb.configs" in sql_text
+
+    def test_apply_knowledge_quarantine_to_sandbox(self, gate, setup_tables):
+        """KNOWLEDGE quarantine should set confidence=0."""
+        gate_mock = RegressionGate.__new__(RegressionGate)
+        gate_mock.db = Mock()
+        gate_mock.db.execute = Mock()
+        gate_mock.db.commit = Mock()
+        gate_mock._apply_change_to_sandbox(
+            sandbox_name="test_sb",
+            change_type=ChangeType.KNOWLEDGE,
+            change_id="quarantine_entry123",
+            change_content={"entry_id": "entry123", "action": "quarantine"},
+        )
+        sql_text = gate_mock.db.execute.call_args[0][0].text
+        assert "confidence = 0.0" in sql_text
+        assert "test_sb.knowledge_entries" in sql_text
+
+    def test_apply_knowledge_restore_to_sandbox(self, gate, setup_tables):
+        """KNOWLEDGE restore should set confidence to specified value."""
+        gate_mock = RegressionGate.__new__(RegressionGate)
+        gate_mock.db = Mock()
+        gate_mock.db.execute = Mock()
+        gate_mock.db.commit = Mock()
+        gate_mock._apply_change_to_sandbox(
+            sandbox_name="test_sb",
+            change_type=ChangeType.KNOWLEDGE,
+            change_id="restore_entry123",
+            change_content={"entry_id": "entry123", "action": "restore", "confidence": 0.9},
+        )
+        sql_text = gate_mock.db.execute.call_args[0][0].text
+        assert "confidence = :confidence" in sql_text
+        params = gate_mock.db.execute.call_args[0][1]
+        assert params["confidence"] == 0.9
+
+    def test_apply_knowledge_missing_entry_id_raises(self, gate, setup_tables):
+        """KNOWLEDGE change without entry_id should raise ValueError."""
+        gate_mock = RegressionGate.__new__(RegressionGate)
+        gate_mock.db = Mock()
+        gate_mock.db.execute = Mock()
+        gate_mock.db.commit = Mock()
+        with pytest.raises(ValueError, match="entry_id"):
+            gate_mock._apply_change_to_sandbox(
+                sandbox_name="test_sb",
+                change_type=ChangeType.KNOWLEDGE,
+                change_id="bad",
+                change_content={"action": "quarantine"},
+            )
+
+
+class TestPollutionGatedQuarantine:
+    """Tests for PollutionDetector.quarantine_with_validation."""
+
+    def test_quarantine_with_gate_pass(self):
+        from core.context.pollution import PollutionDetector
+
+        db = Mock()
+        detector = PollutionDetector(db)
+        detector.quarantine_entry = Mock(return_value=True)
+
+        with patch("core.evaluation.regression_gate.RegressionGate") as MockGate:
+            MockGate.return_value.validate_change.return_value = {"verdict": "pass"}
+            result = detector.quarantine_with_validation("entry1", "high", "bad data")
+
+        assert result["verdict"] == "pass"
+        detector.quarantine_entry.assert_called_once_with("entry1", "high", "bad data")
+
+    def test_quarantine_with_gate_fail(self):
+        from core.context.pollution import PollutionDetector
+
+        db = Mock()
+        detector = PollutionDetector(db)
+        detector.quarantine_entry = Mock()
+
+        with patch("core.evaluation.regression_gate.RegressionGate") as MockGate:
+            MockGate.return_value.validate_change.return_value = {"verdict": "fail", "reason": "regression"}
+            result = detector.quarantine_with_validation("entry1", "high")
+
+        assert result["verdict"] == "fail"
+        detector.quarantine_entry.assert_not_called()
+
+    def test_quarantine_with_gate_unavailable(self):
+        from core.context.pollution import PollutionDetector
+
+        db = Mock()
+        detector = PollutionDetector(db)
+        detector.quarantine_entry = Mock(return_value=True)
+
+        with patch("core.evaluation.regression_gate.RegressionGate", side_effect=Exception("no gate")):
+            result = detector.quarantine_with_validation("entry1", "medium")
+
+        assert result["verdict"] == "skipped"
+        detector.quarantine_entry.assert_called_once()

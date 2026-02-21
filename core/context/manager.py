@@ -13,6 +13,7 @@ from typing import Any
 
 from core.exceptions import ContextError
 from core.logging_config import get_logger
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from api.database import get_db_session
 
@@ -225,11 +226,12 @@ class ContextManager:
 
         Returns dict of section → {allocated: int, used: int} per design §2.
         Fixed allocations: system 500, skills 1000, reserve 500.
+        Loads overrides from configs table if available (set by ContextBudgetTuner).
         """
         fixed_tokens = 500 + 1000 + 500  # system + skills + reserve
         available = max(0, total_tokens - fixed_tokens)
 
-        ratios = _BUDGET_RATIOS[task_type]
+        ratios = self._load_budget_ratios(task_type)
         budget: dict[str, dict[str, int]] = {
             "system":  {"allocated": 500,  "used": 0},
             "skills":  {"allocated": 1000, "used": 0},
@@ -238,6 +240,36 @@ class ContextManager:
         for section, ratio in ratios.items():
             budget[section] = {"allocated": int(available * ratio), "used": 0}
         return budget
+
+    _budget_cache: dict[str, Any] | None = None
+    _budget_cache_ts: float = 0.0
+    _BUDGET_CACHE_TTL: float = 60.0  # seconds
+
+    def _load_budget_ratios(self, task_type: TaskType) -> dict[str, float]:
+        """Load budget ratios, preferring DB overrides over hardcoded defaults."""
+        now = time.monotonic()
+        if self._budget_cache is not None and (now - self._budget_cache_ts) < self._BUDGET_CACHE_TTL:
+            if task_type.value in self._budget_cache:
+                return self._budget_cache[task_type.value]
+            return _BUDGET_RATIOS[task_type]
+
+        try:
+            import json
+            row = self.db.execute(
+                text("SELECT value FROM configs WHERE key_name = 'context_budget_ratios' LIMIT 1"),
+            ).first()
+            if row:
+                overrides = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                self._budget_cache = overrides
+                self._budget_cache_ts = now
+                if task_type.value in overrides:
+                    return overrides[task_type.value]
+            else:
+                self._budget_cache = {}
+                self._budget_cache_ts = now
+        except Exception as e:
+            logger.debug("Failed to load budget overrides, using defaults: %s", e)
+        return _BUDGET_RATIOS[task_type]
 
 
     def _retrieve_candidates(self, session_id: str, query: str) -> list[dict[str, Any]]:

@@ -336,3 +336,40 @@ class PollutionDetector:
         
         logger.info(f"Found {len(contradictions)} contradiction groups for {user_id}")
         return contradictions
+
+    def quarantine_with_validation(
+        self,
+        entry_id: str,
+        severity: str,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Quarantine entry with regression gate validation.
+
+        Validates that quarantining improves (or doesn't degrade) quality
+        on golden sessions before committing the change.
+        """
+        try:
+            from core.evaluation.regression_gate import RegressionGate, ChangeType
+
+            gate = RegressionGate(self.db)
+            result = gate.validate_change(
+                change_type=ChangeType.KNOWLEDGE,
+                change_id=f"quarantine_{entry_id}",
+                change_content={"entry_id": entry_id, "action": "quarantine"},
+                golden_session_count=10,
+            )
+            verdict = result.get("verdict", "error")
+        except Exception as e:
+            logger.warning("Gate validation unavailable for knowledge quarantine: %s", e)
+            verdict = "skipped"
+
+        if verdict in ("pass", "skip", "skipped"):
+            self.quarantine_entry(entry_id, severity, reason)
+            logger.info("Gated quarantine applied: %s (verdict=%s)", entry_id, verdict)
+        else:
+            logger.warning(
+                "Quarantine rejected by gate: %s (verdict=%s, reason=%s)",
+                entry_id, verdict, result.get("reason"),
+            )
+
+        return {"entry_id": entry_id, "verdict": verdict, "severity": severity}

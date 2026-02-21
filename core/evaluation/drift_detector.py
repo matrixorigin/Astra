@@ -33,6 +33,7 @@ class DriftSeverity(str, Enum):
 class CorrectionAction(str, Enum):
     NONE = "none"
     FALLBACK_MODEL = "fallback_model"
+    OPTIMIZE_PROMPT = "optimize_prompt"
     ESCALATE_HUMAN = "escalate_human"
 
 
@@ -178,10 +179,11 @@ class DriftCorrector:
     CONFIRM_REPLAY_COUNT = 20
     CONFIRM_THRESHOLD = -0.3  # confirmed if replay delta < this
 
-    def __init__(self, db: Session, regression_gate=None, router=None):
+    def __init__(self, db: Session, regression_gate=None, router=None, prompt_optimizer=None):
         self.db = db
         self.regression_gate = regression_gate
         self.router = router
+        self.prompt_optimizer = prompt_optimizer
 
     def confirm_and_correct(
         self, signals: list[DriftSignal],
@@ -227,16 +229,21 @@ class DriftCorrector:
             )
 
     def _correct(self, signal: DriftSignal) -> dict[str, Any]:
-        """Apply correction based on severity."""
+        """Apply correction based on severity and drift source.
+
+        Priority: template-level drift → prompt optimization first,
+        model-level drift → fallback model.
+        """
         action = CorrectionAction.NONE
 
-        if signal.severity == DriftSeverity.SEVERE:
-            action = self._apply_fallback(signal)
-        elif signal.severity == DriftSeverity.SIGNIFICANT:
-            action = self._apply_fallback(signal)
-        else:
-            # Mild — monitor only
-            action = CorrectionAction.NONE
+        if signal.severity in (DriftSeverity.SIGNIFICANT, DriftSeverity.SEVERE):
+            # Template-level drift: try prompt optimization before fallback
+            if signal.template_id and self.prompt_optimizer:
+                action = self._try_prompt_optimization(signal)
+
+            # If prompt optimization didn't help or not applicable, fallback model
+            if action in (CorrectionAction.NONE, CorrectionAction.ESCALATE_HUMAN):
+                action = self._apply_fallback(signal)
 
         return {
             "model": signal.model,
@@ -246,6 +253,26 @@ class DriftCorrector:
             "week_delta": signal.week_delta,
             "corrected_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    def _try_prompt_optimization(self, signal: DriftSignal) -> CorrectionAction:
+        """Attempt to fix template drift via prompt optimization."""
+        try:
+            result = self.prompt_optimizer.optimize(
+                template_id=signal.template_id,
+                min_cases=2,
+            )
+            if getattr(result, "activated", False):
+                logger.info(
+                    "Drift correction via prompt optimization: %s %s → %s",
+                    signal.template_id,
+                    getattr(result, "old_version", "?"),
+                    getattr(result, "new_version", "?"),
+                )
+                return CorrectionAction.OPTIMIZE_PROMPT
+            return CorrectionAction.NONE
+        except Exception as e:
+            logger.warning("Prompt optimization failed for %s: %s", signal.template_id, e)
+            return CorrectionAction.NONE
 
     def _apply_fallback(self, signal: DriftSignal) -> CorrectionAction:
         """Route affected model to its fallback."""
