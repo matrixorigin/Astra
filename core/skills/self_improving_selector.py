@@ -22,7 +22,6 @@ Target Improvements:
 """
 
 import json
-import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -33,17 +32,25 @@ from api.models import SkillSelectionEvent as EventModel, SkillSelectionLearning
 from core.context.embeddings import EmbeddingService
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
+from core.skills.learning_config import (
+    RUNTIME_CONFIG_TTL_SECONDS,
+    effective_confidence,
+    load_runtime_config,
+    resolve_weights_for_signal,
+)
 from core.skills.learning_signals import LearningSignal, SignalType, SignalWeights, SignalThresholds
+from core.skills.learning_similarity import (
+    context_matches,
+    embedding_to_vec_str,
+    extract_context_features,
+    l2_similarity,
+    normalize_confidence,
+    parse_embedding,
+    pattern_matches,
+    semantic_similarity_map,
+)
 
 logger = get_logger(__name__)
-
-CONFIG_KEY_LEARNING_WEIGHTS = "selector_learning_weights"
-CONFIG_KEY_LEARNING_DECAY = "selector_learning_decay"
-CONFIG_KEY_SEMANTIC_SIMILARITY = "selector_semantic_similarity_threshold"
-CONFIG_KEY_SEMANTIC_MATCH_LIMIT = "selector_semantic_match_limit"
-RUNTIME_CONFIG_TTL_SECONDS = 30
-SEMANTIC_SIMILARITY_THRESHOLD = 0.78
-SEMANTIC_MATCH_LIMIT = 50
 
 
 class SelfImprovingSelector:
@@ -98,6 +105,10 @@ class SelfImprovingSelector:
             self.session.execute(
                 text("ALTER TABLE skill_selection_learning ADD COLUMN context_features JSON")
             )
+        if "is_active" not in columns:
+            self.session.execute(
+                text("ALTER TABLE skill_selection_learning ADD COLUMN is_active TINYINT(1) DEFAULT 1")
+            )
         self.session.commit()
 
     def learn_from_failures(self, days: int = 7, signal_types: list[SignalType] | None = None) -> dict[str, Any]:
@@ -129,12 +140,28 @@ class SelfImprovingSelector:
                         signals_by_type[signal_type] += 1
             except Exception as e:
                 logger.error(f"Failed to learn from failure: {e}")
-        
+
+        if learned_count > 0:
+            self._persist_learning_updates()
+
         return {
             "learned": learned_count,
             "total_failures": len(failures),
             "signals_by_type": {k.value: v for k, v in signals_by_type.items()},
         }
+
+    def rollback_learnings(self, learning_ids: list[str] | None = None, since: datetime | None = None) -> int:
+        """Soft-delete learnings by ID list or creation time. Returns count deactivated."""
+        query = self.session.query(LearningModel).filter(LearningModel.is_active == 1)
+        if learning_ids:
+            query = query.filter(LearningModel.learning_id.in_(learning_ids))
+        elif since:
+            query = query.filter(LearningModel.created_at >= since)
+        else:
+            return 0
+        count = query.update({"is_active": 0}, synchronize_session="fetch")
+        self._persist_learning_updates()
+        return count
 
     def get_recent_failures(self, days: int = 7, limit: int = 10) -> list[dict]:
         """Get recent events with any learning signal (not just wrong_skill).
@@ -237,7 +264,7 @@ class SelfImprovingSelector:
         """
         query = failure["user_query"][:255]
         selected = failure.get("selected_skills", [])
-        context_features = self._extract_context_features_from_query(query)
+        context_features = extract_context_features(query)
         
         if signal_type == SignalType.WRONG_SKILL:
             correction = failure.get("correction_suggestion")
@@ -294,7 +321,7 @@ class SelfImprovingSelector:
         return None
 
     def _update_learnings(self, signal: LearningSignal):
-        """Update learning database with new signal."""
+        """Update learning database with new signal (no commit — caller batches)."""
         # Check if similar learning exists
         existing = self.session.query(LearningModel).filter(
             LearningModel.query_pattern == signal.query_pattern,
@@ -336,8 +363,6 @@ class SelfImprovingSelector:
                 context_features=signal.context_features,
             )
             self.session.add(learning)
-        
-        self._persist_learning_updates()
 
     def apply_learnings(self, query: str, candidates: list) -> list:
         """Apply learned corrections to candidate selection with multi-dimensional scoring."""
@@ -347,7 +372,7 @@ class SelfImprovingSelector:
             return candidates
 
         query_lower = query.lower()
-        query_features = self._extract_context_features_from_query(query)
+        query_features = extract_context_features(query)
         query_embedding = self._embed_query(query)
 
         runtime_config = self._load_runtime_config()
@@ -356,12 +381,14 @@ class SelfImprovingSelector:
         decay = runtime_config["decay"]
         similarity_threshold = runtime_config["semantic_similarity_threshold"]
 
-        similarity_map = self._semantic_similarity_map(
+        similarity_map = semantic_similarity_map(self.session, 
             query_embedding,
             similarity_threshold,
             runtime_config["semantic_match_limit"],
         )
-        learnings = self.session.query(LearningModel).all()
+        learnings = self.session.query(LearningModel).filter(
+            LearningModel.is_active == 1
+        ).all()
         matched = []
         semantic_matches = 0
         substring_matches = 0
@@ -372,21 +399,21 @@ class SelfImprovingSelector:
                 self._effective_confidence(learning, decay, learning.signal_type)
             ):
                 continue
-            if not self._context_matches(learning.context_features, query_features):
+            if not context_matches(learning.context_features, query_features):
                 continue
             similarity = None
             if similarity_map is not None:
                 if learning.learning_id in similarity_map:
                     similarity = similarity_map[learning.learning_id]
             else:
-                learning_embedding = self._parse_embedding(learning.query_embedding)
+                learning_embedding = parse_embedding(learning.query_embedding)
                 if query_embedding is not None and learning_embedding is not None:
-                    similarity = self._l2_similarity(query_embedding, learning_embedding)
+                    similarity = l2_similarity(query_embedding, learning_embedding)
             if similarity is not None and similarity >= similarity_threshold:
                 matched.append((learning, similarity))
                 semantic_matches += 1
                 continue
-            if learning.query_pattern.lower() in query_lower:
+            if pattern_matches(learning.query_pattern.lower(), query_lower):
                 matched.append((learning, 1.0))
                 substring_matches += 1
 
@@ -484,130 +511,8 @@ class SelfImprovingSelector:
             logger.warning(f"Embedding generation failed: {exc}")
             return None
 
-    def _embedding_to_vec_str(self, embedding: list[float] | None) -> str | None:
-        if not embedding:
-            return None
-        vector = [float(value) for value in embedding]
-        return json.dumps(vector, separators=(",", ":"))
-
-    def _semantic_similarity_map(
-        self, query_embedding: list[float] | None, threshold: float, limit: int | None = None
-    ) -> dict[str, float] | None:
-        if query_embedding is None:
-            return None
-        if not hasattr(self.session, "bind") or self.session.bind is None:
-            return None
-        # Convert list to string format for L2_DISTANCE: [1.0,2.0,3.0]
-        vec_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
-        from sqlalchemy import text
-        if limit is None:
-            limit = SEMANTIC_MATCH_LIMIT
-        try:
-            rows = self.session.execute(
-                text(
-                    """
-                    SELECT
-                        learning_id,
-                        similarity
-                    FROM (
-                        SELECT
-                            learning_id,
-                            1.0 / (1.0 + L2_DISTANCE(query_embedding, :vec)) AS similarity
-                        FROM skill_selection_learning
-                        WHERE query_embedding IS NOT NULL
-                    ) ranked
-                    WHERE similarity >= :threshold
-                    ORDER BY similarity DESC
-                    LIMIT :limit
-                    """
-                ),
-                {"vec": vec_str, "limit": limit, "threshold": threshold},
-            ).fetchall()
-        except Exception as exc:
-            logger.warning(f"Semantic similarity SQL failed: {exc}")
-            return None
-        similarity_map = {
-            str(row.learning_id): float(row.similarity)
-            for row in rows
-            if row.similarity is not None  # Protect against NULL values
-        }
-        if not similarity_map:
-            return None
-        return similarity_map
-
-    def _l2_similarity(self, left: list[float], right: list[float]) -> float:
-        if not left or not right:
-            return 0.0
-        if len(left) != len(right):
-            return 0.0
-        distance = 0.0
-        for i in range(len(left)):
-            diff = float(left[i]) - float(right[i])
-            distance += diff * diff
-        distance = math.sqrt(distance)
-        return 1.0 / (1.0 + distance)
-
-    def _parse_embedding(self, value: Any) -> list[float] | None:
-        if value is None:
-            return None
-        if isinstance(value, list):
-            return value
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError:
-                return None
-            if isinstance(parsed, list):
-                return parsed
-        return None
-
-    def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
-        if not left or not right:
-            return 0.0
-        if len(left) != len(right):
-            return 0.0
-        dot = 0.0
-        left_norm = 0.0
-        right_norm = 0.0
-        for i in range(len(left)):
-            lval = float(left[i])
-            rval = float(right[i])
-            dot += lval * rval
-            left_norm += lval * lval
-            right_norm += rval * rval
-        denom = math.sqrt(left_norm) * math.sqrt(right_norm)
-        if denom == 0:
-            return 0.0
-        return dot / denom
-
-    def _extract_context_features_from_query(self, query: str) -> dict[str, Any]:
-        length = len(query)
-        if length <= 50:
-            length_bucket = "short"
-        elif length <= 200:
-            length_bucket = "medium"
-        else:
-            length_bucket = "long"
-        contains_code = "```" in query or "def " in query or "class " in query or ";" in query
-        return {
-            "length_bucket": length_bucket,
-            "contains_code": contains_code,
-        }
-
-    def _context_matches(self, learning_features: dict[str, Any] | None, query_features: dict[str, Any]) -> bool:
-        if not learning_features:
-            return True
-        for key, value in learning_features.items():
-            if query_features.get(key) != value:
-                return False
-        return True
-
     def _normalize_confidence(self, value: float | None) -> float:
-        if value is None:
-            return 0.0
-        if value <= 1.0:
-            return max(0.0, float(value))
-        return min(1.0, float(value) / 100.0)
+        return normalize_confidence(value)
 
     def _persist_learning_updates(self) -> None:
         try:
@@ -639,11 +544,7 @@ class SelfImprovingSelector:
     ) -> float:
         active_weights = weights or self.weights
         if per_signal is not None:
-            active_weights = self._resolve_weights_for_signal(
-                signal_type,
-                active_weights,
-                per_signal,
-            )
+            active_weights = resolve_weights_for_signal(signal_type, active_weights, per_signal)
         if signal_type == SignalType.SLOW_EXECUTION.value:
             return active_weights.speed
         if signal_type == SignalType.HIGH_COST.value:
@@ -761,222 +662,18 @@ class SelfImprovingSelector:
         }
 
     def _load_runtime_config(self) -> dict[str, Any]:
-        now = datetime.now(timezone.utc)
-        if self._runtime_config_cache and self._runtime_config_loaded_at:
-            cache_age = (now - self._runtime_config_loaded_at).total_seconds()
-            if cache_age < self._runtime_config_ttl_seconds:
-                from api.models import Config
-                from sqlalchemy import func
-
-                latest_updated_at = (
-                    self.session.query(func.max(Config.updated_at))
-                    .filter(
-                        Config.key_name.in_(
-                            [
-                                CONFIG_KEY_LEARNING_WEIGHTS,
-                                CONFIG_KEY_LEARNING_DECAY,
-                                CONFIG_KEY_SEMANTIC_SIMILARITY,
-                                CONFIG_KEY_SEMANTIC_MATCH_LIMIT,
-                            ]
-                        )
-                    )
-                    .scalar()
-                )
-                if (
-                    (latest_updated_at is None and self._runtime_config_last_updated_at is None)
-                    or (
-                        latest_updated_at
-                        and self._runtime_config_last_updated_at
-                        and latest_updated_at <= self._runtime_config_last_updated_at
-                    )
-                ):
-                    return self._runtime_config_cache
-
-        weights = self.weights
-        per_signal_weights: dict[str, Any] = {}
-        decay = {
-            "enabled": False,
-            "half_life_days": 0.0,
-            "min_confidence": 0.0,
-            "per_signal": {},
-        }
-        semantic_similarity_threshold = SEMANTIC_SIMILARITY_THRESHOLD
-        semantic_match_limit = SEMANTIC_MATCH_LIMIT
-
-        from api.models import Config
-
-        configs = (
-            self.session.query(Config)
-            .filter(
-                Config.key_name.in_(
-                    [
-                        CONFIG_KEY_LEARNING_WEIGHTS,
-                        CONFIG_KEY_LEARNING_DECAY,
-                        CONFIG_KEY_SEMANTIC_SIMILARITY,
-                        CONFIG_KEY_SEMANTIC_MATCH_LIMIT,
-                    ]
-                )
-            )
-            .all()
+        result, loaded_at, last_updated = load_runtime_config(
+            self.session,
+            self.weights,
+            cache=self._runtime_config_cache,
+            cache_loaded_at=self._runtime_config_loaded_at,
+            cache_last_updated_at=self._runtime_config_last_updated_at,
+            ttl_seconds=self._runtime_config_ttl_seconds,
         )
-        latest_updated_at = None
-        for cfg in configs:
-            if cfg.updated_at and (latest_updated_at is None or cfg.updated_at > latest_updated_at):
-                latest_updated_at = cfg.updated_at
-            if cfg.key_name == CONFIG_KEY_LEARNING_WEIGHTS:
-                parsed = self._parse_json_config(cfg.value)
-                if isinstance(parsed, dict):
-                    per_signal_weights = self._sanitize_per_signal_weights(
-                        parsed.get("per_signal", {}) or {}
-                    )
-                weights = self._merge_weights(weights, parsed)
-            elif cfg.key_name == CONFIG_KEY_LEARNING_DECAY:
-                parsed = self._parse_json_config(cfg.value)
-                if isinstance(parsed, dict):
-                    decay = {
-                        "enabled": bool(parsed.get("enabled", False)),
-                        "half_life_days": float(parsed.get("half_life_days", 0.0) or 0.0),
-                        "min_confidence": float(parsed.get("min_confidence", 0.0) or 0.0),
-                        "per_signal": parsed.get("per_signal", {}) or {},
-                    }
-            elif cfg.key_name == CONFIG_KEY_SEMANTIC_SIMILARITY:
-                parsed = self._parse_json_config(cfg.value)
-                if isinstance(parsed, dict) and "threshold" in parsed:
-                    semantic_similarity_threshold = float(parsed["threshold"])
-                elif isinstance(parsed, (int, float, str)):
-                    semantic_similarity_threshold = float(parsed)
-            elif cfg.key_name == CONFIG_KEY_SEMANTIC_MATCH_LIMIT:
-                parsed = self._parse_json_config(cfg.value)
-                if isinstance(parsed, dict) and "limit" in parsed:
-                    semantic_match_limit = int(parsed["limit"])
-                elif isinstance(parsed, (int, float, str)):
-                    semantic_match_limit = int(float(parsed))
+        self._runtime_config_cache = result
+        self._runtime_config_loaded_at = loaded_at
+        self._runtime_config_last_updated_at = last_updated
+        return result
 
-        self._runtime_config_cache = {
-            "weights": weights,
-            "weights_per_signal": per_signal_weights,
-            "decay": decay,
-            "semantic_similarity_threshold": semantic_similarity_threshold,
-            "semantic_match_limit": semantic_match_limit,
-        }
-        self._runtime_config_loaded_at = now
-        self._runtime_config_last_updated_at = latest_updated_at
-        return self._runtime_config_cache
-
-    def _parse_json_config(self, raw: str | None) -> Any:
-        if not raw:
-            return None
-        try:
-            return json.loads(raw)
-        except Exception:
-            logger.warning("Failed to parse selector runtime config, using defaults")
-            return None
-
-    def _merge_weights(self, base: SignalWeights, override: Any) -> SignalWeights:
-        if not isinstance(override, dict):
-            return base
-        merged = base.to_dict()
-        for key in ["accuracy", "speed", "cost", "satisfaction"]:
-            if key in override:
-                merged[key] = float(override[key])
-        try:
-            return SignalWeights(**merged)
-        except (TypeError, ValueError):
-            logger.warning("Invalid selector_learning_weights, using defaults")
-            return base
-
-    def _sanitize_per_signal_weights(self, per_signal: Any) -> dict[str, dict[str, float]]:
-        if not isinstance(per_signal, dict):
-            logger.warning("Invalid selector_learning_weights per_signal, using defaults")
-            return {}
-        valid_signals = {st.value for st in SignalType}
-        allowed_keys = {"accuracy", "speed", "cost", "satisfaction"}
-        sanitized: dict[str, dict[str, float]] = {}
-        for signal_type, override in per_signal.items():
-            if signal_type not in valid_signals:
-                logger.warning("Unknown signal_type in per_signal weights, skipping")
-                continue
-            if not isinstance(override, dict):
-                logger.warning("Invalid per_signal override for signal_type, skipping")
-                continue
-            cleaned: dict[str, float] = {}
-            for key, value in override.items():
-                if key not in allowed_keys:
-                    logger.warning("Invalid weight key in per_signal override, skipping")
-                    continue
-                try:
-                    cleaned[key] = float(value)
-                except (TypeError, ValueError):
-                    logger.warning("Invalid weight value in per_signal override, skipping")
-            if cleaned:
-                sanitized[signal_type] = cleaned
-        return sanitized
-
-    def _effective_confidence(
-        self,
-        learning: LearningModel,
-        decay: dict[str, Any],
-        signal_type: str | None,
-    ) -> float:
-        normalized = self._normalize_confidence(learning.confidence)
-        decay_config = self._resolve_decay_config(decay, signal_type)
-        if not decay_config.get("enabled") or not decay_config.get("half_life_days"):
-            return normalized
-        reference = learning.updated_at or learning.created_at
-        if not reference:
-            return normalized
-        if reference.tzinfo is None:
-            reference = reference.replace(tzinfo=timezone.utc)
-        age_days = (datetime.now(timezone.utc) - reference).total_seconds() / 86400.0
-        factor = 0.5 ** (age_days / float(decay_config["half_life_days"]))
-        decayed = normalized * factor
-        min_confidence = float(decay_config.get("min_confidence", 0.0) or 0.0)
-        decayed = max(min_confidence, decayed)
-        return min(normalized, decayed)
-
-    def _resolve_weights_for_signal(
-        self,
-        signal_type: str | None,
-        base: SignalWeights,
-        per_signal: dict[str, Any],
-    ) -> SignalWeights:
-        if not signal_type:
-            return base
-        override = per_signal.get(signal_type)
-        if not isinstance(override, dict):
-            return base
-        merged = base.to_dict()
-        for key in ["accuracy", "speed", "cost", "satisfaction"]:
-            if key in override:
-                merged[key] = float(override[key])
-        total = sum(merged.values())
-        if total <= 0:
-            return base
-        if abs(total - 1.0) > 0.01:
-            merged = {key: value / total for key, value in merged.items()}
-        try:
-            return SignalWeights(**merged)
-        except (TypeError, ValueError):
-            logger.warning("Invalid selector_learning_weights per_signal override, using defaults")
-            return base
-
-    def _resolve_decay_config(self, decay: dict[str, Any], signal_type: str | None) -> dict[str, Any]:
-        base = {
-            "enabled": bool(decay.get("enabled", False)),
-            "half_life_days": float(decay.get("half_life_days", 0.0) or 0.0),
-            "min_confidence": float(decay.get("min_confidence", 0.0) or 0.0),
-        }
-        if not signal_type:
-            return base
-        per_signal = decay.get("per_signal") or {}
-        override = per_signal.get(signal_type)
-        if not isinstance(override, dict):
-            return base
-        merged = base.copy()
-        if "enabled" in override:
-            merged["enabled"] = bool(override["enabled"])
-        if "half_life_days" in override:
-            merged["half_life_days"] = float(override["half_life_days"] or 0.0)
-        if "min_confidence" in override:
-            merged["min_confidence"] = float(override["min_confidence"] or 0.0)
-        return merged
+    def _effective_confidence(self, learning, decay: dict[str, Any], signal_type: str | None) -> float:
+        return effective_confidence(learning, decay, signal_type)

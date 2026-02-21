@@ -383,6 +383,7 @@ class SkillSelectionLearning(Base):
     signal_type = Column(String(50), default="wrong_skill", index=True)
     target_metrics = Column(JSON)  # {"time_ms": 500, "cost": 0.01, "satisfaction": 4}
     context_features = Column(JSON)  # Context features for better matching
+    is_active = Column(TINYINT(1), default=1, index=True)  # Soft-delete for rollback
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

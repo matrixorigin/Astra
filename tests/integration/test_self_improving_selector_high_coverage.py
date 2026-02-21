@@ -7,6 +7,10 @@ from sqlalchemy import text
 
 from core.skills.self_improving_selector import SelfImprovingSelector
 from core.skills.learning_signals import SignalType, SignalWeights, SignalThresholds, LearningSignal
+from core.skills.learning_similarity import (
+    embedding_to_vec_str, extract_context_features, l2_similarity,
+    normalize_confidence, parse_embedding,
+)
 from api.models import SkillSelectionEvent, SkillSelectionLearning
 from api.database import get_db_session
 
@@ -172,7 +176,7 @@ class TestSelfImprovingSelectorHighCoverage:
         
         # Test confidence normalization
         for val in [0, 5, 10, 25, 50, 75, 90, 95, 100, None]:
-            normalized = selector._normalize_confidence(val)
+            normalized = normalize_confidence(val)
             assert 0 <= normalized <= 1.0
 
     def test_signal_weights_comprehensive(self, db, clean_db):
@@ -202,14 +206,14 @@ class TestSelfImprovingSelectorHighCoverage:
         ]
         
         for vec in test_vectors:
-            vec_str = selector._embedding_to_vec_str(vec)
-            parsed = selector._parse_embedding(vec_str)
+            vec_str = embedding_to_vec_str(vec)
+            parsed = parse_embedding(vec_str)
             assert parsed == vec
         
         # Test similarity
         for i, v1 in enumerate(test_vectors[:3]):
             for v2 in test_vectors[i:i+2]:
-                sim = selector._l2_similarity(v1, v2)
+                sim = l2_similarity(v1, v2)
                 assert 0 <= sim <= 1
 
     def test_high_confidence_detection_comprehensive(self, db, clean_db):
@@ -317,7 +321,8 @@ class TestSelfImprovingSelectorHighCoverage:
                 confidence=50.0 + i * 2
             )
             selector._update_learnings(signal)
-        
+        db.flush()  # Ensure pending adds are visible to queries
+
         stats = selector.get_learning_stats()
         assert stats['total_learnings'] >= 10
 
@@ -439,7 +444,7 @@ class TestSelfImprovingSelectorHighCoverage:
         ]
         
         for query in queries:
-            features = selector._extract_context_features_from_query(query)
+            features = extract_context_features(query)
             assert isinstance(features, dict)
 
     def test_get_recent_failures_ordering(self, db, clean_db):
@@ -513,6 +518,6 @@ class TestSelfImprovingSelectorHighCoverage:
         selector = SelfImprovingSelector(session=db, llm_client=None)
         
         # Test exact boundaries
-        assert selector._normalize_confidence(0) == 0.0
-        assert selector._normalize_confidence(100) == 1.0
-        assert selector._normalize_confidence(50) == 0.5
+        assert normalize_confidence(0) == 0.0
+        assert normalize_confidence(100) == 1.0
+        assert normalize_confidence(50) == 0.5

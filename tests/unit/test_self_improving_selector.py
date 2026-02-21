@@ -7,6 +7,10 @@ import uuid
 import pytest
 
 from core.skills.self_improving_selector import SelfImprovingSelector
+from core.skills.learning_similarity import (
+    cosine_similarity, embedding_to_vec_str, extract_context_features,
+    l2_similarity, parse_embedding, pattern_matches,
+)
 from core.skills.selector import SkillMetadata
 
 
@@ -194,7 +198,7 @@ class TestSelfImprovingSelector:
 
         service = EmbeddingService(db, provider="mock")
         embedding = service.embed_text("Review PR #123")
-        embedding_vec_str = self_improving._embedding_to_vec_str(embedding)
+        embedding_vec_str = embedding_to_vec_str(embedding)
 
         learning = SkillSelectionLearning(
             learning_id=f"learn-sem-{uuid.uuid4().hex[:8]}",
@@ -280,7 +284,7 @@ class TestSelfImprovingSelector:
 
         service = EmbeddingService(db, provider="mock")
         embedding = service.embed_text("Review PR #123")
-        embedding_vec_str = self_improving._embedding_to_vec_str(embedding)
+        embedding_vec_str = embedding_to_vec_str(embedding)
 
         learning = SkillSelectionLearning(
             learning_id=f"learn-th-{uuid.uuid4().hex[:8]}",
@@ -340,9 +344,9 @@ class TestSelfImprovingSelector:
         service = EmbeddingService(db, provider="mock")
         query_text = "Review PR #123"
         embedding = service.embed_text(query_text)
-        embedding_vec_str = self_improving._embedding_to_vec_str(embedding)
+        embedding_vec_str = embedding_to_vec_str(embedding)
         other_embedding = service.embed_text("Other query")
-        other_vec_str = self_improving._embedding_to_vec_str(other_embedding)
+        other_vec_str = embedding_to_vec_str(other_embedding)
 
         # Create two learnings with unique IDs
         learning_id_1 = f"learn-lim-{uuid.uuid4().hex[:8]}"
@@ -399,42 +403,42 @@ class TestSelfImprovingSelector:
     def test_parse_embedding(self, self_improving):
         """Test parsing embeddings from various formats."""
         raw_list = [0.1, 0.2]
-        assert self_improving._parse_embedding(raw_list) == raw_list
+        assert parse_embedding(raw_list) == raw_list
 
         raw_json = "[0.3, 0.4]"
-        assert self_improving._parse_embedding(raw_json) == [0.3, 0.4]
+        assert parse_embedding(raw_json) == [0.3, 0.4]
 
-        assert self_improving._parse_embedding("not-json") is None
-        assert self_improving._parse_embedding(None) is None
+        assert parse_embedding("not-json") is None
+        assert parse_embedding(None) is None
 
     def test_embedding_to_vec_str_round_trip(self, self_improving):
         """Test embedding serialization round-trip."""
         raw_list = [0.1, 0.2]
-        vec_str = self_improving._embedding_to_vec_str(raw_list)
-        assert self_improving._parse_embedding(vec_str) == raw_list
+        vec_str = embedding_to_vec_str(raw_list)
+        assert parse_embedding(vec_str) == raw_list
         assert vec_str.startswith("[")
         assert vec_str.endswith("]")
         assert " " not in vec_str
 
     def test_cosine_similarity(self, self_improving):
         """Test cosine similarity calculations."""
-        assert self_improving._cosine_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0
-        assert self_improving._cosine_similarity([1.0, 0.0], [0.0, 1.0]) == 0.0
+        assert cosine_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0
+        assert cosine_similarity([1.0, 0.0], [0.0, 1.0]) == 0.0
 
     def test_l2_similarity(self, self_improving):
         """Test L2 similarity calculations."""
-        assert self_improving._l2_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0
-        assert self_improving._l2_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(
+        assert l2_similarity([1.0, 0.0], [1.0, 0.0]) == 1.0
+        assert l2_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(
             1.0 / (1.0 + (2.0 ** 0.5))
         )
 
     def test_extract_context_features(self, self_improving):
         """Test context feature extraction."""
-        short = self_improving._extract_context_features_from_query("review")
+        short = extract_context_features("review")
         assert short["length_bucket"] == "short"
         assert short["contains_code"] is False
 
-        code = self_improving._extract_context_features_from_query("def foo():\n    return 1")
+        code = extract_context_features("def foo():\n    return 1")
         assert code["contains_code"] is True
 
     def test_apply_learnings_limits_matches(self, self_improving, db):
@@ -699,3 +703,53 @@ class TestSelfImprovingSelector:
         ).all()
         assert len(rows) >= 1
         assert rows[0].evidence_count >= 1
+
+    def test_pattern_matches_word_boundary(self, self_improving):
+        """Substring 'pr' should NOT match 'print' or 'improve'."""
+        assert pattern_matches("review pr", "review pr changes") is True
+        assert pattern_matches("pr", "print something") is False
+        assert pattern_matches("pr", "improve code") is False
+        assert pattern_matches("pr", "open a pr") is True
+
+    def test_rollback_learnings_by_ids(self, self_improving, db):
+        """Rollback specific learnings by ID."""
+        from api.models import SkillSelectionLearning
+        from uuid_utils import uuid7
+
+        lid = str(uuid7())
+        db.add(SkillSelectionLearning(
+            learning_id=lid, query_pattern="test", wrong_skills=["a"],
+            correct_skills=["b"], confidence=50, signal_type="wrong_skill",
+        ))
+        db.commit()
+
+        count = self_improving.rollback_learnings(learning_ids=[lid])
+        assert count == 1
+
+        row = db.get(SkillSelectionLearning, lid)
+        assert row.is_active == 0
+
+    def test_rollback_learnings_no_args(self, self_improving):
+        """Rollback with no args should be a no-op."""
+        assert self_improving.rollback_learnings() == 0
+
+    def test_apply_learnings_skips_inactive(self, self_improving, db):
+        """Inactive learnings should not affect scoring."""
+        from api.models import SkillSelectionLearning
+        from uuid_utils import uuid7
+
+        db.add(SkillSelectionLearning(
+            learning_id=str(uuid7()), query_pattern="deploy k8s",
+            wrong_skills=["summarize_pr"], correct_skills=["deploy"],
+            confidence=90, signal_type="wrong_skill", is_active=0,
+        ))
+        db.commit()
+
+        candidates = [SkillMetadata(
+            name="summarize_pr", version="1.0.0", description="",
+            category="test", subcategory="sub", triggers=[],
+            dependencies=[], priority=5, cost_estimate="low",
+        )]
+        result = self_improving.apply_learnings("deploy k8s cluster", candidates)
+        # Inactive learning should not demote summarize_pr
+        assert result[0].name == "summarize_pr"
