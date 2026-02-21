@@ -115,6 +115,9 @@ class SelfImprovingSelector:
             self.session.rollback()
             raise
 
+    # Events scoring above this threshold are "good enough" — skip learning
+    _MULTI_FACTOR_SKIP_THRESHOLD = 70.0
+
     def learn_from_failures(self, days: int = 7, signal_types: list[SignalType] | None = None) -> dict[str, Any]:
         """Analyze recent failures and learn corrections.
         
@@ -131,10 +134,16 @@ class SelfImprovingSelector:
             return {"learned": 0, "message": "No failures to learn from"}
         
         learned_count = 0
+        skipped_high_score = 0
         signals_by_type = {st: 0 for st in signal_types}
         
         for failure in failures:
             try:
+                # Skip events that score well overall — not worth learning from
+                mf_score = self.calculate_multi_factor_score(failure)
+                if mf_score >= self._MULTI_FACTOR_SKIP_THRESHOLD:
+                    skipped_high_score += 1
+                    continue
                 # Extract signals for each type
                 for signal_type in signal_types:
                     signal = self._extract_signal(failure, signal_type)
@@ -151,6 +160,7 @@ class SelfImprovingSelector:
         return {
             "learned": learned_count,
             "total_failures": len(failures),
+            "skipped_high_score": skipped_high_score,
             "signals_by_type": {k.value: v for k, v in signals_by_type.items()},
         }
 
@@ -527,13 +537,6 @@ class SelfImprovingSelector:
         except Exception:
             self.session.rollback()
             raise
-
-    def _is_high_confidence(self, value: float | None) -> bool:
-        if value is None:
-            return False
-        if value <= 1.0:
-            return value >= 0.5
-        return value >= 50.0
 
     def _is_high_confidence_value(self, normalized_value: float | None) -> bool:
         if normalized_value is None:

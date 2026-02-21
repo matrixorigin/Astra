@@ -840,3 +840,35 @@ class TestSelfImprovingSelector:
         assert names == names2
         # Alphabetical tiebreaker: aa before zz
         assert names.index("aa_deploy") < names.index("zz_deploy")
+
+    def test_no_dual_scale_confidence_method(self, self_improving):
+        """Dead _is_high_confidence (dual-scale) must not exist."""
+        assert not hasattr(self_improving, "_is_high_confidence")
+
+    def test_learn_skips_high_multi_factor_score_events(self, self_improving, db):
+        """Events scoring above threshold are skipped by learn_from_failures."""
+        from api.models import SkillSelectionEvent
+        from uuid_utils import uuid7
+        from datetime import datetime, timezone
+
+        # Event enters via low_satisfaction (<3) but multi-factor score is high
+        # because accuracy, speed, cost are all excellent
+        event = SkillSelectionEvent(
+            event_id=str(uuid7()),
+            session_id=str(uuid7()),
+            user_query="high score event",
+            available_skills=["s1"],
+            selected_skills=["s1"],
+            selection_method="test",
+            execution_success=True,
+            selection_correctness=1,     # accuracy=100
+            execution_time_ms=500,       # speed≈98
+            execution_cost=0.01,         # cost≈98
+            user_feedback_score=2,       # <3 triggers low_satisfaction filter
+            created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        db.add(event)
+        db.commit()
+
+        result = self_improving.learn_from_failures(days=1)
+        assert result["skipped_high_score"] >= 1

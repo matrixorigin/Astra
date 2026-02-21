@@ -217,7 +217,7 @@ class TestSelfImprovingSelectorHighCoverage:
                 assert 0 <= sim <= 1
 
     def test_high_confidence_detection_comprehensive(self, db, clean_db):
-        """Test high confidence detection comprehensively."""
+        """Test high confidence detection with normalized 0-1 values."""
         selector = SelfImprovingSelector(session=db, llm_client=None)
         
         test_cases = [
@@ -227,17 +227,12 @@ class TestSelfImprovingSelectorHighCoverage:
             (0.5, True),
             (0.6, True),
             (1.0, True),
-            (30.0, False),
-            (40.0, False),
-            (50.0, True),
-            (60.0, True),
-            (100.0, True),
             (None, False),
         ]
         
         for val, expected in test_cases:
-            result = selector._is_high_confidence(val)
-            assert result == expected
+            result = selector._is_high_confidence_value(val)
+            assert result == expected, f"_is_high_confidence_value({val}) expected {expected}"
 
     def test_get_recent_failures_comprehensive(self, db, clean_db):
         """Test get_recent_failures comprehensively."""
