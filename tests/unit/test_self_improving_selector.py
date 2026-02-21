@@ -753,3 +753,55 @@ class TestSelfImprovingSelector:
         result = self_improving.apply_learnings("deploy k8s cluster", candidates)
         # Inactive learning should not demote summarize_pr
         assert result[0].name == "summarize_pr"
+
+    def test_ensure_tables_rollback_on_failure(self, db, mock_llm):
+        """_ensure_tables should rollback on DDL failure, not leave session dirty."""
+        si = SelfImprovingSelector(db, mock_llm)
+        si._ensure_tables()  # first call succeeds, columns exist
+
+        # commit() is still called even when no ALTER needed — mock it to fail
+        original_commit = db.commit
+        db.commit = Mock(side_effect=RuntimeError("DDL failed"))
+        try:
+            with pytest.raises(RuntimeError, match="DDL failed"):
+                SelfImprovingSelector(db, mock_llm)._ensure_tables()
+        finally:
+            db.commit = original_commit
+
+        # Session should be usable after rollback (not stuck in failed state)
+        from sqlalchemy import text
+        result = db.execute(text("SELECT 1")).scalar()
+        assert result == 1
+
+    def test_apply_learnings_does_not_mutate_input(self, self_improving, db):
+        """apply_learnings should not modify the input candidates list."""
+        from core.skills.pipeline import SkillCandidate
+        from core.skills.selector import SkillMetadata
+        from api.models import SkillSelectionLearning
+        from datetime import datetime, timezone
+
+        learning = SkillSelectionLearning(
+            learning_id="mut_test",
+            query_pattern="mutate test",
+            wrong_skills=["skill_a"],
+            correct_skills=["skill_b"],
+            confidence=0.95,
+            evidence_count=5,
+            applied_count=0,
+            signal_type="wrong_skill",
+            is_active=1,
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(learning)
+        db.flush()
+
+        original = [
+            SkillCandidate(name="skill_a"),
+            SkillCandidate(name="skill_c"),
+        ]
+        original_copy = list(original)
+        self_improving.apply_learnings("mutate test", original)
+        # Input list should not be modified in-place
+        assert len(original) == len(original_copy)
+        for a, b in zip(original, original_copy):
+            assert a.name == b.name

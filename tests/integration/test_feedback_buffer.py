@@ -424,6 +424,12 @@ class TestSkillPipelineIntegration:
         assert result.event_id is not None
         assert result.candidates >= 0
 
+    def test_skill_pipeline_get_tools_schema_latency(self, db, clean_db):
+        """select_tools should populate latency_ms."""
+        pipeline = SkillPipeline(db=db, llm_client=None, audit=False, learning=False)
+        result = pipeline.get_tools_schema("test query", str(uuid7()))
+        assert result.latency_ms >= 0
+
     def test_skill_pipeline_record_feedback_no_event_id(self, db, clean_db):
         """Test record_feedback with None event_id (no-op)."""
         pipeline = SkillPipeline(

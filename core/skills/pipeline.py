@@ -44,6 +44,7 @@ class ToolsResult:
     event_id: str | None = None          # Audit event ID (None if audit off)
     candidates: int = 0                  # Candidates considered
     retrieval_method: str | None = None  # "semantic" or "keyword", None if unknown
+    latency_ms: int = 0                  # End-to-end selection latency
 
 
 @dataclass
@@ -199,6 +200,7 @@ class SkillPipeline:
                  Apply learned corrections if learning is enabled.
         Stage 2: Record audit event with selection metadata.
         """
+        t0 = time.monotonic()
         # Stage 1a: retrieve + rank (progressive disclosure)
         tools, retrieval_method = self._modern.get_tools_schema(
             query, max_candidates=max_candidates, context_budget=context_budget,
@@ -232,11 +234,14 @@ class SkillPipeline:
         # Opportunistic flush
         self._feedback.maybe_flush()
 
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        logger.debug("select_tools latency=%dms tools=%d", latency_ms, len(tools))
         return ToolsResult(
             tools=tools,
             event_id=event_id,
             candidates=len(tools),
             retrieval_method=retrieval_method,
+            latency_ms=latency_ms,
         )
 
     # ------------------------------------------------------------------

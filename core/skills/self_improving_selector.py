@@ -109,7 +109,11 @@ class SelfImprovingSelector:
             self.session.execute(
                 text("ALTER TABLE skill_selection_learning ADD COLUMN is_active TINYINT(1) DEFAULT 1")
             )
-        self.session.commit()
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
 
     def learn_from_failures(self, days: int = 7, signal_types: list[SignalType] | None = None) -> dict[str, Any]:
         """Analyze recent failures and learn corrections.
