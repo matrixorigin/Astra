@@ -2,7 +2,7 @@
 
 Replaces the old GitHubClient. Key changes:
 - repo identified by "owner/repo" string, not repo_id: int
-- PR cache in user BYOD database
+- PR cache in platform DB (sk_github_ prefix tables)
 - Credentials from platform credential manager
 """
 
@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from core.exceptions import GitHubError, GitHubRateLimitError
 from core.logging_config import get_logger
-from skills.github.models import GithubPRCache, GithubRepo
+from skills.github.models import SkGithubPRCache, SkGithubRepo
 
 logger = get_logger(__name__)
 
@@ -31,10 +31,10 @@ class GitHubSkillAPI:
     def __init__(
         self,
         token: str | None = None,
-        user_db: Session | None = None,
+        db: Session | None = None,
         base_url: str = "https://api.github.com",
     ):
-        self._user_db = user_db
+        self._db = db
         self._base_url = base_url
         self._rl_checked_at: float = 0
 
@@ -50,31 +50,31 @@ class GitHubSkillAPI:
 
     def add_repo(self, owner: str, name: str) -> dict:
         """Register a repository for tracking."""
-        if not self._user_db:
-            raise RuntimeError("User DB session required for repo management")
+        if not self._db:
+            raise RuntimeError("DB session required for repo management")
         full_name = f"{owner}/{name}"
         existing = (
-            self._user_db.query(GithubRepo)
+            self._db.query(SkGithubRepo)
             .filter_by(owner=owner, name=name)
             .one_or_none()
         )
         if existing:
             return {"repo_id": existing.repo_id, "full_name": full_name, "created": False}
-        repo = GithubRepo(
+        repo = SkGithubRepo(
             repo_id=str(uuid.uuid4()),
             owner=owner,
             name=name,
             full_name=full_name,
         )
-        self._user_db.add(repo)
-        self._user_db.flush()
+        self._db.add(repo)
+        self._db.flush()
         return {"repo_id": repo.repo_id, "full_name": full_name, "created": True}
 
     def list_repos(self) -> list[dict]:
         """List registered repositories."""
-        if not self._user_db:
+        if not self._db:
             return []
-        rows = self._user_db.query(GithubRepo).all()
+        rows = self._db.query(SkGithubRepo).all()
         return [
             {"repo_id": r.repo_id, "full_name": r.full_name, "default_branch": r.default_branch}
             for r in rows
@@ -299,11 +299,11 @@ class GitHubSkillAPI:
 
     def _cache_pr(self, repo: str, pr_data: dict) -> None:
         """Upsert PR data into cache (if user DB available)."""
-        if not self._user_db:
+        if not self._db:
             return
         try:
             existing = (
-                self._user_db.query(GithubPRCache)
+                self._db.query(SkGithubPRCache)
                 .filter_by(repo_full_name=repo, pr_number=pr_data["number"])
                 .one_or_none()
             )
@@ -315,7 +315,7 @@ class GitHubSkillAPI:
                 existing.data = pr_data
                 existing.fetched_at = now
             else:
-                self._user_db.add(GithubPRCache(
+                self._db.add(SkGithubPRCache(
                     cache_id=str(uuid.uuid4()),
                     repo_full_name=repo,
                     pr_number=pr_data["number"],
@@ -325,6 +325,6 @@ class GitHubSkillAPI:
                     data=pr_data,
                     fetched_at=now,
                 ))
-            self._user_db.flush()
+            self._db.flush()
         except Exception as e:
             logger.debug(f"PR cache upsert failed (non-fatal): {e}")

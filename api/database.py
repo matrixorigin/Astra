@@ -117,7 +117,23 @@ def init_db():
     from api.models import Base
     from sqlalchemy import inspect
 
+    # Auto-discover skill models (skills/*/models.py) so their tables are in Base.metadata
+    _import_skill_models()
+
     existing = set(inspect(engine).get_table_names(schema=engine.url.database))
     tables_to_create = [t for t in Base.metadata.sorted_tables if t.name not in existing]
     if tables_to_create:
         Base.metadata.create_all(bind=engine, tables=tables_to_create, checkfirst=False)
+
+
+def _import_skill_models():
+    """Import skills/*/models.py so skill tables register with Base.metadata."""
+    import importlib
+    from pathlib import Path
+
+    skills_dir = Path(__file__).parent.parent / "skills"
+    if not skills_dir.is_dir():
+        return
+    for skill_dir in sorted(skills_dir.iterdir()):
+        if skill_dir.is_dir() and (skill_dir / "models.py").exists():
+            importlib.import_module(f"skills.{skill_dir.name}.models")

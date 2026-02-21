@@ -627,23 +627,6 @@ class ModelArtifact(Base):
 # ── Skill-as-Package platform tables ──────────────────────────────────────────
 
 
-class UserConnection(Base):
-    """BYOD database connection registry — one per user."""
-    __tablename__ = "user_connections"
-
-    connection_id = Column(String(36), primary_key=True)
-    user_id = Column(String(36), nullable=False, unique=True)
-    dialect = Column(String(20), nullable=False)       # "mysql" | "matrixone"
-    host = Column(String(255), nullable=False)
-    port = Column(Integer, nullable=False)
-    database = Column(String(100), nullable=False)
-    username = Column(String(100), nullable=False)
-    password_encrypted = Column(Text, nullable=False)
-    status = Column(String(20), default="active")      # active | inactive | error
-    created_at = Column(DateTime, default=func.now(), nullable=False)
-    verified_at = Column(DateTime)
-
-
 class SkillDefinition(Base):
     """Skill marketplace catalog — admin-managed."""
     __tablename__ = "skill_definitions"

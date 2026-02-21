@@ -3,11 +3,11 @@ name: github
 version: "1.0.0"
 description: "GitHub integration — PRs, issues, CI status, code search"
 author: "mo-agent-engine"
-table_prefix: github
+table_prefix: sk_github
 
 tables:
-  - github_repos
-  - github_pr_cache
+  - sk_github_repos
+  - sk_github_pr_cache
 
 credentials:
   - name: github_token
@@ -19,7 +19,3 @@ requires:
   - http
 
 depends_on: []
-
-dialects:
-  - mysql
-  - matrixone

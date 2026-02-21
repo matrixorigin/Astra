@@ -1,17 +1,17 @@
-"""GitHub skill tables — schema defined by platform, created in user BYOD."""
+"""GitHub skill tables — platform DB with sk_github_ prefix."""
 
 from sqlalchemy import Column, DateTime, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.sql import func
 
-from core.skills.schema_base import SkillTableBase
+from api.models import Base
 
 
-class GithubRepo(SkillTableBase):
+class SkGithubRepo(Base):
     """Registered GitHub repositories for a user."""
 
-    __tablename__ = "github_repos"
+    __tablename__ = "sk_github_repos"
     __table_args__ = (
-        UniqueConstraint("owner", "name", name="uq_github_repo_owner_name"),
+        UniqueConstraint("owner", "name", name="uq_sk_github_repo_owner_name"),
     )
 
     repo_id = Column(String(36), primary_key=True)
@@ -22,13 +22,13 @@ class GithubRepo(SkillTableBase):
     created_at = Column(DateTime, default=func.now(), nullable=False)
 
 
-class GithubPRCache(SkillTableBase):
+class SkGithubPRCache(Base):
     """Cached PR data — fetched from GitHub API, stored locally."""
 
-    __tablename__ = "github_pr_cache"
+    __tablename__ = "sk_github_pr_cache"
     __table_args__ = (
-        UniqueConstraint("repo_full_name", "pr_number", name="uq_github_pr_repo_pr"),
-        Index("ix_github_pr_cache_repo_state", "repo_full_name", "state"),
+        UniqueConstraint("repo_full_name", "pr_number", name="uq_sk_github_pr_repo_pr"),
+        Index("ix_sk_github_pr_cache_repo_state", "repo_full_name", "state"),
     )
 
     cache_id = Column(String(36), primary_key=True)
