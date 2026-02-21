@@ -578,7 +578,7 @@ class SelfImprovingSelector:
             scores["accuracy"] = 50.0  # Neutral if unknown
         
         # Speed score (0-100, inverse of time)
-        exec_time = event.get("execution_time_ms", 0)
+        exec_time = event.get("execution_time_ms") or 0
         if exec_time > 0:
             # 1s = 100, 10s = 50, 30s+ = 0
             scores["speed"] = max(0, 100 - (exec_time / 300))
@@ -586,7 +586,7 @@ class SelfImprovingSelector:
             scores["speed"] = 100.0
         
         # Cost score (0-100, inverse of cost)
-        cost = event.get("execution_cost", 0.0)
+        cost = event.get("execution_cost") or 0.0
         if cost > 0:
             # $0.01 = 100, $0.10 = 50, $0.50+ = 0
             scores["cost"] = max(0, 100 - (cost * 200))

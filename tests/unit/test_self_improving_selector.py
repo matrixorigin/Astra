@@ -872,3 +872,15 @@ class TestSelfImprovingSelector:
 
         result = self_improving.learn_from_failures(days=1)
         assert result["skipped_high_score"] >= 1
+
+    def test_multi_factor_score_handles_none_fields(self, self_improving):
+        """calculate_multi_factor_score must not crash on None metric values."""
+        event = {
+            "selection_correctness": 1,
+            "execution_time_ms": None,
+            "execution_cost": None,
+            "user_feedback_score": None,
+        }
+        score = self_improving.calculate_multi_factor_score(event)
+        # None fields treated as defaults: speed=100, cost=100, satisfaction=75
+        assert score > 0
