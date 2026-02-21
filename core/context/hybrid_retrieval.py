@@ -115,12 +115,8 @@ class HybridRetriever:
         except Exception as e:
             logger.warning(f"Vector search failed: {e}")
         
-        # 2. Fulltext search (keyword matching with session filtering via BOOLEAN MODE)
+        # 2. Fulltext search (keyword matching with session_id filter in WHERE)
         try:
-            # Use BOOLEAN MODE to combine query text with session_id filter
-            # Format: "+query_text +session_id" means both must match
-            fulltext_query = f"+{query_text} +{session_id}"
-            
             fulltext_sql = text("""
                 SELECT 
                     event_id,
@@ -132,14 +128,16 @@ class HybridRetriever:
                     parent_event_id,
                     metadata
                 FROM conversation_events
-                WHERE MATCH(content, session_id) AGAINST(:query_bool IN BOOLEAN MODE)
+                WHERE MATCH(content, session_id) AGAINST(:query_text IN BOOLEAN MODE)
+                    AND session_id = :session_id
                 LIMIT :limit
             """)
             
             result = self.db.execute(
                 fulltext_sql,
                 {
-                    "query_bool": fulltext_query,
+                    "query_text": query_text,
+                    "session_id": session_id,
                     "limit": limit,
                 }
             )
@@ -232,7 +230,7 @@ class HybridRetriever:
                 created_at,
                 last_validated_at,
                 (
-                    :w_semantic * (1.0 / (1.0 + l2_distance(embedding, :query_vec))) +
+                    :w_semantic * IFNULL(1.0 / (1.0 + l2_distance(embedding, :query_vec)), 0) +
                     :w_keyword * COALESCE(
                         MATCH(value) AGAINST(:query_text IN BOOLEAN MODE), 
                         0

@@ -286,3 +286,19 @@ class TestEnhancedHybridRetrieval:
         # evt_456: keyword only (0.25)
         evt_456 = next(e for e in events if e["event_id"] == "evt_456")
         assert evt_456["relevance_score"] == pytest.approx(0.25, abs=0.01)
+
+    def test_fulltext_uses_where_session_filter(self, retriever, mock_db):
+        """Fulltext search filters session_id via WHERE, not inside MATCH query."""
+        mock_db.execute.side_effect = [[], []]  # vector, fulltext both empty
+
+        retriever.retrieve_events(
+            query_text="test query",
+            query_embedding=[0.1] * 4,
+            session_id="sess_abc",
+        )
+
+        # Second call is fulltext; verify session_id passed as separate param
+        params = mock_db.execute.call_args_list[1][0][1]
+        assert params["session_id"] == "sess_abc"
+        assert params["query_text"] == "test query"
+        assert "query_bool" not in params
