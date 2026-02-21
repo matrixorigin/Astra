@@ -118,7 +118,8 @@ class ToolMockingLayer:
             # For WRITE operations, try to use recorded results
             if skill.side_effect_profile.category == SideEffectCategory.WRITE:
                 recorded = self._get_recorded_result(
-                    skill.name, params, session_id, parent_event_id
+                    skill.name, params, session_id, parent_event_id,
+                    expected_version=getattr(skill, "version", None),
                 )
                 if recorded is not None:
                     logger.info(
@@ -155,7 +156,10 @@ class ToolMockingLayer:
 
         # Record result in production mode
         if self.mode == MockMode.PRODUCTION:
-            self._record_result(skill.name, params, result, session_id, parent_event_id)
+            self._record_result(
+                skill.name, params, result, session_id, parent_event_id,
+                skill_version=getattr(skill, "version", None),
+            )
 
         return result
 
@@ -228,6 +232,7 @@ class ToolMockingLayer:
         params: dict,
         session_id: str,
         parent_event_id: str | None,
+        expected_version: str | None = None,
     ) -> Any | None:
         """
         Query recorded skill result from conversation_events.
@@ -259,7 +264,8 @@ class ToolMockingLayer:
                 # Fuzzy lookup: most recent matching event in session
                 logger.warning(
                     f"Using fuzzy lookup for {skill_name} without parent_event_id. "
-                    f"This is not concurrency-safe. Consider providing parent_event_id."
+                    f"This is not concurrency-safe. "
+                    f"Pass parent_event_id from the tool_call event for deterministic lookups."
                 )
                 event = session.query(EventModel).filter(
                     EventModel.session_id == session_id,
@@ -278,6 +284,15 @@ class ToolMockingLayer:
                         f"expected {params_hash}, got {recorded_hash}"
                     )
                     return None
+
+                # Warn on version mismatch (result may be stale)
+                recorded_version = metadata.get("skill_version")
+                if expected_version and recorded_version and recorded_version != expected_version:
+                    logger.warning(
+                        f"Skill version mismatch for {skill_name}: "
+                        f"recorded={recorded_version}, current={expected_version}. "
+                        f"Result may be stale."
+                    )
 
                 return metadata.get("skill_result")
 
@@ -336,6 +351,7 @@ class ToolMockingLayer:
         session_id: str,
         parent_event_id: str | None,
         event_id_override: str | None = None,
+        skill_version: str | None = None,
     ) -> None:
         """
         Record skill result in conversation_events metadata.
@@ -365,6 +381,8 @@ class ToolMockingLayer:
                 "skill_params_hash": params_hash,
                 "skill_result": result_data,
             }
+            if skill_version:
+                metadata["skill_version"] = skill_version
 
             # Check metadata size (MatrixOne JSON field limit is typically 16MB)
             metadata_json = json.dumps(metadata)
@@ -391,7 +409,20 @@ class ToolMockingLayer:
             
             if event_id_override:
                 query = query.filter(EventModel.event_id == event_id_override)
+            elif parent_event_id:
+                # Concurrency-safe: locate by parent event chain
+                query = query.filter(
+                    EventModel.parent_event_id == parent_event_id,
+                    EventModel.skill_name == skill_name,
+                    EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
+                )
             else:
+                # Fallback: most recent matching event in session (not concurrency-safe)
+                logger.warning(
+                    f"Recording result for {skill_name} without event_id_override or "
+                    f"parent_event_id — not concurrency-safe. "
+                    f"Pass parent_event_id from the tool_call event for safe lookups."
+                )
                 query = query.filter(
                     EventModel.session_id == session_id,
                     EventModel.skill_name == skill_name,
@@ -403,7 +434,6 @@ class ToolMockingLayer:
             if event:
                 # Merge with existing metadata if present
                 existing_metadata = event.event_metadata or {}
-                # Update with new metadata
                 existing_metadata.update(metadata)
                 event.event_metadata = existing_metadata
                 

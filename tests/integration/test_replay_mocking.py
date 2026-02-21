@@ -326,3 +326,132 @@ def test_params_hash_consistency(db):
     hash_nested2 = mock_layer._hash_params(nested2)
 
     assert hash_nested1 == hash_nested2
+
+
+def test_record_result_uses_parent_event_id(db, session_id):
+    """_record_result should prefer parent_event_id over session-wide desc() lookup."""
+    import logging
+    from api.models import Event
+    from datetime import datetime, timezone
+
+    parent_id = "parent_evt_001"
+    event = Event(
+        event_id="child_evt_001",
+        user_id="test_user",
+        session_id=session_id,
+        agent_id="test_agent",
+        agent_version="1.0.0",
+        event_type="tool_result",
+        content="",
+        skill_name="test_read_skill",
+        parent_event_id=parent_id,
+        causal_chain_id=parent_id,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(event)
+    db.commit()
+
+    try:
+        mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db)
+        mock_layer._record_result(
+            "test_read_skill", {"q": "x"}, {"data": "ok"},
+            session_id, parent_event_id=parent_id,
+        )
+        db.refresh(event)
+        assert event.event_metadata["skill_result"] == {"data": "ok"}
+    finally:
+        db.query(Event).filter(Event.event_id == "child_evt_001").delete()
+        db.commit()
+
+
+def test_record_result_warns_without_parent_event_id(db, session_id, caplog):
+    """_record_result without parent_event_id should log a concurrency warning."""
+    import logging
+    caplog.set_level(logging.WARNING)
+
+    mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db)
+    mock_layer._record_result(
+        "nonexistent_skill", {}, {}, session_id, parent_event_id=None,
+    )
+    assert any("not concurrency-safe" in r.message for r in caplog.records)
+
+
+def test_record_result_stores_skill_version(db, session_id):
+    """_record_result should persist skill_version in metadata."""
+    from api.models import Event
+    from datetime import datetime, timezone
+
+    eid = "ver_evt_001"
+    event = Event(
+        event_id=eid,
+        user_id="test_user",
+        session_id=session_id,
+        agent_id="test_agent",
+        agent_version="1.0.0",
+        event_type="tool_result",
+        content="",
+        skill_name="test_read_skill",
+        causal_chain_id=eid,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(event)
+    db.commit()
+
+    try:
+        mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db)
+        mock_layer._record_result(
+            "test_read_skill", {}, {"data": "v"}, session_id,
+            parent_event_id=None, event_id_override=eid, skill_version="2.1.0",
+        )
+        db.refresh(event)
+        assert event.event_metadata["skill_version"] == "2.1.0"
+    finally:
+        db.query(Event).filter(Event.event_id == eid).delete()
+        db.commit()
+
+
+def test_get_recorded_result_warns_version_mismatch(db, session_id, caplog):
+    """_get_recorded_result should warn when skill version differs from recorded."""
+    import hashlib
+    import logging
+    from api.models import Event
+    from datetime import datetime, timezone
+
+    caplog.set_level(logging.WARNING)
+
+    params = {"query": "hello"}
+    params_hash = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
+    metadata = {
+        "skill_name": "test_read_skill",
+        "skill_params": params,
+        "skill_params_hash": params_hash,
+        "skill_result": {"data": "world"},
+        "skill_version": "1.0.0",
+    }
+    event = Event(
+        event_id="ver_mismatch_evt",
+        user_id="test_user",
+        session_id=session_id,
+        agent_id="test_agent",
+        agent_version="1.0.0",
+        event_type="tool_result",
+        content="",
+        skill_name="test_read_skill",
+        causal_chain_id="ver_mismatch_evt",
+        event_metadata=metadata,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(event)
+    db.commit()
+
+    try:
+        mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
+        result = mock_layer._get_recorded_result(
+            "test_read_skill", params, session_id,
+            parent_event_id=None, expected_version="2.0.0",
+        )
+        assert result == {"data": "world"}  # Still returns result
+        assert any("version mismatch" in r.message.lower() for r in caplog.records)
+    finally:
+        db.query(Event).filter(Event.event_id == "ver_mismatch_evt").delete()
+        db.commit()
