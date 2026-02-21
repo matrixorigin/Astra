@@ -139,3 +139,84 @@ def test_low_confidence_quarantine(db_session):
     count = extractor.quarantine_low_confidence(user_id, threshold=0.3)
     
     assert count >= 1
+
+
+def test_llm_extraction(db_session):
+    """LLM-based extraction produces structured knowledge entries."""
+    from unittest.mock import Mock
+    import json
+
+    llm = Mock()
+    llm.chat_with_tools.return_value = {
+        "content": json.dumps([
+            {"category": "user_preference", "key_name": "llm_test_lang", "value": "python"},
+            {"category": "domain_fact", "key_name": "llm_test_db", "value": "matrixone"},
+        ])
+    }
+    extractor = KnowledgeExtractor(db_session, llm_client=llm)
+
+    user_id = str(uuid7())[:36]
+    chain_id = str(uuid7())
+    event = Event(
+        event_id=str(uuid7()),
+        session_id=str(uuid7()),
+        user_id=user_id,
+        agent_id="agent",
+        event_type="user_query",
+        content="I use python with matrixone",
+        causal_chain_id=chain_id,
+    )
+    db_session.add(event)
+    db_session.commit()
+
+    stored = extractor.extract_from_chain(chain_id, user_id)
+
+    assert len(stored) == 2
+    assert all(s["action"] == "created" for s in stored)
+    llm.chat_with_tools.assert_called_once()
+
+
+def test_contradiction_detection(db_session):
+    """Contradictory value supersedes old entry and decays its confidence."""
+    extractor = KnowledgeExtractor(db_session)
+    user_id = str(uuid7())[:36]
+
+    # Create existing entry
+    old = KnowledgeEntry(
+        entry_id=str(uuid7()),
+        user_id=user_id,
+        category="user_preference",
+        key_name="language",
+        value="java",
+        source_event_ids='["e1"]',
+        confidence=0.9,
+        initial_confidence=0.9,
+        trust_tier="T3",
+    )
+    db_session.add(old)
+    db_session.commit()
+    old_id = old.entry_id
+
+    # Extract contradictory value via regex path
+    chain_id = str(uuid7())
+    event = Event(
+        event_id=str(uuid7()),
+        session_id=str(uuid7()),
+        user_id=user_id,
+        agent_id="agent",
+        event_type="user_query",
+        content="I prefer TypeScript for everything",
+        causal_chain_id=chain_id,
+    )
+    db_session.add(event)
+    db_session.commit()
+
+    stored = extractor.extract_from_chain(chain_id, user_id)
+
+    assert len(stored) == 1
+    assert stored[0]["action"] == "contradiction"
+
+    # Old entry should have decayed confidence and superseded_by set
+    db_session.refresh(old)
+    assert old.confidence == pytest.approx(0.6, abs=0.01)
+    assert old.superseded_by == stored[0]["entry_id"]

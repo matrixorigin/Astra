@@ -14,6 +14,17 @@ from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
 
+KNOWLEDGE_EXTRACTION_PROMPT = """\
+You extract structured knowledge from conversations. Output a JSON array ONLY.
+
+Each item must have:
+- "category": one of "user_preference", "codebase_pattern", "domain_fact", "tool_behavior", "entity"
+- "key_name": short unique key (e.g. "preferred_language", "auth.pattern")
+- "value": the extracted fact
+
+Only extract clear, factual statements. Skip vague or uncertain information.
+"""
+
 
 class KnowledgeExtractor:
     """Extract semantic knowledge from conversation events.
@@ -44,16 +55,20 @@ class KnowledgeExtractor:
         re.IGNORECASE
     )
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, llm_client=None):
         """Initialize knowledge extractor.
         
         Args:
             db: SQLAlchemy database session
+            llm_client: Optional LLM client for extraction (falls back to regex)
         """
         self.db = db
+        self.llm = llm_client
 
     def extract_from_chain(self, causal_chain_id: str, user_id: str) -> list[dict[str, Any]]:
         """Extract knowledge from completed causal chain.
+        
+        Uses LLM extraction when available, falls back to regex patterns.
         
         Args:
             causal_chain_id: Completed causal chain
@@ -64,7 +79,6 @@ class KnowledgeExtractor:
         """
         from api.models import Event
         
-        # Get all events in chain
         events = self.db.query(Event).filter(
             Event.causal_chain_id == causal_chain_id,
             Event.user_id == user_id
@@ -73,28 +87,74 @@ class KnowledgeExtractor:
         if not events:
             return []
         
-        # Extract knowledge using simple pattern matching
-        # In production, this would use LLM extraction
-        extracted = []
+        if self.llm:
+            extracted = self._extract_via_llm(events, user_id)
+        else:
+            extracted = self._extract_via_regex(events, user_id)
         
-        for event in events:
-            # User preference patterns (case-insensitive)
-            if self.PREFERENCE_PATTERNS.search(event.content):
-                entry = self._extract_preference(event, user_id)
-                if entry:
-                    extracted.append(entry)
-            
-            # Codebase pattern observations (case-insensitive)
-            if self.PATTERN_PATTERNS.search(event.content):
-                entry = self._extract_pattern(event, user_id)
-                if entry:
-                    extracted.append(entry)
-        
-        # Batch store extracted knowledge
         stored = self._batch_store_knowledge(extracted)
         
         logger.info(f"Extracted {len(stored)} knowledge entries from chain {causal_chain_id}")
         return stored
+
+    def _extract_via_llm(self, events, user_id: str) -> list[dict[str, Any]]:
+        """Extract knowledge from events using LLM."""
+        from core.memory.observer import _parse_json_array
+        from core.context.lifecycle import trust_tier_defaults
+
+        conv_text = "\n".join(
+            f"[{e.event_type}]: {e.content[:500]}" for e in events if e.content
+        )
+        event_ids = [e.event_id for e in events]
+
+        try:
+            result = self.llm.chat_with_tools(
+                messages=[
+                    {"role": "system", "content": KNOWLEDGE_EXTRACTION_PROMPT},
+                    {"role": "user", "content": conv_text},
+                ],
+                tools=[],
+                tool_choice="none",
+            )
+            raw = _parse_json_array(result.get("content", ""))
+        except Exception as e:
+            logger.warning("Knowledge LLM extraction failed: %s", e)
+            return []
+
+        defaults = trust_tier_defaults("T3")
+        valid_categories = {"user_preference", "codebase_pattern", "domain_fact", "tool_behavior", "entity"}
+        extracted = []
+        for item in raw:
+            if not isinstance(item, dict) or not item.get("key_name") or not item.get("value"):
+                continue
+            category = item.get("category", "domain_fact")
+            if category not in valid_categories:
+                category = "domain_fact"
+            extracted.append({
+                "user_id": user_id,
+                "category": category,
+                "key_name": item["key_name"],
+                "value": item["value"],
+                "source_event_ids": event_ids,
+                "extraction_method": "llm_extraction",
+                "trust_tier": "T3",
+                "confidence": defaults["initial_confidence"],
+            })
+        return extracted
+
+    def _extract_via_regex(self, events, user_id: str) -> list[dict[str, Any]]:
+        """Fallback regex extraction when no LLM available."""
+        extracted = []
+        for event in events:
+            if self.PREFERENCE_PATTERNS.search(event.content):
+                entry = self._extract_preference(event, user_id)
+                if entry:
+                    extracted.append(entry)
+            if self.PATTERN_PATTERNS.search(event.content):
+                entry = self._extract_pattern(event, user_id)
+                if entry:
+                    extracted.append(entry)
+        return extracted
 
     def _extract_preference(self, event, user_id: str) -> dict[str, Any] | None:
         """Extract user preference from event."""
@@ -182,19 +242,47 @@ class KnowledgeExtractor:
         # Update or create entries
         for key, entry in entries_by_key.items():
             if key in existing_entries:
-                # Update existing
                 existing = existing_entries[key]
-                existing.confidence = min(1.0, existing.confidence + 0.1)
-                existing.version += 1
-                existing.last_validated_at = datetime.now()
-                existing.updated_at = datetime.now()
-                
-                stored.append({
-                    "entry_id": existing.entry_id,
-                    "action": "updated",
-                    "confidence": existing.confidence
-                })
-                logger.debug(f"Updated existing knowledge: {entry['key_name']}")
+                now = datetime.now()
+                if existing.value == entry["value"]:
+                    # Same value — reinforce confidence
+                    existing.confidence = min(1.0, existing.confidence + 0.1)
+                    existing.version += 1
+                    existing.last_validated_at = now
+                    existing.updated_at = now
+                    stored.append({
+                        "entry_id": existing.entry_id,
+                        "action": "updated",
+                        "confidence": existing.confidence,
+                    })
+                else:
+                    # Contradiction — decay old, supersede with new
+                    logger.warning(
+                        "Knowledge contradiction: %s = %r vs %r",
+                        entry["key_name"], existing.value, entry["value"],
+                    )
+                    existing.confidence = max(0, existing.confidence - 0.3)
+                    existing.updated_at = now
+                    entry_id = str(uuid.uuid4())
+                    knowledge = KnowledgeEntry(
+                        entry_id=entry_id,
+                        user_id=entry["user_id"],
+                        category=entry["category"],
+                        key_name=entry["key_name"],
+                        value=entry["value"],
+                        source_event_ids=json.dumps(entry["source_event_ids"]),
+                        extraction_method=entry.get("extraction_method", "observation"),
+                        trust_tier=entry["trust_tier"],
+                        confidence=entry["confidence"],
+                        initial_confidence=entry["confidence"],
+                    )
+                    existing.superseded_by = entry_id
+                    self.db.add(knowledge)
+                    stored.append({
+                        "entry_id": entry_id,
+                        "action": "contradiction",
+                        "confidence": entry["confidence"],
+                    })
             else:
                 # Create new
                 entry_id = str(uuid.uuid4())
