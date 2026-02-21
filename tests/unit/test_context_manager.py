@@ -162,3 +162,70 @@ class TestAllocateBudget:
         budget = context_manager._allocate_budget(10000, TaskType.GENERAL)
         for section in budget.values():
             assert section["used"] == 0
+
+
+class TestGetSkillDefinitions:
+    """Tests for _get_skill_definitions loading from DB."""
+
+    def test_loads_active_skills(self, context_manager, mock_db):
+        """Should query active skills from DB and return structured dicts."""
+        skill = MagicMock()
+        skill.skill_name = "code_review"
+        skill.description = "Review code"
+        skill.version = "1.0.0"
+        skill.skill_definition = {"repo_types": ["code"]}
+        skill.triggers = ["review", "pr"]
+
+        mock_db.query.return_value.filter.return_value.all.return_value = [skill]
+
+        result = context_manager._get_skill_definitions(4000)
+
+        assert len(result) == 1
+        assert result[0]["skill_name"] == "code_review"
+        assert result[0]["definition"] == {"repo_types": ["code"]}
+        assert result[0]["triggers"] == ["review", "pr"]
+
+    def test_returns_empty_on_db_error(self, context_manager, mock_db):
+        """Should return empty list on DB failure, not crash."""
+        mock_db.query.side_effect = Exception("connection lost")
+
+        result = context_manager._get_skill_definitions(4000)
+
+        assert result == []
+
+
+class TestGetCodeContext:
+    """Tests for _get_code_context file path extraction."""
+
+    def test_extracts_full_paths(self, context_manager):
+        """Should extract full file paths, not just extensions."""
+        events = [
+            {"event_id": "e1", "content": "Check core/context/manager.py and src/index.ts"},
+        ]
+        result = context_manager._get_code_context(events, 2000)
+
+        files = [r["file"] for r in result]
+        assert "core/context/manager.py" in files
+        assert "src/index.ts" in files
+
+    def test_handles_complex_paths(self, context_manager):
+        """Should handle hyphens, dots, and @ in paths."""
+        events = [
+            {"event_id": "e1", "content": "See my-app/src/App.tsx and @scope/pkg/index.js"},
+        ]
+        result = context_manager._get_code_context(events, 2000)
+
+        files = [r["file"] for r in result]
+        assert "my-app/src/App.tsx" in files
+        assert "@scope/pkg/index.js" in files
+
+    def test_deduplicates_paths(self, context_manager):
+        """Same file mentioned twice should appear once."""
+        events = [
+            {"event_id": "e1", "content": "Fix main.py"},
+            {"event_id": "e2", "content": "Also check main.py"},
+        ]
+        result = context_manager._get_code_context(events, 2000)
+
+        assert len(result) == 1
+        assert result[0]["file"] == "main.py"

@@ -463,42 +463,61 @@ class ContextManager:
             return fallbacks.get(task_type, fallbacks[TaskType.GENERAL])
 
     def _get_skill_definitions(self, token_budget: int) -> list[dict[str, Any]]:
-        """Get available skill definitions within budget."""
-        # Return empty list for now (skills_registry schema mismatch)
-        return []
+        """Get active skill definitions from DB within token budget."""
+        from api.models import SkillRegistry as SkillModel
+
+        try:
+            skills = self.db.query(SkillModel).filter(
+                SkillModel.is_active == 1
+            ).all()
+        except Exception as e:
+            logger.warning("Failed to load skill definitions: %s", e)
+            return []
+
+        result = []
+        for s in skills:
+            defn = {
+                "skill_name": s.skill_name,
+                "description": s.description or "",
+                "version": s.version,
+            }
+            if s.skill_definition:
+                defn["definition"] = s.skill_definition
+            if s.triggers:
+                defn["triggers"] = s.triggers
+            result.append(defn)
+
+        return result
 
     def _get_code_context(
         self, selected_events: list[dict[str, Any]], token_budget: int
     ) -> list[dict[str, Any]]:
-        """Extract code context from events and repos.
+        """Extract code context from events.
 
-        Strategy:
-        1. Extract file paths mentioned in events
-        2. Get repo info from session
-        3. Return file summaries
+        Extracts file paths mentioned in event content using regex,
+        then returns de-duplicated file references.
         """
-        code_files: list[dict[str, str]] = []
-
-        # Extract file paths from event content
         import re
 
-        file_pattern = r"[\w/]+\.(py|js|go|java|rs|cpp|c|h)"
+        # Non-capturing group so findall returns full match, not just extension.
+        # Supports hyphens, dots, and @ in directory/file names.
+        file_pattern = r"[\w.@/-]+\.(?:py|tsx|ts|jsx|js|go|java|rs|cpp|c|h|rb|sh|yaml|yml|json|toml)"
 
-        for event in selected_events[:5]:  # Check recent 5 events
+        seen: set[str] = set()
+        code_files: list[dict[str, str]] = []
+
+        for event in selected_events[:5]:
             content = event.get("content", "")
-            matches = re.findall(file_pattern, content)
-
-            for match in matches:
-                if len(code_files) >= 5:  # Limit to 5 files
-                    break
-
-                code_files.append(
-                    {
-                        "file": match,
-                        "mentioned_in": event["event_id"],
-                        "summary": f"File mentioned in conversation: {match}",
-                    }
-                )
+            for match in re.finditer(file_pattern, content):
+                path = match.group()
+                if path in seen or len(code_files) >= 5:
+                    continue
+                seen.add(path)
+                code_files.append({
+                    "file": path,
+                    "mentioned_in": event["event_id"],
+                    "summary": f"File mentioned in conversation: {path}",
+                })
 
         return code_files
 
@@ -535,7 +554,7 @@ class ContextManager:
 
         # Extract skills used (name and version)
         skills_used = [
-            {"name": s["name"], "version": s.get("version", "latest")}
+            {"name": s.get("name") or s.get("skill_name", ""), "version": s.get("version", "latest")}
             for s in context.skill_definitions
         ]
 
