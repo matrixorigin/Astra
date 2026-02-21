@@ -579,3 +579,40 @@ class TestObserverEdgeCases:
 
         with pytest.raises(RuntimeError, match="DB error"):
             observer.observe("s1", "u1", _make_messages())
+
+
+class TestObserverDedup:
+    """Deduplication and confidence scoring."""
+
+    def _setup(self, observer):
+        observer.db.query.return_value.filter.return_value.scalar.return_value = 0
+
+    def test_within_batch_dedup(self, observer, db):
+        """Duplicate content within a single LLM response should be stored only once."""
+        self._setup(observer)
+        observer.llm.chat_with_tools.return_value = {
+            "content": json.dumps([
+                {"content": "User prefers Python", "priority": "high", "type": "preference"},
+                {"content": "User prefers Python", "priority": "medium", "type": "preference"},
+                {"content": "Project uses FastAPI", "priority": "medium", "type": "fact"},
+            ])
+        }
+        result = observer.observe("s1", "u1", _make_messages())
+        assert len(result) == 2
+        contents = [r["content"] for r in result]
+        assert contents == ["User prefers Python", "Project uses FastAPI"]
+
+    def test_confidence_from_priority(self, observer, db):
+        """Observations should have confidence derived from priority."""
+        self._setup(observer)
+        observer.llm.chat_with_tools.return_value = {
+            "content": json.dumps([
+                {"content": "Critical decision", "priority": "high", "type": "decision"},
+                {"content": "Some context", "priority": "medium", "type": "fact"},
+                {"content": "Minor detail", "priority": "low", "type": "fact"},
+            ])
+        }
+        result = observer.observe("s1", "u1", _make_messages())
+        assert result[0]["confidence"] == 0.95
+        assert result[1]["confidence"] == 0.75
+        assert result[2]["confidence"] == 0.5

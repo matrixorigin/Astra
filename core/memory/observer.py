@@ -181,6 +181,7 @@ class Observer:
             source_event_ids="[]",
             is_reflected=1,  # Already "reflected" so it never shows in context
             observed_msg_index=new_idx,
+            confidence=0.0,
         )
         self.db.add(marker)
         self.db.commit()
@@ -227,7 +228,11 @@ class Observer:
         source_messages: list[dict[str, Any]],
         observed_msg_index: int,
     ) -> list[dict[str, Any]]:
-        """Persist observations to DB in a single transaction."""
+        """Persist observations to DB in a single transaction.
+
+        Deduplicates against existing observations in the same session
+        (exact content match). Assigns confidence from priority.
+        """
         from api.models import Observation
 
         source_ids = [
@@ -236,12 +241,31 @@ class Observer:
             if m.get("event_id")
         ]
 
+        # Load existing content for dedup
+        try:
+            existing = set(
+                row[0] for row in
+                self.db.query(Observation.content).filter(
+                    Observation.session_id == session_id,
+                    Observation.observation_type != "marker",
+                ).all()
+            )
+        except Exception:
+            existing = set()
+
+        priority_confidence = {"high": 0.95, "medium": 0.75, "low": 0.5}
         now = datetime.now()
         stored = []
 
         for obs in raw_observations:
             if not isinstance(obs, dict) or not obs.get("content"):
                 continue
+
+            content = obs["content"]
+            if content in existing:
+                logger.debug("Observer: skipping duplicate observation: %s", content[:80])
+                continue
+            existing.add(content)
 
             ref_at = None
             if obs.get("referenced_at"):
@@ -250,23 +274,28 @@ class Observer:
                 except (ValueError, TypeError):
                     pass
 
+            priority = obs.get("priority", "medium")
+            confidence = priority_confidence.get(priority, 0.75)
+
             entry = Observation(
                 observation_id=str(uuid.uuid4()),
                 user_id=user_id,
                 session_id=session_id,
-                content=obs["content"],
-                priority=obs.get("priority", "medium"),
+                content=content,
+                priority=priority,
                 observation_type=obs.get("type", "fact"),
                 observed_at=now,
                 referenced_at=ref_at,
                 source_event_ids=json.dumps(source_ids),
                 observed_msg_index=observed_msg_index,
+                confidence=confidence,
             )
             self.db.add(entry)
             stored.append({
                 "observation_id": entry.observation_id,
                 "content": entry.content,
                 "priority": entry.priority,
+                "confidence": confidence,
             })
 
         if stored:
@@ -309,6 +338,7 @@ class Observer:
                 "referenced_at": r.referenced_at.isoformat() if r.referenced_at else None,
                 "session_id": r.session_id,
                 "is_reflected": bool(r.is_reflected),
+                "confidence": getattr(r, "confidence", 0.75),
             }
             for r in reversed(rows)  # chronological order
         ]

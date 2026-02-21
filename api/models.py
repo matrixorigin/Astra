@@ -499,6 +499,7 @@ class Observation(Base):
     is_reflected = Column(TINYINT(1), server_default="0")  # Consumed by Reflector
     version = Column(Integer, default=1)             # Bumped on reflection rewrite
     observed_msg_index = Column(Integer, default=0)  # Messages observed up to this index
+    confidence = Column(Float, default=0.75)         # Confidence score (derived from priority)
 
     created_at = Column(DateTime, default=func.now())
 
