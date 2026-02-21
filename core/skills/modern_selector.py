@@ -163,8 +163,7 @@ class ModernSkillSelector:
         """Return top-ranked candidate when LLM function calling fails.
 
         Preserves the semantic/keyword ranking from retrieval stage.
-        Uses empty arguments — the caller (ChatLoop) can re-prompt the LLM
-        for parameter extraction if needed.
+        Marks arguments as pending — the caller must prompt for parameter extraction.
         """
         if not tools_schema:
             return []
@@ -172,7 +171,7 @@ class ModernSkillSelector:
         logger.warning(
             "Fallback selection: %s (from %d candidates)", top["name"], len(tools_schema),
         )
-        return [{"function": {"name": top["name"], "arguments": "{}"}}]
+        return [{"function": {"name": top["name"], "arguments": None}, "fallback": True}]
 
     def _skill_to_tool_schema(self, skill: SkillMetadata) -> dict[str, Any]:
         """Convert skill metadata to OpenAI tool schema.
@@ -218,7 +217,9 @@ class ModernSkillSelector:
 
     @staticmethod
     def _strip_framework_fields(schema: dict[str, Any]) -> dict[str, Any]:
-        """Remove framework-injected fields from tool schema."""
+        """Remove framework-injected fields and inline $defs for OpenAI compatibility."""
+        # Inline $ref/$defs — OpenAI function calling doesn't support JSON Schema references
+        schema = ModernSkillSelector._inline_refs(schema)
         from core.skills.base import SkillInput
         fw = SkillInput._FRAMEWORK_FIELDS
         props = schema.get("properties", {})
@@ -228,6 +229,25 @@ class ModernSkillSelector:
         if req:
             schema["required"] = [r for r in req if r not in fw]
         return schema
+
+    @staticmethod
+    def _inline_refs(schema: dict[str, Any]) -> dict[str, Any]:
+        """Recursively resolve $ref pointers against $defs, producing a self-contained schema."""
+        defs = schema.pop("$defs", None) or schema.pop("definitions", None)
+        if not defs:
+            return schema
+
+        def _resolve(node: Any) -> Any:
+            if isinstance(node, dict):
+                if "$ref" in node:
+                    ref_name = node["$ref"].rsplit("/", 1)[-1]
+                    return _resolve(defs.get(ref_name, node))
+                return {k: _resolve(v) for k, v in node.items()}
+            if isinstance(node, list):
+                return [_resolve(item) for item in node]
+            return node
+
+        return _resolve(schema)
 
     def _get_default_schema(self, skill_name: str) -> dict[str, Any]:
         """Default schema for skills without a Pydantic model."""
@@ -336,7 +356,12 @@ class AdaptiveSkillOrchestrator:
         results = []
         for tool_call in tool_calls:
             skill_name = tool_call["function"]["name"]
-            arguments = json.loads(tool_call["function"]["arguments"])
+            raw_args = tool_call["function"]["arguments"]
+            if raw_args is None:
+                # Fallback selection — no arguments extracted, skip execution
+                logger.warning("Skipping %s: fallback selection, no arguments", skill_name)
+                continue
+            arguments = json.loads(raw_args)
 
             # Get skill metadata
             skill = self.selector.rule_selector.get_skill_by_name(skill_name)

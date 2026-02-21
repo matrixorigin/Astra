@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import Mock
 
-from core.skills.selector import SkillSelector, SkillMetadata, SkillOrchestrator
+from core.skills.selector import SkillSelector, SkillMetadata
 
 
 
@@ -152,109 +152,3 @@ class TestSkillSelector:
         skills = selector.list_skills_by_category("nonexistent")
         
         assert skills == []
-
-
-class TestSkillOrchestrator:
-    """Test SkillOrchestrator."""
-
-    def test_plan_execution_with_skills(self, db):
-        """Test execution planning with selected skills."""
-        orchestrator = SkillOrchestrator(db)
-        
-        # Register test skills with triggers
-        from core.skills.selector import SkillMetadata
-        skills = [
-            SkillMetadata(name="skill_a", version="1.0.0", description="A", category="test", subcategory="sub", triggers=["trigger_a"], dependencies=[], priority=5, cost_estimate="low"),
-            SkillMetadata(name="skill_b", version="1.0.0", description="B", category="test", subcategory="sub", triggers=["trigger_b"], dependencies=[], priority=5, cost_estimate="low")
-        ]
-        for skill in skills:
-            orchestrator.selector.skills[skill.name] = skill
-        
-        plan = orchestrator.plan_execution("trigger_a trigger_b")
-        
-        assert "skills" in plan
-        assert "execution_order" in plan
-        assert "estimated_cost" in plan
-        assert len(plan["skills"]) > 0
-        assert plan["dependencies_resolved"] is True
-
-    def test_plan_execution_no_skills(self, db):
-        """Test execution planning with no matching skills."""
-        orchestrator = SkillOrchestrator(db)
-        
-        plan = orchestrator.plan_execution("unrelated query xyz")
-        
-        assert plan["skills"] == []
-        assert plan["execution_order"] == []
-        assert plan["estimated_cost"] == "none"
-
-    def test_estimate_total_cost_low(self, db):
-        """Test cost estimation - low."""
-        orchestrator = SkillOrchestrator(db)
-        
-        skills = [
-            SkillMetadata(
-                name="s1", version="1.0.0", description="", category="test",
-                subcategory="sub", triggers=[], dependencies=[],
-                priority=5, cost_estimate="low"
-            )
-        ]
-        
-        cost = orchestrator._estimate_total_cost(skills)
-        
-        assert cost == "low"
-
-    def test_estimate_total_cost_medium(self, db):
-        """Test cost estimation - medium."""
-        orchestrator = SkillOrchestrator(db)
-        
-        skills = [
-            SkillMetadata(
-                name="s1", version="1.0.0", description="", category="test",
-                subcategory="sub", triggers=[], dependencies=[],
-                priority=5, cost_estimate="low"
-            ),
-            SkillMetadata(
-                name="s2", version="1.0.0", description="", category="test",
-                subcategory="sub", triggers=[], dependencies=[],
-                priority=5, cost_estimate="medium"
-            )
-        ]
-        
-        cost = orchestrator._estimate_total_cost(skills)
-        
-        assert cost == "medium"
-
-    def test_estimate_total_cost_high(self, db):
-        """Test cost estimation - high."""
-        orchestrator = SkillOrchestrator(db)
-        
-        skills = [
-            SkillMetadata(
-                name="s1", version="1.0.0", description="", category="test",
-                subcategory="sub", triggers=[], dependencies=[],
-                priority=5, cost_estimate="high"
-            ),
-            SkillMetadata(
-                name="s2", version="1.0.0", description="", category="test",
-                subcategory="sub", triggers=[], dependencies=[],
-                priority=5, cost_estimate="high"
-            )
-        ]
-        
-        cost = orchestrator._estimate_total_cost(skills)
-        
-        assert cost == "high"
-
-    def test_plan_execution_includes_skill_details(self, db):
-        """Test plan includes all skill details."""
-        orchestrator = SkillOrchestrator(db)
-        
-        plan = orchestrator.plan_execution("trigger_a")
-        
-        if plan["skills"]:
-            skill = plan["skills"][0]
-            assert "name" in skill
-            assert "description" in skill
-            assert "category" in skill
-            assert "priority" in skill

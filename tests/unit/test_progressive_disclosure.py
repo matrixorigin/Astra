@@ -278,7 +278,8 @@ class TestFallbackSelection:
 
         assert len(result) == 1
         assert result[0]["function"]["name"] == "code_review"
-        assert result[0]["function"]["arguments"] == "{}"
+        assert result[0]["function"]["arguments"] is None
+        assert result[0]["fallback"] is True
 
     def test_fallback_preserves_ranking_order(self, db):
         """Fallback should use the semantic/keyword ranked order, not arbitrary."""
@@ -332,10 +333,43 @@ class TestFallbackSelection:
         result = sel._fallback_selection(tools)
         assert len(result) == 1
         assert result[0]["function"]["name"] == "skill_a"  # top-ranked
+        assert result[0]["function"]["arguments"] is None  # no fake empty args
+        assert result[0]["fallback"] is True
 
     def test_fallback_selection_empty_input(self):
         sel = ModernSkillSelector.__new__(ModernSkillSelector)
         assert sel._fallback_selection([]) == []
+
+
+class TestInlineRefs:
+    """Test $ref/$defs inlining for OpenAI compatibility."""
+
+    def test_no_defs_passthrough(self):
+        schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+        assert ModernSkillSelector._inline_refs(schema) == schema
+
+    def test_inline_nested_ref(self):
+        schema = {
+            "$defs": {"Addr": {"type": "object", "properties": {"city": {"type": "string"}}}},
+            "type": "object",
+            "properties": {"home": {"$ref": "#/$defs/Addr"}},
+        }
+        result = ModernSkillSelector._inline_refs(schema)
+        assert "$defs" not in result
+        assert "$ref" not in result["properties"]["home"]
+        assert result["properties"]["home"]["properties"]["city"]["type"] == "string"
+
+    def test_inline_anyof_ref(self):
+        schema = {
+            "$defs": {"Addr": {"type": "object", "properties": {"city": {"type": "string"}}}},
+            "type": "object",
+            "properties": {
+                "addr": {"anyOf": [{"$ref": "#/$defs/Addr"}, {"type": "null"}]}
+            },
+        }
+        result = ModernSkillSelector._inline_refs(schema)
+        resolved = result["properties"]["addr"]["anyOf"][0]
+        assert resolved["type"] == "object"
 
 
 # ===========================================================================

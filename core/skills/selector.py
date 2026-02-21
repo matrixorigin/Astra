@@ -10,7 +10,6 @@ External code should use SkillPipeline from core.skills.pipeline.
 """
 
 from dataclasses import dataclass
-from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -167,59 +166,3 @@ class SkillSelector:
     def list_skills_by_category(self, category: str) -> list[SkillMetadata]:
         """List skills in a category."""
         return [s for s in self.skills.values() if s.category == category]
-
-
-class SkillOrchestrator:
-    """Orchestrate skill selection and execution."""
-
-    def __init__(self, session: Session | None = None):
-        self._session = session
-        self.selector = SkillSelector(session)
-
-    def plan_execution(self, query: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Plan skill execution for query.
-
-        Args:
-            query: User query
-            context: Optional context information
-
-        Returns:
-            Execution plan with selected skills
-        """
-        # Select skills
-        selected_skills = self.selector.select_skills(query)
-
-        if not selected_skills:
-            return {"skills": [], "execution_order": [], "estimated_cost": "none"}
-
-        # Build execution plan
-        plan = {
-            "skills": [
-                {
-                    "name": s.name,
-                    "description": s.description,
-                    "category": s.category,
-                    "priority": s.priority,
-                }
-                for s in selected_skills
-            ],
-            "execution_order": [s.name for s in selected_skills],
-            "estimated_cost": self._estimate_total_cost(selected_skills),
-            "dependencies_resolved": True,
-        }
-
-        logger.info(f"Execution plan: {plan['execution_order']}")
-
-        return plan
-
-    def _estimate_total_cost(self, skills: list[SkillMetadata]) -> str:
-        """Estimate total cost of skill execution."""
-        cost_map = {"low": 1, "medium": 2, "high": 3}
-        total = sum(cost_map.get(s.cost_estimate, 1) for s in skills)
-
-        if total <= 2:
-            return "low"
-        elif total <= 5:
-            return "medium"
-        else:
-            return "high"
