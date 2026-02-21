@@ -805,3 +805,38 @@ class TestSelfImprovingSelector:
         assert len(original) == len(original_copy)
         for a, b in zip(original, original_copy):
             assert a.name == b.name
+
+    def test_apply_learnings_deterministic_order_on_tie(self, self_improving, db):
+        """Same-score candidates must be sorted by name for deterministic output."""
+        from api.models import SkillSelectionLearning
+        from core.skills.pipeline import SkillCandidate
+
+        # Create a learning that boosts both skills equally
+        learning = SkillSelectionLearning(
+            learning_id=f"learn-{uuid.uuid4().hex[:8]}",
+            query_pattern="deploy",
+            wrong_skills=[],
+            correct_skills=["zz_deploy", "aa_deploy"],
+            signal_type="wrong_skill",
+            confidence=0.9,
+            evidence_count=5,
+            applied_count=0,
+            is_active=1,
+        )
+        db.add(learning)
+        db.commit()
+
+        candidates = [
+            SkillCandidate(name="zz_deploy"),
+            SkillCandidate(name="aa_deploy"),
+        ]
+        result = self_improving.apply_learnings("deploy service", candidates)
+        names = [c.name for c in result]
+
+        # Both get same boost → tiebreaker is alphabetical
+        # Run twice to confirm determinism
+        result2 = self_improving.apply_learnings("deploy service", candidates)
+        names2 = [c.name for c in result2]
+        assert names == names2
+        # Alphabetical tiebreaker: aa before zz
+        assert names.index("aa_deploy") < names.index("zz_deploy")

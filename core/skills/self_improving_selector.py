@@ -497,7 +497,7 @@ class SelfImprovingSelector:
         if not scored:
             return candidates
 
-        scored.sort(key=lambda item: item[1], reverse=True)
+        scored.sort(key=lambda item: (-item[1], item[0]))
         return [candidate_map[name] for name, _ in scored]
 
     def _embed_query(self, query: str) -> list[float] | None:
