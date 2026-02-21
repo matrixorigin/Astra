@@ -5,7 +5,6 @@ from typing import Any
 from core.skills.base import AccessScope, RepoType, Skill, SkillInput, SkillOutput, SkillRequirement
 from core.skills.github_client import GitHubClient
 from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 # ============================================================================
 # Code Review Skill
@@ -32,11 +31,11 @@ class CodeReviewSkill(Skill):
     output_schema = CodeReviewOutput
 
     def __init__(self, github: GitHubClient, session: Session | None = None):
-        self.db = db
+        self.db = session
         self.github = github
 
-    def execute(self, input: CodeReviewInput) -> CodeReviewOutput:  # type: ignore[override]
-        pr = self.github.get_pr(input.repo_id, input.pr_number)
+    async def execute(self, input: CodeReviewInput) -> CodeReviewOutput:  # type: ignore[override]
+        pr = await self.github.get_pr(input.repo_id, input.pr_number)
         review = {
             "pr_number": input.pr_number,
             "files_changed": pr.get("changed_files", 0),
@@ -75,10 +74,10 @@ class SearchCodeSkill(Skill):
     output_schema = SearchCodeOutput
 
     def __init__(self, github: GitHubClient, session: Session | None = None):
-        self.db = db
+        self.db = session
         self.github = github
 
-    def execute(self, input: SearchCodeInput) -> SearchCodeOutput:
+    async def execute(self, input: SearchCodeInput) -> SearchCodeOutput:
         results = [{"file": "example.py", "line": 42, "content": f"Match for: {input.query}"}]
         return SearchCodeOutput(success=True, result=results, results=results)
 
@@ -108,10 +107,10 @@ class GenerateTestsSkill(Skill):
     output_schema = GenerateTestsOutput
 
     def __init__(self, github: GitHubClient, session: Session | None = None):
-        self.db = db
+        self.db = session
         self.github = github
 
-    def execute(self, input: GenerateTestsInput) -> GenerateTestsOutput:
+    async def execute(self, input: GenerateTestsInput) -> GenerateTestsOutput:
         test_code = f"def test_{input.function_name}():\n    pass"
         return GenerateTestsOutput(success=True, result=test_code, test_code=test_code)
 
@@ -140,10 +139,10 @@ class AnalyzeBugSkill(Skill):
     output_schema = AnalyzeBugOutput
 
     def __init__(self, github: GitHubClient, session: Session | None = None):
-        self.db = db
+        self.db = session
         self.github = github
 
-    def execute(self, input: AnalyzeBugInput) -> AnalyzeBugOutput:
+    async def execute(self, input: AnalyzeBugInput) -> AnalyzeBugOutput:
         analysis = {
             "issue_number": input.issue_number,
             "severity": "medium",
@@ -166,7 +165,7 @@ def register_extended_skills(registry, db, github=None):
 
     skills = [
         (
-            CodeReviewSkill(db, github),
+            CodeReviewSkill(github, db),
             "github",
             "pr_management",
             ["review", "code review"],
@@ -174,9 +173,9 @@ def register_extended_skills(registry, db, github=None):
             8,
             "medium",
         ),
-        (SearchCodeSkill(db, github), "code", "analysis", ["search", "find", "code"], [], 6, "low"),
+        (SearchCodeSkill(github, db), "code", "analysis", ["search", "find", "code"], [], 6, "low"),
         (
-            GenerateTestsSkill(db, github),
+            GenerateTestsSkill(github, db),
             "code",
             "testing",
             ["test", "generate", "unit test"],
@@ -185,7 +184,7 @@ def register_extended_skills(registry, db, github=None):
             "high",
         ),
         (
-            AnalyzeBugSkill(db, github),
+            AnalyzeBugSkill(github, db),
             "github",
             "issue_management",
             ["bug", "issue", "analyze"],

@@ -1,15 +1,19 @@
 """GitHub client wrapper for skills."""
 
+import asyncio
+import time
+
 from github import Auth, Github, GithubException
 
 from config.settings import get_settings
 from core.exceptions import GitHubError, GitHubRateLimitError
 from core.logging_config import get_logger
 from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 settings = get_settings()
 logger = get_logger(__name__)
+
+RATE_LIMIT_THRESHOLD = 10  # pre-emptive pause when remaining < threshold
 
 
 class GitHubClient:
@@ -67,6 +71,27 @@ class GitHubClient:
                     f"GitHub API error: {e.data.get('message', str(e))}", status_code=e.status
                 ) from e
 
+    async def _check_rate_limit(self) -> None:
+        """Pre-emptively wait if GitHub API rate limit is nearly exhausted."""
+        now = time.monotonic()
+        if now - getattr(self, "_rl_checked_at", 0) < 60:
+            return
+        try:
+            rl = self.client.get_rate_limit()
+            self._rl_checked_at = now
+            core = getattr(rl, "core", None)
+            if core and core.remaining < RATE_LIMIT_THRESHOLD:
+                reset_ts = core.reset.timestamp() if core.reset else 0
+                wait = max(0, reset_ts - time.time()) + 1
+                if wait > 0:
+                    logger.warning(
+                        f"GitHub rate limit low ({core.remaining}/{core.limit}), "
+                        f"waiting {wait:.0f}s until reset"
+                    )
+                    await asyncio.sleep(min(wait, 60))  # cap at 60s
+        except Exception as exc:
+            logger.debug(f"Rate limit check failed (non-fatal): {exc}")
+
     async def get_pr(self, repo_id: int, pr_number: int) -> dict:
         """Fetch PR details from GitHub.
 
@@ -81,6 +106,7 @@ class GitHubClient:
             GitHubError: If API call fails
         """
         logger.info(f"Fetching PR #{pr_number} from repo {repo_id}")
+        await self._check_rate_limit()
 
         try:
             repo = self._get_repo(repo_id)
@@ -121,6 +147,7 @@ class GitHubClient:
             Diff string
         """
         logger.info(f"Fetching diff for PR #{pr_number} from repo {repo_id}")
+        await self._check_rate_limit()
 
         try:
             repo = self._get_repo(repo_id)
@@ -156,6 +183,7 @@ class GitHubClient:
             List of PR dicts
         """
         logger.info(f"Listing PRs from repo {repo_id}, state={state}, limit={limit}")
+        await self._check_rate_limit()
 
         try:
             repo = self._get_repo(repo_id)
@@ -197,6 +225,7 @@ class GitHubClient:
             List of workflow run dicts
         """
         logger.info(f"Listing workflow runs from repo {repo_id}, limit={limit}")
+        await self._check_rate_limit()
 
         try:
             repo = self._get_repo(repo_id)
