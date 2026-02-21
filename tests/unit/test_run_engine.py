@@ -105,7 +105,8 @@ class TestRunEngineStartRun:
         mock_loop.run_step_stream = failing_stream
 
         with patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
-            await engine.start_run(run)
+            with pytest.raises(RuntimeError, match="LLM exploded"):
+                await engine.start_run(run)
 
         assert run.status == RunStatus.FAILED
         events = _run_events[run.run_id]
@@ -128,7 +129,8 @@ class TestRunEngineStartRun:
         mock_loop.run_step_stream = slow_stream
 
         with patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
-            await engine.start_run(run)
+            with pytest.raises(asyncio.TimeoutError):
+                await engine.start_run(run)
 
         assert run.status == RunStatus.FAILED
         events = _run_events[run.run_id]
@@ -339,8 +341,9 @@ class TestTryClaimResume:
         db = MagicMock()
         db.execute.side_effect = RuntimeError("connection lost")
         engine = self._make_engine(db)
-        # Fallback: allow resume in single-worker mode
-        assert engine._try_claim_resume("run-1") is True
+        # Fail safe: reject on error in distributed mode
+        assert engine._try_claim_resume("run-1") is False
+        db.rollback.assert_called_once()
 
 
 class TestMultiAgentRuns:
@@ -358,6 +361,7 @@ class TestMultiAgentRuns:
         mock_loop.run_step_stream = stream
         mock_loop._current_run_id = None
 
+        # Patch _build_chat_loop in the module where it's imported
         with patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
             child = await engine.create_child_run(
                 parent_run_id=parent.run_id,
@@ -365,13 +369,13 @@ class TestMultiAgentRuns:
                 task="Review for security issues",
             )
 
-        assert child.parent_run_id == parent.run_id
-        assert child.agent_id == "security_reviewer"
-        assert child.session_id == parent.session_id
-        assert child.run_id in _child_runs[parent.run_id]
-        assert child.run_id in _run_tasks
-        # Wait for child to finish
-        await _run_tasks[child.run_id]
+            assert child.parent_run_id == parent.run_id
+            assert child.agent_id == "security_reviewer"
+            assert child.session_id == parent.session_id
+            assert child.run_id in _child_runs[parent.run_id]
+            assert child.run_id in _run_tasks
+            # Wait for child to finish (within patch context)
+            await _run_tasks[child.run_id]
 
     @pytest.mark.asyncio
     async def test_create_child_run_unknown_parent(self, engine):

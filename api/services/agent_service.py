@@ -3,10 +3,78 @@
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field, field_validator
 
 from api.repositories import AgentRepository
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
+
+
+class CreateAgentRequest(BaseModel):
+    """Agent创建请求验证模型"""
+    name: str = Field(..., min_length=1, max_length=100, description="Agent名称")
+    agent_config: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Agent配置")
+    data_source: Optional[Dict[str, Any]] = Field(default_factory=dict, description="数据源配置")
+    
+    @field_validator('name')
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        """验证名称不为空白"""
+        if not v or not v.strip():
+            raise ValueError('Agent name cannot be empty or whitespace')
+        return v.strip()
+    
+    @field_validator('agent_config')
+    @classmethod
+    def validate_agent_config(cls, v: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """验证agent_config必须是字典"""
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            raise ValueError('agent_config must be a dictionary')
+        return v
+    
+    @field_validator('data_source')
+    @classmethod
+    def validate_data_source(cls, v: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """验证data_source必须是字典"""
+        if v is None:
+            return {"type": "matrixone", "database": "dev_agent"}
+        if not isinstance(v, dict):
+            raise ValueError('data_source must be a dictionary')
+        return v
+
+
+class UpdateAgentRequest(BaseModel):
+    """Agent更新请求验证模型"""
+    name: Optional[str] = Field(None, min_length=1, max_length=100, description="Agent名称")
+    agent_config: Optional[Dict[str, Any]] = Field(None, description="Agent配置")
+    data_source: Optional[Dict[str, Any]] = Field(None, description="数据源配置")
+    is_active: Optional[bool] = Field(None, description="是否激活")
+    
+    @field_validator('name')
+    @classmethod
+    def validate_name(cls, v: Optional[str]) -> Optional[str]:
+        """验证名称不为空白"""
+        if v is not None and (not v or not v.strip()):
+            raise ValueError('Agent name cannot be empty or whitespace')
+        return v.strip() if v else None
+    
+    @field_validator('agent_config')
+    @classmethod
+    def validate_agent_config(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """验证agent_config必须是字典"""
+        if v is not None and not isinstance(v, dict):
+            raise ValueError('agent_config must be a dictionary')
+        return v
+    
+    @field_validator('data_source')
+    @classmethod
+    def validate_data_source(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """验证data_source必须是字典"""
+        if v is not None and not isinstance(v, dict):
+            raise ValueError('data_source must be a dictionary')
+        return v
 
 
 class AgentService:
@@ -30,7 +98,6 @@ class AgentService:
         Args:
             user_id: 用户ID
             name: Agent名称
-            description: 描述
             agent_config: Agent配置
             data_source: 数据源配置
             
@@ -40,43 +107,43 @@ class AgentService:
         Raises:
             ValueError: 参数错误
         """
-        # 1. 参数验证
-        if not name or not name.strip():
-            raise ValueError("Agent name 不能为空")
+        # 1. 参数验证 - 使用Pydantic模型
+        try:
+            request = CreateAgentRequest(
+                name=name,
+                agent_config=agent_config,
+                data_source=data_source
+            )
+        except Exception as e:
+            raise ValueError(f"Invalid input: {e}")
         
-        # 2. 设置默认值
-        if agent_config is None:
-            agent_config = {}
-        if data_source is None:
-            data_source = {"type": "matrixone", "database": "dev_agent"}
-        
-        # 3. 创建 Agent
+        # 2. 创建 Agent
         try:
             from uuid_utils import uuid7
             
             agent_data = {
                 "agent_id": str(uuid7()),  # 生成agent_id
-                "agent_name": name,  # 使用正确的字段名
+                "agent_name": request.name,  # 使用验证后的数据
                 "agent_type": "general",  # 设置默认类型
                 "owner_user_id": user_id,
-                "agent_config": agent_config,
-                "data_source": data_source,
+                "agent_config": request.agent_config,
+                "data_source": request.data_source,
                 "is_active": True
             }
             
             agent = self.agent_repo.create(agent_data)
             
-            # 4. 审计日志
+            # 3. 审计日志
             self.audit.log(
                 user_id=user_id,
                 action="agent_create",
                 resource_type="agent",
                 resource_id=agent.agent_id,
-                details={"name": name},
+                details={"name": request.name},
                 status="success"
             )
             
-            # 5. 返回结果
+            # 4. 返回结果
             return {
                 "agent_id": agent.agent_id,
                 "name": agent.agent_name,  # 映射字段名
@@ -176,7 +243,6 @@ class AgentService:
             agent_id: Agent ID
             user_id: 用户ID
             name: 新名称
-            description: 新描述
             agent_config: 新配置
             data_source: 新数据源
             is_active: 是否激活
@@ -187,6 +253,18 @@ class AgentService:
         Raises:
             ValueError: Agent不存在或无权限
         """
+        # 1. 参数验证 - 使用Pydantic模型
+        try:
+            request = UpdateAgentRequest(
+                name=name,
+                agent_config=agent_config,
+                data_source=data_source,
+                is_active=is_active
+            )
+        except Exception as e:
+            raise ValueError(f"Invalid input: {e}")
+        
+        # 2. 获取并验证Agent
         agent = self.agent_repo.get_by_id(agent_id)
         
         if not agent:
@@ -196,16 +274,16 @@ class AgentService:
         if agent.owner_user_id != user_id:
             raise ValueError(f"无权限修改 Agent {agent_id}")
         
-        # 准备更新数据
+        # 3. 准备更新数据
         update_data = {}
-        if name is not None:
-            update_data["agent_name"] = name  # 使用正确的字段名
-        if agent_config is not None:
-            update_data["agent_config"] = agent_config
-        if data_source is not None:
-            update_data["data_source"] = data_source
-        if is_active is not None:
-            update_data["is_active"] = is_active
+        if request.name is not None:
+            update_data["agent_name"] = request.name
+        if request.agent_config is not None:
+            update_data["agent_config"] = request.agent_config
+        if request.data_source is not None:
+            update_data["data_source"] = request.data_source
+        if request.is_active is not None:
+            update_data["is_active"] = request.is_active
         
         if not update_data:
             # 没有更新内容，直接返回当前信息

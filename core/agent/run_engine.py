@@ -4,6 +4,7 @@ Distributed-safe: all coordination through DB, no cross-worker in-memory deps.
 """
 
 import asyncio
+import gc
 import json
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
@@ -32,6 +33,37 @@ _resume_counters: dict[str, int] = {}  # run_id → resume count (for claim uniq
 _MAX_RESUME_INPUT_CHARS = 4000
 # Max completed runs to keep in memory before cleanup
 _MAX_COMPLETED_RUNS = 500
+# Periodic GC interval in seconds
+_GC_INTERVAL_SECONDS = 300
+
+# Global GC task reference
+_gc_task: asyncio.Task | None = None
+
+
+async def _periodic_gc() -> None:
+    """Clean up completed runs periodically to prevent memory leaks."""
+    while True:
+        try:
+            await asyncio.sleep(_GC_INTERVAL_SECONDS)
+            RunEngine._maybe_gc()
+            gc.collect()
+            logger.debug(f"Periodic GC: {len(_active_runs)} active runs, {len(_run_events)} event buffers")
+        except asyncio.CancelledError:
+            logger.info("Periodic GC task cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Periodic GC error: {e}", exc_info=True)
+
+
+def _start_gc_task() -> None:
+    """Start periodic GC task if not already running."""
+    global _gc_task
+    if _gc_task is None or _gc_task.done():
+        try:
+            _gc_task = asyncio.create_task(_periodic_gc())
+            logger.info("Started periodic GC task")
+        except RuntimeError:
+            logger.warning("Cannot start GC task: no running event loop")
 
 
 class RunEngine:
@@ -40,6 +72,8 @@ class RunEngine:
     def __init__(self, db: Session):
         self.db = db
         self.event_logger = EventLogger(db)
+        # Start GC task on first engine instantiation
+        _start_gc_task()
 
     # ── Public API ────────────────────────────────────────────
 
@@ -144,7 +178,7 @@ class RunEngine:
 
             if run.status == RunStatus.RUNNING:
                 self._complete_run(run)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             logger.error(f"Run {run.run_id} timed out after {timeout}s")
             run.status = RunStatus.FAILED
             self._log_run_event(run, EventType.RUN_FAILED, {"error": f"Run timed out after {timeout}s"})
@@ -152,9 +186,11 @@ class RunEngine:
                 "event_type": "run_error", "data": {"error": f"Run timed out after {timeout}s"},
                 "run_id": run.run_id,
             })
+            raise  # Re-raise to ensure proper cleanup
         except asyncio.CancelledError:
             run.status = RunStatus.CANCELLED
             self._log_run_event(run, EventType.RUN_CANCELLED)
+            raise  # Re-raise to ensure proper cleanup
         except Exception as e:
             logger.error(f"Run {run.run_id} failed: {e}", exc_info=True)
             run.status = RunStatus.FAILED
@@ -163,6 +199,7 @@ class RunEngine:
                 "event_type": "run_error", "data": {"error": str(e)},
                 "run_id": run.run_id,
             })
+            raise  # Re-raise to ensure proper cleanup
         finally:
             _run_tasks.pop(run.run_id, None)
             _run_waiters.get(run.run_id, asyncio.Event()).set()
@@ -471,11 +508,19 @@ class RunEngine:
 
         Uses a monotonic counter so adversarial loops (multiple resume cycles)
         each get a unique idx: -1, -2, -3, ...
+        
+        Uses SELECT FOR UPDATE for proper isolation in distributed scenarios.
         """
         counter = _resume_counters.get(run_id, 0) + 1
         _resume_counters[run_id] = counter
         claim_idx = -counter  # -1, -2, -3, ...
         try:
+            # Use SELECT FOR UPDATE for critical section
+            self.db.execute(
+                text("SELECT 1 FROM run_events WHERE run_id = :run_id LIMIT 1 FOR UPDATE"),
+                {"run_id": run_id}
+            )
+            # Then attempt insert
             self.db.execute(
                 text(
                     "INSERT INTO run_events (run_id, idx, event_type, data) "
@@ -493,8 +538,9 @@ class RunEngine:
             self.db.rollback()
             return False
         except Exception as e:
-            logger.debug(f"Claim resume failed for {run_id}: {e}")
-            return True  # On error, allow resume (single-worker fallback)
+            self.db.rollback()
+            logger.error(f"Claim resume failed for {run_id}: {e}")
+            return False  # Fail safe: reject on error in distributed mode
 
     def _is_cancelled_in_db(self, run_id: str) -> bool:
         try:
