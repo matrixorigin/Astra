@@ -14,6 +14,34 @@ from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
 
+
+def _normalize_value(v: str) -> str:
+    """Normalize a knowledge value for semantic-equivalent comparison.
+
+    Handles casing, whitespace, and common tech synonyms so that
+    'TypeScript' vs 'typescript' or 'JS' vs 'JavaScript' are treated
+    as the same value.
+    """
+    v = " ".join(v.lower().split())
+    synonyms = {
+        "js": "javascript",
+        "ts": "typescript",
+        "py": "python",
+        "golang": "go",
+        "k8s": "kubernetes",
+        "pg": "postgresql",
+        "postgres": "postgresql",
+        "mongo": "mongodb",
+        "react.js": "react",
+        "reactjs": "react",
+        "vue.js": "vue",
+        "vuejs": "vue",
+        "node.js": "node",
+        "nodejs": "node",
+    }
+    return synonyms.get(v, v)
+
+
 KNOWLEDGE_EXTRACTION_PROMPT = """\
 You extract structured knowledge from conversations. Output a JSON array ONLY.
 
@@ -244,7 +272,7 @@ class KnowledgeExtractor:
             if key in existing_entries:
                 existing = existing_entries[key]
                 now = datetime.now()
-                if existing.value == entry["value"]:
+                if _normalize_value(existing.value) == _normalize_value(entry["value"]):
                     # Same value — reinforce confidence
                     existing.confidence = min(1.0, existing.confidence + 0.1)
                     existing.version += 1

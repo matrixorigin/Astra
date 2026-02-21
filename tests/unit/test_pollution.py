@@ -136,3 +136,57 @@ class TestPollutionDetector:
         assert contradictions[0]["category"] == "user_preference"
         assert contradictions[0]["key_name"] == "language"
         assert contradictions[0]["value_count"] == 2
+
+    def test_cascade_impact_traces_through_snapshots(self, detector, mock_db):
+        """Test that cascade analysis parses context_snapshots to find affected decisions."""
+        import json
+
+        # Snapshot whose selected_events references the polluted entry
+        snap = Mock()
+        snap.context_capture_id = "snap_1"
+        snap.selected_events = [{"event_id": "ke_polluted", "score": 0.9}]
+
+        # Decision linked to that snapshot
+        decision = Mock()
+        decision.decision_id = "dec_1"
+        decision.context_capture_id = "snap_1"
+        decision.event_id = "evt_from_dec"
+
+        # Knowledge entry sourced from the decision's event
+        downstream = Mock()
+        downstream.entry_id = "ke_downstream"
+        downstream.source_event_ids = json.dumps(["evt_from_dec"])
+
+        # Wire up db.query routing
+        def route_query(model):
+            m = Mock()
+            name = model.__tablename__
+            if name == "context_snapshots":
+                m.all.return_value = [snap]
+            elif name == "decision_audit":
+                m.filter.return_value.all.return_value = [decision]
+            elif name == "knowledge_entries":
+                m.all.return_value = [downstream]
+            return m
+
+        mock_db.query.side_effect = route_query
+
+        result = detector.analyze_cascade_impact("ke_polluted")
+
+        assert result["affected_decisions"] == 1
+        assert result["affected_entries"] == 1
+        assert result["contamination_depth"] >= 1
+        assert "note" not in result  # No longer a placeholder
+
+    def test_cascade_impact_no_snapshots(self, detector, mock_db):
+        """Test cascade returns zero impact when no snapshots reference the entry."""
+        snap = Mock()
+        snap.context_capture_id = "snap_x"
+        snap.selected_events = [{"event_id": "unrelated"}]
+
+        mock_db.query.return_value.all.return_value = [snap]
+
+        result = detector.analyze_cascade_impact("ke_orphan")
+
+        assert result["affected_decisions"] == 0
+        assert result["affected_entries"] == 0

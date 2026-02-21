@@ -198,39 +198,92 @@ class PollutionDetector:
     def analyze_cascade_impact(
         self,
         entry_id: str,
+        max_depth: int = 5,
     ) -> dict[str, Any]:
         """Analyze cascade impact of a polluted entry.
-        
-        NOTE: This is a placeholder implementation. Full cascade analysis requires
-        parsing context_snapshots JSON to find which decisions used this entry.
-        
+
         Traces contamination graph:
-        1. Find decisions that used this entry (via context_snapshots)
-        2. Check if those decisions became memory entries
-        3. Recursively trace contamination chain
-        
+        1. Find context_snapshots whose selected_events contain this entry
+        2. Find decisions linked to those snapshots
+        3. Check if those decisions produced knowledge entries (via source_event_ids)
+        4. Recurse up to max_depth
+
         Args:
             entry_id: Polluted entry ID
-            
+            max_depth: Maximum recursion depth to prevent runaway queries
+
         Returns:
-            Impact analysis with affected events/entries counts
+            Impact analysis with affected decisions/entries counts
         """
-        from api.models import Event, KnowledgeEntry
+        from api.models import ContextSnapshot, DecisionAudit, KnowledgeEntry
         import json
-        
-        # TODO: Implement full cascade analysis by parsing context_snapshots
-        # For now, return placeholder counts
-        logger.warning(
-            f"Cascade impact analysis for {entry_id} is placeholder - "
-            "requires context_snapshots JSON parsing"
-        )
-        
+
+        # NOTE: Full-table scans below are unavoidable — selected_events is a JSON
+        # column and we need to match entry IDs inside JSON arrays.  This method is
+        # only called during offline pollution analysis, not on the hot path.
+
+        affected_decisions: set[str] = set()
+        affected_entries: set[str] = set()
+        frontier = {entry_id}
+        depth = 0
+
+        while frontier and depth < max_depth:
+            depth += 1
+            next_frontier: set[str] = set()
+
+            # Find snapshots that reference any frontier entry in selected_events
+            snapshots = self.db.query(ContextSnapshot).all()
+            hit_snapshot_ids: set[str] = set()
+            for snap in snapshots:
+                events = snap.selected_events or []
+                if isinstance(events, str):
+                    try:
+                        events = json.loads(events)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                event_ids = {e.get("event_id") or e for e in events if isinstance(e, (dict, str))}
+                if frontier & event_ids:
+                    hit_snapshot_ids.add(snap.context_capture_id)
+
+            if not hit_snapshot_ids:
+                break
+
+            # Find decisions linked to those snapshots
+            decisions = self.db.query(DecisionAudit).filter(
+                DecisionAudit.context_capture_id.in_(list(hit_snapshot_ids))
+            ).all()
+            new_decision_event_ids: set[str] = set()
+            for d in decisions:
+                if d.decision_id not in affected_decisions:
+                    affected_decisions.add(d.decision_id)
+                    if d.event_id:
+                        new_decision_event_ids.add(d.event_id)
+
+            if not new_decision_event_ids:
+                break
+
+            # Find knowledge entries sourced from those decision events
+            all_entries = self.db.query(KnowledgeEntry).all()
+            for ke in all_entries:
+                if ke.entry_id in affected_entries:
+                    continue
+                source_ids = ke.source_event_ids or "[]"
+                if isinstance(source_ids, str):
+                    try:
+                        source_ids = json.loads(source_ids)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                if set(source_ids) & new_decision_event_ids:
+                    affected_entries.add(ke.entry_id)
+                    next_frontier.add(ke.entry_id)
+
+            frontier = next_frontier
+
         return {
             "entry_id": entry_id,
-            "affected_events": 0,
-            "affected_entries": 0,
-            "contamination_depth": 0,
-            "note": "Placeholder implementation - requires context_snapshots parsing",
+            "affected_decisions": len(affected_decisions),
+            "affected_entries": len(affected_entries),
+            "contamination_depth": depth,
         }
     
     def scan_contradictions(

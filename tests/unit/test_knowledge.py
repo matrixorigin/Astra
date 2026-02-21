@@ -220,3 +220,66 @@ def test_contradiction_detection(db_session):
     db_session.refresh(old)
     assert old.confidence == pytest.approx(0.6, abs=0.01)
     assert old.superseded_by == stored[0]["entry_id"]
+
+
+def test_normalize_value_synonyms():
+    """Test that _normalize_value handles casing, whitespace, and tech synonyms."""
+    from core.context.knowledge import _normalize_value
+
+    # Case + whitespace
+    assert _normalize_value("TypeScript") == "typescript"
+    assert _normalize_value("  hello   world  ") == "hello world"
+
+    # Synonyms
+    assert _normalize_value("JS") == "javascript"
+    assert _normalize_value("ts") == "typescript"
+    assert _normalize_value("Golang") == "go"
+    assert _normalize_value("pg") == "postgresql"
+    assert _normalize_value("nodejs") == "node"
+
+    # Non-synonym passes through
+    assert _normalize_value("rust") == "rust"
+
+
+def test_synonym_match_reinforces_not_contradicts(db_session):
+    """Test that 'JS' and 'javascript' are treated as same value (reinforce, not contradict)."""
+    from api.models import KnowledgeEntry
+    from core.context.knowledge import KnowledgeExtractor
+    from uuid_utils import uuid7
+
+    user_id = str(uuid7())[:36]
+    extractor = KnowledgeExtractor(db_session)
+
+    # Pre-existing entry with value "javascript"
+    existing = KnowledgeEntry(
+        entry_id=str(uuid7()),
+        user_id=user_id,
+        category="user_preference",
+        key_name="preferred_language",
+        value="javascript",
+        source_event_ids="[]",
+        extraction_method="test",
+        trust_tier="T3",
+        confidence=0.8,
+        initial_confidence=0.8,
+        version=1,
+    )
+    db_session.add(existing)
+    db_session.commit()
+
+    # New extraction says "JS" — should be treated as same value
+    entries = [{
+        "user_id": user_id,
+        "category": "user_preference",
+        "key_name": "preferred_language",
+        "value": "JS",
+        "source_event_ids": [],
+        "extraction_method": "test",
+        "trust_tier": "T3",
+        "confidence": 0.8,
+    }]
+    stored = extractor._batch_store_knowledge(entries)
+
+    assert stored[0]["action"] == "updated"  # reinforced, NOT contradiction
+    db_session.refresh(existing)
+    assert existing.confidence == pytest.approx(0.9, abs=0.01)
