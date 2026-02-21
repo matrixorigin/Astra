@@ -303,6 +303,36 @@ class TestRunEngineResolveHandle:
         assert result is False
 
 
+class TestTryClaimResume:
+    """Test the real _try_claim_resume logic (not mocked)."""
+
+    def _make_engine(self, mock_db):
+        with patch.object(RunEngine, '__init__', lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
+            return RunEngine(mock_db)
+
+    def test_claim_succeeds_on_first_insert(self):
+        db = MagicMock()
+        db.execute.return_value = MagicMock()
+        engine = self._make_engine(db)
+        assert engine._try_claim_resume("run-1") is True
+        db.commit.assert_called_once()
+
+    def test_claim_fails_on_integrity_error(self):
+        from sqlalchemy.exc import IntegrityError
+        db = MagicMock()
+        db.execute.side_effect = IntegrityError("dup", {}, None)
+        engine = self._make_engine(db)
+        assert engine._try_claim_resume("run-1") is False
+        db.rollback.assert_called_once()
+
+    def test_claim_fallback_on_unexpected_error(self):
+        db = MagicMock()
+        db.execute.side_effect = RuntimeError("connection lost")
+        engine = self._make_engine(db)
+        # Fallback: allow resume in single-worker mode
+        assert engine._try_claim_resume("run-1") is True
+
+
 def get_async_tool_registry():
     from core.agent.async_tools import get_async_tool_registry as _get
     return _get()

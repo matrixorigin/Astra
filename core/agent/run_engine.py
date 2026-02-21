@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timezone
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from core.agent.run import AgentRun, RunStatus, RunTrigger
@@ -350,44 +351,24 @@ class RunEngine:
     # ── Distributed coordination ──────────────────────────────
 
     def _try_claim_resume(self, run_id: str) -> bool:
-        """Optimistic lock: atomically claim a waiting run for resume.
+        """Optimistic lock: INSERT a unique claim row.
 
-        UPDATE ... WHERE status='waiting' — only one worker succeeds.
+        The run_events table has a unique index on (run_id, idx) where idx=-1
+        is reserved for resume claims. Second INSERT raises IntegrityError.
         """
         try:
-            result = self.db.execute(
-                text(
-                    "UPDATE conversation_events SET content = content "
-                    "WHERE event_type = :et "
-                    "AND JSON_EXTRACT(metadata, '$.run_id') = :run_id "
-                    "AND event_type = :waiting_et "
-                    "ORDER BY created_at DESC LIMIT 1"
-                ),
-                {
-                    "et": EventType.RUN_WAITING.value,
-                    "run_id": run_id,
-                    "waiting_et": EventType.RUN_WAITING.value,
-                },
-            )
-            # Use a dedicated claim table for proper locking
-            # Fallback: use a simple INSERT that fails on duplicate
             self.db.execute(
                 text(
                     "INSERT INTO run_events (run_id, idx, event_type, data) "
-                    "SELECT :run_id, -1, 'resume_claim', :data "
-                    "FROM dual WHERE NOT EXISTS ("
-                    "  SELECT 1 FROM run_events WHERE run_id = :run_id AND event_type = 'resume_claim'"
-                    ")"
+                    "VALUES (:run_id, -1, 'resume_claim', :data)"
                 ),
                 {"run_id": run_id, "data": json.dumps({"claimed_at": datetime.now(timezone.utc).isoformat()})},
             )
             self.db.commit()
-            # Check if we actually inserted
-            row = self.db.execute(
-                text("SELECT 1 FROM run_events WHERE run_id = :run_id AND event_type = 'resume_claim'"),
-                {"run_id": run_id},
-            ).fetchone()
-            return row is not None
+            return True
+        except IntegrityError:
+            self.db.rollback()
+            return False
         except Exception as e:
             logger.debug(f"Claim resume failed for {run_id}: {e}")
             return True  # On error, allow resume (single-worker fallback)

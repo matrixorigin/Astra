@@ -1,6 +1,6 @@
 """SQLAlchemy ORM models."""
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, JSON, ForeignKey, Float, Index
+from sqlalchemy import Column, DateTime, Integer, String, Text, JSON, ForeignKey, Float, Index, UniqueConstraint
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.dialects.mysql import TINYINT
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
@@ -538,9 +538,12 @@ class WorkflowRun(Base):
 class RunEvent(Base):
     """Persisted SSE events for cross-worker streaming."""
     __tablename__ = "run_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "idx", name="uq_run_event_run_idx"),
+    )
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_id = Column(String(255), nullable=False, index=True)
-    idx = Column(Integer, nullable=False)  # sequential index within run
+    idx = Column(Integer, nullable=False)  # sequential index within run; -1 = resume_claim
     event_type = Column(String(64), nullable=False)
     data = Column(JSON, nullable=False)
     event_id = Column(String(255))

@@ -534,3 +534,35 @@ class TestWorkflowSerialization:
         data = run.model_dump()
         run2 = WorkflowRun(**data)
         assert run2.step_results["s1"].output == {"x": 1}
+
+
+# ── Distributed cancel check ──
+
+class TestDistributedCancelCheck:
+
+    def test_is_cancelled_in_db_no_run_id(self):
+        """No wf_run_id → always returns False."""
+        engine = WorkflowEngine()
+        assert engine._is_cancelled_in_db() is False
+
+    def test_is_cancelled_in_db_with_run_id_not_cancelled(self):
+        engine = WorkflowEngine(wf_run_id="wf-1")
+        with patch("api.database.get_db_session") as mock_get:
+            mock_db = MagicMock()
+            mock_db.query.return_value.filter.return_value.first.return_value = None
+            mock_get.return_value = iter([mock_db])
+            assert engine._is_cancelled_in_db() is False
+
+    def test_is_cancelled_in_db_with_run_id_cancelled(self):
+        engine = WorkflowEngine(wf_run_id="wf-1")
+        with patch("api.database.get_db_session") as mock_get:
+            mock_db = MagicMock()
+            mock_db.query.return_value.filter.return_value.first.return_value = MagicMock()
+            mock_get.return_value = iter([mock_db])
+            assert engine._is_cancelled_in_db() is True
+
+    def test_is_cancelled_in_db_import_error(self):
+        """DB unavailable → returns False (safe fallback)."""
+        engine = WorkflowEngine(wf_run_id="wf-1")
+        with patch("api.database.get_db_session", side_effect=Exception("no db")):
+            assert engine._is_cancelled_in_db() is False
