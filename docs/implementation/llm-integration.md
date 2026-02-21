@@ -1,5 +1,7 @@
 # LLM Integration
 
+> **Last Updated**: 2026-02-21
+
 ## Architecture
 
 ```
@@ -10,6 +12,7 @@ LLMClient (unified interface)
   chat() / chat_stream() / chat_with_tools() / chat_with_tools_stream()
   + task_hint for routing
   + pre-call budget check
+  + auto-detect provider/model from DB tokens table
         │
         ▼
 ModelRouter (pluggable strategy)
@@ -22,7 +25,7 @@ RateLimiter + CircuitBreaker
         │
         ▼
 Provider Adapters
-  OpenAI │ Anthropic │ Groq │ Self-hosted (OpenAI-compatible)
+  OpenAI │ Anthropic │ Groq │ DeepSeek │ Self-hosted (OpenAI-compatible)
         │
         ▼
 MatrixOne (llm_call_logs, conversation_events)
@@ -30,16 +33,41 @@ MatrixOne (llm_call_logs, conversation_events)
 
 Module: `core/llm/`
 
+## Provider Auto-Detection (Implemented)
+
+API keys are stored **only in the DB `tokens` table** — no environment variable fallbacks.
+
+`LLMClient._load_config()` resolution order:
+1. DB `model_configs` table (scope-resolved)
+2. Auto-detect from first active LLM token in `tokens` table
+3. Default model per provider: `deepseek→deepseek-chat`, `openai→gpt-4o`, `anthropic→claude-3-5-sonnet`, `groq→llama3-70b`
+
+```bash
+# Setup: store API key in DB
+mo-admin token create --type llm --provider deepseek --scope global \
+  --base-url https://api.deepseek.com/v1
+
+# LLMClient auto-detects: provider=deepseek, model=deepseek-chat, base_url from token metadata
+mo-agent chat  # Just works, no --model needed
+```
+
 ## Providers
 
 | Provider | Models | Notes |
 |---|---|---|
-| OpenAI | GPT-4o, GPT-4o-mini, GPT-4-turbo, GPT-3.5-turbo | Standard OpenAI API |
+| OpenAI | GPT-4o, GPT-4o-mini, GPT-4-turbo | Standard OpenAI API |
 | Anthropic | Claude-3.5-Sonnet, Claude-3-Haiku | System message separation, tool format conversion |
+| DeepSeek | deepseek-chat, deepseek-reasoner | OpenAI-compatible API, prompt caching support |
 | Groq | Llama3-70B, Mixtral-8x7B | Ultra-fast inference |
 | Self-hosted | Any OpenAI-compatible | Via `base_url` (Ollama, vLLM, TGI) |
 
 Each provider implements `BaseProvider` with 4 methods: `complete`, `complete_stream`, `complete_with_tools`, `complete_with_tools_stream`. Provider-specific API differences (Anthropic's system message format, tool schema format) are handled inside the adapter.
+
+## Embedding Service
+
+`core/context/embeddings.py` — auto-detects provider from tokens table.
+
+Providers without embedding support (`deepseek`, `groq`) automatically fall back to mock embeddings (zero vectors). This allows the full pipeline to work without an embedding-capable provider, with degraded semantic search quality.
 
 ## Routing Strategies
 
@@ -60,18 +88,11 @@ Every LLM call logs:
 
 Pre-call budget check: estimate cost from token count × model pricing. Reject if budget exceeded.
 
-```python
-# Budget check before call
-estimated_cost = estimate_cost(messages, model)
-if budget_remaining < estimated_cost:
-    raise BudgetExceededError(f"Estimated ${estimated_cost}, budget ${budget_remaining}")
-```
-
 ## Rate Limiting and Circuit Breaker
 
 **Rate limiter**: Token bucket per provider (RPM + TPM limits). Queues requests when limit approached.
 
-**Circuit breaker**: Per-provider. Opens after N consecutive failures. Half-open after cooldown. Prevents cascading failures when a provider is down.
+**Circuit breaker**: Per-provider. Opens after N consecutive failures. Half-open after cooldown.
 
 ```
 CLOSED → (N failures) → OPEN → (cooldown) → HALF_OPEN → (success) → CLOSED
@@ -80,7 +101,7 @@ CLOSED → (N failures) → OPEN → (cooldown) → HALF_OPEN → (success) → 
 
 ## Resilience
 
-Provider failure → circuit breaker opens → router falls back to next model in chain → logs `provider_failover` event. See [agents-and-orchestration.md §10](../design/agents-and-orchestration.md) for cross-model consistency design.
+Provider failure → circuit breaker opens → router falls back to next model in chain → logs `provider_failover` event.
 
 ## Scope-Based Configuration
 
@@ -92,4 +113,8 @@ mo-admin model add gpt-4 openai --scope global
 
 # Admin: add model for specific account
 mo-admin model add claude-3 anthropic --scope account --scope-id acme
+
+# Admin: manage tokens
+mo-admin token create --type llm --provider deepseek --scope global --base-url https://api.deepseek.com/v1
+mo-admin token list
 ```

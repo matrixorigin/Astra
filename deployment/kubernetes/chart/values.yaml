@@ -1,0 +1,139 @@
+# ─── API Server (Required) ──────────────────────────────────
+api:
+  replicas: 2
+  image:
+    repository: mo-agent-engine
+    tag: latest
+    pullPolicy: IfNotPresent
+  port: 8000
+  workers: 2
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "512Mi"
+    limits:
+      cpu: "2"
+      memory: "2Gi"
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilization: 70
+  env: {}
+  # Extra env vars, e.g.:
+  #   JWT_SECRET: "change-me"
+
+# ─── MatrixOne [opt] ───────────────────────────────────────
+matrixone:
+  enabled: true
+  image:
+    repository: matrixorigin/matrixone
+    tag: latest
+  port: 6001
+  storage:
+    size: 100Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "8"
+      memory: "16Gi"
+  external:
+    host: ""
+    port: 6001
+    user: root
+    password: "111"
+    database: mo_dev_agent
+
+# ─── Redis [opt] ───────────────────────────────────────────
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: 7.2-alpine
+  port: 6379
+  storage:
+    size: 10Gi
+    storageClass: ""
+  external:
+    url: ""
+
+# ─── Model Server [opt] ───────────────────────────────────
+modelServer:
+  enabled: false
+  replicas: 1
+  image:
+    repository: mo-agent-engine
+    tag: infer
+  port: 9527
+  resources:
+    requests:
+      cpu: "1"
+      memory: "1Gi"
+    limits:
+      cpu: "4"
+      memory: "4Gi"
+  modelCache:
+    size: 10Gi
+    storageClass: ""
+
+# ─── Skill Worker [opt] ───────────────────────────────────
+skillWorker:
+  enabled: false
+  image:
+    repository: mo-agent-engine
+    tag: train-gpu
+  gpu:
+    enabled: false
+    nodeSelector:
+      accelerator: nvidia-gpu
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+    limits:
+      cpu: "8"
+      memory: "16Gi"
+  # Job defaults
+  backoffLimit: 2
+  activeDeadlineSeconds: 7200
+
+# ─── Ray Cluster [opt] ────────────────────────────────────
+ray:
+  enabled: false
+  head:
+    resources:
+      cpu: "2"
+      memory: "4Gi"
+  workers:
+    gpu:
+      replicas: 0
+      resources:
+        cpu: "4"
+        memory: "8Gi"
+        nvidia.com/gpu: "1"
+    cpu:
+      minReplicas: 1
+      maxReplicas: 8
+      resources:
+        cpu: "2"
+        memory: "4Gi"
+
+# ─── Ingress [opt] ────────────────────────────────────────
+ingress:
+  enabled: false
+  className: nginx
+  host: mo-agent.example.com
+  tls:
+    enabled: false
+    secretName: mo-agent-tls
+
+# ─── Common ───────────────────────────────────────────────
+namespace: mo-agent
+imagePullSecrets: []

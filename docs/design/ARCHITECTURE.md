@@ -1,7 +1,7 @@
 # mo-agent-engine Architecture
 
 > **Status**: Living Document — source of truth for all design decisions  
-> **Last Updated**: 2026-02-14
+> **Last Updated**: 2026-02-21
 
 ---
 
@@ -18,7 +18,7 @@ Five problems block AI agents from production adoption:
 | # | Problem | Why It's Hard |
 |---|---------|---------------|
 | 1 | **Decisions are black boxes** | The data the agent saw has changed. The prompt was updated. The context window is gone. No way to reconstruct. |
-| 2 | **Iteration is guesswork** | No regression testing for prompt/skill changes. Teams ship and pray. |
+| 2 | **Iteration is guesswork** | No regression testing for prompt/skill changes. Teams ship and pray. | ✅ **SOLVED**: Prompt Auto-Evolution with regression gate. Implicit feedback mining → LLM diagnosis → auto-improve → gate → activate. |
 | 3 | **Memory is broken** | Agents forget across sessions. Knowledge updates silently invalidate past answers. No memory lifecycle. | ✅ **SOLVED**: Episodic/semantic/procedural memory with automated governance (confidence decay, quarantine, compression). Distributed scheduling ensures multi-instance safety. |
 | 4 | **Experimentation is expensive** | Testing on production data requires full copies. Most teams skip it. |
 | 5 | **Trust is unverifiable** | No confidence signals, no claim verification, no audit trail for compliance. |
@@ -80,16 +80,19 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Unified Selector Pipeline](unified-selector-pipeline.md) | Skill selection: retrieve → audit → feedback pipeline |
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
-| [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt evolution, self-improving agents, meta-learning closed loop |
+| [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt auto-evolution, implicit feedback mining, self-improving agents, meta-learning closed loop |
+| [Feedback Classification Model](feedback-classification-model.md) | Native feedback classifier: data pipeline, model training, deployment as platform skill, continuous learning |
+| [Deployment Architecture](deployment-architecture.md) | Deployment topologies (single machine → K8s), execution backend abstraction, GPU scheduling, Ray integration |
 
 ### Supporting Documents (Implementation)
 
 | Document | Scope |
 |----------|-------|
 | [Authentication](../implementation/authentication.md) | JWT, ownership-based authorization |
-| [LLM Integration](../implementation/llm-integration.md) | Provider abstraction, routing, cost tracking |
+| [LLM Integration](../implementation/llm-integration.md) | Provider abstraction, auto-detection from DB tokens, routing, cost tracking |
 | [GitHub Integration](../implementation/github-integration.md) | Repo operations, token management |
 | [Deployment](../implementation/deployment.md) | Project structure, Docker, configuration |
+| [Feedback Classifier Deployment](../implementation/feedback-classifier-deployment.md) | Training/inference skill isolation, ONNX export, batch processing, model artifacts |
 | [Scope Configuration](../implementation/scope-configuration.md) | Scope-based config resolution |
 | [CI](../implementation/ci.md) | GitHub Actions workflows |
 

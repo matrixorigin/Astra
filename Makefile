@@ -14,8 +14,9 @@ help:
 	@echo "  make lock               - Update dependency lock file (poetry.lock)"
 	@echo ""
 	@echo "Development Environment:"
-	@echo "  make dev-up             - Start MatrixOne + Redis"
+	@echo "  make dev-up             - Start infra (MatrixOne + Redis)"
 	@echo "  make dev-down           - Stop all services"
+	@echo "  make dev-full           - Start everything in containers (build + run)"
 	@echo "  make dev-restart        - Restart all services"
 	@echo "  make dev-logs           - Show all logs (tail -f)"
 	@echo "  make dev-logs-db        - Show MatrixOne logs"
@@ -45,9 +46,9 @@ help:
 	@echo "  make format-check       - Check code formatting"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make setup && make dev-up && make db-init  # First time setup"
-	@echo "  make dev-up && make test                   # Daily development"
-	@echo "  make install-runtime && make test-runtime  # Setup runtime tests"
+	@echo "  make setup && make dev-up                     # First time setup"
+	@echo "  make dev-up && make test                      # Daily development"
+	@echo "  make dev-full                                 # All services + GPU + model"
 
 # ============================================================================
 # Environment Setup
@@ -187,35 +188,35 @@ lock:
 .PHONY: dev-up
 dev-up:
 	@echo "Starting mo-agent-engine development environment..."
-	@cd infra && docker compose --profile dev up -d
+	@cd deployment/all-in-one && docker compose up -d
 	@echo ""
 	@echo "✅ Services started!"
 	@echo "   MatrixOne: mysql -h127.0.0.1 -P6001 -uroot -p111"
 	@echo "   Redis:     redis-cli -h 127.0.0.1 -p 6379"
 	@echo ""
-	@echo "Next: make db-init (to initialize database schema)"
+	@echo "Next: mo-admin init && mo-agent chat"
 
 .PHONY: dev-down
 dev-down:
 	@echo "Stopping mo-agent-engine services..."
-	@cd infra && docker compose --profile dev down
+	@cd deployment/all-in-one && docker compose down
 
 .PHONY: dev-restart
 dev-restart:
 	@echo "Restarting mo-agent-engine services..."
-	@cd infra && docker compose --profile dev restart
+	@cd deployment/all-in-one && docker compose restart
 
 .PHONY: dev-logs
 dev-logs:
-	@cd infra && docker compose --profile dev logs -f
+	@cd deployment/all-in-one && docker compose logs -f
 
 .PHONY: dev-logs-db
 dev-logs-db:
-	@cd infra && docker compose logs -f matrixone
+	@cd deployment/all-in-one && docker compose logs -f matrixone
 
 .PHONY: dev-ps
 dev-ps:
-	@cd infra && docker compose --profile dev ps
+	@cd deployment/all-in-one && docker compose ps
 
 .PHONY: dev-clean
 dev-clean:
@@ -223,14 +224,19 @@ dev-clean:
 	@printf "Are you sure? [y/N] "; \
 	read REPLY; \
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
-		cd infra && docker compose --profile dev down -v; \
+		cd deployment/all-in-one && docker compose --profile full down -v; \
 		echo "✅ All data removed"; \
 	else \
 		echo "Cancelled"; \
 	fi
 
+.PHONY: dev-full
+dev-full:
+	@echo "Starting all services in containers (build + run)..."
+	@cd deployment/all-in-one && docker compose --profile full up -d --build
+
 .PHONY: dev-init
-dev-init: dev-up db-init
+dev-init: dev-up
 	@echo "✅ Development environment ready!"
 
 # ============================================================================
@@ -245,7 +251,7 @@ db-init:
 .PHONY: db-init-agent
 db-init-agent:
 	@echo "Initializing agent configuration system..."
-	@python3 infra/scripts/init_agent_system.py
+	@python3 scripts/init_agent_system.py
 
 .PHONY: db-connect
 db-connect:
@@ -287,22 +293,22 @@ db-reset:
 .PHONY: test
 test:
 	@echo "Running all tests..."
-	@pytest tests/ -v
+	@python -m pytest tests/ -v
 
 .PHONY: test-unit
 test-unit:
 	@echo "Running unit tests..."
-	@pytest tests/unit/ -v
+	@python -m pytest tests/unit/ -v
 
 .PHONY: test-integration
 test-integration:
 	@echo "Running integration tests..."
-	@pytest tests/integration/ -v
+	@python -m pytest tests/integration/ -v
 
 .PHONY: test-e2e
 test-e2e:
 	@echo "Running end-to-end tests..."
-	@pytest tests/e2e/ -v
+	@python -m pytest tests/e2e/ -v
 
 .PHONY: test-runtime
 test-runtime:

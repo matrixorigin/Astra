@@ -1,0 +1,179 @@
+# mo-agent-engine — All-in-One Docker Compose
+#
+# Usage (from project root):
+#   make dev-up                             # Dev: MatrixOne + Redis only
+#   make dev-full                           # Prod: Everything in containers
+#
+# Profiles:
+#   (default)  — matrixone + redis (dev infra only)
+#   app        — + init + api (containerized app)
+#   gpu        — + skill-worker with GPU support
+#   model      — + model-server for platform-trained small models
+#   full       — all of the above
+
+services:
+
+  # ─── Infrastructure (always started) ─────────────────────────
+
+  matrixone:
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    hostname: matrixone
+    command: ["/mo-service", "-launch", "/etc/quickstart/launch.toml"]
+    ports:
+      - "${MATRIXONE_PORT:-6001}:6001"
+    volumes:
+      - mo-data:/mo-data
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2-alpine
+    hostname: redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # ─── App (containerized, profile: app/full) ──────────────────
+
+  init:
+    build:
+      context: ../..
+    profiles:
+      - app
+      - full
+    command: ["python", "-m", "cli.mo_admin", "init"]
+    environment:
+      - MATRIXONE_HOST=matrixone
+      - MATRIXONE_PORT=6001
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      matrixone:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mo-net
+    restart: "no"
+
+  api:
+    build:
+      context: ../..
+    hostname: api
+    profiles:
+      - app
+      - full
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${API_WORKERS:-2}"]
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - MATRIXONE_HOST=matrixone
+      - MATRIXONE_PORT=6001
+      - MATRIXONE_DATABASE=${MATRIXONE_DATABASE:-mo_dev_agent}
+      - REDIS_URL=redis://redis:6379
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+    env_file:
+      - ../../.env
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # ─── Optional: GPU Skill Worker ──────────────────────────────
+
+  skill-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.train
+    hostname: skill-worker
+    profiles:
+      - gpu
+      - full
+    command: ["python", "-m", "core.skills.worker", "--queue", "redis://redis:6379"]
+    environment:
+      - MATRIXONE_HOST=matrixone
+      - MATRIXONE_PORT=6001
+      - REDIS_URL=redis://redis:6379
+      - NVIDIA_VISIBLE_DEVICES=all
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    networks:
+      - mo-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ─── Optional: Model Inference Server ────────────────────────
+  # Serves platform-trained small models (e.g., feedback classifier ONNX).
+  # NOT for LLM inference — LLMs are accessed via external API (DeepSeek, OpenAI, etc.)
+
+  model-server:
+    build:
+      context: ../..
+    hostname: model-server
+    profiles:
+      - model
+      - full
+    command: ["python", "-m", "core.models.model_server", "--port", "9527"]
+    ports:
+      - "${MODEL_SERVER_PORT:-9527}:9527"
+    environment:
+      - MATRIXONE_HOST=matrixone
+      - MATRIXONE_PORT=6001
+      - MODEL_CACHE_DIR=/models
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - model-cache:/models
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9527/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  mo-data:
+    name: mo-agent-engine-data
+  redis-data:
+    name: mo-agent-engine-redis
+  model-cache:
+    name: mo-agent-engine-model-cache
+
+networks:
+  mo-net:
+    driver: bridge

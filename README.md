@@ -367,33 +367,25 @@ make test-integration   # Integration tests
 
 ---
 
-## Production Deployment
+## Deployment
 
-### Quick Deploy
+### Docker Compose (All-in-One)
 
 ```bash
-# 1. Configure
-cp .env.production.example .env.production
-# Edit with your secrets
+# Start everything
+cd deployment/all-in-one && docker-compose up -d
 
-# 2. Deploy
-docker-compose -f docker-compose.prod.yml up -d
-
-# 3. Verify
+# Verify
 curl http://localhost:8000/health
 ```
 
-### Features
+### Kubernetes
 
-- ✅ Structured logging (JSON)
-- ✅ API authentication (API Key + JWT)
-- ✅ Rate limiting (60 req/min)
-- ✅ Health checks (3 endpoints)
-- ✅ Prometheus metrics
-- ✅ Docker support
-- ✅ Environment-based configuration
+```bash
+helm install mo-agent deployment/kubernetes/chart
+```
 
-See [Development Guide](docs/development.md) for details.
+See [deployment/](deployment/) for all options (GPU, Ray, external DB, etc.).
 
 ---
 

@@ -256,31 +256,27 @@ User Request
 │     → Select top-K within each budget slot                   │
 └────────────────────────┬────────────────────────────────────┘
                          │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  5. ASSEMBLE: Build the prompt                               │
-│     [System identity + instructions]                         │
-│     [Skill definitions — progressive disclosure]             │
-│     [Retrieved knowledge — semantic memory]                  │
-│     [Relevant history — episodic memory]                     │
-│     [Working state — current plan, intermediate results]     │
-│     [Current request]                                        │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────┐
-│  6. SNAPSHOT: Record exactly what the LLM will see           │
-│     context_snapshot = {                                     │
-│       prompt_template_id, routing_reason,                    │
-│       skills_included, skills_excluded (with reasons),       │
-│       episodic_events: [{id, score}],                        │
-│       semantic_entries: [{id, score}],                       │
-│       token_budget: {per_section_actual},                    │
-│       assembly_time_ms                                       │
-│     }                                                        │
-│     → Stored BEFORE LLM call for audit                       │
-└─────────────────────────────────────────────────────────────┘
+
+### Prompt Assembly: 5-Section Layout (Implemented)
+
+**File**: `core/agent/chat_loop.py` — `_build_messages()`
+
+Cache-friendly layout — stable prefix maximizes prompt caching, dynamic suffix changes per turn:
+
 ```
+[STABLE]  §1 Role & capabilities        ← from DB prompt_templates (cacheable)
+[STABLE]  §2 Constraints & format rules  ← hardcoded behavioral rules
+[DYNAMIC] §2.5 Few-shot examples         ← from high-rated feedback (FewShotRetriever)
+[DYNAMIC] §3 Observations + prior ctx    ← cross-session continuity, observer
+[DYNAMIC] §4 Working memory / scratchpad ← per-session active notes
+[DYNAMIC] §5 Conversation history        ← budget-capped from token_budget.history.allocated
+```
+
+**Prompt caching**: §1-§2 are stable across turns → cached by DeepSeek/Anthropic, amortized cost. §2.5-§5 change per turn → only these tokens billed.
+
+**Dynamic few-shot** (`core/context/few_shot.py`): Retrieves high-rated (≥4) examples from `llm_feedback` JOIN `conversation_events`. Keyword overlap scoring selects most relevant examples for current query.
+
+**Budget control**: §5 history section respects `context.token_budget.history.allocated` — older turns dropped when budget exceeded.
 
 ### Just-in-Time Retrieval
 

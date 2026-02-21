@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-api
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: mo-agent
+    component: api
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app: mo-agent
+      component: api
+  template:
+    metadata:
+      labels:
+        app: mo-agent
+        component: api
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: api
+        image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}"
+        imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+        command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "{{ .Values.api.port }}", "--workers", "{{ .Values.api.workers }}"]
+        ports:
+        - containerPort: {{ .Values.api.port }}
+          name: http
+        env:
+        {{- if .Values.matrixone.enabled }}
+        - name: MATRIXONE_HOST
+          value: "{{ .Release.Name }}-matrixone.{{ .Values.namespace }}.svc.cluster.local"
+        {{- else }}
+        - name: MATRIXONE_HOST
+          value: "{{ .Values.matrixone.external.host }}"
+        {{- end }}
+        - name: MATRIXONE_PORT
+          value: "{{ .Values.matrixone.external.port | default .Values.matrixone.port }}"
+        {{- if .Values.redis.enabled }}
+        - name: REDIS_URL
+          value: "redis://{{ .Release.Name }}-redis.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.redis.port }}"
+        {{- else }}
+        - name: REDIS_URL
+          value: "{{ .Values.redis.external.url }}"
+        {{- end }}
+        {{- range $key, $val := .Values.api.env }}
+        - name: {{ $key }}
+          value: "{{ $val }}"
+        {{- end }}
+        resources:
+          {{- toYaml .Values.api.resources | nindent 10 }}
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 30
+---
+{{- if .Values.api.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}-api-hpa
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Release.Name }}-api
+  minReplicas: {{ .Values.api.hpa.minReplicas }}
+  maxReplicas: {{ .Values.api.hpa.maxReplicas }}
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: {{ .Values.api.hpa.targetCPUUtilization }}
+{{- end }}

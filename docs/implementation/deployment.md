@@ -71,11 +71,11 @@ Features: structured JSON logging, JWT auth, rate limiting (60 req/min), health 
 # Build
 docker build -t mo-agent-engine .
 
-# Run with compose (includes MatrixOne)
-docker-compose up -d
+# All-in-one (MatrixOne + Redis + API)
+cd deployment/all-in-one && docker-compose up -d
 
-# Production compose
-docker-compose -f docker-compose.prod.yml up -d
+# With GPU + model server
+cd deployment/all-in-one && docker-compose --profile full up -d
 ```
 
 ## Environment Variables

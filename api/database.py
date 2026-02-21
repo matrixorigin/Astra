@@ -4,7 +4,7 @@ from contextlib import contextmanager
 import json
 from decimal import Decimal
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 
 from config.settings import get_settings
@@ -24,7 +24,7 @@ def decimal_decoder(dct):
     return {k: float(v) if isinstance(v, Decimal) else v for k, v in dct.items()}
 
 
-# Database URL
+# Database URL (kept for reference; engine uses MatrixOne client below)
 DATABASE_URL = (
     f"mysql+pymysql://{settings.matrixone_user}:{settings.matrixone_password}"
     f"@{settings.matrixone_host}:{settings.matrixone_port}/{settings.matrixone_database}"
@@ -32,6 +32,39 @@ DATABASE_URL = (
 )
 
 from matrixone import Client as _MoClient  # noqa: E402
+from matrixone.sqlalchemy_ext import FulltextIndex as _FulltextIndex  # noqa: E402
+from sqlalchemy.dialects.mysql.base import MySQLDDLCompiler as _MySQLDDLCompiler  # noqa: E402
+
+# Workaround: MatrixOne dialect has default_schema_name=None, breaking has_table()
+# and visit_create_index() for FulltextIndex. Patch both.
+
+_orig_visit_create_index = _MySQLDDLCompiler.visit_create_index
+
+def _visit_create_index(self, create, **kw):
+    idx = create.element
+    if isinstance(idx, _FulltextIndex):
+        cols = ", ".join(col.name for col in idx.columns)
+        sql = f"CREATE FULLTEXT INDEX {idx.name} ON {idx.table.name} ({cols})"
+        if getattr(idx, "parser", None):
+            sql += f" WITH PARSER {idx.parser}"
+        return sql
+    return _orig_visit_create_index(self, create, **kw)
+
+_MySQLDDLCompiler.visit_create_index = _visit_create_index
+
+# Ensure database exists before connecting
+_bootstrap = _MoClient(
+    host=settings.matrixone_host,
+    port=settings.matrixone_port,
+    user=settings.matrixone_user,
+    password=settings.matrixone_password,
+    database="mo_catalog",
+    sql_log_mode="off",
+)
+with _bootstrap._engine.connect() as _c:
+    _c.execute(text(f"CREATE DATABASE IF NOT EXISTS `{settings.matrixone_database}`"))
+    _c.execute(text("COMMIT"))
+_bootstrap._engine.dispose()
 
 # Use MatrixOne client's engine (supports vecf32/vecf64 and FulltextIndex DDL)
 _mo_client = _MoClient(
@@ -80,22 +113,11 @@ def get_db_context():
 
 
 def init_db():
-    """Initialize database - create tables if not exist."""
+    """Initialize database - create tables and indexes if not exist."""
     from api.models import Base
-    from sqlalchemy import inspect, text
-    from sqlalchemy.schema import CreateTable
+    from sqlalchemy import inspect
 
-    inspector = inspect(engine)
-    existing_tables = set(inspector.get_table_names())
-
-    with engine.connect() as conn:
-        for table in Base.metadata.sorted_tables:
-            if table.name in existing_tables:
-                continue
-            try:
-                ddl = str(CreateTable(table).compile(dialect=engine.dialect))
-                conn.execute(text(ddl))
-                conn.execute(text("COMMIT"))
-                print(f"Created table: {table.name}")
-            except Exception as e:
-                print(f"Warning: could not create {table.name}: {e}")
+    existing = set(inspect(engine).get_table_names(schema=engine.url.database))
+    tables_to_create = [t for t in Base.metadata.sorted_tables if t.name not in existing]
+    if tables_to_create:
+        Base.metadata.create_all(bind=engine, tables=tables_to_create, checkfirst=False)

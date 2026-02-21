@@ -131,7 +131,7 @@ curl http://localhost:8000/metrics        # Prometheus metrics
 
 ```bash
 docker build -t mo-agent-engine .
-docker-compose -f docker-compose.prod.yml up -d
+cd deployment/all-in-one && docker-compose up -d
 ```
 
 ## Troubleshooting

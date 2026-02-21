@@ -1,7 +1,7 @@
 # Evaluation and Evolution
 
 > **Status**: Core Design — single source of truth for quality measurement, testing, and self-improvement  
-> **Last Updated**: 2026-02-14
+> **Last Updated**: 2026-02-21
 
 ---
 
@@ -184,35 +184,104 @@ Every gate result is auditable: which snapshot, which sessions, what metrics, pa
 
 Prompt engineering is trial-and-error with no scientific method. Teams change prompts and deploy. Did it break existing cases? No one knows until users complain.
 
-### The Solution: Branch-Based Experimentation
+### Implemented: Prompt Auto-Evolution (PromptOptimizer)
+
+**Status**: ✅ Implemented — `core/context/prompt_optimizer.py`
+
+The platform automatically improves prompts based on accumulated feedback:
 
 ```
-1. Identify low-scoring causal chains (quality_score < 3.0)
-2. Analyze failure patterns (wrong skill? insufficient context? bad instructions?)
-3. Generate candidate prompt revision
-   - Manual: developer writes new version
-   - Semi-auto: LLM proposes revision based on failure analysis
-   - Auto: DSPy/TextGrad optimization on historical chains
-4. Create sandbox branch
-5. Replay low-score AND high-score chains with candidate
-6. Compute quality delta
-7. If improvement > threshold AND no regression: propose merge
-8. Human review → approve → activate new version
+1. Collect low-rated feedback (rating ≤ 2) from llm_feedback table
+2. Correlate with context_snapshots to see what prompt + context was used
+3. LLM diagnosis: analyze failure patterns across cases
+4. LLM generates improved prompt (same role, more specific behaviors)
+5. Regression gate validates change (replay golden sessions if available)
+6. Auto-activate new version via upsert into prompt_templates
+```
+
+**CLI**: `mo-admin prompt optimize --template system_general [--dry-run]`
+
+**Verified result**: system_general v1.0 → v1.1 automatically. Diagnosis identified "prompt too vague, lacks behavioral instructions." New prompt added "Be Specific & Direct", "Use Tools Proactively" — measurably more direct responses.
+
+### Implemented: Implicit Feedback Mining
+
+**Status**: ✅ Implemented — `core/context/implicit_feedback.py`
+
+Users rarely give explicit feedback. But their next message is rich with implicit signals. Based on Liu et al. (2025, NYU) research on WildChat/LMSYS datasets showing >50% of follow-up turns contain implicit feedback.
+
+**Two-layer architecture:**
+
+| Layer | When | Cost | How |
+|-------|------|------|-----|
+| Heuristic detector | Every turn, inline | Zero | Regex patterns for correction/frustration/rephrasing/clarification (CN+EN) |
+| LLM batch analyzer | Async, on-demand | Per-batch | `mo-admin prompt mine-feedback [--use-llm]` analyzes conversation triples |
+
+**Taxonomy** (following Don-Yehiya et al. 2024):
+- `correction`: "不对" / "错了" / "wrong" — user says answer was wrong
+- `frustration`: "太啰嗦" / "废话" / "useless" — emotional dissatisfaction
+- `rephrasing`: "我再说一遍" / "let me rephrase" — user restates same request
+- `clarification`: "具体一点" / "be more specific" — user wants more detail
+- `positive`: "谢谢" / "thanks" / "perfect" — explicit satisfaction
+- `neutral`: new topic, no feedback signal
+
+**Complete evolution loop:**
+```
+User conversation → implicit signal auto-detected → llm_feedback table
+                                                         ↓
+                              mo-admin prompt mine-feedback (deep async analysis)
+                                                         ↓
+                              mo-admin prompt optimize (LLM diagnosis + improvement)
+                                                         ↓
+                              regression gate → new prompt activated → next chat uses it
 ```
 
 ### Prompt as Versioned Data
 
 ```sql
--- Every prompt change is versioned
-INSERT INTO prompt_templates (template_id, version, content, effective_at, is_active)
-VALUES ('code_review', 'v3', '...new prompt...', NOW(), FALSE);
--- is_active = FALSE until gate passes
+-- Prompt stored with version, updated via upsert
+INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+VALUES ('code_review', '1.1', '...new prompt...', 1, NOW(), NOW())
+ON DUPLICATE KEY UPDATE version=VALUES(version), content=VALUES(content),
+    is_active=VALUES(is_active), updated_at=NOW();
 
--- Events reference the exact version used
-UPDATE conversation_events SET prompt_template_id = 'code_review@v3'
-WHERE ...;
--- Historical events still reference v2 — never changed
+-- Context snapshots record the exact prompt used for each decision
+-- Historical snapshots preserve the old prompt — never changed
 ```
+
+### Future: Feedback-Tuned Classification Model
+
+The implicit feedback detection currently uses regex heuristics + optional LLM classification. As the platform accumulates labeled conversation data (both from heuristic detection and explicit `/rate` feedback), we can train a small specialized model for feedback classification — see §4.1 below.
+
+### 4.1 Feedback Classification Model (Design)
+
+**Motivation**: Regex heuristics catch obvious signals but miss nuanced dissatisfaction. LLM classification is accurate but expensive. A small fine-tuned model (e.g., distilled from labeled conversation pairs) can achieve high accuracy at near-zero marginal cost.
+
+**Data pipeline:**
+```
+Heuristic labels (high-confidence) ──┐
+Explicit /rate feedback ─────────────┼──→ Training dataset
+LLM batch classification ───────────┘    (query, response, followup) → label
+
+                                          ↓
+                                    Fine-tune small model
+                                    (e.g., BERT-base or distilled LLM)
+                                          ↓
+                                    Deploy as native platform service
+                                    Replace heuristic layer
+```
+
+**Why this is a native Agent OS capability:**
+- The platform already captures all conversation events with full context
+- Feedback labels accumulate naturally through usage (implicit + explicit)
+- The training data pipeline (§6) already handles versioning and lineage
+- The regression gate validates model changes before deployment
+- Every classification decision is auditable via the same snapshot infrastructure
+
+**Implementation phases:**
+1. **Accumulate**: Run heuristic + LLM mining, build labeled dataset (current)
+2. **Distill**: When dataset reaches ~5K labeled pairs, fine-tune small classifier
+3. **Deploy**: Register as a platform skill, replace heuristic layer
+4. **Evolve**: Continuous learning from new feedback, gated by regression tests
 
 ---
 

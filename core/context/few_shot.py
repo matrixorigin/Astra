@@ -23,19 +23,21 @@ class FewShotRetriever:
         self.max_examples = max_examples
 
     def retrieve(self, query: str, task_type: str | None = None) -> list[dict[str, Any]]:
-        """Find similar high-rated examples.
+        """Find similar high-rated examples via conversation_events.
 
-        Strategy: keyword overlap between query and stored request content.
+        Strategy: feedback → context_snapshot → event → find user query + next agent response.
         Falls back gracefully if no feedback data exists.
         """
         try:
-            # Get high-rated feedback with linked LLM request content
             sql = """
-                SELECT f.llm_request_id, f.rating, f.prompt_template_id,
-                       l.request_content, l.response_content
+                SELECT f.rating, e_user.content AS user_query, e_agent.content AS agent_response
                 FROM llm_feedback f
-                JOIN llm_call_logs l ON f.llm_request_id = l.event_id
-                WHERE f.rating >= :min_rating
+                JOIN context_snapshots cs ON f.llm_request_id = cs.llm_request_id
+                JOIN conversation_events e_user ON cs.event_id = e_user.event_id
+                LEFT JOIN conversation_events e_agent
+                    ON e_agent.parent_event_id = e_user.event_id
+                    AND e_agent.event_type = 'llm_response'
+                WHERE f.rating >= :min_rating AND e_user.content IS NOT NULL
                 ORDER BY f.rating DESC, f.created_at DESC
                 LIMIT :limit
             """
@@ -50,19 +52,19 @@ class FewShotRetriever:
             query_words = set(query.lower().split())
             scored = []
             for row in rows:
-                req = (row[3] or "").lower()
+                req = (row[1] or "").lower()
                 overlap = len(query_words & set(req.split()))
                 if overlap > 0:
                     scored.append((overlap, row))
 
-            scored.sort(key=lambda x: (-x[0], -x[1][1]))  # overlap desc, rating desc
+            scored.sort(key=lambda x: (-x[0], -x[1][0]))  # overlap desc, rating desc
 
             examples = []
             for _, row in scored[: self.max_examples]:
                 examples.append({
-                    "input": row[3],
-                    "output": row[4],
-                    "rating": row[1],
+                    "input": row[1],
+                    "output": row[2] or "(no response captured)",
+                    "rating": row[0],
                 })
             return examples
 

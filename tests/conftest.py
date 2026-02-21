@@ -1,9 +1,13 @@
 """Test configuration and fixtures."""
 
-import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
 import os
+
+# Must be set BEFORE any app imports so database.py uses test DB on first import
+# os.environ takes priority over .env file in pydantic-settings
+os.environ["MATRIXONE_DATABASE"] = os.getenv("TEST_MATRIXONE_DATABASE", "test_dev_agent_v3")
+
+import pytest
+from sqlalchemy.orm import sessionmaker
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -17,29 +21,16 @@ TEST_DATABASE_CONFIG = {
     "database": os.getenv("TEST_MATRIXONE_DATABASE", "test_dev_agent_v3")
 }
 
-TEST_DATABASE_URL = f"mysql+pymysql://{TEST_DATABASE_CONFIG['user']}:{TEST_DATABASE_CONFIG['password']}@{TEST_DATABASE_CONFIG['host']}:{TEST_DATABASE_CONFIG['port']}/{TEST_DATABASE_CONFIG['database']}"
-
 
 @pytest.fixture(scope="session")
 def test_engine():
-    """Create test database engine with separate MatrixOne instance/database."""
-    # Connect to test database directly (assume it exists)
-    engine = create_engine(TEST_DATABASE_URL, echo=False, pool_pre_ping=True)
-    
-    # Create tables in test database
-    from api.models import Base, ContextSnapshot
-    
-    # Drop old context_snapshots table if it exists (schema migration)
-    with engine.connect() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS context_snapshots"))
-        conn.execute(text("DROP TABLE IF EXISTS decision_audit"))
-        conn.commit()
-    
-    Base.metadata.create_all(engine)
-    
+    """Use the same engine as production, already pointed at test DB via env var."""
+    from api import database
+    from api.database import init_db
+
+    engine = database.engine
+    init_db()
     yield engine
-    
-    # Cleanup: dispose engine to close all connections
     engine.dispose()
 
 
@@ -68,22 +59,11 @@ def db_session(test_session_factory):
 
 @pytest.fixture(scope="session", autouse=True)
 def patch_db_engine(test_engine):
-    """Patch database engine to use test database globally."""
+    """Ensure database module uses test engine throughout the session."""
     from api import database
-    
-    # Save originals
-    original_engine = database.engine
-    original_session_local = database.SessionLocal
-    
-    # Patch
     database.engine = test_engine
     database.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
-    
     yield
-    
-    # Restore (optional, as session ends anyway)
-    database.engine = original_engine
-    database.SessionLocal = original_session_local
 
 
 @pytest.fixture(autouse=True)
@@ -117,7 +97,7 @@ def override_db_dependency(db_session, monkeypatch):
     # Clear overrides
     try:
         from api.main import app
-        app.dependency_overrides.clear()
+        app.dependency_overrides.pop(original_get_db_session, None)
     except ImportError:
         pass
 

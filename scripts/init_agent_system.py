@@ -2,10 +2,10 @@
 """Initialize agent configuration database and RBAC roles.
 
 Usage:
-    python3 infra/scripts/init_agent_system.py
+    python3 scripts/init_agent_system.py
 
     # Or with custom connection
-    python3 infra/scripts/init_agent_system.py --host localhost --port 6001 --user root --password 111
+    python3 scripts/init_agent_system.py --host localhost --port 6001 --user root --password 111
 """
 
 import argparse

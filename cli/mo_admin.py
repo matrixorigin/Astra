@@ -450,6 +450,39 @@ def prompt_list():
         click.echo(f"{r[0]:<25} {r[1]:<8} {active:<7} {r[3]}")
 
 
+@prompt.command("mine-feedback")
+@click.option("--session-id", default=None, help="Specific session to analyze")
+@click.option("--use-llm", is_flag=True, help="Use LLM for ambiguous cases (costs tokens)")
+def prompt_mine_feedback(session_id, use_llm):
+    """Mine implicit feedback from conversation history."""
+    from api.database import get_db_session
+
+    db = next(get_db_session())
+    llm_client = None
+    if use_llm:
+        from core.llm.client import LLMClient
+        llm_client = LLMClient(db)
+
+    from core.context.implicit_feedback import ImplicitFeedbackMiner
+    miner = ImplicitFeedbackMiner(db, llm_client=llm_client)
+
+    pairs = miner.extract_pairs(session_id=session_id)
+    click.echo(f"📊 Found {len(pairs)} conversation pairs to analyze")
+
+    if not pairs:
+        click.echo("No conversation pairs found")
+        return
+
+    results = miner.analyze_batch(pairs)
+    negative = [r for r in results if r["rating"] <= 3]
+    click.echo(f"🔍 Detected {len(negative)} implicit negative feedback signals:")
+    for r in negative[:10]:
+        click.echo(f"  [{r['signal_type']}] rating={r['rating']} conf={r['confidence']:.1f} — {r['user_followup'][:80]}")
+
+    count = miner.analyze_and_store(session_id=session_id)
+    click.echo(f"✅ Stored {count} feedback records")
+
+
 @cli.command()
 @click.option("--reset", is_flag=True, help="Drop and recreate database")
 def init(reset):

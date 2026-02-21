@@ -152,12 +152,53 @@ def chat(user_id, model, mode):
     llm_client.set_user_context(user_id=user_id)
 
     try:
+        last_llm_request_id = None
+        last_agent_response = None
+
         while True:
             # Get user input
             user_input = click.prompt("You", type=str, prompt_suffix="> ")
 
             if user_input.lower() in ["exit", "quit"]:
                 break
+
+            # /rate N [comment] — lightweight feedback on last response
+            if user_input.startswith("/rate "):
+                parts = user_input[6:].strip().split(None, 1)
+                try:
+                    rating = int(parts[0])
+                    comment = parts[1] if len(parts) > 1 else None
+                    if 1 <= rating <= 5:
+                        from sqlalchemy import text as sa_text
+                        import uuid
+                        db.execute(sa_text(
+                            "INSERT INTO llm_feedback (feedback_id, prompt_template_id, prompt_version, llm_request_id, rating, comment, created_at) "
+                            "VALUES (:fid, 'system_general', '1.0', :rid, :r, :c, NOW())"
+                        ), {"fid": str(uuid.uuid4()), "rid": last_llm_request_id or "", "r": rating, "c": comment})
+                        db.commit()
+                        click.echo(f"📝 Feedback recorded: {rating}/5" + (f" — {comment}" if comment else ""))
+                    else:
+                        click.echo("Rating must be 1-5")
+                except (ValueError, IndexError):
+                    click.echo("Usage: /rate <1-5> [comment]")
+                continue
+
+            # Implicit feedback detection (heuristic, zero LLM cost)
+            if last_agent_response and last_llm_request_id:
+                from core.context.implicit_feedback import ImplicitFeedbackDetector
+                signal = ImplicitFeedbackDetector.detect(user_input, last_agent_response)
+                if signal.signal_type in ("correction", "frustration", "rephrasing") and signal.confidence >= 0.7:
+                    rating_map = {"correction": 1, "frustration": 1, "rephrasing": 2}
+                    import uuid
+                    from sqlalchemy import text as sa_text
+                    db.execute(sa_text(
+                        "INSERT INTO llm_feedback (feedback_id, prompt_template_id, prompt_version, llm_request_id, rating, comment, created_at) "
+                        "VALUES (:fid, 'system_general', 'auto', :rid, :r, :c, NOW())"
+                    ), {"fid": str(uuid.uuid4()), "rid": last_llm_request_id,
+                        "r": rating_map[signal.signal_type],
+                        "c": f"[implicit:{signal.signal_type}] {signal.evidence}"})
+                    db.commit()
+                    logger.debug(f"Implicit feedback: {signal.signal_type} (conf={signal.confidence})")
 
             # Run Chat Loop Step
             click.echo("Agent> ", nl=False)
@@ -176,7 +217,10 @@ def chat(user_id, model, mode):
                 context_dict = None
 
             # Run async loop with streaming
+            _response_chunks = []
+
             async def _stream_response():
+                nonlocal last_llm_request_id, last_agent_response
                 async for event in chat_loop.run_step_stream(
                     user_input=user_input,
                     session_id=session.session_id,
@@ -184,7 +228,9 @@ def chat(user_id, model, mode):
                     context=context_dict,
                 ):
                     if event.event_type == StreamEventType.TEXT_DELTA:
-                        click.echo(event.data.get("chunk", ""), nl=False)
+                        chunk = event.data.get("chunk", "")
+                        _response_chunks.append(chunk)
+                        click.echo(chunk, nl=False)
                     elif event.event_type == StreamEventType.THINKING_DELTA:
                         click.echo(f"\n  🤔 {event.data.get('chunk', '')}", nl=False)
                     elif event.event_type == StreamEventType.TOOL_CALL_START:
@@ -192,6 +238,9 @@ def chat(user_id, model, mode):
                     elif event.event_type == StreamEventType.TOOL_RESULT:
                         click.echo(" ✓", nl=False)
                     elif event.event_type == StreamEventType.RUN_FINISHED:
+                        last_llm_request_id = getattr(event, 'event_id', None)
+                        last_agent_response = "".join(_response_chunks)
+                        _response_chunks.clear()
                         click.echo()  # Final newline
 
             asyncio.run(_stream_response())
