@@ -71,7 +71,7 @@ class TestPriorContext:
 class TestSessionContinuity:
     def test_load_prior_context_assembles_all(self):
         db = _mock_db()
-        # Mock 3 queries returning different results
+        # Mock 3 queries + 1 access tracking UPDATE
         db.execute.side_effect = [
             Mock(fetchall=Mock(return_value=[
                 ("s1", "Did auth work", datetime(2026, 1, 1, tzinfo=timezone.utc), "Auth Session"),
@@ -79,6 +79,7 @@ class TestSessionContinuity:
             Mock(fetchall=Mock(return_value=[
                 ("e1", "user_preference", "language", "python", 0.9),
             ])),
+            Mock(),  # access tracking UPDATE
             Mock(fetchall=Mock(return_value=[
                 ("n1", "s0", "plan", "Finish migration", datetime(2026, 1, 2, tzinfo=timezone.utc)),
             ])),
@@ -137,6 +138,7 @@ class TestSessionContinuity:
             Mock(fetchall=Mock(return_value=[
                 ("e1", "pref", "lang", "py", 0.5),
             ])),
+            Mock(),  # access tracking UPDATE
             Mock(fetchall=Mock(return_value=[])),
         ]
 

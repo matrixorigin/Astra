@@ -171,7 +171,7 @@ class SessionContinuity:
             {"user_id": user_id, "limit": limit},
         ).fetchall()
 
-        return [
+        results = [
             {
                 "entry_id": r[0],
                 "category": r[1],
@@ -181,6 +181,13 @@ class SessionContinuity:
             }
             for r in rows
         ]
+
+        # Update access tracking for returned entries
+        if results:
+            from core.context.knowledge import update_access_tracking
+            update_access_tracking(self.db, [r["entry_id"] for r in results])
+
+        return results
 
     def _load_active_notes(
         self, user_id: str, limit: int,

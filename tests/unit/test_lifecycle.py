@@ -75,12 +75,19 @@ class TestMemoryGovernanceEngine:
         assert count == 1
     
     def test_quarantine_low_confidence(self, engine, mock_db):
-        """Test quarantine sets confidence to 0 via bulk update."""
-        mock_db.query.return_value.filter.return_value.update.return_value = 3
+        """Test quarantine sets confidence to 0 and logs entry_ids."""
+        from unittest.mock import MagicMock
+
+        row1 = ("entry_1", "key_a", 0.2)
+        row2 = ("entry_2", "key_b", 0.1)
+        # First .filter().all() returns rows to quarantine
+        mock_db.query.return_value.filter.return_value.all.return_value = [row1, row2]
+        # Second .filter().update() applies the change
+        mock_db.query.return_value.filter.return_value.update.return_value = 2
 
         count = engine._quarantine_low_confidence(threshold=0.3)
 
-        assert count == 3
+        assert count == 2
         mock_db.commit.assert_called_once()
 
     def test_decay_skips_entry_with_no_dates(self, engine, mock_db):

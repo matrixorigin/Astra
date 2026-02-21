@@ -216,6 +216,7 @@ class MemoryGovernanceEngine:
         """Quarantine entries below confidence threshold.
         
         Sets confidence to 0 so they are excluded from retrieval and decay.
+        Logs quarantined entry_ids for audit trail.
         
         Args:
             threshold: Minimum confidence to keep active
@@ -225,19 +226,31 @@ class MemoryGovernanceEngine:
         """
         from api.models import KnowledgeEntry
         
-        count = self.db.query(KnowledgeEntry).filter(
+        # Query first to capture entry_ids for audit
+        to_quarantine = self.db.query(
+            KnowledgeEntry.entry_id, KnowledgeEntry.key_name, KnowledgeEntry.confidence,
+        ).filter(
             KnowledgeEntry.confidence < threshold,
-            KnowledgeEntry.confidence > 0,  # skip already quarantined
+            KnowledgeEntry.confidence > 0,
+        ).all()
+
+        if not to_quarantine:
+            return 0
+
+        ids = [r[0] for r in to_quarantine]
+        self.db.query(KnowledgeEntry).filter(
+            KnowledgeEntry.entry_id.in_(ids),
         ).update(
             {KnowledgeEntry.confidence: 0, KnowledgeEntry.updated_at: datetime.now()},
             synchronize_session=False,
         )
-        
-        if count:
-            self.db.commit()
-            logger.info("Quarantined %d low-confidence entries (threshold=%.2f)", count, threshold)
-        
-        return count
+        self.db.commit()
+
+        logger.info(
+            "Quarantined %d low-confidence entries (threshold=%.2f): %s",
+            len(ids), threshold, ids,
+        )
+        return len(ids)
     
     def _compress_episodic_events(self, ttl_days: int = 90) -> int:
         """Compress old episodic events to summaries.

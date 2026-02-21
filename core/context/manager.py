@@ -13,6 +13,7 @@ from typing import Any
 
 from core.exceptions import ContextError
 from core.logging_config import get_logger
+from core.context.knowledge import update_access_tracking as _update_access_tracking
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from api.database import get_db_session
@@ -376,8 +377,14 @@ class ContextManager:
         # Sort by combined score: relevance * confidence
         results.sort(key=lambda x: x["relevance"] * x["confidence"], reverse=True)
         
-        logger.debug(f"Retrieved {len(results)} knowledge entries for query: {query[:50]}")
-        return results[:limit]
+        top = results[:limit]
+
+        # Update access tracking for returned entries
+        if top:
+            _update_access_tracking(self.db, [r["entry_id"] for r in top])
+
+        logger.debug(f"Retrieved {len(top)} knowledge entries for query: {query[:50]}")
+        return top
 
     def _score_candidates(
         self, query: str, candidates: list[dict[str, Any]], session_id: str, task_type: TaskType

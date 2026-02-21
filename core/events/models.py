@@ -30,6 +30,9 @@ class EventType(str, Enum):
     PLAN_COMPLETED = "plan_completed"
     PLAN_FAILED = "plan_failed"
 
+    # Memory governance events
+    KNOWLEDGE_EXTRACTED = "knowledge_extracted"
+
     # Agent run lifecycle
     RUN_STARTED = "run_started"
     RUN_WAITING = "run_waiting"

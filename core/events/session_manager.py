@@ -136,9 +136,11 @@ class SessionManager:
             # Auto-trigger knowledge extraction
             try:
                 from core.context.knowledge import KnowledgeExtractor
+                from core.events.event_logger import EventLogger
                 from api.models import Event
                 
-                extractor = KnowledgeExtractor(db)
+                event_logger = EventLogger(db)
+                extractor = KnowledgeExtractor(db, event_logger=event_logger)
                 
                 # Get all unique causal chains in this session
                 chains = db.query(Event.causal_chain_id).filter(

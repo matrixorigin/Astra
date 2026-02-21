@@ -10,9 +10,35 @@ from datetime import datetime
 from typing import Any
 
 from core.logging_config import get_logger
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
+
+
+def update_access_tracking(db: Session, entry_ids: list[str]) -> None:
+    """Bump access_count and last_accessed_at for retrieved entries.
+
+    Single UPDATE — no N+1.  Safe to call with empty list.
+    """
+    if not entry_ids:
+        return
+    try:
+        db.execute(
+            text(
+                "UPDATE knowledge_entries "
+                "SET access_count = access_count + 1, last_accessed_at = NOW() "
+                "WHERE entry_id IN :ids"
+            ),
+            {"ids": tuple(entry_ids)},
+        )
+        db.commit()
+    except Exception as e:
+        logger.warning("Access tracking update failed: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _normalize_value(v: str) -> str:
@@ -83,15 +109,17 @@ class KnowledgeExtractor:
         re.IGNORECASE
     )
 
-    def __init__(self, db: Session, llm_client=None):
+    def __init__(self, db: Session, llm_client=None, event_logger=None):
         """Initialize knowledge extractor.
         
         Args:
             db: SQLAlchemy database session
             llm_client: Optional LLM client for extraction (falls back to regex)
+            event_logger: Optional EventLogger for audit trail
         """
         self.db = db
         self.llm = llm_client
+        self.event_logger = event_logger
 
     def extract_from_chain(self, causal_chain_id: str, user_id: str) -> list[dict[str, Any]]:
         """Extract knowledge from completed causal chain.
@@ -122,6 +150,25 @@ class KnowledgeExtractor:
         
         stored = self._batch_store_knowledge(extracted)
         
+        # Audit: log extraction event
+        if self.event_logger and stored:
+            try:
+                self.event_logger.create_stream_event(
+                    user_id=user_id,
+                    session_id="system",
+                    event_type="knowledge_extracted",
+                    content=json.dumps({
+                        "causal_chain_id": causal_chain_id,
+                        "entries": stored,
+                    }),
+                    metadata={
+                        "causal_chain_id": causal_chain_id,
+                        "count": len(stored),
+                    },
+                )
+            except Exception as e:
+                logger.warning("Failed to log extraction event: %s", e)
+
         logger.info(f"Extracted {len(stored)} knowledge entries from chain {causal_chain_id}")
         return stored
 
@@ -289,7 +336,7 @@ class KnowledgeExtractor:
                         "Knowledge contradiction: %s = %r vs %r",
                         entry["key_name"], existing.value, entry["value"],
                     )
-                    existing.confidence = max(0, existing.confidence - 0.3)
+                    existing.confidence = max(0.0, existing.confidence - 0.3)
                     existing.updated_at = now
                     entry_id = str(uuid.uuid4())
                     knowledge = KnowledgeEntry(
@@ -343,40 +390,41 @@ class KnowledgeExtractor:
 
     def decay_confidence(self, user_id: str, half_life_days: int = 60) -> int:
         """Apply confidence decay to knowledge entries.
-        
+
+        Uses per-entry trust_tier half-life when available, falls back to
+        *half_life_days* parameter.
+
         Args:
             user_id: User whose knowledge to decay
-            half_life_days: Days for confidence to halve
-            
+            half_life_days: Default half-life when trust_tier is missing
+
         Returns:
             Number of entries decayed
         """
         from api.models import KnowledgeEntry
-        from sqlalchemy import func
-        
-        # Calculate days since validation
-        days_diff = func.datediff(func.now(), KnowledgeEntry.last_validated_at)
-        
-        # Calculate decay: initial_confidence * 0.5^(days_diff / half_life)
-        decay_factor = func.power(0.5, days_diff / half_life_days)
-        new_confidence = KnowledgeEntry.initial_confidence * decay_factor
-        
-        # Update entries with confidence > 0.3
-        result = self.db.query(KnowledgeEntry).filter(
+        from core.context.lifecycle import TRUST_TIER_HALF_LIVES
+
+        entries = self.db.query(KnowledgeEntry).filter(
             KnowledgeEntry.user_id == user_id,
-            KnowledgeEntry.confidence > 0.3
-        ).update(
-            {
-                KnowledgeEntry.confidence: new_confidence,
-                KnowledgeEntry.updated_at: func.now()
-            },
-            synchronize_session=False
-        )
-        
+            KnowledgeEntry.confidence > 0.3,
+        ).all()
+
+        count = 0
+        now = datetime.now()
+        for entry in entries:
+            anchor = entry.last_validated_at or entry.created_at
+            if anchor is None:
+                continue
+            hl = TRUST_TIER_HALF_LIVES.get(entry.trust_tier, half_life_days)
+            days_since = (now - anchor).days
+            new_conf = entry.initial_confidence * (0.5 ** (days_since / hl))
+            if new_conf != entry.confidence:
+                entry.confidence = new_conf
+                entry.updated_at = now
+                count += 1
+
         self.db.commit()
-        
-        count = result
-        logger.info(f"Applied confidence decay to {count} entries for user {user_id}")
+        logger.info("Applied confidence decay to %d entries for user %s", count, user_id)
         return count
 
     def quarantine_low_confidence(self, user_id: str, threshold: float = 0.3) -> int:

@@ -245,6 +245,7 @@ class HybridRetriever:
             LIMIT :limit
         """)
         
+        entries = []
         try:
             result = self.db.execute(
                 sql,
@@ -260,7 +261,6 @@ class HybridRetriever:
                 }
             )
             
-            entries = []
             for row in result:
                 entries.append({
                     "entry_id": row.entry_id,
@@ -275,7 +275,12 @@ class HybridRetriever:
                 })
             
             logger.info(f"Knowledge retrieval: {len(entries)} entries, top score: {entries[0]['relevance_score']:.3f}" if entries else "No entries found")
-            return entries
         except Exception as e:
             logger.error(f"Knowledge retrieval failed: {e}")
-            return []
+
+        # Access tracking — outside try/except so retrieval errors don't lose results
+        if entries:
+            from core.context.knowledge import update_access_tracking
+            update_access_tracking(self.db, [e["entry_id"] for e in entries])
+
+        return entries
