@@ -120,6 +120,12 @@ curl http://localhost:8000/health
 - `GET /workflows/runs/{run_id}` - Get workflow run status and step results
 - `POST /workflows/runs/{run_id}/resolve` - Resolve a wait step (e.g. human approval)
 
+### Triggers
+- `POST /triggers` - Create webhook or cron trigger
+- `GET /triggers` - List your triggers
+- `DELETE /triggers/{trigger_id}` - Delete a trigger
+- `POST /triggers/{trigger_id}/fire` - Fire a webhook trigger (secret-based auth)
+
 ### Agents
 - `POST /agents` - Create agent
 - `GET /agents` - List agents

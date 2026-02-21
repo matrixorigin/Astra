@@ -55,10 +55,33 @@ async def lifespan(app: FastAPI):
             await cleanup_stale_workflows(max_age_hours=24)
     cleanup_task = asyncio.create_task(_cleanup_loop())
 
+    # Cron trigger scheduler (check every 30s)
+    async def _trigger_loop():
+        while True:
+            await asyncio.sleep(30)
+            try:
+                from core.agent.triggers import get_due_triggers, fire_trigger, claim_and_advance
+                from api.database import get_db_session as _get_db
+                db = next(_get_db())
+                try:
+                    due = get_due_triggers(db)
+                    for tid in due:
+                        try:
+                            if claim_and_advance(db, tid):
+                                fire_trigger(db, tid)
+                        except Exception as e:
+                            logger.warning(f"Trigger {tid} fire failed: {e}")
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.debug(f"Trigger loop error: {e}")
+    trigger_task = asyncio.create_task(_trigger_loop())
+
     yield
 
     # Shutdown
     cleanup_task.cancel()
+    trigger_task.cancel()
     await scheduler.stop()
     logger.info("Shutting down...")
 
@@ -150,6 +173,10 @@ app.include_router(workflows.router, tags=["workflows"])
 # Learning service API
 from api.routers import learning
 app.include_router(learning.router, tags=["learning"])
+
+# Triggers — webhook + cron → AgentRun
+from api.routers import triggers
+app.include_router(triggers.router, tags=["triggers"])
 
 
 @app.get("/health")

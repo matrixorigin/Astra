@@ -549,3 +549,21 @@ class RunEvent(Base):
     event_id = Column(String(255))
     agent_id = Column(String(255))
     created_at = Column(DateTime, default=func.now())
+
+
+class Trigger(Base):
+    """Webhook or cron trigger that creates AgentRuns."""
+    __tablename__ = "triggers"
+    trigger_id = Column(String(255), primary_key=True)
+    user_id = Column(String(255), nullable=False, index=True)
+    agent_id = Column(String(255), nullable=False)
+    trigger_type = Column(String(32), nullable=False)  # webhook | schedule
+    name = Column(String(255), nullable=False)
+    user_input = Column(Text, nullable=False)
+    context = Column(JSON)
+    cron_expr = Column(String(128))
+    secret = Column(String(255))  # webhook auth
+    session_id = Column(String(255))  # optional: reuse session
+    next_fire_at = Column(DateTime)  # next scheduled fire time
+    is_active = Column(TINYINT(1), default=1)
+    created_at = Column(DateTime, default=func.now())
