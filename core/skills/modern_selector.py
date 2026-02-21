@@ -104,6 +104,13 @@ class ModernSkillSelector:
         )
         return tools, retrieval_method
 
+    def _skill_to_tool_schema_by_name(self, name: str) -> dict[str, Any] | None:
+        """Look up a skill by exact name and return its tool schema, or None."""
+        skill = self.rule_selector.skills.get(name)
+        if skill is None:
+            return None
+        return self._skill_to_tool_schema(skill)
+
     def select_and_execute(
         self, query: str, context: dict[str, Any] | None = None, max_candidates: int = 5
     ) -> list[dict[str, Any]]:

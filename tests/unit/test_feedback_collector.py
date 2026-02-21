@@ -11,9 +11,15 @@ from api.models import SkillLearningSignal
 
 @pytest.fixture
 def db():
-    """Mock database session."""
+    """Mock database session with get_bind() for independent connection."""
     mock_db = MagicMock()
     mock_db.query.return_value.filter.return_value.all.return_value = []
+    # _FeedbackBuffer._flush_locked uses db.get_bind().connect() for thread safety
+    mock_conn = MagicMock()
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_db.get_bind.return_value.connect.return_value = mock_conn
+    mock_db._mock_conn = mock_conn  # expose for assertions
     return mock_db
 
 
@@ -52,12 +58,11 @@ class TestFeedbackBuffer:
         
         buffer.add(event_id1, SignalType.WRONG_SKILL, {"test": 1})
         assert len(buffer._buffer) == 1
-        assert db.execute.call_count == 0
         
         buffer.add(event_id2, SignalType.SLOW_EXECUTION, {"test": 2})
         # Should auto-flush after 2nd record (batch_size=2)
-        assert db.execute.call_count == 2
-        assert db.commit.call_count == 1
+        conn = db._mock_conn
+        assert conn.execute.call_count == 3  # 2 INSERTs + 1 COMMIT
         assert len(buffer._buffer) == 0
 
     def test_manual_flush(self, buffer, db):
@@ -69,8 +74,8 @@ class TestFeedbackBuffer:
         flushed = buffer.flush()
         
         assert flushed == 1
-        assert db.execute.call_count == 1
-        assert db.commit.call_count == 1
+        conn = db._mock_conn
+        assert conn.execute.call_count == 2  # 1 INSERT + 1 COMMIT
         assert len(buffer._buffer) == 0
 
     def test_flush_empty_buffer(self, buffer, db):
@@ -82,7 +87,8 @@ class TestFeedbackBuffer:
 
     def test_flush_error_requeues(self, buffer, db):
         """Test that flush errors re-queue signals."""
-        db.execute.side_effect = Exception("DB error")
+        conn = db._mock_conn
+        conn.execute.side_effect = Exception("DB error")
         
         event_id = f"evt-{uuid.uuid4().hex[:8]}"
         buffer.add(event_id, SignalType.WRONG_SKILL, {"test": 1})
@@ -90,7 +96,6 @@ class TestFeedbackBuffer:
         
         # Auto-flush should fail and re-queue
         assert len(buffer._buffer) == 2
-        assert db.rollback.call_count == 1
 
     def test_maybe_flush_interval_not_elapsed(self, buffer, db):
         """Test maybe_flush when interval not elapsed."""

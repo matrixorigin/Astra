@@ -455,51 +455,26 @@ class TestRollbackMechanism:
     """Test rollback mechanism for failed gates."""
     
     def test_rollback_learnings_deletes_recent_records(self, setup_tables):
-        """Test that _rollback_learnings() deletes records from the specified time window."""
+        """Test that _rollback_learnings() soft-deletes recent learnings via SelfImprovingSelector."""
         from core.skills.pipeline import SkillPipeline
-        from unittest.mock import Mock
-        
-        # Setup selector_learnings table
-        setup_tables.execute(text("DROP TABLE IF EXISTS selector_learnings"))
-        setup_tables.execute(text("""
-            CREATE TABLE selector_learnings (
-                learning_id VARCHAR(36) PRIMARY KEY,
-                query_pattern VARCHAR(255),
-                wrong_skills TEXT,
-                correct_skills TEXT,
-                improvement_score DOUBLE,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        setup_tables.commit()
-        
-        # Insert test data with different timestamps
-        setup_tables.execute(text("""
-            INSERT INTO selector_learnings 
-            (learning_id, query_pattern, wrong_skills, correct_skills, improvement_score, created_at)
-            VALUES
-            ('l1', 'pattern1', '[]', '["skill1"]', 0.8, DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 DAY)),
-            ('l2', 'pattern2', '[]', '["skill2"]', 0.9, DATE_SUB(UTC_TIMESTAMP(), INTERVAL 5 DAY)),
-            ('l3', 'pattern3', '[]', '["skill3"]', 0.7, DATE_SUB(UTC_TIMESTAMP(), INTERVAL 10 DAY))
-        """))
-        setup_tables.commit()
-        
-        # Create pipeline and call rollback
+        from unittest.mock import Mock, patch
+        from datetime import timedelta
+
         mock_improver = Mock()
-        pipeline = SkillPipeline(setup_tables, mock_improver)
+        mock_improver.rollback_learnings.return_value = 2
+
+        mock_llm = Mock()
+        pipeline = SkillPipeline(setup_tables, mock_llm, learning=False)
+        pipeline._improver = mock_improver
+
         pipeline._rollback_learnings(days=7)
-        
-        # Verify only records within 7 days are deleted
-        result = setup_tables.execute(text("SELECT learning_id FROM selector_learnings ORDER BY learning_id"))
-        remaining = [row[0] for row in result]
-        
-        assert "l3" in remaining  # 10 days old, should remain
-        assert "l1" not in remaining  # 2 days old, should be deleted
-        assert "l2" not in remaining  # 5 days old, should be deleted
-        
-        # Cleanup
-        setup_tables.execute(text("DROP TABLE IF EXISTS selector_learnings"))
-        setup_tables.commit()
+
+        mock_improver.rollback_learnings.assert_called_once()
+        call_kwargs = mock_improver.rollback_learnings.call_args
+        since = call_kwargs[1]["since"]
+        # since should be ~7 days ago
+        expected = datetime.now(timezone.utc) - timedelta(days=7)
+        assert abs((since - expected).total_seconds()) < 5
 
 
 class TestSandboxCleanup:

@@ -64,10 +64,15 @@ class LearningResult:
 # ---------------------------------------------------------------------------
 
 class _FeedbackBuffer:
-    """Thread-safe buffer that batches feedback signals before DB write."""
+    """Thread-safe buffer that batches feedback signals before DB write.
+
+    Uses a dedicated Session for flush to avoid contention with the
+    caller's Session when multiple threads add/flush concurrently.
+    """
 
     def __init__(self, db: Session, *, batch_size: int = 50, flush_interval: float = 2.0):
-        self._db = db
+        self._session_factory = db.get_bind().engine.connect  # for independent sessions
+        self._db = db  # fallback reference for engine access
         self._batch_size = batch_size
         self._flush_interval = flush_interval
         self._buffer: list[dict[str, Any]] = []
@@ -97,7 +102,7 @@ class _FeedbackBuffer:
         return 0
 
     def _flush_locked(self) -> int:
-        """Must be called with self._lock held."""
+        """Must be called with self._lock held. Uses independent connection."""
         if not self._buffer:
             return 0
         batch = self._buffer[:]
@@ -105,25 +110,25 @@ class _FeedbackBuffer:
         self._last_flush = time.time()
 
         try:
-            for row in batch:
-                self._db.execute(
-                    text("""INSERT INTO skill_learning_signals
-                           (signal_id, selection_event_id, signal_type, signal_data, created_at)
-                           VALUES (:signal_id, :selection_event_id, :signal_type, :signal_data, :created_at)"""),
-                    {
-                        "signal_id": row["signal_id"],
-                        "selection_event_id": row["selection_event_id"],
-                        "signal_type": row["signal_type"],
-                        "signal_data": row["signal_data"],
-                        "created_at": row["created_at"],
-                    },
-                )
-            self._db.commit()
+            with self._db.get_bind().connect() as conn:
+                for row in batch:
+                    conn.execute(
+                        text("""INSERT INTO skill_learning_signals
+                               (signal_id, selection_event_id, signal_type, signal_data, created_at)
+                               VALUES (:signal_id, :selection_event_id, :signal_type, :signal_data, :created_at)"""),
+                        {
+                            "signal_id": row["signal_id"],
+                            "selection_event_id": row["selection_event_id"],
+                            "signal_type": row["signal_type"],
+                            "signal_data": row["signal_data"],
+                            "created_at": row["created_at"],
+                        },
+                    )
+                conn.execute(text("COMMIT"))
             logger.debug("Flushed %d feedback signals", len(batch))
             return len(batch)
         except Exception as e:
             logger.error("Feedback flush failed: %s", e)
-            self._db.rollback()
             # Re-queue
             self._buffer.extend(batch)
             return 0
@@ -207,24 +212,29 @@ class SkillPipeline:
         )
         skill_names = [t["function"]["name"] for t in tools]
 
-        # Stage 1b: apply learned corrections
+        # Stage 1b: apply learned corrections (order-preserving)
         if self._improver and skill_names:
             candidates = [SkillCandidate(name=n) for n in skill_names]
             corrected = self._improver.apply_learnings(query, candidates)
-            corrected_names = {c.name for c in corrected}
+            corrected_names = [c.name for c in corrected]
 
-            if corrected_names != set(skill_names):
+            if corrected_names != skill_names:
                 logger.info(
                     "Learning correction: %s → %s",
-                    skill_names, list(corrected_names),
+                    skill_names, corrected_names,
                 )
-                # Filter tools to corrected set, preserving schema
-                tools = [t for t in tools if t["function"]["name"] in corrected_names]
-                # Add tools for newly-added skills (corrections may add skills)
-                existing = {t["function"]["name"] for t in tools}
-                for name in corrected_names - existing:
-                    extra, _ = self._modern.get_tools_schema(name, max_candidates=1)
-                    tools.extend(extra)
+                # Rebuild tools in corrected order
+                tool_by_name = {t["function"]["name"]: t for t in tools}
+                ordered_tools = []
+                for name in corrected_names:
+                    if name in tool_by_name:
+                        ordered_tools.append(tool_by_name[name])
+                    else:
+                        # New skill added by correction — look up by exact name
+                        schema = self._modern._skill_to_tool_schema_by_name(name)
+                        if schema:
+                            ordered_tools.append(schema)
+                tools = ordered_tools
 
         # Stage 2: audit
         event_id = None
@@ -329,16 +339,13 @@ class SkillPipeline:
             return LearningResult(error=str(e))
 
     def _rollback_learnings(self, days: int) -> None:
-        """Remove learnings created in the current cycle."""
+        """Soft-delete learnings created in the current cycle via SelfImprovingSelector."""
+        if not self._improver:
+            return
+        since = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=days)
         try:
-            self._db.execute(
-                text(
-                    "DELETE FROM selector_learnings "
-                    "WHERE created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)"
-                ),
-                {"days": days},
-            )
-            self._db.commit()
+            count = self._improver.rollback_learnings(since=since)
+            logger.info("Rolled back %d learnings (since %s)", count, since)
         except Exception as e:
             logger.error("Learning rollback failed: %s", e)
             self._db.rollback()

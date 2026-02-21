@@ -119,9 +119,10 @@ def test_extraction_logs_event(db_session):
     # Verify knowledge_extracted event was logged
     audit_events = db_session.query(Event).filter(
         Event.event_type == "knowledge_extracted",
+        Event.content.like(f'%{chain_id}%'),
     ).all()
-    assert len(audit_events) >= 1
-    content = json.loads(audit_events[-1].content)
+    assert len(audit_events) == 1
+    content = json.loads(audit_events[0].content)
     assert content["causal_chain_id"] == chain_id
     assert len(content["entries"]) == len(stored)
 
