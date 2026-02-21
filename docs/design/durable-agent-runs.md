@@ -620,7 +620,122 @@ reg.register("trigger_airflow", airflow_exec, airflow_schema)
 
 ---
 
-## 9. Why This Design
+## 9. Distributed Safety
+
+> **Status**: Implemented — all coordination through DB, no cross-worker in-memory dependencies
+
+### Problem
+
+Phase 1-2 used in-memory dicts (`_active_runs`, `_run_events`, `_workflow_runs`, `_workflow_waits`) for run state. This works for single-worker but breaks with multiple workers behind a load balancer:
+
+| Operation | Failure mode |
+|-----------|-------------|
+| SSE streaming | Client reconnects to worker B, but events are in worker A's memory |
+| Resume run | Webhook hits worker B, but waiting run is on worker A |
+| Cancel run | User cancels on worker B, but run is executing on worker A |
+| Resume workflow | Job callback hits worker B, but workflow state is on worker A |
+| Concurrent resume | Two webhooks arrive simultaneously, both workers try to resume |
+
+### Solution: DB as Sole Coordination Layer
+
+```
+Worker A                    DB (MatrixOne)                Worker B
+   │                            │                            │
+   │── INSERT run_events ──────▶│                            │
+   │                            │◀── SELECT run_events ──────│  (SSE stream)
+   │                            │                            │
+   │── UPDATE status=waiting ──▶│                            │
+   │                            │◀── SELECT waiting runs ────│  (resume)
+   │                            │                            │
+   │                            │◀── INSERT resume_claim ────│  (optimistic lock)
+   │                            │    IntegrityError? → skip  │
+```
+
+### Implementation Details
+
+#### 1. Event Persistence (`run_events` table)
+
+Every SSE event is dual-written: local buffer (zero-latency for same-worker clients) + DB INSERT (cross-worker access).
+
+```sql
+CREATE TABLE run_events (
+    id          INT AUTO_INCREMENT PRIMARY KEY,
+    run_id      VARCHAR(255) NOT NULL,
+    idx         INT NOT NULL,              -- sequential within run; -1 = resume_claim
+    event_type  VARCHAR(64) NOT NULL,
+    data        JSON NOT NULL,
+    event_id    VARCHAR(255),
+    agent_id    VARCHAR(255),
+    created_at  DATETIME DEFAULT NOW(),
+    UNIQUE KEY uq_run_event_run_idx (run_id, idx)
+);
+```
+
+Streaming path:
+- Same worker: read from `_run_events` dict (instant)
+- Cross worker: poll `run_events` table every 0.1s
+
+#### 2. Optimistic Lock for Resume (`_try_claim_resume`)
+
+Multiple workers may receive the same job-completion webhook. Only one should resume the run.
+
+```
+INSERT INTO run_events (run_id, idx, event_type, data)
+VALUES (:run_id, -1, 'resume_claim', :data)
+```
+
+- `UNIQUE(run_id, idx)` ensures only one `idx=-1` row per run
+- First INSERT succeeds → worker wins the claim
+- Second INSERT → `IntegrityError` → worker skips
+- DB unavailable → fallback `return True` (single-worker degradation)
+
+#### 3. Cross-Worker Cancel
+
+```
+cancel_run(run_id):
+  1. Set local status → CANCELLED
+  2. Cancel asyncio task (if local)
+  3. Cancel workflow (if local): engine.cancel(wf_name)
+  4. Write to DB: UPDATE workflow_runs SET status='cancelled'
+
+WorkflowEngine._execute_loop() — before each step:
+  1. Check _cancelled set (local cancel)
+  2. Check _is_cancelled_in_db() (remote cancel via DB query)
+```
+
+#### 4. Workflow Resume with DB Fallback
+
+```
+resume_workflow(handle, result):
+  1. _workflow_waits[handle] → wf_id          (local memory)
+  2. Miss → query workflow_runs WHERE waiting_for=handle  (DB fallback)
+  3. _workflow_runs[wf_id] → entry            (local memory)
+  4. Miss → _restore_workflow_entry(wf_id)    (reconstruct from DB)
+  5. Resume workflow execution
+```
+
+#### 5. Run Restore from Events
+
+```
+restore_run(run_id):
+  SELECT event_type, content, metadata FROM conversation_events
+  WHERE metadata->>'run_id' = :run_id ORDER BY created_at
+
+  Replay: run_started → run_waiting → ... → reconstruct AgentRun state
+```
+
+### Failure Modes & Degradation
+
+| Scenario | Behavior |
+|----------|----------|
+| DB down during event persist | Non-fatal: local buffer still works, log warning |
+| DB down during claim | Allow resume (single-worker fallback) |
+| DB down during cancel check | Skip check (local cancel still works) |
+| Worker crash mid-run | Run stays RUNNING; `restore_waiting_workflows()` on startup recovers WAITING runs; stuck RUNNING runs cleaned by hourly `cleanup_stale_workflows()` |
+
+---
+
+## 10. Why This Design
 
 ### vs. Temporal/Durable Execution
 Temporal is powerful but adds a heavy dependency and requires learning a new programming model. Our approach uses what we already have (events + ChatLoop) and adds durability naturally through event sourcing. If we outgrow this, migrating to Temporal is straightforward because our events map cleanly to Temporal activities.
