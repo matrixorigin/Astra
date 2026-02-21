@@ -62,6 +62,7 @@ class RunEngine:
         try:
             from api.routers.chat import _build_chat_loop
             loop = _build_chat_loop(self.db)
+            loop._current_run_id = run.run_id  # For async tools to link jobs
 
             async for event in loop.run_step_stream(
                 user_input=run.user_input,
@@ -122,6 +123,20 @@ class RunEngine:
         run.status = RunStatus.CANCELLED
         self._log_run_event(run, EventType.RUN_CANCELLED)
         _run_waiters.get(run_id, asyncio.Event()).set()
+        return True
+
+    async def on_job_completed(self, job_id: str, result: dict) -> bool:
+        """Called when a background job completes. Resumes the waiting run."""
+        return await self.resolve_handle(f"job:{job_id}", {"job_id": job_id, **result})
+
+    async def resolve_handle(self, handle: str, result: dict) -> bool:
+        """Resolve any wait handle. Resumes the run waiting for it."""
+        from core.agent.async_tools import get_async_tool_registry
+        run_id = get_async_tool_registry().resolve_handle(handle)
+        if not run_id:
+            logger.warning(f"No run waiting for handle {handle}")
+            return False
+        await self.resume_run(run_id, result)
         return True
 
     def get_run(self, run_id: str) -> AgentRun | None:

@@ -358,8 +358,13 @@ class ChatLoop:
 
                 # Execute skill with automatic feedback recording
                 try:
+                    from core.agent.async_tools import get_async_tool_registry as _get_atr
+                    _atr = _get_atr()
+                    # Intercept async tools (submit_job, etc.)
+                    if _atr.is_async_tool(fn_name):
+                        result = await _atr.execute(fn_name, params, run_id=getattr(self, '_current_run_id', None))
                     # Intercept scratchpad tools — handle locally, don't go to executor
-                    if fn_name.startswith("scratchpad_") and self.scratchpad:
+                    elif fn_name.startswith("scratchpad_") and self.scratchpad:
                         result = self._handle_scratchpad_tool(
                             fn_name, params, session_id, user_id,
                         )
@@ -504,6 +509,11 @@ class ChatLoop:
         if self.mcp_bridge and self.mcp_bridge.tool_count > 0:
             mcp_tools = await self.mcp_bridge.get_tools_schema()
             tools_schema = list(tools_schema) + mcp_tools
+
+        # Append async tools (submit_job, etc.)
+        from core.agent.async_tools import get_async_tool_registry
+        _async_registry = get_async_tool_registry()
+        tools_schema = list(tools_schema) + _async_registry.get_schemas()
 
         # Log RUN_STARTED event
         run_started_event = self.event_logger.create_stream_event(
@@ -885,6 +895,19 @@ class ChatLoop:
                         if not audit.safe:
                             logger.warning("CoT audit blocked tool %s: %s", fn_name, audit.reason)
                             result_str = json.dumps({"error": f"Blocked by CoT audit: {audit.reason}"})
+                        elif _async_registry.is_async_tool(fn_name):
+                            result = await _async_registry.execute(fn_name, params, run_id=getattr(self, '_current_run_id', None))
+                            result_str = json.dumps(result, default=str)
+                            if result.get("wait_for"):
+                                yield StreamEvent(
+                                    event_type=StreamEventType.TOOL_RESULT,
+                                    data={"call_id": tc["id"], "result": result_str[:500], "wait_for": result["wait_for"]},
+                                    event_id=user_event.event_id,
+                                    causal_chain_id=user_event.causal_chain_id,
+                                    agent_id=self.agent_id,
+                                )
+                                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+                                return
                         elif fn_name == "delegate_task":
                             delegated_agent_id = params.get("agent_id", "unknown")
                             

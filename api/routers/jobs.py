@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from api.dependencies import get_current_user
+from api.database import get_db_session
 from core.jobs.backend import JobRequirements, JobStatus
 from core.jobs.router import JobRouter
 
@@ -27,6 +28,13 @@ class JobResponse(BaseModel):
     result: dict | None = None
     error: str | None = None
     progress: float = 0.0
+
+
+class JobCompletionWebhook(BaseModel):
+    job_id: str
+    status: str
+    result: dict | None = None
+    error: str | None = None
 
 
 @router.post("/jobs", response_model=JobResponse)
@@ -70,3 +78,18 @@ async def cancel_job(
     if not cancelled:
         raise HTTPException(status_code=404, detail="Job not found or already finished")
     return {"job_id": job_id, "status": "cancelled"}
+
+
+@router.post("/jobs/webhook")
+async def job_completion_webhook(
+    payload: JobCompletionWebhook,
+    db=Depends(get_db_session),
+):
+    """Webhook called when a job completes. Resumes the waiting agent run."""
+    from core.agent.run_engine import RunEngine
+    engine = RunEngine(db)
+    result = payload.result or {}
+    if payload.error:
+        result["error"] = payload.error
+    resumed = await engine.on_job_completed(payload.job_id, result)
+    return {"resumed": resumed, "job_id": payload.job_id}

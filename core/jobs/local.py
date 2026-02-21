@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sys
+from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from core.jobs.backend import JobBackend, JobRequirements, JobResult, JobStatus
@@ -14,9 +15,10 @@ logger = get_logger(__name__)
 class LocalJobBackend(JobBackend):
     """Execute background jobs as local subprocesses."""
 
-    def __init__(self) -> None:
+    def __init__(self, on_completed: Callable[[str, dict], Awaitable[None]] | None = None) -> None:
         self._tasks: dict[str, asyncio.Task] = {}
         self._results: dict[str, JobResult] = {}
+        self._on_completed = on_completed
 
     async def submit(self, job_type: str, inputs: dict, requirements: JobRequirements) -> str:
         job_id = str(uuid4())
@@ -87,6 +89,15 @@ class LocalJobBackend(JobBackend):
             self._results[job_id] = JobResult(
                 job_id=job_id, status=JobStatus.FAILED, error=str(e)
             )
+        finally:
+            # Notify completion callback (for run resume)
+            if self._on_completed:
+                r = self._results.get(job_id)
+                if r and r.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                    try:
+                        await self._on_completed(job_id, r.result or {"error": r.error})
+                    except Exception as cb_err:
+                        logger.error(f"Job completion callback failed: {cb_err}")
 
     @staticmethod
     def _build_cmd(job_type: str, inputs: dict, req: JobRequirements) -> list[str]:
