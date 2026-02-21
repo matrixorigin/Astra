@@ -622,3 +622,89 @@ class ModelArtifact(Base):
     is_active = Column(TINYINT(1), default=0, index=True)  # only 1 active per model_name
     created_by = Column(String(36))
     created_at = Column(DateTime, default=func.now())
+
+
+# ── Skill-as-Package platform tables ──────────────────────────────────────────
+
+
+class UserConnection(Base):
+    """BYOD database connection registry — one per user."""
+    __tablename__ = "user_connections"
+
+    connection_id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False, unique=True)
+    dialect = Column(String(20), nullable=False)       # "mysql" | "matrixone"
+    host = Column(String(255), nullable=False)
+    port = Column(Integer, nullable=False)
+    database = Column(String(100), nullable=False)
+    username = Column(String(100), nullable=False)
+    password_encrypted = Column(Text, nullable=False)
+    status = Column(String(20), default="active")      # active | inactive | error
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    verified_at = Column(DateTime)
+
+
+class SkillDefinition(Base):
+    """Skill marketplace catalog — admin-managed."""
+    __tablename__ = "skill_definitions"
+
+    skill_id = Column(String(36), primary_key=True)
+    name = Column(String(100), nullable=False, unique=True)
+    version = Column(String(20), nullable=False)
+    description = Column(Text)
+    manifest = Column(JSON, nullable=False)
+    is_active = Column(TINYINT(1), default=1, nullable=False)
+    is_public = Column(TINYINT(1), default=0, nullable=False)
+    created_by = Column(String(36))
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class SkillInstallation(Base):
+    """Per-user skill installation state."""
+    __tablename__ = "skill_installations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "skill_name", name="uq_user_skill"),
+        Index("ix_install_user_status", "user_id", "status"),
+    )
+
+    installation_id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False)
+    skill_name = Column(String(100), nullable=False)
+    skill_version = Column(String(20), nullable=False)
+    status = Column(String(20), default="installed")   # installed | uninstalled
+    installed_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, onupdate=func.now())
+
+
+class UserCredential(Base):
+    """Per-user encrypted skill credentials."""
+    __tablename__ = "user_credentials"
+    __table_args__ = (
+        UniqueConstraint("user_id", "skill_name", "credential_name",
+                         name="uq_user_skill_cred"),
+    )
+
+    credential_id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False)
+    skill_name = Column(String(100), nullable=False)
+    credential_name = Column(String(100), nullable=False)
+    value_encrypted = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    rotated_at = Column(DateTime)
+
+
+class SkillPermission(Base):
+    """Skill RBAC — who can install which skill."""
+    __tablename__ = "skill_permissions"
+    __table_args__ = (
+        UniqueConstraint("skill_name", "grantee_type", "grantee_id",
+                         name="uq_skill_grantee"),
+    )
+
+    permission_id = Column(String(36), primary_key=True)
+    skill_name = Column(String(100), nullable=False)
+    grantee_type = Column(String(10), nullable=False)  # "user" | "role"
+    grantee_id = Column(String(36), nullable=False)
+    granted_by = Column(String(36), nullable=False)
+    granted_at = Column(DateTime, default=func.now(), nullable=False)

@@ -1,0 +1,25 @@
+# skills/github/manifest.yaml
+name: github
+version: "1.0.0"
+description: "GitHub integration — PRs, issues, CI status, code search"
+author: "mo-agent-engine"
+table_prefix: github
+
+tables:
+  - github_repos
+  - github_pr_cache
+
+credentials:
+  - name: github_token
+    type: secret
+    description: "GitHub Personal Access Token or App token"
+    required: true
+
+requires:
+  - http
+
+depends_on: []
+
+dialects:
+  - mysql
+  - matrixone
