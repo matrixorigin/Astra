@@ -185,14 +185,17 @@ class RunEngine:
         Checks for DB cancellation between events so cross-worker cancel
         is detected even during long tool calls.
         """
+        event_count = 0
         async for event in loop.run_step_stream(
             user_input=run.user_input,
             session_id=run.session_id,
             user_id=run.user_id,
             context=run.context,
         ):
-            # Check for cross-worker cancellation between events
-            if run.parent_run_id and self._is_cancelled_in_db(run.run_id):
+            # Cross-worker cancel: check DB periodically for child runs
+            # (parent runs are cancelled in-memory via cancel_run + task.cancel)
+            event_count += 1
+            if run.parent_run_id and event_count % 5 == 0 and self._is_cancelled_in_db(run.run_id):
                 run.status = RunStatus.CANCELLED
                 self._log_run_event(run, EventType.RUN_CANCELLED)
                 return
@@ -377,6 +380,7 @@ class RunEngine:
         idx = last_index
         max_idle_polls = 3000  # ~5 min at 0.1s interval
         idle_count = 0
+        db_check_interval = 20  # Check DB every ~2s, not every 0.1s
 
         while idle_count < max_idle_polls:
             # Re-check each iteration (run may be GC'd mid-stream)
@@ -394,16 +398,13 @@ class RunEngine:
             else:
                 idle_count += 1
 
-            # Check if run is done
+            # Check if run is done (DB check only every db_check_interval polls)
             run = _active_runs.get(run_id)
             if run and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                 return
-            if not run:
-                # Cross-worker: check DB for terminal status
+            if not run and idle_count % db_check_interval == 0:
                 db_run = self.restore_run(run_id)
-                if db_run and db_run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
-                    return
-                if not db_run:
+                if not db_run or db_run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                     return
 
             await asyncio.sleep(0.1)
@@ -554,7 +555,10 @@ class RunEngine:
         results = {}
         for cid in children:
             child = _active_runs.get(cid)
-            status = child.status if child else self._get_run_status_from_db(cid)
+            if not child:
+                # Single DB restore for both status and agent_id
+                child = self.restore_run(cid)
+            status = child.status if child else None
             if status not in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                 return  # Still waiting for some children
 
@@ -567,7 +571,7 @@ class RunEngine:
                 if ev.get("event_type") == "text_delta":
                     final_text += ev.get("data", {}).get("text", "")
 
-            agent_id = child.agent_id if child else self._get_agent_id_from_db(cid)
+            agent_id = child.agent_id if child else cid
             results[agent_id] = {
                 "run_id": cid,
                 "status": status.value if hasattr(status, 'value') else str(status),

@@ -861,25 +861,18 @@ class TestConsumeStreamCancellation:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
-            for i in range(5):
+            for i in range(20):
                 event_count[0] += 1
                 yield StreamEvent(event_type="text_delta", data={"text": f"chunk-{i}"})
 
         mock_loop.run_step_stream = stream
 
-        # Simulate: DB says child is cancelled after first event
-        call_count = [0]
-        original_is_cancelled = engine._is_cancelled_in_db
-
-        def mock_is_cancelled(run_id):
-            call_count[0] += 1
-            return call_count[0] > 1  # Cancel after first check
-
-        engine._is_cancelled_in_db = mock_is_cancelled
+        # Always report cancelled in DB
+        engine._is_cancelled_in_db = lambda run_id: True
 
         with patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
             await engine.start_run(child)
 
         assert child.status == RunStatus.CANCELLED
-        # Should have stopped early, not consumed all 5 events
-        assert event_count[0] < 5
+        # Check happens at event_count % 5 == 0, so should stop at event 5
+        assert event_count[0] <= 5
