@@ -75,7 +75,8 @@ class SubprocessRuntime(Runtime):
                 # RLIMIT_AS only works on Linux; macOS raises in preexec_fn
                 if _IS_LINUX:
                     resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-                    resource.setrlimit(resource.RLIMIT_NPROC, (10, 10))
+                    # RLIMIT_NPROC is per-UID, not per-process, so it would block
+                    # subprocess.run() in executed code. Use RLIMIT_CPU instead.
                 resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
 
             start = time.monotonic()

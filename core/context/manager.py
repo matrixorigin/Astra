@@ -618,7 +618,7 @@ class ContextManager:
 
         # Extract skills used (name and version)
         skills_used = [
-            {"name": s.get("name") or s.get("skill_name", ""), "version": s.get("version", "latest")}
+            {"skill_name": s.get("skill_name") or s.get("name", ""), "version": s.get("version", "latest")}
             for s in context.skill_definitions
         ]
 

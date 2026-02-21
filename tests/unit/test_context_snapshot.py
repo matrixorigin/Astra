@@ -29,7 +29,7 @@ def sample_context():
     """Create a sample Context object."""
     return Context(
         system_prompt="System prompt",
-        skill_definitions=[{"name": "skill1", "version": "v1"}, {"name": "skill2"}],
+        skill_definitions=[{"skill_name": "skill1", "version": "v1"}, {"skill_name": "skill2"}],
         selected_events=[],
         code_context=[],
         documentation=[],
@@ -65,9 +65,9 @@ class TestSaveSnapshot:
         # Verify skills_used extraction
         skills_used = snapshot.skills_used
         assert len(skills_used) == 2
-        assert skills_used[0]["name"] == "skill1"
+        assert skills_used[0]["skill_name"] == "skill1"
         assert skills_used[0]["version"] == "v1"
-        assert skills_used[1]["name"] == "skill2"
+        assert skills_used[1]["skill_name"] == "skill2"
         assert skills_used[1]["version"] == "latest"  # Default fallback
 
     def test_save_snapshot_with_llm_ids(self, context_manager, mock_db, sample_context):
