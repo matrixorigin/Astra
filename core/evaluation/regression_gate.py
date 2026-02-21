@@ -215,18 +215,25 @@ class RegressionGate:
                 })
             
             elif change_type == ChangeType.SKILL:
-                # Insert or update skill in sandbox
+                skill_definition = change_content.get("definition")
+                if skill_definition is None:
+                    skill_definition = change_content.get("skill_definition", {})
                 self.db.execute(text(f"""
                     INSERT INTO {sandbox_name}.skills_registry 
-                    (skill_id, skill_name, version, skill_definition, created_at)
-                    VALUES (:skill_id, :skill_name, :version, :definition, NOW())
+                    (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
+                    VALUES (:skill_id, :skill_name, :version, :description, :definition, 1, NOW(), NOW())
                     ON DUPLICATE KEY UPDATE
-                    skill_definition = :definition, version = :version
+                    skill_definition = :definition,
+                    version = :version,
+                    description = :description,
+                    is_active = 1,
+                    updated_at = NOW()
                 """), {
                     "skill_id": change_id,
-                    "skill_name": change_content.get("name", change_id),
+                    "skill_name": change_content.get("skill_name") or change_content.get("name", change_id),
                     "version": change_content.get("version", "1.0.0"),
-                    "definition": str(change_content.get("definition", {})),
+                    "description": change_content.get("description", ""),
+                    "definition": skill_definition,
                 })
             
             elif change_type == ChangeType.CONFIG:
