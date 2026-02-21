@@ -318,6 +318,7 @@ RECORD: Store the learning signal for future pattern matching
 - **SelfImprovingSelector**: Learns from historical skill selection failures using time-travel replay
 - **RegressionGate (ChangeType.SELECTOR)**: Validates selector changes before deployment via unified gate
 - **AuditableSkillSelector**: Records every selection decision with full context
+- **InputFaceLearner**: ✅ Unified meta-learning loop for prompt, context budget, and knowledge input faces (`core/learning/input_face_learner.py`)
 
 ### The Generalization
 
@@ -326,8 +327,9 @@ Meta-learning generalizes `SelfImprovingSelector` to ALL versioned inputs:
 | Input | Current | Meta-Learning |
 |-------|---------|---------------|
 | Skill selection | SelfImprovingSelector | ✅ Already learning |
-| Prompt | Manual iteration | Auto-propose from failure patterns |
-| Context budget | Fixed allocation | Task-aware dynamic allocation |
+| Prompt | PromptOptimizer | ✅ Auto-diagnose + improve via InputFaceLearner |
+| Context budget | _BUDGET_RATIOS | ✅ Task-aware dynamic adjustment via InputFaceLearner |
+| Knowledge | MemoryGovernanceEngine | ✅ Stale detection + targeted quarantine via InputFaceLearner |
 | Model routing | Static rules | Cost-quality optimization from historical data |
 | Memory retrieval | Fixed weights | Relevance weight tuning from feedback |
 

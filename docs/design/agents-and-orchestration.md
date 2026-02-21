@@ -232,6 +232,14 @@ Orchestrator → delegate(code_agent, "Review code")     ─┐
              ← collect all results → synthesize
 ```
 
+**Status**: ✅ Implemented — `core/agent/coordination.py`
+
+Fan-in returns structured `AggregatedResult` with:
+- Quality metrics: `success_rate`, `succeeded`/`failed` counts
+- Conflict detection: artifact-level disagreement between agents (e.g. two agents modifying same file)
+- `summary` property for backward-compatible string output
+- Conflicts surfaced as `Conflict(artifact, agents, proposals, severity)`
+
 **Pipeline** (sequential):
 ```
 Orchestrator → delegate(ci_agent, "Get failure details")

@@ -7,8 +7,9 @@ Supports streaming for real-time multi-agent progress visualization.
 """
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from core.events.models import StreamEvent
@@ -34,6 +35,122 @@ class Result:
     success: bool
     output: str
     error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Structured aggregation result (replaces raw string fan_in)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Conflict:
+    """A detected conflict between agent results."""
+
+    artifact: str  # target artifact (e.g. file path, function name)
+    agents: list[str]  # agents that disagree
+    proposals: list[str]  # their competing proposals
+    severity: str = "info"  # "info" | "warning" | "blocking"
+
+
+@dataclass
+class AggregatedResult:
+    """Structured fan-in output with quality metrics and conflict detection."""
+
+    results: list[Result]
+    conflicts: list[Conflict] = field(default_factory=list)
+    success_rate: float = 0.0
+    total: int = 0
+    succeeded: int = 0
+    failed: int = 0
+
+    @property
+    def has_conflicts(self) -> bool:
+        return len(self.conflicts) > 0
+
+    @property
+    def summary(self) -> str:
+        """Human-readable summary (backward-compatible with old fan_in str)."""
+        parts = []
+        if self.succeeded:
+            parts.append(f"✅ {self.succeeded}/{self.total} tasks succeeded:")
+            for r in self.results:
+                if r.success:
+                    parts.append(f"  [{r.agent_id}]: {r.output}")
+        if self.failed:
+            parts.append(f"❌ {self.failed}/{self.total} tasks failed:")
+            for r in self.results:
+                if not r.success:
+                    parts.append(f"  [{r.agent_id}]: {r.error}")
+        if self.conflicts:
+            parts.append(f"⚠️ {len(self.conflicts)} conflict(s) detected:")
+            for c in self.conflicts:
+                parts.append(
+                    f"  [{c.artifact}] {c.severity}: "
+                    f"{', '.join(c.agents)} have competing proposals"
+                )
+        return "\n".join(parts)
+
+
+# Artifact patterns: only match tokens with clear artifact structure.
+# 1. Path-like: contains '/' or '.' with extension (auth.py, core/utils.py)
+# 2. Callable: word followed by () (validate(), check_auth())
+# 3. Keyword-prefixed: "file X", "function X", etc.
+_PATH_RE = re.compile(r"[`'\"]?([\w/\-]+\.[\w]+)[`'\"]?")
+_CALLABLE_RE = re.compile(r"[`'\"]?([\w_]+\(\))[`'\"]?")
+_KEYWORD_RE = re.compile(
+    r"(?:file|function|class|module|table|endpoint)\s+[`'\"]?([\w./\-]+)[`'\"]?",
+    re.IGNORECASE,
+)
+
+
+def _extract_artifacts(text: str) -> set[str]:
+    """Extract artifact names (files, functions) from agent output.
+
+    Only matches tokens with structural artifact indicators:
+    path separators, file extensions, call parens, or keyword prefixes.
+    Plain words like 'error' or 'critical' are NOT matched.
+    """
+    artifacts: set[str] = set()
+    for pattern in (_PATH_RE, _CALLABLE_RE, _KEYWORD_RE):
+        for m in pattern.finditer(text):
+            token = m.group(1).lower()
+            if len(token) > 2:
+                artifacts.add(token)
+    return artifacts
+
+
+def detect_conflicts(results: list[Result]) -> list[Conflict]:
+    """Detect conflicts: multiple successful agents referencing the same artifact.
+
+    This is structural detection (same artifact mentioned by different agents).
+    Semantic conflict analysis (modify vs don't modify) requires LLM and is
+    left to the lead agent's synthesis step.
+    """
+    successful = [r for r in results if r.success]
+    if len(successful) < 2:
+        return []
+
+    # Map artifact → list of (agent_id, output snippet)
+    artifact_agents: dict[str, list[tuple[str, str]]] = {}
+    for r in successful:
+        for artifact in _extract_artifacts(r.output):
+            artifact_agents.setdefault(artifact, []).append((r.agent_id, r.output))
+
+    conflicts = []
+    for artifact, agents in artifact_agents.items():
+        if len(agents) < 2:
+            continue
+        agent_ids = [a[0] for a in agents]
+        # Only flag if different agents (not same agent mentioned twice)
+        if len(set(agent_ids)) < 2:
+            continue
+        conflicts.append(Conflict(
+            artifact=artifact,
+            agents=agent_ids,
+            proposals=[a[1] for a in agents],
+            severity="warning",
+        ))
+
+    return sorted(conflicts, key=lambda c: c.artifact)
 
 
 class CoordinationPatterns:
@@ -133,31 +250,32 @@ class CoordinationPatterns:
         results = await asyncio.gather(*[execute_task(task) for task in tasks])
         return list(results)
 
-    def fan_in(self, results: list[Result]) -> str:
-        """Collect and synthesize results (fan-in pattern).
-        
-        Args:
-            results: List of results from parallel execution
-            
-        Returns:
-            Synthesized summary of all results
+    def fan_in(self, results: list[Result]) -> AggregatedResult:
+        """Collect, evaluate quality, detect conflicts, and synthesize results.
+
+        Returns structured AggregatedResult with:
+        - success_rate: fraction of tasks that succeeded
+        - conflicts: detected artifact-level disagreements between agents
+        - summary: human-readable synthesis (backward-compatible)
         """
-        successful = [r for r in results if r.success]
-        failed = [r for r in results if not r.success]
-        
-        summary_parts = []
-        
-        if successful:
-            summary_parts.append(f"✅ {len(successful)} tasks completed successfully:")
-            for r in successful:
-                summary_parts.append(f"  [{r.agent_id}]: {r.output[:200]}...")
-        
-        if failed:
-            summary_parts.append(f"\n❌ {len(failed)} tasks failed:")
-            for r in failed:
-                summary_parts.append(f"  [{r.agent_id}]: {r.error}")
-        
-        return "\n".join(summary_parts)
+        total = len(results)
+        succeeded = sum(1 for r in results if r.success)
+        success_rate = succeeded / total if total else 0.0
+
+        conflicts = detect_conflicts(results)
+        if conflicts:
+            logger.warning(
+                "fan_in: %d conflict(s) across %d results", len(conflicts), total,
+            )
+
+        return AggregatedResult(
+            results=results,
+            conflicts=conflicts,
+            success_rate=success_rate,
+            total=total,
+            succeeded=succeeded,
+            failed=total - succeeded,
+        )
 
     async def pipeline(
         self, steps: list[Task], session_id: str, user_id: str

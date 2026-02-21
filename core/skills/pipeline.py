@@ -9,7 +9,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from sqlalchemy import text
 
@@ -56,6 +56,7 @@ class LearningResult:
     signals_by_type: dict[str, int] = field(default_factory=dict)
     gate_verdict: str = "skipped"
     improvement_pct: float = 0.0
+    input_face_results: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
 
 
@@ -281,9 +282,10 @@ class SkillPipeline:
         """Run learning cycle: learn → verify → activate.
 
         Pipeline:
-            1. Extract signals from recent failures (staging)
-            2. Validate via RegressionGate (unless skip_gate=True)
-            3. Activate learnings only if gate passes
+            1. Skill selection learning (SelfImprovingSelector)
+            2. Input face learning (prompt, context budget, knowledge)
+            3. Validate via RegressionGate (unless skip_gate=True)
+            4. Activate learnings only if gate passes
 
         Args:
             days: Look-back window for failure analysis.
@@ -293,13 +295,33 @@ class SkillPipeline:
             return LearningResult(error="Learning disabled")
 
         try:
-            # Stage 1: Learn (writes to DB — learnings are "staged")
+            # Stage 1: Skill selection learning
             result = self._improver.learn_from_failures(days=days)
-            learned = result.get("learned", 0)
+            selector_learned = result.get("learned", 0)
+
+            # Stage 1b: Input face learning (prompt, context, knowledge)
+            input_face_results = []
+            face_applied = 0
+            try:
+                from core.learning.input_face_learner import InputFaceLearner
+                face_learner = InputFaceLearner(self._db, self._llm)
+                input_face_results = face_learner.diagnose_and_fix(
+                    days=days, dry_run=skip_gate,
+                )
+                face_applied = sum(1 for fr in input_face_results if fr.applied)
+            except Exception as e:
+                logger.warning("Input face learning unavailable: %s", e)
+
+            learned = selector_learned + face_applied
+            face_dicts = [
+                {"face": r.input_face.value, "bottleneck": r.bottleneck, "applied": r.applied}
+                for r in input_face_results
+            ]
             if learned == 0:
                 return LearningResult(
                     total_failures=result.get("total_failures", 0),
                     gate_verdict="skipped",
+                    input_face_results=face_dicts,
                 )
 
             # Stage 2: Validate via unified RegressionGate
@@ -319,20 +341,23 @@ class SkillPipeline:
                     gate_verdict = gate_result["verdict"]
                     improvement_pct = gate_result.get("metrics", {}).get("score_delta", 0.0)
 
-                    # Stage 3: Rollback if gate fails
+                    # Stage 3: Rollback selector learnings if gate fails
+                    # (input face changes are independently validated, not rolled back)
                     if gate_verdict == "fail":
                         self._rollback_learnings(days)
+                        selector_learned = 0
                         logger.warning("Learning rolled back: gate failed (%s)", gate_result.get("reason"))
                 except Exception as e:
                     logger.warning("Gate validation unavailable, learnings kept: %s", e)
                     gate_verdict = "error"
 
             return LearningResult(
-                learned=learned,
+                learned=selector_learned + face_applied,
                 total_failures=result.get("total_failures", 0),
                 signals_by_type=result.get("signals_by_type", {}),
                 gate_verdict=gate_verdict,
                 improvement_pct=improvement_pct,
+                input_face_results=face_dicts,
             )
         except Exception as e:
             logger.error("Learning cycle failed: %s", e)
@@ -342,7 +367,7 @@ class SkillPipeline:
         """Soft-delete learnings created in the current cycle via SelfImprovingSelector."""
         if not self._improver:
             return
-        since = datetime.now(timezone.utc) - __import__("datetime").timedelta(days=days)
+        since = datetime.now(timezone.utc) - timedelta(days=days)
         try:
             count = self._improver.rollback_learnings(since=since)
             logger.info("Rolled back %d learnings (since %s)", count, since)
