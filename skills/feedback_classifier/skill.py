@@ -50,9 +50,6 @@ class FeedbackClassifierSkill(Skill[ClassifierInput, ClassifierOutput]):
         self._session = None  # lazy loaded ONNX session
         self._tokenizer = None
 
-    def validate_input(self, input_data: dict) -> ClassifierInput:
-        return ClassifierInput(**input_data)
-
     async def execute(self, input: ClassifierInput) -> ClassifierOutput:
         """Classify feedback. Try ONNX model first, fallback to heuristic."""
         # Try model inference

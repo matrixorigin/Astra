@@ -6,7 +6,7 @@ and full lifecycle management.
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, ClassVar, Generic, TypeVar
+from typing import Any, ClassVar, Generic, TypeVar, get_args
 
 from pydantic import BaseModel
 
@@ -93,10 +93,25 @@ class Skill(ABC, Generic[InputT, OutputT]):
         category=SideEffectCategory.READ
     )  # Default to READ (safe)
 
-    @abstractmethod
+    # Auto-populated by __init_subclass__ from Generic type args
+    _input_cls: ClassVar[type["SkillInput"] | None] = None
+    _output_cls: ClassVar[type["SkillOutput"] | None] = None
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        for base in getattr(cls, "__orig_bases__", ()):
+            args = get_args(base)
+            if len(args) == 2 and isinstance(args[0], type) and issubclass(args[0], SkillInput):
+                cls._input_cls = args[0]
+                cls._output_cls = args[1]
+                break
+
     def validate_input(self, input_data: dict) -> InputT:
-        """Validate and parse input"""
-        pass
+        """Validate and parse input. Override for custom logic."""
+        if self._input_cls is None:
+            raise TypeError(f"{type(self).__name__} has no _input_cls; "
+                            "specify Generic type args or override validate_input()")
+        return self._input_cls(**input_data)  # type: ignore[return-value]
 
     @abstractmethod
     async def execute(self, input: InputT) -> OutputT:

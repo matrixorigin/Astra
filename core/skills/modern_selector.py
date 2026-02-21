@@ -185,10 +185,13 @@ class ModernSkillSelector:
             skill_def = self._registry.get(skill.name)
 
             if skill_def:
-                # Get input model from validate_input return type annotation
-                import typing
-                hints = typing.get_type_hints(skill_def.validate_input)
-                input_cls = hints.get("return")
+                # Get input model from __init_subclass__ auto-populated _input_cls
+                input_cls = getattr(skill_def, "_input_cls", None)
+                if input_cls is None:
+                    # Fallback: inspect validate_input return type annotation
+                    import typing
+                    hints = typing.get_type_hints(skill_def.validate_input)
+                    input_cls = hints.get("return")
                 if input_cls and hasattr(input_cls, "model_json_schema"):
                     parameters = input_cls.model_json_schema()
                 elif input_cls and hasattr(input_cls, "schema"):

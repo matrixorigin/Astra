@@ -41,7 +41,7 @@ class SummarizePROutput(SkillOutput):
     deletions: int
 
 
-class SummarizePRSkill(Skill):
+class SummarizePRSkill(Skill[SummarizePRInput, SummarizePROutput]):
     """Summarize a GitHub PR with LLM"""
 
     name = "summarize_pr"
@@ -59,10 +59,6 @@ class SummarizePRSkill(Skill):
         self._session = session
         self.llm = llm
         self.github = github
-
-    def validate_input(self, input_data: dict) -> SummarizePRInput:
-        """Validate and parse input"""
-        return SummarizePRInput(**input_data)
 
     async def execute(self, input: SummarizePRInput) -> SummarizePROutput:
         """Execute the skill"""
@@ -123,7 +119,7 @@ class ListPRsOutput(SkillOutput):
     prs: list[dict]
 
 
-class ListPRsSkill(Skill):
+class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
     """List PRs in a repository"""
 
     name = "list_prs"
@@ -139,10 +135,6 @@ class ListPRsSkill(Skill):
 
     def __init__(self, github: GitHubClient, session: Session | None = None):
         self.github = github
-
-    def validate_input(self, input_data: dict) -> ListPRsInput:
-        """Validate and parse input"""
-        return ListPRsInput(**input_data)
 
     async def execute(self, input: ListPRsInput) -> ListPRsOutput:
         """Execute the skill"""
@@ -179,7 +171,7 @@ class CIStatusOutput(SkillOutput):
     workflows: list[dict]
 
 
-class CIStatusSkill(Skill):
+class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
     """Check CI workflow status"""
 
     name = "ci_status"
@@ -197,10 +189,6 @@ class CIStatusSkill(Skill):
 
     def __init__(self, github: GitHubClient, session: Session | None = None):
         self.github = github
-
-    def validate_input(self, input_data: dict) -> CIStatusInput:
-        """Validate and parse input"""
-        return CIStatusInput(**input_data)
 
     async def execute(self, input: CIStatusInput) -> CIStatusOutput:
         """Execute the skill"""
@@ -246,7 +234,7 @@ class ExecuteCodeOutput(SkillOutput):
     time_travel: dict | None = None
 
 
-class ExecuteCodeSkill(Skill):
+class ExecuteCodeSkill(Skill[ExecuteCodeInput, ExecuteCodeOutput]):
     """Execute Python code in isolated environment with optional database access."""
 
     name = "execute_code"
@@ -264,9 +252,6 @@ class ExecuteCodeSkill(Skill):
 
     def __init__(self, code_executor):
         self.code_executor = code_executor
-
-    def validate_input(self, input_data: dict) -> ExecuteCodeInput:
-        return ExecuteCodeInput(**input_data)
 
     async def execute(self, input: ExecuteCodeInput) -> ExecuteCodeOutput:
         from core.code_executor import CodeExecutionRequest

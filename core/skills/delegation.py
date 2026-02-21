@@ -45,7 +45,7 @@ class DelegateTaskOutput(SkillOutput):
     events_produced: int
 
 
-class DelegateTaskSkill(Skill):
+class DelegateTaskSkill(Skill[DelegateTaskInput, DelegateTaskOutput]):
     """Delegate a task to another agent.
 
     This skill enables orchestrator agents to delegate work to specialist agents.

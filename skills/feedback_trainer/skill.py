@@ -52,9 +52,6 @@ class FeedbackTrainerSkill(Skill[TrainerInput, TrainerOutput]):
     def __init__(self, db=None) -> None:
         self._db = db
 
-    def validate_input(self, input_data: dict) -> TrainerInput:
-        return TrainerInput(**input_data)
-
     async def execute(self, input: TrainerInput) -> TrainerOutput:
         """Train model: load data → fine-tune → evaluate → export ONNX → register artifact."""
         from pathlib import Path

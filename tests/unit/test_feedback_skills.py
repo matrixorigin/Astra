@@ -166,3 +166,36 @@ class TestClassifierSkill:
         skill = FeedbackClassifierSkill(db=db)
         # Will fail because path doesn't exist, but should not raise
         assert skill._ensure_model() is False
+
+
+# ---------------------------------------------------------------------------
+# __init_subclass__ + default validate_input
+# ---------------------------------------------------------------------------
+
+class TestSkillInitSubclass:
+
+    def test_input_cls_auto_populated(self):
+        """Concrete Generic args should auto-populate _input_cls."""
+        assert FeedbackTrainerSkill._input_cls is TrainerInput
+        assert FeedbackClassifierSkill._input_cls is ClassifierInput
+
+    def test_default_validate_input(self):
+        """Default validate_input should use _input_cls."""
+        skill = FeedbackTrainerSkill()
+        inp = skill.validate_input({"dataset_path": "/data/train.jsonl"})
+        assert isinstance(inp, TrainerInput)
+
+    def test_no_generic_args_input_cls_none(self):
+        """Skill without Generic type args should have _input_cls=None."""
+        from core.skills.base import Skill, SkillInput, SkillOutput
+
+        class BareSkill(Skill):
+            name = "bare"
+            version = "1.0.0"
+            description = "test"
+            requirements = None
+            async def execute(self, input): pass
+
+        assert BareSkill._input_cls is None
+        with pytest.raises(TypeError, match="_input_cls"):
+            BareSkill().validate_input({})
