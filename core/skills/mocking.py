@@ -137,6 +137,22 @@ class ToolMockingLayer:
         validated_input = skill.validate_input(params)
         result = skill.execute(validated_input)
 
+        # If skill.execute is async, run it synchronously
+        import asyncio
+        import inspect
+        if inspect.isawaitable(result):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop and loop.is_running():
+                # Already in async context — create a task
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    result = pool.submit(asyncio.run, result).result()
+            else:
+                result = asyncio.run(result)
+
         # Record result in production mode
         if self.mode == MockMode.PRODUCTION:
             self._record_result(skill.name, params, result, session_id, parent_event_id)

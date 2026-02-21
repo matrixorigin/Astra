@@ -59,6 +59,11 @@ class AgentExecutor:
         if not skill:
             raise ValueError(f"Skill '{skill_name}' not found in registry.")
 
+        # 1.5. Auto-inject framework fields (user_id, session_id)
+        params.setdefault("session_id", session_id)
+        if "user_id" not in params:
+            params["user_id"] = getattr(self, "_current_user_id", "system")
+
         # 2. Execute via Mocking Layer with timing
         start_time = time.time()
         success = True

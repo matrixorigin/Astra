@@ -169,6 +169,13 @@ class ChatLoop:
         self.continuity = continuity
         self.observer = None  # Set via set_observer()
         self.mcp_bridge = None  # Set via set_mcp_bridge()
+        self._few_shot = None  # Initialized lazily on first use
+        try:
+            from core.context.few_shot import FewShotRetriever
+            if hasattr(llm_client, 'db') and llm_client.db:
+                self._few_shot = FewShotRetriever(llm_client.db)
+        except Exception:
+            pass
 
     async def run_step(
         self,
@@ -449,6 +456,9 @@ class ChatLoop:
 
         Yields StreamEvent objects for real-time output.
         """
+        # Set user context on executor for framework field injection
+        self.executor._current_user_id = user_id
+
         # 1. Log user query event
         user_event = self.event_logger.create_user_query(
             user_id=user_id,
@@ -1290,7 +1300,7 @@ class ChatLoop:
           [STABLE]  §2 Constraints & format
           [DYNAMIC] §3 Observations / prior context
           [DYNAMIC] §4 Working memory (scratchpad)
-          [DYNAMIC] §5 Conversation history
+          [DYNAMIC] §5 Conversation history (budget-capped)
         """
         # §1 Role — from DB prompt template or fallback
         role = "You are a development assistant. Use the available tools to help the user."
@@ -1308,6 +1318,13 @@ class ChatLoop:
 
         # Stable prefix (§1 + §2) — benefits from prompt caching
         sections = [role, constraints]
+
+        # §2.5 Dynamic few-shot examples (from high-rated feedback)
+        if hasattr(self, '_few_shot') and self._few_shot:
+            examples = self._few_shot.retrieve(user_input)
+            few_shot_section = self._few_shot.format_for_prompt(examples)
+            if few_shot_section:
+                sections.append(few_shot_section)
 
         # §3 Observations + prior context (semi-stable, changes across sessions)
         if self.continuity and session_id and user_id:
@@ -1333,12 +1350,20 @@ class ChatLoop:
                     "Working memory (your active notes):\n" + "\n---\n".join(note_lines)
                 )
 
-        # §5 Conversation history (changes every turn)
+        # §5 Conversation history (changes every turn, budget-capped)
         if context and context.get("selected_events"):
+            # Budget: ~2000 chars for history (roughly 500 tokens)
+            budget = context.get("token_budget", {}).get("history", {}).get("allocated", 500) * 4
             history_lines = []
+            used = 0
             for ev in context["selected_events"]:
                 role_label = "User" if ev.get("event_type") == "user_query" else "Agent"
-                history_lines.append(f"{role_label}: {ev.get('content', '')}")
+                line = f"{role_label}: {ev.get('content', '')}"
+                line_len = len(line)
+                if used + line_len > budget and history_lines:
+                    break
+                history_lines.append(line)
+                used += line_len
             if history_lines:
                 sections.append("Recent conversation:\n" + "\n".join(history_lines))
 

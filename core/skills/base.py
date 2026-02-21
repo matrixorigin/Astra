@@ -6,7 +6,7 @@ and full lifecycle management.
 
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Generic, TypeVar
+from typing import Any, ClassVar, Generic, TypeVar
 
 from pydantic import BaseModel
 
@@ -59,8 +59,11 @@ class SkillInput(BaseModel):
     """Base class for skill inputs"""
 
     repo_id: int | None = None  # Resolved by framework
-    user_id: str
-    session_id: str
+    user_id: str | None = None  # Injected by executor
+    session_id: str | None = None  # Injected by executor
+
+    # Fields auto-injected by framework, excluded from LLM tool schema
+    _FRAMEWORK_FIELDS: ClassVar[set[str]] = {"repo_id", "user_id", "session_id"}
 
 
 class SkillOutput(BaseModel):

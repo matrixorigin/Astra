@@ -178,22 +178,25 @@ class ModernSkillSelector:
         """Convert skill metadata to OpenAI tool schema.
 
         Auto-generates schema from skill's input model (Pydantic).
+        Framework fields (user_id, session_id, repo_id) are excluded —
+        they are injected by the executor at runtime.
         """
-        # Try to load skill class and extract schema
         try:
             skill_def = self._registry.get(skill.name)
 
-            if skill_def and hasattr(skill_def, "requirements"):
-                # Use Pydantic model's schema
-                input_model = skill_def.requirements
-                if hasattr(input_model, "model_json_schema"):
-                    # Pydantic v2
-                    parameters = input_model.model_json_schema()
-                elif hasattr(input_model, "schema"):
-                    # Pydantic v1
-                    parameters = input_model.schema()
+            if skill_def:
+                # Get input model from validate_input return type annotation
+                import typing
+                hints = typing.get_type_hints(skill_def.validate_input)
+                input_cls = hints.get("return")
+                if input_cls and hasattr(input_cls, "model_json_schema"):
+                    parameters = input_cls.model_json_schema()
+                elif input_cls and hasattr(input_cls, "schema"):
+                    parameters = input_cls.schema()
                 else:
                     parameters = self._get_default_schema(skill.name)
+                # Strip framework fields from schema
+                parameters = self._strip_framework_fields(parameters)
             else:
                 parameters = self._get_default_schema(skill.name)
 
@@ -209,6 +212,19 @@ class ModernSkillSelector:
                 "parameters": parameters,
             },
         }
+
+    @staticmethod
+    def _strip_framework_fields(schema: dict[str, Any]) -> dict[str, Any]:
+        """Remove framework-injected fields from tool schema."""
+        from core.skills.base import SkillInput
+        fw = SkillInput._FRAMEWORK_FIELDS
+        props = schema.get("properties", {})
+        for f in fw:
+            props.pop(f, None)
+        req = schema.get("required", [])
+        if req:
+            schema["required"] = [r for r in req if r not in fw]
+        return schema
 
     def _get_default_schema(self, skill_name: str) -> dict[str, Any]:
         """Default schema for skills without a Pydantic model."""
