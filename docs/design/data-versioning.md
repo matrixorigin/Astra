@@ -3,7 +3,7 @@
 > **Status**: Core Design — single source of truth for time travel, sandbox, branching, and data lineage  
 > **Last Updated**: 2026-02-22
 
-> **Data ownership note**: Data versioning operations (sandbox, time-travel, branching) apply to both the platform DB and the user's BYOD database. Enhanced operations (zero-copy clone, native time-travel) require MatrixOne. See [skill-as-package.md](skill-as-package.md) for the BYOD architecture.
+> **Data ownership note**: Data versioning operations (sandbox, time-travel, branching) apply to the platform database. All tables — core and skill — are in the same DB. Enhanced operations (zero-copy clone, native time-travel) require MatrixOne. See [skill-as-package.md](skill-as-package.md) for the architecture.
 
 ---
 
@@ -430,7 +430,7 @@ Every workflow above follows the same principle: **what traditionally requires a
 
 For the platform's own state (workflows 1-4, 6-7): this is always available — the platform runs on MatrixOne.
 
-For user business data (workflow 5, and workflows 1-3 applied to user data): this activates when the user's data is also on MatrixOne. The service accepts a `db` handle — like `Sandbox(db=user_db, source_db="user_database")` — and operates on the user's database. The agent code doesn't change; only the db handle determines what data the service operates on.
+For user business data (workflow 5, and workflows 1-3 applied to user data): the service accepts a `db` handle — like `Sandbox(db=db, source_db="my_database")` — and operates on the specified database. The agent code doesn't change; only the db handle determines what data the service operates on.
 
 ---
 

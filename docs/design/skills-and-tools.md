@@ -9,9 +9,9 @@
 
 The industry is moving from "tools as function calls" to "skills as modular expertise packages." Anthropic's Agent Skills introduces three-tier progressive loading. ElizaOS pioneered plugin schemas (plugins declare DB tables, platform auto-migrates).
 
-mo-agent-engine goes further with **Skill-as-Package**: skills are platform capabilities with platform-defined schemas and typed API layers. Users bring their own database (BYOD); installing a skill runs platform-defined DDL on the user's DB. Users interact with skill data through skill APIs, not direct SQL. No other agent framework supports this.
+mo-agent-engine goes further with **Skill-as-Package**: skills are platform capabilities with platform-defined schemas and typed API layers. All skill tables live in the platform database with `sk_{skill}_{table}` naming convention. Users interact with skill data through skill APIs, not direct SQL. Each skill defines its own tables in `skills/{name}/models.py`.
 
-For the full Skill-as-Package architecture (BYOD, install lifecycle, skill API layer, credential management), see **[skill-as-package.md](skill-as-package.md)**. This document focuses on skill execution, selection, and tool design.
+For the full Skill-as-Package architecture (install lifecycle, skill API layer, credential management, table naming), see **[skill-as-package.md](skill-as-package.md)**. This document focuses on skill execution, selection, and tool design.
 
 ---
 
@@ -22,7 +22,7 @@ For the full Skill-as-Package architecture (BYOD, install lifecycle, skill API l
 A skill is a **versioned, stateful capability package** with:
 
 - **Identity**: name, version (semver), description
-- **Schema**: database tables defined by platform (created on install in user's BYOD)
+- **Schema**: database tables defined by platform (`sk_{skill}_{table}` in platform DB)
 - **API layer**: typed interface for data access (users don't write direct SQL)
 - **Credentials**: what secrets it needs (e.g. GitHub token, per-user encrypted)
 - **Requirements**: what it needs (permissions, platform capabilities)
@@ -31,7 +31,7 @@ A skill is a **versioned, stateful capability package** with:
 - **Execution logic**: the actual code
 - **Audit trail**: every invocation recorded with version, params, result
 
-Skills are platform capabilities with deterministic schemas: install creates tables (platform DDL), skill provides typed API for data access. See [skill-as-package.md](skill-as-package.md) for the full architecture.
+Skills are platform capabilities with deterministic schemas: tables are defined in `skills/{name}/models.py` with `sk_` prefix, created by `init_db()`. Skills provide typed API layers for data access. See [skill-as-package.md](skill-as-package.md) for the full architecture.
 
 ### Execution Model
 
@@ -335,7 +335,7 @@ For the full package structure (schema.py, migrations/, manifest.yaml), see [ski
 
 ### The Vision: App Store for Agent Skills
 
-Skills are publishable, discoverable, and installable — like an app store. Admin publishes skills to the marketplace, controls visibility per user/role, and users install skills into their own BYOD database.
+Skills are publishable, discoverable, and installable — like an app store. Admin publishes skills to the marketplace, controls visibility per user/role, and users install skills to enable capabilities.
 
 ### Architecture: Publish → Authorize → Install → Use
 
@@ -348,15 +348,13 @@ ADMIN (platform operator)
 
 USER
   │
-  ├── Registers DB connection (user_connections — BYOD)
   ├── Browses available skills (filtered by permissions)
   ├── Installs skill:
-  │     → Platform runs migrations on user's DB
-  │     → Creates {skill}_{table} tables
-  │     → User provides credentials (encrypted in platform DB)
+  │     → Permission check
+  │     → User provides credentials if required (encrypted in platform DB)
   │     → Records in skill_installations
-  ├── Uses skill in sessions (agent calls skill, skill reads/writes user DB)
-  └── Uninstalls skill (optional: keep or drop tables)
+  ├── Uses skill in sessions (agent calls skill API, skill reads/writes platform DB)
+  └── Uninstalls skill (marks uninstalled, deletes credentials)
 ```
 
 ### Platform Tables for Marketplace
@@ -364,8 +362,9 @@ USER
 - `skill_definitions` — catalog of available skills (admin-managed)
 - `skill_permissions` — RBAC: which users/roles can see which skills
 - `skill_installations` — tracks what's installed per user
-- `user_connections` — user's BYOD database connection info
 - `user_credentials` — per-user encrypted secrets for skills
+
+Skill business tables (`sk_{skill}_{table}`) are defined in `skills/{name}/models.py` and created by `init_db()`.
 
 For full table schemas and install/uninstall lifecycle, see [skill-as-package.md](skill-as-package.md).
 
@@ -427,12 +426,12 @@ Automated validation:
 Published (admin adds to skill_definitions)
   │
   ▼
-Admin grants access → users can install into their BYOD
+Admin grants access → users can install
 ```
 
 ### Marketplace Table Design
 
-All marketplace tables (skill_definitions, skill_permissions, skill_installations, user_connections, user_credentials) are defined in [skill-as-package.md §5](skill-as-package.md). They live in the platform DB, not the user's DB.
+All marketplace tables (skill_definitions, skill_permissions, skill_installations, user_credentials) are defined in [skill-as-package.md](skill-as-package.md). They live in the platform DB alongside skill business tables (`sk_{skill}_{table}`).
 
 ### MatrixOne-Enhanced: Version Pinning via Clone
 

@@ -466,7 +466,7 @@ Layer 1 guardrails (§6 in trust-and-safety.md) catch single-turn prompt injecti
 
 The most insidious attack: inject bad data into memory, wait for the agent to retrieve it.
 
-> **Note**: This query joins `knowledge_entries` (user BYOD) with `conversation_events` (platform DB). In BYOD deployments, this requires a cross-database join or materialized view. See [skill-as-package.md](skill-as-package.md) for the data ownership model.
+> **Note**: This query joins `sk_knowledge_entries` with `conversation_events` — both in the same platform database. See [skill-as-package.md](skill-as-package.md) for the table naming convention.
 
 ```sql
 -- Find memory entries that were retrieved before a low-quality decision
