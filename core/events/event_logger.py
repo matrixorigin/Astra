@@ -285,3 +285,14 @@ class EventLogger:
         )
         self.log_event(event)
         return event
+
+    def update_quality_score(
+        self, event_id: str, quality_score: float, training_eligible: bool,
+    ) -> None:
+        """Update quality_score and training_eligible on an existing event."""
+        self.session.query(EventModel).filter(
+            EventModel.event_id == event_id,
+        ).update(
+            {"quality_score": quality_score, "training_eligible": training_eligible},
+        )
+        self.session.commit()

@@ -242,15 +242,24 @@ class ChatLoop:
                 user_id=user_id,
                 session_id=session_id,
             )
+            plain_content = response.content or ""
+            verification = self.firewall.verify_response(plain_content, context_capture_id, mode=self.firewall_mode)
+            self.firewall.log_verification(session_id, user_event.event_id, verification, context_capture_id)
+            if not verification.safe_to_deliver:
+                plain_content += (
+                    f"\n\n⚠️ Warning: Low confidence ({verification.confidence_score:.0%}). "
+                    f"{verification.claims_failed} unverified claims."
+                )
             self._log_response(
                 user_id,
                 session_id,
-                response.content or "",
+                plain_content,
                 user_event.event_id,
                 user_event.causal_chain_id,
                 messages=messages,
+                firewall_result=verification,
             )
-            return response.content or ""
+            return plain_content
 
         # 6. Multi-turn tool use loop
         # Pre-fetch observations once (avoid N+1 in tool loop)
@@ -314,6 +323,7 @@ class ChatLoop:
                     user_event.event_id,
                     user_event.causal_chain_id,
                     messages=messages,
+                    firewall_result=verification,
                 )
                 return final_content or ""
 
@@ -449,6 +459,7 @@ class ChatLoop:
             user_event.event_id,
             user_event.causal_chain_id,
             messages=messages,
+            firewall_result=verification,
         )
         return final_content
 
@@ -627,7 +638,7 @@ class ChatLoop:
             )
             self._log_response(
                 user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
-                messages=messages,
+                messages=messages, firewall_result=verification,
             )
 
             run_finished_event = self.event_logger.create_stream_event(
@@ -731,7 +742,7 @@ class ChatLoop:
                 )
                 self._log_response(
                     user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
-                    messages=messages,
+                    messages=messages, firewall_result=verification,
                 )
 
                 run_finished_event = self.event_logger.create_stream_event(
@@ -1054,7 +1065,7 @@ class ChatLoop:
 
         self._log_response(
             user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
-            messages=messages,
+            messages=messages, firewall_result=verification,
         )
         yield StreamEvent(
             event_type=StreamEventType.RUN_FINISHED,
@@ -1338,6 +1349,7 @@ class ChatLoop:
         self._log_response(
             user_id, session_id, final_text,
             user_event.event_id, user_event.causal_chain_id,
+            firewall_result=verification,
         )
 
         yield StreamEvent(
@@ -1553,9 +1565,10 @@ class ChatLoop:
         parent_event_id: str,
         causal_chain_id: str | None,
         messages: list[dict[str, Any]] | None = None,
+        firewall_result: Any | None = None,
     ) -> None:
         """Log the final agent response as an event, then run Observer."""
-        self.event_logger.create_llm_response(
+        event = self.event_logger.create_llm_response(
             user_id=user_id,
             session_id=session_id,
             content=content,
@@ -1565,6 +1578,22 @@ class ChatLoop:
             causal_chain_id=causal_chain_id or "",
             llm_model_used=self.llm.config.get("model", "unknown"),
         )
+        # Auto-score: fill quality_score + training_eligible
+        if firewall_result is not None:
+            try:
+                from core.evaluation.auto_scorer import compute_auto_score
+
+                response_tokens = len(content.split()) if content else 0
+                result = compute_auto_score(
+                    firewall_passed=firewall_result.safe_to_deliver,
+                    firewall_confidence=firewall_result.confidence_score,
+                    response_tokens=response_tokens,
+                )
+                self.event_logger.update_quality_score(
+                    event.event_id, result.quality_score, result.training_eligible,
+                )
+            except Exception as e:
+                logger.warning("Auto-score failed (non-fatal): %s", e)
         # Post-turn: run Observer on the conversation messages
         if messages:
             self._run_observer(session_id, user_id, messages)
