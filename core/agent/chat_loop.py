@@ -144,6 +144,7 @@ class ChatLoop:
         scratchpad=None,
         continuity=None,
         firewall_mode: str = "warn",
+        hitl_policy=None,
     ):
         """Initialize ChatLoop.
         
@@ -158,6 +159,7 @@ class ChatLoop:
             scratchpad: AgentScratchpad instance for working memory (optional)
             continuity: SessionContinuity instance for cross-session context (optional)
             firewall_mode: 'warn' (annotate) or 'block' (fail-closed). Default: 'warn'.
+            hitl_policy: HITLPolicyEngine instance for human-in-the-loop supervision (optional)
         """
         self.selector = selector
         self._pipeline = selector
@@ -170,6 +172,7 @@ class ChatLoop:
         self.agent_id = agent_id
         self.scratchpad = scratchpad
         self.continuity = continuity
+        self.hitl_policy = hitl_policy
         self.observer = None  # Set via set_observer()
         self.mcp_bridge = None  # Set via set_mcp_bridge()
         self._few_shot = None  # Initialized lazily on first use
@@ -369,6 +372,12 @@ class ChatLoop:
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": result_str})
                     continue
 
+                # HITL policy check
+                hitl_ok, hitl_msg = self._evaluate_hitl(fn_name, params)
+                if not hitl_ok:
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": hitl_msg})
+                    continue
+
                 # Execute skill with automatic feedback recording
                 try:
                     from core.agent.async_tools import get_async_tool_registry as _get_atr
@@ -394,9 +403,13 @@ class ChatLoop:
                     result_str = (
                         json.dumps(result, default=str) if not isinstance(result, str) else result
                     )
+                    if self.hitl_policy:
+                        self.hitl_policy.record_outcome(fn_name, success=True)
                 except Exception as e:
                     logger.error(f"Skill {fn_name} failed: {e}")
                     result_str = json.dumps({"error": str(e)})
+                    if self.hitl_policy:
+                        self.hitl_policy.record_outcome(fn_name, success=False)
 
                 # Log tool result
                 metadata = {
@@ -916,63 +929,76 @@ class ChatLoop:
                         if not audit.safe:
                             logger.warning("CoT audit blocked tool %s: %s", fn_name, audit.reason)
                             result_str = json.dumps({"error": f"Blocked by CoT audit: {audit.reason}"})
-                        elif _async_registry.is_async_tool(fn_name):
-                            result = await _async_registry.execute(fn_name, params, run_id=getattr(self, '_current_run_id', None))
-                            result_str = json.dumps(result, default=str)
-                            if result.get("wait_for"):
-                                yield StreamEvent(
-                                    event_type=StreamEventType.TOOL_RESULT,
-                                    data={"call_id": tc["id"], "result": result_str[:500], "wait_for": result["wait_for"]},
-                                    event_id=user_event.event_id,
-                                    causal_chain_id=user_event.causal_chain_id,
-                                    agent_id=self.agent_id,
-                                )
-                                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
-                                return
-                        elif fn_name == "delegate_task":
-                            delegated_agent_id = params.get("agent_id", "unknown")
-                            
-                            # Stream delegated agent's events
-                            result_text = ""
-                            has_output = False
-                            async for delegated_event in self.executor.execute_skill_stream(
-                                skill_name=fn_name,
-                                params=params,
-                                session_id=session_id,
-                                parent_event_id=user_event.event_id,
-                            ):
-                                # Forward delegated agent's events with agent_id tagged
-                                yield delegated_event
-                                
-                                # Collect final result
-                                if delegated_event.event_type == StreamEventType.TEXT_DONE:
-                                    result_text = delegated_event.data.get("text", "")
-                                    has_output = True
-                            
-                            # Use collected result or fallback message with agent_id
-                            result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
                         else:
-                            # Execute skill with automatic feedback recording
-                            if fn_name.startswith("scratchpad_") and self.scratchpad:
-                                result = self._handle_scratchpad_tool(
-                                    fn_name, params, session_id, user_id,
-                                )
-                            elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
-                                result = await self.mcp_bridge.call_tool(fn_name, params)
-                            else:
-                                result = self.executor.execute_skill_with_feedback(
+                            # HITL policy check
+                            hitl_ok, hitl_msg = self._evaluate_hitl(fn_name, params)
+                            if not hitl_ok:
+                                result_str = hitl_msg
+                            elif _async_registry.is_async_tool(fn_name):
+                                result = await _async_registry.execute(fn_name, params, run_id=getattr(self, '_current_run_id', None))
+                                result_str = json.dumps(result, default=str)
+                                if self.hitl_policy:
+                                    self.hitl_policy.record_outcome(fn_name, success=True)
+                                if result.get("wait_for"):
+                                    yield StreamEvent(
+                                        event_type=StreamEventType.TOOL_RESULT,
+                                        data={"call_id": tc["id"], "result": result_str[:500], "wait_for": result["wait_for"]},
+                                        event_id=user_event.event_id,
+                                        causal_chain_id=user_event.causal_chain_id,
+                                        agent_id=self.agent_id,
+                                    )
+                                    messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+                                    return
+                            elif fn_name == "delegate_task":
+                                delegated_agent_id = params.get("agent_id", "unknown")
+                                
+                                # Stream delegated agent's events
+                                result_text = ""
+                                has_output = False
+                                async for delegated_event in self.executor.execute_skill_stream(
                                     skill_name=fn_name,
                                     params=params,
                                     session_id=session_id,
                                     parent_event_id=user_event.event_id,
-                                    selection_event_id=self._last_selection_event_id,
+                                ):
+                                    # Forward delegated agent's events with agent_id tagged
+                                    yield delegated_event
+                                    
+                                    # Collect final result
+                                    if delegated_event.event_type == StreamEventType.TEXT_DONE:
+                                        result_text = delegated_event.data.get("text", "")
+                                        has_output = True
+                                
+                                # Use collected result or fallback message with agent_id
+                                result_str = result_text if has_output else f"Agent '{delegated_agent_id}' completed with no text output"
+                                if self.hitl_policy:
+                                    self.hitl_policy.record_outcome(fn_name, success=True)
+                            else:
+                                # Execute skill with automatic feedback recording
+                                if fn_name.startswith("scratchpad_") and self.scratchpad:
+                                    result = self._handle_scratchpad_tool(
+                                        fn_name, params, session_id, user_id,
+                                    )
+                                elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
+                                    result = await self.mcp_bridge.call_tool(fn_name, params)
+                                else:
+                                    result = self.executor.execute_skill_with_feedback(
+                                        skill_name=fn_name,
+                                        params=params,
+                                        session_id=session_id,
+                                        parent_event_id=user_event.event_id,
+                                        selection_event_id=self._last_selection_event_id,
+                                    )
+                                result_str = (
+                                    json.dumps(result, default=str) if not isinstance(result, str) else result
                                 )
-                            result_str = (
-                                json.dumps(result, default=str) if not isinstance(result, str) else result
-                            )
+                                if self.hitl_policy:
+                                    self.hitl_policy.record_outcome(fn_name, success=True)
                     except Exception as e:
                         logger.error(f"Parallel tool {fn_name} failed: {e}")
                         result_str = json.dumps({"error": str(e)})
+                        if self.hitl_policy:
+                            self.hitl_policy.record_outcome(fn_name, success=False)
                     finally:
                         # Record feedback for delegate_task streaming (non-delegate skills handled by execute_skill_with_feedback)
                         if fn_name == "delegate_task" and self._last_selection_event_id:
@@ -1253,8 +1279,13 @@ class ChatLoop:
                         )
                     
                     if tool_found or tools_schema:
+                        # HITL policy check
+                        hitl_ok, hitl_msg = self._evaluate_hitl(skill_name, {"input": step.description})
+                        if not hitl_ok:
+                            result = hitl_msg
+                            step.status = "blocked"  # type: ignore
                         # Execute skill with automatic feedback recording
-                        if self.mcp_bridge and self.mcp_bridge.is_mcp_tool(skill_name):
+                        elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(skill_name):
                             result = await self.mcp_bridge.call_tool(
                                 skill_name, {"input": step.description},
                             )
@@ -1273,7 +1304,7 @@ class ChatLoop:
                     # Use plain chat for step execution
                     result = "Step executed"
 
-                step.status = "completed"  # type: ignore
+                step.status = step.status if step.status == "blocked" else "completed"  # type: ignore
                 step.result = str(result)
                 step_results.append({"step_id": step.step_id, "result": result})
 
@@ -1556,6 +1587,36 @@ class ChatLoop:
                 logger.warning(f"Observer failed (non-fatal): {e}")
 
         threading.Thread(target=_bg, daemon=True).start()
+
+    def _evaluate_hitl(self, fn_name: str, params: dict, **ctx_overrides) -> tuple[bool, str | None]:
+        """Check HITL policy before tool execution.
+
+        Returns (allowed, block_message).
+        - allowed=True  → proceed (NONE or OBSERVE_ONLY)
+        - allowed=False → block with message (APPROVE_REJECT / REVIEW_AND_EDIT / TAKEOVER)
+        """
+        if not self.hitl_policy:
+            return True, None
+        from core.verification.hitl_policy import ActionContext, SupervisionAction
+        # Auto-detect novel skill: never seen in success streak
+        is_novel = fn_name not in self.hitl_policy._success_streak
+        ctx = ActionContext(
+            skill_name=fn_name,
+            agent_id=self.agent_id,
+            is_novel_skill=ctx_overrides.pop("is_novel_skill", is_novel),
+            **ctx_overrides,
+        )
+        decision = self.hitl_policy.evaluate(ctx)
+        if decision.action in (SupervisionAction.NONE, SupervisionAction.OBSERVE_ONLY):
+            if decision.action == SupervisionAction.OBSERVE_ONLY:
+                logger.info("[HITL] observe_only for %s: %s", fn_name, decision.reason)
+            return True, None
+        logger.warning("[HITL] %s blocked %s: %s", decision.action.value, fn_name, decision.reason)
+        return False, json.dumps({
+            "error": f"Blocked by HITL policy ({decision.action.value}): {decision.reason}",
+            "hitl_action": decision.action.value,
+            "triggered_policies": decision.triggered_policies,
+        })
 
     def _log_response(
         self,

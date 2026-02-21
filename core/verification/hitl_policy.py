@@ -41,6 +41,13 @@ _ACTION_SEVERITY = {
     SupervisionAction.TAKEOVER: 4,
 }
 
+_SEVERITY_TO_ACTION = {v: k for k, v in _ACTION_SEVERITY.items()}
+
+
+def _decay_action(action: SupervisionAction) -> SupervisionAction:
+    """Relax an action by one severity level."""
+    return _SEVERITY_TO_ACTION.get(action.severity - 1, SupervisionAction.NONE)
+
 
 @dataclass
 class SupervisionTrigger:
@@ -83,11 +90,27 @@ class PolicyDecision:
 
 
 class HITLPolicyEngine:
-    """Evaluates supervision policies against proposed actions."""
+    """Evaluates supervision policies against proposed actions.
 
-    def __init__(self, db: Session | None = None):
+    Supports **Adaptive Supervision Decay**: skills that succeed consecutively
+    get their supervision level automatically relaxed.  A single failure resets
+    the counter.  Decay thresholds are configurable per-engine.
+    """
+
+    # Default: after 5 consecutive successes, decay one severity level
+    DEFAULT_DECAY_THRESHOLD = 5
+
+    def __init__(
+        self,
+        db: Session | None = None,
+        *,
+        decay_threshold: int = DEFAULT_DECAY_THRESHOLD,
+    ):
         self.db = db
         self._policies: list[SupervisionPolicy] = []
+        self._decay_threshold = decay_threshold
+        # skill_name → consecutive success count
+        self._success_streak: dict[str, int] = {}
 
     def load_policies(self, agent_id: str | None = None):
         """Load active policies from DB."""
@@ -129,7 +152,11 @@ class HITLPolicyEngine:
         self._policies.append(policy)
 
     def evaluate(self, ctx: ActionContext) -> PolicyDecision:
-        """Evaluate all active policies. Returns most restrictive action."""
+        """Evaluate all active policies. Returns most restrictive action.
+
+        Applies Adaptive Supervision Decay: if the skill has a long enough
+        success streak, the final action is relaxed by one severity level.
+        """
         triggered: list[tuple[SupervisionPolicy, str]] = []
 
         for policy in self._policies:
@@ -150,15 +177,30 @@ class HITLPolicyEngine:
         triggered.sort(key=lambda t: t[0].action.severity, reverse=True)
         winner = triggered[0]
         reasons = "; ".join(f"{p.name}: {r}" for p, r in triggered)
+        action = winner[0].action
+
+        # Adaptive Supervision Decay
+        skill = ctx.skill_name or ""
+        streak = self._success_streak.get(skill, 0)
+        if streak >= self._decay_threshold and action.severity > 0:
+            action = _decay_action(action)
+            reasons += f"; [decay] {skill} streak={streak}→relaxed"
 
         decision = PolicyDecision(
-            action=winner[0].action,
+            action=action,
             triggered_policies=[p.name for p, _ in triggered],
             reason=reasons,
         )
 
         self._record(ctx, decision)
         return decision
+
+    def record_outcome(self, skill_name: str, *, success: bool) -> None:
+        """Record skill execution outcome for Adaptive Supervision Decay."""
+        if success:
+            self._success_streak[skill_name] = self._success_streak.get(skill_name, 0) + 1
+        else:
+            self._success_streak[skill_name] = 0
 
     @staticmethod
     def _check_trigger(trigger: SupervisionTrigger, ctx: ActionContext) -> str | None:
