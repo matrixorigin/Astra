@@ -150,8 +150,10 @@ class FirecrackerRuntime(Runtime):
                 })
 
                 # Network: only configure if enabled
-                if not resources.network_enabled:
-                    pass  # No network interface = no network
+                if resources.network_enabled:
+                    # TODO: Configure TAP device + network interface via API
+                    # Requires host-side TAP setup (ip tuntap add, ip addr add, iptables)
+                    logger.warning("network_enabled=True but TAP device not configured")
 
                 # Boot VM
                 self._api_put(sock_path, "/actions", {"action_type": "InstanceStart"})

@@ -94,6 +94,21 @@ class TestFirecrackerRuntime:
         assert result.exit_code == 137
         assert "timed out" in result.stderr
 
+    @patch("core.runtime.firecracker_runtime.subprocess.Popen")
+    @patch.object(FirecrackerRuntime, "_wait_for_socket", return_value=True)
+    @patch.object(FirecrackerRuntime, "_api_put")
+    def test_network_enabled_warns(self, mock_api, mock_wait, mock_popen, runtime):
+        """network_enabled=True should log warning about missing TAP device."""
+        mock_proc = Mock()
+        mock_proc.poll.return_value = None
+        mock_proc.wait.return_value = 0
+        mock_popen.return_value = mock_proc
+
+        with patch("core.runtime.firecracker_runtime.logger") as mock_logger:
+            runtime.execute("print('hi')", resources=ResourceProfile(network_enabled=True))
+            mock_logger.warning.assert_called_once()
+            assert "TAP" in mock_logger.warning.call_args[0][0]
+
 
 class TestCreateRuntimeWithFirecracker:
     def test_firecracker_selected_when_available(self):

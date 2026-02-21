@@ -177,6 +177,20 @@ class TestSubprocessRuntime:
         assert r.exit_code == 0
         assert "stdout_ok" in r.stdout
 
+    def test_subprocess_allowed_in_executed_code(self, runtime):
+        """RLIMIT_NPROC must allow subprocess creation from executed code."""
+        code = "import subprocess; r = subprocess.run(['echo', 'ok'], capture_output=True, text=True); print(r.stdout.strip())"
+        r = runtime.execute(code, "python")
+        assert r.exit_code == 0
+        assert "ok" in r.stdout
+
+    def test_memory_overhead_reserved(self, runtime):
+        """Memory limit should include interpreter overhead so user code gets full allocation."""
+        code = "x = bytearray(200 * 1024 * 1024); print('ok')"  # 200MB
+        r = runtime.execute(code, "python", ResourceProfile(max_memory_mb=256))
+        assert r.exit_code == 0
+        assert "ok" in r.stdout
+
 
 # ===========================================================================
 # 4. SecurityGuard

@@ -66,14 +66,16 @@ class SubprocessRuntime(Runtime):
             with open(code_file, "w") as f:
                 f.write(code)
 
-            mem_bytes = resources.max_memory_mb * 1024 * 1024
+            # Reserve 50MB overhead for Python interpreter itself
+            _INTERPRETER_OVERHEAD_MB = 50
+            mem_bytes = (resources.max_memory_mb + _INTERPRETER_OVERHEAD_MB) * 1024 * 1024
             cpu_seconds = resources.max_cpu_seconds
 
             def _set_limits():
                 # RLIMIT_AS only works on Linux; macOS raises in preexec_fn
                 if _IS_LINUX:
                     resource.setrlimit(resource.RLIMIT_AS, (mem_bytes, mem_bytes))
-                    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+                    resource.setrlimit(resource.RLIMIT_NPROC, (10, 10))
                 resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
 
             start = time.monotonic()
