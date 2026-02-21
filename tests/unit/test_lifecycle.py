@@ -75,19 +75,45 @@ class TestMemoryGovernanceEngine:
         assert count == 1
     
     def test_quarantine_low_confidence(self, engine, mock_db):
-        """Test quarantine of low confidence entries."""
-        # Create mock entries
-        low_entry = Mock()
-        low_entry.entry_id = "ke_low"
-        low_entry.key_name = "test_key"
-        low_entry.confidence = 0.2
-        low_entry.trust_tier = "T4"
-        
-        mock_db.query.return_value.filter.return_value.all.return_value = [low_entry]
-        
+        """Test quarantine sets confidence to 0 via bulk update."""
+        mock_db.query.return_value.filter.return_value.update.return_value = 3
+
         count = engine._quarantine_low_confidence(threshold=0.3)
-        
+
+        assert count == 3
+        mock_db.commit.assert_called_once()
+
+    def test_decay_skips_entry_with_no_dates(self, engine, mock_db):
+        """Entry with both last_validated_at and created_at as None is skipped."""
+        entry = Mock()
+        entry.trust_tier = "T3"
+        entry.initial_confidence = 1.0
+        entry.confidence = 1.0
+        entry.last_validated_at = None
+        entry.created_at = None
+
+        mock_db.query.return_value.filter.return_value.all.return_value = [entry]
+
+        count = engine._apply_confidence_decay()
+
+        assert count == 0
+        assert entry.confidence == 1.0  # unchanged
+
+    def test_decay_uses_created_at_fallback(self, engine, mock_db):
+        """When last_validated_at is None, created_at is used for decay calc."""
+        entry = Mock()
+        entry.trust_tier = "T3"
+        entry.initial_confidence = 1.0
+        entry.confidence = 1.0
+        entry.last_validated_at = None
+        entry.created_at = datetime.now() - timedelta(days=60)
+
+        mock_db.query.return_value.filter.return_value.all.return_value = [entry]
+
+        count = engine._apply_confidence_decay()
+
         assert count == 1
+        assert entry.confidence == pytest.approx(0.5, rel=0.01)
     
     def test_contradiction_scan(self, engine, mock_db):
         """Test contradiction detection."""

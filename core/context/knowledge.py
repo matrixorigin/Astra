@@ -266,6 +266,8 @@ class KnowledgeExtractor:
     def quarantine_low_confidence(self, user_id: str, threshold: float = 0.3) -> int:
         """Quarantine entries below confidence threshold.
         
+        Sets confidence to 0 so they are excluded from retrieval and decay.
+        
         Args:
             user_id: User whose knowledge to check
             threshold: Minimum confidence to keep active
@@ -275,17 +277,17 @@ class KnowledgeExtractor:
         """
         from api.models import KnowledgeEntry
         
-        entries = self.db.query(KnowledgeEntry).filter(
+        count = self.db.query(KnowledgeEntry).filter(
             KnowledgeEntry.user_id == user_id,
-            KnowledgeEntry.confidence < threshold
-        ).all()
+            KnowledgeEntry.confidence < threshold,
+            KnowledgeEntry.confidence > 0,
+        ).update(
+            {KnowledgeEntry.confidence: 0, KnowledgeEntry.updated_at: datetime.now()},
+            synchronize_session=False,
+        )
         
-        # In production, move to quarantine table or mark as inactive
-        # For now, just log
-        for entry in entries:
-            logger.warning(
-                f"Low confidence entry: {entry.key_name} "
-                f"(confidence={entry.confidence:.2f}, threshold={threshold})"
-            )
+        if count:
+            self.db.commit()
+            logger.info("Quarantined %d low-confidence entries for user %s", count, user_id)
         
-        return len(entries)
+        return count

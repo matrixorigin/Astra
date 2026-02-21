@@ -188,13 +188,15 @@ class MemoryGovernanceEngine:
         ).all()
         
         count = 0
+        now = datetime.now()
         for entry in entries:
             # Handle None last_validated_at (use created_at as fallback)
-            if entry.last_validated_at is None:
-                entry.last_validated_at = entry.created_at or datetime.now()
+            anchor = entry.last_validated_at or entry.created_at
+            if anchor is None:
+                continue  # No temporal anchor — skip, don't crash
             
             half_life = TRUST_TIER_HALF_LIVES.get(entry.trust_tier, 60)
-            days_since = (datetime.now() - entry.last_validated_at).days
+            days_since = (now - anchor).days
             
             # Calculate decay
             decay_factor = 0.5 ** (days_since / half_life)
@@ -202,7 +204,7 @@ class MemoryGovernanceEngine:
             
             if new_confidence != entry.confidence:
                 entry.confidence = new_confidence
-                entry.updated_at = datetime.now()
+                entry.updated_at = now
                 count += 1
         
         self.db.commit()
@@ -213,6 +215,8 @@ class MemoryGovernanceEngine:
     def _quarantine_low_confidence(self, threshold: float = 0.3) -> int:
         """Quarantine entries below confidence threshold.
         
+        Sets confidence to 0 so they are excluded from retrieval and decay.
+        
         Args:
             threshold: Minimum confidence to keep active
             
@@ -221,19 +225,19 @@ class MemoryGovernanceEngine:
         """
         from api.models import KnowledgeEntry
         
-        entries = self.db.query(KnowledgeEntry).filter(
-            KnowledgeEntry.confidence < threshold
-        ).all()
+        count = self.db.query(KnowledgeEntry).filter(
+            KnowledgeEntry.confidence < threshold,
+            KnowledgeEntry.confidence > 0,  # skip already quarantined
+        ).update(
+            {KnowledgeEntry.confidence: 0, KnowledgeEntry.updated_at: datetime.now()},
+            synchronize_session=False,
+        )
         
-        # In production, move to quarantine table
-        # For now, just log
-        for entry in entries:
-            logger.warning(
-                f"Quarantine candidate: {entry.key_name} "
-                f"(confidence={entry.confidence:.2f}, tier={entry.trust_tier})"
-            )
+        if count:
+            self.db.commit()
+            logger.info("Quarantined %d low-confidence entries (threshold=%.2f)", count, threshold)
         
-        return len(entries)
+        return count
     
     def _compress_episodic_events(self, ttl_days: int = 90) -> int:
         """Compress old episodic events to summaries.
