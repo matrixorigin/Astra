@@ -176,3 +176,16 @@ class TestChatAPI:
         mock_get_engine.return_value = engine
         resp = client.get("/chat/runs/test_run_123", headers=auth_headers)
         assert resp.status_code == 403
+
+    @patch("api.routers.chat._get_engine")
+    def test_cancel_finished_run_returns_409(self, mock_get_engine, client, auth_headers, test_user):
+        """Cancelling an already-finished run returns 409."""
+        engine = _mock_engine()
+        run = AgentRun(session_id="test", user_id=test_user.user_id, user_input="hi")
+        run.status = RunStatus.COMPLETED
+        engine.get_run.return_value = run
+        engine.restore_run.return_value = run
+        engine.cancel_run.return_value = False  # Already finished
+        mock_get_engine.return_value = engine
+        resp = client.delete("/chat/runs/test_run_123", headers=auth_headers)
+        assert resp.status_code == 409

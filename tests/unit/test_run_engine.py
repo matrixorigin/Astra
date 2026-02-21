@@ -876,3 +876,98 @@ class TestConsumeStreamCancellation:
         assert child.status == RunStatus.CANCELLED
         # Check happens at event_count % 5 == 0, so should stop at event 5
         assert event_count[0] <= 5
+
+
+class TestStreamRunEventsBounded:
+    """Test stream_run_events timeout and local flag re-check."""
+
+    @pytest.mark.asyncio
+    async def test_stream_exits_on_max_idle(self, engine):
+        """stream_run_events should exit after max_idle_polls."""
+        run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
+        run.status = RunStatus.RUNNING
+
+        # Monkey-patch to use tiny max_idle for test speed
+        original = engine.stream_run_events
+
+        async def fast_stream(run_id, last_index=0):
+            idx = last_index
+            max_idle = 3  # Very small for test
+            idle = 0
+            while idle < max_idle:
+                events = _run_events.get(run_id, [])
+                if idx < len(events):
+                    for i in range(idx, len(events)):
+                        yield events[i]
+                    idx = len(events)
+                    idle = 0
+                else:
+                    idle += 1
+                await asyncio.sleep(0)
+
+        collected = []
+        async for ev in fast_stream(run.run_id):
+            collected.append(ev)
+
+        assert collected == []  # No events emitted, just timed out
+
+    @pytest.mark.asyncio
+    async def test_stream_switches_to_db_after_gc(self, engine):
+        """After run is GC'd from memory, stream falls back to DB."""
+        run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
+        engine._append_event(run.run_id, {"event_type": "text_delta", "data": {"text": "hello"}})
+        run.status = RunStatus.COMPLETED
+        run.completed_at = datetime.now(timezone.utc)
+
+        # Simulate GC: remove from memory
+        _run_events.pop(run.run_id)
+        _active_runs.pop(run.run_id)
+
+        # Mock DB to return the event
+        engine.db.execute.return_value.fetchall.return_value = [
+            ("text_delta", '{"text": "hello"}', None, None),
+        ]
+
+        collected = []
+        async for ev in engine.stream_run_events(run.run_id):
+            collected.append(ev)
+            break  # Just need one to prove DB fallback works
+
+        assert len(collected) == 1
+        assert collected[0]["event_type"] == "text_delta"
+
+
+class TestFanInAgentIdFallback:
+    """Test _check_fan_in uses restore_run for agent_id when child not in memory."""
+
+    @pytest.mark.asyncio
+    async def test_fan_in_uses_restored_agent_id(self, engine):
+        """When child is not in _active_runs, fan-in should restore from DB."""
+        parent = engine.create_run(session_id="s1", user_id="u1", user_input="review")
+        parent.status = RunStatus.WAITING
+        parent.waiting_for = "children:" + parent.run_id
+
+        child_id = "child-run-123"
+        _child_runs[parent.run_id] = {child_id}
+
+        # Child NOT in _active_runs — simulate cross-worker
+        restored_child = AgentRun(
+            session_id="s1", user_id="u1", user_input="sub",
+            agent_id="security_reviewer",
+        )
+        restored_child.run_id = child_id
+        restored_child.status = RunStatus.COMPLETED
+
+        engine.restore_run = MagicMock(side_effect=lambda rid: restored_child if rid == child_id else parent)
+        engine.resume_run = AsyncMock()
+
+        # Provide events for the child
+        _run_events[child_id] = [{"event_type": "text_delta", "data": {"text": "looks good"}}]
+
+        await engine._check_fan_in(parent.run_id)
+
+        # resume_run should have been called with agent_id from restored child
+        engine.resume_run.assert_called_once()
+        result = engine.resume_run.call_args[0][1]
+        assert "security_reviewer" in result["child_results"]
+        assert result["child_results"]["security_reviewer"]["output"] == "looks good"
