@@ -203,3 +203,160 @@ class TestChatLoopMCPIntegration:
         bridge = MagicMock()
         loop.set_mcp_bridge(bridge)
         assert loop.mcp_bridge is bridge
+
+
+class TestMCPRetry:
+    @pytest.mark.asyncio
+    async def test_call_tool_retries_on_connection_error(self, bridge):
+        """Transient ConnectionError should be retried."""
+        session = AsyncMock()
+        list_result = MagicMock()
+        list_result.tools = [_mock_tool("flaky")]
+        session.list_tools.return_value = list_result
+
+        # Fail twice with ConnectionError, succeed on third
+        content_item = MagicMock()
+        content_item.text = "ok"
+        del content_item.data
+        success = MagicMock(content=[content_item], isError=False)
+        session.call_tool.side_effect = [ConnectionError("reset"), ConnectionError("reset"), success]
+
+        await bridge._register_server("s", session, "stdio")
+        result = await bridge.call_tool("s__flaky", {})
+
+        assert result == "ok"
+        assert session.call_tool.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_call_tool_exhausts_retries(self, bridge):
+        """After MAX_RETRIES+1 attempts, returns error."""
+        session = AsyncMock()
+        list_result = MagicMock()
+        list_result.tools = [_mock_tool("dead")]
+        session.list_tools.return_value = list_result
+        session.call_tool.side_effect = ConnectionError("gone")
+
+        await bridge._register_server("s", session, "stdio")
+        result = await bridge.call_tool("s__dead", {})
+
+        parsed = json.loads(result)
+        assert "gone" in parsed["error"]
+
+    @pytest.mark.asyncio
+    async def test_non_transient_error_no_retry(self, bridge):
+        """Non-connection errors should not be retried."""
+        session = AsyncMock()
+        list_result = MagicMock()
+        list_result.tools = [_mock_tool("bad")]
+        session.list_tools.return_value = list_result
+        session.call_tool.side_effect = ValueError("bad args")
+
+        await bridge._register_server("s", session, "stdio")
+        result = await bridge.call_tool("s__bad", {})
+
+        parsed = json.loads(result)
+        assert "bad args" in parsed["error"]
+        assert session.call_tool.call_count == 1
+
+
+class TestMCPToolMetadata:
+    @pytest.mark.asyncio
+    async def test_tool_metadata_list(self, bridge):
+        """tool_metadata_list returns lightweight metadata for registry integration."""
+        session = AsyncMock()
+        list_result = MagicMock()
+        list_result.tools = [_mock_tool("read"), _mock_tool("write")]
+        session.list_tools.return_value = list_result
+
+        await bridge._register_server("fs", session, "stdio")
+        meta = bridge.tool_metadata_list()
+
+        assert len(meta) == 2
+        assert meta[0]["name"] == "fs__read"
+        assert meta[0]["category"] == "mcp"
+        assert meta[0]["version"] == "mcp:stdio"
+        assert meta[0]["server"] == "fs"
+
+
+class TestMCPToolsChangedCallback:
+    @pytest.mark.asyncio
+    async def test_on_tools_changed_fires_on_register(self, bridge):
+        callback = MagicMock()
+        bridge.set_on_tools_changed(callback)
+
+        session = AsyncMock()
+        list_result = MagicMock()
+        list_result.tools = [_mock_tool("t")]
+        session.list_tools.return_value = list_result
+
+        await bridge._register_server("s", session, "stdio")
+        callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_on_tools_changed_fires_on_refresh(self, bridge):
+        session = AsyncMock()
+        list_result = MagicMock()
+        list_result.tools = [_mock_tool("t")]
+        session.list_tools.return_value = list_result
+        await bridge._register_server("s", session, "stdio")
+
+        callback = MagicMock()
+        bridge.set_on_tools_changed(callback)
+
+        await bridge.refresh_tools("s")
+        callback.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_on_tools_changed_fires_on_close(self, bridge):
+        callback = MagicMock()
+        bridge.set_on_tools_changed(callback)
+        await bridge.close()
+        callback.assert_called_once()
+
+
+class TestChatLoopMCPSync:
+    def _make_loop(self):
+        from core.agent.chat_loop import ChatLoop
+        return ChatLoop(
+            selector=MagicMock(),
+            executor=MagicMock(),
+            llm_client=MagicMock(),
+            event_logger=MagicMock(),
+            context_manager=MagicMock(),
+            firewall=MagicMock(),
+        )
+
+    def test_set_mcp_bridge_syncs_tools(self):
+        """set_mcp_bridge should populate selector.skills with MCP tool metadata."""
+        loop = self._make_loop()
+        # Simulate SkillPipeline._modern.rule_selector.skills chain
+        loop.selector._modern = MagicMock()
+        loop.selector._modern.rule_selector = MagicMock()
+        loop.selector._modern.rule_selector.skills = {}
+        bridge = MagicMock()
+        bridge.tool_metadata_list.return_value = [
+            {"name": "fs__read", "version": "mcp:stdio", "description": "Read", "server": "fs"},
+        ]
+        loop.set_mcp_bridge(bridge)
+
+        bridge.set_on_tools_changed.assert_called_once()
+        skills = loop.selector._modern.rule_selector.skills
+        assert "fs__read" in skills
+        assert skills["fs__read"].category == "mcp"
+
+    def test_sync_removes_stale_mcp_tools(self):
+        """When MCP tools change, stale entries should be removed."""
+        loop = self._make_loop()
+        loop.selector._modern = MagicMock()
+        loop.selector._modern.rule_selector = MagicMock()
+        loop.selector._modern.rule_selector.skills = {}
+        bridge = MagicMock()
+        bridge.tool_metadata_list.return_value = [
+            {"name": "fs__read", "version": "mcp:stdio", "description": "Read", "server": "fs"},
+        ]
+        loop.set_mcp_bridge(bridge)
+        assert "fs__read" in loop.selector._modern.rule_selector.skills
+
+        bridge.tool_metadata_list.return_value = []
+        loop._sync_mcp_tools()
+        assert "fs__read" not in loop.selector._modern.rule_selector.skills

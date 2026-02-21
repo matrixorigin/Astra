@@ -1407,8 +1407,51 @@ class ChatLoop:
         self.observer = observer
 
     def set_mcp_bridge(self, bridge) -> None:
-        """Attach an MCPBridge for external MCP server tool access."""
+        """Attach an MCPBridge for external MCP server tool access.
+
+        Registers a callback so that when MCP tools change (connect/refresh/close),
+        the selector's skill list is updated with MCP tool metadata.
+        """
         self.mcp_bridge = bridge
+        if bridge is not None:
+            bridge.set_on_tools_changed(self._sync_mcp_tools)
+            self._sync_mcp_tools()
+
+    def _sync_mcp_tools(self) -> None:
+        """Sync MCP tool metadata into rule_selector.skills for selection/audit."""
+        if not self.mcp_bridge:
+            return
+        from core.skills.selector import SkillMetadata
+        # Walk selector chain to find the skills dict:
+        # SkillPipeline._modern.rule_selector.skills
+        # ModernSkillSelector.rule_selector.skills
+        # SkillSelector.skills
+        skills = None
+        obj = self.selector
+        for attr in ("_modern", "rule_selector"):
+            nxt = getattr(obj, attr, None)
+            if nxt is not None:
+                obj = nxt
+        skills = getattr(obj, "skills", None)
+        if not isinstance(skills, dict):
+            return
+        # Remove stale MCP entries
+        stale = [k for k, v in skills.items() if getattr(v, "category", "") == "mcp"]
+        for k in stale:
+            del skills[k]
+        # Add current MCP tools
+        for meta in self.mcp_bridge.tool_metadata_list():
+            skills[meta["name"]] = SkillMetadata(
+                name=meta["name"],
+                version=meta["version"],
+                description=meta["description"],
+                category="mcp",
+                subcategory=meta.get("server", "external"),
+                triggers=[],
+                dependencies=[],
+                priority=5,
+                cost_estimate="unknown",
+            )
 
     def _run_observer(
         self, session_id: str, user_id: str, messages: list[dict[str, Any]]

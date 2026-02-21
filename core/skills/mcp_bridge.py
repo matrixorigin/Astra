@@ -15,16 +15,20 @@ Usage:
     await bridge.close()
 """
 
+import asyncio
 import json
 import logging
 from contextlib import AsyncExitStack
-from typing import Any
+from typing import Any, Callable
 
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
 logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 2
+RETRY_DELAY_SECONDS = 1.0
 
 
 class MCPServerHandle:
@@ -51,6 +55,7 @@ class MCPBridge:
         self._servers: dict[str, MCPServerHandle] = {}
         self._tool_to_server: dict[str, str] = {}  # tool_name → server_name
         self._exit_stack = AsyncExitStack()
+        self._on_tools_changed: Callable[[], None] | None = None
 
     async def connect_stdio(
         self, name: str, command: str, args: list[str] | None = None,
@@ -101,7 +106,37 @@ class MCPBridge:
 
         self._servers[name] = handle
         logger.info(f"MCP: connected to '{name}' ({transport}), {len(handle.tools)} tools")
+        self._notify_tools_changed()
         return len(handle.tools)
+
+    def set_on_tools_changed(self, callback: Callable[[], None]) -> None:
+        """Register callback invoked when tool list changes (connect/refresh/close)."""
+        self._on_tools_changed = callback
+
+    def _notify_tools_changed(self) -> None:
+        if self._on_tools_changed:
+            try:
+                self._on_tools_changed()
+            except Exception as exc:
+                logger.warning(f"on_tools_changed callback failed: {exc}")
+
+    def tool_metadata_list(self) -> list[dict[str, str]]:
+        """Return lightweight metadata for each MCP tool (for registry/audit integration).
+
+        Each entry has: name, version (server transport), description, category='mcp'.
+        """
+        items: list[dict[str, str]] = []
+        for handle in self._servers.values():
+            for schema in handle.tools:
+                fn = schema["function"]
+                items.append({
+                    "name": fn["name"],
+                    "version": f"mcp:{handle.transport}",
+                    "description": fn.get("description", ""),
+                    "category": "mcp",
+                    "server": handle.name,
+                })
+        return items
 
     def _mcp_tool_to_openai_schema(self, name: str, tool) -> dict[str, Any]:
         """Convert MCP Tool to OpenAI function calling schema."""
@@ -134,6 +169,8 @@ class MCPBridge:
     ) -> str:
         """Call an MCP tool and return the result as a string.
 
+        Retries up to MAX_RETRIES times on transient (connection) errors.
+
         Args:
             tool_name: Qualified name (server__tool)
             arguments: Tool arguments
@@ -149,28 +186,41 @@ class MCPBridge:
         # Strip namespace prefix to get original MCP tool name
         original_name = tool_name[len(server_name) + 2:]  # skip "name__"
 
-        try:
-            result = await handle.session.call_tool(original_name, arguments)
+        last_error: Exception | None = None
+        for attempt in range(1 + MAX_RETRIES):
+            try:
+                result = await handle.session.call_tool(original_name, arguments)
 
-            # Extract text content from MCP result
-            parts = []
-            for content in result.content:
-                if hasattr(content, "text"):
-                    parts.append(content.text)
-                elif hasattr(content, "data"):
-                    parts.append(f"[binary: {content.mimeType}]")
-                else:
-                    parts.append(str(content))
+                # Extract text content from MCP result
+                parts = []
+                for content in result.content:
+                    if hasattr(content, "text"):
+                        parts.append(content.text)
+                    elif hasattr(content, "data"):
+                        parts.append(f"[binary: {content.mimeType}]")
+                    else:
+                        parts.append(str(content))
 
-            output = "\n".join(parts) if parts else ""
+                output = "\n".join(parts) if parts else ""
 
-            if result.isError:
-                return json.dumps({"error": output})
-            return output if output else json.dumps({"result": "ok"})
+                if result.isError:
+                    return json.dumps({"error": output})
+                return output if output else json.dumps({"result": "ok"})
 
-        except Exception as e:
-            logger.error(f"MCP tool '{tool_name}' failed: {e}")
-            return json.dumps({"error": str(e)})
+            except (ConnectionError, OSError, EOFError, BrokenPipeError) as e:
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    logger.warning(
+                        f"MCP tool '{tool_name}' transient error (attempt {attempt + 1}): {e}"
+                    )
+                    await asyncio.sleep(RETRY_DELAY_SECONDS * (attempt + 1))
+                    continue
+            except Exception as e:
+                logger.error(f"MCP tool '{tool_name}' failed: {e}")
+                return json.dumps({"error": str(e)})
+
+        logger.error(f"MCP tool '{tool_name}' failed after {MAX_RETRIES + 1} attempts: {last_error}")
+        return json.dumps({"error": str(last_error)})
 
     @property
     def server_names(self) -> list[str]:
@@ -202,6 +252,7 @@ class MCPBridge:
                 handle.tools.append(schema)
                 self._tool_to_server[qualified_name] = name
             total += len(handle.tools)
+        self._notify_tools_changed()
         return total
 
     async def close(self):
@@ -209,4 +260,5 @@ class MCPBridge:
         await self._exit_stack.aclose()
         self._servers.clear()
         self._tool_to_server.clear()
+        self._notify_tools_changed()
         logger.info("MCP: all connections closed")
