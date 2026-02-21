@@ -105,10 +105,23 @@ class RunEngine:
             return
 
         run.status = RunStatus.RUNNING
+        waiting_for = run.waiting_for
         run.waiting_for = None
         self._log_run_event(run, EventType.RUN_RESUMED, {"result": result})
 
-        # Inject result and continue
+        # Inject result into context so agent sees it on next LLM call
+        run.context = run.context or {}
+        run.context["resumed_from"] = waiting_for
+        run.context["async_result"] = result
+
+        # Prepend result to user_input so LLM sees what happened
+        import json as _json
+        result_summary = _json.dumps(result, default=str)[:2000]
+        run.user_input = (
+            f"[Async result from {waiting_for}]:\n{result_summary}\n\n"
+            f"Original task: {run.user_input}"
+        )
+
         _run_events.setdefault(run.run_id, []).append({
             "event_type": "tool_result",
             "data": {"result": result},

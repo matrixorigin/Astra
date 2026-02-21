@@ -212,37 +212,37 @@ class RunEngine:
 #### 3. AsyncTool
 
 Tools that can return immediately with a "wait handle" instead of blocking.
+Managed by `AsyncToolRegistry` — a singleton that ChatLoop and RunEngine both use.
 
 ```python
-class ToolResult:
-    """Result of a tool execution — either immediate or async."""
-    value: Any = None           # Immediate result
-    wait_for: str | None = None # If set, run parks until this event arrives
+class AsyncToolRegistry:
+    """Extensible registry for tools that park agent runs."""
     
-    @property
-    def is_async(self) -> bool:
-        return self.wait_for is not None
+    def register(name, executor, schema)   # Add new async tool type
+    def is_async_tool(name) -> bool        # ChatLoop checks before execution
+    def execute(name, params, run_id)      # Execute + auto-track handle→run
+    def resolve_handle(handle) -> run_id   # Pop run_id waiting for handle
+    def get_schemas() -> [openai_schema]   # Auto-injected into tools_schema
 
-# Example: submit_training_job tool
-async def submit_training_job(params) -> ToolResult:
-    job_id = await job_backend.submit("feedback_trainer", params, requirements)
-    return ToolResult(
-        value=f"Training job submitted: {job_id}",
-        wait_for=f"job:{job_id}",  # Run will park until job completes
-    )
+# Built-in: submit_job
+async def submit_job(params, run_id) -> dict:
+    job_id = await backend.submit(params["job_type"], ...)
+    return {"job_id": job_id, "wait_for": f"job:{job_id}"}
 
-# Example: request_review tool (multi-agent)
-async def request_review(params) -> ToolResult:
-    review_run = await engine.create_child_run(
-        agent_id=params["reviewer_agent"],
-        task=params["task"],
-        parent_run_id=current_run.run_id,
-    )
-    return ToolResult(
-        value=f"Review requested from {params['reviewer_agent']}",
-        wait_for=f"run:{review_run.run_id}",
-    )
+# User-extensible: any framework
+registry.register("start_workflow", temporal_executor, temporal_schema)
+registry.register("wait_approval", approval_executor, approval_schema)
+# On completion: engine.resolve_handle("workflow:<id>", result)
 ```
+
+**Handle format:** `"<type>:<id>"` — pure convention, not parsed. Any string works.
+
+**Flow:**
+1. LLM calls async tool → `execute()` returns `{wait_for: "job:abc"}`
+2. Registry auto-maps `"job:abc" → run_id`
+3. ChatLoop yields StreamEvent with `wait_for` → RunEngine parks run
+4. External event arrives → `resolve_handle("job:abc")` → returns run_id
+5. RunEngine resumes run with result injected into context
 
 ### How It Handles the Scenarios
 
@@ -536,17 +536,55 @@ child_run_created — Parent created a child run
 
 ## 8. Implementation Phases
 
-### Phase 1: Durable Run (foundation)
+### Phase 1: Durable Run (foundation) ✅
 - `AgentRun` as events in conversation_events
-- `RunEngine` with start/resume
-- `/chat` returns run_id, sync fast-path preserved
-- `/chat/runs/{run_id}` status + stream endpoints
-- SSE reconnection via Last-Event-ID
+- `RunEngine` with start/resume/cancel/stream/restore
+- `/chat` returns run_id (async-only, no sync fast-path)
+- `/chat/runs/{run_id}` status + stream + cancel endpoints
+- SSE reconnection via `last_index`
 
-### Phase 2: Async Tools
-- `ToolResult.wait_for` protocol
-- Job completion → run resume
-- `submit_job` as an async tool
+### Phase 2: Async Tools ✅
+- `AsyncToolRegistry` — extensible registry for tools that park runs
+- `wait_for` handle protocol: any `"<type>:<id>"` string
+- `resolve_handle()` — unified resume mechanism for any handle type
+- `submit_job` as built-in async tool
+- Job completion → `on_job_completed` → `resolve_handle("job:<id>")` → resume
+- `POST /jobs/webhook` endpoint for external job completion callbacks
+- `LocalJobBackend.on_completed` callback for in-process job completion
+- Resume injects async result into `user_input` so LLM sees what happened
+
+**Extensibility:** New async tool types (workflow, approval, webhook) require only:
+```python
+reg = get_async_tool_registry()
+reg.register("start_workflow", my_executor, my_schema)
+# On completion: engine.resolve_handle("workflow:<id>", result)
+```
+ChatLoop and RunEngine require zero changes.
+
+**Built-in async tools:**
+- `submit_job` — single background job, parks until job completes
+- `submit_dag` — multi-step pipeline (sequential), each step's output feeds next, parks until entire DAG completes. Use when steps are predetermined and don't need LLM decisions between them.
+
+**Integration examples (zero core changes):**
+```python
+# Celery
+async def celery_exec(params, run_id=None):
+    r = celery_app.send_task(params["task_name"], args=params.get("args", []))
+    return {"task_id": r.id, "wait_for": f"celery:{r.id}"}
+reg.register("celery_task", celery_exec, celery_schema)
+
+# Temporal workflow
+async def temporal_exec(params, run_id=None):
+    handle = await client.start_workflow(params["workflow"], ...)
+    return {"workflow_id": handle.id, "wait_for": f"temporal:{handle.id}"}
+reg.register("start_workflow", temporal_exec, temporal_schema)
+
+# Airflow DAG
+async def airflow_exec(params, run_id=None):
+    run = trigger_dag(params["dag_id"], conf=params.get("conf", {}))
+    return {"dag_run_id": run.run_id, "wait_for": f"airflow:{run.run_id}"}
+reg.register("trigger_airflow", airflow_exec, airflow_schema)
+```
 
 ### Phase 3: Multi-Agent Runs
 - Child run creation

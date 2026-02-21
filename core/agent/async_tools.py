@@ -120,6 +120,107 @@ _SUBMIT_JOB_SCHEMA = {
 _registry.register("submit_job", _execute_submit_job, _SUBMIT_JOB_SCHEMA)
 
 
+# ── Built-in: submit_dag ──
+
+async def _execute_submit_dag(params: dict[str, Any], run_id: str | None = None) -> dict:
+    """Submit a multi-step DAG. Steps run sequentially via JobBackend.
+
+    Each step's output is passed as input to the next step.
+    The run parks once and resumes only when the entire DAG completes.
+    """
+    import asyncio as _aio
+    from uuid import uuid4
+
+    from core.jobs.backend import JobRequirements
+    from core.jobs.router import JobRouter
+
+    dag_id = str(uuid4())[:12]
+    steps = params["steps"]  # [{job_type, inputs?, ...}, ...]
+
+    async def _run_dag() -> dict:
+        router = JobRouter()
+        carry: dict = {}
+        results: list[dict] = []
+        for i, step in enumerate(steps):
+            merged_inputs = {**step.get("inputs", {}), **carry}
+            req = JobRequirements(
+                gpu_required=step.get("gpu_required", False),
+                timeout_seconds=step.get("timeout_seconds", 3600),
+                conda_env=step.get("conda_env"),
+            )
+            backend = router.select(req)
+            job_id = await backend.submit(step["job_type"], merged_inputs, req)
+            result = await backend.wait(job_id)
+            step_out = {
+                "step": i, "job_type": step["job_type"], "job_id": job_id,
+                "status": result.status.value, "result": result.result, "error": result.error,
+            }
+            results.append(step_out)
+            if result.status.value != "completed":
+                return {"dag_id": dag_id, "status": "failed", "steps": results}
+            carry = result.result or {}
+        return {"dag_id": dag_id, "status": "completed", "steps": results}
+
+    async def _dag_then_resolve() -> None:
+        try:
+            result = await _run_dag()
+        except Exception as e:
+            logger.error(f"DAG {dag_id} failed: {e}")
+            result = {"dag_id": dag_id, "status": "failed", "error": str(e)}
+        # Resolve handle — RunEngine.resolve_handle will resume the run
+        reg = get_async_tool_registry()
+        waiting_run_id = reg.resolve_handle(f"dag:{dag_id}")
+        if waiting_run_id:
+            # Import late to avoid circular
+            from core.agent.run_engine import RunEngine
+            from api.database import get_db_session
+            db = next(get_db_session())
+            try:
+                engine = RunEngine(db)
+                await engine.resume_run(waiting_run_id, result)
+            finally:
+                db.close()
+
+    _aio.create_task(_dag_then_resolve())
+    return {"dag_id": dag_id, "steps_count": len(steps), "status": "submitted", "wait_for": f"dag:{dag_id}"}
+
+
+_SUBMIT_DAG_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "submit_dag",
+        "description": (
+            "Submit a multi-step pipeline (DAG) where each step's output feeds "
+            "into the next. The agent run pauses until the entire pipeline completes. "
+            "Use this when steps are predetermined and don't need LLM decisions between them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "description": "Ordered list of job steps. Each step's output is passed to the next.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "job_type": {"type": "string"},
+                            "inputs": {"type": "object"},
+                            "gpu_required": {"type": "boolean", "default": False},
+                            "timeout_seconds": {"type": "integer", "default": 3600},
+                            "conda_env": {"type": "string"},
+                        },
+                        "required": ["job_type"],
+                    },
+                },
+            },
+            "required": ["steps"],
+        },
+    },
+}
+
+_registry.register("submit_dag", _execute_submit_dag, _SUBMIT_DAG_SCHEMA)
+
+
 # ── Backward compat (used by jobs webhook + old imports) ──
 
 SUBMIT_JOB_SCHEMA = _SUBMIT_JOB_SCHEMA
