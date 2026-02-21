@@ -8,6 +8,17 @@ from core.skills.delegation import DelegateTaskSkill, DelegateTaskInput
 from core.events.models import StreamEvent, StreamEventType
 
 
+@pytest.fixture(autouse=True)
+def clean_fan_in_tasks():
+    """Clean fan-in tasks after each test."""
+    from core.agent.run_engine import _fan_in_tasks
+    yield
+    # Cancel any pending fan-in tasks
+    for task in _fan_in_tasks:
+        task.cancel()
+    _fan_in_tasks.clear()
+
+
 @pytest.fixture
 def mock_agent_registry():
     """Mock agent registry."""

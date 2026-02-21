@@ -515,6 +515,13 @@ class ChatLoop:
         _async_registry = get_async_tool_registry()
         tools_schema = list(tools_schema) + _async_registry.get_schemas()
 
+        # Filter tools by agent's allowed_tools (for child agent isolation)
+        allowed = (context or {}).get("allowed_tools")
+        if allowed:
+            allowed_set = set(allowed)
+            tools_schema = [t for t in tools_schema
+                           if t.get("function", {}).get("name") in allowed_set]
+
         # Log RUN_STARTED event
         run_started_event = self.event_logger.create_stream_event(
             user_id=user_id,

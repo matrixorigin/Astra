@@ -25,6 +25,13 @@ _run_events: dict[str, list[dict]] = {}  # local buffer, also persisted to DB
 _run_waiters: dict[str, asyncio.Event] = {}
 _run_tasks: dict[str, asyncio.Task] = {}
 _child_runs: dict[str, set[str]] = {}  # parent_run_id → {child_run_ids}
+_fan_in_tasks: set[asyncio.Task] = set()  # Track fan-in tasks for cleanup
+_resume_counters: dict[str, int] = {}  # run_id → resume count (for claim uniqueness)
+
+# Max size for resume user_input to prevent token explosion on adversarial loops
+_MAX_RESUME_INPUT_CHARS = 4000
+# Max completed runs to keep in memory before cleanup
+_MAX_COMPLETED_RUNS = 500
 
 
 class RunEngine:
@@ -74,6 +81,21 @@ class RunEngine:
         if not parent:
             raise ValueError(f"Parent run {parent_run_id} not found")
 
+        ctx = dict(context or {})
+        # Load agent config from DB (system_prompt, etc.)
+        if "system_prompt" not in ctx:
+            config = self._load_agent_config(agent_id)
+            if config:
+                if config.get("system_prompt"):
+                    ctx["system_prompt"] = config["system_prompt"]
+                if config.get("allowed_tools"):
+                    ctx.setdefault("allowed_tools", config["allowed_tools"])
+
+        # Propagate causal chain from parent for audit traceability
+        parent_ctx = parent.context or {}
+        if "_causal_chain_id" in parent_ctx:
+            ctx.setdefault("_causal_chain_id", parent_ctx["_causal_chain_id"])
+
         child = self.create_run(
             session_id=parent.session_id,
             user_id=parent.user_id,
@@ -81,7 +103,7 @@ class RunEngine:
             agent_id=agent_id,
             parent_run_id=parent_run_id,
             trigger=RunTrigger.USER_MESSAGE,
-            context=context,
+            context=ctx,
         )
         _child_runs.setdefault(parent_run_id, set()).add(child.run_id)
 
@@ -89,6 +111,24 @@ class RunEngine:
         task_obj = asyncio.create_task(self.start_run(child))
         _run_tasks[child.run_id] = task_obj
         return child
+
+    def _load_agent_prompt(self, agent_id: str) -> str | None:
+        """Load system_prompt from agents table config."""
+        config = self._load_agent_config(agent_id)
+        return config.get("system_prompt") if config else None
+
+    def _load_agent_config(self, agent_id: str) -> dict | None:
+        """Load agent_config from agents table."""
+        try:
+            row = self.db.execute(
+                text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
+                {"aid": agent_id},
+            ).fetchone()
+            if row and row[0]:
+                return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        except Exception as e:
+            logger.warning(f"Failed to load agent config for {agent_id}: {e}")
+        return None
 
     async def start_run(self, run: AgentRun) -> None:
         """Execute an AgentRun using ChatLoop. Streams events to buffer."""
@@ -126,15 +166,37 @@ class RunEngine:
         finally:
             _run_tasks.pop(run.run_id, None)
             _run_waiters.get(run.run_id, asyncio.Event()).set()
+            # Fan-in: if this is a child run that ended, check parent
+            if run.parent_run_id and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                coro = self._check_fan_in(run.parent_run_id)
+                try:
+                    task = asyncio.create_task(coro)
+                    _fan_in_tasks.add(task)
+                    task.add_done_callback(lambda t: _fan_in_tasks.discard(t))
+                except RuntimeError:
+                    coro.close()  # No running event loop (shutdown)
+            # Cleanup completed runs to prevent memory leak
+            if run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                self._maybe_gc()
 
     async def _consume_stream(self, loop, run: AgentRun) -> None:
-        """Consume ChatLoop stream, parking on wait_for signals."""
+        """Consume ChatLoop stream, parking on wait_for signals.
+
+        Checks for DB cancellation between events so cross-worker cancel
+        is detected even during long tool calls.
+        """
         async for event in loop.run_step_stream(
             user_input=run.user_input,
             session_id=run.session_id,
             user_id=run.user_id,
             context=run.context,
         ):
+            # Check for cross-worker cancellation between events
+            if run.parent_run_id and self._is_cancelled_in_db(run.run_id):
+                run.status = RunStatus.CANCELLED
+                self._log_run_event(run, EventType.RUN_CANCELLED)
+                return
+
             sse = self._stream_event_to_dict(event, run.run_id)
             self._append_event(run.run_id, sse)
 
@@ -186,12 +248,14 @@ class RunEngine:
         run.context["resumed_from"] = waiting_for
         run.context["async_result"] = result
 
-        import json as _json
-        result_summary = _json.dumps(result, default=str)[:2000]
+        # Build resume input — keep original_input stable to prevent token explosion
+        result_summary = json.dumps(result, default=str)[:2000]
+        original_input = run.context.get("_original_input", run.user_input)
+        run.context["_original_input"] = original_input  # preserve for future resumes
         run.user_input = (
             f"[Async result from {waiting_for}]:\n{result_summary}\n\n"
-            f"Original task: {run.user_input}"
-        )
+            f"Original task: {original_input}"
+        )[:_MAX_RESUME_INPUT_CHARS]
 
         self._append_event(run.run_id, {
             "event_type": "tool_result",
@@ -211,6 +275,23 @@ class RunEngine:
         task = _run_tasks.pop(run_id, None)
         if task and not task.done():
             task.cancel()
+
+        # Cancel children (local + write DB for cross-worker)
+        children = _child_runs.pop(run_id, set())
+        # Also check DB for children on other workers
+        if not children:
+            children = self._get_child_run_ids_from_db(run_id)
+        for cid in children:
+            child_task = _run_tasks.pop(cid, None)
+            if child_task and not child_task.done():
+                child_task.cancel()
+            child = _active_runs.get(cid)
+            if child and child.status not in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                child.status = RunStatus.CANCELLED
+                self._log_run_event(child, EventType.RUN_CANCELLED)
+            elif not child:
+                # Cross-worker: write cancel event so other worker detects it
+                self._write_cancel_event_for_run(cid, run.session_id, run.user_id)
 
         # Propagate to workflow
         if run.waiting_for and run.waiting_for.startswith("workflow:"):
@@ -233,7 +314,6 @@ class RunEngine:
         # Also mark in DB so other workers see it
         try:
             from api.database import get_db_session
-            from api.models import WorkflowRun as WFRunModel
             db = next(get_db_session())
             try:
                 db.execute(
@@ -295,9 +375,12 @@ class RunEngine:
     async def stream_run_events(self, run_id: str, last_index: int = 0) -> AsyncIterator[dict]:
         """Yield events as they arrive. Cross-worker safe via DB polling."""
         idx = last_index
-        local = run_id in _run_events  # Is this run on this worker?
+        max_idle_polls = 3000  # ~5 min at 0.1s interval
+        idle_count = 0
 
-        while True:
+        while idle_count < max_idle_polls:
+            # Re-check each iteration (run may be GC'd mid-stream)
+            local = run_id in _run_events
             if local:
                 events = _run_events.get(run_id, [])
             else:
@@ -307,6 +390,9 @@ class RunEngine:
                 for i in range(idx, len(events)):
                     yield events[i]
                 idx = len(events)
+                idle_count = 0  # Reset on activity
+            else:
+                idle_count += 1
 
             # Check if run is done
             run = _active_runs.get(run_id)
@@ -347,7 +433,7 @@ class RunEngine:
             )
             self.db.commit()
         except Exception as e:
-            logger.debug(f"Event persist failed (non-fatal): {e}")
+            logger.warning(f"Event persist failed for run {run_id} idx {idx}: {e}")
 
     def _load_events_from_db(self, run_id: str, after_index: int = 0) -> list[dict]:
         """Load events from DB for cross-worker streaming."""
@@ -380,18 +466,25 @@ class RunEngine:
     # ── Distributed coordination ──────────────────────────────
 
     def _try_claim_resume(self, run_id: str) -> bool:
-        """Optimistic lock: INSERT a unique claim row.
+        """Optimistic lock: INSERT a unique claim row per resume attempt.
 
-        The run_events table has a unique index on (run_id, idx) where idx=-1
-        is reserved for resume claims. Second INSERT raises IntegrityError.
+        Uses a monotonic counter so adversarial loops (multiple resume cycles)
+        each get a unique idx: -1, -2, -3, ...
         """
+        counter = _resume_counters.get(run_id, 0) + 1
+        _resume_counters[run_id] = counter
+        claim_idx = -counter  # -1, -2, -3, ...
         try:
             self.db.execute(
                 text(
                     "INSERT INTO run_events (run_id, idx, event_type, data) "
-                    "VALUES (:run_id, -1, 'resume_claim', :data)"
+                    "VALUES (:run_id, :idx, 'resume_claim', :data)"
                 ),
-                {"run_id": run_id, "data": json.dumps({"claimed_at": datetime.now(timezone.utc).isoformat()})},
+                {
+                    "run_id": run_id,
+                    "idx": claim_idx,
+                    "data": json.dumps({"claimed_at": datetime.now(timezone.utc).isoformat(), "attempt": counter}),
+                },
             )
             self.db.commit()
             return True
@@ -444,30 +537,72 @@ class RunEngine:
                 "data": {"child_run_id": run.run_id},
                 "run_id": run.parent_run_id,
             })
-            # Fan-in: check if all siblings are done
-            asyncio.ensure_future(self._check_fan_in(run.parent_run_id))
 
     async def _check_fan_in(self, parent_run_id: str) -> None:
-        """If all child runs completed, resume the parent with aggregated results."""
+        """If all child runs completed, resume the parent with aggregated results.
+
+        Checks in-memory first, falls back to DB for cross-worker coordination.
+        """
         children = _child_runs.get(parent_run_id)
+
+        # Fallback: if no in-memory children, query DB
         if not children:
-            return
+            children = self._get_child_run_ids_from_db(parent_run_id)
+            if not children:
+                return
 
         results = {}
         for cid in children:
             child = _active_runs.get(cid)
-            if not child or child.status not in (RunStatus.COMPLETED, RunStatus.FAILED):
+            status = child.status if child else self._get_run_status_from_db(cid)
+            if status not in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                 return  # Still waiting for some children
-            results[cid] = {
-                "agent_id": child.agent_id,
-                "status": child.status.value,
-                "events": _run_events.get(cid, []),
+
+            # Collect output
+            child_events = _run_events.get(cid)
+            if child_events is None:
+                child_events = self._load_events_from_db(cid, 0)
+            final_text = ""
+            for ev in child_events:
+                if ev.get("event_type") == "text_delta":
+                    final_text += ev.get("data", {}).get("text", "")
+
+            agent_id = child.agent_id if child else self._get_agent_id_from_db(cid)
+            results[agent_id] = {
+                "run_id": cid,
+                "status": status.value if hasattr(status, 'value') else str(status),
+                "output": final_text or "(no text output)",
             }
 
         # All done — resume parent
         _child_runs.pop(parent_run_id, None)
-        handle = f"children:{parent_run_id}"
         await self.resume_run(parent_run_id, {"child_results": results})
+
+    def _get_child_run_ids_from_db(self, parent_run_id: str) -> set[str]:
+        """Query DB for child run IDs of a parent."""
+        try:
+            rows = self.db.execute(
+                text(
+                    "SELECT DISTINCT JSON_EXTRACT(metadata, '$.run_id') FROM conversation_events "
+                    "WHERE event_type = :et "
+                    "AND JSON_EXTRACT(metadata, '$.parent_run_id') = :pid"
+                ),
+                {"et": EventType.RUN_STARTED.value, "pid": parent_run_id},
+            ).fetchall()
+            return {row[0] for row in rows if row[0]}
+        except Exception as e:
+            logger.warning(f"Failed to query child runs for {parent_run_id}: {e}")
+            return set()
+
+    def _get_run_status_from_db(self, run_id: str) -> RunStatus | None:
+        """Get latest run status from DB."""
+        restored = self.restore_run(run_id)
+        return restored.status if restored else None
+
+    def _get_agent_id_from_db(self, run_id: str) -> str:
+        """Get agent_id for a run from DB. Falls back to run_id."""
+        restored = self.restore_run(run_id)
+        return restored.agent_id if restored else run_id
 
     def _log_run_event(self, run: AgentRun, event_type: EventType, extra_meta: dict | None = None) -> None:
         meta = {"run_id": run.run_id}
@@ -478,13 +613,49 @@ class RunEngine:
         if extra_meta:
             meta.update(extra_meta)
 
+        # Propagate causal chain from parent for audit traceability
+        causal_chain_id = (run.context or {}).get("_causal_chain_id")
+
         self.event_logger.create_stream_event(
             user_id=run.user_id,
             session_id=run.session_id,
             event_type=event_type.value,
             content=run.to_event_content(),
+            causal_chain_id=causal_chain_id,
             metadata=meta,
         )
+
+    def _write_cancel_event_for_run(self, run_id: str, session_id: str, user_id: str) -> None:
+        """Write a cancel event to DB for a run on another worker."""
+        try:
+            self.event_logger.create_stream_event(
+                user_id=user_id,
+                session_id=session_id,
+                event_type=EventType.RUN_CANCELLED.value,
+                content="{}",
+                metadata={"run_id": run_id},
+            )
+        except Exception as e:
+            logger.warning(f"Failed to write cross-worker cancel for {run_id}: {e}")
+
+    @staticmethod
+    def _maybe_gc() -> None:
+        """Remove oldest completed runs from memory if over threshold."""
+        terminal = {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
+        completed = [
+            (rid, r) for rid, r in _active_runs.items()
+            if r.status in terminal
+        ]
+        if len(completed) <= _MAX_COMPLETED_RUNS:
+            return
+        # Sort by completed_at, remove oldest
+        completed.sort(key=lambda x: x[1].completed_at or x[1].created_at)
+        to_remove = len(completed) - _MAX_COMPLETED_RUNS
+        for rid, _ in completed[:to_remove]:
+            _active_runs.pop(rid, None)
+            _run_events.pop(rid, None)
+            _run_waiters.pop(rid, None)
+            _resume_counters.pop(rid, None)
 
     @staticmethod
     def _stream_event_to_dict(event: StreamEvent, run_id: str) -> dict:

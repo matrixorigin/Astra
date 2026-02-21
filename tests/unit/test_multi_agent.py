@@ -1,122 +1,358 @@
-"""Unit tests for multi-agent collaboration features."""
+"""End-to-end test: multi-agent code review workflow.
 
-import unittest
-from unittest.mock import AsyncMock, MagicMock
+Tests the full flow: orchestrator → spawn reviewers → fan-in → synthesize.
+Uses mock LLM to simulate realistic agent behavior.
+"""
 
-from core.agent.agent_registry import AgentProfile, AgentRegistry
-from core.skills.delegation import DelegateTaskInput, DelegateTaskSkill
+import asyncio
+import json
+import pytest
+from unittest.mock import MagicMock, patch, AsyncMock
 
-
-class TestAgentRegistry(unittest.TestCase):
-    """Test AgentRegistry functionality."""
-
-    def setUp(self):
-        self.registry = AgentRegistry()
-
-    def test_register_agent(self):
-        """Test registering an agent profile."""
-        profile = AgentProfile(
-            agent_id="test_agent", system_prompt="Test prompt", skill_filter=["skill1"]
-        )
-        self.registry.register(profile)
-
-        retrieved = self.registry.get("test_agent")
-        self.assertIsNotNone(retrieved)
-        self.assertEqual(retrieved.agent_id, "test_agent")
-
-    def test_get_nonexistent_agent(self):
-        """Test getting a non-existent agent."""
-        result = self.registry.get("nonexistent")
-        self.assertIsNone(result)
-
-    def test_list_agents(self):
-        """Test listing all agents."""
-        self.registry.register(AgentProfile(agent_id="agent1", system_prompt="p1"))
-        self.registry.register(AgentProfile(agent_id="agent2", system_prompt="p2"))
-
-        agents = self.registry.list_agents()
-        self.assertEqual(len(agents), 2)
-
-    def test_unregister_agent(self):
-        """Test unregistering an agent."""
-        self.registry.register(AgentProfile(agent_id="test", system_prompt="p"))
-        result = self.registry.unregister("test")
-
-        self.assertTrue(result)
-        self.assertIsNone(self.registry.get("test"))
+from core.agent.run import RunStatus
+from core.agent.run_engine import (
+    RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks, _child_runs, _fan_in_tasks,
+    _MAX_RESUME_INPUT_CHARS, _resume_counters,
+)
+from core.events.models import StreamEvent, StreamEventType
 
 
-class TestDelegateTaskSkill(unittest.IsolatedAsyncioTestCase):
-    """Test DelegateTaskSkill functionality."""
+@pytest.fixture(autouse=True)
+def clean_state():
+    _active_runs.clear()
+    _run_events.clear()
+    _run_waiters.clear()
+    _run_tasks.clear()
+    _child_runs.clear()
+    _fan_in_tasks.clear()
+    _resume_counters.clear()
+    yield
+    _active_runs.clear()
+    _run_events.clear()
+    _run_waiters.clear()
+    _run_tasks.clear()
+    _child_runs.clear()
+    _fan_in_tasks.clear()
+    _resume_counters.clear()
 
-    def setUp(self):
-        self.registry = AgentRegistry()
-        self.registry.register(
-            AgentProfile(
-                agent_id="code_reviewer",
-                system_prompt="You are a code reviewer.",
-                skill_filter=["analyze_code"],
+
+@pytest.fixture
+def mock_db():
+    db = MagicMock()
+    db.execute.return_value.fetchone.return_value = None
+    db.execute.return_value.fetchall.return_value = []
+    return db
+
+
+@pytest.fixture
+def engine(mock_db):
+    with patch.object(RunEngine, '__init__',
+                      lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
+        e = RunEngine(mock_db)
+        e._try_claim_resume = MagicMock(return_value=True)
+        return e
+
+
+def _make_mock_loop(responses: list[str]):
+    """Create a mock ChatLoop that yields text responses in sequence.
+
+    Each call to run_step_stream yields the next response from the list.
+    If a response starts with 'TOOL:spawn_runs:', it simulates a tool call.
+    """
+    call_idx = [0]
+
+    class MockLoop:
+        _current_run_id = None
+
+        async def run_step_stream(self, **kw):
+            idx = call_idx[0]
+            call_idx[0] += 1
+            text = responses[idx] if idx < len(responses) else "done"
+
+            if text.startswith("TOOL:spawn_runs:"):
+                # Simulate async tool call → wait_for
+                payload = json.loads(text[len("TOOL:spawn_runs:"):])
+                yield StreamEvent(
+                    event_type=StreamEventType.TOOL_RESULT,
+                    data={"wait_for": payload["wait_for"]},
+                )
+            else:
+                yield StreamEvent(
+                    event_type=StreamEventType.TEXT_DELTA,
+                    data={"text": text},
+                )
+
+    return MockLoop()
+
+
+class TestMultiAgentE2E:
+
+    @pytest.mark.asyncio
+    async def test_single_child_run_lifecycle(self, engine):
+        """Parent creates one child, child completes, parent resumes."""
+        # Child will output "LGTM, no issues found"
+        child_loop = _make_mock_loop(["LGTM, no issues found"])
+        # Parent will output "Review complete: all clear"
+        parent_loop = _make_mock_loop([
+            "Starting review...",  # First run (before wait)
+            "Review complete: all clear",  # After resume
+        ])
+
+        # We need different loops for parent vs child
+        loops = {"parent": parent_loop, "child": child_loop}
+        current_agent = [None]
+
+        def build_loop(db):
+            # Return different loop based on which run is being started
+            loop = MagicMock()
+            loop._current_run_id = None
+
+            async def stream(**kw):
+                user_input = kw.get("user_input", "")
+                if "Review for" in user_input:
+                    async for ev in child_loop.run_step_stream(**kw):
+                        yield ev
+                elif "[Async result" in user_input:
+                    # This is the resumed parent
+                    yield StreamEvent(
+                        event_type=StreamEventType.TEXT_DELTA,
+                        data={"text": "Review complete: all clear"},
+                    )
+                else:
+                    # First parent call — will trigger wait
+                    yield StreamEvent(
+                        event_type=StreamEventType.TOOL_RESULT,
+                        data={"wait_for": "will_be_set_by_engine"},
+                    )
+
+            loop.run_step_stream = stream
+            return loop
+
+        with patch("api.routers.chat._build_chat_loop", side_effect=build_loop):
+            # Create and start parent
+            parent = engine.create_run(session_id="s1", user_id="u1", user_input="Review auth.py")
+
+            # Manually create child (simulating what spawn_runs does)
+            child = await engine.create_child_run(
+                parent_run_id=parent.run_id,
+                agent_id="security-reviewer",
+                task="Review for security issues in auth.py",
             )
+
+            # Parent should be waiting
+            parent.status = RunStatus.WAITING
+            parent.waiting_for = f"children:{parent.run_id}"
+
+            # Wait for child to complete
+            await asyncio.sleep(0.15)
+
+        assert child.status == RunStatus.COMPLETED
+        assert parent.status == RunStatus.COMPLETED
+
+        # Verify child output was captured
+        child_events = _run_events.get(child.run_id, [])
+        child_text = "".join(
+            ev.get("data", {}).get("text", "")
+            for ev in child_events if ev.get("event_type") == "text_delta"
+        )
+        assert "LGTM" in child_text
+
+    @pytest.mark.asyncio
+    async def test_fan_out_fan_in_three_reviewers(self, engine):
+        """Spawn 3 reviewers, all complete, parent gets aggregated results."""
+        reviewer_outputs = {
+            "security": "No SQL injection found. Auth looks solid.",
+            "perf": "N+1 query on line 42. Add .select_related().",
+            "style": "Missing docstring on public method validate().",
+        }
+
+        def build_loop(db):
+            loop = MagicMock()
+            loop._current_run_id = None
+
+            async def stream(**kw):
+                user_input = kw.get("user_input", "")
+                # Match reviewer by task content
+                for key, output in reviewer_outputs.items():
+                    if key in user_input.lower():
+                        yield StreamEvent(
+                            event_type=StreamEventType.TEXT_DELTA,
+                            data={"text": output},
+                        )
+                        return
+                # Parent resume
+                yield StreamEvent(
+                    event_type=StreamEventType.TEXT_DELTA,
+                    data={"text": "All reviews done. Summary: 1 perf issue, 1 style issue."},
+                )
+
+            loop.run_step_stream = stream
+            return loop
+
+        with patch("api.routers.chat._build_chat_loop", side_effect=build_loop):
+            parent = engine.create_run(session_id="s1", user_id="u1", user_input="Review auth module")
+            parent.status = RunStatus.WAITING
+            parent.waiting_for = f"children:{parent.run_id}"
+
+            children = []
+            for agent_id, task in [
+                ("security-reviewer", "Review for security issues"),
+                ("perf-reviewer", "Review for perf issues"),
+                ("style-reviewer", "Review for style issues"),
+            ]:
+                c = await engine.create_child_run(parent.run_id, agent_id, task)
+                children.append(c)
+
+            await asyncio.sleep(0.15)
+
+        # All children completed
+        for c in children:
+            assert c.status == RunStatus.COMPLETED
+
+        # Parent resumed and completed
+        assert parent.status == RunStatus.COMPLETED
+
+        # Verify parent received child results in its input
+        assert "child_results" in (parent.context or {}).get("async_result", {})
+
+    @pytest.mark.asyncio
+    async def test_child_failure_doesnt_crash_parent(self, engine):
+        """If one child fails, parent still gets results from all children."""
+        call_count = [0]
+
+        def build_loop(db):
+            loop = MagicMock()
+            loop._current_run_id = None
+
+            async def stream(**kw):
+                user_input = kw.get("user_input", "")
+                if user_input == "Review FAIL part":
+                    # Only the child with exactly this task fails
+                    raise RuntimeError("LLM API error")
+                yield StreamEvent(
+                    event_type=StreamEventType.TEXT_DELTA,
+                    data={"text": "Review OK"},
+                )
+
+            loop.run_step_stream = stream
+            return loop
+
+        with patch("api.routers.chat._build_chat_loop", side_effect=build_loop):
+            parent = engine.create_run(session_id="s1", user_id="u1", user_input="Review")
+            parent.status = RunStatus.WAITING
+            parent.waiting_for = f"children:{parent.run_id}"
+
+            c_ok = await engine.create_child_run(parent.run_id, "reviewer-a", "Review OK part")
+            c_fail = await engine.create_child_run(parent.run_id, "reviewer-b", "Review FAIL part")
+
+            await asyncio.sleep(0.15)
+
+        assert c_ok.status == RunStatus.COMPLETED
+        assert c_fail.status == RunStatus.FAILED
+        # Parent should still resume (fan-in accepts FAILED children)
+        assert parent.status == RunStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_agent_config_injection(self, engine):
+        """Child run should receive system_prompt from agent config."""
+        # Mock DB to return agent config
+        engine.db.execute.return_value.fetchone.return_value = (
+            json.dumps({
+                "system_prompt": "You are a security expert.",
+                "allowed_tools": ["read_file"],
+            }),
         )
 
-        # Mock chat_loop_factory
-        self.mock_loop = AsyncMock()
-        self.mock_loop.run_step = AsyncMock(return_value="Review result")
-        self.loop_factory = MagicMock(return_value=self.mock_loop)
+        received_context = {}
 
-        self.skill = DelegateTaskSkill(
-            agent_registry=self.registry, chat_loop_factory=self.loop_factory
-        )
+        def build_loop(db):
+            loop = MagicMock()
+            loop._current_run_id = None
 
-    async def test_execute_valid_agent(self):
-        """Test executing delegation to a valid agent."""
-        input_data = DelegateTaskInput(
-            agent_id="code_reviewer",
-            task="Review this PR",
-            session_id="session_1",
-            user_id="user_1",
-        )
+            async def stream(**kw):
+                received_context.update(kw.get("context", {}))
+                yield StreamEvent(
+                    event_type=StreamEventType.TEXT_DELTA,
+                    data={"text": "done"},
+                )
 
-        result = await self.skill.execute(input_data)
+            loop.run_step_stream = stream
+            return loop
 
-        self.assertTrue(result.success)
-        self.assertEqual(result.agent_id, "code_reviewer")
-        self.assertEqual(result.result, "Review result")
-        self.loop_factory.assert_called_once()
+        with patch("api.routers.chat._build_chat_loop", side_effect=build_loop):
+            parent = engine.create_run(session_id="s1", user_id="u1", user_input="test")
+            parent.status = RunStatus.RUNNING
+            child = await engine.create_child_run(parent.run_id, "security-reviewer", "review")
+            await asyncio.sleep(0.1)
 
-    async def test_execute_invalid_agent(self):
-        """Test executing delegation to an invalid agent."""
-        input_data = DelegateTaskInput(
-            agent_id="nonexistent_agent",
-            task="Review this PR",
-            session_id="session_1",
-            user_id="user_1",
-        )
+        assert child.context.get("system_prompt") == "You are a security expert."
+        assert child.context.get("allowed_tools") == ["read_file"]
 
-        result = await self.skill.execute(input_data)
+    @pytest.mark.asyncio
+    async def test_cancel_parent_stops_children(self, engine):
+        """Cancelling parent should propagate to running children."""
+        started = asyncio.Event()
 
-        self.assertFalse(result.success)
-        self.assertIn("not found", result.result)
+        def build_loop(db):
+            loop = MagicMock()
+            loop._current_run_id = None
 
-    async def test_execute_with_context(self):
-        """Test executing delegation with context."""
-        input_data = DelegateTaskInput(
-            agent_id="code_reviewer",
-            task="Review this PR",
-            context="Additional context",
-            session_id="session_1",
-            user_id="user_1",
-        )
+            async def stream(**kw):
+                started.set()
+                await asyncio.sleep(10)  # Simulate long-running child
+                yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data={"text": "done"})
 
-        result = await self.skill.execute(input_data)
+            loop.run_step_stream = stream
+            return loop
 
-        self.assertTrue(result.success)
-        # Verify the loop was created with the correct system prompt and agent_id
-        self.loop_factory.assert_called_once_with(
-            system_prompt="You are a code reviewer.",
-            agent_id="code_reviewer",
-        )
+        with patch("api.routers.chat._build_chat_loop", side_effect=build_loop):
+            parent = engine.create_run(session_id="s1", user_id="u1", user_input="test")
+            parent.status = RunStatus.WAITING
+            parent.waiting_for = f"children:{parent.run_id}"
+
+            child = await engine.create_child_run(parent.run_id, "reviewer", "review")
+            await started.wait()
+
+            # Cancel parent — should propagate to child
+            engine.cancel_run(parent.run_id)
+
+            # Wait for child task to finish (cancelled)
+            task = _run_tasks.get(child.run_id)
+            if task and not task.done():
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        assert parent.status == RunStatus.CANCELLED
+        assert child.status == RunStatus.CANCELLED
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestSeedAgents:
+
+    def test_seed_inserts_agents(self):
+        from core.agent.seed_agents import seed_agents, SEED_AGENTS
+        db = MagicMock()
+        # No existing agents
+        db.execute.return_value.fetchone.return_value = None
+        count = seed_agents(db)
+        assert count == len(SEED_AGENTS)
+        db.commit.assert_called_once()
+
+    def test_seed_skips_existing(self):
+        from core.agent.seed_agents import seed_agents
+        db = MagicMock()
+        # All agents already exist
+        db.execute.return_value.fetchone.return_value = (1,)
+        count = seed_agents(db)
+        assert count == 0
+
+    def test_seed_agent_configs(self):
+        from core.agent.seed_agents import SEED_AGENTS
+        for agent in SEED_AGENTS:
+            assert "system_prompt" in agent["agent_config"]
+            assert len(agent["agent_config"]["system_prompt"]) > 20
+        # Reviewers should have allowed_tools
+        reviewers = [a for a in SEED_AGENTS if a["agent_type"] == "reviewer"]
+        for r in reviewers:
+            assert "allowed_tools" in r["agent_config"]

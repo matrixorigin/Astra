@@ -196,10 +196,11 @@ async def get_run_status(
     engine = _get_engine(db)
     run = engine.get_run(run_id)
     if not run:
-        # Try restoring from DB
         run = engine.restore_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized to view this run")
 
     events = engine.get_run_events(run_id)
     return RunStatusResponse(
@@ -220,9 +221,11 @@ async def stream_run(
 ):
     """Stream run events as SSE. Supports reconnection via last_index."""
     engine = _get_engine(db)
-    run = engine.get_run(run_id)
+    run = engine.get_run(run_id) or engine.restore_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized to view this run")
 
     async def event_generator():
         async for event in engine.stream_run_events(run_id, last_index=last_index):
@@ -243,6 +246,12 @@ async def cancel_run(
 ):
     """Cancel a running or waiting run."""
     engine = _get_engine(db)
+    # Verify ownership
+    run = engine.get_run(run_id) or engine.restore_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.user_id != current_user["user_id"]:
+        raise HTTPException(status_code=403, detail="Not authorized to cancel this run")
     if not engine.cancel_run(run_id):
-        raise HTTPException(status_code=404, detail="Run not found or already finished")
+        raise HTTPException(status_code=409, detail="Run already finished")
     return {"run_id": run_id, "status": "cancelled"}

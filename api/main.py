@@ -35,6 +35,18 @@ async def lifespan(app: FastAPI):
     if restored:
         logger.info(f"Restored {restored} waiting workflow(s)")
 
+    # Seed predefined agent roles
+    try:
+        from core.agent.seed_agents import seed_agents
+        from api.database import get_db_session
+        db = next(get_db_session())
+        seeded = seed_agents(db)
+        if seeded:
+            logger.info(f"Seeded {seeded} agent role(s)")
+        db.close()
+    except Exception as e:
+        logger.debug(f"Agent seeding skipped: {e}")
+
     # Periodic workflow cleanup (every hour)
     import asyncio
     async def _cleanup_loop():

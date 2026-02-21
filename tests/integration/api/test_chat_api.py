@@ -55,15 +55,27 @@ def auth_headers(client, test_user):
 def _mock_engine(reply="Hello back!", status=RunStatus.PENDING):
     """Return a mock RunEngine."""
     engine = MagicMock()
-    run = AgentRun(session_id="test", user_id="test", user_input="hi")
-    run.status = status
-    engine.create_run.return_value = run
-    engine.start_run_with_timeout = AsyncMock(return_value=run)
+
+    def _create_run(**kwargs):
+        run = AgentRun(
+            session_id=kwargs.get("session_id", "test"),
+            user_id=kwargs.get("user_id", "test"),
+            user_input=kwargs.get("user_input", "hi"),
+        )
+        run.status = status
+        engine.get_run.return_value = run
+        engine.restore_run.return_value = run
+        return run
+
+    engine.create_run.side_effect = _create_run
+    # Default for get/restore before create_run is called
+    default_run = AgentRun(session_id="test", user_id="test", user_input="hi")
+    default_run.status = status
+    engine.get_run.return_value = default_run
+    engine.restore_run.return_value = default_run
     engine.get_run_events.return_value = [
         {"event_type": "text_done", "data": {"text": reply}},
     ]
-    engine.get_run.return_value = run
-    engine.restore_run.return_value = None
     engine.cancel_run.return_value = True
 
     async def stream_events(run_id, last_index=0):
@@ -118,8 +130,12 @@ class TestChatAPI:
         assert "run_id" in resp.text
 
     @patch("api.routers.chat._get_engine")
-    def test_get_run_status(self, mock_get_engine, client, auth_headers):
+    def test_get_run_status(self, mock_get_engine, client, auth_headers, test_user):
         engine = _mock_engine()
+        # Make the mock run match the authenticated user
+        run = AgentRun(session_id="test", user_id=test_user.user_id, user_input="hi")
+        engine.get_run.return_value = run
+        engine.restore_run.return_value = run
         mock_get_engine.return_value = engine
         resp = client.get("/chat/runs/test_run_123", headers=auth_headers)
         assert resp.status_code == 200
@@ -127,8 +143,36 @@ class TestChatAPI:
         assert data["status"] == "pending"
 
     @patch("api.routers.chat._get_engine")
-    def test_cancel_run(self, mock_get_engine, client, auth_headers):
-        mock_get_engine.return_value = _mock_engine()
+    def test_cancel_run(self, mock_get_engine, client, auth_headers, test_user):
+        engine = _mock_engine()
+        run = AgentRun(session_id="test", user_id=test_user.user_id, user_input="hi")
+        run.status = RunStatus.RUNNING
+        engine.get_run.return_value = run
+        engine.restore_run.return_value = run
+        mock_get_engine.return_value = engine
         resp = client.delete("/chat/runs/test_run_123", headers=auth_headers)
         assert resp.status_code == 200
         assert resp.json()["status"] == "cancelled"
+
+    @patch("api.routers.chat._get_engine")
+    def test_cancel_run_wrong_user(self, mock_get_engine, client, auth_headers):
+        """Cannot cancel another user's run."""
+        engine = _mock_engine()
+        run = AgentRun(session_id="test", user_id="other_user_id", user_input="hi")
+        run.status = RunStatus.RUNNING
+        engine.get_run.return_value = run
+        engine.restore_run.return_value = run
+        mock_get_engine.return_value = engine
+        resp = client.delete("/chat/runs/test_run_123", headers=auth_headers)
+        assert resp.status_code == 403
+
+    @patch("api.routers.chat._get_engine")
+    def test_get_run_status_wrong_user(self, mock_get_engine, client, auth_headers):
+        """Cannot view another user's run."""
+        engine = _mock_engine()
+        run = AgentRun(session_id="test", user_id="other_user_id", user_input="hi")
+        engine.get_run.return_value = run
+        engine.restore_run.return_value = run
+        mock_get_engine.return_value = engine
+        resp = client.get("/chat/runs/test_run_123", headers=auth_headers)
+        assert resp.status_code == 403

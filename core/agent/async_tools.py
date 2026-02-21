@@ -462,25 +462,42 @@ async def _execute_spawn_runs(params: dict[str, Any], run_id: str | None = None)
     from core.agent.run_engine import RunEngine, _active_runs
     from api.database import get_db_session
 
+    parent = _active_runs.get(run_id)
+    if not parent:
+        return {"error": f"Parent run {run_id} not found in active runs"}
+
     db = next(get_db_session())
-    engine = RunEngine(db)
+    try:
+        engine = RunEngine(db)
 
-    agents = params["agents"]  # [{"agent_id": "reviewer", "task": "Review code"}, ...]
-    children = []
-    for spec in agents:
-        child = await engine.create_child_run(
-            parent_run_id=run_id,
-            agent_id=spec.get("agent_id", "dev-agent"),
-            task=spec["task"],
-            context=spec.get("context"),
-        )
-        children.append({"run_id": child.run_id, "agent_id": child.agent_id})
+        agents = params.get("agents")
+        if not agents or not isinstance(agents, list):
+            return {"error": "spawn_runs requires a non-empty 'agents' list"}
 
-    return {
-        "children": children,
-        "count": len(children),
-        "wait_for": f"children:{run_id}",
-    }
+        children = []
+        for spec in agents:
+            if not isinstance(spec, dict) or "task" not in spec:
+                continue  # Skip malformed entries
+            child = await engine.create_child_run(
+                parent_run_id=run_id,
+                agent_id=spec.get("agent_id", "dev-agent"),
+                task=spec["task"],
+                context=spec.get("context"),
+            )
+            children.append({"run_id": child.run_id, "agent_id": child.agent_id})
+
+        return {
+            "children": children,
+            "count": len(children),
+            "wait_for": f"children:{run_id}",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 _SPAWN_RUNS_SCHEMA = {
