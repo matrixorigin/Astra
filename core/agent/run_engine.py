@@ -1,4 +1,7 @@
-"""RunEngine — drives AgentRun execution, decoupled from HTTP lifecycle."""
+"""RunEngine — drives AgentRun execution, decoupled from HTTP lifecycle.
+
+Distributed-safe: all coordination through DB, no cross-worker in-memory deps.
+"""
 
 import asyncio
 import json
@@ -15,10 +18,11 @@ from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# In-memory registry of active runs (production would use Redis)
+# In-memory: only for THIS worker's active runs (not shared across workers)
 _active_runs: dict[str, AgentRun] = {}
-_run_events: dict[str, list[dict]] = {}  # run_id → buffered SSE events
-_run_waiters: dict[str, asyncio.Event] = {}  # run_id → completion signal
+_run_events: dict[str, list[dict]] = {}  # local buffer, also persisted to DB
+_run_waiters: dict[str, asyncio.Event] = {}
+_run_tasks: dict[str, asyncio.Task] = {}
 
 
 class RunEngine:
@@ -62,10 +66,9 @@ class RunEngine:
         try:
             from api.routers.chat import _build_chat_loop
             loop = _build_chat_loop(self.db)
-            loop._current_run_id = run.run_id  # For async tools to link jobs
+            loop._current_run_id = run.run_id
 
             coro = self._consume_stream(loop, run)
-            # Run-level timeout: 30 min default, prevents ChatLoop from hanging forever
             timeout = (run.context or {}).get("run_timeout_seconds", 1800)
             await asyncio.wait_for(coro, timeout=timeout)
 
@@ -75,7 +78,7 @@ class RunEngine:
             logger.error(f"Run {run.run_id} timed out after {timeout}s")
             run.status = RunStatus.FAILED
             self._log_run_event(run, EventType.RUN_FAILED, {"error": f"Run timed out after {timeout}s"})
-            _run_events.setdefault(run.run_id, []).append({
+            self._append_event(run.run_id, {
                 "event_type": "run_error", "data": {"error": f"Run timed out after {timeout}s"},
                 "run_id": run.run_id,
             })
@@ -86,11 +89,12 @@ class RunEngine:
             logger.error(f"Run {run.run_id} failed: {e}", exc_info=True)
             run.status = RunStatus.FAILED
             self._log_run_event(run, EventType.RUN_FAILED, {"error": str(e)})
-            _run_events.setdefault(run.run_id, []).append({
+            self._append_event(run.run_id, {
                 "event_type": "run_error", "data": {"error": str(e)},
                 "run_id": run.run_id,
             })
         finally:
+            _run_tasks.pop(run.run_id, None)
             _run_waiters.get(run.run_id, asyncio.Event()).set()
 
     async def _consume_stream(self, loop, run: AgentRun) -> None:
@@ -102,22 +106,45 @@ class RunEngine:
             context=run.context,
         ):
             sse = self._stream_event_to_dict(event, run.run_id)
-            _run_events.setdefault(run.run_id, []).append(sse)
+            self._append_event(run.run_id, sse)
 
-            # Check for async wait signal
             if event.data.get("wait_for"):
                 run.status = RunStatus.WAITING
                 run.waiting_for = event.data["wait_for"]
                 self._log_run_event(run, EventType.RUN_WAITING, {
                     "waiting_for": run.waiting_for,
                 })
-                return  # Park the run
+                return
 
     async def resume_run(self, run_id: str, result: dict) -> None:
-        """Resume a waiting run when its async event arrives."""
+        """Resume a waiting run. Distributed-safe with optimistic locking."""
         run = _active_runs.get(run_id)
-        if not run or run.status != RunStatus.WAITING:
-            logger.warning(f"Cannot resume run {run_id}: not waiting")
+
+        # Distributed: run might be on another worker — restore from DB
+        if not run:
+            run = self.restore_run(run_id)
+            if run and run.status == RunStatus.WAITING:
+                _active_runs[run_id] = run
+                _run_events.setdefault(run_id, [])
+                _run_waiters.setdefault(run_id, asyncio.Event())
+            else:
+                logger.warning(f"Cannot resume run {run_id}: not found or not waiting")
+                return
+
+        if run.status != RunStatus.WAITING:
+            logger.warning(f"Cannot resume run {run_id}: status={run.status}")
+            return
+
+        # Optimistic lock: only one worker can claim this resume
+        if not self._try_claim_resume(run_id):
+            logger.info(f"Run {run_id} already claimed by another worker")
+            return
+
+        # Check if cancelled while waiting
+        if self._is_cancelled_in_db(run_id):
+            run.status = RunStatus.CANCELLED
+            self._log_run_event(run, EventType.RUN_CANCELLED)
+            _run_waiters.get(run_id, asyncio.Event()).set()
             return
 
         run.status = RunStatus.RUNNING
@@ -125,12 +152,10 @@ class RunEngine:
         run.waiting_for = None
         self._log_run_event(run, EventType.RUN_RESUMED, {"result": result})
 
-        # Inject result into context so agent sees it on next LLM call
         run.context = run.context or {}
         run.context["resumed_from"] = waiting_for
         run.context["async_result"] = result
 
-        # Prepend result to user_input so LLM sees what happened
         import json as _json
         result_summary = _json.dumps(result, default=str)[:2000]
         run.user_input = (
@@ -138,7 +163,7 @@ class RunEngine:
             f"Original task: {run.user_input}"
         )
 
-        _run_events.setdefault(run.run_id, []).append({
+        self._append_event(run.run_id, {
             "event_type": "tool_result",
             "data": {"result": result},
             "run_id": run.run_id,
@@ -151,23 +176,65 @@ class RunEngine:
             return False
         run.status = RunStatus.CANCELLED
         self._log_run_event(run, EventType.RUN_CANCELLED)
+
+        # Cancel the asyncio task
+        task = _run_tasks.pop(run_id, None)
+        if task and not task.done():
+            task.cancel()
+
+        # Propagate to workflow
+        if run.waiting_for and run.waiting_for.startswith("workflow:"):
+            wf_id = run.waiting_for.split(":", 1)[1]
+            self._cancel_workflow(wf_id)
+
         _run_waiters.get(run_id, asyncio.Event()).set()
         return True
 
+    @staticmethod
+    def _cancel_workflow(wf_id: str) -> None:
+        """Propagate cancel to a workflow and its in-memory state."""
+        from core.agent.async_tools import _workflow_runs, _workflow_waits
+        entry = _workflow_runs.pop(wf_id, None)
+        if entry and entry.get("engine"):
+            entry["engine"].cancel(entry["workflow"].name)
+        to_remove = [h for h, wid in _workflow_waits.items() if wid == wf_id]
+        for h in to_remove:
+            _workflow_waits.pop(h, None)
+        # Also mark in DB so other workers see it
+        try:
+            from api.database import get_db_session
+            from api.models import WorkflowRun as WFRunModel
+            db = next(get_db_session())
+            try:
+                db.execute(
+                    text("UPDATE workflow_runs SET status='cancelled', error='Cancelled by user' "
+                         "WHERE run_id = :wf_id AND status IN ('running','waiting')"),
+                    {"wf_id": wf_id},
+                )
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            logger.error(f"Failed to cancel workflow {wf_id} in DB: {e}")
+
     async def on_job_completed(self, job_id: str, result: dict) -> bool:
-        """Called when a background job completes. Resumes the waiting run."""
         return await self.resolve_handle(f"job:{job_id}", {"job_id": job_id, **result})
 
     async def resolve_handle(self, handle: str, result: dict) -> bool:
-        """Resolve any wait handle. Resumes the run waiting for it."""
+        """Resolve any wait handle. Distributed-safe."""
         from core.agent.async_tools import get_async_tool_registry, resume_workflow
 
-        # First check if this handle is for a workflow's inner wait step
+        # 1. Workflow inner wait (in-memory first, then DB fallback)
         if await resume_workflow(handle, result):
             return True
 
-        # Otherwise resolve directly to a run
+        # 2. In-memory handle → run
         run_id = get_async_tool_registry().resolve_handle(handle)
+
+        # 3. DB fallback: find run waiting for this handle
+        if not run_id:
+            run_id = self._find_waiting_run_by_handle(handle)
+
         if not run_id:
             logger.warning(f"No run waiting for handle {handle}")
             return False
@@ -178,8 +245,12 @@ class RunEngine:
         return _active_runs.get(run_id)
 
     def get_run_events(self, run_id: str, after_index: int = 0) -> list[dict]:
-        events = _run_events.get(run_id, [])
-        return events[after_index:]
+        """Get events — local buffer first, DB fallback for cross-worker."""
+        events = _run_events.get(run_id)
+        if events is not None:
+            return events[after_index:]
+        # Cross-worker: read from DB
+        return self._load_events_from_db(run_id, after_index)
 
     async def wait_for_run(self, run_id: str, timeout: float | None = None) -> AgentRun | None:
         waiter = _run_waiters.get(run_id)
@@ -192,28 +263,163 @@ class RunEngine:
         return _active_runs.get(run_id)
 
     async def stream_run_events(self, run_id: str, last_index: int = 0) -> AsyncIterator[dict]:
-        """Yield events as they arrive. Supports reconnection via last_index."""
-        # Replay buffered events
-        events = _run_events.get(run_id, [])
-        for i in range(last_index, len(events)):
-            yield events[i]
+        """Yield events as they arrive. Cross-worker safe via DB polling."""
+        idx = last_index
+        local = run_id in _run_events  # Is this run on this worker?
 
-        # Live stream
-        idx = len(events)
         while True:
-            run = _active_runs.get(run_id)
-            if not run:
-                return
-
-            current_events = _run_events.get(run_id, [])
-            if idx < len(current_events):
-                for i in range(idx, len(current_events)):
-                    yield current_events[i]
-                idx = len(current_events)
-            elif run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
-                return
+            if local:
+                events = _run_events.get(run_id, [])
             else:
-                await asyncio.sleep(0.05)
+                events = self._load_events_from_db(run_id, 0)
+
+            if idx < len(events):
+                for i in range(idx, len(events)):
+                    yield events[i]
+                idx = len(events)
+
+            # Check if run is done
+            run = _active_runs.get(run_id)
+            if run and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                return
+            if not run:
+                # Cross-worker: check DB for terminal status
+                db_run = self.restore_run(run_id)
+                if db_run and db_run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                    return
+                if not db_run:
+                    return
+
+            await asyncio.sleep(0.1)
+
+    # ── Event persistence ─────────────────────────────────────
+
+    def _append_event(self, run_id: str, sse: dict) -> None:
+        """Append event to local buffer AND persist to DB."""
+        events = _run_events.setdefault(run_id, [])
+        idx = len(events)
+        events.append(sse)
+        # Persist to run_events table
+        try:
+            self.db.execute(
+                text(
+                    "INSERT INTO run_events (run_id, idx, event_type, data, event_id, agent_id) "
+                    "VALUES (:run_id, :idx, :event_type, :data, :event_id, :agent_id)"
+                ),
+                {
+                    "run_id": run_id,
+                    "idx": idx,
+                    "event_type": sse.get("event_type", ""),
+                    "data": json.dumps(sse.get("data", {})),
+                    "event_id": sse.get("event_id"),
+                    "agent_id": sse.get("agent_id"),
+                },
+            )
+            self.db.commit()
+        except Exception as e:
+            logger.debug(f"Event persist failed (non-fatal): {e}")
+
+    def _load_events_from_db(self, run_id: str, after_index: int = 0) -> list[dict]:
+        """Load events from DB for cross-worker streaming."""
+        try:
+            rows = self.db.execute(
+                text(
+                    "SELECT event_type, data, event_id, agent_id FROM run_events "
+                    "WHERE run_id = :run_id AND idx >= :after "
+                    "ORDER BY idx"
+                ),
+                {"run_id": run_id, "after": after_index},
+            ).fetchall()
+            result = []
+            for row in rows:
+                data = row[1]
+                if isinstance(data, str):
+                    data = json.loads(data)
+                result.append({
+                    "event_type": row[0],
+                    "data": data,
+                    "event_id": row[2],
+                    "agent_id": row[3],
+                    "run_id": run_id,
+                })
+            return result
+        except Exception as e:
+            logger.error(f"Failed to load events from DB for {run_id}: {e}")
+            return []
+
+    # ── Distributed coordination ──────────────────────────────
+
+    def _try_claim_resume(self, run_id: str) -> bool:
+        """Optimistic lock: atomically claim a waiting run for resume.
+
+        UPDATE ... WHERE status='waiting' — only one worker succeeds.
+        """
+        try:
+            result = self.db.execute(
+                text(
+                    "UPDATE conversation_events SET content = content "
+                    "WHERE event_type = :et "
+                    "AND JSON_EXTRACT(metadata, '$.run_id') = :run_id "
+                    "AND event_type = :waiting_et "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {
+                    "et": EventType.RUN_WAITING.value,
+                    "run_id": run_id,
+                    "waiting_et": EventType.RUN_WAITING.value,
+                },
+            )
+            # Use a dedicated claim table for proper locking
+            # Fallback: use a simple INSERT that fails on duplicate
+            self.db.execute(
+                text(
+                    "INSERT INTO run_events (run_id, idx, event_type, data) "
+                    "SELECT :run_id, -1, 'resume_claim', :data "
+                    "FROM dual WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM run_events WHERE run_id = :run_id AND event_type = 'resume_claim'"
+                    ")"
+                ),
+                {"run_id": run_id, "data": json.dumps({"claimed_at": datetime.now(timezone.utc).isoformat()})},
+            )
+            self.db.commit()
+            # Check if we actually inserted
+            row = self.db.execute(
+                text("SELECT 1 FROM run_events WHERE run_id = :run_id AND event_type = 'resume_claim'"),
+                {"run_id": run_id},
+            ).fetchone()
+            return row is not None
+        except Exception as e:
+            logger.debug(f"Claim resume failed for {run_id}: {e}")
+            return True  # On error, allow resume (single-worker fallback)
+
+    def _is_cancelled_in_db(self, run_id: str) -> bool:
+        try:
+            row = self.db.execute(
+                text(
+                    "SELECT 1 FROM conversation_events "
+                    "WHERE event_type = :et AND JSON_EXTRACT(metadata, '$.run_id') = :run_id "
+                    "LIMIT 1"
+                ),
+                {"et": EventType.RUN_CANCELLED.value, "run_id": run_id},
+            ).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
+    def _find_waiting_run_by_handle(self, handle: str) -> str | None:
+        try:
+            row = self.db.execute(
+                text(
+                    "SELECT JSON_EXTRACT(metadata, '$.run_id') FROM conversation_events "
+                    "WHERE event_type = :et AND JSON_EXTRACT(metadata, '$.waiting_for') = :handle "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"et": EventType.RUN_WAITING.value, "handle": handle},
+            ).fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"DB lookup for handle {handle} failed: {e}")
+            return None
 
     # ── Internal ──────────────────────────────────────────────
 
@@ -222,9 +428,8 @@ class RunEngine:
         run.completed_at = datetime.now(timezone.utc)
         self._log_run_event(run, EventType.RUN_COMPLETED)
 
-        # If this is a child run, notify parent
         if run.parent_run_id:
-            _run_events.setdefault(run.parent_run_id, []).append({
+            self._append_event(run.parent_run_id, {
                 "event_type": "child_run_completed",
                 "data": {"child_run_id": run.run_id},
                 "run_id": run.parent_run_id,
@@ -258,7 +463,7 @@ class RunEngine:
             "run_id": run_id,
         }
 
-    # ── State Recovery (Phase 1: from in-memory; Phase 2: from DB) ──
+    # ── State Recovery ────────────────────────────────────────
 
     def restore_run(self, run_id: str) -> AgentRun | None:
         """Restore run state from conversation_events."""

@@ -136,11 +136,12 @@ ProgressCallback = Any  # Callable[[str, StepResult], None] | None
 class WorkflowEngine:
     """Execute a Workflow definition. Stateless — all state in WorkflowRun."""
 
-    def __init__(self, on_progress: ProgressCallback = None) -> None:
+    def __init__(self, on_progress: ProgressCallback = None, wf_run_id: str | None = None) -> None:
         self._registered: dict[str, Workflow] = {}
         self._on_progress = on_progress
         self._cancelled: set[str] = set()  # workflow names being cancelled
         self._active_jobs: dict[str, list[str]] = {}  # wf_name → [job_ids]
+        self._wf_run_id = wf_run_id  # DB run_id for distributed cancel check
 
     def register(self, workflow: Workflow) -> None:
         self._registered[workflow.name] = workflow
@@ -150,6 +151,25 @@ class WorkflowEngine:
 
     def cancel(self, workflow_name: str) -> None:
         self._cancelled.add(workflow_name)
+
+    def _is_cancelled_in_db(self) -> bool:
+        """Check if this workflow was cancelled in DB (by another worker)."""
+        if not self._wf_run_id:
+            return False
+        try:
+            from api.database import get_db_session
+            from api.models import WorkflowRun as WFRunModel
+            db = next(get_db_session())
+            try:
+                row = db.query(WFRunModel).filter(
+                    WFRunModel.run_id == self._wf_run_id,
+                    WFRunModel.status == "cancelled",
+                ).first()
+                return row is not None
+            finally:
+                db.close()
+        except Exception:
+            return False
 
     async def execute(
         self, workflow: Workflow, initial_inputs: dict | None = None,
@@ -192,7 +212,7 @@ class WorkflowEngine:
         step_index = {s.id: i for i, s in enumerate(workflow.steps)}
 
         while run.current_step_idx < len(workflow.steps):
-            if workflow.name in self._cancelled:
+            if workflow.name in self._cancelled or self._is_cancelled_in_db():
                 run.status = "cancelled"
                 self._cancelled.discard(workflow.name)
                 return

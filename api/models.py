@@ -533,3 +533,16 @@ class WorkflowRun(Base):
     started_at = Column(DateTime, default=func.now())
     completed_at = Column(DateTime)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class RunEvent(Base):
+    """Persisted SSE events for cross-worker streaming."""
+    __tablename__ = "run_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(255), nullable=False, index=True)
+    idx = Column(Integer, nullable=False)  # sequential index within run
+    event_type = Column(String(64), nullable=False)
+    data = Column(JSON, nullable=False)
+    event_id = Column(String(255))
+    agent_id = Column(String(255))
+    created_at = Column(DateTime, default=func.now())

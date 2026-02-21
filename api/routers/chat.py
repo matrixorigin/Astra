@@ -139,7 +139,9 @@ async def chat(
     )
 
     import asyncio
-    asyncio.create_task(engine.start_run(run))
+    task = asyncio.create_task(engine.start_run(run))
+    from core.agent.run_engine import _run_tasks
+    _run_tasks[run.run_id] = task
 
     return ChatResponse(session_id=session_id, run_id=run.run_id, status=run.status.value)
 
@@ -163,7 +165,9 @@ async def chat_stream(
     )
 
     import asyncio
-    asyncio.create_task(engine.start_run(run))
+    task = asyncio.create_task(engine.start_run(run))
+    from core.agent.run_engine import _run_tasks
+    _run_tasks[run.run_id] = task
 
     async def event_generator():
         yield f"data: {json.dumps({'event_type': 'session_info', 'data': {'session_id': session_id, 'run_id': run.run_id}})}\n\n"

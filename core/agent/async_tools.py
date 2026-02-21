@@ -142,7 +142,7 @@ async def _execute_submit_workflow(params: dict[str, Any], run_id: str | None = 
     _persist_workflow_start(wf_id, workflow, initial_inputs, run_id)
 
     # In-memory state for resume
-    _workflow_runs[wf_id] = {"workflow": workflow, "engine": WorkflowEngine(), "wf_run": None}
+    _workflow_runs[wf_id] = {"workflow": workflow, "engine": WorkflowEngine(wf_run_id=wf_id), "wf_run": None}
 
     async def _run_then_resolve() -> None:
         entry = _workflow_runs[wf_id]
@@ -178,14 +178,24 @@ _workflow_waits: dict[str, str] = {}  # inner_handle → wf_id
 
 
 async def resume_workflow(inner_handle: str, event_result: dict) -> bool:
-    """Resume a workflow that's waiting on an inner wait step."""
+    """Resume a workflow that's waiting on an inner wait step. Distributed-safe."""
     wf_id = _workflow_waits.pop(inner_handle, None)
+
+    # DB fallback: handle might be on another worker
+    if not wf_id:
+        wf_id = _find_workflow_by_wait_handle(inner_handle)
+
     if not wf_id:
         return False
 
     entry = _workflow_runs.get(wf_id)
-    if not entry or not entry["wf_run"]:
-        return False
+
+    # DB fallback: workflow might be on another worker — restore it
+    if not entry or not entry.get("wf_run"):
+        entry = _restore_workflow_entry(wf_id)
+        if not entry:
+            return False
+        _workflow_runs[wf_id] = entry
 
     engine = entry["engine"]
     workflow = entry["workflow"]
@@ -207,6 +217,62 @@ async def resume_workflow(inner_handle: str, event_result: dict) -> bool:
 
     _resolve_workflow(wf_id, result)
     return True
+
+
+def _find_workflow_by_wait_handle(handle: str) -> str | None:
+    """Find workflow waiting for this handle from DB."""
+    try:
+        from api.database import get_db_session
+        from api.models import WorkflowRun as WFRunModel
+        db = next(get_db_session())
+        try:
+            row = db.query(WFRunModel).filter(
+                WFRunModel.status == "waiting",
+                WFRunModel.waiting_for == handle,
+            ).first()
+            return row.run_id if row else None
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+
+def _restore_workflow_entry(wf_id: str) -> dict | None:
+    """Restore a workflow's in-memory entry from DB."""
+    try:
+        from api.database import get_db_session
+        from api.models import WorkflowRun as WFRunModel, WorkflowDefinition
+        from core.workflow.engine import Workflow, WorkflowEngine
+        from core.workflow.engine import WorkflowRun as WFRunState, StepResult
+
+        db = next(get_db_session())
+        try:
+            row = db.query(WFRunModel).filter(WFRunModel.run_id == wf_id).first()
+            if not row:
+                return None
+            wf_def = db.query(WorkflowDefinition).filter(
+                WorkflowDefinition.workflow_id == row.workflow_id,
+            ).first()
+            if not wf_def:
+                return None
+
+            workflow = Workflow(**wf_def.definition)
+            wf_run = WFRunState(
+                workflow_name=workflow.name,
+                current_step_idx=row.current_step_idx,
+                status=row.status,
+                waiting_for=row.waiting_for,
+                waiting_step_id=row.waiting_step_id,
+            )
+            for sid, sr_data in (row.step_results or {}).items():
+                wf_run.step_results[sid] = StepResult(**sr_data)
+
+            return {"workflow": workflow, "engine": WorkflowEngine(), "wf_run": wf_run}
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error(f"Failed to restore workflow {wf_id}: {e}")
+        return None
 
 
 def _workflow_result(wf_id: str, wf_run) -> dict:

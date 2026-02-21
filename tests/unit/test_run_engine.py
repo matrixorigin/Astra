@@ -6,19 +6,25 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from datetime import datetime, timezone
 
 from core.agent.run import AgentRun, RunStatus, RunTrigger
-from core.agent.run_engine import RunEngine, _active_runs, _run_events, _run_waiters
+from core.agent.run_engine import RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks
 from core.events.models import EventType
 
 
 @pytest.fixture
 def mock_db():
-    return MagicMock()
+    db = MagicMock()
+    # Default: DB queries return no results (no cancel events, no waiting runs)
+    db.execute.return_value.fetchone.return_value = None
+    db.execute.return_value.fetchall.return_value = []
+    return db
 
 
 @pytest.fixture
 def engine(mock_db):
     with patch.object(RunEngine, '__init__', lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
         e = RunEngine(mock_db)
+        # Default: claim always succeeds (single-worker behavior)
+        e._try_claim_resume = MagicMock(return_value=True)
         return e
 
 
@@ -28,10 +34,12 @@ def clean_state():
     _active_runs.clear()
     _run_events.clear()
     _run_waiters.clear()
+    _run_tasks.clear()
     yield
     _active_runs.clear()
     _run_events.clear()
     _run_waiters.clear()
+    _run_tasks.clear()
 
 
 class TestRunEngineCreate:
@@ -191,6 +199,68 @@ class TestRunEngineCancel:
 
     def test_cancel_unknown_run(self, engine):
         assert engine.cancel_run("nonexistent") is False
+
+    def test_cancel_kills_task(self, engine):
+        run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
+        run.status = RunStatus.RUNNING
+        _active_runs[run.run_id] = run
+
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        _run_tasks[run.run_id] = mock_task
+
+        engine.cancel_run(run.run_id)
+        mock_task.cancel.assert_called_once()
+        assert run.run_id not in _run_tasks
+
+    def test_cancel_propagates_to_workflow(self, engine):
+        from core.agent.async_tools import _workflow_runs, _workflow_waits
+
+        run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
+        run.status = RunStatus.WAITING
+        run.waiting_for = "workflow:wf_123"
+        _active_runs[run.run_id] = run
+
+        mock_engine = MagicMock()
+        mock_wf = MagicMock()
+        mock_wf.name = "test_wf"
+        _workflow_runs["wf_123"] = {"workflow": mock_wf, "engine": mock_engine, "wf_run": None}
+        _workflow_waits["inner:handle"] = "wf_123"
+
+        engine.cancel_run(run.run_id)
+
+        assert run.status == RunStatus.CANCELLED
+        mock_engine.cancel.assert_called_once_with("test_wf")
+        assert "wf_123" not in _workflow_runs
+        assert "inner:handle" not in _workflow_waits
+
+    @pytest.mark.asyncio
+    async def test_resume_cancelled_run_from_db(self, engine):
+        """If run was cancelled while waiting (from another worker), resume should detect it."""
+        run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
+        run.status = RunStatus.WAITING
+        run.waiting_for = "job:1"
+        _active_runs[run.run_id] = run
+
+        # Simulate cancel event in DB
+        engine.db.execute.return_value.fetchone.return_value = (1,)
+
+        await engine.resume_run(run.run_id, {"data": "result"})
+        assert run.status == RunStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_resume_claim_rejected(self, engine):
+        """If another worker already claimed the resume, this one should skip."""
+        run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
+        run.status = RunStatus.WAITING
+        run.waiting_for = "job:1"
+        _active_runs[run.run_id] = run
+
+        engine._try_claim_resume = MagicMock(return_value=False)
+
+        await engine.resume_run(run.run_id, {"data": "result"})
+        # Run should still be WAITING — not resumed
+        assert run.status == RunStatus.WAITING
 
 
 class TestRunEngineResolveHandle:
