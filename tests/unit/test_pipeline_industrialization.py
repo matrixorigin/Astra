@@ -256,3 +256,30 @@ class TestFeedbackBufferThreadSafety:
         count = buf.flush()
         assert count == 0
         assert len(buf._buffer) == 1  # re-queued
+
+    def test_engine_extracted_once_no_session_access_on_flush(self):
+        """Engine is extracted in __init__; flush never touches the Session."""
+        from core.skills.pipeline import _FeedbackBuffer
+        from core.skills.learning_signals import SignalType
+
+        mock_conn = MagicMock()
+        mock_conn.__enter__ = Mock(return_value=mock_conn)
+        mock_conn.__exit__ = Mock(return_value=False)
+
+        mock_engine = Mock()
+        mock_engine.connect.return_value = mock_conn
+
+        mock_db = Mock()
+        mock_db.get_bind.return_value = mock_engine
+
+        buf = _FeedbackBuffer(mock_db, batch_size=100)
+        # get_bind called once during __init__
+        assert mock_db.get_bind.call_count == 1
+
+        buf.add("evt1", SignalType.WRONG_SKILL, {"skill": "bad"})
+        buf.flush()
+
+        # get_bind NOT called again during flush — engine was cached
+        assert mock_db.get_bind.call_count == 1
+        # flush used the cached engine
+        mock_engine.connect.assert_called()

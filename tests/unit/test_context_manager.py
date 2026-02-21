@@ -229,3 +229,83 @@ class TestGetCodeContext:
 
         assert len(result) == 1
         assert result[0]["file"] == "main.py"
+
+
+class TestToPromptSkillFieldName:
+    """to_prompt must use the same key that _get_skill_definitions writes."""
+
+    def test_to_prompt_uses_skill_name_key(self):
+        """skill_definitions dicts use 'skill_name', not 'name'."""
+        ctx = Context(
+            system_prompt="sys",
+            skill_definitions=[{"skill_name": "review", "description": "Code review"}],
+            selected_events=[],
+            code_context=[],
+            documentation=[],
+            total_tokens=100,
+            token_budget={},
+            assembly_time_ms=1,
+            relevance_scores={},
+            task_type=TaskType.GENERAL,
+        )
+        prompt = ctx.to_prompt()
+        assert "review: Code review" in prompt
+
+
+class TestSkillDefinitionsTokenBudget:
+    """_get_skill_definitions must respect token_budget."""
+
+    def test_truncates_when_budget_exceeded(self, context_manager, mock_db):
+        """Skills exceeding budget should be dropped."""
+        skills = []
+        for i in range(20):
+            s = MagicMock()
+            s.skill_name = f"skill_{i}"
+            s.description = "x" * 200  # ~50+ tokens per skill
+            s.version = "1.0.0"
+            s.skill_definition = None
+            s.triggers = None
+            skills.append(s)
+
+        mock_db.query.return_value.filter.return_value.all.return_value = skills
+
+        result = context_manager._get_skill_definitions(token_budget=100)
+
+        assert len(result) < 20
+        assert len(result) >= 1
+
+
+class TestRetrieveSemanticKnowledgeHybrid:
+    """retrieve_semantic_knowledge should use hybrid retrieval."""
+
+    def test_delegates_to_hybrid_retriever(self, context_manager):
+        """Primary path uses HybridRetriever.retrieve_knowledge."""
+        context_manager.embeddings.embed_text.return_value = [0.1, 0.2]
+
+        mock_results = [{"entry_id": "e1", "relevance_score": 0.9}]
+        with patch("core.context.hybrid_retrieval.HybridRetriever") as MockRetriever:
+            MockRetriever.return_value.retrieve_knowledge.return_value = mock_results
+            results = context_manager.retrieve_semantic_knowledge("user1", "python")
+
+        assert results == mock_results
+        MockRetriever.return_value.retrieve_knowledge.assert_called_once()
+
+    def test_falls_back_to_keyword_on_hybrid_failure(self, context_manager, mock_db):
+        """Falls back to keyword search when hybrid fails."""
+        context_manager.embeddings.embed_text.side_effect = RuntimeError("no embeddings")
+
+        entry = MagicMock()
+        entry.entry_id = "e1"
+        entry.category = "lang"
+        entry.key_name = "python"
+        entry.value = "Python is great"
+        entry.confidence = 0.8
+        entry.trust_tier = "verified"
+        entry.created_at = None
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [entry]
+
+        with patch("core.context.manager._update_access_tracking"):
+            results = context_manager.retrieve_semantic_knowledge("user1", "python")
+
+        assert len(results) == 1
+        assert results[0]["entry_id"] == "e1"

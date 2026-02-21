@@ -82,7 +82,7 @@ class Context:
         if self.skill_definitions:
             parts.append("\n## Available Skills\n")
             for skill in self.skill_definitions:
-                parts.append(f"- {skill['name']}: {skill['description']}")
+                parts.append(f"- {skill['skill_name']}: {skill['description']}")
 
         if self.selected_events:
             parts.append("\n## Conversation History\n")
@@ -324,45 +324,68 @@ class ContextManager:
     def retrieve_semantic_knowledge(
         self, user_id: str, query: str, limit: int = 5, min_confidence: float = 0.3
     ) -> list[dict[str, Any]]:
-        """Retrieve relevant knowledge entries using keyword search.
-        
-        Note: This MVP implementation uses keyword matching.
-        Vector similarity search will be implemented in future release.
-        
+        """Retrieve relevant knowledge entries using hybrid (vector + keyword) search.
+
+        Delegates to HybridRetriever.retrieve_knowledge for semantic scoring.
+        Falls back to keyword matching if embedding or hybrid retrieval fails.
+
         Args:
             user_id: User whose knowledge to search
             query: Search query
             limit: Max results
             min_confidence: Minimum confidence threshold
-            
+
         Returns:
             List of knowledge entries with relevance scores
         """
+        # Primary path: hybrid retrieval (vector + keyword + confidence)
+        try:
+            from core.context.hybrid_retrieval import HybridRetriever
+            query_embedding = self.embeddings.embed_text(query)
+            retriever = HybridRetriever(self.db)
+            results = retriever.retrieve_knowledge(
+                query_text=query,
+                query_embedding=query_embedding,
+                user_id=user_id,
+                limit=limit,
+                confidence_threshold=min_confidence,
+            )
+            if results:
+                logger.debug("Hybrid knowledge retrieval: %d entries for: %s", len(results), query[:50])
+                return results
+        except Exception as e:
+            logger.warning("Hybrid knowledge retrieval failed, falling back to keyword: %s", e)
+
+        # Fallback: keyword matching
+        return self._keyword_knowledge_fallback(user_id, query, limit, min_confidence)
+
+    def _keyword_knowledge_fallback(
+        self, user_id: str, query: str, limit: int, min_confidence: float
+    ) -> list[dict[str, Any]]:
+        """Keyword-based knowledge retrieval fallback."""
         from api.models import KnowledgeEntry
-        
-        # Keyword-based retrieval (MVP)
-        entries = self.db.query(KnowledgeEntry).filter(
-            KnowledgeEntry.user_id == user_id,
-            KnowledgeEntry.confidence >= min_confidence
-        ).order_by(KnowledgeEntry.confidence.desc()).limit(limit * 2).all()  # Get more for filtering
-        
+
+        try:
+            entries = self.db.query(KnowledgeEntry).filter(
+                KnowledgeEntry.user_id == user_id,
+                KnowledgeEntry.confidence >= min_confidence,
+            ).order_by(KnowledgeEntry.confidence.desc()).limit(limit * 2).all()
+        except Exception as e:
+            logger.warning("Keyword knowledge fallback failed: %s", e)
+            return []
+
         results = []
         query_lower = query.lower()
-        
+
         for entry in entries:
-            # Keyword matching with scoring
-            relevance = 0.3  # Base relevance
-            
-            # Exact match in value
+            relevance = 0.3
             if query_lower in entry.value.lower():
                 relevance = 0.9
-            # Match in key name
             elif query_lower in entry.key_name.lower():
                 relevance = 0.7
-            # Partial word match
             elif any(word in entry.value.lower() for word in query_lower.split() if len(word) > 3):
                 relevance = 0.5
-            
+
             results.append({
                 "entry_id": entry.entry_id,
                 "category": entry.category,
@@ -373,17 +396,14 @@ class ContextManager:
                 "relevance": relevance,
                 "created_at": entry.created_at,
             })
-        
-        # Sort by combined score: relevance * confidence
+
         results.sort(key=lambda x: x["relevance"] * x["confidence"], reverse=True)
-        
         top = results[:limit]
 
-        # Update access tracking for returned entries
         if top:
             _update_access_tracking(self.db, [r["entry_id"] for r in top])
 
-        logger.debug(f"Retrieved {len(top)} knowledge entries for query: {query[:50]}")
+        logger.debug("Keyword knowledge fallback: %d entries for: %s", len(top), query[:50])
         return top
 
     def _score_candidates(
@@ -514,8 +534,9 @@ class ContextManager:
             return []
 
         result = []
+        tokens_used = 0
         for s in skills:
-            defn = {
+            defn: dict[str, Any] = {
                 "skill_name": s.skill_name,
                 "description": s.description or "",
                 "version": s.version,
@@ -524,7 +545,11 @@ class ContextManager:
                 defn["definition"] = s.skill_definition
             if s.triggers:
                 defn["triggers"] = s.triggers
+            entry_tokens = len(str(defn)) // 4
+            if tokens_used + entry_tokens > token_budget:
+                break
             result.append(defn)
+            tokens_used += entry_tokens
 
         return result
 

@@ -217,14 +217,14 @@ class RegressionGate:
             elif change_type == ChangeType.SKILL:
                 # Insert or update skill in sandbox
                 self.db.execute(text(f"""
-                    INSERT INTO {sandbox_name}.skills 
-                    (skill_id, name, version, definition, created_at)
-                    VALUES (:skill_id, :name, :version, :definition, NOW())
+                    INSERT INTO {sandbox_name}.skills_registry 
+                    (skill_id, skill_name, version, skill_definition, created_at)
+                    VALUES (:skill_id, :skill_name, :version, :definition, NOW())
                     ON DUPLICATE KEY UPDATE
-                    definition = :definition, version = :version
+                    skill_definition = :definition, version = :version
                 """), {
                     "skill_id": change_id,
-                    "name": change_content.get("name", change_id),
+                    "skill_name": change_content.get("name", change_id),
                     "version": change_content.get("version", "1.0.0"),
                     "definition": str(change_content.get("definition", {})),
                 })

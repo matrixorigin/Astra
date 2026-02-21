@@ -719,3 +719,24 @@ class TestPollutionGatedQuarantine:
 
         assert result["verdict"] == "skipped"
         detector.quarantine_entry.assert_called_once()
+
+
+class TestSkillTableName:
+    """SKILL gate must write to skills_registry, not skills."""
+
+    def test_apply_skill_change_uses_skills_registry_table(self):
+        """SKILL change should target skills_registry table with correct columns."""
+        gate = RegressionGate.__new__(RegressionGate)
+        gate.db = Mock()
+        gate.db.execute = Mock()
+        gate.db.commit = Mock()
+        gate._apply_change_to_sandbox(
+            sandbox_name="test_sb",
+            change_type=ChangeType.SKILL,
+            change_id="code_review@v2",
+            change_content={"name": "code_review", "version": "2.0.0", "definition": {}},
+        )
+        sql_text = gate.db.execute.call_args[0][0].text
+        assert "test_sb.skills_registry" in sql_text
+        assert "skill_name" in sql_text
+        assert "skill_definition" in sql_text

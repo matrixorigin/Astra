@@ -72,8 +72,7 @@ class _FeedbackBuffer:
     """
 
     def __init__(self, db: Session, *, batch_size: int = 50, flush_interval: float = 2.0):
-        self._session_factory = db.get_bind().engine.connect  # for independent sessions
-        self._db = db  # fallback reference for engine access
+        self._engine = db.get_bind()  # Engine is thread-safe; extract once
         self._batch_size = batch_size
         self._flush_interval = flush_interval
         self._buffer: list[dict[str, Any]] = []
@@ -111,7 +110,7 @@ class _FeedbackBuffer:
         self._last_flush = time.time()
 
         try:
-            with self._db.get_bind().connect() as conn:
+            with self._engine.connect() as conn:
                 for row in batch:
                     conn.execute(
                         text("""INSERT INTO skill_learning_signals
