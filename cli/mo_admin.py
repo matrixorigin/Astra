@@ -382,6 +382,74 @@ def audit_logs(ctx, user_id, action, resource_type, since, limit):
         click.echo()
 
 
+@cli.group()
+def prompt():
+    """Manage prompt templates."""
+    pass
+
+
+@prompt.command("optimize")
+@click.option("--template", default="system_general", help="Template ID to optimize")
+@click.option("--min-cases", default=3, help="Minimum low-score cases needed")
+@click.option("--dry-run", is_flag=True, help="Generate improvement without activating")
+def prompt_optimize(template, min_cases, dry_run):
+    """Auto-optimize a prompt template based on feedback."""
+    from api.database import get_db_session
+    from core.context.prompt_optimizer import PromptOptimizer
+    from core.llm.client import LLMClient
+
+    db = next(get_db_session())
+    llm = LLMClient(db)
+    optimizer = PromptOptimizer(db, llm)
+
+    click.echo(f"🔄 Optimizing prompt: {template} (dry_run={dry_run})")
+    result = optimizer.optimize(template, min_cases=min_cases, dry_run=dry_run)
+
+    if result.error:
+        click.echo(f"⚠️  {result.error}")
+        return
+
+    click.echo(f"📊 Cases analyzed: {result.cases_analyzed}")
+    click.echo(f"🔍 Diagnosis: {result.diagnosis}")
+    click.echo(f"🔒 Gate verdict: {result.gate_verdict}")
+
+    if result.new_content:
+        click.echo(f"\n📝 New prompt ({result.new_version}):")
+        click.echo("-" * 40)
+        click.echo(result.new_content[:500])
+        if len(result.new_content) > 500:
+            click.echo("...")
+        click.echo("-" * 40)
+
+    if result.activated:
+        click.echo(f"✅ Activated: {template} v{result.new_version}")
+    elif dry_run and result.new_content:
+        click.echo("ℹ️  Dry run — not activated. Remove --dry-run to apply.")
+
+
+@prompt.command("list")
+def prompt_list():
+    """List all prompt templates."""
+    from api.database import get_db_session
+    from sqlalchemy import text as sql_text
+
+    db = next(get_db_session())
+    rows = db.execute(sql_text(
+        "SELECT template_id, version, is_active, LEFT(content, 60) as preview, created_at "
+        "FROM prompt_templates ORDER BY template_id, created_at DESC"
+    )).fetchall()
+
+    if not rows:
+        click.echo("No prompt templates found")
+        return
+
+    click.echo(f"{'Template':<25} {'Version':<8} {'Active':<7} {'Preview'}")
+    click.echo("=" * 80)
+    for r in rows:
+        active = "✓" if r[2] else " "
+        click.echo(f"{r[0]:<25} {r[1]:<8} {active:<7} {r[3]}")
+
+
 @cli.command()
 @click.option("--reset", is_flag=True, help="Drop and recreate database")
 def init(reset):

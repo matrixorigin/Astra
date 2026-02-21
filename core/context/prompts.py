@@ -88,8 +88,13 @@ class PromptManager:
 
             self.db.execute(
                 text("""
-                INSERT INTO prompt_templates (template_id, version, content, is_active, created_at)
-                VALUES (:template_id, :version, :content, :is_active, NOW())
+                INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+                VALUES (:template_id, :version, :content, :is_active, NOW(), NOW())
+                ON DUPLICATE KEY UPDATE
+                    version = VALUES(version),
+                    content = VALUES(content),
+                    is_active = VALUES(is_active),
+                    updated_at = NOW()
                 """),
                 {
                     "template_id": template_id,
