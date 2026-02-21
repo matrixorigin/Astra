@@ -43,6 +43,8 @@ PLATFORM CAPABILITIES — Not agents. APIs that agents call.
 
 ## 2. The Execution Model: ChatLoop
 
+> **See also**: [Durable Agent Runs](durable-agent-runs.md) — how ChatLoop is wrapped in a durable, resumable AgentRun for complex tasks that outlive a single HTTP request.
+
 Every agent — user or system — runs the same loop:
 
 ```

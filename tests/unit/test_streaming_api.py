@@ -171,28 +171,39 @@ class TestChat:
     """Test /chat (non-streaming) endpoint."""
 
     @pytest.mark.asyncio
-    @patch("api.routers.chat._build_chat_loop")
-    async def test_chat_success(self, mock_build, mock_db, mock_auth):
+    @patch("api.routers.chat._get_engine")
+    async def test_chat_success(self, mock_get_engine, mock_db, mock_auth):
         from api.routers.chat import chat, ChatRequest
+        from core.agent.run import AgentRun, RunStatus
 
-        mock_build.return_value = _make_mock_loop(run_step_result="Hello back!")
+        mock_engine = MagicMock()
+        mock_run = AgentRun(session_id="sess_123", user_id="user_123", user_input="Hello")
+        mock_engine.create_run.return_value = mock_run
+        mock_engine.start_run = AsyncMock()
+        mock_get_engine.return_value = mock_engine
 
         request = ChatRequest(session_id="sess_123", message="Hello")
         response = await chat(request, mock_auth, mock_db)
 
         assert response.session_id == "sess_123"
-        assert response.message == "Hello back!"
+        assert response.run_id == mock_run.run_id
+        assert response.status == "pending"
 
     @pytest.mark.asyncio
-    @patch("api.routers.chat._build_chat_loop")
+    @patch("api.routers.chat._get_engine")
     @patch("api.routers.chat._ensure_session")
-    async def test_chat_auto_create_session(self, mock_ensure, mock_build, mock_db, mock_auth):
+    async def test_chat_auto_create_session(self, mock_ensure, mock_get_engine, mock_db, mock_auth):
         from api.routers.chat import chat, ChatRequest
+        from core.agent.run import AgentRun
 
         mock_ensure.return_value = "new_sess_456"
-        mock_build.return_value = _make_mock_loop(run_step_result="Hi!")
+        mock_engine = MagicMock()
+        mock_run = AgentRun(session_id="new_sess_456", user_id="user_123", user_input="Hello")
+        mock_engine.create_run.return_value = mock_run
+        mock_engine.start_run = AsyncMock()
+        mock_get_engine.return_value = mock_engine
 
-        request = ChatRequest(message="Hello")  # no session_id
+        request = ChatRequest(message="Hello")
         response = await chat(request, mock_auth, mock_db)
 
         assert response.session_id == "new_sess_456"

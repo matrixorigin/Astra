@@ -30,6 +30,15 @@ class EventType(str, Enum):
     PLAN_COMPLETED = "plan_completed"
     PLAN_FAILED = "plan_failed"
 
+    # Agent run lifecycle
+    RUN_STARTED = "run_started"
+    RUN_WAITING = "run_waiting"
+    RUN_RESUMED = "run_resumed"
+    RUN_COMPLETED = "run_completed"
+    RUN_FAILED = "run_failed"
+    RUN_CANCELLED = "run_cancelled"
+    CHILD_RUN_CREATED = "child_run_created"
+
     # Streaming events
     STREAM_RUN_STARTED = "stream_run_started"
     STREAM_RUN_FINISHED = "stream_run_finished"

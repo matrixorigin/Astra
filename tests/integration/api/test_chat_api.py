@@ -1,4 +1,4 @@
-"""Integration tests for /chat API — TestClient + real DB, only mock LLM."""
+"""Integration tests for /chat API — TestClient + real DB, only mock LLM/engine."""
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from api.main import app
 from api.database import get_db_session
 from api.repositories.user_repository import UserRepository
+from core.agent.run import AgentRun, RunStatus
 from core.events.models import StreamEvent, StreamEventType
 
 
@@ -51,40 +52,49 @@ def auth_headers(client, test_user):
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 
-def _mock_chat_loop(reply="Hello back!"):
-    """Return a mock ChatLoop that returns a fixed reply."""
-    loop = MagicMock()
-    loop.run_step = AsyncMock(return_value=reply)
+def _mock_engine(reply="Hello back!", status=RunStatus.PENDING):
+    """Return a mock RunEngine."""
+    engine = MagicMock()
+    run = AgentRun(session_id="test", user_id="test", user_input="hi")
+    run.status = status
+    engine.create_run.return_value = run
+    engine.start_run_with_timeout = AsyncMock(return_value=run)
+    engine.get_run_events.return_value = [
+        {"event_type": "text_done", "data": {"text": reply}},
+    ]
+    engine.get_run.return_value = run
+    engine.restore_run.return_value = None
+    engine.cancel_run.return_value = True
 
-    async def stream(*a, **kw):
-        yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data={"chunk": reply}, event_id="e1")
-        yield StreamEvent(event_type=StreamEventType.RUN_FINISHED, data={}, event_id="e2")
+    async def stream_events(run_id, last_index=0):
+        yield {"event_type": "text_delta", "data": {"chunk": reply}, "run_id": run_id}
+        yield {"event_type": "run_finished", "data": {}, "run_id": run_id}
 
-    loop.run_step_stream = stream
-    loop.set_observer = MagicMock()
-    return loop
+    engine.stream_run_events = stream_events
+    engine.start_run = AsyncMock()
+    return engine
 
 
 class TestChatAPI:
     """Integration: auth → route → DB session creation → response."""
 
-    @patch("api.routers.chat._build_chat_loop")
-    def test_chat_auto_create_session(self, mock_build, client, auth_headers):
-        mock_build.return_value = _mock_chat_loop()
+    @patch("api.routers.chat._get_engine")
+    def test_chat_auto_create_session(self, mock_get_engine, client, auth_headers):
+        mock_get_engine.return_value = _mock_engine()
         resp = client.post("/chat", json={"message": "hi"}, headers=auth_headers)
         assert resp.status_code == 200
         data = resp.json()
-        assert data["session_id"]  # auto-created
-        assert data["message"] == "Hello back!"
+        assert data["session_id"]
+        assert data["run_id"]
+        assert data["status"] == "pending"
 
-    @patch("api.routers.chat._build_chat_loop")
-    def test_chat_with_existing_session(self, mock_build, client, auth_headers, db_session, test_user):
-        # Create a real session first
+    @patch("api.routers.chat._get_engine")
+    def test_chat_with_existing_session(self, mock_get_engine, client, auth_headers, db_session, test_user):
         from core.events.session_manager import SessionManager
         mgr = SessionManager(db_session)
         session = mgr.create_session(user_id=test_user.user_id)
 
-        mock_build.return_value = _mock_chat_loop("reply2")
+        mock_get_engine.return_value = _mock_engine("reply2")
         resp = client.post("/chat", json={"session_id": session.session_id, "message": "hi"}, headers=auth_headers)
         assert resp.status_code == 200
         assert resp.json()["session_id"] == session.session_id
@@ -93,16 +103,32 @@ class TestChatAPI:
         resp = client.post("/chat", json={"message": "hi"})
         assert resp.status_code == 403
 
-    @patch("api.routers.chat._build_chat_loop")
-    def test_chat_nonexistent_session(self, mock_build, client, auth_headers):
+    @patch("api.routers.chat._get_engine")
+    def test_chat_nonexistent_session(self, mock_get_engine, client, auth_headers):
         resp = client.post("/chat", json={"session_id": "no_such_id", "message": "hi"}, headers=auth_headers)
         assert resp.status_code == 404
 
-    @patch("api.routers.chat._build_chat_loop")
-    def test_stream_returns_sse(self, mock_build, client, auth_headers):
-        mock_build.return_value = _mock_chat_loop("streamed")
+    @patch("api.routers.chat._get_engine")
+    def test_stream_returns_sse(self, mock_get_engine, client, auth_headers):
+        mock_get_engine.return_value = _mock_engine("streamed")
         resp = client.post("/chat/stream", json={"message": "hi"}, headers=auth_headers)
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]
         assert "session_info" in resp.text
-        assert "text_delta" in resp.text
+        assert "run_id" in resp.text
+
+    @patch("api.routers.chat._get_engine")
+    def test_get_run_status(self, mock_get_engine, client, auth_headers):
+        engine = _mock_engine()
+        mock_get_engine.return_value = engine
+        resp = client.get("/chat/runs/test_run_123", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "pending"
+
+    @patch("api.routers.chat._get_engine")
+    def test_cancel_run(self, mock_get_engine, client, auth_headers):
+        mock_get_engine.return_value = _mock_engine()
+        resp = client.delete("/chat/runs/test_run_123", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "cancelled"

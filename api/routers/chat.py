@@ -1,9 +1,9 @@
-"""Chat API endpoints — unified conversation entry point."""
+"""Chat API endpoints — unified conversation entry point with durable AgentRun."""
 
 import json
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -31,10 +31,18 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """Non-streaming chat response."""
+    """Chat response — always returns run_id."""
     session_id: str
-    message: str
-    event_id: Optional[str] = None
+    run_id: str
+    status: str
+
+
+class RunStatusResponse(BaseModel):
+    run_id: str
+    session_id: str
+    status: str
+    waiting_for: Optional[str] = None
+    events_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +60,6 @@ def _ensure_session(db: Session, user_id: str, session_id: Optional[str], agent_
             raise HTTPException(status_code=404, detail="Session not found")
         return session_id
 
-    # Auto-create session
     from core.events.session_manager import SessionManager
     mgr = SessionManager(db)
     session = mgr.create_session(user_id=user_id, metadata={"agent_id": agent_id} if agent_id else None)
@@ -101,6 +108,11 @@ def _build_chat_loop(db: Session):
     return loop
 
 
+def _get_engine(db: Session):
+    from core.agent.run_engine import RunEngine
+    return RunEngine(db)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -111,31 +123,25 @@ async def chat(
     current_user: Annotated[dict, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db_session)],
 ):
-    """Non-streaming chat — send a message, get a response.
+    """Create an AgentRun. Returns run_id immediately.
 
-    If session_id is omitted, a new session is created automatically.
-
-    Example:
-        ```bash
-        curl -H "Authorization: Bearer <token>" \\
-             -H "Content-Type: application/json" \\
-             -d '{"message":"Hello"}' \\
-             http://localhost:8000/chat
-        ```
+    Poll /chat/runs/{run_id} or stream /chat/runs/{run_id}/stream for progress.
     """
     user_id = current_user["user_id"]
     session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
-    loop = _build_chat_loop(db)
 
-    response_text = await loop.run_step(
-        user_input=request.message,
+    engine = _get_engine(db)
+    run = engine.create_run(
         session_id=session_id,
         user_id=user_id,
+        user_input=request.message,
         context=request.context,
-        max_candidates=request.max_candidates,
     )
 
-    return ChatResponse(session_id=session_id, message=response_text)
+    import asyncio
+    asyncio.create_task(engine.start_run(run))
+
+    return ChatResponse(session_id=session_id, run_id=run.run_id, status=run.status.value)
 
 
 @router.post("/chat/stream")
@@ -144,43 +150,27 @@ async def chat_stream(
     current_user: Annotated[dict, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db_session)],
 ):
-    """Stream chat response as Server-Sent Events.
-
-    If session_id is omitted, a new session is created automatically.
-    The first event always contains the session_id.
-
-    Example:
-        ```bash
-        curl -N -H "Authorization: Bearer <token>" \\
-             -H "Content-Type: application/json" \\
-             -d '{"message":"Hello"}' \\
-             http://localhost:8000/chat/stream
-        ```
-    """
+    """Stream chat response as SSE. Returns run_id in first event."""
     user_id = current_user["user_id"]
     session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
-    loop = _build_chat_loop(db)
+
+    engine = _get_engine(db)
+    run = engine.create_run(
+        session_id=session_id,
+        user_id=user_id,
+        user_input=request.message,
+        context=request.context,
+    )
+
+    import asyncio
+    asyncio.create_task(engine.start_run(run))
 
     async def event_generator():
-        # First event: session info (so client knows the session_id)
-        yield f"data: {json.dumps({'event_type': 'session_info', 'data': {'session_id': session_id}})}\n\n"
+        yield f"data: {json.dumps({'event_type': 'session_info', 'data': {'session_id': session_id, 'run_id': run.run_id}})}\n\n"
 
         try:
-            async for stream_event in loop.run_step_stream(
-                user_input=request.message,
-                session_id=session_id,
-                user_id=user_id,
-                context=request.context,
-                max_candidates=request.max_candidates,
-            ):
-                event_data = {
-                    "event_type": stream_event.event_type,
-                    "data": stream_event.data,
-                    "event_id": stream_event.event_id,
-                    "causal_chain_id": stream_event.causal_chain_id,
-                    "agent_id": stream_event.agent_id,
-                }
-                yield f"data: {json.dumps(event_data)}\n\n"
+            async for event in engine.stream_run_events(run.run_id):
+                yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
             yield f"data: {json.dumps({'event_type': 'run_error', 'data': {'error': str(e)}})}\n\n"
@@ -188,9 +178,67 @@ async def chat_stream(
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/chat/runs/{run_id}", response_model=RunStatusResponse)
+async def get_run_status(
+    run_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db_session)],
+):
+    """Get run status and progress."""
+    engine = _get_engine(db)
+    run = engine.get_run(run_id)
+    if not run:
+        # Try restoring from DB
+        run = engine.restore_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    events = engine.get_run_events(run_id)
+    return RunStatusResponse(
+        run_id=run.run_id,
+        session_id=run.session_id,
+        status=run.status.value,
+        waiting_for=run.waiting_for,
+        events_count=len(events),
+    )
+
+
+@router.get("/chat/runs/{run_id}/stream")
+async def stream_run(
+    run_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db_session)],
+    last_index: int = Query(default=0, description="Resume from event index (for reconnection)"),
+):
+    """Stream run events as SSE. Supports reconnection via last_index."""
+    engine = _get_engine(db)
+    run = engine.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    async def event_generator():
+        async for event in engine.stream_run_events(run_id, last_index=last_index):
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.delete("/chat/runs/{run_id}")
+async def cancel_run(
+    run_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db_session)],
+):
+    """Cancel a running or waiting run."""
+    engine = _get_engine(db)
+    if not engine.cancel_run(run_id):
+        raise HTTPException(status_code=404, detail="Run not found or already finished")
+    return {"run_id": run_id, "status": "cancelled"}

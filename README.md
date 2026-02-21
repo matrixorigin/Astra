@@ -103,8 +103,11 @@ curl http://localhost:8000/health
 - `GET /auth/me` - Get current user info
 
 ### Chat
-- `POST /chat` - Send message, get response (auto-creates session if omitted)
-- `POST /chat/stream` - Stream chat response as SSE (auto-creates session if omitted)
+- `POST /chat` - Send message, get response (auto-creates session if omitted, returns run_id)
+- `POST /chat/stream` - Stream chat response as SSE (returns run_id in first event)
+- `GET /chat/runs/{run_id}` - Get run status and progress
+- `GET /chat/runs/{run_id}/stream` - Stream run events (supports reconnection)
+- `DELETE /chat/runs/{run_id}` - Cancel a running task
 
 ### Background Jobs
 - `POST /jobs` - Submit background job (training, data collection, etc.)
