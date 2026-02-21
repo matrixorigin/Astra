@@ -82,14 +82,32 @@ class Reflector:
         if not condensed:
             return {"before": len(observations), "after": len(observations), "reflected": False}
 
+        # Quality gate: reject if condensed is longer than original (LLM hallucinated)
+        condensed_text = "\n".join(
+            o["content"] for o in condensed if isinstance(o, dict) and o.get("content")
+        )
+        tokens_after = estimate_tokens([{"role": "user", "content": condensed_text}])
+        if tokens_after >= tokens:
+            logger.warning(
+                "Reflector: condensed (%d tokens) >= original (%d tokens), discarding",
+                tokens_after, tokens,
+            )
+            return {"before": len(observations), "after": len(observations), "reflected": False}
+
         replaced = self._replace_observations(
             user_id, session_id, observations, condensed,
         )
 
+        logger.info(
+            "Reflector compression: %d → %d tokens (%.0f%% reduction)",
+            tokens, tokens_after, (1 - tokens_after / tokens) * 100,
+        )
         return {
             "before": len(observations),
             "after": replaced,
             "reflected": True,
+            "tokens_before": tokens,
+            "tokens_after": tokens_after,
         }
 
     def _reflect_via_llm(self, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:

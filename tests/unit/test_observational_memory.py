@@ -428,6 +428,39 @@ class TestReflector:
 
         db.rollback.assert_called_once()
 
+    def test_reject_if_condensed_longer(self, reflector, db):
+        """Quality gate: discard condensed output if it's longer than original."""
+        # Return condensed that is LONGER than original
+        big_content = "x" * 100_000
+        reflector.llm.chat_with_tools.return_value = {
+            "content": json.dumps([
+                {"content": big_content, "priority": "high", "type": "pattern"},
+            ])
+        }
+        with patch("core.memory.observer.Observer") as MockObs:
+            MockObs.return_value.get_observations.return_value = _big_observations()
+            result = reflector.reflect("u1")
+        assert result["reflected"] is False
+        db.commit.assert_not_called()
+
+    def test_reflect_returns_token_metrics(self, reflector, db):
+        """Reflected result includes tokens_before and tokens_after."""
+        reflector.llm.chat_with_tools.return_value = {
+            "content": json.dumps([
+                {"content": "Condensed", "priority": "high", "type": "pattern"},
+            ])
+        }
+        mock_query = MagicMock()
+        db.query.return_value.filter.return_value = mock_query
+        mock_query.update.return_value = 30
+
+        with patch("core.memory.observer.Observer") as MockObs:
+            MockObs.return_value.get_observations.return_value = _big_observations()
+            result = reflector.reflect("u1")
+        assert result["reflected"] is True
+        assert result["tokens_before"] > result["tokens_after"]
+        assert result["tokens_after"] > 0
+
 
 # ---------------------------------------------------------------------------
 # ChatLoop integration
