@@ -169,6 +169,25 @@ class Event(Base):
     skill_result = Column(JSON)
 
 
+class QualityAssessment(Base):
+    """Multi-level quality assessment (chain / session)."""
+    __tablename__ = "quality_assessments"
+    __table_args__ = (
+        UniqueConstraint("level", "target_id", name="uq_level_target"),
+    )
+
+    assessment_id = Column(String(36), primary_key=True)
+    level = Column(String(10), nullable=False, index=True)  # "chain" | "session"
+    target_id = Column(String(36), nullable=False, index=True)  # causal_chain_id or session_id
+    session_id = Column(String(36), nullable=False, index=True)
+    score = Column(Float, nullable=False)  # 0-5
+    step_count = Column(Integer, nullable=False, default=0)
+    failure_count = Column(Integer, nullable=False, default=0)
+    details = Column(JSON)  # per-step breakdown, cascade penalty, etc.
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
 class Role(Base):
     __tablename__ = "roles"
     role_id = Column(String(36), primary_key=True)

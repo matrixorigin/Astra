@@ -1655,6 +1655,13 @@ class ChatLoop:
                 )
             except Exception as e:
                 logger.warning("Auto-score failed (non-fatal): %s", e)
+        # Chain-level quality aggregation (non-fatal)
+        if causal_chain_id:
+            try:
+                from core.evaluation.multi_level_scorer import score_chain
+                score_chain(self.event_logger.session, causal_chain_id, session_id)
+            except Exception as e:
+                logger.warning("Chain-level scoring failed (non-fatal): %s", e)
         # Post-turn: run Observer on the conversation messages
         if messages:
             self._run_observer(session_id, user_id, messages)
