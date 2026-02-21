@@ -54,6 +54,13 @@ class SkillRequirement(BaseModel):
     min_access: AccessScope  # e.g., READ or WRITE
     llm_required: bool = True  # Does this skill need LLM?
 
+    # Execution backend routing (all optional, backward-compatible)
+    gpu_required: bool = False
+    conda_env: str | None = None
+    timeout_seconds: int = 60
+    min_memory_gb: float = 0.5
+    async_execution: bool = False  # If True, skill runs as background job
+
 
 class SkillInput(BaseModel):
     """Base class for skill inputs"""

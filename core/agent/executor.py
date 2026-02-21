@@ -31,6 +31,9 @@ class AgentExecutor:
         self.mock_layer = ToolMockingLayer(mode, db)
         self._pipeline = pipeline
 
+        from core.agent.execution_backend import BackendRouter
+        self._backend_router = BackendRouter()
+
     def execute_skill(
         self,
         skill_name: str,
@@ -64,7 +67,12 @@ class AgentExecutor:
         if "user_id" not in params:
             params["user_id"] = getattr(self, "_current_user_id", "system")
 
-        # 2. Execute via Mocking Layer with timing
+        # 2. Check if skill needs heavyweight backend
+        exec_req = self._get_execution_requirements(skill)
+        if not self._backend_router.is_lightweight(exec_req):
+            return self._execute_heavyweight_sync(skill_name, params, exec_req, session_id)
+
+        # 3. Execute via Mocking Layer with timing (in-process, zero overhead)
         start_time = time.time()
         success = True
         cost = 0.0
@@ -239,3 +247,65 @@ class AgentExecutor:
                 event_type=StreamEventType.RUN_ERROR,
                 data={"error": str(e)},
             )
+
+    @staticmethod
+    def _get_execution_requirements(skill) -> "ExecutionRequirements":
+        """Extract ExecutionRequirements from skill's SkillRequirement."""
+        from core.agent.execution_backend import ExecutionRequirements
+        from core.skills.base import SkillRequirement
+        req = getattr(skill, "requirements", None)
+        if not isinstance(req, SkillRequirement):
+            return ExecutionRequirements()
+        return ExecutionRequirements(
+            gpu_required=req.gpu_required,
+            conda_env=req.conda_env,
+            timeout_seconds=req.timeout_seconds,
+            min_memory_gb=req.min_memory_gb,
+        )
+
+    def _execute_heavyweight_sync(
+        self, skill_name: str, params: dict, req: "ExecutionRequirements", session_id: str,
+    ) -> Any:
+        """Route heavyweight skill to subprocess (blocking, for sync callers)."""
+        import json as _json
+        import os
+        import subprocess
+        import sys
+
+        cmd = [sys.executable, "-m", "core.skills.runner",
+               "--skill", skill_name, "--inputs", _json.dumps(params)]
+        if req.conda_env:
+            cmd = ["conda", "run", "-n", req.conda_env, "--no-capture-output"] + cmd
+
+        start_time = time.time()
+        try:
+            env = {**os.environ, **req.env_vars} if req.env_vars else None
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=req.timeout_seconds, env=env)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            if proc.returncode != 0:
+                err_text = (proc.stderr or "")[-2000:]
+                self._record_execution_metrics(
+                    skill_name=skill_name, session_id=session_id,
+                    execution_time_ms=elapsed_ms, execution_cost=0.0,
+                    success=False, error_msg=err_text,
+                )
+                raise RuntimeError(f"Skill {skill_name} failed: {err_text[-500:]}")
+
+            try:
+                result = _json.loads(proc.stdout) if proc.stdout and proc.stdout.strip() else {}
+            except (ValueError, _json.JSONDecodeError):
+                result = {"output": (proc.stdout or "")[-2000:]}
+
+            self._record_execution_metrics(
+                skill_name=skill_name, session_id=session_id,
+                execution_time_ms=elapsed_ms, execution_cost=0.0, success=True,
+            )
+            return result
+        except subprocess.TimeoutExpired:
+            self._record_execution_metrics(
+                skill_name=skill_name, session_id=session_id,
+                execution_time_ms=req.timeout_seconds * 1000, execution_cost=0.0,
+                success=False, error_msg="Timeout",
+            )
+            raise RuntimeError(f"Skill {skill_name} timed out after {req.timeout_seconds}s")
