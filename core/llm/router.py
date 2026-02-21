@@ -82,16 +82,17 @@ class TaskBasedStrategy(RoutingStrategy):
         preferred_tags = self.TASK_TAG_MAP[task_hint]
         all_models = registry.list_active()
 
-        # Score models by tag overlap
+        # Score models by tag overlap; tie-break by cost (cheaper first)
         scored = []
         for m in all_models:
             score = sum(1 for t in preferred_tags if t in m.tags)
             if score > 0:
-                scored.append((score, m))
-        scored.sort(key=lambda x: -x[0])
+                cost = m.price_per_1k_prompt + m.price_per_1k_completion
+                scored.append((score, cost, m))
+        scored.sort(key=lambda x: (-x[0], x[1]))
 
         if scored:
-            return [m for _, m in scored]
+            return [m for _, _, m in scored]
 
         # No tag match — fall back to default chain
         return FallbackChainStrategy().select(model, registry)

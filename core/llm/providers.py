@@ -1,6 +1,7 @@
 """LLM provider adapters with connection pooling and retry."""
 
 import logging
+import random
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -73,7 +74,9 @@ class BaseProvider(ABC):
             except Exception as e:
                 last_error = e
                 if attempt < MAX_RETRIES - 1 and _should_retry(e):
-                    time.sleep(RETRY_BASE_DELAY * (2**attempt))
+                    delay = RETRY_BASE_DELAY * (2**attempt)
+                    jitter = random.uniform(0, delay * 0.5)
+                    time.sleep(delay + jitter)
                     logger.warning(f"Retry {attempt + 1}/{MAX_RETRIES}: {e}")
                 else:
                     raise

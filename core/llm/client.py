@@ -149,7 +149,20 @@ class LLMClient:
                 "budget_usd": float(os.getenv("LLM_BUDGET_USD", "0")),
             }
         self.config = config
+        self._validate_config()
         self._total_spend_usd = 0.0
+
+    def _validate_config(self) -> None:
+        """Validate config values; raise ValueError on invalid."""
+        budget = self.config.get("budget_usd", 0)
+        if budget < 0:
+            raise ValueError(f"budget_usd must be >= 0, got {budget}")
+        temp = self.config.get("temperature", 0.7)
+        if not 0 <= temp <= 2:
+            raise ValueError(f"temperature must be 0-2, got {temp}")
+        max_tok = self.config.get("max_tokens")
+        if max_tok is not None and max_tok <= 0:
+            raise ValueError(f"max_tokens must be > 0, got {max_tok}")
 
     def reload_config(self):
         """Hot reload config + model registry (#4)."""
@@ -295,10 +308,15 @@ class LLMClient:
 
     # ── Budget control (#7) ────────────────────────────────────────
 
-    def _check_budget(self, model: str, estimated_tokens: int = 1000):
+    def _check_budget(self, model: str, messages: list | None = None):
         budget = self.config.get("budget_usd", 0)
         if budget <= 0:
             return  # unlimited
+        estimated_tokens = 1000
+        if messages:
+            # ~4 chars per token, rough but better than fixed 1000
+            char_count = sum(len(m.get("content", "") or "") for m in messages if isinstance(m, dict))
+            estimated_tokens = max(char_count // 4, 200)
         estimated_cost = self.router.estimate_cost(model, estimated_tokens)
         if self._total_spend_usd + estimated_cost > budget:
             raise BudgetExceededError(
@@ -345,23 +363,25 @@ class LLMClient:
 
             raise PermissionError("\n".join(error_msg))
 
+    def _resolve_chain(self, model: str, task_hint: str | None = None) -> list[ModelConfig]:
+        """Permission check + route to model chain. Used by _dispatch and streaming methods."""
+        self._check_model_permission(model)
+        chain = self.router.route(model, task_hint=task_hint)
+        if not chain:
+            chain = [
+                ModelConfig(
+                    model_name=model, provider=self.config.get("provider", "openai")
+                )
+            ]
+        return chain
+
     def _dispatch(self, model: str, fn_name: str, task_hint: str | None = None, **kwargs):
         """Route to model chain, respecting circuit breaker + rate limiter.
 
         fn_name: method name on BaseProvider (complete, complete_stream, etc.)
         Returns the result of the first successful provider call.
         """
-        # Check permission before routing
-        self._check_model_permission(model)
-
-        chain = self.router.route(model, task_hint=task_hint)
-        if not chain:
-            # Unknown model — try direct with default provider
-            chain = [
-                ModelConfig(
-                    model_name=model, provider=self.config.get("provider", "openai")
-                )
-            ]
+        chain = self._resolve_chain(model, task_hint)
 
         last_error = None
         for model_cfg in chain:
@@ -382,6 +402,8 @@ class LLMClient:
                 result = getattr(provider, fn_name)(model=model_cfg.model_name, **kwargs)
                 breaker.record_success()
                 return result, model_cfg
+            except (BudgetExceededError, PermissionError):
+                raise  # Non-retryable — propagate immediately
             except Exception as e:
                 breaker.record_failure()
                 last_error = e
@@ -410,8 +432,8 @@ class LLMClient:
         temp = temperature or self.config.get("temperature", 0.7)
         max_tok = self.config.get("max_tokens")
 
-        self._check_budget(model)
         msg_dicts = self._normalize_messages(messages)
+        self._check_budget(model, msg_dicts)
 
         try:
             response, model_cfg = self._dispatch(
@@ -463,7 +485,7 @@ class LLMClient:
     ) -> dict:
         """Chat with function calling."""
         model = self._resolve_model(model)
-        self._check_budget(model)
+        self._check_budget(model, messages)
         temp = self.config.get("temperature", 0.7)
         max_tok = self.config.get("max_tokens")
 
@@ -491,17 +513,11 @@ class LLMClient:
         start = time.time()
         trace_id = str(uuid7())
         model = self._resolve_model(model)
-        self._check_budget(model)
+        self._check_budget(model, messages)
         temp = self.config.get("temperature", 0.7)
         max_tok = self.config.get("max_tokens")
 
-        chain = self.router.route(model, task_hint=task_hint)
-        if not chain:
-            chain = [
-                ModelConfig(
-                    model_name=model, provider=self.config.get("provider", "openai")
-                )
-            ]
+        chain = self._resolve_chain(model, task_hint=task_hint)
 
         for model_cfg in chain:
             breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
@@ -552,6 +568,8 @@ class LLMClient:
                     "success",
                 )
                 return
+            except (BudgetExceededError, PermissionError):
+                raise
             except Exception as e:
                 breaker.record_failure()
                 logger.warning(f"Stream {model_cfg.model_name} failed: {e}")
@@ -569,17 +587,11 @@ class LLMClient:
     ):
         """Yield tool calls and text chunks."""
         model = self._resolve_model(model)
-        self._check_budget(model)
+        self._check_budget(model, messages)
         temp = self.config.get("temperature", 0.7)
         max_tok = self.config.get("max_tokens")
 
-        chain = self.router.route(model, task_hint=task_hint)
-        if not chain:
-            chain = [
-                ModelConfig(
-                    model_name=model, provider=self.config.get("provider", "openai")
-                )
-            ]
+        chain = self._resolve_chain(model, task_hint=task_hint)
 
         for model_cfg in chain:
             breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
@@ -597,6 +609,8 @@ class LLMClient:
                         yield chunk
                 breaker.record_success()
                 return
+            except (BudgetExceededError, PermissionError):
+                raise
             except Exception as e:
                 breaker.record_failure()
                 logger.warning(f"Stream+tools {model_cfg.model_name} failed: {e}")
