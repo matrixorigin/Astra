@@ -452,6 +452,71 @@ _SUBMIT_WORKFLOW_SCHEMA = {
 _registry.register("submit_workflow", _execute_submit_workflow, _SUBMIT_WORKFLOW_SCHEMA)
 
 
+# ── Built-in: spawn_runs (multi-agent fan-out) ──
+
+async def _execute_spawn_runs(params: dict[str, Any], run_id: str | None = None) -> dict:
+    """Spawn child agent runs. Parent parks until all children complete."""
+    if not run_id:
+        return {"error": "spawn_runs requires a parent run_id"}
+
+    from core.agent.run_engine import RunEngine, _active_runs
+    from api.database import get_db_session
+
+    db = next(get_db_session())
+    engine = RunEngine(db)
+
+    agents = params["agents"]  # [{"agent_id": "reviewer", "task": "Review code"}, ...]
+    children = []
+    for spec in agents:
+        child = await engine.create_child_run(
+            parent_run_id=run_id,
+            agent_id=spec.get("agent_id", "dev-agent"),
+            task=spec["task"],
+            context=spec.get("context"),
+        )
+        children.append({"run_id": child.run_id, "agent_id": child.agent_id})
+
+    return {
+        "children": children,
+        "count": len(children),
+        "wait_for": f"children:{run_id}",
+    }
+
+
+_SPAWN_RUNS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "spawn_runs",
+        "description": (
+            "Spawn multiple child agent runs in parallel (fan-out). "
+            "The current run pauses until ALL children complete (fan-in). "
+            "Use for multi-agent review, parallel analysis, etc."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "agents": {
+                    "type": "array",
+                    "description": "List of agent specs to spawn",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {"type": "string", "description": "Agent to run (e.g. security_reviewer)"},
+                            "task": {"type": "string", "description": "Task description for the agent"},
+                            "context": {"type": "object", "description": "Optional context for the agent"},
+                        },
+                        "required": ["task"],
+                    },
+                },
+            },
+            "required": ["agents"],
+        },
+    },
+}
+
+_registry.register("spawn_runs", _execute_spawn_runs, _SPAWN_RUNS_SCHEMA)
+
+
 # ── Backward compat (used by jobs webhook + old imports) ──
 
 SUBMIT_JOB_SCHEMA = _SUBMIT_JOB_SCHEMA

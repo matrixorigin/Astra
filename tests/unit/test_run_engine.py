@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from datetime import datetime, timezone
 
 from core.agent.run import AgentRun, RunStatus, RunTrigger
-from core.agent.run_engine import RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks
+from core.agent.run_engine import RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks, _child_runs
 from core.events.models import EventType
 
 
@@ -35,11 +35,13 @@ def clean_state():
     _run_events.clear()
     _run_waiters.clear()
     _run_tasks.clear()
+    _child_runs.clear()
     yield
     _active_runs.clear()
     _run_events.clear()
     _run_waiters.clear()
     _run_tasks.clear()
+    _child_runs.clear()
 
 
 class TestRunEngineCreate:
@@ -331,6 +333,100 @@ class TestTryClaimResume:
         engine = self._make_engine(db)
         # Fallback: allow resume in single-worker mode
         assert engine._try_claim_resume("run-1") is True
+
+
+class TestMultiAgentRuns:
+    """Test child run creation, fan-out, and fan-in."""
+
+    @pytest.mark.asyncio
+    async def test_create_child_run(self, engine):
+        parent = engine.create_run(session_id="s1", user_id="u1", user_input="review code")
+        parent.status = RunStatus.RUNNING
+
+        mock_loop = MagicMock()
+        async def stream(**kw):
+            from core.events.models import StreamEvent
+            yield StreamEvent(event_type="text_delta", data={"text": "reviewed"})
+        mock_loop.run_step_stream = stream
+        mock_loop._current_run_id = None
+
+        with patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
+            child = await engine.create_child_run(
+                parent_run_id=parent.run_id,
+                agent_id="security_reviewer",
+                task="Review for security issues",
+            )
+
+        assert child.parent_run_id == parent.run_id
+        assert child.agent_id == "security_reviewer"
+        assert child.session_id == parent.session_id
+        assert child.run_id in _child_runs[parent.run_id]
+        assert child.run_id in _run_tasks
+        # Wait for child to finish
+        await _run_tasks[child.run_id]
+
+    @pytest.mark.asyncio
+    async def test_create_child_run_unknown_parent(self, engine):
+        with pytest.raises(ValueError, match="not found"):
+            await engine.create_child_run(
+                parent_run_id="nonexistent",
+                agent_id="reviewer",
+                task="review",
+            )
+
+    @pytest.mark.asyncio
+    async def test_fan_in_resumes_parent(self, engine):
+        """When all children complete, parent should be resumed."""
+        parent = engine.create_run(session_id="s1", user_id="u1", user_input="multi-review")
+        parent.status = RunStatus.WAITING
+        parent.waiting_for = f"children:{parent.run_id}"
+
+        mock_loop = MagicMock()
+        mock_loop._current_run_id = None
+        call_count = 0
+
+        async def stream(**kw):
+            from core.events.models import StreamEvent
+            nonlocal call_count
+            call_count += 1
+            yield StreamEvent(event_type="text_delta", data={"text": f"result-{call_count}"})
+        mock_loop.run_step_stream = stream
+
+        with patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
+            c1 = await engine.create_child_run(parent.run_id, "reviewer_a", "review A")
+            c2 = await engine.create_child_run(parent.run_id, "reviewer_b", "review B")
+
+            # Let all tasks complete (children + fan-in resume)
+            await asyncio.sleep(0.1)
+
+        assert c1.status == RunStatus.COMPLETED
+        assert c2.status == RunStatus.COMPLETED
+        # Parent should have been resumed (status changed from WAITING)
+        assert parent.status == RunStatus.COMPLETED
+        assert parent.run_id not in _child_runs
+
+    @pytest.mark.asyncio
+    async def test_fan_in_waits_for_all(self, engine):
+        """Fan-in should NOT resume parent until ALL children are done."""
+        parent = engine.create_run(session_id="s1", user_id="u1", user_input="multi")
+        parent.status = RunStatus.WAITING
+        parent.waiting_for = f"children:{parent.run_id}"
+
+        # Create two children manually (don't start them)
+        c1 = engine.create_run(session_id="s1", user_id="u1", user_input="task1",
+                               agent_id="a1", parent_run_id=parent.run_id)
+        c2 = engine.create_run(session_id="s1", user_id="u1", user_input="task2",
+                               agent_id="a2", parent_run_id=parent.run_id)
+        _child_runs.setdefault(parent.run_id, set()).update({c1.run_id, c2.run_id})
+
+        # Only c1 completes
+        c1.status = RunStatus.COMPLETED
+        c1.completed_at = datetime.now(timezone.utc)
+
+        await engine._check_fan_in(parent.run_id)
+        # Parent still waiting — c2 not done
+        assert parent.status == RunStatus.WAITING
+        assert parent.run_id in _child_runs
 
 
 def get_async_tool_registry():

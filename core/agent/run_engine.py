@@ -24,6 +24,7 @@ _active_runs: dict[str, AgentRun] = {}
 _run_events: dict[str, list[dict]] = {}  # local buffer, also persisted to DB
 _run_waiters: dict[str, asyncio.Event] = {}
 _run_tasks: dict[str, asyncio.Task] = {}
+_child_runs: dict[str, set[str]] = {}  # parent_run_id → {child_run_ids}
 
 
 class RunEngine:
@@ -60,6 +61,34 @@ class RunEngine:
         _run_events[run.run_id] = []
         _run_waiters[run.run_id] = asyncio.Event()
         return run
+
+    async def create_child_run(
+        self,
+        parent_run_id: str,
+        agent_id: str,
+        task: str,
+        context: dict | None = None,
+    ) -> AgentRun:
+        """Create and start a child run. Parent tracks it for fan-in."""
+        parent = _active_runs.get(parent_run_id)
+        if not parent:
+            raise ValueError(f"Parent run {parent_run_id} not found")
+
+        child = self.create_run(
+            session_id=parent.session_id,
+            user_id=parent.user_id,
+            user_input=task,
+            agent_id=agent_id,
+            parent_run_id=parent_run_id,
+            trigger=RunTrigger.USER_MESSAGE,
+            context=context,
+        )
+        _child_runs.setdefault(parent_run_id, set()).add(child.run_id)
+
+        # Start child in background
+        task_obj = asyncio.create_task(self.start_run(child))
+        _run_tasks[child.run_id] = task_obj
+        return child
 
     async def start_run(self, run: AgentRun) -> None:
         """Execute an AgentRun using ChatLoop. Streams events to buffer."""
@@ -415,6 +444,30 @@ class RunEngine:
                 "data": {"child_run_id": run.run_id},
                 "run_id": run.parent_run_id,
             })
+            # Fan-in: check if all siblings are done
+            asyncio.ensure_future(self._check_fan_in(run.parent_run_id))
+
+    async def _check_fan_in(self, parent_run_id: str) -> None:
+        """If all child runs completed, resume the parent with aggregated results."""
+        children = _child_runs.get(parent_run_id)
+        if not children:
+            return
+
+        results = {}
+        for cid in children:
+            child = _active_runs.get(cid)
+            if not child or child.status not in (RunStatus.COMPLETED, RunStatus.FAILED):
+                return  # Still waiting for some children
+            results[cid] = {
+                "agent_id": child.agent_id,
+                "status": child.status.value,
+                "events": _run_events.get(cid, []),
+            }
+
+        # All done — resume parent
+        _child_runs.pop(parent_run_id, None)
+        handle = f"children:{parent_run_id}"
+        await self.resume_run(parent_run_id, {"child_results": results})
 
     def _log_run_event(self, run: AgentRun, event_type: EventType, extra_meta: dict | None = None) -> None:
         meta = {"run_id": run.run_id}

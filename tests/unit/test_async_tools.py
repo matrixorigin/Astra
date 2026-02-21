@@ -12,6 +12,7 @@ from core.agent.async_tools import (
     resume_workflow,
     cleanup_stale_workflows,
 )
+from core.agent.run import RunStatus
 
 
 class TestAsyncToolRegistry:
@@ -141,3 +142,55 @@ class TestCleanupStaleWorkflows:
         with patch("api.database.get_db_session", side_effect=RuntimeError("db down")):
             count = await cleanup_stale_workflows()
         assert count == 0
+
+
+class TestSpawnRuns:
+
+    @pytest.mark.asyncio
+    async def test_spawn_runs_no_run_id(self):
+        from core.agent.async_tools import _execute_spawn_runs
+        result = await _execute_spawn_runs({"agents": [{"task": "test"}]})
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_spawn_runs_creates_children(self):
+        from core.agent.async_tools import _execute_spawn_runs
+        from core.agent.run_engine import RunEngine, _active_runs, _child_runs, _run_tasks
+
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchone.return_value = None
+        mock_db.execute.return_value.fetchall.return_value = []
+
+        mock_loop = MagicMock()
+        mock_loop._current_run_id = None
+        async def stream(**kw):
+            from core.events.models import StreamEvent
+            yield StreamEvent(event_type="text_delta", data={"text": "done"})
+        mock_loop.run_step_stream = stream
+
+        # Create parent run with patched init
+        with patch.object(RunEngine, '__init__', lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
+            engine = RunEngine(mock_db)
+            parent = engine.create_run(session_id="s1", user_id="u1", user_input="multi")
+            parent.status = RunStatus.RUNNING
+
+            with patch("api.database.get_db_session", return_value=iter([mock_db])), \
+                 patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
+                result = await _execute_spawn_runs(
+                    {"agents": [
+                        {"agent_id": "reviewer_a", "task": "review security"},
+                        {"agent_id": "reviewer_b", "task": "review perf"},
+                    ]},
+                    run_id=parent.run_id,
+                )
+
+        assert result["count"] == 2
+        assert result["wait_for"] == f"children:{parent.run_id}"
+        assert len(result["children"]) == 2
+        assert result["children"][0]["agent_id"] == "reviewer_a"
+
+    @pytest.mark.asyncio
+    async def test_spawn_runs_registered(self):
+        from core.agent.async_tools import get_async_tool_registry
+        reg = get_async_tool_registry()
+        assert reg.is_async_tool("spawn_runs")
