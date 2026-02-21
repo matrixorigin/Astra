@@ -12,7 +12,7 @@ from api.models import SkillRegistry as SkillModel
 from core.exceptions import DatabaseError, SkillNotFoundError
 from core.logging_config import get_logger
 
-from .base import Skill
+from .base import AccessScope, Skill
 
 logger = get_logger(__name__)
 
@@ -260,21 +260,25 @@ class SkillRegistry:
 
             if repo.repo_type in [
                 rt.value for rt in skill.requirements.repo_types
-            ] and self._has_access(repo.access_scope, skill.requirements.min_access.value):
+            ] and self._has_access(repo.access_scope, skill.requirements.min_access):
                 available.append(skill)
 
         logger.debug(f"Found {len(available)} available skills for repo {repo_id}")
         return available
 
-    def _has_access(self, current: str, required: str) -> bool:
+    def _has_access(self, current: str | AccessScope, required: str | AccessScope) -> bool:
         """Check if current access meets requirement"""
         levels = {"read": 1, "write": 2, "admin": 3}
-        return levels.get(current, 0) >= levels.get(required, 0)
+        c = current.value if isinstance(current, AccessScope) else current
+        r = required.value if isinstance(required, AccessScope) else required
+        return levels.get(c, 0) >= levels.get(r, 0)
 
     def _compute_code_hash(self, skill: Skill) -> str:
         """Compute SHA256 hash of skill code for verification"""
         try:
             code = inspect.getsource(skill.__class__)
-            return hashlib.sha256(code.encode()).hexdigest()
-        except Exception:
-            return "unknown"
+        except (OSError, TypeError):
+            # Fallback for dynamic classes: hash qualified name + version
+            cls = skill.__class__
+            code = f"{cls.__module__}.{cls.__qualname__}:{getattr(skill, 'version', '')}"
+        return hashlib.sha256(code.encode()).hexdigest()

@@ -319,13 +319,19 @@ class TestHistoricalQueries:
         assert result2["version"] == "2.0.0"
 
     def test_compute_code_hash_handles_error(self, registry):
-        """Test code hash computation handles errors gracefully."""
+        """Test code hash computation falls back to name-based hash for dynamic classes."""
         skill = MockSkill("test_skill", "1.0.0")
 
-        with patch("inspect.getsource", side_effect=Exception("Source error")):
+        with patch("inspect.getsource", side_effect=OSError("Source error")):
             hash_result = registry._compute_code_hash(skill)
 
-        assert hash_result == "unknown"
+        # Should produce a deterministic hash, not "unknown"
+        assert hash_result != "unknown"
+        assert len(hash_result) == 64  # SHA256 hex
+
+        # Same input should produce same hash
+        with patch("inspect.getsource", side_effect=OSError("Source error")):
+            assert registry._compute_code_hash(skill) == hash_result
 
 
 class TestListAvailable:
