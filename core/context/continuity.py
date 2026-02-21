@@ -162,7 +162,7 @@ class SessionContinuity:
         rows = self.db.execute(
             text(
                 "SELECT entry_id, category, key_name, value, confidence "
-                "FROM knowledge_entries "
+                "FROM sk_knowledge_entries "
                 "WHERE user_id = :user_id AND confidence > 0.3 "
                 "AND superseded_by IS NULL "
                 "ORDER BY confidence DESC, access_count DESC "

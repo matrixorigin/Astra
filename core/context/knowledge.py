@@ -26,7 +26,7 @@ def update_access_tracking(db: Session, entry_ids: list[str]) -> None:
     try:
         db.execute(
             text(
-                "UPDATE knowledge_entries "
+                "UPDATE sk_knowledge_entries "
                 "SET access_count = access_count + 1, last_accessed_at = NOW() "
                 "WHERE entry_id IN :ids"
             ),

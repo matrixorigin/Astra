@@ -165,7 +165,7 @@ class TestPollutionDetector:
                 m.all.return_value = [snap]
             elif name == "decision_audit":
                 m.filter.return_value.all.return_value = [decision]
-            elif name == "knowledge_entries":
+            elif name == "sk_knowledge_entries":
                 m.all.return_value = [downstream]
             return m
 

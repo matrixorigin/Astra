@@ -263,7 +263,7 @@ def test_decay_skips_entries_without_dates(db_session):
     # Force both date fields to None
     db_session.execute(
         __import__("sqlalchemy").text(
-            "UPDATE knowledge_entries SET last_validated_at = NULL, created_at = NULL "
+            "UPDATE sk_knowledge_entries SET last_validated_at = NULL, created_at = NULL "
             "WHERE entry_id = :eid"
         ),
         {"eid": entry.entry_id},

@@ -290,7 +290,7 @@ class InputFaceLearner:
         row = self._db.execute(
             text("""
                 SELECT COUNT(*) as stale_count
-                FROM knowledge_entries
+                FROM sk_knowledge_entries
                 WHERE status = 'active'
                   AND confidence < :threshold
                   AND last_validated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
@@ -332,7 +332,7 @@ class InputFaceLearner:
 
             qr = self._db.execute(
                 text("""
-                    UPDATE knowledge_entries
+                    UPDATE sk_knowledge_entries
                     SET status = 'quarantined', confidence = 0, updated_at = UTC_TIMESTAMP()
                     WHERE status = 'active'
                       AND confidence < :threshold

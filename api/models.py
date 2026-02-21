@@ -1,13 +1,12 @@
 """SQLAlchemy ORM models."""
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, JSON, ForeignKey, Float, Index, UniqueConstraint
-from sqlalchemy.orm import declarative_base
 from sqlalchemy.dialects.mysql import TINYINT
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy.sql import func
 from matrixone import VectorType, VectorPrecision
 
-Base = declarative_base()
+from api.base import Base
 
 
 class User(Base):
@@ -431,57 +430,6 @@ class SkillExecutionMetric(Base):
     created_at = Column(DateTime, default=func.now(), index=True)
 
 
-class KnowledgeEntry(Base):
-    """Semantic memory: extracted knowledge that persists across sessions."""
-    __tablename__ = "knowledge_entries"
-    entry_id = Column(String(64), primary_key=True)
-    user_id = Column(String(64), nullable=False, index=True)
-    agent_id = Column(String(64))
-    
-    # What
-    category = Column(String(50), nullable=False, index=True)  # user_preference | codebase_pattern | domain_fact | tool_behavior | entity
-    key_name = Column(String(255), nullable=False, index=True)
-    value = Column(Text, nullable=False)
-    
-    # Provenance
-    source_event_ids = Column(JSON, nullable=False)
-    extraction_method = Column(String(50))  # llm_extraction | user_explicit | observation
-    
-    # Trust & Lifecycle
-    trust_tier = Column(String(10), default="T3")  # T1/T2/T3/T4
-    confidence = Column(Float, default=1.0)
-    initial_confidence = Column(Float, default=1.0)
-    last_validated_at = Column(DateTime, default=func.now())
-    last_accessed_at = Column(DateTime)
-    access_count = Column(Integer, default=0)
-    
-    # Versioning
-    version = Column(Integer, default=1)
-    superseded_by = Column(String(64))
-    
-    # Vector search
-    embedding = Column(VectorType(1536, VectorPrecision.F32))  # Native VECF32 vector
-    
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-
-
-class KnowledgeRelation(Base):
-    """Entity-relationship layer over knowledge_entries (knowledge graph edges)."""
-    __tablename__ = "knowledge_relations"
-    __table_args__ = (
-        UniqueConstraint("subject_id", "predicate", "object_id", name="uq_spo"),
-    )
-
-    relation_id = Column(String(36), primary_key=True)
-    subject_id = Column(String(64), nullable=False)   # knowledge_entry.entry_id (covered by uq_spo prefix)
-    predicate = Column(String(100), nullable=False)    # e.g. "related_to", "depends_on", "supersedes"
-    object_id = Column(String(64), nullable=False, index=True)  # reverse lookups need separate index
-    weight = Column(Float, default=1.0)  # relationship strength 0-1
-    source = Column(String(50))  # "extraction" | "user_explicit" | "contradiction_scan"
-    created_at = Column(DateTime, default=func.now(), nullable=False)
-
-
 class AgentScratchpad(Base):
     """Working memory: structured notes for long-horizon tasks."""
     __tablename__ = "agent_scratchpad"
@@ -691,3 +639,10 @@ class SkillPermission(Base):
     grantee_id = Column(String(36), nullable=False)
     granted_by = Column(String(36), nullable=False)
     granted_at = Column(DateTime, default=func.now(), nullable=False)
+
+
+# ── Re-exports from skill models ─────────────────────────────────────────────
+# Knowledge models moved to skills/knowledge/models.py (sk_knowledge_ prefix).
+# Re-exported here so existing `from api.models import KnowledgeEntry` still works.
+from skills.knowledge.models import SkKnowledgeEntry as KnowledgeEntry  # noqa: F401
+from skills.knowledge.models import SkKnowledgeRelation as KnowledgeRelation  # noqa: F401

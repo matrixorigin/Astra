@@ -275,13 +275,13 @@ class RegressionGate:
                 action = change_content.get("action", "quarantine")
                 if action == "quarantine":
                     self.db.execute(text(f"""
-                        UPDATE {sandbox_name}.knowledge_entries
+                        UPDATE {sandbox_name}.sk_knowledge_entries
                         SET confidence = 0.0
                         WHERE entry_id = :entry_id
                     """), {"entry_id": entry_id})
                 elif action == "restore":
                     self.db.execute(text(f"""
-                        UPDATE {sandbox_name}.knowledge_entries
+                        UPDATE {sandbox_name}.sk_knowledge_entries
                         SET confidence = :confidence
                         WHERE entry_id = :entry_id
                     """), {

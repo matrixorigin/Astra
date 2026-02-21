@@ -3,7 +3,7 @@
 from sqlalchemy import Column, DateTime, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.sql import func
 
-from api.models import Base
+from api.base import Base
 
 
 class SkGithubRepo(Base):

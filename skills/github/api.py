@@ -298,7 +298,7 @@ class GitHubSkillAPI:
     # ------------------------------------------------------------------
 
     def _cache_pr(self, repo: str, pr_data: dict) -> None:
-        """Upsert PR data into cache (if user DB available)."""
+        """Upsert PR data into cache (if DB session available)."""
         if not self._db:
             return
         try:

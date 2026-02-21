@@ -237,7 +237,7 @@ class HybridRetriever:
                     ) +
                     :w_confidence * confidence
                 ) AS relevance_score
-            FROM knowledge_entries
+            FROM sk_knowledge_entries
             WHERE user_id = :user_id
                 AND confidence > :threshold
                 AND embedding IS NOT NULL
@@ -301,7 +301,7 @@ class HybridRetriever:
                             text(f"""
                                 SELECT entry_id, category, key_name, value, confidence, trust_tier,
                                        created_at, last_validated_at
-                                FROM knowledge_entries
+                                FROM sk_knowledge_entries
                                 WHERE entry_id IN ({ph}) AND user_id = :uid AND confidence > :thr
                             """),
                             params,

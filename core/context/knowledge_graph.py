@@ -1,4 +1,4 @@
-"""Knowledge Graph — entity-relationship layer over knowledge_entries.
+"""Knowledge Graph — entity-relationship layer over sk_knowledge_entries.
 
 Ref: memory-and-context.md §9 — "Knowledge Graphs for Semantic Memory"
 
@@ -37,7 +37,7 @@ def add_relation(
     try:
         db.execute(
             text("""
-                INSERT INTO knowledge_relations
+                INSERT INTO sk_knowledge_relations
                 (relation_id, subject_id, predicate, object_id, weight, source, created_at)
                 VALUES (:rid, :sid, :pred, :oid, :w, :src, NOW())
                 ON DUPLICATE KEY UPDATE weight = VALUES(weight), source = VALUES(source)
@@ -85,12 +85,12 @@ def get_neighbors(
     if direction in ("outgoing", "both"):
         clauses.append(f"""
             SELECT object_id AS neighbor_id, predicate, weight, 'outgoing' AS dir
-            FROM knowledge_relations WHERE subject_id = :eid {pred_filter}
+            FROM sk_knowledge_relations WHERE subject_id = :eid {pred_filter}
         """)
     if direction in ("incoming", "both"):
         clauses.append(f"""
             SELECT subject_id AS neighbor_id, predicate, weight, 'incoming' AS dir
-            FROM knowledge_relations WHERE object_id = :eid {pred_filter}
+            FROM sk_knowledge_relations WHERE object_id = :eid {pred_filter}
         """)
 
     sql = " UNION ALL ".join(clauses) + " ORDER BY weight DESC LIMIT :limit"
@@ -126,10 +126,10 @@ def expand_with_graph(
     sql = text(f"""
         SELECT neighbor_id, SUM(weight) AS total_weight FROM (
             SELECT object_id AS neighbor_id, weight
-            FROM knowledge_relations WHERE subject_id IN ({placeholders})
+            FROM sk_knowledge_relations WHERE subject_id IN ({placeholders})
             UNION ALL
             SELECT subject_id AS neighbor_id, weight
-            FROM knowledge_relations WHERE object_id IN ({placeholders})
+            FROM sk_knowledge_relations WHERE object_id IN ({placeholders})
         ) t
         WHERE neighbor_id NOT IN ({placeholders})
         GROUP BY neighbor_id

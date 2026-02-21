@@ -642,7 +642,7 @@ class TestNewChangeTypes:
         )
         sql_text = gate_mock.db.execute.call_args[0][0].text
         assert "confidence = 0.0" in sql_text
-        assert "test_sb.knowledge_entries" in sql_text
+        assert "test_sb.sk_knowledge_entries" in sql_text
 
     def test_apply_knowledge_restore_to_sandbox(self, gate, setup_tables):
         """KNOWLEDGE restore should set confidence to specified value."""
