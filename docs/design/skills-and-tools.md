@@ -1,15 +1,17 @@
 # Skills and Tools
 
 > **Status**: Core Design — single source of truth for skill system and tool integration  
-> **Last Updated**: 2026-02-14
+> **Last Updated**: 2026-02-22
 
 ---
 
-## The Shift: From Functions to Modular Expertise
+## The Shift: From Functions to Stateful Packages
 
-The industry is moving from "tools as function calls" to "skills as modular expertise packages." Anthropic's Agent Skills introduces three-tier progressive loading.
+The industry is moving from "tools as function calls" to "skills as modular expertise packages." Anthropic's Agent Skills introduces three-tier progressive loading. ElizaOS pioneered plugin schemas (plugins declare DB tables, platform auto-migrates).
 
-mo-agent-engine's skill system goes beyond industry standards by adding what no one else has: **versioning, auditability, side-effect isolation, and regression testing** — all backed by MatrixOne's time-travel and branching capabilities. MCP/A2A are supported as interop layers, not architectural drivers.
+mo-agent-engine goes further with **Skill-as-Package**: skills are platform capabilities with platform-defined schemas and typed API layers. Users bring their own database (BYOD); installing a skill runs platform-defined DDL on the user's DB. Users interact with skill data through skill APIs, not direct SQL. No other agent framework supports this.
+
+For the full Skill-as-Package architecture (BYOD, install lifecycle, skill API layer, credential management), see **[skill-as-package.md](skill-as-package.md)**. This document focuses on skill execution, selection, and tool design.
 
 ---
 
@@ -17,14 +19,19 @@ mo-agent-engine's skill system goes beyond industry standards by adding what no 
 
 ### What a Skill Is
 
-A skill is a **versioned, declarative capability** with:
+A skill is a **versioned, stateful capability package** with:
 
 - **Identity**: name, version (semver), description
-- **Requirements**: what it needs (repo type, permissions, parameters)
+- **Schema**: database tables defined by platform (created on install in user's BYOD)
+- **API layer**: typed interface for data access (users don't write direct SQL)
+- **Credentials**: what secrets it needs (e.g. GitHub token, per-user encrypted)
+- **Requirements**: what it needs (permissions, platform capabilities)
 - **Side-effect profile**: read / write / destructive (see [Trust and Safety](trust-and-safety.md))
 - **Progressive disclosure**: metadata → summary → full instructions
 - **Execution logic**: the actual code
 - **Audit trail**: every invocation recorded with version, params, result
+
+Skills are platform capabilities with deterministic schemas: install creates tables (platform DDL), skill provides typed API for data access. See [skill-as-package.md](skill-as-package.md) for the full architecture.
 
 ### Execution Model
 
@@ -276,19 +283,25 @@ Deprecated:  Still works, but new selections discouraged
 Archived:    Read-only, available for replay only
 ```
 
-### Skill as MCP-Compatible Package
+### Skill as Stateful Package
 
 ```yaml
 # skill.yaml — declarative skill definition
 name: code_review
 version: 2.1.0
 description: Review code changes for quality, security, and style
+table_prefix: code_review    # tables: code_review_{table_name}
+
+credentials:
+  - name: github_token
+    type: secret
+    description: GitHub Personal Access Token
+    required: true
 
 triggers:
   keywords: [review, PR, pull request, code quality]
   
 requirements:
-  repo_type: code
   access: read
   
 parameters:
@@ -314,17 +327,51 @@ progressive_disclosure:
 mcp_compatible: true
 ```
 
+For the full package structure (schema.py, migrations/, manifest.yaml), see [skill-as-package.md](skill-as-package.md).
+
 ---
 
 ## 6. Skill Marketplace
 
 ### The Vision: App Store for Agent Skills
 
-Skills should be publishable, discoverable, and subscribable — like an app store. A team builds a "Kubernetes Deployment" skill, publishes it, and any agent on the platform can subscribe and use it.
+Skills are publishable, discoverable, and installable — like an app store. Admin publishes skills to the marketplace, controls visibility per user/role, and users install skills into their own BYOD database.
 
-### Architecture: Publish → Subscribe → Use
+### Architecture: Publish → Authorize → Install → Use
 
-MatrixOne's cross-tenant Publication is the natural mechanism: a skill publisher (account) publishes a database containing skill definitions, and subscriber accounts create read-only subscription databases to access them. Updates propagate automatically.
+```
+ADMIN (platform operator)
+  │
+  ├── Publishes skill to marketplace (skill_definitions table)
+  ├── Grants access: per-user or per-role (skill_permissions table)
+  └── Manages skill lifecycle: activate / deprecate / archive
+
+USER
+  │
+  ├── Registers DB connection (user_connections — BYOD)
+  ├── Browses available skills (filtered by permissions)
+  ├── Installs skill:
+  │     → Platform runs migrations on user's DB
+  │     → Creates {skill}_{table} tables
+  │     → User provides credentials (encrypted in platform DB)
+  │     → Records in skill_installations
+  ├── Uses skill in sessions (agent calls skill, skill reads/writes user DB)
+  └── Uninstalls skill (optional: keep or drop tables)
+```
+
+### Platform Tables for Marketplace
+
+- `skill_definitions` — catalog of available skills (admin-managed)
+- `skill_permissions` — RBAC: which users/roles can see which skills
+- `skill_installations` — tracks what's installed per user
+- `user_connections` — user's BYOD database connection info
+- `user_credentials` — per-user encrypted secrets for skills
+
+For full table schemas and install/uninstall lifecycle, see [skill-as-package.md](skill-as-package.md).
+
+### MatrixOne-Enhanced Distribution (opt-in)
+
+When both publisher and subscriber are on MatrixOne, skill distribution can leverage native Publication for zero-copy, auto-updating skill catalogs:
 
 ```
 PUBLISHER (skill author account)
@@ -371,84 +418,35 @@ Submit to marketplace
   │
   ▼
 Automated validation:
-  - skill.yaml schema valid?
+  - manifest.yaml schema valid?
   - Side-effect profile declared?
   - Test coverage provided?
   - Regression gate passes?
   │
   ▼
-Published (status: "listed")
+Published (admin adds to skill_definitions)
   │
   ▼
-Other teams subscribe → skill available in their agents
+Admin grants access → users can install into their BYOD
 ```
 
-### Marketplace Tables
+### Marketplace Table Design
 
-```sql
-CREATE TABLE skill_listings (
-  listing_id    VARCHAR(64) PRIMARY KEY,
-  skill_id      VARCHAR(64) NOT NULL,
-  publisher_id  VARCHAR(64) NOT NULL,  -- account/team
-  
-  -- Discovery
-  display_name  VARCHAR(255),
-  description   TEXT,
-  category      VARCHAR(100),          -- "devops", "security", "data", ...
-  tags          JSON,
-  
-  -- Quality signals
-  avg_rating    DECIMAL(3,2),
-  total_installs INT DEFAULT 0,
-  quality_gate_passed BOOLEAN DEFAULT FALSE,
-  
-  -- Access control
-  visibility    VARCHAR(20) DEFAULT 'public',  -- public | team | private
-  pricing_tier  VARCHAR(20) DEFAULT 'free',    -- free | premium
-  
-  -- Versioning
-  latest_version VARCHAR(20),
-  
-  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
+All marketplace tables (skill_definitions, skill_permissions, skill_installations, user_connections, user_credentials) are defined in [skill-as-package.md §5](skill-as-package.md). They live in the platform DB, not the user's DB.
 
--- Row-level access: premium skills only visible to paying subscribers
--- Uses MatrixOne's account-level isolation
-```
-
-### Subscription Model
-
-```sql
-CREATE TABLE skill_subscriptions (
-  subscription_id VARCHAR(64) PRIMARY KEY,
-  subscriber_id   VARCHAR(64) NOT NULL,  -- account/team subscribing
-  listing_id      VARCHAR(64) NOT NULL,
-  
-  -- Version pinning
-  pinned_version  VARCHAR(20),           -- NULL = auto-update to latest
-  
-  -- Usage tracking
-  invocation_count INT DEFAULT 0,
-  last_used_at    TIMESTAMP,
-  
-  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-### Version Pinning via Clone
+### MatrixOne-Enhanced: Version Pinning via Clone
 
 Subscribers who need version stability can clone instead of subscribing:
 
 ```sql
 -- Pin to current version: clone the published skill (snapshot in time)
 CREATE CLONE pinned_skills FROM publisher_acct.skill_catalog;
--- This is a writable copy — won't change when publisher updates
 
 -- Or subscribe for auto-updates (read-only, always latest)
 CREATE DATABASE live_skills FROM publisher_acct PUBLICATION skill_catalog_pub;
 ```
 
-Two consumption modes from one mechanism: **subscribe** for always-latest, **clone** for pinned versions. No version management API needed.
+Two consumption modes from one mechanism: **subscribe** for always-latest, **clone** for pinned versions.
 
 ### Why MatrixOne Makes This Trivial
 
@@ -474,5 +472,6 @@ With MatrixOne: **Publication = distribution + auto-update. Clone = version pinn
 - [A2A Protocol Guide](https://a2aprotocol.ai/blog/2025-full-guide-a2a-protocol)
 - [AI Agents 2026: Practical Architecture](https://www.andriifurmanets.com/blogs/ai-agents-2026-practical-architecture-tools-memory-evals-guardrails)
 - [Vercel: Agent Skills — Creating, Installing, and Sharing](https://vercel.com/kb/guide/agent-skills-creating-installing-and-sharing-reusable-agent-context)
+- [ElizaOS: Plugin Database Schema](https://docs.elizaos.ai/plugins/schemas) — plugin-declared schemas with auto-migration (closest industry precedent to Skill-as-Package)
 
 Content was rephrased for compliance with licensing restrictions.

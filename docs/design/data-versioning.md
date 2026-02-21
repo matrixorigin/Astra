@@ -1,7 +1,9 @@
 # Data Versioning (Git for Data)
 
 > **Status**: Core Design — single source of truth for time travel, sandbox, branching, and data lineage  
-> **Last Updated**: 2026-02-14
+> **Last Updated**: 2026-02-22
+
+> **Data ownership note**: Data versioning operations (sandbox, time-travel, branching) apply to both the platform DB and the user's BYOD database. Enhanced operations (zero-copy clone, native time-travel) require MatrixOne. See [skill-as-package.md](skill-as-package.md) for the BYOD architecture.
 
 ---
 

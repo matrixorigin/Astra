@@ -39,7 +39,7 @@ Inspired by cognitive science and aligned with the latest industry research (Gen
 │  Extracted knowledge: "what is true"                        │
 │  User prefers X, codebase uses pattern Y, API Z is flaky   │
 │  Lifetime: long-term, evolving                              │
-│  Storage: knowledge_entries + vector store                  │
+│  Storage: knowledge_entries + vector store (user BYOD)      │
 ├─────────────────────────────────────────────────────────────┤
 │  PROCEDURAL MEMORY                                          │
 │  Learned behaviors: "how to do things"                      │
@@ -343,7 +343,9 @@ conversation_events:
 
 Retrieval: by session (recent), by causal chain (thread), by user (cross-session), by semantic similarity (embedding search).
 
-### Semantic Memory: knowledge_entries (NEW)
+### Semantic Memory: knowledge_entries
+
+> **Data ownership note**: `knowledge_entries` and `knowledge_relations` are part of the **knowledge skill** — their schema is platform-defined, but the data lives in the user's BYOD database. Tables are created when the knowledge skill is installed. Users access data through the knowledge skill API. See [skill-as-package.md](skill-as-package.md).
 
 Extracted, structured knowledge that persists across sessions:
 
@@ -457,7 +459,9 @@ No single retrieval method works for all memory types:
 
 ### MatrixOne-Native Retrieval (No External Vector DB)
 
-**Critical design decision**: We do NOT use an external vector database. MatrixOne natively supports VECTOR type, IVF/HNSW indexes, fulltext search, and hybrid search. All memory retrieval happens in a single SQL query — no Pinecone, no Milvus, no sync headaches.
+**Critical design decision**: We do NOT use an external vector database. When the user's BYOD is MatrixOne, it natively supports VECTOR type, IVF/HNSW indexes, fulltext search, and hybrid search. All memory retrieval happens in a single SQL query — no Pinecone, no Milvus, no sync headaches. For MySQL BYOD users, vector search falls back to application-level embedding comparison.
+
+> **Note**: `knowledge_entries` lives in the user's BYOD database (part of the knowledge skill). `conversation_events` lives in the platform DB. See [skill-as-package.md](skill-as-package.md) for the data ownership model.
 
 ```sql
 -- knowledge_entries stores embeddings directly
@@ -771,7 +775,9 @@ CREATE TABLE observations (
 
 ### Knowledge Graphs for Semantic Memory
 
-EverMemOS uses dynamic knowledge graphs for entity relationships. Our `knowledge_entries` table could be extended with an entity-relationship layer for richer semantic retrieval.
+✅ **Implemented**: `knowledge_relations` table provides an entity-relationship layer over `knowledge_entries`. Supports `add_relation`, `get_neighbors` (1-hop with predicate filter), and `expand_with_graph` (1-hop expansion for hybrid retrieval). Wired into `HybridRetriever.retrieve_knowledge()` — top-5 seeds → 1-hop graph expansion → append related entries.
+
+Both `knowledge_entries` and `knowledge_relations` are part of the **knowledge skill** and live in the user's BYOD database. See [skill-as-package.md](skill-as-package.md).
 
 ### Predictive Context Loading
 

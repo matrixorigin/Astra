@@ -49,10 +49,16 @@ We don't compete on "smarter LLM." We compete on **trust infrastructure**: every
 │  Memory │ Context │ Skills │ Planning │ Trust Engine │       │
 │  LLM Client │ Streaming │ Evaluation │ Cost Control         │
 ├─────────────────────────────────────────────────────────────┤
-│              PLATFORM STATE (MatrixOne instance)             │
-│  Agent state: sessions, events, skills, decisions, snapshots│
-│  Agent memory: episodic, semantic, procedural               │
-│  Platform ops: SLO metrics, quality scores, audit trail     │
+│              PLATFORM STATE (Platform DB)                    │
+│  Identity: users, roles, permissions                        │
+│  Runtime: sessions, events, decisions, snapshots, audit     │
+│  Catalog: skill_definitions, skill_permissions, models      │
+│  Connections: user_connections, user_credentials (encrypted) │
+├─────────────────────────────────────────────────────────────┤
+│              USER DATA (BYOD — user's own DB)               │
+│  Skill tables: {skill}_{table} (created on skill install)   │
+│  Platform meta: _agent_meta_installed_skills                │
+│  User provides DB connection (MatrixOne / MySQL / etc.)     │
 ├─────────────────────────────────────────────────────────────┤
 │          ENHANCED SERVICES (optional, MatrixOne-native)      │
 │  Sandbox (clone) │ Pub/Sub (marketplace) │ Time Travel      │
@@ -62,9 +68,13 @@ We don't compete on "smarter LLM." We compete on **trust infrastructure**: every
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Key distinction**: The platform manages agent state (sessions, events, memory, decisions) in its own MatrixOne instance. It does NOT assume ownership of the user's business data. Agents can operate on any data source — MySQL, PostgreSQL, S3, APIs, files.
+**Key distinction — three data layers**:
 
-The Enhanced Services layer activates when the user's data also lives on MatrixOne. In that case, services like Sandbox accept a `db: Session` handle and operate on the user's database directly — zero-copy clone, time-travel, hybrid search become available. These are opt-in capabilities, not platform requirements.
+1. **Platform DB** — managed by platform operator. Stores identity, sessions, events, audit trail, skill catalog, and user DB connection info. Users never touch this directly.
+2. **User DB (BYOD)** — user provides their own database connection (MatrixOne, MySQL, etc.). Skill business data lives here. Tables are created when a skill is installed, using `{skill}_{table}` naming convention. Data sovereignty belongs to the user.
+3. **Enhanced Services** — opt-in capabilities when user data is on MatrixOne (zero-copy clone, time-travel, hybrid search).
+
+Skills are **stateful platform capabilities** with platform-defined schemas and typed API layers. Installing a skill creates its tables (platform-defined DDL) in the user's BYOD. See [Skill-as-Package](skill-as-package.md).
 
 Adding a new User Agent = define `AgentProfile` (system_prompt + skills + model). Zero platform code.
 
@@ -76,7 +86,8 @@ This is the index. Each document is the **single source of truth** for its domai
 |----------|-------|
 | [Memory and Context](memory-and-context.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
 | [Trust and Safety](trust-and-safety.md) | Decision audit, hallucination firewall, uncertainty quantification, regression gate, observability, guardrails |
-| [Skills and Tools](skills-and-tools.md) | Skill system, MCP compatibility, tool design, side-effect profiles, progressive disclosure |
+| [Skills and Tools](skills-and-tools.md) | Skill system, MCP compatibility, tool design, side-effect profiles, progressive disclosure, marketplace |
+| [Skill-as-Package](skill-as-package.md) | Stateful skill architecture: BYOD, platform-defined schema, install lifecycle, skill API layer, credential management |
 | [Unified Selector Pipeline](unified-selector-pipeline.md) | Skill selection: retrieve → audit → feedback pipeline |
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
@@ -110,11 +121,11 @@ Following Anthropic's insight: the question is not "how to write a better prompt
 
 Our implementation: task-aware budget allocation, just-in-time retrieval, compaction for long-horizon tasks, structured note-taking for cross-session persistence. See [Memory and Context](memory-and-context.md).
 
-### 3. Skills Are MCP-Compatible, Progressive-Disclosure Modules
+### 3. Skills Are Stateful Packages with BYOD
 
-Industry trend: Anthropic's Agent Skills (three-tier progressive loading), MCP as the tool protocol standard, Google's A2A for agent-to-agent communication.
+Industry trend: Anthropic's Agent Skills (three-tier progressive loading), MCP as the tool protocol standard, ElizaOS plugin schemas. But no framework supports user-owned databases or skill install lifecycle.
 
-Our position: Skills are versioned, declarative capabilities that load progressively (metadata → summary → full instructions). They expose MCP-compatible interfaces. External MCP servers can register as skill sources. See [Skills and Tools](skills-and-tools.md).
+Our position: Skills are **stateful platform capabilities** — the platform defines skill table schemas (deterministic, like any other model), and users bring their own database (BYOD). Installing a skill runs platform-defined DDL on the user's DB. Skills expose typed API layers for data access. This goes beyond ElizaOS (plugin-owned schema, fixed PG, no BYOD) and far beyond LangChain/CrewAI (stateless functions). See [Skill-as-Package](skill-as-package.md) and [Skills and Tools](skills-and-tools.md).
 
 ### 4. Trust Is Built Into the Platform, Not Bolted On
 
@@ -122,17 +133,21 @@ Industry trend: Decision lineage (Elixir Data), agentic observability (DataRobot
 
 Our position: Every decision binds to a data snapshot. Every response carries confidence signals. Every change passes a regression gate. This is not optional — it's platform infrastructure. See [Trust and Safety](trust-and-safety.md).
 
-### 5. MatrixOne: Platform State + Optional Enhanced Services
+### 5. MatrixOne: Platform State + BYOD + Optional Enhanced Services
 
-MatrixOne serves two distinct roles:
+MatrixOne serves three distinct roles:
 
 **Role 1: Platform State Store (always)**
 
-The platform's own state — agent sessions, events, memory, skills, decisions, audit trail — lives in a MatrixOne instance. This gives the platform native vector search (memory retrieval), fulltext search (event search), HTAP (event writes + quality analytics), and time-travel (decision audit) for its own operational data. No external vector DB or search engine needed for platform operations.
+The platform's own state — user identity, sessions, events, skill catalog, decisions, audit trail — lives in a MatrixOne instance managed by the platform operator. This gives the platform native vector search, fulltext search, HTAP, and time-travel for its own operational data.
 
-**Role 2: Enhanced Services for User Data (opt-in)**
+**Role 2: User Data Store via BYOD (always)**
 
-When the user's business data also lives on MatrixOne, the platform can offer enhanced services that operate directly on the user's database. These services accept a `db` handle and use MatrixOne-native operations:
+Users register their own database connection (MatrixOne, MySQL, or any MySQL-compatible DB). Skill business data — repos, PR caches, knowledge entries, etc. — lives in the user's DB. The platform connects to the user's DB at runtime to execute skills. Tables are created when skills are installed, using `{skill}_{table}` naming. Data sovereignty belongs to the user. See [Skill-as-Package](skill-as-package.md).
+
+**Role 3: Enhanced Services (opt-in, MatrixOne-native)**
+
+When the user's DB is also MatrixOne, the platform can offer enhanced services that operate directly on the user's database:
 
 | Enhanced Service | What It Does | How It Works |
 |---|---|---|
@@ -143,7 +158,7 @@ When the user's business data also lives on MatrixOne, the platform can offer en
 | Skill Marketplace | Publish/subscribe skill definitions | `CREATE PUBLICATION` → cross-account sharing |
 | Dynamic Table | Real-time derived views | Auto-refreshing aggregates on user's data |
 
-The platform does NOT require users to put their data in MatrixOne. Agents can operate on any data source. Enhanced services are a value-add for MatrixOne users, not a platform dependency. See [data-versioning.md §6](data-versioning.md) for the concrete workflows.
+The platform does NOT require users to put their data in MatrixOne. Users bring their own DB (BYOD) for skill data. Enhanced services are a value-add for MatrixOne users, not a platform dependency. See [data-versioning.md §6](data-versioning.md) for the concrete workflows.
 
 ### 6. Event-Centric, Not State-Centric
 
@@ -154,12 +169,13 @@ All state flows through `conversation_events` with causal chain tracking. This e
 | Industry Direction | Our Alignment |
 |-------------------|---------------|
 | Anthropic Agent Teams: parallel coordination, shared task board | Teams with clone-per-agent speculative execution — run 4 approaches, keep the best |
-| Vercel/Anthropic Skills: composable, shareable agent capabilities | Skill Marketplace via Publication — distribution without infrastructure |
+| Vercel/Anthropic Skills: composable, shareable agent capabilities | Skill-as-Package: stateful skills with schema + migrations + marketplace + RBAC |
+| ElizaOS plugin schemas: plugins declare DB tables | Platform-defined schema + BYOD + typed skill API — simpler and safer than plugin-owned schemas |
 | RouteMoA: cost-quality model routing | Self-improving router that learns from historical quality/cost data |
 | MemGPT/EverMemOS: cognitive memory architecture | Hybrid memory recall — vector + fulltext + quality in one query, self-curating |
 | Braintrust/Maxim: agent evaluation, regression testing | Clone-test-merge — zero-risk evolution, regression gate as database operation |
 | Microsoft zero-trust: auditable, verifiable agent decisions | Snapshot-as-ground-truth — every decision reconstructable at any future point |
-| Industry-wide: too many systems to integrate | Platform state on single MatrixOne instance (vector DB, search, analytics consolidated); enhanced services for MatrixOne users |
+| Industry-wide: too many systems to integrate | Platform state on single MatrixOne instance; user data via BYOD; enhanced services for MatrixOne users |
 
 ## What This Is NOT
 
