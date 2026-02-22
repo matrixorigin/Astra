@@ -317,6 +317,74 @@ def skill_register(skill_file):
     click.echo(f"   Skill ID: {skill_id}")
 
 
+@skill.command("install")
+@click.argument("skill_name")
+@click.option("--user-id", default="default", help="User ID")
+def skill_install(skill_name, user_id):
+    """Install a skill from the marketplace."""
+    from config.settings import get_settings
+    from core.skills.credential_manager import CredentialManager
+    from core.skills.skill_manager import SkillManager, SkillNotFoundError, PermissionDeniedError
+
+    db = next(get_db_session())
+    settings = get_settings()
+    mgr = SkillManager(db, CredentialManager(settings.secret_key))
+
+    try:
+        inst = mgr.install(user_id, skill_name)
+        click.echo(f"✅ Installed {inst.skill_name} v{inst.skill_version}")
+    except SkillNotFoundError:
+        click.echo(f"❌ Skill '{skill_name}' not found", err=True)
+        raise click.Abort()
+    except PermissionDeniedError:
+        click.echo(f"❌ No permission to install '{skill_name}'", err=True)
+        raise click.Abort()
+
+
+@skill.command("uninstall")
+@click.argument("skill_name")
+@click.option("--user-id", default="default", help="User ID")
+def skill_uninstall(skill_name, user_id):
+    """Uninstall a skill (removes credentials too)."""
+    from config.settings import get_settings
+    from core.skills.credential_manager import CredentialManager
+    from core.skills.skill_manager import SkillManager, SkillNotInstalledError
+
+    db = next(get_db_session())
+    settings = get_settings()
+    mgr = SkillManager(db, CredentialManager(settings.secret_key))
+
+    try:
+        mgr.uninstall(user_id, skill_name)
+        click.echo(f"✅ Uninstalled '{skill_name}'")
+    except SkillNotInstalledError:
+        click.echo(f"❌ '{skill_name}' is not installed", err=True)
+        raise click.Abort()
+
+
+@skill.command("installed")
+@click.option("--user-id", default="default", help="User ID")
+def skill_installed(user_id):
+    """List installed skills for a user."""
+    from config.settings import get_settings
+    from core.skills.credential_manager import CredentialManager
+    from core.skills.skill_manager import SkillManager
+
+    db = next(get_db_session())
+    settings = get_settings()
+    mgr = SkillManager(db, CredentialManager(settings.secret_key))
+
+    rows = mgr.list_installed(user_id)
+    if not rows:
+        click.echo("No skills installed")
+        return
+
+    click.echo("Installed Skills:")
+    click.echo("=" * 50)
+    for r in rows:
+        click.echo(f"  ✓ {r.skill_name} v{r.skill_version}")
+
+
 @skill.command("learn")
 @click.option("--days", default=7, help="Look back N days for failures")
 @click.option("--force", is_flag=True, help="Force learning even in cooldown period")
