@@ -598,7 +598,7 @@ class ChatLoop:
                     data={"chunk": chunk},
                     event_id=text_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                    agent_id=self.agent_id,
                 )
                 for warning in warnings:
                     sv.full_text += warning
@@ -607,7 +607,7 @@ class ChatLoop:
                         data={"chunk": warning},
                         event_id=text_event.event_id,
                         causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                        agent_id=self.agent_id,
                     )
 
             # Flush remaining buffer + pending sentences
@@ -618,7 +618,7 @@ class ChatLoop:
                     data={"chunk": warning},
                     event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                    agent_id=self.agent_id,
                 )
 
             full_text = sv.full_text
@@ -641,7 +641,7 @@ class ChatLoop:
                     data={"chunk": warning},
                     event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                    agent_id=self.agent_id,
                 )
                 full_text += warning
 
@@ -658,7 +658,7 @@ class ChatLoop:
                 data={"full_text": full_text, "context_capture_id": context_capture_id},
                 event_id=text_done_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                agent_id=self.agent_id,
             )
             self._log_response(
                 user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
@@ -678,7 +678,7 @@ class ChatLoop:
                 data={},
                 event_id=run_finished_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                agent_id=self.agent_id,
             )
             return
 
@@ -736,7 +736,7 @@ class ChatLoop:
                         data={"chunk": chunk["content"]},
                         event_id=text_event.event_id,
                         causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                        agent_id=self.agent_id,
                     )
                 elif chunk["type"] == "tool_call":
                     # Accumulate tool calls (streamed in fragments)
@@ -770,7 +770,7 @@ class ChatLoop:
                     data={"full_text": full_text, "context_capture_id": context_capture_id},
                     event_id=text_done_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                    agent_id=self.agent_id,
                 )
                 self._log_response(
                     user_id, session_id, full_text, user_event.event_id, user_event.causal_chain_id,
@@ -790,7 +790,7 @@ class ChatLoop:
                     data={},
                     event_id=run_finished_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                    agent_id=self.agent_id,
                 )
                 return
 
@@ -857,7 +857,7 @@ class ChatLoop:
                             agent_id = event.agent_id
                             call_id = agent_to_call.get(agent_id)
                             if call_id and call_id not in results:  # Only collect first TEXT_DONE
-                                result_text = event.data.get("text", "")
+                                result_text = event.data.get("full_text", "")
                                 results[call_id] = result_text
                         # Track completion
                         elif event.event_type == StreamEventType.AGENT_COMPLETED:
@@ -985,7 +985,7 @@ class ChatLoop:
                                     
                                     # Collect final result
                                     if delegated_event.event_type == StreamEventType.TEXT_DONE:
-                                        result_text = delegated_event.data.get("text", "")
+                                        result_text = delegated_event.data.get("full_text", "")
                                         has_output = True
                                 
                                 # Use collected result or fallback message with agent_id
@@ -1072,7 +1072,7 @@ class ChatLoop:
                 data={"chunk": chunk},
                 event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                agent_id=self.agent_id,
             )
             for warning in warnings:
                 sv.full_text += warning
@@ -1081,7 +1081,7 @@ class ChatLoop:
                     data={"chunk": warning},
                     event_id=user_event.event_id,
                     causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                    agent_id=self.agent_id,
                 )
 
         for warning in sv.flush():
@@ -1091,7 +1091,7 @@ class ChatLoop:
                 data={"chunk": warning},
                 event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                agent_id=self.agent_id,
             )
 
         full_text = sv.full_text
@@ -1114,7 +1114,7 @@ class ChatLoop:
                 data={"chunk": warning},
                 event_id=user_event.event_id,
                 causal_chain_id=user_event.causal_chain_id,
-            agent_id=self.agent_id,
+                agent_id=self.agent_id,
             )
             full_text += warning
 

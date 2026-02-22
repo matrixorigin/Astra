@@ -146,12 +146,12 @@ async def test_parallel_delegation_records_feedback(mock_needs_planning):
         from core.events.models import StreamEvent, StreamEventType
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DONE,
-            data={"text": "Agent 1 done"},
+            data={"full_text": "Agent 1 done"},
             agent_id="agent_1"
         )
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DONE,
-            data={"text": "Agent 2 done"},
+            data={"full_text": "Agent 2 done"},
             agent_id="agent_2"
         )
     

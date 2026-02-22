@@ -40,7 +40,7 @@ async def test_chatloop_parallel_delegation_detection():
         
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DONE,
-            data={"text": reviews.get(agent_id, "Review complete")},
+            data={"full_text": reviews.get(agent_id, "Review complete")},
             agent_id=agent_id,
         )
         
@@ -110,8 +110,8 @@ async def test_chatloop_parallel_delegation_detection():
     
     # Verify TEXT_DONE events contain results
     for event in text_done:
-        assert "text" in event.data, f"TEXT_DONE missing text: {event.data}"
-        assert event.data["text"], f"TEXT_DONE has empty text: {event.data}"
+        assert "full_text" in event.data, f"TEXT_DONE missing full_text: {event.data}"
+        assert event.data["full_text"], f"TEXT_DONE has empty full_text: {event.data}"
     
     print("✅ Parallel delegation fan-out/fan-in working correctly!")
 
@@ -203,7 +203,7 @@ async def test_delegation_timeout():
         
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DONE,
-            data={"text": "This should not be reached"},
+            data={"full_text": "This should not be reached"},
             agent_id=agent_id,
         )
     
@@ -269,7 +269,7 @@ async def test_delegation_cancellation():
             await asyncio.sleep(0.1)
             yield StreamEvent(
                 event_type=StreamEventType.TEXT_DELTA,
-                data={"text": f"chunk {i}"},
+                data={"chunk": f"chunk {i}"},
                 agent_id=agent_id,
             )
     

@@ -301,7 +301,7 @@ class DelegateTaskSkill(Skill[DelegateTaskInput, DelegateTaskOutput]):
                     # Track completion - collect any final text
                     elif event.event_type == StreamEventType.TEXT_DONE:
                         if idx not in errors:  # Only if no error
-                            results[idx] = event.data.get("text", "")
+                            results[idx] = event.data.get("full_text", "")
                     elif event.event_type == StreamEventType.AGENT_COMPLETED:
                         # Ensure we mark as completed even without TEXT_DONE
                         if idx not in results:

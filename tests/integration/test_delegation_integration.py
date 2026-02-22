@@ -38,13 +38,13 @@ async def test_parallel_delegation_integration():
         
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DELTA,
-            data={"text": f"Review from {agent_id}"},
+            data={"chunk": f"Review from {agent_id}"},
             agent_id=agent_id,
         )
         
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DONE,
-            data={"text": f"Review from {agent_id}"},
+            data={"full_text": f"Review from {agent_id}"},
             agent_id=agent_id,
         )
         
@@ -131,7 +131,7 @@ async def test_sequential_delegation():
         
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DONE,
-            data={"text": result},
+            data={"full_text": result},
             agent_id=agent_id,
         )
         

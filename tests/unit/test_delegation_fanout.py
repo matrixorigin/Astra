@@ -58,13 +58,13 @@ def mock_chat_loop_factory():
         
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DELTA,
-            data={"text": f"Result from {agent_id}"},
+            data={"chunk": f"Result from {agent_id}"},
             agent_id=agent_id,
         )
         
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DONE,
-            data={"text": f"Result from {agent_id}"},
+            data={"full_text": f"Result from {agent_id}"},
             agent_id=agent_id,
         )
         
@@ -347,7 +347,7 @@ class TestErrorScenarios:
             
             yield StreamEvent(
                 event_type=StreamEventType.TEXT_DONE,
-                data={"text": f"Success from {agent_id}"},
+                data={"full_text": f"Success from {agent_id}"},
                 agent_id=agent_id,
             )
             
