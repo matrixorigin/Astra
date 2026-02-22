@@ -145,18 +145,42 @@ class SkillSelector:
         return score
 
     def _resolve_dependencies(self, skills: list[SkillMetadata]) -> list[SkillMetadata]:
-        """Resolve skill dependencies."""
-        result = list(skills)
-        added = {s.name for s in skills}
-
-        for skill in skills:
+        """Resolve transitive dependencies with topological sort and cycle detection."""
+        # Collect all needed skills (BFS for transitive deps)
+        needed: dict[str, SkillMetadata] = {s.name: s for s in skills}
+        queue = list(skills)
+        while queue:
+            skill = queue.pop(0)
             for dep_name in skill.dependencies:
-                if dep_name not in added and dep_name in self.skills:
-                    result.insert(0, self.skills[dep_name])
-                    added.add(dep_name)
-                    logger.debug(f"Added dependency: {dep_name} for {skill.name}")
+                if dep_name not in needed and dep_name in self.skills:
+                    dep = self.skills[dep_name]
+                    needed[dep_name] = dep
+                    queue.append(dep)
 
-        return result
+        # Topological sort (Kahn's algorithm)
+        in_degree: dict[str, int] = {name: 0 for name in needed}
+        for skill in needed.values():
+            for dep_name in skill.dependencies:
+                if dep_name in needed:
+                    in_degree[skill.name] += 1
+
+        queue = [name for name, deg in in_degree.items() if deg == 0]
+        ordered: list[SkillMetadata] = []
+        while queue:
+            name = queue.pop(0)
+            ordered.append(needed[name])
+            for skill in needed.values():
+                if name in skill.dependencies:
+                    in_degree[skill.name] -= 1
+                    if in_degree[skill.name] == 0:
+                        queue.append(skill.name)
+
+        if len(ordered) < len(needed):
+            cycle = [n for n in needed if n not in {s.name for s in ordered}]
+            logger.warning(f"Circular dependency detected: {cycle}, returning flat list")
+            return list(needed.values())
+
+        return ordered
 
     def get_skill_by_name(self, name: str) -> SkillMetadata | None:
         """Get skill metadata by name."""

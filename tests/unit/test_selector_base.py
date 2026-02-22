@@ -94,6 +94,39 @@ class TestSkillSelector:
         assert len(result) == 1
         assert result[0].name == "test_skill"
 
+    def test_resolve_transitive_dependencies(self, db):
+        """A → B → C: selecting A should pull in B and C, ordered C, B, A."""
+        selector = SkillSelector(db)
+        _m = lambda name, deps=[]: SkillMetadata(
+            name=name, version="1.0", description="", category="t",
+            subcategory="s", triggers=[], dependencies=deps,
+            priority=5, cost_estimate="low",
+        )
+        c, b, a = _m("c"), _m("b", ["c"]), _m("a", ["b"])
+        selector.skills = {"a": a, "b": b, "c": c}
+
+        result = selector._resolve_dependencies([a])
+        names = [s.name for s in result]
+        assert set(names) == {"a", "b", "c"}
+        # c before b, b before a (topological order)
+        assert names.index("c") < names.index("b") < names.index("a")
+
+    def test_resolve_circular_dependency(self, db):
+        """A → B → A: should not crash, returns all skills."""
+        selector = SkillSelector(db)
+        _m = lambda name, deps=[]: SkillMetadata(
+            name=name, version="1.0", description="", category="t",
+            subcategory="s", triggers=[], dependencies=deps,
+            priority=5, cost_estimate="low",
+        )
+        a = _m("a", ["b"])
+        b = _m("b", ["a"])
+        selector.skills = {"a": a, "b": b}
+
+        result = selector._resolve_dependencies([a])
+        assert len(result) == 2
+        assert {s.name for s in result} == {"a", "b"}
+
     def test_get_skill_by_name(self, db):
         """Test getting skill by name."""
         selector = SkillSelector(db)
