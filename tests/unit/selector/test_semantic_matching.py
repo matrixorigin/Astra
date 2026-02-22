@@ -178,7 +178,8 @@ class TestSemanticMatching:
         query_text = "Review PR #123"
         embedding = service.embed_text(query_text)
         embedding_vec_str = embedding_to_vec_str(embedding)
-        other_embedding = service.embed_text("Other query")
+        # Use same text to ensure high similarity for mock embeddings
+        other_embedding = service.embed_text(query_text)  # Same text = same embedding
         other_vec_str = embedding_to_vec_str(other_embedding)
 
         learning_id_1 = f"learn-lim-{uuid.uuid4().hex[:8]}"

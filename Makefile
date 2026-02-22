@@ -296,15 +296,35 @@ test:
 	@echo "Running all tests..."
 	@python -m pytest tests/ -v
 
+.PHONY: test-parallel
+test-parallel:
+	@echo "Running all tests in parallel..."
+	@python -m pytest tests/ -n auto -v
+
 .PHONY: test-unit
 test-unit:
 	@echo "Running unit tests..."
 	@python -m pytest tests/unit/ -v
 
+.PHONY: test-unit-parallel
+test-unit-parallel:
+	@echo "Running unit tests in parallel..."
+	@python -m pytest tests/unit/ -n auto -v
+
 .PHONY: test-integration
 test-integration:
 	@echo "Running integration tests..."
 	@python -m pytest tests/integration/ -v
+
+.PHONY: test-integration-parallel
+test-integration-parallel:
+	@echo "Running integration tests in parallel..."
+	@python -m pytest tests/integration/ -n auto -v
+
+.PHONY: test-cleanup
+test-cleanup:
+	@echo "Cleaning up test databases..."
+	@python scripts/cleanup_test_dbs.py
 
 .PHONY: test-api
 test-api:

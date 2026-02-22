@@ -4,6 +4,7 @@ Provides text embedding generation and similarity search.
 """
 
 import json
+import os
 from typing import Any
 
 from core.logging_config import get_logger
@@ -83,7 +84,9 @@ class EmbeddingService:
                         kwargs["base_url"] = base_url
                     self.client = openai.OpenAI(**kwargs)
             except ImportError:
-                logger.warning("OpenAI not available, falling back to mock")
+                # Only warn in production, not in tests
+                if not os.getenv("PYTEST_CURRENT_TEST"):
+                    logger.warning("OpenAI not available, falling back to mock")
                 self.provider = "mock"
 
         if self.provider == "mock":

@@ -7,8 +7,11 @@ Requires: MatrixOne running on localhost:6001.
 """
 
 import pytest
+import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+import os
+from uuid_utils import uuid7
 
 from core.sandbox.branch import Branch
 from core.code_executor.data_context import DataContext, DataAccessLevel, TableDiff
@@ -16,8 +19,18 @@ from core.code_executor import CodeExecutor, CodeExecutionRequest
 from core.code_executor.security import SecurityGuard
 from core.runtime.subprocess_runtime import SubprocessRuntime
 
-TEST_DB = "test_branch_integ"
-MO_URL = "mysql+pymysql://root:111@localhost:6001/information_schema"
+# Support parallel testing with worker-specific database names
+def get_worker_id():
+    """Get pytest-xdist worker ID for database isolation."""
+    return os.getenv("PYTEST_XDIST_WORKER", "master")
+
+worker_id = get_worker_id()
+if worker_id != "master":
+    TEST_DB = f"test_branch_integ_{worker_id}"
+else:
+    TEST_DB = "test_branch_integ"
+
+MO_URL = "mysql+pymysql://root:111@localhost:6001/mo_catalog"
 
 
 @pytest.fixture(scope="module")
@@ -29,6 +42,10 @@ def engine():
 def db(engine) -> Session:
     S = sessionmaker(bind=engine)
     session = S()
+    # Create database if it doesn't exist, then use it
+    session.execute(text(f"CREATE DATABASE IF NOT EXISTS `{TEST_DB}`"))
+    session.commit()
+    session.execute(text(f"USE `{TEST_DB}`"))
     yield session
     session.close()
 
@@ -39,16 +56,22 @@ SANDBOX_DB = f"{TEST_DB}_sandbox"
 @pytest.fixture(autouse=True)
 def clean_db(db):
     """Ensure clean state before and after each test."""
-    for name in (SANDBOX_DB, f"code_exec_{TEST_DB[:8]}", TEST_DB):
-        db.execute(text(f"DROP DATABASE IF EXISTS {name}"))
+    try:
+        # Only clean up databases, not metadata
+        for name in (SANDBOX_DB, f"code_exec_{TEST_DB[:8]}", TEST_DB):
+            db.execute(text(f"DROP DATABASE IF EXISTS `{name}`"))
+            db.commit()
+        db.execute(text(f"CREATE DATABASE IF NOT EXISTS `{TEST_DB}`"))
+        db.execute(text(f"USE `{TEST_DB}`"))
         db.commit()
-    db.execute(text(f"CREATE DATABASE {TEST_DB}"))
-    db.commit()
+    except Exception:
+        pass
     yield
     try:
         db.rollback()
+        # Only clean up databases, not metadata
         for name in (SANDBOX_DB, f"code_exec_{TEST_DB[:8]}", TEST_DB):
-            db.execute(text(f"DROP DATABASE IF EXISTS {name}"))
+            db.execute(text(f"DROP DATABASE IF EXISTS `{name}`"))
             db.commit()
     except Exception:
         pass
@@ -56,10 +79,11 @@ def clean_db(db):
 
 def _seed(db, table="t1", rows=((1, 1), (2, 2), (3, 3))):
     """Create and populate a table in TEST_DB."""
-    db.execute(text(f"CREATE TABLE {TEST_DB}.{table}(a int, b int, primary key(a))"))
+    db.execute(text(f"DROP TABLE IF EXISTS `{TEST_DB}`.`{table}`"))
+    db.execute(text(f"CREATE TABLE `{TEST_DB}`.`{table}`(a int, b int, primary key(a))"))
     if rows:
         vals = ",".join(f"({a},{b})" for a, b in rows)
-        db.execute(text(f"INSERT INTO {TEST_DB}.{table} VALUES {vals}"))
+        db.execute(text(f"INSERT INTO `{TEST_DB}`.`{table}` VALUES {vals}"))
     db.commit()
 
 
@@ -77,17 +101,21 @@ class TestBranch:
     def test_create_zero_copy(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        assert _select(db, "t2") == [(1, 1), (2, 2), (3, 3)]
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        assert _select(db, branch_name) == [(1, 1), (2, 2), (3, 3)]
 
     def test_diff_insert(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        db.execute(text(f"INSERT INTO {TEST_DB}.t2 VALUES(4,4)"))
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        db.execute(text(f"INSERT INTO {TEST_DB}.{branch_name} VALUES(4,4)"))
         db.commit()
 
-        rows = br.diff("t2", "t1")
+        rows = br.diff(branch_name, "t1")
         assert len(rows) == 1
         assert rows[0]["flag"] == "INSERT"
         assert rows[0]["a"] == 4
@@ -95,11 +123,13 @@ class TestBranch:
     def test_diff_update(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        db.execute(text(f"UPDATE {TEST_DB}.t2 SET b=99 WHERE a=1"))
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        db.execute(text(f"UPDATE {TEST_DB}.{branch_name} SET b=99 WHERE a=1"))
         db.commit()
 
-        rows = br.diff("t2", "t1")
+        rows = br.diff(branch_name, "t1")
         assert len(rows) == 1
         assert rows[0]["flag"] == "UPDATE"
         assert rows[0]["b"] == 99
@@ -107,11 +137,13 @@ class TestBranch:
     def test_diff_delete(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        db.execute(text(f"DELETE FROM {TEST_DB}.t2 WHERE a=2"))
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        db.execute(text(f"DELETE FROM {TEST_DB}.{branch_name} WHERE a=2"))
         db.commit()
 
-        rows = br.diff("t2", "t1")
+        rows = br.diff(branch_name, "t1")
         assert len(rows) == 1
         assert rows[0]["flag"] == "DELETE"
         assert rows[0]["a"] == 2
@@ -119,67 +151,79 @@ class TestBranch:
     def test_diff_no_changes(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        assert br.diff("t2", "t1") == []
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        assert br.diff(branch_name, "t1") == []
 
     def test_diff_mixed(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        db.execute(text(f"INSERT INTO {TEST_DB}.t2 VALUES(4,4)"))
-        db.execute(text(f"UPDATE {TEST_DB}.t2 SET b=99 WHERE a=1"))
-        db.execute(text(f"DELETE FROM {TEST_DB}.t2 WHERE a=3"))
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        db.execute(text(f"INSERT INTO {TEST_DB}.{branch_name} VALUES(4,4)"))
+        db.execute(text(f"UPDATE {TEST_DB}.{branch_name} SET b=99 WHERE a=1"))
+        db.execute(text(f"DELETE FROM {TEST_DB}.{branch_name} WHERE a=3"))
         db.commit()
 
-        rows = br.diff("t2", "t1")
+        rows = br.diff(branch_name, "t1")
         flags = {r["flag"] for r in rows}
         assert flags == {"INSERT", "UPDATE", "DELETE"}
 
     def test_merge_accept(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        db.execute(text(f"INSERT INTO {TEST_DB}.t2 VALUES(4,4)"))
-        db.execute(text(f"UPDATE {TEST_DB}.t2 SET b=99 WHERE a=1"))
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        db.execute(text(f"INSERT INTO {TEST_DB}.{branch_name} VALUES(4,4)"))
+        db.execute(text(f"UPDATE {TEST_DB}.{branch_name} SET b=99 WHERE a=1"))
         db.commit()
 
-        br.merge("t2", "t1", on_conflict="accept")
+        br.merge(branch_name, "t1", on_conflict="accept")
         assert _select(db) == [(1, 99), (2, 2), (3, 3), (4, 4)]
 
     def test_merge_skip(self, db):
         """Conflict: both sides modify same row differently."""
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
         # t2: a=1 → b=99
-        db.execute(text(f"UPDATE {TEST_DB}.t2 SET b=99 WHERE a=1"))
+        db.execute(text(f"UPDATE {TEST_DB}.{branch_name} SET b=99 WHERE a=1"))
         db.commit()
         # t1: a=1 → b=50 (conflict)
         db.execute(text(f"UPDATE {TEST_DB}.t1 SET b=50 WHERE a=1"))
         db.commit()
 
-        br.merge("t2", "t1", on_conflict="skip")
+        br.merge(branch_name, "t1", on_conflict="skip")
         # skip = keep target (t1), so a=1 stays b=50
         assert _select(db)[0] == (1, 50)
 
     def test_merge_conflict_accept(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        db.execute(text(f"UPDATE {TEST_DB}.t2 SET b=99 WHERE a=1"))
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        db.execute(text(f"UPDATE {TEST_DB}.{branch_name} SET b=99 WHERE a=1"))
         db.commit()
         db.execute(text(f"UPDATE {TEST_DB}.t1 SET b=50 WHERE a=1"))
         db.commit()
 
-        br.merge("t2", "t1", on_conflict="accept")
+        br.merge(branch_name, "t1", on_conflict="accept")
         # accept = take source (t2), so a=1 becomes b=99
         assert _select(db)[0] == (1, 99)
 
     def test_delete_branch(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        br.delete("t2")
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        br.delete(branch_name)
         # t2 should still exist as a table but branch metadata cleaned
         # Verify by trying to diff — should fail or show no LCA
         # Just verify no exception on delete
@@ -188,12 +232,14 @@ class TestBranch:
     def test_diff_after_merge_is_empty(self, db):
         _seed(db)
         br = Branch(database=TEST_DB, db=db)
-        br.create("t2", "t1")
-        db.execute(text(f"INSERT INTO {TEST_DB}.t2 VALUES(4,4)"))
+        uuid_str = str(uuid7()).replace("-", "_")
+        branch_name = f"t2_{uuid_str}"
+        br.create(branch_name, "t1")
+        db.execute(text(f"INSERT INTO {TEST_DB}.{branch_name} VALUES(4,4)"))
         db.commit()
 
-        br.merge("t2", "t1", on_conflict="accept")
-        rows = br.diff("t2", "t1")
+        br.merge(branch_name, "t1", on_conflict="accept")
+        rows = br.diff(branch_name, "t1")
         assert rows == []
 
 

@@ -123,7 +123,7 @@ def init_db():
     existing = set(inspect(engine).get_table_names(schema=engine.url.database))
     tables_to_create = [t for t in Base.metadata.sorted_tables if t.name not in existing]
     if tables_to_create:
-        Base.metadata.create_all(bind=engine, tables=tables_to_create, checkfirst=False)
+        Base.metadata.create_all(bind=engine, tables=tables_to_create, checkfirst=True)
 
 
 def _import_skill_models():

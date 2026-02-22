@@ -4,7 +4,22 @@ import os
 
 # Must be set BEFORE any app imports so database.py uses test DB on first import
 # os.environ takes priority over .env file in pydantic-settings
-os.environ["MATRIXONE_DATABASE"] = os.getenv("TEST_MATRIXONE_DATABASE", "test_dev_agent_v3")
+
+# Support parallel testing with worker-specific databases
+def get_worker_id():
+    """Get pytest-xdist worker ID for database isolation."""
+    worker_id = os.getenv("PYTEST_XDIST_WORKER", "master")
+    return worker_id
+
+# Set worker-specific database name
+base_db_name = os.getenv("TEST_MATRIXONE_DATABASE", "test_dev_agent_v3")
+worker_id = get_worker_id()
+if worker_id != "master":
+    test_db_name = f"{base_db_name}_{worker_id}"
+else:
+    test_db_name = base_db_name
+
+os.environ["MATRIXONE_DATABASE"] = test_db_name
 
 import pytest
 from sqlalchemy.orm import sessionmaker
@@ -18,7 +33,7 @@ TEST_DATABASE_CONFIG = {
     "port": int(os.getenv("TEST_MATRIXONE_PORT", "6001")),
     "user": os.getenv("TEST_MATRIXONE_USER", "root"),
     "password": os.getenv("TEST_MATRIXONE_PASSWORD", "111"),
-    "database": os.getenv("TEST_MATRIXONE_DATABASE", "test_dev_agent_v3")
+    "database": test_db_name
 }
 
 
@@ -31,7 +46,34 @@ def test_engine():
     engine = database.engine
     init_db()
     yield engine
+    
+    # Cleanup worker databases on session end
+    _cleanup_worker_databases()
     engine.dispose()
+
+
+def _cleanup_worker_databases():
+    """Clean up worker-specific databases after test session."""
+    worker_id = get_worker_id()
+    if worker_id == "master":
+        return  # Only cleanup from master process
+    
+    try:
+        from matrixone import Client
+        client = Client(
+            host=TEST_DATABASE_CONFIG["host"],
+            port=TEST_DATABASE_CONFIG["port"],
+            user=TEST_DATABASE_CONFIG["user"],
+            password=TEST_DATABASE_CONFIG["password"],
+            database="mo_catalog"
+        )
+        
+        # Clean up this worker's database
+        db_name = TEST_DATABASE_CONFIG["database"]
+        client.execute(f'DROP DATABASE IF EXISTS `{db_name}`')
+        client._engine.dispose()
+    except Exception:
+        pass  # Ignore cleanup errors
 
 
 @pytest.fixture(scope="session") 

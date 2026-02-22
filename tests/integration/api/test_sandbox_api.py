@@ -231,33 +231,38 @@ class TestDeleteSandbox:
 class TestSandboxPermissions:
     """测试 sandbox 权限控制"""
     
-    def test_user_cannot_see_others_sandboxes(self, client, db_session):
+    def test_user_cannot_see_others_sandboxes(self, client, test_user):
         """测试用户不能看到其他人的 sandboxes"""
-        import time
+        from api.repositories import UserRepository
+        from core.auth.jwt_manager import create_access_token
+        from core.auth.password import hash_password
+        from api.database import get_db_session
         
-        # Create two users with unique names
+        # Create a second user using consistent pattern
+        db_session = next(get_db_session())
         user_repo = UserRepository(db_session)
-        unique_suffix = f"{str(uuid7())[:8]}_{int(time.time() * 1000000) % 1000000}"
         
-        user1 = user_repo.create({
+        # Clean up any existing user
+        existing = user_repo.get_by_username("testuser2")
+        if existing:
+            user_repo.delete(existing.user_id)
+            db_session.commit()
+        
+        # Create second user
+        user2_data = {
             "user_id": str(uuid7()),
-            "username": f"user1_{unique_suffix}",
-            "email": f"user1_{unique_suffix}@example.com",
-            "password_hash": "hashed",
-            "is_active": True
-        })
-        user2 = user_repo.create({
-            "user_id": str(uuid7()),
-            "username": f"user2_{unique_suffix}",
-            "email": f"user2_{unique_suffix}@example.com",
-            "password_hash": "hashed",
-            "is_active": True
-        })
+            "username": "testuser2",
+            "email": "test2@example.com",
+            "password_hash": hash_password("testpass123"),
+            "is_active": True,
+        }
+        user2 = user_repo.create(user2_data)
         db_session.commit()
         
+        # Create tokens
         token1 = create_access_token({
-            "sub": user1.user_id,
-            "username": user1.username,
+            "sub": test_user.user_id,
+            "username": test_user.username,
             "type": "access"
         })
         token2 = create_access_token({
@@ -285,11 +290,12 @@ class TestSandboxPermissions:
         
         # Cleanup
         try:
-            db_session.delete(user1)
-            db_session.delete(user2)
+            user_repo.delete(user2.user_id)
             db_session.commit()
         except:
             pass
+        finally:
+            db_session.close()
 
 
 class TestSandboxEdgeCases:

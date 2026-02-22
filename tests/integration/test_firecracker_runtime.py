@@ -61,6 +61,6 @@ class TestFirecrackerReal:
         assert result.exit_code == 137
         assert "timed out" in result.stderr
 
-    def test_create_runtime_selects_firecracker(self):
+    def test_create_runtime_selects_firecracker(self, runtime):
         rt = create_runtime(min_isolation=IsolationLevel.MICROVM)
         assert isinstance(rt, FirecrackerRuntime)
