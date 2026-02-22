@@ -33,13 +33,6 @@ class MergeResult:
     tables_failed: list[str]
 
 
-# DB user credentials for access control.
-_DB_USERS = {
-    DataAccessLevel.READ: {"user": "code_exec_ro", "password": "code_exec_ro_pass"},
-    DataAccessLevel.WRITE: {"user": "code_exec_rw", "password": "code_exec_rw_pass"},
-}
-
-
 class DataContext:
     """Session-scoped sandbox with table-level zero-copy branch.
 
@@ -57,8 +50,6 @@ class DataContext:
         source_db: str,
         access: DataAccessLevel,
         session_id: str | None = None,
-        db_host: str = "localhost",
-        db_port: int = 6001,
     ):
         self.db = db
         self.branch = branch
@@ -66,19 +57,15 @@ class DataContext:
         self.source_db = source_db
         self.access = access
         self.session_id = session_id
-        self.db_host = db_host
-        self.db_port = db_port
         self._created = False
         self._branched_tables: set[str] = set()
 
     @property
     def dsn(self) -> str:
-        creds = _DB_USERS.get(self.access)
-        if not creds:
-            return self.sandbox_name
+        url = self.db.get_bind().url
         return (
-            f"mysql+pymysql://{creds['user']}:{creds['password']}"
-            f"@{self.db_host}:{self.db_port}/{self.sandbox_name}"
+            f"mysql+pymysql://{url.username}:{url.password}"
+            f"@{url.host}:{url.port}/{self.sandbox_name}"
         )
 
     @property
@@ -115,7 +102,6 @@ class DataContext:
         except Exception:
             # Metadata already exists (idempotent) or table missing
             self.db.rollback()
-        self._grant_permissions()
         self._created = True
 
     def ensure_tables(self, tables: list[str]) -> None:
@@ -197,18 +183,3 @@ class DataContext:
             pass
         self._created = False
         self._branched_tables.clear()
-
-    def _grant_permissions(self) -> None:
-        try:
-            if self.access == DataAccessLevel.READ:
-                self.db.execute(text(
-                    f"GRANT SELECT ON {self.sandbox_name}.* TO 'code_exec_ro'@'%'"
-                ))
-            elif self.access == DataAccessLevel.WRITE:
-                self.db.execute(text(
-                    f"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP "
-                    f"ON {self.sandbox_name}.* TO 'code_exec_rw'@'%'"
-                ))
-            self.db.commit()
-        except Exception:
-            pass

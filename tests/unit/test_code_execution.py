@@ -400,7 +400,12 @@ class TestDataContext:
 
     @pytest.fixture
     def mock_db(self):
-        return MagicMock()
+        from sqlalchemy.engine import make_url
+        db = MagicMock()
+        db.get_bind.return_value.url = make_url(
+            "mysql+pymysql://root:111@localhost:6001/test"
+        )
+        return db
 
     @pytest.fixture
     def ctx_read(self, mock_branch, mock_db):
@@ -419,20 +424,11 @@ class TestDataContext:
         )
 
     # --- DSN ---
-    def test_dsn_read(self, ctx_read):
-        assert "code_exec_ro" in ctx_read.dsn
-        assert "test_sandbox" in ctx_read.dsn
-
-    def test_dsn_write(self, ctx_write):
-        assert "code_exec_rw" in ctx_write.dsn
-
-    def test_dsn_none_access(self, mock_branch, mock_db):
-        ctx = DataContext(
-            db=mock_db, branch=mock_branch,
-            sandbox_name="sb", source_db="src",
-            access=DataAccessLevel.NONE,
-        )
-        assert ctx.dsn == "sb"
+    def test_dsn_uses_engine_credentials(self, ctx_write):
+        dsn = ctx_write.dsn
+        assert "root:111" in dsn
+        assert "localhost:6001" in dsn
+        assert "test_sandbox" in dsn
 
     # --- Lifecycle ---
     def test_not_alive_before_create(self, ctx_read):
@@ -571,16 +567,6 @@ class TestDataContext:
         ctx_write.ensure_tables(["orders"])
         ctx_write.destroy()
         assert ctx_write._branched_tables == set()
-
-    def test_grant_permissions_on_create(self, ctx_write, mock_db):
-        ctx_write.ensure_created()
-        grant_found = False
-        for c in mock_db.execute.call_args_list:
-            sql_arg = c[0][0]
-            if hasattr(sql_arg, 'text') and "GRANT" in sql_arg.text:
-                grant_found = True
-                assert "code_exec_rw" in sql_arg.text
-        assert grant_found
 
 
 # ===========================================================================

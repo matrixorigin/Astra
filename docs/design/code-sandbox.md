@@ -83,7 +83,7 @@ Manages the data environment for code execution. **Session-scoped only** — cre
 
 Key design: **table-level dynamic clone**. Not whole-database clone. Agent declares which tables it needs, DataContext clones only those tables into the sandbox DB. This minimizes the data blocks pinned by the sandbox.
 
-A DataContext wraps the existing `Sandbox` class (CLONE/SNAPSHOT/RESTORE) and `Branch` class (diff/merge). Access control via database user — `code_exec_ro` for READ, `code_exec_rw` for WRITE.
+A DataContext wraps the existing `Sandbox` class (CLONE/SNAPSHOT/RESTORE) and `Branch` class (diff/merge). Access control is configured at deployment time — the DB credentials in the agent's DSN determine what operations are permitted. DataContext does not manage permissions at runtime.
 
 ### SecurityGuard
 
@@ -218,7 +218,7 @@ class SecurityGuard:
 Default deny: `os, subprocess, sys, shutil, socket, ctypes, pickle, multiprocessing, http, signal, importlib`
 Default allow: `json, math, datetime, re, collections, itertools, functools, typing, decimal, statistics, csv, io, hashlib, uuid`
 
-Data safety is enforced by DB user permissions, not by code analysis.
+Data safety is enforced by sandbox isolation (code operates on a branch, not the source) and deployment-time DB user configuration, not by runtime GRANT or code analysis.
 
 ### 4.5 CodeExecutor
 
@@ -334,7 +334,7 @@ Three independent layers (defense-in-depth):
 |-------|------|-------------|
 | **Static analysis** | Reject dangerous code patterns | SecurityGuard (AST) |
 | **Runtime isolation** | Process/container/microVM boundary, resource limits | Runtime |
-| **Data isolation** | DB user permissions (read-only can't write) | DataContext + MatrixOne |
+| **Data isolation** | Sandbox boundary + deployment-time DB user config | DataContext + MatrixOne |
 
 **Capability-aware security**: When `runtime.capabilities.isolation >= CONTAINER`, the runtime itself is the primary security boundary. AST analysis remains as defense-in-depth but could be relaxed for known-safe patterns. When isolation is PROCESS only, AST analysis is critical.
 

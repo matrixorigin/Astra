@@ -57,11 +57,16 @@ SANDBOX_DB = f"{TEST_DB}_sandbox"
 @pytest.fixture(autouse=True)
 def clean_db(db):
     """Ensure clean state before and after each test."""
+    def _cleanup():
+        try:
+            for name in (SANDBOX_DB, TEST_DB):
+                db.execute(text(f"DROP DATABASE IF EXISTS `{name}`"))
+                db.commit()
+        except Exception:
+            pass
+
+    _cleanup()
     try:
-        # Only clean up databases, not metadata
-        for name in (SANDBOX_DB, f"code_exec_{TEST_DB[:8]}", TEST_DB):
-            db.execute(text(f"DROP DATABASE IF EXISTS `{name}`"))
-            db.commit()
         db.execute(text(f"CREATE DATABASE IF NOT EXISTS `{TEST_DB}`"))
         db.execute(text(f"USE `{TEST_DB}`"))
         db.commit()
@@ -70,12 +75,9 @@ def clean_db(db):
     yield
     try:
         db.rollback()
-        # Only clean up databases, not metadata
-        for name in (SANDBOX_DB, f"code_exec_{TEST_DB[:8]}", TEST_DB):
-            db.execute(text(f"DROP DATABASE IF EXISTS `{name}`"))
-            db.commit()
     except Exception:
         pass
+    _cleanup()
 
 
 def _seed(db, table="t1", rows=((1, 1), (2, 2), (3, 3))):
@@ -393,16 +395,17 @@ print('inserted')
             tables=["t1"],
         ))
 
-        assert result.execution.exit_code == 0
-        assert "inserted" in result.execution.stdout
-        assert result.time_travel is not None
-        assert result.time_travel.source_db == TEST_DB
-        assert result.time_travel.started_at is not None
-        assert result.data_diff is not None
-        assert len(result.data_diff) == 1
-        assert any(r["flag"] == "INSERT" and r["a"] == 10 for r in result.data_diff[0].rows)
-
-        executor.cleanup_session(TEST_DB + "_session")
+        try:
+            assert result.execution.exit_code == 0
+            assert "inserted" in result.execution.stdout
+            assert result.time_travel is not None
+            assert result.time_travel.source_db == TEST_DB
+            assert result.time_travel.started_at is not None
+            assert result.data_diff is not None
+            assert len(result.data_diff) == 1
+            assert any(r["flag"] == "INSERT" and r["a"] == 10 for r in result.data_diff[0].rows)
+        finally:
+            executor.cleanup_session(session_id)
 
     def test_write_mode_failed_code_no_diff(self, db):
         """Failed execution (exit_code != 0) should NOT produce diff."""
@@ -420,12 +423,13 @@ print('inserted')
             tables=["t1"],
         ))
 
-        assert result.execution.exit_code == 1
-        assert result.data_diff is None
-        # time_travel still recorded (started_at exists)
-        assert result.time_travel is not None
-
-        executor.cleanup_session(TEST_DB + "_fail")
+        try:
+            assert result.execution.exit_code == 1
+            assert result.data_diff is None
+            # time_travel still recorded (started_at exists)
+            assert result.time_travel is not None
+        finally:
+            executor.cleanup_session(TEST_DB + "_fail")
 
     def test_write_mode_no_changes(self, db):
         """Code runs successfully but doesn't modify data → empty diff."""
@@ -453,7 +457,8 @@ print('inserted')
             tables=["t1"],
         ))
 
-        assert result.execution.exit_code == 0
-        assert result.data_diff == []
-
-        executor.cleanup_session(session_id)
+        try:
+            assert result.execution.exit_code == 0
+            assert result.data_diff == []
+        finally:
+            executor.cleanup_session(session_id)
