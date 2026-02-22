@@ -42,12 +42,16 @@ class JobBackend(ABC):
 
     @abstractmethod
     async def get_status(self, job_id: str) -> JobResult:
-        """Get job status and result."""
+        """Get job status and result. Raises KeyError if job_id unknown."""
 
     @abstractmethod
     async def cancel(self, job_id: str) -> bool:
-        """Cancel running job."""
+        """Cancel a running job. Returns True if cancelled, False if already finished.
+        Raises KeyError if job_id unknown."""
 
     @abstractmethod
     async def wait(self, job_id: str, timeout: float | None = None) -> JobResult:
         """Wait for job completion."""
+
+    async def shutdown(self) -> None:
+        """Graceful shutdown — cancel running tasks, wait for cleanup."""

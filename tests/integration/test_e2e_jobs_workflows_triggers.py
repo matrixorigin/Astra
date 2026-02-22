@@ -3,16 +3,16 @@
 These three routers had ZERO test coverage. Tests go through REST API only.
 
 Scenarios:
-  J1. Job lifecycle: submit → poll status → completed/failed
-  J2. Job cancel: submit → cancel → verify cancelled
-  J3. Job not found: get/cancel non-existent job → 404
+  J1. Job lifecycle: submit → poll → terminal state
+  J2. Job cancel: submit → cancel already-finished → 409
+  J3. Job not found: GET/DELETE unknown job → 404
   J4. Job webhook: POST completion webhook → verify response
   J5. Auth enforcement: all job endpoints require auth
 
-  W1. Workflow list: GET /workflows → empty list (no definitions seeded)
+  W1. Workflow list: GET /workflows → list
   W2. Workflow run not found: GET /workflows/runs/{id} → 404
   W3. Workflow resolve not found: POST /workflows/runs/{id}/resolve → 404
-  W4. Workflow CRUD with seeded data: insert definition + run → query → resolve
+  W4. Workflow CRUD with seeded data: definition + run → query → resolve
   W5. Auth enforcement: all workflow endpoints require auth
 
   T1. Trigger lifecycle: create webhook → list → fire → delete
@@ -26,39 +26,30 @@ Scenarios:
 from __future__ import annotations
 
 import time
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from core.jobs.backend import JobResult, JobStatus
+from core.jobs.local import LocalJobBackend
 from core.utils.id_generator import generate_id
 
 
-def _drain_job_tasks():
-    """Reset the module-level LocalJobBackend state between tests."""
-    from api.routers.jobs import _router
-    backend = _router.backends.get("local")
-    if not backend:
-        return
-    backend._tasks.clear()
-    backend._results.clear()
-
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _patch_job_backend():
-    """Replace LocalJobBackend._run with a no-subprocess version.
+def _no_real_subprocesses():
+    """Replace LocalJobBackend._run with instant in-process version.
 
-    The real _run spawns subprocesses via asyncio.create_subprocess_exec.
-    When TestClient closes its event loop between tests, orphaned subprocess
-    transports raise 'Event loop is closed' in __del__. Avoiding real
-    subprocesses eliminates this entirely while still testing the full
-    API → backend → poll lifecycle.
+    Real _run spawns subprocesses via asyncio.create_subprocess_exec.
+    Subprocess transports outlive TestClient's event loop → RuntimeError
+    in __del__. This mock eliminates subprocesses while preserving the
+    full submit → poll → terminal lifecycle through the API.
     """
-    from unittest.mock import patch
-    from core.jobs.local import LocalJobBackend
-    from core.jobs.backend import JobResult, JobStatus
-
     async def _fake_run(self, job_id, job_type, inputs, req):
-        """Simulate job execution without subprocess — instant completion."""
         self._results[job_id] = JobResult(
             job_id=job_id, status=JobStatus.FAILED,
             error=f"Unknown job type: {job_type}",
@@ -66,7 +57,13 @@ def _patch_job_backend():
 
     with patch.object(LocalJobBackend, "_run", _fake_run):
         yield
-    _drain_job_tasks()
+
+    # Clean singleton state so next test starts fresh
+    from api.routers.jobs import _router
+    backend = _router.backends.get("local")
+    if backend:
+        backend._tasks.clear()
+        backend._results.clear()
 
 
 @pytest.fixture
@@ -77,10 +74,12 @@ def client():
 
 def _make_user(client, suffix=""):
     """Register + login, return auth headers."""
-    username = f"e2e_jwt_{generate_id()}{suffix}"
+    uid = generate_id()
+    # Keep username ≤ 50 chars (VARCHAR(50) constraint)
+    username = f"jwt_{uid}{suffix}"[:50]
     client.post("/auth/register", json={
         "username": username,
-        "email": f"{username}@test.com",
+        "email": f"{uid}@test.com",
         "password": "testpass1234",
     })
     resp = client.post("/auth/login", json={
@@ -99,17 +98,11 @@ def auth_headers(client):
 # ============================================================================
 
 class TestJ1_JobLifecycle:
-    """Submit a job → poll → reaches terminal state.
-
-    LocalJobBackend runs `python -m core.jobs.runner` as subprocess.
-    With empty JOB_REGISTRY, any job_type fails with 'Unknown job type' → FAILED.
-    This is the expected behavior — we verify the lifecycle, not the job logic.
-    """
+    """Submit → poll → terminal state. Fake backend fails instantly."""
 
     def test_submit_and_poll(self, client, auth_headers):
         h = auth_headers
 
-        # Submit
         resp = client.post("/jobs", json={
             "job_type": "nonexistent_type",
             "inputs": {"x": 1},
@@ -121,8 +114,7 @@ class TestJ1_JobLifecycle:
         assert data["status"] == "pending"
         job_id = data["job_id"]
 
-        # Poll until terminal (the job will fail because job_type is not registered)
-        import time
+        # Poll until terminal
         deadline = time.monotonic() + 10
         status = None
         while time.monotonic() < deadline:
@@ -131,57 +123,48 @@ class TestJ1_JobLifecycle:
             status = resp.json()["status"]
             if status in ("completed", "failed", "cancelled"):
                 break
-            time.sleep(0.2)
+            time.sleep(0.1)
 
-        assert status in ("failed", "cancelled"), f"Expected terminal state, got {status}"
+        assert status in ("failed", "cancelled"), f"Expected terminal, got {status}"
         assert resp.json().get("error")
 
 
 class TestJ2_JobCancel:
-    """Submit → cancel before completion."""
+    """Cancel an already-finished job → 409 Conflict."""
 
-    def test_cancel_job(self, client, auth_headers):
+    def test_cancel_finished_job(self, client, auth_headers):
         h = auth_headers
 
-        # Submit a job with long timeout so it stays running
         resp = client.post("/jobs", json={
-            "job_type": "nonexistent_type",
-            "inputs": {},
-            "timeout_seconds": 300,
+            "job_type": "nonexistent_type", "inputs": {},
         }, headers=h)
         assert resp.status_code == 200
         job_id = resp.json()["job_id"]
 
-        # Cancel — may succeed (200) or already finished (404)
+        # Fake backend completes instantly → cancel gets 409
         resp = client.delete(f"/jobs/{job_id}", headers=h)
-        assert resp.status_code in (200, 404)
-
-        if resp.status_code == 200:
-            assert resp.json()["status"] == "cancelled"
+        assert resp.status_code == 409
+        assert "already" in resp.json()["detail"].lower()
 
 
 class TestJ3_JobNotFound:
-    """Get/cancel non-existent job."""
+    """GET/DELETE unknown job_id → 404."""
 
-    def test_get_unknown_job(self, client, auth_headers):
-        h = auth_headers
-        resp = client.get("/jobs/nonexistent-id-999", headers=h)
-        # LocalJobBackend returns FAILED with "Unknown job" for missing IDs
-        assert resp.status_code == 200
-        assert resp.json()["status"] == "failed"
-        assert "Unknown" in (resp.json().get("error") or "")
-
-    def test_cancel_unknown_job(self, client, auth_headers):
-        h = auth_headers
-        resp = client.delete("/jobs/nonexistent-id-999", headers=h)
+    def test_get_unknown(self, client, auth_headers):
+        resp = client.get("/jobs/nonexistent-id", headers=auth_headers)
         assert resp.status_code == 404
+        assert "not found" in resp.json()["detail"].lower()
+
+    def test_cancel_unknown(self, client, auth_headers):
+        resp = client.delete("/jobs/nonexistent-id", headers=auth_headers)
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["detail"].lower()
 
 
 class TestJ4_JobWebhook:
     """POST /jobs/webhook — completion callback (no auth required)."""
 
     def test_webhook_completion(self, client):
-        # Webhook with a fake job_id — should return resumed=False (no waiting run)
         resp = client.post("/jobs/webhook", json={
             "job_id": "fake-job-123",
             "status": "completed",
@@ -223,7 +206,7 @@ class TestJ5_JobAuth:
 # ============================================================================
 
 class TestW1_WorkflowList:
-    """GET /workflows — returns list (empty if no definitions seeded)."""
+    """GET /workflows → list."""
 
     def test_list_workflows(self, client, auth_headers):
         resp = client.get("/workflows", headers=auth_headers)
@@ -252,10 +235,9 @@ class TestW3_WorkflowResolveNotFound:
 
 
 class TestW4_WorkflowCRUD:
-    """Seed a workflow definition + run in DB, then query via API.
+    """Seed definition + run in DB → query via API → resolve.
 
-    This tests the full read path. Write path (creating definitions/runs)
-    is done by the workflow engine internally, not via REST API.
+    Write path (creating definitions/runs) is internal, not API-exposed.
     """
 
     def test_seeded_workflow(self, client, auth_headers):
@@ -263,10 +245,9 @@ class TestW4_WorkflowCRUD:
         from sqlalchemy import text
 
         h = auth_headers
-        wf_id = f"test-wf-{generate_id()}"
-        run_id = f"test-run-{generate_id()}"
+        wf_id = f"wf-{generate_id()}"
+        run_id = f"run-{generate_id()}"
 
-        # Seed directly into DB (workflow creation is internal, not API-exposed)
         db = next(get_db_session())
         try:
             db.execute(text(
@@ -281,21 +262,17 @@ class TestW4_WorkflowCRUD:
                 "INSERT INTO workflow_runs "
                 "(run_id, workflow_id, status, current_step_idx, step_results) "
                 "VALUES (:rid, :wid, :status, 0, :sr)"
-            ), {
-                "rid": run_id, "wid": wf_id, "status": "waiting",
-                "sr": '{}',
-            })
+            ), {"rid": run_id, "wid": wf_id, "status": "waiting", "sr": '{}'})
             db.commit()
         finally:
             db.close()
 
-        # List workflows — should include our seeded definition
+        # List — should include our definition
         resp = client.get("/workflows", headers=h)
         assert resp.status_code == 200
-        names = [w["name"] for w in resp.json()]
-        assert "approval-flow" in names
+        assert any(w["name"] == "approval-flow" for w in resp.json())
 
-        # Get workflow run
+        # Get run
         resp = client.get(f"/workflows/runs/{run_id}", headers=h)
         assert resp.status_code == 200
         data = resp.json()
@@ -303,15 +280,14 @@ class TestW4_WorkflowCRUD:
         assert data["workflow_id"] == wf_id
         assert data["status"] == "waiting"
 
-        # Resolve — will fail because no wait handle is set (400)
+        # Resolve without wait handle → 400
         resp = client.post(
             f"/workflows/runs/{run_id}/resolve",
-            json={"approved": True},
-            headers=h,
+            json={"approved": True}, headers=h,
         )
-        assert resp.status_code == 400  # "No wait handle"
+        assert resp.status_code == 400
 
-        # Seed a wait handle and try resolve
+        # Set wait handle, then resolve → 409 (no in-memory workflow state)
         db = next(get_db_session())
         try:
             db.execute(text(
@@ -321,29 +297,24 @@ class TestW4_WorkflowCRUD:
         finally:
             db.close()
 
-        # Resolve with handle — resume_workflow returns False (no in-memory state)
         resp = client.post(
             f"/workflows/runs/{run_id}/resolve",
-            json={"approved": True},
-            headers=h,
+            json={"approved": True}, headers=h,
         )
-        assert resp.status_code == 409  # "Could not resume workflow"
+        assert resp.status_code == 409
 
 
 class TestW5_WorkflowAuth:
     """All workflow endpoints require authentication."""
 
     def test_list_no_auth(self, client):
-        resp = client.get("/workflows")
-        assert resp.status_code == 401
+        assert client.get("/workflows").status_code == 401
 
     def test_get_run_no_auth(self, client):
-        resp = client.get("/workflows/runs/some-id")
-        assert resp.status_code == 401
+        assert client.get("/workflows/runs/x").status_code == 401
 
     def test_resolve_no_auth(self, client):
-        resp = client.post("/workflows/runs/some-id/resolve", json={})
-        assert resp.status_code == 401
+        assert client.post("/workflows/runs/x/resolve", json={}).status_code == 401
 
 
 # ============================================================================
@@ -351,12 +322,12 @@ class TestW5_WorkflowAuth:
 # ============================================================================
 
 class TestT1_TriggerWebhookLifecycle:
-    """Create webhook trigger → list → fire → delete."""
+    """Create webhook → list → fire → delete → verify gone."""
 
     def test_full_lifecycle(self, client, auth_headers):
         h = auth_headers
 
-        # Create webhook trigger
+        # Create
         resp = client.post("/triggers", json={
             "trigger_type": "webhook",
             "name": "deploy-hook",
@@ -366,36 +337,31 @@ class TestT1_TriggerWebhookLifecycle:
         assert resp.status_code == 200
         data = resp.json()
         assert data["trigger_type"] == "webhook"
-        assert "secret" in data  # webhook triggers get a secret
+        assert "secret" in data
         assert "webhook_url" in data
         trigger_id = data["trigger_id"]
         secret = data["secret"]
 
-        # List — should contain our trigger
+        # List
         resp = client.get("/triggers", headers=h)
         assert resp.status_code == 200
-        triggers = resp.json()
-        assert any(t["trigger_id"] == trigger_id for t in triggers)
+        assert any(t["trigger_id"] == trigger_id for t in resp.json())
 
-        # Fire webhook (no auth header — uses secret)
-        # fire_trigger creates an AgentRun which needs a real chat loop.
-        # We just verify the API accepts the request and returns a run_id.
-        # The run itself may fail (no LLM configured) — that's fine.
+        # Fire (secret-based auth, no JWT)
         resp = client.post(f"/triggers/{trigger_id}/fire", json={
             "secret": secret,
             "payload": {"commit": "abc123"},
         })
         assert resp.status_code == 200
-        fire_data = resp.json()
-        assert "run_id" in fire_data
-        assert fire_data["trigger_id"] == trigger_id
+        assert resp.json()["trigger_id"] == trigger_id
+        assert "run_id" in resp.json()
 
         # Delete
         resp = client.delete(f"/triggers/{trigger_id}", headers=h)
         assert resp.status_code == 200
         assert resp.json()["deleted"] is True
 
-        # Verify deleted — list should not contain it
+        # Verify gone
         resp = client.get("/triggers", headers=h)
         assert not any(t["trigger_id"] == trigger_id for t in resp.json())
 
@@ -411,52 +377,42 @@ class TestT2_TriggerSchedule:
             "name": "nightly-eval",
             "agent_id": "dev-agent",
             "user_input": "Run nightly evaluation",
-            "cron_expr": "0 2 * * *",  # 2 AM daily
+            "cron_expr": "0 2 * * *",
         }, headers=h)
         assert resp.status_code == 200
         data = resp.json()
         assert data["trigger_type"] == "schedule"
-        assert "secret" not in data  # schedule triggers have no secret
+        assert "secret" not in data
         assert "next_fire_at" in data
         trigger_id = data["trigger_id"]
 
-        # List
         resp = client.get("/triggers", headers=h)
         assert any(t["trigger_id"] == trigger_id for t in resp.json())
 
-        # Delete
         resp = client.delete(f"/triggers/{trigger_id}", headers=h)
         assert resp.status_code == 200
 
 
 class TestT3_TriggerFireAuth:
-    """Webhook fire: wrong secret → 403, missing trigger → 404."""
+    """Wrong secret → 403, missing trigger → 404."""
 
     def test_wrong_secret(self, client, auth_headers):
         h = auth_headers
-
-        # Create trigger
         resp = client.post("/triggers", json={
-            "trigger_type": "webhook",
-            "name": "secret-test",
-            "agent_id": "dev-agent",
-            "user_input": "test",
+            "trigger_type": "webhook", "name": "secret-test",
+            "agent_id": "dev-agent", "user_input": "test",
         }, headers=h)
         trigger_id = resp.json()["trigger_id"]
 
-        # Fire with wrong secret
         resp = client.post(f"/triggers/{trigger_id}/fire", json={
             "secret": "wrong-secret-value",
         })
         assert resp.status_code == 403
 
-        # Cleanup
         client.delete(f"/triggers/{trigger_id}", headers=h)
 
     def test_fire_nonexistent(self, client):
-        resp = client.post("/triggers/nonexistent-trigger/fire", json={
-            "secret": "anything",
-        })
+        resp = client.post("/triggers/nonexistent/fire", json={"secret": "x"})
         assert resp.status_code == 404
 
 
@@ -467,62 +423,46 @@ class TestT4_TriggerOwnership:
         h_a = _make_user(client, "_a")
         h_b = _make_user(client, "_b")
 
-        # User A creates trigger
         resp = client.post("/triggers", json={
-            "trigger_type": "webhook",
-            "name": "owned-by-a",
-            "agent_id": "dev-agent",
-            "user_input": "test",
+            "trigger_type": "webhook", "name": "owned-by-a",
+            "agent_id": "dev-agent", "user_input": "test",
         }, headers=h_a)
         trigger_id = resp.json()["trigger_id"]
 
-        # User B tries to delete → 403
-        resp = client.delete(f"/triggers/{trigger_id}", headers=h_b)
-        assert resp.status_code == 403
-
-        # User A can delete
-        resp = client.delete(f"/triggers/{trigger_id}", headers=h_a)
-        assert resp.status_code == 200
+        # User B → 403
+        assert client.delete(f"/triggers/{trigger_id}", headers=h_b).status_code == 403
+        # User A → 200
+        assert client.delete(f"/triggers/{trigger_id}", headers=h_a).status_code == 200
 
 
 class TestT5_TriggerValidation:
-    """Invalid trigger_type → 400, schedule without cron → 400."""
+    """Input validation: invalid type, missing cron, bad cron."""
 
     def test_invalid_trigger_type(self, client, auth_headers):
         resp = client.post("/triggers", json={
-            "trigger_type": "invalid_type",
-            "name": "bad",
-            "agent_id": "dev-agent",
-            "user_input": "test",
+            "trigger_type": "invalid_type", "name": "bad",
+            "agent_id": "dev-agent", "user_input": "test",
         }, headers=auth_headers)
         assert resp.status_code == 400
 
     def test_schedule_without_cron(self, client, auth_headers):
         resp = client.post("/triggers", json={
-            "trigger_type": "schedule",
-            "name": "no-cron",
-            "agent_id": "dev-agent",
-            "user_input": "test",
-            # cron_expr intentionally omitted
+            "trigger_type": "schedule", "name": "no-cron",
+            "agent_id": "dev-agent", "user_input": "test",
         }, headers=auth_headers)
         assert resp.status_code == 400
 
     def test_invalid_cron_expression(self, client, auth_headers):
         resp = client.post("/triggers", json={
-            "trigger_type": "schedule",
-            "name": "bad-cron",
-            "agent_id": "dev-agent",
-            "user_input": "test",
+            "trigger_type": "schedule", "name": "bad-cron",
+            "agent_id": "dev-agent", "user_input": "test",
             "cron_expr": "not a cron",
         }, headers=auth_headers)
         assert resp.status_code == 400
 
 
 class TestT6_TriggerAuth:
-    """All trigger management endpoints require authentication.
-
-    Note: POST /triggers/{id}/fire uses secret-based auth, not JWT.
-    """
+    """All trigger management endpoints require auth (fire uses secret)."""
 
     def test_create_no_auth(self, client):
         resp = client.post("/triggers", json={
@@ -532,9 +472,7 @@ class TestT6_TriggerAuth:
         assert resp.status_code == 401
 
     def test_list_no_auth(self, client):
-        resp = client.get("/triggers")
-        assert resp.status_code == 401
+        assert client.get("/triggers").status_code == 401
 
     def test_delete_no_auth(self, client):
-        resp = client.delete("/triggers/some-id")
-        assert resp.status_code == 401
+        assert client.delete("/triggers/some-id").status_code == 401

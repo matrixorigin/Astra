@@ -83,6 +83,11 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
     trigger_task.cancel()
     await scheduler.stop()
+
+    # Graceful job backend shutdown — wait for subprocess cleanup
+    from api.routers.jobs import _router as job_router
+    await job_router.shutdown()
+
     logger.info("Shutting down...")
 
 

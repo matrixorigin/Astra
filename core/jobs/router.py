@@ -40,3 +40,8 @@ class JobRouter:
                 if name in self.backends:
                     return self.backends[name]
         return self.backends["local"]
+
+    async def shutdown(self) -> None:
+        """Graceful shutdown — propagate to all backends."""
+        for backend in self.backends.values():
+            await backend.shutdown()

@@ -28,16 +28,24 @@ class LocalJobBackend(JobBackend):
 
     async def get_status(self, job_id: str) -> JobResult:
         if job_id not in self._results:
-            return JobResult(job_id=job_id, status=JobStatus.FAILED, error="Unknown job")
+            raise KeyError(f"Job {job_id} not found")
         return self._results[job_id]
 
     async def cancel(self, job_id: str) -> bool:
         task = self._tasks.get(job_id)
-        if task and not task.done():
-            task.cancel()
-            self._results[job_id] = JobResult(job_id=job_id, status=JobStatus.CANCELLED)
-            return True
-        return False
+        if not task:
+            raise KeyError(f"Job {job_id} not found")
+        if task.done():
+            return False
+        task.cancel()
+        # Await the task so subprocess transport is cleaned up before we return.
+        # _run's CancelledError handler sets status; we overwrite to be definitive.
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._results[job_id] = JobResult(job_id=job_id, status=JobStatus.CANCELLED)
+        return True
 
     async def wait(self, job_id: str, timeout: float | None = None) -> JobResult:
         task = self._tasks.get(job_id)
@@ -90,7 +98,6 @@ class LocalJobBackend(JobBackend):
                 job_id=job_id, status=JobStatus.FAILED, error=str(e)
             )
         finally:
-            # Notify completion callback (for run resume)
             if self._on_completed:
                 r = self._results.get(job_id)
                 if r and r.status in (JobStatus.COMPLETED, JobStatus.FAILED):
@@ -109,3 +116,12 @@ class LocalJobBackend(JobBackend):
         if req.conda_env:
             return ["conda", "run", "-n", req.conda_env, "--no-capture-output"] + runner_args
         return runner_args
+
+    async def shutdown(self) -> None:
+        """Cancel all running tasks and wait for subprocess transport cleanup."""
+        for task in self._tasks.values():
+            if not task.done():
+                task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        self._tasks.clear()

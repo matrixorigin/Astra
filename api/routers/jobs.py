@@ -58,7 +58,10 @@ async def get_job(
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     backend = _router.backends["local"]  # TODO: store job→backend mapping
-    result = await backend.get_status(job_id)
+    try:
+        result = await backend.get_status(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Job not found")
     return JobResponse(
         job_id=result.job_id,
         status=result.status,
@@ -74,9 +77,16 @@ async def cancel_job(
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     backend = _router.backends["local"]
+    try:
+        result = await backend.get_status(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if result.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+        raise HTTPException(status_code=409, detail=f"Job already {result.status.value}")
     cancelled = await backend.cancel(job_id)
     if not cancelled:
-        raise HTTPException(status_code=404, detail="Job not found or already finished")
+        # Race: job finished between get_status and cancel
+        raise HTTPException(status_code=409, detail="Job already finished")
     return {"job_id": job_id, "status": "cancelled"}
 
 
