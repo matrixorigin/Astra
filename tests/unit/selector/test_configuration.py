@@ -2,6 +2,7 @@
 
 import uuid
 import pytest
+from uuid_utils import uuid7
 
 from api.models import Config, SkillSelectionLearning, SelectorGateResult
 
@@ -30,8 +31,9 @@ class TestConfiguration:
         db.commit()
         
         for i in range(3):
+            uuid_str = str(uuid7()).replace("-", "")
             learning = SkillSelectionLearning(
-                learning_id=f"learn-{i}-{uuid.uuid4().hex[:8]}",
+                learning_id=f"l{i}-{uuid_str}",  # Shorter prefix: l0-, l1-, l2-
                 query_pattern=f"pattern {i}",
                 wrong_skills=["wrong"],
                 correct_skills=["correct"],
@@ -40,8 +42,9 @@ class TestConfiguration:
             )
             db.add(learning)
         
+        uuid_str = str(uuid7()).replace("-", "")
         db.add(SelectorGateResult(
-            gate_id=f"gate-1-{uuid.uuid4().hex[:8]}",
+            gate_id=f"g1-{uuid_str}",  # Shorter prefix
             selector_version="v1",
             test_queries=[],
             test_count=10,
@@ -50,8 +53,9 @@ class TestConfiguration:
             old_avg_score=0.80,
             improvement_pct=6.25,
         ))
+        uuid_str2 = str(uuid7()).replace("-", "")
         db.add(SelectorGateResult(
-            gate_id=f"gate-2-{uuid.uuid4().hex[:8]}",
+            gate_id=f"g2-{uuid_str2}",  # Shorter prefix
             selector_version="v2",
             test_queries=[],
             test_count=10,
@@ -79,8 +83,9 @@ class TestConfiguration:
         db.query(SelectorGateResult).delete()
         db.commit()
         
+        uuid_str3 = str(uuid7()).replace("-", "")
         db.add(SelectorGateResult(
-            gate_id=f"gate-null-{uuid.uuid4().hex[:8]}",
+            gate_id=f"gn-{uuid_str3}",  # Shorter prefix
             selector_version="v1",
             test_queries=[],
             test_count=10,
@@ -104,8 +109,9 @@ class TestConfiguration:
         db.commit()
         
         for i in range(3):
+            uuid_str = str(uuid7()).replace("-", "")
             db.add(SelectorGateResult(
-                gate_id=f"gate-pass-{i}-{uuid.uuid4().hex[:8]}",
+                gate_id=f"g{i}-{uuid_str}",  # Shorter prefix: g0-, g1-, g2-
                 selector_version=f"v{i}",
                 test_queries=[],
                 test_count=10,

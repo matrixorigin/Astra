@@ -7,6 +7,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from core.utils.id_generator import generate_short_id, generate_hash_id
 from core.code_executor.data_context import (
     DataAccessLevel,
     DataContext,
@@ -160,7 +161,7 @@ class CodeExecutor:
         ctx = DataContext(
             db=self.db,
             branch=self.branch,
-            sandbox_name=f"code_exec_{session_id[:8]}",
+            sandbox_name=f"code_exec_{generate_hash_id(session_id, 8)}",
             source_db=source_db,
             access=DataAccessLevel.WRITE,
             session_id=session_id,

@@ -2,6 +2,7 @@
 
 import uuid
 import pytest
+from uuid_utils import uuid7
 
 from api.models import SkillSelectionEvent, SkillSelectionLearning
 from core.skills.learning_signals import LearningSignal, SignalType
@@ -47,7 +48,8 @@ class TestLearningCore:
     def test_get_recent_failures(self, self_improving, db):
         """Test getting failures."""
         for i in range(3):
-            eid = f"evt-{i}-{uuid.uuid4().hex[:8]}"
+            uuid_str = str(uuid7()).replace("-", "")
+            eid = f"e{i}-{uuid_str}"  # Shorter prefix: e0-, e1-, e2-
             db.add(SkillSelectionEvent(
                 event_id=eid, session_id=f"sess-{i}",
                 user_query=f"Query {i}", selected_skills="wrong_skill",
@@ -90,7 +92,8 @@ class TestLearningCore:
 
     def test_learn_from_failures_with_failures(self, self_improving, db):
         """Test learning from actual failures."""
-        eid = f"evt-{uuid.uuid4().hex[:8]}"
+        uuid_str2 = str(uuid7()).replace("-", "")
+        eid = f"e-{uuid_str2}"  # Shorter prefix
         db.add(SkillSelectionEvent(
             event_id=eid, session_id="sess-1",
             user_query="Review PR #123", selected_skills="wrong_skill",
@@ -104,7 +107,8 @@ class TestLearningCore:
 
     def test_learn_creates_and_cleans_sandbox(self, self_improving, db):
         """Test sandbox lifecycle during learning."""
-        eid = f"evt-{uuid.uuid4().hex[:8]}"
+        uuid_str3 = str(uuid7()).replace("-", "")
+        eid = f"e-{uuid_str3}"  # Shorter prefix
         db.add(SkillSelectionEvent(
             event_id=eid, session_id="sess-1",
             user_query="Test", selected_skills="wrong_skill",

@@ -18,6 +18,7 @@ from core.code_executor.data_context import DataContext, DataAccessLevel, TableD
 from core.code_executor import CodeExecutor, CodeExecutionRequest
 from core.code_executor.security import SecurityGuard
 from core.runtime.subprocess_runtime import SubprocessRuntime
+from core.utils.id_generator import generate_hash_id
 
 # Support parallel testing with worker-specific database names
 def get_worker_id():
@@ -362,11 +363,20 @@ class TestCodeExecutorWrite:
         runtime = SubprocessRuntime()
         executor = CodeExecutor(runtime=runtime, db=db, branch=br, security=SecurityGuard())
 
-        sandbox_name = f"code_exec_{TEST_DB[:8]}"
+        session_id = f"{worker_id}_session"
+        expected_sandbox = f"code_exec_{generate_hash_id(session_id, 8)}"
+        
+        # Clean up any existing sandbox
+        try:
+            db.execute(text(f"DROP DATABASE IF EXISTS {expected_sandbox}"))
+            db.commit()
+        except Exception:
+            pass
+        
         # Code that inserts into sandbox
         code = f"""
 import pymysql
-conn = pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111', database='{sandbox_name}')
+conn = pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111', database='{expected_sandbox}')
 cur = conn.cursor()
 cur.execute('INSERT INTO t1 VALUES(10, 10)')
 conn.commit()
@@ -376,7 +386,7 @@ print('inserted')
         result = executor.execute(CodeExecutionRequest(
             code=code,
             language="python",
-            session_id=TEST_DB + "_session",
+            session_id=session_id,
             data_access=DataAccessLevel.WRITE,
             source_db=TEST_DB,
             tables=["t1"],
@@ -423,10 +433,20 @@ print('inserted')
         runtime = SubprocessRuntime()
         executor = CodeExecutor(runtime=runtime, db=db, branch=br, security=SecurityGuard())
 
+        session_id = f"{worker_id}_noop"
+        expected_sandbox = f"code_exec_{generate_hash_id(session_id, 8)}"
+        
+        # Clean up any existing sandbox
+        try:
+            db.execute(text(f"DROP DATABASE IF EXISTS {expected_sandbox}"))
+            db.commit()
+        except Exception:
+            pass
+
         result = executor.execute(CodeExecutionRequest(
             code="print('hello')",
             language="python",
-            session_id=TEST_DB + "_noop",
+            session_id=session_id,
             data_access=DataAccessLevel.WRITE,
             source_db=TEST_DB,
             tables=["t1"],
@@ -435,4 +455,4 @@ print('inserted')
         assert result.execution.exit_code == 0
         assert result.data_diff == []
 
-        executor.cleanup_session(TEST_DB + "_noop")
+        executor.cleanup_session(session_id)

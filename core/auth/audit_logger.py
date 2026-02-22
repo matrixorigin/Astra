@@ -3,9 +3,12 @@
 import json
 from datetime import datetime
 from typing import Any
+from uuid_utils import uuid7
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+
+from core.utils.id_generator import generate_log_id
 
 
 class AuditLogger:
@@ -25,9 +28,7 @@ class AuditLogger:
     ):
         """Log an admin operation."""
         # Generate log_id
-        import uuid
-
-        log_id = f"log_{uuid.uuid4().hex[:16]}"
+        log_id = f"log_{generate_log_id()}"
 
         from sqlalchemy import insert
         from api.models import AuditLog

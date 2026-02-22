@@ -2,9 +2,11 @@
 
 import uuid
 import pytest
+from uuid_utils import uuid7
 
 from api.models import SkillSelectionLearning
 from core.skills.selector import SkillMetadata
+from core.utils.id_generator import generate_learning_id
 
 
 class TestLearningApplication:
@@ -24,7 +26,7 @@ class TestLearningApplication:
     def test_apply_learnings_with_match(self, self_improving, db):
         """Test applying learnings with match."""
         learning = SkillSelectionLearning(
-            learning_id=f"learn-{uuid.uuid4().hex[:8]}",
+            learning_id=generate_learning_id(),
             query_pattern="review pr",
             wrong_skills=["summarize_pr"],
             correct_skills=["code_review"],
@@ -60,7 +62,7 @@ class TestLearningApplication:
         confidences = [0.9, 0.8, 0.7, 0.6]
         for i, conf in enumerate(confidences):
             learning = SkillSelectionLearning(
-                learning_id=f"learn-{i}-{uuid.uuid4().hex[:8]}",
+                learning_id=generate_learning_id(),
                 query_pattern="review",
                 wrong_skills=["summarize_pr"],
                 correct_skills=["code_review"],
@@ -111,7 +113,7 @@ class TestLearningApplication:
         )
 
         learning = SkillSelectionLearning(
-            learning_id=f"learn-{uuid.uuid4().hex[:8]}",
+            learning_id=generate_learning_id(),
             query_pattern="review",
             wrong_skills=["summarize_pr"],
             correct_skills=[],
@@ -165,7 +167,7 @@ class TestLearningApplication:
     def test_apply_learnings_deterministic_order_on_tie(self, self_improving, db):
         """Same-score candidates must be sorted by name for deterministic output."""
         learning = SkillSelectionLearning(
-            learning_id=f"learn-{uuid.uuid4().hex[:8]}",
+            learning_id=generate_learning_id(),
             query_pattern="deploy",
             wrong_skills=[],
             correct_skills=["zz_deploy", "aa_deploy"],

@@ -2,6 +2,7 @@
 
 import uuid
 import pytest
+from uuid_utils import uuid7
 
 from api.models import Config, SkillSelectionLearning
 from core.skills.learning_similarity import (
@@ -41,8 +42,9 @@ class TestSemanticMatching:
         embedding = service.embed_text("Review PR #123")
         embedding_vec_str = embedding_to_vec_str(embedding)
 
+        uuid_str = str(uuid7()).replace("-", "")
         learning = SkillSelectionLearning(
-            learning_id=f"learn-sem-{uuid.uuid4().hex[:8]}",
+            learning_id=f"ls-{uuid_str}",  # Shorter prefix
             query_pattern="unrelated pattern",
             query_embedding=embedding_vec_str,
             wrong_skills=["summarize_pr"],
@@ -72,8 +74,9 @@ class TestSemanticMatching:
 
     def test_apply_learnings_context_mismatch(self, self_improving, db):
         """Test context feature filtering blocks mismatched learnings."""
+        uuid_str2 = str(uuid7()).replace("-", "")
         learning = SkillSelectionLearning(
-            learning_id=f"learn-ctx-{uuid.uuid4().hex[:8]}",
+            learning_id=f"lc-{uuid_str2}",  # Shorter prefix
             query_pattern="review",
             wrong_skills=["summarize_pr"],
             correct_skills=["code_review"],
@@ -122,8 +125,9 @@ class TestSemanticMatching:
         embedding = service.embed_text("Review PR #123")
         embedding_vec_str = embedding_to_vec_str(embedding)
 
+        uuid_str3 = str(uuid7()).replace("-", "")
         learning = SkillSelectionLearning(
-            learning_id=f"learn-th-{uuid.uuid4().hex[:8]}",
+            learning_id=f"lt-{uuid_str3}",  # Shorter prefix
             query_pattern="unrelated pattern",
             query_embedding=embedding_vec_str,
             wrong_skills=["summarize_pr"],
@@ -182,8 +186,10 @@ class TestSemanticMatching:
         other_embedding = service.embed_text(query_text)  # Same text = same embedding
         other_vec_str = embedding_to_vec_str(other_embedding)
 
-        learning_id_1 = f"learn-lim-{uuid.uuid4().hex[:8]}"
-        learning_id_2 = f"learn-lim-{uuid.uuid4().hex[:8]}"
+        uuid_str4 = str(uuid7()).replace("-", "")
+        uuid_str5 = str(uuid7()).replace("-", "")
+        learning_id_1 = f"lim-{uuid_str4}"  # Shorter prefix
+        learning_id_2 = f"lim-{uuid_str5}"
         
         learning1 = SkillSelectionLearning(
             learning_id=learning_id_1,

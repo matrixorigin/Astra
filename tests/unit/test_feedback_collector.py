@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock
 from core.skills.pipeline import _FeedbackBuffer, SignalType
 from api.models import SkillLearningSignal
+from core.utils.id_generator import generate_event_id
 
 
 @pytest.fixture
@@ -40,7 +41,7 @@ class TestFeedbackBuffer:
 
     def test_add_signal(self, buffer):
         """Test adding a single signal."""
-        event_id = f"evt-{uuid.uuid4().hex[:8]}"
+        event_id = generate_event_id()
         data = {"skill": "wrong_skill", "reason": "test"}
         
         buffer.add(event_id, SignalType.WRONG_SKILL, data)
@@ -53,8 +54,8 @@ class TestFeedbackBuffer:
 
     def test_auto_flush_on_batch_size(self, buffer, db):
         """Test automatic flush when batch size reached."""
-        event_id1 = f"evt-{uuid.uuid4().hex[:8]}"
-        event_id2 = f"evt-{uuid.uuid4().hex[:8]}"
+        event_id1 = generate_event_id()
+        event_id2 = generate_event_id()
         
         buffer.add(event_id1, SignalType.WRONG_SKILL, {"test": 1})
         assert len(buffer._buffer) == 1
@@ -67,7 +68,7 @@ class TestFeedbackBuffer:
 
     def test_manual_flush(self, buffer, db):
         """Test manual flush."""
-        event_id = f"evt-{uuid.uuid4().hex[:8]}"
+        event_id = generate_event_id()
         buffer.add(event_id, SignalType.HIGH_COST, {"cost": 0.5})
         
         assert len(buffer._buffer) == 1
@@ -90,7 +91,7 @@ class TestFeedbackBuffer:
         conn = db._mock_conn
         conn.execute.side_effect = Exception("DB error")
         
-        event_id = f"evt-{uuid.uuid4().hex[:8]}"
+        event_id = generate_event_id()
         buffer.add(event_id, SignalType.WRONG_SKILL, {"test": 1})
         buffer.add(event_id, SignalType.SLOW_EXECUTION, {"test": 2})
         
@@ -99,7 +100,7 @@ class TestFeedbackBuffer:
 
     def test_maybe_flush_interval_not_elapsed(self, buffer, db):
         """Test maybe_flush when interval not elapsed."""
-        event_id = f"evt-{uuid.uuid4().hex[:8]}"
+        event_id = generate_event_id()
         buffer.add(event_id, SignalType.WRONG_SKILL, {"test": 1})
         
         flushed = buffer.maybe_flush()
@@ -112,7 +113,7 @@ class TestFeedbackBuffer:
         """Test that each signal gets unique ID."""
         # Use larger batch_size to prevent auto-flush
         buffer = _FeedbackBuffer(db, batch_size=10, flush_interval=60)
-        event_id = f"evt-{uuid.uuid4().hex[:8]}"
+        event_id = generate_event_id()
         
         buffer.add(event_id, SignalType.WRONG_SKILL, {"test": 1})
         buffer.add(event_id, SignalType.WRONG_SKILL, {"test": 2})
@@ -125,7 +126,7 @@ class TestFeedbackBuffer:
         """Test all signal types."""
         # Use larger batch_size to prevent auto-flush
         buffer = _FeedbackBuffer(db, batch_size=10, flush_interval=60)
-        event_id = f"evt-{uuid.uuid4().hex[:8]}"
+        event_id = generate_event_id()
         
         signal_types = [
             SignalType.WRONG_SKILL,

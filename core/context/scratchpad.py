@@ -8,6 +8,9 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 from sqlalchemy.orm import Session
+
+from core.utils.id_generator import generate_note_id
+from uuid_utils import uuid7
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -76,7 +79,7 @@ class AgentScratchpad:
         if note_type not in valid_types:
             raise ValueError(f"Invalid note_type: {note_type}. Must be one of {valid_types}")
         
-        note_id = f"note_{uuid.uuid4().hex[:16]}"
+        note_id = f"note_{generate_note_id()}"
         
         note = ScratchpadModel(
             note_id=note_id,
