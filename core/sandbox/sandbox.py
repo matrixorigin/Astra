@@ -169,10 +169,15 @@ class Sandbox:
             failures.append(f"DROP DATABASE {name}: {e}")
 
         # Delete metadata
-        self.db.execute(text(
-            f"DELETE FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :name"
-        ), {"name": name})
-        self.db.commit()
+        try:
+            self.db.execute(text(
+                f"DELETE FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :name"
+            ), {"name": name})
+            self.db.commit()
+        except Exception as e:
+            if not force:
+                raise
+            failures.append(f"DELETE metadata {name}: {e}")
 
     # ------------------------------------------------------------------
     # Table management

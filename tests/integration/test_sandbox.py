@@ -1,5 +1,6 @@
 """Tests for Sandbox (branch-based implementation)."""
 
+import os
 import pytest
 from sqlalchemy import text
 
@@ -7,7 +8,7 @@ from core.sandbox import Sandbox
 from core.utils.id_generator import generate_sandbox_name, generate_id
 
 
-SOURCE_DB = "test_dev_agent_v3"
+SOURCE_DB = os.environ.get("MATRIXONE_DATABASE", "test_dev_agent_v3")
 
 
 @pytest.fixture

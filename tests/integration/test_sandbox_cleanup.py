@@ -1,12 +1,13 @@
 """Integration tests for SandboxCleaner."""
 
+import os
 import pytest
 from sqlalchemy import text
 from uuid_utils import uuid7
 
 from core.sandbox import Sandbox, SandboxCleaner
 
-SOURCE_DB = "test_dev_agent_v3"
+SOURCE_DB = os.environ.get("MATRIXONE_DATABASE", "test_dev_agent_v3")
 
 
 @pytest.fixture

@@ -26,7 +26,8 @@ class SandboxService:
             db_session: SQLAlchemy session
         """
         self.db_session = db_session
-        self.sandbox = Sandbox(db=db_session, source_db="test_dev_agent_v3")
+        from config.settings import get_settings
+        self.sandbox = Sandbox(db=db_session, source_db=get_settings().matrixone_database)
         self.audit = AuditLogger(db_session)
         self.permission = PermissionChecker(db_session)
     

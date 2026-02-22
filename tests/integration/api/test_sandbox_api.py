@@ -4,6 +4,7 @@
 当前状态: 部分测试通过，部分需要环境配置
 """
 
+import os
 import pytest
 from fastapi.testclient import TestClient
 
@@ -13,6 +14,8 @@ from api.repositories import UserRepository
 from core.auth.jwt_manager import create_access_token
 from core.sandbox import Sandbox
 from core.utils.id_generator import generate_id
+
+SOURCE_DB = os.environ.get("MATRIXONE_DATABASE", "test_dev_agent_v3")
 
 
 # pytestmark = pytest.mark.skip(reason="需要完整的MatrixOne环境和清理逻辑")
@@ -53,7 +56,7 @@ def cleanup_sandboxes():
     """Cleanup test sandboxes before and after"""
     # Cleanup before test
     db = next(get_db_session())
-    sandbox = Sandbox(db=db, source_db="test_dev_agent_v3")
+    sandbox = Sandbox(db=db, source_db=SOURCE_DB)
     sandboxes = sandbox.list_sandboxes(prefix="", pattern="test_sandbox_%")
     for s in sandboxes:
         try:

@@ -13,14 +13,17 @@ from core.evaluation.regression_gate import RegressionGate, ChangeType
 @pytest.fixture
 def setup_tables(db_session):
     """Setup gate_results table (conversation_events already exists from Base.metadata)."""
+    from core.utils.id_generator import generate_id
+    # Use unique user_id to avoid cross-worker contamination in parallel tests
+    uid = f"gate_test_{generate_id()[:8]}"
+
     # Cleanup any leftover test data from previous runs
-    db_session.execute(text("DELETE FROM conversation_events WHERE user_id = 'u1'"))
     db_session.execute(text("DROP TABLE IF EXISTS gate_results"))
     db_session.commit()
     
     # Create gate_results table
     db_session.execute(text("""
-        CREATE TABLE gate_results (
+        CREATE TABLE IF NOT EXISTS gate_results (
             gate_id VARCHAR(36) PRIMARY KEY,
             change_type VARCHAR(20) NOT NULL,
             change_id VARCHAR(128) NOT NULL,
@@ -35,10 +38,14 @@ def setup_tables(db_session):
     """))
     
     db_session.commit()
+    # Stash unique user_id for tests to use
+    db_session._test_uid = uid
     yield db_session
     
-    # Cleanup: delete test data from conversation_events
-    db_session.execute(text("DELETE FROM conversation_events WHERE user_id = 'u1'"))
+    # Cleanup: delete only our test data
+    db_session.execute(text(
+        "DELETE FROM conversation_events WHERE user_id = :uid"
+    ), {"uid": uid})
     db_session.execute(text("DROP TABLE IF EXISTS gate_results"))
     db_session.commit()
 
@@ -53,25 +60,26 @@ class TestGoldenSessionSelection:
     """Test golden session selection logic."""
     
     def test_get_golden_sessions_empty(self, gate, setup_tables):
-        """Test golden session selection with no data."""
-        sessions = gate._get_golden_sessions(limit=10)
-        assert sessions == []
+        """Test golden session selection with no data from this test."""
+        uid = setup_tables._test_uid
+        sessions = gate._get_golden_sessions(limit=100)
+        own = [s for s in sessions if s["user_id"] == uid]
+        assert own == []
     
     def test_get_golden_sessions_filters_by_quality(self, gate, setup_tables):
         """Test that only high-quality sessions are selected."""
         from core.events.event_logger import EventLogger
-        from uuid_utils import uuid7
         
+        uid = setup_tables._test_uid
         logger = EventLogger(setup_tables)
         
         # Insert high-quality session
         for i in range(3):
             event = logger.create_user_query(
-                user_id="u1",
-                session_id="s1",
+                user_id=uid,
+                session_id=f"{uid}_s1",
                 content=f"query {i}",
             )
-            # Update quality score
             setup_tables.execute(text("""
                 UPDATE conversation_events 
                 SET quality_score = 4.5, training_eligible = 1
@@ -81,8 +89,8 @@ class TestGoldenSessionSelection:
         # Insert low-quality session
         for i in range(3):
             event = logger.create_user_query(
-                user_id="u1",
-                session_id="s2",
+                user_id=uid,
+                session_id=f"{uid}_s2",
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
@@ -93,24 +101,26 @@ class TestGoldenSessionSelection:
         
         setup_tables.commit()
         
-        sessions = gate._get_golden_sessions(limit=10)
+        sessions = gate._get_golden_sessions(limit=100)
+        own = [s for s in sessions if s["user_id"] == uid]
         
         # Only s1 should be selected (quality_score >= 4.0)
-        assert len(sessions) == 1
-        assert sessions[0]["session_id"] == "s1"
-        assert sessions[0]["avg_score"] >= 4.0
+        assert len(own) == 1
+        assert own[0]["session_id"] == f"{uid}_s1"
+        assert own[0]["avg_score"] >= 4.0
     
     def test_get_golden_sessions_requires_multi_turn(self, gate, setup_tables):
         """Test that only multi-turn sessions are selected."""
         from core.events.event_logger import EventLogger
         
+        uid = setup_tables._test_uid
         logger = EventLogger(setup_tables)
         
         # Session with 2 events (should not be selected)
         for i in range(2):
             event = logger.create_user_query(
-                user_id="u1",
-                session_id="s1",
+                user_id=uid,
+                session_id=f"{uid}_s1",
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
@@ -122,8 +132,8 @@ class TestGoldenSessionSelection:
         # Session with 2 events (should not be selected)
         for i in range(2):
             event = logger.create_user_query(
-                user_id="u1",
-                session_id="s2",
+                user_id=uid,
+                session_id=f"{uid}_s2",
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
@@ -134,22 +144,24 @@ class TestGoldenSessionSelection:
         
         setup_tables.commit()
         
-        sessions = gate._get_golden_sessions(limit=10)
+        sessions = gate._get_golden_sessions(limit=100)
+        own = [s for s in sessions if s["user_id"] == uid]
         
         # Neither has >= 3 events
-        assert len(sessions) == 0
+        assert len(own) == 0
     
     def test_get_golden_sessions_orders_by_score(self, gate, setup_tables):
         """Test that sessions are ordered by quality score."""
         from core.events.event_logger import EventLogger
         
+        uid = setup_tables._test_uid
         logger = EventLogger(setup_tables)
         
         # Session s1 with score 4.0
         for i in range(3):
             event = logger.create_user_query(
-                user_id="u1",
-                session_id="s1",
+                user_id=uid,
+                session_id=f"{uid}_s1",
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
@@ -161,8 +173,8 @@ class TestGoldenSessionSelection:
         # Session s2 with score 5.0
         for i in range(3):
             event = logger.create_user_query(
-                user_id="u1",
-                session_id="s2",
+                user_id=uid,
+                session_id=f"{uid}_s2",
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
@@ -173,12 +185,13 @@ class TestGoldenSessionSelection:
         
         setup_tables.commit()
         
-        sessions = gate._get_golden_sessions(limit=10)
+        sessions = gate._get_golden_sessions(limit=100)
+        own = [s for s in sessions if s["user_id"] == uid]
         
         # s2 should come first (higher score)
-        assert len(sessions) == 2
-        assert sessions[0]["session_id"] == "s2"
-        assert sessions[0]["avg_score"] > sessions[1]["avg_score"]
+        assert len(own) == 2
+        assert own[0]["session_id"] == f"{uid}_s2"
+        assert own[0]["avg_score"] > own[1]["avg_score"]
 
 
 class TestMetricsComputation:
@@ -406,13 +419,14 @@ class TestSelectorChangeValidation:
         """Test that ChangeType.SELECTOR is properly validated."""
         from core.events.event_logger import EventLogger
         
+        uid = setup_tables._test_uid
         logger = EventLogger(setup_tables)
         
         # Create a golden session
         for i in range(3):
             event = logger.create_user_query(
-                user_id="u1",
-                session_id="s1",
+                user_id=uid,
+                session_id=f"{uid}_s1",
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
@@ -498,13 +512,14 @@ class TestSandboxCleanup:
         """Test that sandbox is deleted even when gate fails."""
         from core.events.event_logger import EventLogger
         
+        uid = setup_tables._test_uid
         logger = EventLogger(setup_tables)
         
         # Create a golden session
         for i in range(3):
             event = logger.create_user_query(
-                user_id="u1",
-                session_id="s1",
+                user_id=uid,
+                session_id=f"{uid}_s1",
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
@@ -557,13 +572,14 @@ class TestSandboxCleanup:
         """Test that sandbox is deleted after successful gate validation."""
         from core.events.event_logger import EventLogger
         
+        uid = setup_tables._test_uid
         logger = EventLogger(setup_tables)
         
         # Create a golden session
         for i in range(3):
             event = logger.create_user_query(
-                user_id="u1",
-                session_id="s1",
+                user_id=uid,
+                session_id=f"{uid}_s1",
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
