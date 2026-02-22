@@ -1,10 +1,10 @@
 """Tests for Sandbox (branch-based implementation)."""
 
 import pytest
-from uuid_utils import uuid7
 from sqlalchemy import text
 
 from core.sandbox import Sandbox
+from core.utils.id_generator import generate_sandbox_name, generate_id
 
 
 SOURCE_DB = "test_dev_agent_v3"
@@ -18,17 +18,18 @@ def sandbox(db_session):
 @pytest.fixture
 def source_table(db_session):
     """Create a test table in source DB for branching."""
-    db_session.execute(text(f"CREATE TABLE IF NOT EXISTS {SOURCE_DB}.test_branch_src (id INT PRIMARY KEY, val INT)"))
-    db_session.execute(text(f"DELETE FROM {SOURCE_DB}.test_branch_src"))
-    db_session.execute(text(f"INSERT INTO {SOURCE_DB}.test_branch_src VALUES (1,10),(2,20),(3,30)"))
+    # Use unique table name to avoid parallel test conflicts
+    table_name = f"t_{generate_id()}"  # t_ (2) + 32 = 34 chars
+    db_session.execute(text(f"CREATE TABLE IF NOT EXISTS {SOURCE_DB}.{table_name} (id INT PRIMARY KEY, val INT)"))
+    db_session.execute(text(f"INSERT INTO {SOURCE_DB}.{table_name} VALUES (1,10),(2,20),(3,30)"))
     db_session.commit()
-    yield "test_branch_src"
-    db_session.execute(text(f"DROP TABLE IF EXISTS {SOURCE_DB}.test_branch_src"))
+    yield table_name
+    db_session.execute(text(f"DROP TABLE IF EXISTS {SOURCE_DB}.{table_name}"))
     db_session.commit()
 
 
 def _unique_name():
-    return f"sandbox_{str(uuid7()).replace('-', '_')[:16]}".lower()
+    return f"sb_{generate_id()}"  # sb_ (3) + 32 = 35 chars
 
 
 # ===========================================================================
@@ -38,11 +39,11 @@ def _unique_name():
 def test_create_and_delete(sandbox):
     name = _unique_name()
     sandbox.create(name, description="Test sandbox")
-    sandboxes = sandbox.list_sandboxes()
+    sandboxes = sandbox.list_sandboxes(prefix="sb_")  # Match sb_ prefix
     assert any(s["sandbox_name"] == name for s in sandboxes)
 
     sandbox.delete(name)
-    sandboxes = sandbox.list_sandboxes()
+    sandboxes = sandbox.list_sandboxes(prefix="sb_")
     assert not any(s["sandbox_name"] == name for s in sandboxes)
 
 
