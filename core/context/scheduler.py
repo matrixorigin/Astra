@@ -39,6 +39,8 @@ GOVERNANCE_TASKS: dict[str, dict[str, Any]] = {
     "hourly":  {"interval": 3600,   "lock_name": "governance_hourly"},
     "daily":   {"interval": 86400,  "lock_name": "governance_daily"},
     "weekly":  {"interval": 604800, "lock_name": "governance_weekly"},
+    # Evaluation closed-loop tasks — auto-trigger drift/calibration/learning
+    "eval_daily": {"interval": 86400, "lock_name": "governance_eval_daily"},
 }
 
 LOCK_TTL = 300          # 5 min — lock expires if no heartbeat
@@ -98,9 +100,7 @@ class GovernanceTaskRunner:
             hb.start()
 
             try:
-                from core.context.lifecycle import MemoryGovernanceEngine
-                engine = MemoryGovernanceEngine(db)
-                result = getattr(engine, f"run_{task_name}_tasks")()
+                result = self._dispatch(task_name, db)
                 self._persist_run(db, task_name, result)
                 logger.info(f"Governance [{task_name}]: {result}")
                 return result
@@ -112,6 +112,64 @@ class GovernanceTaskRunner:
                 stop_heartbeat.set()
                 hb.join(timeout=5)
                 self._release(db, lock_name)
+
+    # ── Task dispatch ──────────────────────────────────────────
+
+    @staticmethod
+    def _dispatch(task_name: str, db: Session) -> dict[str, int]:
+        """Route task_name to the appropriate executor."""
+        if task_name == "eval_daily":
+            return GovernanceTaskRunner._run_eval_daily(db)
+        from core.context.lifecycle import MemoryGovernanceEngine
+        engine = MemoryGovernanceEngine(db)
+        return getattr(engine, f"run_{task_name}_tasks")()
+
+    @staticmethod
+    def _run_eval_daily(db: Session) -> dict[str, int]:
+        """Run daily evaluation closed-loop: drift → calibration → learning."""
+        results: dict[str, int] = {}
+
+        # Phase 1: Drift detection + auto-correction
+        try:
+            from core.evaluation.drift_pipeline import run_drift_pipeline
+            from api.database import SessionLocal
+            drift = run_drift_pipeline(db_factory=SessionLocal)
+            results["drift_signals"] = drift.signals_detected
+            results["drift_corrections"] = drift.corrections_applied
+        except Exception as e:
+            logger.error("eval_daily drift failed: %s", e)
+            results["drift_signals"] = 0
+
+        # Phase 2: Confidence calibration
+        try:
+            from core.evaluation.confidence_calibrator import ConfidenceCalibrator
+            cal = ConfidenceCalibrator(db)
+            cal_result = cal.measure(days=7)
+            results["calibration_error"] = round(cal_result.calibration_error * 100)
+        except Exception as e:
+            logger.error("eval_daily calibration failed: %s", e)
+
+        # Phase 3: Input face learning (prompt, context budget, knowledge)
+        try:
+            from core.learning.input_face_learner import InputFaceLearner
+            from core.llm.client import LLMClient
+            llm = LLMClient(db)
+            learner = InputFaceLearner(db, llm)
+            face_results = learner.diagnose_and_fix(days=7)
+            results["faces_fixed"] = sum(1 for r in face_results if r.applied)
+        except Exception as e:
+            logger.error("eval_daily learning failed: %s", e)
+
+        # Phase 4: Skill selection learning
+        try:
+            from core.skills.self_improving_selector import SelfImprovingSelector
+            selector = SelfImprovingSelector(session=db)
+            skill_result = selector.learn_from_failures(days=7)
+            results["skills_learned"] = skill_result.get("learned", 0)
+        except Exception as e:
+            logger.error("eval_daily skill learning failed: %s", e)
+
+        return results
 
     # ── Lock operations ─────────────────────────────────────────
 

@@ -82,13 +82,19 @@ def _build_chat_loop(db: Session):
 
     event_logger = EventLogger(db)
     llm_client = LLMClient()
-    skill_registry = SkillRegistry(db)
+
+    # Wire GateTrigger so skill/prompt changes auto-trigger regression gate
+    from core.evaluation.gate_trigger import GateTrigger
+    from api.database import SessionLocal as _gate_session_factory
+    gate_trigger = GateTrigger(db_factory=_gate_session_factory)
+
+    skill_registry = SkillRegistry(db, gate_trigger=gate_trigger)
     code_executor = CodeExecutor(
         runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
         db=db,
     )
     register_builtin_skills(skill_registry, db, code_executor=code_executor)
-    context_manager = ContextManager(db)
+    context_manager = ContextManager(db, gate_trigger=gate_trigger)
     selector = SkillPipeline(db, llm_client, audit=True, learning=True)
     executor = AgentExecutor(db, skill_registry)
     firewall = HallucinationFirewall(db, context_manager)

@@ -106,13 +106,14 @@ class ContextManager:
     """Orchestrate context selection and assembly."""
 
     def __init__(
-        self, db: Session, embedding_provider: str = "mock"
+        self, db: Session, embedding_provider: str = "mock", gate_trigger=None,
     ):
         """Initialize context manager.
 
         Args:
             db: Session connection
             embedding_provider: Embedding provider (openai, mock)
+            gate_trigger: GateTrigger for auto-firing regression gate on prompt changes
         """
         self.db = db
 
@@ -124,7 +125,7 @@ class ContextManager:
         # Initialize prompt manager
         from core.context.prompts import PromptManager
 
-        self.prompts = PromptManager(db)
+        self.prompts = PromptManager(db, gate_trigger=gate_trigger)
 
         # Initialize relevance scorer
         from core.context.scorer import RelevanceScorer

@@ -333,19 +333,19 @@ See [examples/](examples/) for more detailed examples.
 - **Training Data Pipeline**: Versioned datasets with lineage and contamination detection
 - **Cost-Aware Execution**: Predict costs from historical data before spending
 
-### 6. Multi-Agent Collaboration (Design)
+### 6. Multi-Agent Collaboration ✅
 - Event blackboard coordination — all inter-agent communication through auditable events
 - Delegation-as-skill — orchestrator delegates to specialists using existing skill infrastructure
 - Fan-out/fan-in, pipeline, adversarial review patterns
 - Multi-agent replay with same audit guarantees as single-agent
 
-### 7. Autonomous Planning (Design)
+### 7. Autonomous Planning ✅
 - Plan-Act-Observe-Reflect loop with hierarchical task decomposition
 - Plan versioning — every revision is an event, time-travel to any plan state
 - Cross-session plan persistence for long-horizon goals
 - Plan dry-run in sandbox branches before production execution
 
-### 8. Streaming Output (Design)
+### 8. Streaming Output ✅
 - AG-UI protocol aligned structured event stream
 - Transport-agnostic: SSE, WebSocket, stdout (CLI)
 - Every streamed chunk is a persisted, replayable event

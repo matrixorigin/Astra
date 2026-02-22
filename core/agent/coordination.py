@@ -57,6 +57,7 @@ class AggregatedResult:
 
     results: list[Result]
     conflicts: list[Conflict] = field(default_factory=list)
+    resolutions: list[dict] = field(default_factory=list)
     success_rate: float = 0.0
     total: int = 0
     succeeded: int = 0
@@ -250,8 +251,13 @@ class CoordinationPatterns:
         results = await asyncio.gather(*[execute_task(task) for task in tasks])
         return list(results)
 
-    def fan_in(self, results: list[Result]) -> AggregatedResult:
+    def fan_in(self, results: list[Result], *, resolve: bool = False, priority_order: list[str] | None = None) -> AggregatedResult:
         """Collect, evaluate quality, detect conflicts, and synthesize results.
+
+        Args:
+            results: Agent results to aggregate
+            resolve: If True, auto-resolve conflicts using ConflictResolver
+            priority_order: Agent priority for authority-based resolution
 
         Returns structured AggregatedResult with:
         - success_rate: fraction of tasks that succeeded
@@ -268,7 +274,30 @@ class CoordinationPatterns:
                 "fan_in: %d conflict(s) across %d results", len(conflicts), total,
             )
 
-        return AggregatedResult(
+        # Auto-resolve conflicts if requested
+        resolutions: list[dict] | None = None
+        if resolve and conflicts:
+            try:
+                from core.agents.conflict_resolver import ConflictResolver as CR
+                from core.agents.conflict_resolver import Proposal
+                resolver = CR(db=None)  # stateless resolution, no DB needed
+                resolutions = []
+                for c in conflicts:
+                    proposals = [
+                        Proposal(agent_id=aid, action=c.proposals[i][:200], reasoning="")
+                        for i, aid in enumerate(c.agents)
+                    ]
+                    cr_conflict = resolver.detect_conflict(proposals, c.artifact, session_id="")
+                    if cr_conflict and priority_order:
+                        winner = resolver.resolve_by_authority(cr_conflict, priority_order)
+                        resolutions.append({"artifact": c.artifact, "winner": winner.agent_id, "method": "authority"})
+                    elif cr_conflict:
+                        winner = resolver.resolve_by_evidence(cr_conflict)
+                        resolutions.append({"artifact": c.artifact, "winner": winner.agent_id, "method": "evidence"})
+            except Exception as e:
+                logger.warning("Conflict resolution failed (non-fatal): %s", e)
+
+        agg = AggregatedResult(
             results=results,
             conflicts=conflicts,
             success_rate=success_rate,
@@ -276,6 +305,9 @@ class CoordinationPatterns:
             succeeded=succeeded,
             failed=total - succeeded,
         )
+        if resolutions:
+            agg.resolutions = resolutions
+        return agg
 
     async def pipeline(
         self, steps: list[Task], session_id: str, user_id: str

@@ -134,6 +134,18 @@ class MemoryGovernanceEngine:
         
         # Generate health report
         results["health_reports"] = self._generate_health_reports()
+
+        # SLO compliance check
+        try:
+            from core.evaluation.slo_monitor import SLOMonitor
+            monitor = SLOMonitor(self.db)
+            # Check default agent — SLO violations are logged as warnings
+            report = monitor.check_agent("dev-agent", period_days=7)
+            results["slo_violations"] = sum(
+                1 for s in report.statuses if not s.met
+            )
+        except Exception as e:
+            logger.debug("SLO check skipped: %s", e)
         
         logger.info(f"Weekly tasks: {results}")
         return results
