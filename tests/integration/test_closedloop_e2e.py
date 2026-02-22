@@ -540,15 +540,21 @@ class TestSLOWeeklyGovernance:
 
         _seed_llm_events(db_session, "slo_test_agent", n=15, quality=4.5)
 
-        monitor = SLOMonitor(db_session)
-        report = monitor.check_agent("slo_test_agent", period_days=7)
+        try:
+            monitor = SLOMonitor(db_session)
+            report = monitor.check_agent("slo_test_agent", period_days=7)
 
-        assert report.agent_id == "slo_test_agent"
-        assert report.period_days == 7
-        assert len(report.statuses) == 3  # 3 default SLOs
-        for s in report.statuses:
-            assert hasattr(s, "met")
-            assert hasattr(s, "burn_rate")
+            assert report.agent_id == "slo_test_agent"
+            assert report.period_days == 7
+            assert len(report.statuses) == 3  # 3 default SLOs
+            for s in report.statuses:
+                assert hasattr(s, "met")
+                assert hasattr(s, "burn_rate")
+        finally:
+            db_session.execute(
+                text("DELETE FROM conversation_events WHERE agent_id = 'slo_test_agent'")
+            )
+            db_session.commit()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -796,14 +802,20 @@ class TestGovernanceTaskRunnerIntegration:
         ))
         db_session.commit()
 
-        with patch.object(
-            GovernanceTaskRunner, "_run_eval_daily",
-            return_value={"drift_signals": 0},
-        ):
-            result = runner.run("eval_daily")
+        try:
+            with patch.object(
+                GovernanceTaskRunner, "_run_eval_daily",
+                return_value={"drift_signals": 0},
+            ):
+                result = runner.run("eval_daily")
 
-        assert result is not None  # Took over expired lock and ran
-        assert result["drift_signals"] == 0
+            assert result is not None  # Took over expired lock and ran
+            assert result["drift_signals"] == 0
+        finally:
+            db_session.execute(
+                text("DELETE FROM distributed_locks WHERE lock_name = 'governance_eval_daily'")
+            )
+            db_session.commit()
 
 
 # ═══════════════════════════════════════════════════════════════════
