@@ -57,28 +57,26 @@ def cleanup_sandboxes():
     # Cleanup before test
     db = next(get_db_session())
     sandbox = Sandbox(db=db, source_db=SOURCE_DB)
-    sandboxes = sandbox.list_sandboxes(prefix="", pattern="test_sandbox_%")
-    for s in sandboxes:
-        try:
-            sandbox.delete(s["sandbox_name"], force=True)
-        except:
-            pass
+    
+    # Clean up both test_sandbox_% and ts_% patterns
+    for pattern in ["test_sandbox_%", "ts_%"]:
+        sandboxes = sandbox.list_sandboxes(prefix="", pattern=pattern)
+        for s in sandboxes:
+            try:
+                sandbox.delete(s["sandbox_name"], force=True)
+            except:
+                pass
     
     yield
     
-    # Cleanup after test
-    sandboxes = sandbox.list_sandboxes(prefix="", pattern="test_sandbox_%")
-    for s in sandboxes:
-        try:
-            sandbox.delete(s["sandbox_name"], force=True)
-        except:
-            pass
-    sandboxes = sandbox.list_sandboxes(pattern="test_sandbox_%")
-    for s in sandboxes:
-        try:
-            sandbox.delete(s["sandbox_name"], force=True)
-        except:
-            pass
+    # Cleanup after test - clean up both patterns
+    for pattern in ["test_sandbox_%", "ts_%"]:
+        sandboxes = sandbox.list_sandboxes(prefix="", pattern=pattern)
+        for s in sandboxes:
+            try:
+                sandbox.delete(s["sandbox_name"], force=True)
+            except:
+                pass
 
 
 class TestCreateSandbox:
