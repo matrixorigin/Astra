@@ -1,15 +1,16 @@
-"""Evaluation API — quality trends, drift detection, gate history, calibration."""
+"""Evaluation API — quality trends, drift detection, gate history, calibration, closed-loop actions."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal, get_db_session
+from api.dependencies import get_current_user
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -69,6 +70,44 @@ class SessionScoreResponse(BaseModel):
     session_id: str
     score: float
     chain_count: int
+
+
+class GateValidateRequest(BaseModel):
+    change_type: str = Field(..., pattern="^(prompt|skill|config|selector|context_budget|knowledge)$")
+    change_id: str
+    change_content: dict[str, Any]
+    golden_session_count: int = Field(default=50, ge=1, le=500)
+    error_rate_threshold: float = Field(default=0.05, ge=0.0, le=1.0)
+    score_regression_threshold: float = Field(default=-0.1, ge=-5.0, le=0.0)
+
+
+class GateValidateResponse(BaseModel):
+    gate_id: str
+    verdict: str
+    reason: str
+    sessions_tested: int
+    metrics: dict[str, Any]
+
+
+class DriftPipelineResponse(BaseModel):
+    signals_detected: int
+    signals_confirmed: int
+    corrections_applied: int
+    actions: list[dict[str, Any]]
+    error: str | None = None
+
+
+class LoopDiagnosisItem(BaseModel):
+    input_face: str
+    bottleneck: str
+    applied: bool
+    gate_verdict: str
+    error: str | None = None
+
+
+class ClosedLoopResponse(BaseModel):
+    drift: DriftPipelineResponse
+    diagnoses: list[LoopDiagnosisItem]
 
 
 # ---------------------------------------------------------------------------
@@ -231,3 +270,127 @@ def get_session_scores(
         )
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Action endpoints — closed-loop evaluation
+# ---------------------------------------------------------------------------
+
+
+@router.post("/gate/validate", response_model=GateValidateResponse)
+def validate_gate(
+    req: GateValidateRequest,
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+) -> GateValidateResponse:
+    """Trigger regression gate: replay golden sessions against a proposed change."""
+    from core.evaluation.regression_gate import ChangeType, RegressionGate
+
+    try:
+        gate = RegressionGate(db=db)
+        result = gate.validate_change(
+            change_type=ChangeType(req.change_type),
+            change_id=req.change_id,
+            change_content=req.change_content,
+            golden_session_count=req.golden_session_count,
+            error_rate_threshold=req.error_rate_threshold,
+            score_regression_threshold=req.score_regression_threshold,
+        )
+    except Exception as e:
+        logger.error("Gate validation failed: %s", e)
+        return GateValidateResponse(
+            gate_id="", verdict="error", reason=str(e),
+            sessions_tested=0, metrics={},
+        )
+    return GateValidateResponse(
+        gate_id=result["gate_id"],
+        verdict=result["verdict"],
+        reason=result["reason"],
+        sessions_tested=result["sessions_tested"],
+        metrics=result.get("metrics", {}),
+    )
+
+
+@router.post("/drift/run", response_model=DriftPipelineResponse)
+def run_drift(
+    current_user: dict = Depends(get_current_user),
+) -> DriftPipelineResponse:
+    """Run full drift pipeline: detect → confirm → correct."""
+    from core.evaluation.drift_pipeline import run_drift_pipeline
+
+    try:
+        result = run_drift_pipeline(db_factory=SessionLocal)
+    except Exception as e:
+        logger.error("Drift pipeline failed: %s", e)
+        return DriftPipelineResponse(
+            signals_detected=0, signals_confirmed=0,
+            corrections_applied=0, actions=[], error=str(e),
+        )
+    return DriftPipelineResponse(
+        signals_detected=result.signals_detected,
+        signals_confirmed=result.signals_confirmed,
+        corrections_applied=result.corrections_applied,
+        actions=result.actions,
+        error=result.error,
+    )
+
+
+@router.post("/loop", response_model=ClosedLoopResponse)
+def run_closed_loop(
+    days: int = Query(default=7, ge=1, le=30),
+    dry_run: bool = Query(default=False),
+    current_user: dict = Depends(get_current_user),
+) -> ClosedLoopResponse:
+    """One-click closed loop: drift pipeline + InputFaceLearner diagnose-and-fix.
+
+    This is the OBSERVE → DIAGNOSE → PROPOSE → VALIDATE → DEPLOY loop
+    from the design doc, exposed as a single API call.
+    """
+    from core.evaluation.drift_pipeline import run_drift_pipeline
+
+    # Phase 1: Drift detection + auto-correction
+    try:
+        drift_result = run_drift_pipeline(db_factory=SessionLocal)
+    except Exception as e:
+        logger.error("Closed loop drift phase failed: %s", e)
+        drift_result = None
+
+    drift_resp = DriftPipelineResponse(
+        signals_detected=drift_result.signals_detected if drift_result else 0,
+        signals_confirmed=drift_result.signals_confirmed if drift_result else 0,
+        corrections_applied=drift_result.corrections_applied if drift_result else 0,
+        actions=drift_result.actions if drift_result else [],
+        error=drift_result.error if drift_result else None,
+    )
+
+    # Phase 2: InputFaceLearner — diagnose bottlenecks + propose/apply fixes
+    diagnoses: list[LoopDiagnosisItem] = []
+    try:
+        from core.learning.input_face_learner import InputFaceLearner
+        from core.llm.client import LLMClient
+
+        db = SessionLocal()
+        try:
+            llm = LLMClient(db)
+            learner = InputFaceLearner(db, llm)
+            results = learner.diagnose_and_fix(days=days, dry_run=dry_run)
+            diagnoses = [
+                LoopDiagnosisItem(
+                    input_face=r.input_face.value,
+                    bottleneck=r.bottleneck,
+                    applied=r.applied,
+                    gate_verdict=r.gate_verdict,
+                    error=r.error,
+                )
+                for r in results
+            ]
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error("Closed loop learner phase failed: %s", e)
+        diagnoses = [LoopDiagnosisItem(
+            input_face="all", bottleneck="learner_unavailable",
+            applied=False, gate_verdict="error", error=str(e),
+        )]
+
+    return ClosedLoopResponse(drift=drift_resp, diagnoses=diagnoses)

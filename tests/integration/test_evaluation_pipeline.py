@@ -251,3 +251,84 @@ class TestEvaluationAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert any(s["session_id"] == session_id for s in data)
+
+
+class TestEvaluationActionAPI:
+    """Test evaluation action endpoints (gate/validate, drift/run, loop)."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def auth_token(self, client):
+        username = f"eval_action_{generate_id()[:8]}"
+        client.post("/auth/register", json={
+            "username": username,
+            "email": f"{username}@test.com",
+            "password": "testpass1234",
+        })
+        resp = client.post("/auth/login", json={
+            "username": username, "password": "testpass1234",
+        })
+        return resp.json()["access_token"]
+
+    @pytest.fixture
+    def headers(self, auth_token):
+        return {"Authorization": f"Bearer {auth_token}"}
+
+    def test_gate_validate_requires_auth(self, client):
+        resp = client.post("/api/v1/evaluation/gate/validate", json={
+            "change_type": "prompt", "change_id": "x", "change_content": {},
+        })
+        assert resp.status_code == 401
+
+    def test_gate_validate_skip_no_golden(self, client, headers):
+        """Gate returns skip when no golden sessions exist."""
+        resp = client.post("/api/v1/evaluation/gate/validate", json={
+            "change_type": "prompt",
+            "change_id": "test_prompt@v1",
+            "change_content": {"content": "You are helpful."},
+        }, headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["verdict"] in ("skip", "error")
+        assert data["sessions_tested"] == 0
+
+    def test_gate_validate_invalid_change_type(self, client, headers):
+        resp = client.post("/api/v1/evaluation/gate/validate", json={
+            "change_type": "invalid_type",
+            "change_id": "x",
+            "change_content": {},
+        }, headers=headers)
+        assert resp.status_code == 422
+
+    def test_drift_run_requires_auth(self, client):
+        resp = client.post("/api/v1/evaluation/drift/run")
+        assert resp.status_code == 401
+
+    def test_drift_run_returns_result(self, client, headers):
+        resp = client.post("/api/v1/evaluation/drift/run", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "signals_detected" in data
+        assert "corrections_applied" in data
+
+    def test_loop_requires_auth(self, client):
+        resp = client.post("/api/v1/evaluation/loop")
+        assert resp.status_code == 401
+
+    def test_loop_returns_both_phases(self, client, headers):
+        resp = client.post(
+            "/api/v1/evaluation/loop",
+            params={"days": 7, "dry_run": True},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "drift" in data
+        assert "diagnoses" in data
+        assert isinstance(data["drift"]["actions"], list)
+        assert isinstance(data["diagnoses"], list)
