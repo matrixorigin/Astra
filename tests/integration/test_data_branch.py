@@ -18,7 +18,7 @@ from core.code_executor.data_context import DataContext, DataAccessLevel, TableD
 from core.code_executor import CodeExecutor, CodeExecutionRequest
 from core.code_executor.security import SecurityGuard
 from core.runtime.subprocess_runtime import SubprocessRuntime
-from core.utils.id_generator import generate_hash_id
+from core.utils.id_generator import generate_hash_id, generate_id
 
 # Support parallel testing with worker-specific database names
 def get_worker_id():
@@ -363,7 +363,8 @@ class TestCodeExecutorWrite:
         runtime = SubprocessRuntime()
         executor = CodeExecutor(runtime=runtime, db=db, branch=br, security=SecurityGuard())
 
-        session_id = f"{worker_id}_session"
+        # Use unique session_id (same format as production)
+        session_id = generate_id()
         expected_sandbox = f"code_exec_{generate_hash_id(session_id, 8)}"
         
         # Clean up any existing sandbox
