@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
+from api.dependencies import get_current_user
 from core.skills.pipeline import SkillPipeline
 from core.llm.client import LLMClient
 from core.logging_config import get_logger
@@ -92,6 +93,7 @@ class FeedbackResponse(BaseModel):
 async def trigger_learning(
     request: LearningTriggerRequest,
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ) -> LearningTriggerResponse:
     """Trigger learning cycle from recent failures.
     
@@ -161,7 +163,9 @@ async def trigger_learning(
 
 
 @router.get("/signals", response_model=SignalTypesResponse)
-async def get_signal_types() -> SignalTypesResponse:
+async def get_signal_types(
+    current_user: dict = Depends(get_current_user),
+) -> SignalTypesResponse:
     """Get available learning signal types.
     
     Returns:
@@ -181,6 +185,7 @@ async def get_signal_types() -> SignalTypesResponse:
 @router.get("/stats", response_model=LearningStatsResponse)
 async def get_learning_stats(
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ) -> LearningStatsResponse:
     """Get learning statistics.
     
@@ -226,6 +231,7 @@ async def get_learning_stats(
 async def submit_feedback(
     request: FeedbackRequest,
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ) -> FeedbackResponse:
     """Submit feedback for a skill selection event.
     

@@ -452,9 +452,9 @@ class TestScenario4_EvaluationQueries:
 class TestScenario5_SkillLearning:
     """Trigger learning → check stats → verify signals — all via API."""
 
-    def test_learning_signals_endpoint(self, client):
+    def test_learning_signals_endpoint(self, client, auth_headers):
         """Signal types endpoint returns available signal types."""
-        resp = client.get("/api/v1/learning/signals")
+        resp = client.get("/api/v1/learning/signals", headers=auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert "signal_types" in data
@@ -631,6 +631,15 @@ class TestScenario7_CRUD:
             ("POST", "/decisions"),
             ("POST", "/api/v1/evaluation/loop"),
             ("POST", "/api/v1/evaluation/drift/run"),
+            ("GET", "/api/v1/evaluation/quality/trend"),
+            ("GET", "/api/v1/evaluation/drift"),
+            ("GET", "/api/v1/evaluation/gates"),
+            ("GET", "/api/v1/evaluation/calibration"),
+            ("GET", "/api/v1/evaluation/sessions/scores"),
+            ("GET", "/api/v1/learning/signals"),
+            ("GET", "/api/v1/learning/stats"),
+            ("POST", "/api/v1/learning/trigger"),
+            ("POST", "/api/v1/learning/feedback"),
         ]
         for method, path in endpoints:
             if method == "POST":

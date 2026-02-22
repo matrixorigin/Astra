@@ -124,6 +124,7 @@ def get_quality_trend(
     days: int = Query(default=14, ge=1, le=90),
     model: str | None = Query(default=None),
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ) -> QualityTrendResponse:
     """Daily quality score trend from conversation_events."""
     params: dict[str, Any] = {"days": days}
@@ -169,6 +170,7 @@ def get_quality_trend(
 @router.get("/drift", response_model=list[DriftSignalResponse])
 def detect_drift(
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ) -> list[DriftSignalResponse]:
     """Run drift detection and return active signals."""
     from core.evaluation.drift_detector import DriftDetector
@@ -195,6 +197,7 @@ def detect_drift(
 def get_gate_history(
     limit: int = Query(default=20, ge=1, le=100),
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ) -> list[GateResultResponse]:
     """Recent regression gate results."""
     try:
@@ -224,6 +227,7 @@ def get_calibration(
     agent_id: str | None = Query(default=None),
     days: int = Query(default=30, ge=1, le=90),
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ) -> CalibrationResponse:
     """Confidence calibration status — how well the system knows what it doesn't know."""
     from core.evaluation.confidence_calibrator import ConfidenceCalibrator
@@ -255,6 +259,7 @@ def get_session_scores(
     limit: int = Query(default=20, ge=1, le=100),
     min_score: float = Query(default=0.0, ge=0.0, le=5.0),
     db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ) -> list[SessionScoreResponse]:
     """Session-level quality scores from quality_assessments."""
     try:

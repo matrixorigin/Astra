@@ -79,7 +79,7 @@ def _make_mock_loop(responses: list[str]):
             else:
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DELTA,
-                    data={"text": text},
+                    data={"chunk": text},
                 )
 
     return MockLoop()
@@ -116,7 +116,7 @@ class TestMultiAgentE2E:
                     # This is the resumed parent
                     yield StreamEvent(
                         event_type=StreamEventType.TEXT_DELTA,
-                        data={"text": "Review complete: all clear"},
+                        data={"chunk": "Review complete: all clear"},
                     )
                 else:
                     # First parent call — will trigger wait
@@ -152,7 +152,7 @@ class TestMultiAgentE2E:
         # Verify child output was captured
         child_events = _run_events.get(child.run_id, [])
         child_text = "".join(
-            ev.get("data", {}).get("text", "")
+            ev.get("data", {}).get("chunk", "")
             for ev in child_events if ev.get("event_type") == "text_delta"
         )
         assert "LGTM" in child_text
@@ -177,13 +177,13 @@ class TestMultiAgentE2E:
                     if key in user_input.lower():
                         yield StreamEvent(
                             event_type=StreamEventType.TEXT_DELTA,
-                            data={"text": output},
+                            data={"chunk": output},
                         )
                         return
                 # Parent resume
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DELTA,
-                    data={"text": "All reviews done. Summary: 1 perf issue, 1 style issue."},
+                    data={"chunk": "All reviews done. Summary: 1 perf issue, 1 style issue."},
                 )
 
             loop.run_step_stream = stream
@@ -231,7 +231,7 @@ class TestMultiAgentE2E:
                     raise RuntimeError("LLM API error")
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DELTA,
-                    data={"text": "Review OK"},
+                    data={"chunk": "Review OK"},
                 )
 
             loop.run_step_stream = stream
@@ -273,7 +273,7 @@ class TestMultiAgentE2E:
                 received_context.update(kw.get("context", {}))
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DELTA,
-                    data={"text": "done"},
+                    data={"chunk": "done"},
                 )
 
             loop.run_step_stream = stream
@@ -300,7 +300,7 @@ class TestMultiAgentE2E:
             async def stream(**kw):
                 started.set()
                 await asyncio.sleep(10)  # Simulate long-running child
-                yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data={"text": "done"})
+                yield StreamEvent(event_type=StreamEventType.TEXT_DELTA, data={"chunk": "done"})
 
             loop.run_step_stream = stream
             return loop

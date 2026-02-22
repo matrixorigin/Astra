@@ -84,7 +84,7 @@ class TestRunEngineStartRun:
 
         async def fake_stream(**kw):
             from core.events.models import StreamEvent
-            yield StreamEvent(event_type="text_delta", data={"text": "hello"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": "hello"})
 
         mock_loop.run_step_stream = fake_stream
 
@@ -172,7 +172,7 @@ class TestRunEngineResume:
 
         async def resume_stream(**kw):
             from core.events.models import StreamEvent
-            yield StreamEvent(event_type="text_delta", data={"text": "done"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": "done"})
 
         mock_loop.run_step_stream = resume_stream
 
@@ -300,7 +300,7 @@ class TestRunEngineResolveHandle:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
-            yield StreamEvent(event_type="text_delta", data={"text": "ok"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": "ok"})
 
         mock_loop.run_step_stream = stream
 
@@ -359,7 +359,7 @@ class TestMultiAgentRuns:
         mock_loop = MagicMock()
         async def stream(**kw):
             from core.events.models import StreamEvent
-            yield StreamEvent(event_type="text_delta", data={"text": "reviewed"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": "reviewed"})
         mock_loop.run_step_stream = stream
         mock_loop._current_run_id = None
 
@@ -403,7 +403,7 @@ class TestMultiAgentRuns:
             from core.events.models import StreamEvent
             nonlocal call_count
             call_count += 1
-            yield StreamEvent(event_type="text_delta", data={"text": f"result-{call_count}"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": f"result-{call_count}"})
         mock_loop.run_step_stream = stream
 
         with patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
@@ -470,7 +470,7 @@ class TestResumeInputCap:
                 # Simulate another wait
                 yield StreamEvent(event_type="tool_result", data={"wait_for": f"job:{resume_count[0]+1}"})
             else:
-                yield StreamEvent(event_type="text_delta", data={"text": "done"})
+                yield StreamEvent(event_type="text_delta", data={"chunk": "done"})
 
         mock_loop.run_step_stream = stream
 
@@ -509,7 +509,7 @@ class TestResumeInputCap:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
-            yield StreamEvent(event_type="text_delta", data={"text": "ok"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": "ok"})
 
         mock_loop.run_step_stream = stream
 
@@ -615,7 +615,7 @@ class TestFanInDBFallback:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
-            yield StreamEvent(event_type="text_delta", data={"text": "synthesized"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": "synthesized"})
 
         mock_loop.run_step_stream = stream
 
@@ -827,7 +827,7 @@ class TestCausalChainPropagation:
 
         async def stream(**kw):
             from core.events.models import StreamEvent
-            yield StreamEvent(event_type="text_delta", data={"text": "ok"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": "ok"})
 
         mock_loop.run_step_stream = stream
 
@@ -869,7 +869,7 @@ class TestConsumeStreamCancellation:
             from core.events.models import StreamEvent
             for i in range(20):
                 event_count[0] += 1
-                yield StreamEvent(event_type="text_delta", data={"text": f"chunk-{i}"})
+                yield StreamEvent(event_type="text_delta", data={"chunk": f"chunk-{i}"})
 
         mock_loop.run_step_stream = stream
 
@@ -921,7 +921,7 @@ class TestStreamRunEventsBounded:
     async def test_stream_switches_to_db_after_gc(self, engine):
         """After run is GC'd from memory, stream falls back to DB."""
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
-        engine._append_event(run.run_id, {"event_type": "text_delta", "data": {"text": "hello"}})
+        engine._append_event(run.run_id, {"event_type": "text_delta", "data": {"chunk": "hello"}})
         run.status = RunStatus.COMPLETED
         run.completed_at = datetime.now(timezone.utc)
 
@@ -931,7 +931,7 @@ class TestStreamRunEventsBounded:
 
         # Mock DB to return the event
         engine.db.execute.return_value.fetchall.return_value = [
-            ("text_delta", '{"text": "hello"}', None, None),
+            ("text_delta", '{"chunk": "hello"}', None, None),
         ]
 
         collected = []
@@ -968,7 +968,7 @@ class TestFanInAgentIdFallback:
         engine.resume_run = AsyncMock()
 
         # Provide events for the child
-        _run_events[child_id] = [{"event_type": "text_delta", "data": {"text": "looks good"}}]
+        _run_events[child_id] = [{"event_type": "text_delta", "data": {"chunk": "looks good"}}]
 
         await engine._check_fan_in(parent.run_id)
 

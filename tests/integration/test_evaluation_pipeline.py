@@ -208,37 +208,51 @@ class TestEvaluationAPI:
         from api.main import app
         return TestClient(app)
 
-    def test_quality_trend(self, client, db, session_id, user_id):
+    @pytest.fixture
+    def auth_headers(self, client):
+        username = f"eval_{generate_id()[:8]}"
+        client.post("/auth/register", json={
+            "username": username,
+            "email": f"{username}@test.com",
+            "password": "testpass1234",
+        })
+        resp = client.post("/auth/login", json={
+            "username": username, "password": "testpass1234",
+        })
+        return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+    def test_quality_trend(self, client, auth_headers, db, session_id, user_id):
         # Insert scored events
         chain_id = generate_id()
         _insert_event(db, session_id=session_id, user_id=user_id,
                       chain_id=chain_id, quality_score=4.0,
                       training_eligible=True)
 
-        resp = client.get("/api/v1/evaluation/quality/trend", params={"days": 1})
+        resp = client.get("/api/v1/evaluation/quality/trend", params={"days": 1},
+                          headers=auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert "points" in data
         assert data["total_events"] >= 1
 
-    def test_drift_returns_list(self, client):
-        resp = client.get("/api/v1/evaluation/drift")
+    def test_drift_returns_list(self, client, auth_headers):
+        resp = client.get("/api/v1/evaluation/drift", headers=auth_headers)
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
 
-    def test_gates_returns_list(self, client):
-        resp = client.get("/api/v1/evaluation/gates")
+    def test_gates_returns_list(self, client, auth_headers):
+        resp = client.get("/api/v1/evaluation/gates", headers=auth_headers)
         assert resp.status_code == 200
         assert isinstance(resp.json(), list)
 
-    def test_calibration(self, client):
-        resp = client.get("/api/v1/evaluation/calibration")
+    def test_calibration(self, client, auth_headers):
+        resp = client.get("/api/v1/evaluation/calibration", headers=auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert "calibration_error" in data
         assert "adjustment_multiplier" in data
 
-    def test_session_scores(self, client, db, session_id, user_id):
+    def test_session_scores(self, client, auth_headers, db, session_id, user_id):
         # Build a scored session
         chain_id = generate_id()
         _insert_event(db, session_id=session_id, user_id=user_id,
@@ -247,7 +261,7 @@ class TestEvaluationAPI:
         score_session(db, session_id)
 
         resp = client.get("/api/v1/evaluation/sessions/scores",
-                          params={"min_score": 4.0})
+                          params={"min_score": 4.0}, headers=auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert any(s["session_id"] == session_id for s in data)

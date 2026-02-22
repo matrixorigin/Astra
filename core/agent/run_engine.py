@@ -615,7 +615,7 @@ class RunEngine:
             final_text = ""
             for ev in child_events:
                 if ev.get("event_type") == "text_delta":
-                    final_text += ev.get("data", {}).get("text", "")
+                    final_text += ev.get("data", {}).get("chunk", "")
 
             agent_id = child.agent_id if child else cid
             results[agent_id] = {

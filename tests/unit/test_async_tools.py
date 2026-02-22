@@ -182,7 +182,7 @@ class TestSpawnRuns:
         mock_loop._current_run_id = None
         async def stream(**kw):
             from core.events.models import StreamEvent
-            yield StreamEvent(event_type="text_delta", data={"text": "done"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": "done"})
         mock_loop.run_step_stream = stream
 
         # Create parent run with patched init
@@ -241,7 +241,7 @@ class TestSpawnRuns:
         mock_loop._current_run_id = None
         async def stream(**kw):
             from core.events.models import StreamEvent
-            yield StreamEvent(event_type="text_delta", data={"text": "done"})
+            yield StreamEvent(event_type="text_delta", data={"chunk": "done"})
         mock_loop.run_step_stream = stream
 
         with patch.object(RunEngine, '__init__', lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):

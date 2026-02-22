@@ -44,13 +44,13 @@ async def code_review_example():
         
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DELTA,
-            data={"text": reviews.get(agent_id, "Review complete")},
+            data={"chunk": reviews.get(agent_id, "Review complete")},
             agent_id=agent_id,
         )
         
         yield StreamEvent(
             event_type=StreamEventType.TEXT_DONE,
-            data={"text": reviews.get(agent_id, "Review complete")},
+            data={"full_text": reviews.get(agent_id, "Review complete")},
             agent_id=agent_id,
         )
         
