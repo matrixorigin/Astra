@@ -377,9 +377,18 @@ class TestCodeExecutorWrite:
             pass
         
         # Code that inserts into sandbox
+        # Retry connect: MatrixOne CREATE DATABASE is async, new connections
+        # may not see it immediately under parallel test load.
         code = f"""
-import pymysql
-conn = pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111', database='{expected_sandbox}')
+import pymysql, time
+for _ in range(10):
+    try:
+        conn = pymysql.connect(host='127.0.0.1', port=6001, user='root', password='111', database='{expected_sandbox}')
+        break
+    except pymysql.err.OperationalError:
+        time.sleep(0.3)
+else:
+    raise RuntimeError('sandbox DB not visible after retries')
 cur = conn.cursor()
 cur.execute('INSERT INTO t1 VALUES(10, 10)')
 conn.commit()
@@ -396,7 +405,11 @@ print('inserted')
         ))
 
         try:
-            assert result.execution.exit_code == 0
+            assert result.execution.exit_code == 0, (
+                f"Code execution failed (sandbox={expected_sandbox}):\n"
+                f"  stderr: {result.execution.stderr}\n"
+                f"  stdout: {result.execution.stdout}"
+            )
             assert "inserted" in result.execution.stdout
             assert result.time_travel is not None
             assert result.time_travel.source_db == TEST_DB
@@ -458,7 +471,11 @@ print('inserted')
         ))
 
         try:
-            assert result.execution.exit_code == 0
+            assert result.execution.exit_code == 0, (
+                f"Code execution failed (sandbox={expected_sandbox}):\n"
+                f"  stderr: {result.execution.stderr}\n"
+                f"  stdout: {result.execution.stdout}"
+            )
             assert result.data_diff == []
         finally:
             executor.cleanup_session(session_id)
