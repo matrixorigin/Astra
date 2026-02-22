@@ -178,6 +178,9 @@ class RunEngine:
 
             if run.status == RunStatus.RUNNING:
                 self._complete_run(run)
+
+            if run.status == RunStatus.RUNNING:
+                self._complete_run(run)
         except asyncio.TimeoutError as e:
             logger.error(f"Run {run.run_id} timed out after {timeout}s")
             run.status = RunStatus.FAILED
@@ -547,7 +550,7 @@ class RunEngine:
             row = self.db.execute(
                 text(
                     "SELECT 1 FROM conversation_events "
-                    "WHERE event_type = :et AND JSON_EXTRACT(metadata, '$.run_id') = :run_id "
+                    "WHERE event_type = :et AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :run_id "
                     "LIMIT 1"
                 ),
                 {"et": EventType.RUN_CANCELLED.value, "run_id": run_id},
@@ -560,8 +563,8 @@ class RunEngine:
         try:
             row = self.db.execute(
                 text(
-                    "SELECT JSON_EXTRACT(metadata, '$.run_id') FROM conversation_events "
-                    "WHERE event_type = :et AND JSON_EXTRACT(metadata, '$.waiting_for') = :handle "
+                    "SELECT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) FROM conversation_events "
+                    "WHERE event_type = :et AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.waiting_for')) = :handle "
                     "ORDER BY created_at DESC LIMIT 1"
                 ),
                 {"et": EventType.RUN_WAITING.value, "handle": handle},
@@ -633,9 +636,9 @@ class RunEngine:
         try:
             rows = self.db.execute(
                 text(
-                    "SELECT DISTINCT JSON_EXTRACT(metadata, '$.run_id') FROM conversation_events "
+                    "SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) FROM conversation_events "
                     "WHERE event_type = :et "
-                    "AND JSON_EXTRACT(metadata, '$.parent_run_id') = :pid"
+                    "AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.parent_run_id')) = :pid"
                 ),
                 {"et": EventType.RUN_STARTED.value, "pid": parent_run_id},
             ).fetchall()
@@ -724,8 +727,8 @@ class RunEngine:
         """Restore run state from conversation_events."""
         rows = self.db.execute(
             text(
-                "SELECT event_type, content, metadata FROM conversation_events "
-                "WHERE JSON_EXTRACT(metadata, '$.run_id') = :run_id "
+                "SELECT event_type, content, `metadata` FROM conversation_events "
+                "WHERE JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :run_id "
                 "ORDER BY created_at"
             ),
             {"run_id": run_id},
