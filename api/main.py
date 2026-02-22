@@ -175,6 +175,10 @@ app.include_router(workflows.router, tags=["workflows"])
 from api.routers import learning
 app.include_router(learning.router, tags=["learning"])
 
+# Evaluation — quality trends, drift, gate history, calibration
+from api.routers import evaluation
+app.include_router(evaluation.router, tags=["evaluation"])
+
 # Triggers — webhook + cron → AgentRun
 from api.routers import triggers
 app.include_router(triggers.router, tags=["triggers"])

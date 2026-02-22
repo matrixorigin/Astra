@@ -133,6 +133,13 @@ class SessionManager:
             db_session.updated_at = datetime.now(timezone.utc)
             db.commit()
             
+            # Session-level quality scoring (aggregate chain scores)
+            try:
+                from core.evaluation.multi_level_scorer import score_session
+                score_session(db, session_id)
+            except Exception as e:
+                logger.warning("Session-level scoring failed (non-fatal): %s", e)
+
             # Auto-trigger knowledge extraction
             try:
                 from skills.knowledge.api import KnowledgeExtractor

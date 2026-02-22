@@ -115,34 +115,44 @@ def score_session(db: Session, session_id: str) -> dict[str, Any] | None:
 def _upsert_assessment(
     db: Session, level: str, target_id: str, session_id: str, result: dict,
 ) -> None:
-    """Insert or update a quality assessment row (race-safe via ON DUPLICATE KEY)."""
+    """Insert or update a quality assessment row.
+
+    MatrixOne does not support ON DUPLICATE KEY UPDATE when the conflict is on
+    a unique key but not the primary key.  quality_assessments has PK =
+    assessment_id (always new uuid) and UK = (level, target_id), so we must
+    use SELECT + INSERT/UPDATE.
+    """
     now = datetime.now(timezone.utc)
     sc = result.get("step_count", result.get("chain_count", 0))
     fc = result.get("failure_count", 0)
     details = _json_dumps(result.get("details"))
 
-    db.execute(
-        text("""
-            INSERT INTO quality_assessments
-            (assessment_id, level, target_id, session_id, score, step_count, failure_count, details, created_at, updated_at)
-            VALUES (:aid, :lvl, :tid, :sid, :score, :sc, :fc, :details, :now, :now)
-            ON DUPLICATE KEY UPDATE
-                score = VALUES(score), step_count = VALUES(step_count),
-                failure_count = VALUES(failure_count), details = VALUES(details),
-                updated_at = VALUES(updated_at)
-        """),
-        {
-            "aid": str(uuid7()),
-            "lvl": level,
-            "tid": target_id,
-            "sid": session_id,
-            "score": result["score"],
-            "sc": sc,
-            "fc": fc,
-            "details": details,
-            "now": now,
-        },
-    )
+    row = db.execute(
+        text("SELECT assessment_id FROM quality_assessments "
+             "WHERE level = :lvl AND target_id = :tid"),
+        {"lvl": level, "tid": target_id},
+    ).fetchone()
+
+    if row:
+        db.execute(
+            text("UPDATE quality_assessments "
+                 "SET score = :score, step_count = :sc, failure_count = :fc, "
+                 "details = :details, updated_at = :now "
+                 "WHERE assessment_id = :aid"),
+            {"score": result["score"], "sc": sc, "fc": fc,
+             "details": details, "now": now, "aid": row.assessment_id},
+        )
+    else:
+        db.execute(
+            text("INSERT INTO quality_assessments "
+                 "(assessment_id, level, target_id, session_id, score, "
+                 "step_count, failure_count, details, created_at, updated_at) "
+                 "VALUES (:aid, :lvl, :tid, :sid, :score, :sc, :fc, "
+                 ":details, :now, :now)"),
+            {"aid": str(uuid7()), "lvl": level, "tid": target_id,
+             "sid": session_id, "score": result["score"], "sc": sc,
+             "fc": fc, "details": details, "now": now},
+        )
     db.commit()
 
 

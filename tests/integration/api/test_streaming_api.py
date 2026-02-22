@@ -66,4 +66,4 @@ def test_stream_chat_unauthorized(client):
         "message": "Hello"
     })
     
-    assert response.status_code == 403  # FastAPI returns 403 for missing auth
+    assert response.status_code == 401  # FastAPI returns 403 for missing auth

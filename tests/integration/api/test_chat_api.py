@@ -92,7 +92,7 @@ class TestChatAPI:
 
     def test_chat_no_auth(self, client):
         resp = client.post("/chat", json={"message": "hi"})
-        assert resp.status_code == 403
+        assert resp.status_code == 401
 
     @patch("api.routers.chat._get_engine")
     def test_chat_nonexistent_session(self, mock_get_engine, client, auth_headers):

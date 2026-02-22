@@ -27,10 +27,11 @@ def _mock_db_for_chain(scores: list[float]):
     """Return a mock db whose execute returns rows with quality_score."""
     db = MagicMock()
     rows = [_make_row(event_id=f"e{i}", quality_score=s) for i, s in enumerate(scores)]
-    # First call = step query, second = upsert (INSERT ON DUPLICATE KEY)
+    # 1st call = step query, 2nd = upsert SELECT (no existing row), 3rd = upsert INSERT
     call_results = iter([
         MagicMock(fetchall=MagicMock(return_value=rows)),  # step query
-        MagicMock(),  # upsert
+        MagicMock(fetchone=MagicMock(return_value=None)),   # upsert SELECT
+        MagicMock(),                                        # upsert INSERT
     ])
     db.execute = MagicMock(side_effect=lambda *a, **kw: next(call_results))
     return db
@@ -107,7 +108,8 @@ class TestScoreSession:
         chain_row = _make_row(target_id="c1", score=4.0, step_count=3, failure_count=0)
         call_results = iter([
             MagicMock(fetchall=MagicMock(return_value=[chain_row])),  # chain query
-            MagicMock(),  # upsert
+            MagicMock(fetchone=MagicMock(return_value=None)),          # upsert SELECT
+            MagicMock(),                                               # upsert INSERT
         ])
         db.execute = MagicMock(side_effect=lambda *a, **kw: next(call_results))
         result = score_session(db, "sess1")
@@ -124,7 +126,8 @@ class TestScoreSession:
         ]
         call_results = iter([
             MagicMock(fetchall=MagicMock(return_value=chains)),
-            MagicMock(),  # upsert
+            MagicMock(fetchone=MagicMock(return_value=None)),  # upsert SELECT
+            MagicMock(),                                        # upsert INSERT
         ])
         db.execute = MagicMock(side_effect=lambda *a, **kw: next(call_results))
         result = score_session(db, "sess1")

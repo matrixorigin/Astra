@@ -107,7 +107,7 @@ class TestCreateSandbox:
             json={"name": "test_sandbox"}
         )
         
-        assert response.status_code == 403  # HTTPBearer returns 403
+        assert response.status_code == 401  # returns 401 Unauthorized
     
     def test_create_sandbox_empty_name(self, client, auth_headers):
         """测试空名称"""
@@ -155,7 +155,7 @@ class TestListSandboxes:
         """测试未认证"""
         response = client.get("/sandbox")
         
-        assert response.status_code == 403
+        assert response.status_code == 401
 
 
 class TestGetSandbox:
@@ -189,7 +189,7 @@ class TestGetSandbox:
         """测试未认证"""
         response = client.get("/sandbox/test")
         
-        assert response.status_code == 403
+        assert response.status_code == 401
 
 
 class TestDeleteSandbox:
@@ -225,7 +225,7 @@ class TestDeleteSandbox:
         """测试未认证"""
         response = client.delete("/sandbox/test")
         
-        assert response.status_code == 403
+        assert response.status_code == 401
 
 
 class TestSandboxPermissions:

@@ -134,7 +134,7 @@ def test_agent_not_found(client, auth_token):
 def test_unauthorized_access(client):
     """Test accessing agents without auth."""
     response = client.get("/agents")
-    assert response.status_code == 403  # FastAPI returns 403 for missing auth
+    assert response.status_code == 401
 
 
 def test_create_agent_with_data_source(client, auth_token):
