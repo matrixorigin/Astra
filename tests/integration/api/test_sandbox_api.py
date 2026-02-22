@@ -6,13 +6,13 @@
 
 import pytest
 from fastapi.testclient import TestClient
-from uuid_utils import uuid7
 
 from api.main import app
 from api.database import get_db_session
 from api.repositories import UserRepository
 from core.auth.jwt_manager import create_access_token
 from core.sandbox import Sandbox
+from core.utils.id_generator import generate_id
 
 
 # pytestmark = pytest.mark.skip(reason="需要完整的MatrixOne环境和清理逻辑")
@@ -86,7 +86,7 @@ class TestCreateSandbox:
         response = client.post(
             "/sandbox",
             json={
-                "name": f"test_sandbox_{str(uuid7())[:8]}",
+                "name": f"ts_{generate_id()}",  # test_ (5) + 31 = 36
                 "description": "Test sandbox"
             },
             headers=auth_headers
@@ -126,7 +126,7 @@ class TestListSandboxes:
     def test_list_sandboxes_success(self, client, auth_headers):
         """测试成功列出 sandboxes"""
         # Create a sandbox first
-        sandbox_name = f"test_sandbox_{str(uuid7())[:8]}"
+        sandbox_name = f"ts_{generate_id()}"
         client.post(
             "/sandbox",
             json={"name": sandbox_name},
@@ -164,7 +164,7 @@ class TestGetSandbox:
     def test_get_sandbox_success(self, client, auth_headers):
         """测试成功获取 sandbox 信息"""
         # Create a sandbox first
-        sandbox_name = f"test_sandbox_{str(uuid7())[:8]}"
+        sandbox_name = f"ts_{generate_id()}"
         create_response = client.post(
             "/sandbox",
             json={"name": sandbox_name},
@@ -198,7 +198,7 @@ class TestDeleteSandbox:
     def test_delete_sandbox_success(self, client, auth_headers):
         """测试成功删除 sandbox"""
         # Create a sandbox first
-        sandbox_name = f"test_sandbox_{str(uuid7())[:8]}"
+        sandbox_name = f"ts_{generate_id()}"
         create_response = client.post(
             "/sandbox",
             json={"name": sandbox_name},
@@ -250,7 +250,7 @@ class TestSandboxPermissions:
         
         # Create second user
         user2_data = {
-            "user_id": str(uuid7()),
+            "user_id": generate_id(),
             "username": "testuser2",
             "email": "test2@example.com",
             "password_hash": hash_password("testpass123"),
@@ -272,7 +272,7 @@ class TestSandboxPermissions:
         })
         
         # User1 creates a sandbox
-        sandbox_name = f"test_sandbox_{str(uuid7())[:8]}"
+        sandbox_name = f"ts_{generate_id()}"
         response1 = client.post(
             "/sandbox",
             json={"name": sandbox_name},
@@ -306,7 +306,7 @@ class TestSandboxEdgeCases:
         response = client.post(
             "/sandbox",
             json={
-                "name": f"test_sandbox_{str(uuid7())[:8]}",
+                "name": f"ts_{generate_id()}",
                 "description": "Test with special chars: !@#$%"
             },
             headers=auth_headers
@@ -328,7 +328,7 @@ class TestSandboxEdgeCases:
     
     def test_create_sandbox_duplicate_name(self, client, auth_headers):
         """测试创建重名 sandbox"""
-        sandbox_name = f"test_sandbox_{str(uuid7())[:8]}"
+        sandbox_name = f"ts_{generate_id()}"
         
         # Create first sandbox
         response1 = client.post(

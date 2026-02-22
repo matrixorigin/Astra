@@ -344,7 +344,7 @@ class AuditLog(Base):
     user_id = Column(String(36), nullable=False, index=True)
     action = Column(String(50), nullable=False)
     resource_type = Column(String(50))
-    resource_id = Column(String(36))
+    resource_id = Column(String(64))  # Increased to support longer resource names
     details = Column(JSON)
     ip_address = Column(String(45))
     created_at = Column(DateTime, default=func.now())
