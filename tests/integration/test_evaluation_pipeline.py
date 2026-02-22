@@ -279,11 +279,23 @@ class TestEvaluationActionAPI:
     def headers(self, auth_token):
         return {"Authorization": f"Bearer {auth_token}"}
 
+    # ── Auth ──────────────────────────────────────────────────
+
     def test_gate_validate_requires_auth(self, client):
         resp = client.post("/api/v1/evaluation/gate/validate", json={
             "change_type": "prompt", "change_id": "x", "change_content": {},
         })
         assert resp.status_code == 401
+
+    def test_drift_run_requires_auth(self, client):
+        resp = client.post("/api/v1/evaluation/drift/run")
+        assert resp.status_code == 401
+
+    def test_loop_requires_auth(self, client):
+        resp = client.post("/api/v1/evaluation/loop")
+        assert resp.status_code == 401
+
+    # ── Gate ──────────────────────────────────────────────────
 
     def test_gate_validate_skip_no_golden(self, client, headers):
         """Gate returns skip when no golden sessions exist."""
@@ -294,8 +306,10 @@ class TestEvaluationActionAPI:
         }, headers=headers)
         assert resp.status_code == 200
         data = resp.json()
-        assert data["verdict"] in ("skip", "error")
+        assert data["verdict"] == "skip"
+        assert data["reason"] == "no_golden_sessions_available"
         assert data["sessions_tested"] == 0
+        assert data["gate_id"]  # non-empty
 
     def test_gate_validate_invalid_change_type(self, client, headers):
         resp = client.post("/api/v1/evaluation/gate/validate", json={
@@ -305,22 +319,19 @@ class TestEvaluationActionAPI:
         }, headers=headers)
         assert resp.status_code == 422
 
-    def test_drift_run_requires_auth(self, client):
-        resp = client.post("/api/v1/evaluation/drift/run")
-        assert resp.status_code == 401
+    # ── Drift ─────────────────────────────────────────────────
 
-    def test_drift_run_returns_result(self, client, headers):
+    def test_drift_run_returns_structure(self, client, headers):
         resp = client.post("/api/v1/evaluation/drift/run", headers=headers)
         assert resp.status_code == 200
         data = resp.json()
-        assert "signals_detected" in data
-        assert "corrections_applied" in data
+        assert isinstance(data["signals_detected"], int)
+        assert isinstance(data["corrections_applied"], int)
+        assert isinstance(data["actions"], list)
 
-    def test_loop_requires_auth(self, client):
-        resp = client.post("/api/v1/evaluation/loop")
-        assert resp.status_code == 401
+    # ── Closed Loop ───────────────────────────────────────────
 
-    def test_loop_returns_both_phases(self, client, headers):
+    def test_loop_returns_all_phases(self, client, headers):
         resp = client.post(
             "/api/v1/evaluation/loop",
             params={"days": 7, "dry_run": True},
@@ -328,7 +339,32 @@ class TestEvaluationActionAPI:
         )
         assert resp.status_code == 200
         data = resp.json()
-        assert "drift" in data
-        assert "diagnoses" in data
-        assert isinstance(data["drift"]["actions"], list)
+        # Must have loop_id for audit trail
+        assert data["loop_id"]
+        # Phase 1: drift
+        assert isinstance(data["drift"]["signals_detected"], int)
+        # Phase 2: calibration (may be null if no data, but key must exist)
+        assert "calibration" in data
+        # Phase 3: diagnoses
         assert isinstance(data["diagnoses"], list)
+
+    def test_loop_audit_event_recorded(self, client, headers, db):
+        """Closed loop must persist an audit event."""
+        resp = client.post(
+            "/api/v1/evaluation/loop",
+            params={"days": 1, "dry_run": True},
+            headers=headers,
+        )
+        assert resp.status_code == 200
+        loop_id = resp.json()["loop_id"]
+
+        row = db.execute(text(
+            "SELECT event_type, content FROM conversation_events WHERE event_id = :eid"
+        ), {"eid": loop_id}).first()
+        assert row is not None, "Loop audit event not found in DB"
+        assert row[0] == "closed_loop_execution"
+        import json
+        content = json.loads(row[1])
+        assert content["dry_run"] is True
+        assert "drift" in content
+        assert "diagnoses" in content

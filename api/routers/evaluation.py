@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
 from core.logging_config import get_logger
+from core.utils.id_generator import generate_id
 
 logger = get_logger(__name__)
 
@@ -106,7 +108,9 @@ class LoopDiagnosisItem(BaseModel):
 
 
 class ClosedLoopResponse(BaseModel):
+    loop_id: str
     drift: DriftPipelineResponse
+    calibration: CalibrationResponse | None = None
     diagnoses: list[LoopDiagnosisItem]
 
 
@@ -277,7 +281,7 @@ def get_session_scores(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/gate/validate", response_model=GateValidateResponse)
+@router.post("/gate/validate", response_model=GateValidateResponse, status_code=200)
 def validate_gate(
     req: GateValidateRequest,
     db: Session = Depends(get_db_session),
@@ -286,22 +290,15 @@ def validate_gate(
     """Trigger regression gate: replay golden sessions against a proposed change."""
     from core.evaluation.regression_gate import ChangeType, RegressionGate
 
-    try:
-        gate = RegressionGate(db=db)
-        result = gate.validate_change(
-            change_type=ChangeType(req.change_type),
-            change_id=req.change_id,
-            change_content=req.change_content,
-            golden_session_count=req.golden_session_count,
-            error_rate_threshold=req.error_rate_threshold,
-            score_regression_threshold=req.score_regression_threshold,
-        )
-    except Exception as e:
-        logger.error("Gate validation failed: %s", e)
-        return GateValidateResponse(
-            gate_id="", verdict="error", reason=str(e),
-            sessions_tested=0, metrics={},
-        )
+    gate = RegressionGate(db=db)
+    result = gate.validate_change(
+        change_type=ChangeType(req.change_type),
+        change_id=req.change_id,
+        change_content=req.change_content,
+        golden_session_count=req.golden_session_count,
+        error_rate_threshold=req.error_rate_threshold,
+        score_regression_threshold=req.score_regression_threshold,
+    )
     return GateValidateResponse(
         gate_id=result["gate_id"],
         verdict=result["verdict"],
@@ -318,14 +315,7 @@ def run_drift(
     """Run full drift pipeline: detect → confirm → correct."""
     from core.evaluation.drift_pipeline import run_drift_pipeline
 
-    try:
-        result = run_drift_pipeline(db_factory=SessionLocal)
-    except Exception as e:
-        logger.error("Drift pipeline failed: %s", e)
-        return DriftPipelineResponse(
-            signals_detected=0, signals_confirmed=0,
-            corrections_applied=0, actions=[], error=str(e),
-        )
+    result = run_drift_pipeline(db_factory=SessionLocal)
     return DriftPipelineResponse(
         signals_detected=result.signals_detected,
         signals_confirmed=result.signals_confirmed,
@@ -341,56 +331,131 @@ def run_closed_loop(
     dry_run: bool = Query(default=False),
     current_user: dict = Depends(get_current_user),
 ) -> ClosedLoopResponse:
-    """One-click closed loop: drift pipeline + InputFaceLearner diagnose-and-fix.
+    """Full closed loop: OBSERVE → DIAGNOSE → PROPOSE → VALIDATE → DEPLOY → RECORD.
 
-    This is the OBSERVE → DIAGNOSE → PROPOSE → VALIDATE → DEPLOY loop
-    from the design doc, exposed as a single API call.
+    Phase 1 — Drift: detect quality drift, confirm via replay, auto-correct.
+    Phase 2 — Calibration: measure confidence calibration, compute adjustment.
+    Phase 3 — Learner: diagnose input-face bottlenecks, propose + validate + deploy fixes.
+              If drift found template-level issues, learner targets PROMPT face specifically.
+    Record — Persist loop execution as auditable event.
     """
-    from core.evaluation.drift_pipeline import run_drift_pipeline
+    from core.evaluation.confidence_calibrator import ConfidenceCalibrator
+    from core.evaluation.drift_pipeline import PipelineResult, run_drift_pipeline
+    from core.learning.input_face_learner import InputFace, InputFaceLearner
+
+    loop_id = generate_id()
 
     # Phase 1: Drift detection + auto-correction
     try:
         drift_result = run_drift_pipeline(db_factory=SessionLocal)
     except Exception as e:
         logger.error("Closed loop drift phase failed: %s", e)
-        drift_result = None
+        drift_result = PipelineResult(error=str(e))
 
     drift_resp = DriftPipelineResponse(
-        signals_detected=drift_result.signals_detected if drift_result else 0,
-        signals_confirmed=drift_result.signals_confirmed if drift_result else 0,
-        corrections_applied=drift_result.corrections_applied if drift_result else 0,
-        actions=drift_result.actions if drift_result else [],
-        error=drift_result.error if drift_result else None,
+        signals_detected=drift_result.signals_detected,
+        signals_confirmed=drift_result.signals_confirmed,
+        corrections_applied=drift_result.corrections_applied,
+        actions=drift_result.actions,
+        error=drift_result.error,
     )
 
-    # Phase 2: InputFaceLearner — diagnose bottlenecks + propose/apply fixes
-    diagnoses: list[LoopDiagnosisItem] = []
+    # Phase 2: Calibration
+    calibration_resp: CalibrationResponse | None = None
+    db = SessionLocal()
     try:
-        from core.learning.input_face_learner import InputFaceLearner
+        cal = ConfidenceCalibrator(db)
+        cal_result = cal.measure(days=days)
+        adj = cal.compute_adjustment(cal_result)
+        calibration_resp = CalibrationResponse(
+            mean_confidence=cal_result.mean_confidence,
+            mean_quality=cal_result.mean_quality,
+            calibration_error=cal_result.calibration_error,
+            bias=cal_result.bias,
+            sample_count=cal_result.sample_count,
+            adjustment_multiplier=adj["multiplier"],
+            adjustment_reason=adj["reason"],
+        )
+    except Exception as e:
+        logger.error("Closed loop calibration phase failed: %s", e)
+    finally:
+        db.close()
+
+    # Phase 3: InputFaceLearner — drift-informed targeted diagnosis
+    # If drift found template-level issues, focus learner on PROMPT face
+    faces: list[InputFace] | None = None
+    if any(a.get("template_id") for a in drift_result.actions):
+        faces = [InputFace.PROMPT]
+
+    diagnoses: list[LoopDiagnosisItem] = []
+    db = SessionLocal()
+    try:
         from core.llm.client import LLMClient
 
-        db = SessionLocal()
-        try:
-            llm = LLMClient(db)
-            learner = InputFaceLearner(db, llm)
-            results = learner.diagnose_and_fix(days=days, dry_run=dry_run)
-            diagnoses = [
-                LoopDiagnosisItem(
-                    input_face=r.input_face.value,
-                    bottleneck=r.bottleneck,
-                    applied=r.applied,
-                    gate_verdict=r.gate_verdict,
-                    error=r.error,
-                )
-                for r in results
-            ]
-        finally:
-            db.close()
+        llm = LLMClient(db)
+        learner = InputFaceLearner(db, llm)
+        results = learner.diagnose_and_fix(days=days, dry_run=dry_run, faces=faces)
+        diagnoses = [
+            LoopDiagnosisItem(
+                input_face=r.input_face.value,
+                bottleneck=r.bottleneck,
+                applied=r.applied,
+                gate_verdict=r.gate_verdict,
+                error=r.error,
+            )
+            for r in results
+        ]
     except Exception as e:
         logger.error("Closed loop learner phase failed: %s", e)
         diagnoses = [LoopDiagnosisItem(
             input_face="all", bottleneck="learner_unavailable",
             applied=False, gate_verdict="error", error=str(e),
         )]
+    finally:
+        db.close()
 
-    return ClosedLoopResponse(drift=drift_resp, diagnoses=diagnoses)
+    # Record — audit trail for the loop execution itself
+    _record_loop_event(loop_id, drift_resp, calibration_resp, diagnoses, dry_run)
+
+    return ClosedLoopResponse(
+        loop_id=loop_id,
+        drift=drift_resp,
+        calibration=calibration_resp,
+        diagnoses=diagnoses,
+    )
+
+
+def _record_loop_event(
+    loop_id: str,
+    drift: DriftPipelineResponse,
+    calibration: CalibrationResponse | None,
+    diagnoses: list[LoopDiagnosisItem],
+    dry_run: bool,
+) -> None:
+    """Persist closed-loop execution as an auditable conversation event."""
+    db = SessionLocal()
+    try:
+        db.execute(text("""
+            INSERT INTO conversation_events
+            (event_id, session_id, user_id, agent_id, agent_version,
+             event_type, content, causal_chain_id, created_at)
+            VALUES (:eid, 'system', 'system', 'system', '1.0.0',
+                    'closed_loop_execution', :content, :eid, NOW())
+        """), {
+            "eid": loop_id,
+            "content": json.dumps({
+                "dry_run": dry_run,
+                "drift": {"detected": drift.signals_detected, "confirmed": drift.signals_confirmed,
+                          "corrected": drift.corrections_applied},
+                "calibration": {"error": calibration.calibration_error,
+                                "bias": calibration.bias} if calibration else None,
+                "diagnoses": [{"face": d.input_face, "applied": d.applied,
+                               "verdict": d.gate_verdict} for d in diagnoses],
+            }),
+        })
+        db.commit()
+    except Exception as e:
+        logger.warning("Failed to record loop event: %s", e)
+        db.rollback()
+    finally:
+        db.close()
