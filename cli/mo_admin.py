@@ -106,6 +106,8 @@ def model_add(
         cfg = Config(
             config_id=config_id,
             key_name=model_name,
+            scope_type=scope or "global",
+            scope_user_id=scope_id,
             value=json.dumps(config),
             description=f"Model config for {model_name}",
         )

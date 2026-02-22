@@ -250,7 +250,7 @@ class TestGovernanceTaskRunner:
         import asyncio
         with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "false"}):
             scheduler = MemoryGovernanceScheduler()
-            asyncio.get_event_loop().run_until_complete(scheduler.start())
+            asyncio.run(scheduler.start())
             # Should be a no-op, no backend created
             assert scheduler._backend is None
 
@@ -275,7 +275,7 @@ class TestSchedulerBackendInterface:
         scheduler = MemoryGovernanceScheduler(backend=backend)
 
         import asyncio
-        asyncio.get_event_loop().run_until_complete(scheduler.start())
+        asyncio.run(scheduler.start())
         assert backend.started
-        asyncio.get_event_loop().run_until_complete(scheduler.stop())
+        asyncio.run(scheduler.stop())
         assert not backend.started

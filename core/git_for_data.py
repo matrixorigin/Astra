@@ -185,17 +185,21 @@ class GitForData:
         
         snapshot_ts = snapshot_info["timestamp"]
         
-        # Step 2: Clear current table data
-        self.db.execute(text(f"DELETE FROM {safe_table}"))
-        
-        # Step 3: Insert data from snapshot using time-travel query
-        # Note: This uses MatrixOne's {SNAPSHOT = 'name'} syntax
-        insert_query = f"""
-        INSERT INTO {safe_table} 
-        SELECT * FROM {safe_table} {{SNAPSHOT = '{safe_snapshot}'}}
-        """
-        self.db.execute(text(insert_query))
-        self.db.commit()
+        try:
+            # Step 2: Clear current table data
+            self.db.execute(text(f"DELETE FROM {safe_table}"))
+            
+            # Step 3: Insert data from snapshot using time-travel query
+            # Note: This uses MatrixOne's {SNAPSHOT = 'name'} syntax
+            insert_query = f"""
+            INSERT INTO {safe_table} 
+            SELECT * FROM {safe_table} {{SNAPSHOT = '{safe_snapshot}'}}
+            """
+            self.db.execute(text(insert_query))
+            self.db.commit()
+        except Exception as e:
+            self.db.rollback()
+            raise
 
     def drop_snapshot(self, snapshot_name: str) -> None:
         """Delete a snapshot.

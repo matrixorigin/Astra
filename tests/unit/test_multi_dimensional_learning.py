@@ -94,7 +94,10 @@ class TestMultiDimensionalLearning:
         ).delete()
         db_session.add(
             Config(
+                config_id="test_selector_learning_weights_001",
                 key_name="selector_learning_weights",
+                scope_type="global",
+                scope_user_id=None,
                 value='{"accuracy": 0.1, "speed": 0.7, "cost": 0.1, "satisfaction": 0.1}',
             )
         )
@@ -120,7 +123,10 @@ class TestMultiDimensionalLearning:
         ).delete()
         db_session.add(
             Config(
+                config_id="test_selector_learning_weights_002",
                 key_name="selector_learning_weights",
+                scope_type="global",
+                scope_user_id=None,
                 value='{"accuracy": 0.4, "speed": 0.3, "cost": 0.2, "satisfaction": 0.1, "per_signal": {"wrong_skill": {"accuracy": 0.0}}}',
             )
         )
@@ -157,7 +163,10 @@ class TestMultiDimensionalLearning:
         ).delete()
         db_session.add(
             Config(
+                config_id="test_selector_learning_weights_003",
                 key_name="selector_learning_weights",
+                scope_type="global",
+                scope_user_id=None,
                 value='{"accuracy": 0.4, "speed": 0.3, "cost": 0.2, "satisfaction": 0.1, "per_signal": {"wrong_skill": {"accuracy": 0.8, "speed": 0.1, "cost": 0.05, "satisfaction": 0.05}}}',
             )
         )
@@ -196,7 +205,10 @@ class TestMultiDimensionalLearning:
         ).delete()
         db_session.add(
             Config(
+                config_id="test_selector_learning_weights_004",
                 key_name="selector_learning_weights",
+                scope_type="global",
+                scope_user_id=None,
                 value='{"accuracy": 0.4, "speed": 0.3, "cost": 0.2, "satisfaction": 0.1, "per_signal": {"wrong_skill": {"speed": 0.6}}}',
             )
         )
@@ -235,7 +247,10 @@ class TestMultiDimensionalLearning:
         ).delete()
         db_session.add(
             Config(
+                config_id="test_selector_learning_weights_005",
                 key_name="selector_learning_weights",
+                scope_type="global",
+                scope_user_id=None,
                 value='{"accuracy": 0.4, "speed": 0.3, "cost": 0.2, "satisfaction": 0.1, "per_signal": {"wrong_skill": "invalid"}}',
             )
         )
@@ -274,7 +289,10 @@ class TestMultiDimensionalLearning:
         ).delete()
         db_session.add(
             Config(
+                config_id="test_selector_learning_decay_001",
                 key_name="selector_learning_decay",
+                scope_type="global",
+                scope_user_id=None,
                 value='{"enabled": true, "half_life_days": 1}',
             )
         )
@@ -311,7 +329,10 @@ class TestMultiDimensionalLearning:
         ).delete()
         db_session.add(
             Config(
+                config_id="test_selector_learning_decay_002",
                 key_name="selector_learning_decay",
+                scope_type="global",
+                scope_user_id=None,
                 value='{"enabled": false, "per_signal": {"wrong_skill": {"enabled": true, "half_life_days": 1}}}',
             )
         )

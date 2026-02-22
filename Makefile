@@ -299,7 +299,7 @@ test:
 .PHONY: test-parallel
 test-parallel:
 	@echo "Running all tests in parallel..."
-	@python -m pytest tests/ -n auto -v
+	@python -m pytest tests/ -n auto --dist loadscope -v
 
 .PHONY: test-unit
 test-unit:
@@ -309,7 +309,7 @@ test-unit:
 .PHONY: test-unit-parallel
 test-unit-parallel:
 	@echo "Running unit tests in parallel..."
-	@python -m pytest tests/unit/ -n auto -v
+	@python -m pytest tests/unit/ -n auto --dist loadscope -v
 
 .PHONY: test-integration
 test-integration:
@@ -319,7 +319,7 @@ test-integration:
 .PHONY: test-integration-parallel
 test-integration-parallel:
 	@echo "Running integration tests in parallel..."
-	@python -m pytest tests/integration/ -n auto -v
+	@python -m pytest tests/integration/ -n auto --dist loadscope -v
 
 .PHONY: test-cleanup
 test-cleanup:

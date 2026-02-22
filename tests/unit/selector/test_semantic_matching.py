@@ -114,7 +114,10 @@ class TestSemanticMatching:
 
         db.add(
             Config(
+                config_id="test_semantic_threshold_001",
                 key_name="selector_semantic_similarity_threshold",
+                scope_type="global",
+                scope_user_id=None,
                 value="1.1",
             )
         )
@@ -171,7 +174,10 @@ class TestSemanticMatching:
 
         db.add(
             Config(
+                config_id="test_semantic_match_limit_001",
                 key_name="selector_semantic_match_limit",
+                scope_type="global",
+                scope_user_id=None,
                 value="1",
             )
         )

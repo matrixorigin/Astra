@@ -67,12 +67,19 @@ class GateResult(Base):
 
 class Config(Base):
     __tablename__ = "configs"
-    config_id = Column(String(64))
-    key_name = Column(String(255), primary_key=True, nullable=False)
+    config_id = Column(String(64), primary_key=True)
+    key_name = Column(String(255), nullable=False, index=True)
+    scope_type = Column(String(32), nullable=False, index=True)
+    scope_user_id = Column(String(64), nullable=True, index=True)
     value = Column(Text, nullable=False)
     description = Column(Text)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    
+    __table_args__ = (
+        # Unique constraint for the logical key
+        UniqueConstraint('key_name', 'scope_type', 'scope_user_id', name='uq_config_scope'),
+    )
 
 
 class LLMFeedback(Base):

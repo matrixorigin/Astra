@@ -24,6 +24,7 @@ def feedback(db):
     from sqlalchemy import text
     db.execute(text("DELETE FROM llm_feedback WHERE prompt_template_id LIKE 'system_test%'"))
     db.execute(text("DELETE FROM llm_feedback WHERE prompt_template_id = 'system_compare'"))
+    db.commit()
 
 
 def test_record_feedback(db, feedback):

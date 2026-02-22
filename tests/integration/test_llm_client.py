@@ -23,13 +23,15 @@ def db(db_session):
     })
     db_session.execute(
         text("""
-        INSERT INTO configs (config_id, key_name, value) 
-        VALUES (:config_id, :key_name, :value) 
+        INSERT INTO configs (config_id, key_name, scope_type, scope_user_id, value) 
+        VALUES (:config_id, :key_name, :scope_type, :scope_user_id, :value) 
         ON DUPLICATE KEY UPDATE value = :value2
         """),
         {
-            "config_id": "llm_config",
+            "config_id": "test_llm_config_001",
             "key_name": "llm_config",
+            "scope_type": "global",
+            "scope_user_id": None,
             "value": config_data,
             "value2": config_data,
         },
