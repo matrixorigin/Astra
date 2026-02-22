@@ -9,13 +9,7 @@ This directory contains detailed implementation documentation for mo-agent-engin
 ### Self-Improving Selector
 The breakthrough feature that enables automatic learning from failures.
 
-- **[self-improving-selector-TODO.md](self-improving-selector-TODO.md)** - Complete guide & roadmap ⭐
-  - Current implementation (Phase 0)
-  - Usage guide (CLI, API, Python)
-  - Database schema
-  - Roadmap (Phase 1-4)
-  - Effort estimates and success metrics
-  - Technical debt tracking
+- **[self-improving-selector.md](self-improving-selector.md)** - Implementation guide & roadmap ⭐
 
 ### Other Features
 
@@ -48,7 +42,6 @@ docs/
     ├── README.md                    # This file
     ├── memory-governance.md         # Memory lifecycle & distributed scheduling ⭐
     ├── self-improving-selector.md   # Implementation guide
-    ├── self-improving-selector-TODO.md  # Roadmap & TODO
     ├── authentication.md
     ├── llm-integration.md
     ├── github-integration.md
@@ -67,7 +60,7 @@ docs/
 - **Development Guide:** [../development.md](../development.md)
 
 ### For Self-Improving Selector
-- **Complete Guide:** [self-improving-selector-TODO.md](self-improving-selector-TODO.md) ⭐
+- **Complete Guide:** [self-improving-selector.md](self-improving-selector.md) ⭐
 - **Architecture:** [../design/self-improving-selector-architecture.md](../design/self-improving-selector-architecture.md)
 - **Evolution Strategy:** [../design/learning-evolution-roadmap.md](../design/learning-evolution-roadmap.md)
 
@@ -94,7 +87,7 @@ Future development plans with:
 - Success metrics
 - Technical debt tracking
 
-**Example:** `self-improving-selector-TODO.md` ⭐
+**Example:** `self-improving-selector.md` ⭐
 
 ### Design Documents
 High-level architecture and strategy:
@@ -131,7 +124,7 @@ High-level architecture and strategy:
 
 ## 🎯 Next Steps
 
-1. **Review TODO:** [self-improving-selector-TODO.md](self-improving-selector-TODO.md)
+1. **Review Guide:** [self-improving-selector.md](self-improving-selector.md)
 2. **Start Phase 1:** Multi-Dimensional Learning (8 days effort)
 3. **Update Progress:** Mark tasks as complete in TODO doc
 

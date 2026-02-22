@@ -179,6 +179,10 @@ app.include_router(learning.router, tags=["learning"])
 from api.routers import evaluation
 app.include_router(evaluation.router, tags=["evaluation"])
 
+# Branches — zero-copy data branching (diff, merge, cost estimation)
+from api.routers import branches
+app.include_router(branches.router, tags=["branches"])
+
 # Triggers — webhook + cron → AgentRun
 from api.routers import triggers
 app.include_router(triggers.router, tags=["triggers"])
