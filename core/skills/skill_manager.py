@@ -70,6 +70,15 @@ class SkillManager:
             .all()
         )
 
+    # ── runtime enforcement ──────────────────────────────────────────────────
+
+    def require_installed(self, user_id: str, skill_name: str) -> None:
+        """Raise SkillNotInstalledError if skill is not installed for user."""
+        if self.get_installation(user_id, skill_name) is None:
+            raise SkillNotInstalledError(
+                f"Skill '{skill_name}' is not installed. Run: /skill install {skill_name}"
+            )
+
     # ── permission check ──────────────────────────────────────────────────────
 
     def check_permission(self, user_id: str, skill_name: str) -> bool:
@@ -100,6 +109,15 @@ class SkillManager:
             raise SkillNotFoundError(f"Skill '{skill_name}' not found")
         if not self.check_permission(user_id, skill_name):
             raise PermissionDeniedError(f"No permission to install '{skill_name}'")
+
+        # Check dependencies
+        manifest = defn.manifest or {}
+        for dep in manifest.get("depends_on", []):
+            if self.get_installation(user_id, dep) is None:
+                raise SkillNotInstalledError(
+                    f"Dependency '{dep}' must be installed before '{skill_name}'"
+                )
+
         existing = self.get_installation(user_id, skill_name)
         if existing is not None:
             return existing

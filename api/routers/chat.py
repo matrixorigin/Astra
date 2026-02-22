@@ -96,7 +96,13 @@ def _build_chat_loop(db: Session):
     register_builtin_skills(skill_registry, db, code_executor=code_executor)
     context_manager = ContextManager(db, gate_trigger=gate_trigger)
     selector = SkillPipeline(db, llm_client, audit=True, learning=True)
-    executor = AgentExecutor(db, skill_registry)
+
+    from core.skills.skill_manager import SkillManager
+    from core.skills.credential_manager import CredentialManager
+    from config.settings import get_settings
+    skill_mgr = SkillManager(db, CredentialManager(get_settings().secret_key))
+    executor = AgentExecutor(db, skill_registry, skill_manager=skill_mgr)
+
     firewall = HallucinationFirewall(db, context_manager)
 
     loop = ChatLoop(

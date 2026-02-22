@@ -27,7 +27,6 @@ _run_waiters: dict[str, asyncio.Event] = {}
 _run_tasks: dict[str, asyncio.Task] = {}
 _child_runs: dict[str, set[str]] = {}  # parent_run_id → {child_run_ids}
 _fan_in_tasks: set[asyncio.Task] = set()  # Track fan-in tasks for cleanup
-_resume_counters: dict[str, int] = {}  # run_id → resume count (for claim uniqueness)
 
 # Max size for resume user_input to prevent token explosion on adversarial loops
 _MAX_RESUME_INPUT_CHARS = 4000
@@ -175,9 +174,6 @@ class RunEngine:
             coro = self._consume_stream(loop, run)
             timeout = (run.context or {}).get("run_timeout_seconds", 1800)
             await asyncio.wait_for(coro, timeout=timeout)
-
-            if run.status == RunStatus.RUNNING:
-                self._complete_run(run)
 
             if run.status == RunStatus.RUNNING:
                 self._complete_run(run)
@@ -344,8 +340,7 @@ class RunEngine:
         _run_waiters.get(run_id, asyncio.Event()).set()
         return True
 
-    @staticmethod
-    def _cancel_workflow(wf_id: str) -> None:
+    def _cancel_workflow(self, wf_id: str) -> None:
         """Propagate cancel to a workflow and its in-memory state."""
         from core.agent.async_tools import _workflow_runs, _workflow_waits
         entry = _workflow_runs.pop(wf_id, None)
@@ -356,18 +351,14 @@ class RunEngine:
             _workflow_waits.pop(h, None)
         # Also mark in DB so other workers see it
         try:
-            from api.database import get_db_session
-            db = next(get_db_session())
-            try:
-                db.execute(
-                    text("UPDATE workflow_runs SET status='cancelled', error='Cancelled by user' "
-                         "WHERE run_id = :wf_id AND status IN ('running','waiting')"),
-                    {"wf_id": wf_id},
-                )
-                db.commit()
-            finally:
-                db.close()
+            self.db.execute(
+                text("UPDATE workflow_runs SET status='cancelled', error='Cancelled by user' "
+                     "WHERE run_id = :wf_id AND status IN ('running','waiting')"),
+                {"wf_id": wf_id},
+            )
+            self.db.commit()
         except Exception as e:
+            self.db.rollback()
             logger.error(f"Failed to cancel workflow {wf_id} in DB: {e}")
 
     async def on_job_completed(self, job_id: str, result: dict) -> bool:
@@ -474,6 +465,7 @@ class RunEngine:
             )
             self.db.commit()
         except Exception as e:
+            self.db.rollback()
             logger.warning(f"Event persist failed for run {run_id} idx {idx}: {e}")
 
     def _load_events_from_db(self, run_id: str, after_index: int = 0) -> list[dict]:
@@ -509,21 +501,20 @@ class RunEngine:
     def _try_claim_resume(self, run_id: str) -> bool:
         """Optimistic lock: INSERT a unique claim row per resume attempt.
 
-        Uses a monotonic counter so adversarial loops (multiple resume cycles)
-        each get a unique idx: -1, -2, -3, ...
-        
-        Uses SELECT FOR UPDATE for proper isolation in distributed scenarios.
+        Uses DB-derived counter so cross-worker resume cycles get unique idx
+        values: -1, -2, -3, ... even when workers have no shared memory.
+        UNIQUE(run_id, idx) ensures only one worker wins each cycle.
         """
-        counter = _resume_counters.get(run_id, 0) + 1
-        _resume_counters[run_id] = counter
-        claim_idx = -counter  # -1, -2, -3, ...
         try:
-            # Use SELECT FOR UPDATE for critical section
-            self.db.execute(
-                text("SELECT 1 FROM run_events WHERE run_id = :run_id LIMIT 1 FOR UPDATE"),
-                {"run_id": run_id}
-            )
-            # Then attempt insert
+            # Get next claim idx from DB (works across workers)
+            row = self.db.execute(
+                text("SELECT MIN(idx) FROM run_events "
+                     "WHERE run_id = :run_id AND event_type = 'resume_claim'"),
+                {"run_id": run_id},
+            ).fetchone()
+            prev_min = row[0] if row and row[0] is not None else 0
+            claim_idx = prev_min - 1  # -1, -2, -3, ...
+
             self.db.execute(
                 text(
                     "INSERT INTO run_events (run_id, idx, event_type, data) "
@@ -532,7 +523,7 @@ class RunEngine:
                 {
                     "run_id": run_id,
                     "idx": claim_idx,
-                    "data": json.dumps({"claimed_at": datetime.now(timezone.utc).isoformat(), "attempt": counter}),
+                    "data": json.dumps({"claimed_at": datetime.now(timezone.utc).isoformat()}),
                 },
             )
             self.db.commit()
@@ -708,7 +699,6 @@ class RunEngine:
             _active_runs.pop(rid, None)
             _run_events.pop(rid, None)
             _run_waiters.pop(rid, None)
-            _resume_counters.pop(rid, None)
 
     @staticmethod
     def _stream_event_to_dict(event: StreamEvent, run_id: str) -> dict:

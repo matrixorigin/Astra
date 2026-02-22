@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from core.agent.run import RunStatus
 from core.agent.run_engine import (
     RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks, _child_runs, _fan_in_tasks,
-    _MAX_RESUME_INPUT_CHARS, _resume_counters,
+    _MAX_RESUME_INPUT_CHARS,
 )
 from core.events.models import StreamEvent, StreamEventType
 
@@ -25,7 +25,6 @@ def clean_state():
     _run_tasks.clear()
     _child_runs.clear()
     _fan_in_tasks.clear()
-    _resume_counters.clear()
     yield
     _active_runs.clear()
     _run_events.clear()
@@ -33,7 +32,6 @@ def clean_state():
     _run_tasks.clear()
     _child_runs.clear()
     _fan_in_tasks.clear()
-    _resume_counters.clear()
 
 
 @pytest.fixture

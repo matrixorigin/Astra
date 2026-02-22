@@ -38,7 +38,6 @@ from core.agent.run_engine import (
     _active_runs,
     _child_runs,
     _fan_in_tasks,
-    _resume_counters,
     _run_events,
     _run_tasks,
     _run_waiters,
@@ -106,30 +105,38 @@ def _patch_job(job_id: str):
 @pytest.fixture(autouse=True)
 def _clean_globals():
     for d in (_active_runs, _run_events, _run_waiters, _run_tasks,
-              _child_runs, _resume_counters):
+              _child_runs):
         d.clear()
     _fan_in_tasks.clear()
     yield
     for d in (_active_runs, _run_events, _run_waiters, _run_tasks,
-              _child_runs, _resume_counters):
+              _child_runs):
         d.clear()
     _fan_in_tasks.clear()
 
 
 @pytest.fixture
-def db():
-    from api.database import get_db_session
-    s = next(get_db_session())
-    yield s
-    s.close()
+def db(db_session):
+    """Use conftest's db_session — same session, no double-close."""
+    return db_session
 
 
 @pytest.fixture
 def session_id(db):
     from core.events.session_manager import SessionManager
-    return SessionManager(db).create_session(
+    sid = SessionManager(db).create_session(
         user_id="test-user", metadata={"source": "backbone_e2e"},
     ).session_id
+    yield sid
+    # Clean up all test data tied to this session
+    db.execute(text("DELETE FROM run_events WHERE run_id IN "
+                    "(SELECT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) "
+                    "FROM conversation_events WHERE session_id = :sid AND event_type = 'run_started')"),
+               {"sid": sid})
+    db.execute(text("DELETE FROM conversation_events WHERE session_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM triggers WHERE session_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM sessions WHERE session_id = :sid"), {"sid": sid})
+    db.commit()
 
 
 @pytest.fixture
@@ -305,16 +312,15 @@ class TestCrossWorkerResume:
 
         assert run.status == RunStatus.WAITING
 
-        # CRASH
+        # CRASH — clear all in-memory state
         _active_runs.clear()
         _run_events.clear()
         _run_waiters.clear()
         _run_tasks.clear()
-        _resume_counters.clear()
 
-        # Worker B
-        from api.database import get_db_session
-        db2 = next(get_db_session())
+        # Worker B — genuinely separate DB session
+        from api.database import SessionLocal
+        db2 = SessionLocal()
         try:
             engine2 = RunEngine(db2)
             with patch("api.routers.chat._build_chat_loop",

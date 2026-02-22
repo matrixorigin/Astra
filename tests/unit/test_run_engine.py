@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from core.agent.run import AgentRun, RunStatus, RunTrigger
 from core.agent.run_engine import (
     RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks,
-    _child_runs, _fan_in_tasks, _MAX_RESUME_INPUT_CHARS, _resume_counters,
+    _child_runs, _fan_in_tasks, _MAX_RESUME_INPUT_CHARS,
     _MAX_COMPLETED_RUNS,
 )
 from core.events.models import EventType
@@ -43,7 +43,6 @@ def clean_state():
     _run_tasks.clear()
     _child_runs.clear()
     _fan_in_tasks.clear()
-    _resume_counters.clear()
     yield
     _active_runs.clear()
     _run_events.clear()
@@ -51,7 +50,6 @@ def clean_state():
     _run_tasks.clear()
     _child_runs.clear()
     _fan_in_tasks.clear()
-    _resume_counters.clear()
 
 
 class TestRunEngineCreate:
@@ -408,10 +406,15 @@ class TestMultiAgentRuns:
 
         with patch("api.routers.chat._build_chat_loop", return_value=mock_loop):
             c1 = await engine.create_child_run(parent.run_id, "reviewer_a", "review A")
+            t1 = _run_tasks[c1.run_id]
             c2 = await engine.create_child_run(parent.run_id, "reviewer_b", "review B")
+            t2 = _run_tasks[c2.run_id]
 
-            # Let all tasks complete (children + fan-in resume)
-            await asyncio.sleep(0.1)
+            # Wait for children, then fan-in
+            await t1
+            await t2
+            for t in list(_fan_in_tasks):
+                await t
 
         assert c1.status == RunStatus.COMPLETED
         assert c2.status == RunStatus.COMPLETED
@@ -713,14 +716,26 @@ class TestResumeClaimMultiple:
     def test_multiple_claims_use_different_idx(self):
         """Adversarial loop: same run resumed multiple times should succeed."""
         db = MagicMock()
-        db.execute.return_value = MagicMock()
+        # Simulate DB returning MIN(idx): None, -1, -2 for successive calls
+        min_results = iter([(None,), (-1,), (-2,)])
+        def _execute(stmt, params=None):
+            sql = str(stmt) if not isinstance(stmt, str) else stmt
+            if hasattr(stmt, 'text'):
+                sql = stmt.text
+            if "MIN(idx)" in sql:
+                row = next(min_results)
+                result = MagicMock()
+                result.fetchone.return_value = row
+                return result
+            return MagicMock()
+        db.execute.side_effect = _execute
         engine = self._make_engine(db)
 
         assert engine._try_claim_resume("run-1") is True
         assert engine._try_claim_resume("run-1") is True
         assert engine._try_claim_resume("run-1") is True
 
-        # Verify different idx values were used
+        # Verify different idx values were used: -1, -2, -3
         calls = db.execute.call_args_list
         idxs = []
         for call in calls:
@@ -729,17 +744,30 @@ class TestResumeClaimMultiple:
                 idxs.append(params["idx"])
         assert idxs == [-1, -2, -3]
 
-    def test_claim_counter_isolated_per_run(self):
+    def test_claim_counter_db_based_cross_worker(self):
+        """Counter derived from DB, not in-memory — works across workers."""
         db = MagicMock()
-        db.execute.return_value = MagicMock()
+        # Worker B sees existing claim at idx=-1 from Worker A
+        def _execute(stmt, params=None):
+            sql = str(stmt) if not isinstance(stmt, str) else stmt
+            if hasattr(stmt, 'text'):
+                sql = stmt.text
+            if "MIN(idx)" in sql:
+                result = MagicMock()
+                result.fetchone.return_value = (-1,)  # Worker A already claimed -1
+                return result
+            return MagicMock()
+        db.execute.side_effect = _execute
         engine = self._make_engine(db)
 
-        engine._try_claim_resume("run-a")
-        engine._try_claim_resume("run-b")
-        engine._try_claim_resume("run-a")
+        assert engine._try_claim_resume("run-a") is True
 
-        assert _resume_counters["run-a"] == 2
-        assert _resume_counters["run-b"] == 1
+        # Verify Worker B uses idx=-2 (not -1 which would collide)
+        calls = db.execute.call_args_list
+        for call in calls:
+            params = call[0][1] if len(call[0]) > 1 else call[1].get("params", {})
+            if isinstance(params, dict) and "idx" in params:
+                assert params["idx"] == -2
 
 
 class TestMemoryGC:
