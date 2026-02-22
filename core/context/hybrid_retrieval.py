@@ -280,13 +280,13 @@ class HybridRetriever:
 
         # Access tracking — outside try/except so retrieval errors don't lose results
         if entries:
-            from core.context.knowledge import update_access_tracking
+            from skills.knowledge.api import update_access_tracking
             update_access_tracking(self.db, [e["entry_id"] for e in entries])
 
         # 1-hop graph expansion: find related entries not already in results
         if entries:
             try:
-                from core.context.knowledge_graph import expand_with_graph
+                from skills.knowledge.api import expand_with_graph
                 seed_ids = [e["entry_id"] for e in entries[:5]]  # top-5 seeds
                 expanded_ids = expand_with_graph(self.db, seed_ids, limit_per_entry=2)
                 if expanded_ids:

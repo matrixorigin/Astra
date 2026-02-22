@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
-from core.context.knowledge_graph import add_relation, expand_with_graph, get_neighbors
+from skills.knowledge.api import add_relation, expand_with_graph, get_neighbors
 
 
 def _make_row(**kwargs):
@@ -31,9 +31,13 @@ class TestAddRelation:
     def test_idempotent_via_on_duplicate_key(self):
         """Calling twice with same (s, p, o) should not raise."""
         db = MagicMock()
+        # First call: SELECT returns None → INSERT
+        db.execute.return_value.fetchone.return_value = None
         add_relation(db, "e1", "related_to", "e2")
+        # Second call: SELECT returns existing → UPDATE
+        db.execute.return_value.fetchone.return_value = _make_row(relation_id="r1")
         add_relation(db, "e1", "related_to", "e2", weight=0.5)
-        assert db.execute.call_count == 2
+        assert db.commit.call_count == 2
 
 
 # ── get_neighbors ────────────────────────────────────────────────
@@ -132,7 +136,7 @@ class TestHybridRetrievalGraphExpansion:
 
         hr.db.execute = MagicMock(side_effect=side_effect)
 
-        with patch("core.context.knowledge.update_access_tracking"):
+        with patch("skills.knowledge.api.update_access_tracking"):
             entries = hr.retrieve_knowledge(
                 query_text="test", query_embedding=[0.1] * 1536,
                 user_id="u1", limit=5,

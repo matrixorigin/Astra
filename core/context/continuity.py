@@ -184,7 +184,7 @@ class SessionContinuity:
 
         # Update access tracking for returned entries
         if results:
-            from core.context.knowledge import update_access_tracking
+            from skills.knowledge.api import update_access_tracking
             update_access_tracking(self.db, [r["entry_id"] for r in results])
 
         return results

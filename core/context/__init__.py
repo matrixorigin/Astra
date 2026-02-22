@@ -2,7 +2,7 @@
 
 from core.context.embeddings import EmbeddingService
 from core.context.hybrid_retrieval import HybridRetriever
-from core.context.knowledge import KnowledgeExtractor
+from skills.knowledge.api import KnowledgeExtractor
 from core.context.lifecycle import MemoryGovernanceEngine
 from core.context.manager import Context, ContextFragment, ContextManager, TaskType
 from core.context.prompts import PromptManager

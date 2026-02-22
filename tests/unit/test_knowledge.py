@@ -224,7 +224,7 @@ def test_contradiction_detection(db_session):
 
 def test_normalize_value_synonyms():
     """Test that _normalize_value handles casing, whitespace, and tech synonyms."""
-    from core.context.knowledge import _normalize_value
+    from skills.knowledge.api import _normalize_value
 
     # Case + whitespace
     assert _normalize_value("TypeScript") == "typescript"
@@ -244,7 +244,7 @@ def test_normalize_value_synonyms():
 def test_synonym_match_reinforces_not_contradicts(db_session):
     """Test that 'JS' and 'javascript' are treated as same value (reinforce, not contradict)."""
     from api.models import KnowledgeEntry
-    from core.context.knowledge import KnowledgeExtractor
+    from skills.knowledge.api import KnowledgeExtractor
     from uuid_utils import uuid7
 
     user_id = str(uuid7())[:36]

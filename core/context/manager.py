@@ -13,7 +13,7 @@ from typing import Any
 
 from core.exceptions import ContextError
 from core.logging_config import get_logger
-from core.context.knowledge import update_access_tracking as _update_access_tracking
+from skills.knowledge.api import update_access_tracking as _update_access_tracking
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from api.database import get_db_session

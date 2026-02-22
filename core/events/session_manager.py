@@ -135,7 +135,7 @@ class SessionManager:
             
             # Auto-trigger knowledge extraction
             try:
-                from core.context.knowledge import KnowledgeExtractor
+                from skills.knowledge.api import KnowledgeExtractor
                 from core.events.event_logger import EventLogger
                 from api.models import Event
                 

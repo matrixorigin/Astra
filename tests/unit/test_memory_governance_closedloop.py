@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, Mock, patch
 
 from api.models import KnowledgeEntry, Event
-from core.context.knowledge import KnowledgeExtractor, update_access_tracking
+from skills.knowledge.api import KnowledgeExtractor, update_access_tracking
 from core.context.lifecycle import MemoryGovernanceEngine
 from uuid_utils import uuid7
 
