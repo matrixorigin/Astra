@@ -101,3 +101,56 @@ def override_db_dependency(db_session, monkeypatch):
     except ImportError:
         pass
 
+
+
+# ============================================================================
+# Shared Fixtures for Selector Tests
+# ============================================================================
+
+@pytest.fixture
+def mock_llm_selector():
+    """Mock LLM for selector tests."""
+    from unittest.mock import Mock
+    import json
+    
+    llm = Mock()
+    llm.chat = Mock(return_value=json.dumps({
+        "query_pattern": "review pr",
+        "wrong_skills": ["summarize_pr"],
+        "correct_skills": ["code_review"],
+        "improvement_score": 0.8,
+        "evidence": "User feedback"
+    }))
+    llm.chat_with_tools = Mock(return_value={"tool_calls": []})
+    return llm
+
+
+@pytest.fixture
+def clean_skill_learning_db(db_session):
+    """Clean skill learning tables before test."""
+    from api.models import SkillSelectionLearning, SelectorGateResult
+    db_session.query(SkillSelectionLearning).delete()
+    db_session.query(SelectorGateResult).delete()
+    db_session.commit()
+    yield db_session
+    db_session.query(SkillSelectionLearning).delete()
+    db_session.query(SelectorGateResult).delete()
+    db_session.commit()
+
+
+@pytest.fixture
+def clean_skill_events_db(db_session):
+    """Clean skill selection events before test."""
+    from api.models import SkillSelectionEvent
+    db_session.query(SkillSelectionEvent).delete()
+    db_session.commit()
+    yield db_session
+    db_session.query(SkillSelectionEvent).delete()
+    db_session.commit()
+
+
+# Alias for backward compatibility
+@pytest.fixture
+def db(db_session):
+    """Alias for db_session."""
+    return db_session

@@ -3,6 +3,8 @@
 import asyncio
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
+
+pytestmark = pytest.mark.slow
 from datetime import datetime, timezone
 
 from core.agent.run import AgentRun, RunStatus, RunTrigger

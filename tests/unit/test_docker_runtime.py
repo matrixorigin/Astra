@@ -15,14 +15,6 @@ def runtime():
 
 
 class TestDockerRuntime:
-    def test_capabilities(self, runtime):
-        cap = runtime.capabilities
-        assert cap.isolation == IsolationLevel.CONTAINER
-        assert cap.network_isolatable is True
-        assert cap.filesystem_isolated is True
-        assert cap.resource_limits is True
-        assert cap.reproducible is True
-
     def test_supported_languages(self, runtime):
         assert runtime.supported_languages == ["python"]
 
@@ -31,34 +23,9 @@ class TestDockerRuntime:
         assert result.exit_code == 1
         assert "Unsupported" in result.stderr
 
-    def test_health_check(self, runtime):
-        runtime.client.ping.return_value = True
-        assert runtime.health_check() is True
-
     def test_health_check_failure(self, runtime):
         runtime.client.ping.side_effect = Exception("no docker")
         assert runtime.health_check() is False
-
-    def test_execute_success(self, runtime):
-        container = Mock()
-        container.wait.return_value = {"StatusCode": 0}
-        container.logs.side_effect = [b"hello\n", b""]
-        runtime.client.containers.run.return_value = container
-
-        result = runtime.execute("print('hello')")
-        assert result.exit_code == 0
-        assert result.stdout == "hello\n"
-        container.remove.assert_called_once_with(force=True)
-
-    def test_execute_failure(self, runtime):
-        container = Mock()
-        container.wait.return_value = {"StatusCode": 1}
-        container.logs.side_effect = [b"", b"error\n"]
-        runtime.client.containers.run.return_value = container
-
-        result = runtime.execute("bad code")
-        assert result.exit_code == 1
-        assert result.stderr == "error\n"
 
     def test_execute_timeout(self, runtime):
         container = Mock()

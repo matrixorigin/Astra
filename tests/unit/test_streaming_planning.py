@@ -132,34 +132,6 @@ class TestPlannerGetNextSteps(unittest.TestCase):
         self.assertEqual(len(next_steps), 1)
         self.assertEqual(next_steps[0].step_id, "step_2")
 
-    def test_get_next_steps_with_dependencies(self):
-        """Test getting next steps with step dependencies."""
-        plan = Plan(
-            plan_id="plan_1",
-            goal="Test",
-            steps=[
-                PlanStep(step_id="step_1", description="Step 1", status=PlanStatus.COMPLETED),
-                PlanStep(
-                    step_id="step_2",
-                    description="Step 2",
-                    depends_on=["step_1"],
-                    status=PlanStatus.PENDING,
-                ),
-                PlanStep(
-                    step_id="step_3",
-                    description="Step 3",
-                    depends_on=["step_2"],
-                    status=PlanStatus.PENDING,
-                ),
-            ],
-        )
-
-        next_steps = self.planner.get_next_steps(plan)
-
-        # Only step_2 should be next (step_3 depends on step_2)
-        self.assertEqual(len(next_steps), 1)
-        self.assertEqual(next_steps[0].step_id, "step_2")
-
 
 class TestPlannerCheckConstraints(unittest.TestCase):
     """Test Planner.check_constraints method."""

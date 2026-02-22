@@ -26,29 +26,8 @@ def db_session():
 
 
 @pytest.fixture
-def test_user(db_session):
-    repo = UserRepository(db_session)
-    user = repo.get_by_username("chatuser")
-    if user:
-        repo.delete(user.user_id)
-        db_session.commit()
-
-    from core.auth.password import hash_password
-    user = repo.create({
-        "user_id": str(uuid4()),
-        "username": "chatuser",
-        "email": "chat@example.com",
-        "password_hash": hash_password("password123"),
-        "is_active": 1,
-    })
-    yield user
-    repo.delete(user.user_id)
-    db_session.commit()
-
-
-@pytest.fixture
 def auth_headers(client, test_user):
-    resp = client.post("/auth/login", json={"username": "chatuser", "password": "password123"})
+    resp = client.post("/auth/login", json={"username": "testuser", "password": "testpass123"})
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
 
 

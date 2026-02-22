@@ -33,51 +33,6 @@ def db_session():
 
 
 @pytest.fixture
-def test_user():
-    """Create test user directly in database"""
-    from api.database import get_db_session
-    from api.repositories import UserRepository
-    import time
-    
-    session = next(get_db_session())
-    user_repo = UserRepository(session)
-    
-    # Use timestamp to ensure uniqueness
-    unique_id = f"{str(uuid7())[:8]}_{int(time.time() * 1000000) % 1000000}"
-    
-    user = user_repo.create({
-        "user_id": str(uuid7()),
-        "username": f"test_user_{unique_id}",
-        "email": f"test_{unique_id}@example.com",
-        "password_hash": "hashed_password",
-        "is_active": True
-    })
-    session.commit()
-    
-    # Return user data, not the SQLAlchemy object
-    user_data = {
-        "user_id": user.user_id,
-        "username": user.username,
-        "email": user.email
-    }
-    session.close()
-    
-    yield type('User', (), user_data)()
-    
-    # Cleanup
-    session = next(get_db_session())
-    try:
-        user_to_delete = session.get(user.__class__, user_data["user_id"])
-        if user_to_delete:
-            session.delete(user_to_delete)
-            session.commit()
-    except:
-        pass
-    finally:
-        session.close()
-
-
-@pytest.fixture
 def auth_token(test_user):
     """Generate auth token"""
     return create_access_token({

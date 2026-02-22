@@ -54,7 +54,7 @@ class TestAccessTracking:
     def test_bumps_access_count(self, db, user_id):
         eid = _insert_entry(db, user_id)
         update_access_tracking(db, [eid])
-        row = db.query(KnowledgeEntry).get(eid)
+        row = db.get(KnowledgeEntry, eid)
         assert row.access_count == 1
         assert row.last_accessed_at is not None
 
@@ -62,7 +62,7 @@ class TestAccessTracking:
         eid = _insert_entry(db, user_id)
         update_access_tracking(db, [eid])
         update_access_tracking(db, [eid])
-        row = db.query(KnowledgeEntry).get(eid)
+        row = db.get(KnowledgeEntry, eid)
         assert row.access_count == 2
 
     def test_empty_list_noop(self, db):
@@ -144,7 +144,7 @@ class TestKnowledgeExtractor:
         assert len(result) == 1
         assert result[0]["action"] == "created"
 
-        row = db.query(KnowledgeEntry).get(result[0]["entry_id"])
+        row = db.get(KnowledgeEntry, result[0]["entry_id"])
         assert row.value == "vim"
         assert row.confidence == 0.7
 
@@ -198,7 +198,7 @@ class TestKnowledgeExtractor:
         }])
         assert result[0]["action"] == "contradiction"
 
-        old = db.query(KnowledgeEntry).get(eid)
+        old = db.get(KnowledgeEntry, eid)
         assert old.confidence == 0.5  # 0.8 - 0.3
         assert old.superseded_by == result[0]["entry_id"]
 
@@ -218,7 +218,7 @@ class TestKnowledgeExtractor:
         count = ext.decay_confidence(user_id)
         assert count >= 1
 
-        row = db.query(KnowledgeEntry).get(eid)
+        row = db.get(KnowledgeEntry, eid)
         assert row.confidence < 0.9  # decayed
 
     def test_quarantine_low_confidence(self, db, user_id):
@@ -228,7 +228,7 @@ class TestKnowledgeExtractor:
         count = ext.quarantine_low_confidence(user_id, threshold=0.3)
         assert count >= 1
 
-        row = db.query(KnowledgeEntry).get(eid)
+        row = db.get(KnowledgeEntry, eid)
         assert row.confidence == 0
 
     def test_quarantine_skips_already_zero(self, db, user_id):

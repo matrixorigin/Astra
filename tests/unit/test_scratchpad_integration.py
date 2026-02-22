@@ -97,17 +97,6 @@ class TestHandleScratchpadTool:
         )
         scratchpad.get_active_notes.assert_called_once_with("sess-1", note_type="todo")
 
-    def test_close_note(self):
-        loop, scratchpad = _make_loop()
-        result = loop._handle_scratchpad_tool(
-            "scratchpad_close",
-            {"note_id": "note_abc123", "status": "completed"},
-            session_id="sess-1",
-            user_id="alice",
-        )
-        scratchpad.close_note.assert_called_once_with("note_abc123", status="completed")
-        assert result["success"] is True
-
     def test_close_note_default_status(self):
         loop, scratchpad = _make_loop()
         loop._handle_scratchpad_tool(

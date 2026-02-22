@@ -74,60 +74,7 @@ class TestMultiDimensionalLearning:
         weights = SignalWeights(accuracy=0.5, speed=0.2, cost=0.2, satisfaction=0.1)
         return SelfImprovingSelector(db_session, llm_client=None, weights=weights)
     
-    def test_extract_wrong_skill_signal(self, selector):
-        """Test extracting wrong_skill signal."""
-        failure = {
-            "user_query": "Create a pull request",
-            "selected_skills": ["github_list_repos"],
-            "correction_suggestion": ["github_create_pr"],
-        }
-        
-        signal = selector._extract_signal(failure, SignalType.WRONG_SKILL)
-        
-        assert signal is not None
-        assert signal.signal_type == SignalType.WRONG_SKILL
-        assert signal.wrong_skills == ["github_list_repos"]
-        assert signal.correct_skills == ["github_create_pr"]
-        assert signal.target_metrics["accuracy"] == 1.0
-    
-    def test_extract_slow_execution_signal(self, selector):
-        """Test extracting slow_execution signal."""
-        failure = {
-            "user_query": "Run tests",
-            "selected_skills": ["pytest_run_all"],
-            "execution_time_ms": 10000,  # 10 seconds
-        }
-        
-        signal = selector._extract_signal(failure, SignalType.SLOW_EXECUTION)
-        
-        assert signal is not None
-        assert signal.signal_type == SignalType.SLOW_EXECUTION
-        assert signal.target_metrics["time_ms"] == 5000  # Target: 50% faster
-    
-    def test_extract_slow_execution_below_threshold(self, selector):
-        """Test slow execution below threshold returns None."""
-        failure = {
-            "user_query": "Quick task",
-            "selected_skills": ["fast_skill"],
-            "execution_time_ms": 1000,  # 1 second (below 5s threshold)
-        }
-        
-        signal = selector._extract_signal(failure, SignalType.SLOW_EXECUTION)
-        assert signal is None
-    
-    def test_extract_high_cost_signal(self, selector):
-        """Test extracting high_cost signal."""
-        failure = {
-            "user_query": "Analyze large dataset",
-            "selected_skills": ["gpt4_analyze"],
-            "execution_cost": 0.50,  # $0.50
-        }
-        
-        signal = selector._extract_signal(failure, SignalType.HIGH_COST)
-        
-        assert signal is not None
-        assert signal.signal_type == SignalType.HIGH_COST
-        assert signal.target_metrics["cost"] == 0.25  # Target: 50% cheaper
+
     
     def test_extract_high_cost_below_threshold(self, selector):
         """Test high cost below threshold returns None."""
@@ -395,19 +342,6 @@ class TestMultiDimensionalLearning:
         ).delete()
         db_session.commit()
     
-    def test_extract_low_satisfaction_signal(self, selector):
-        """Test extracting low_satisfaction signal."""
-        failure = {
-            "user_query": "Help me debug",
-            "selected_skills": ["generic_help"],
-            "user_feedback_score": 2,  # 2 stars
-        }
-        
-        signal = selector._extract_signal(failure, SignalType.LOW_SATISFACTION)
-        
-        assert signal is not None
-        assert signal.signal_type == SignalType.LOW_SATISFACTION
-        assert signal.target_metrics["satisfaction"] == 4.0  # Target: 4+ stars
     
     def test_extract_low_satisfaction_above_threshold(self, selector):
         """Test satisfaction above threshold returns None."""

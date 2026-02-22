@@ -3,6 +3,8 @@
 import pytest
 from datetime import datetime, timezone
 from unittest.mock import Mock, patch, MagicMock
+
+pytestmark = pytest.mark.slow
 from sqlalchemy import text
 
 from core.evaluation.regression_gate import RegressionGate, ChangeType

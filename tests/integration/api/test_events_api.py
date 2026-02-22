@@ -23,45 +23,14 @@ def db_session():
 
 
 @pytest.fixture
-def test_user(db_session):
-    """Create test user."""
-    repo = UserRepository(db_session)
-    
-    # Clean up first
-    user = repo.get_by_username("eventuser")
-    if user:
-        repo.delete(user.user_id)
-        db_session.commit()
-    
-    # Create user
-    from core.auth.password import hash_password
-    from uuid import uuid4
-    
-    user_data = {
-        "user_id": str(uuid4()),
-        "username": "eventuser",
-        "email": "event@example.com",
-        "password_hash": hash_password("password123"),
-        "is_active": 1,
-    }
-    user = repo.create(user_data)
-    
-    yield user
-    
-    # Clean up
-    repo.delete(user.user_id)
-    db_session.commit()
-
-
-@pytest.fixture
 def auth_headers(client, test_user):
     """Get authentication headers."""
     # Login to get token
     response = client.post(
         "/auth/login",
         json={
-            "username": "eventuser",
-            "password": "password123",
+            "username": "testuser",
+            "password": "testpass123",
         },
     )
     
@@ -125,16 +94,16 @@ class TestCreateEvent:
         repo = UserRepository(db_session)
         
         # Clean up first
-        existing = repo.get_by_username("othereventuser")
+        existing = repo.get_by_username("otheruser")
         if existing:
             repo.delete(existing.user_id)
             db_session.commit()
         
         other_user = repo.create({
             "user_id": str(uuid4()),
-            "username": "othereventuser",
-            "email": "otherevent@example.com",
-            "password_hash": hash_password("password123"),
+            "username": "otheruser",
+            "email": "other@example.com",
+            "password_hash": hash_password("otherpass123"),
             "is_active": 1,
         })
         
@@ -142,8 +111,8 @@ class TestCreateEvent:
         response = client.post(
             "/auth/login",
             json={
-                "username": "othereventuser",
-                "password": "password123",
+                "username": "otheruser",
+                "password": "otherpass123",
             },
         )
         other_token = response.json()["access_token"]

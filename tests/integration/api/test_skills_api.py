@@ -6,7 +6,6 @@ from uuid import uuid4
 
 from api.main import app
 from api.database import get_db_session
-from api.repositories.user_repository import UserRepository
 
 
 @pytest.fixture(autouse=True)
@@ -14,7 +13,6 @@ def cleanup_skills():
     """Clean up test skills before and after each test."""
     from sqlalchemy.orm import Session
     from sqlalchemy import text
-    from api.database import get_db_session
     db = next(get_db_session())
     
     # Clean before
@@ -42,39 +40,10 @@ def db_session():
 
 
 @pytest.fixture
-def test_user(db_session):
-    repo = UserRepository(db_session)
-    
-    # Clean up first
-    user = repo.get_by_username("skilluser")
-    if user:
-        repo.delete(user.user_id)
-        db_session.commit()
-    
-    from core.auth.password import hash_password
-    
-    user_data = {
-        "user_id": str(uuid4()),
-        "username": "skilluser",
-        "email": "skill@example.com",
-        "password_hash": hash_password("password123"),
-        "is_active": 1,
-    }
-    user = repo.create(user_data)
-    db_session.commit()  # 添加 commit
-    
-    yield user
-    
-    # Clean up
-    repo.delete(user.user_id)
-    db_session.commit()
-
-
-@pytest.fixture
 def auth_headers(client, test_user):
     response = client.post(
         "/auth/login",
-        json={"username": "skilluser", "password": "password123"},
+        json={"username": "testuser", "password": "testpass123"},
     )
     token = response.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}

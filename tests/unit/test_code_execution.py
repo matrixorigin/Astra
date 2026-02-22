@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch, PropertyMock, call
 import pytest
 
+pytestmark = pytest.mark.slow
+
 from core.runtime import (
     Runtime, ExecutionResult, ResourceProfile,
     PROFILE_LIGHTWEIGHT, PROFILE_DATA_ANALYSIS,
