@@ -1,0 +1,83 @@
+name: Test Suite
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:latest
+        ports:
+          - 6001:6001
+        options: >-
+          --health-cmd "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Run unit tests (parallel)
+        env:
+          DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          python -m pytest tests/unit/ -n auto --dist loadscope -v --tb=short
+      
+      - name: Run integration tests (parallel)
+        env:
+          DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          python -m pytest tests/integration/ -n auto --dist loadscope -v --tb=short
+      
+      - name: Run schema validation tests
+        env:
+          DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          python -m pytest tests/integration/test_schema_validation.py -v
+      
+      - name: Run transaction integrity tests
+        env:
+          DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
+          REDIS_URL: redis://localhost:6379/0
+        run: |
+          python -m pytest tests/integration/test_transaction_integrity.py -v
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            .pytest_cache/
+            test-results.xml

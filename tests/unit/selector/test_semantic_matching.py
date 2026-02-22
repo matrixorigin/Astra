@@ -74,6 +74,10 @@ class TestSemanticMatching:
 
     def test_apply_learnings_context_mismatch(self, self_improving, db):
         """Test context feature filtering blocks mismatched learnings."""
+        # Clean up any existing learnings to ensure test isolation
+        db.query(SkillSelectionLearning).delete()
+        db.commit()
+        
         uuid_str2 = str(uuid7()).replace("-", "")
         learning = SkillSelectionLearning(
             learning_id=f"lc-{uuid_str2}",  # Shorter prefix
@@ -102,6 +106,7 @@ class TestSemanticMatching:
 
         long_query = "review " + ("x" * 250)
         corrected = self_improving.apply_learnings(long_query, candidates)
+        # Context mismatch should return original candidates unchanged
         assert corrected == candidates
 
     def test_semantic_threshold_config_blocks_match(self, self_improving, db):

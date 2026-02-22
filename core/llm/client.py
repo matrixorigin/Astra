@@ -641,7 +641,7 @@ class LLMClient:
                     text("""INSERT INTO llm_call_logs (
                         log_id, event_id, user_id, provider, model,
                         tokens_prompt, tokens_completion, tokens_total,
-                        cost_usd, latency_ms, status, call_metadata, created_at
+                        cost_usd, latency_ms, status, metadata, created_at
                     ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
                         :tp, :tc, :tt, :cost, :lat, :status, :meta, :ts)"""),
                     {
@@ -659,7 +659,7 @@ class LLMClient:
                     text("""INSERT INTO llm_call_logs (
                         log_id, event_id, user_id, provider, model,
                         tokens_prompt, tokens_completion, tokens_total,
-                        cost_usd, latency_ms, status, error_message, call_metadata, created_at
+                        cost_usd, latency_ms, status, error_message, metadata, created_at
                     ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
                         0, 0, 0, 0.0, :lat, :status, :err, :meta, :ts)"""),
                     {
