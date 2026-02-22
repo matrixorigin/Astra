@@ -94,14 +94,17 @@ class TaskBoard:
             return event.event_id
         else:
             # Fallback: direct DB insert
-            from uuid_utils import uuid7
+            from core.utils.id_generator import generate_id
 
-            task_id = str(uuid7())
+            task_id = generate_id()
+            # causal_chain_id = task_id: task is the root of its own causal chain
             self.db.execute(
                 text(
                     "INSERT INTO conversation_events "
-                    "(event_id, session_id, user_id, event_type, content, metadata, parent_event_id, created_at) "
-                    "VALUES (:id, :sid, 'system', 'team_task', :title, :meta, :parent, NOW())"
+                    "(event_id, session_id, user_id, agent_id, agent_version, "
+                    "event_type, content, metadata, causal_chain_id, parent_event_id, created_at) "
+                    "VALUES (:id, :sid, 'system', 'system', '1.0.0', "
+                    "'team_task', :title, :meta, :id, :parent, NOW())"
                 ),
                 {
                     "id": task_id,
@@ -160,16 +163,20 @@ class TaskBoard:
                 parent_event_id=task_id,
             )
         else:
-            from uuid_utils import uuid7
+            from core.utils.id_generator import generate_id
 
+            eid = generate_id()
+            # causal_chain_id = eid: claim is an independent action, linked to task via parent_event_id
             self.db.execute(
                 text(
                     "INSERT INTO conversation_events "
-                    "(event_id, session_id, user_id, event_type, content, metadata, parent_event_id, created_at) "
-                    "VALUES (:id, :sid, 'system', 'team_task_claimed', :content, :meta, :parent, NOW())"
+                    "(event_id, session_id, user_id, agent_id, agent_version, "
+                    "event_type, content, metadata, causal_chain_id, parent_event_id, created_at) "
+                    "VALUES (:id, :sid, 'system', 'system', '1.0.0', "
+                    "'team_task_claimed', :content, :meta, :id, :parent, NOW())"
                 ),
                 {
-                    "id": str(uuid7()),
+                    "id": eid,
                     "sid": session_id,
                     "content": f"Claimed by {agent_id}",
                     "meta": json.dumps({"claimed_by": agent_id}),
@@ -206,16 +213,20 @@ class TaskBoard:
                 parent_event_id=task_id,
             )
         else:
-            from uuid_utils import uuid7
+            from core.utils.id_generator import generate_id
 
+            eid = generate_id()
+            # causal_chain_id = eid: completion is an independent action, linked to task via parent_event_id
             self.db.execute(
                 text(
                     "INSERT INTO conversation_events "
-                    "(event_id, session_id, user_id, event_type, content, metadata, parent_event_id, created_at) "
-                    "VALUES (:id, :sid, 'system', 'team_task_done', :content, :meta, :parent, NOW())"
+                    "(event_id, session_id, user_id, agent_id, agent_version, "
+                    "event_type, content, metadata, causal_chain_id, parent_event_id, created_at) "
+                    "VALUES (:id, :sid, 'system', 'system', '1.0.0', "
+                    "'team_task_done', :content, :meta, :id, :parent, NOW())"
                 ),
                 {
-                    "id": str(uuid7()),
+                    "id": eid,
                     "sid": session_id,
                     "content": result,
                     "meta": json.dumps({"completed_by": agent_id}),
@@ -297,14 +308,16 @@ class TaskBoard:
             )
             return event.event_id
         else:
-            from uuid_utils import uuid7
+            from core.utils.id_generator import generate_id
 
-            msg_id = str(uuid7())
+            msg_id = generate_id()
             self.db.execute(
                 text(
                     "INSERT INTO conversation_events "
-                    "(event_id, session_id, user_id, event_type, content, metadata, causal_chain_id, created_at) "
-                    "VALUES (:id, :sid, 'system', 'agent_message', :content, :meta, :chain, NOW())"
+                    "(event_id, session_id, user_id, agent_id, agent_version, "
+                    "event_type, content, metadata, causal_chain_id, created_at) "
+                    "VALUES (:id, :sid, 'system', 'system', '1.0.0', "
+                    "'agent_message', :content, :meta, :chain, NOW())"
                 ),
                 {
                     "id": msg_id,

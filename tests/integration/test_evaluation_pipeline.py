@@ -347,9 +347,13 @@ class TestEvaluationActionAPI:
         assert "calibration" in data
         # Phase 3: diagnoses
         assert isinstance(data["diagnoses"], list)
+        # Phase 4: skill selection learning
+        assert "skill_learning" in data
+        if data["skill_learning"] is not None:
+            assert "learned" in data["skill_learning"]
 
     def test_loop_audit_event_recorded(self, client, headers, db):
-        """Closed loop must persist an audit event."""
+        """Closed loop must persist an audit event with all phases."""
         resp = client.post(
             "/api/v1/evaluation/loop",
             params={"days": 1, "dry_run": True},
@@ -368,3 +372,4 @@ class TestEvaluationActionAPI:
         assert content["dry_run"] is True
         assert "drift" in content
         assert "diagnoses" in content
+        assert "skill_learning" in content

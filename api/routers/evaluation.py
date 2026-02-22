@@ -112,6 +112,7 @@ class ClosedLoopResponse(BaseModel):
     drift: DriftPipelineResponse
     calibration: CalibrationResponse | None = None
     diagnoses: list[LoopDiagnosisItem]
+    skill_learning: dict[str, Any] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +282,7 @@ def get_session_scores(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/gate/validate", response_model=GateValidateResponse, status_code=200)
+@router.post("/gate/validate", response_model=GateValidateResponse)
 def validate_gate(
     req: GateValidateRequest,
     db: Session = Depends(get_db_session),
@@ -337,6 +338,7 @@ def run_closed_loop(
     Phase 2 — Calibration: measure confidence calibration, compute adjustment.
     Phase 3 — Learner: diagnose input-face bottlenecks, propose + validate + deploy fixes.
               If drift found template-level issues, learner targets PROMPT face specifically.
+    Phase 4 — Skill selection: learn from recent skill selection failures.
     Record — Persist loop execution as auditable event.
     """
     from core.evaluation.confidence_calibrator import ConfidenceCalibrator
@@ -414,14 +416,34 @@ def run_closed_loop(
     finally:
         db.close()
 
+    # Phase 4: Skill selection learning
+    # Separate from InputFaceLearner — SelfImprovingSelector has its own
+    # signal extraction, multi-factor scoring, and sandbox-based validation
+    skill_learning_resp: dict[str, Any] | None = None
+    db = SessionLocal()
+    try:
+        from core.skills.self_improving_selector import SelfImprovingSelector
+
+        selector = SelfImprovingSelector(session=db)
+        skill_learning_resp = selector.learn_from_failures(days=days)
+    except Exception as e:
+        logger.error("Closed loop skill learning phase failed: %s", e)
+        skill_learning_resp = {"learned": 0, "error": str(e)}
+    finally:
+        db.close()
+
     # Record — audit trail for the loop execution itself
-    _record_loop_event(loop_id, drift_resp, calibration_resp, diagnoses, dry_run)
+    _record_loop_event(
+        loop_id, drift_resp, calibration_resp, diagnoses,
+        skill_learning_resp, dry_run,
+    )
 
     return ClosedLoopResponse(
         loop_id=loop_id,
         drift=drift_resp,
         calibration=calibration_resp,
         diagnoses=diagnoses,
+        skill_learning=skill_learning_resp,
     )
 
 
@@ -430,11 +452,13 @@ def _record_loop_event(
     drift: DriftPipelineResponse,
     calibration: CalibrationResponse | None,
     diagnoses: list[LoopDiagnosisItem],
+    skill_learning: dict[str, Any] | None,
     dry_run: bool,
 ) -> None:
     """Persist closed-loop execution as an auditable conversation event."""
     db = SessionLocal()
     try:
+        # causal_chain_id = loop_id: each loop execution is its own causal chain root
         db.execute(text("""
             INSERT INTO conversation_events
             (event_id, session_id, user_id, agent_id, agent_version,
@@ -451,6 +475,7 @@ def _record_loop_event(
                                 "bias": calibration.bias} if calibration else None,
                 "diagnoses": [{"face": d.input_face, "applied": d.applied,
                                "verdict": d.gate_verdict} for d in diagnoses],
+                "skill_learning": skill_learning,
             }),
         })
         db.commit()

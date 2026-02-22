@@ -105,17 +105,22 @@ class SessionContinuity:
 
         Distributed-safe: INSERT only, no read-modify-write.
         """
-        from uuid_utils import uuid7
+        from core.utils.id_generator import generate_id
 
+        eid = generate_id()
+        # INSERT...SELECT: pull session_id + user_id from sessions table,
+        # inject system constants for agent_id/agent_version/causal_chain_id
         self.db.execute(
             text(
                 "INSERT INTO conversation_events "
-                "(event_id, session_id, user_id, event_type, content, created_at) "
-                "SELECT :event_id, s.session_id, s.user_id, 'session_summary', :summary, NOW() "
+                "(event_id, session_id, user_id, agent_id, agent_version, "
+                "event_type, content, causal_chain_id, created_at) "
+                "SELECT :event_id, s.session_id, s.user_id, 'system', '1.0.0', "
+                "'session_summary', :summary, :event_id, NOW() "
                 "FROM sessions s WHERE s.session_id = :session_id"
             ),
             {
-                "event_id": str(uuid7()),
+                "event_id": eid,
                 "session_id": session_id,
                 "summary": summary,
             },

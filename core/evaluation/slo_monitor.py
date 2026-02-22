@@ -188,16 +188,17 @@ class SLOMonitor:
         """Record SLO alert as auditable event."""
         try:
             import json
-            from uuid_extensions import uuid7
+            from core.utils.id_generator import generate_id
+            eid = generate_id()
             self.db.execute(text("""
                 INSERT INTO conversation_events
-                    (event_id, session_id, user_id, agent_id, event_type,
-                     content, causal_chain_id, created_at)
+                    (event_id, session_id, user_id, agent_id, agent_version,
+                     event_type, content, causal_chain_id, created_at)
                 VALUES
-                    (:eid, 'system_slo', 'system', :aid, 'slo_alert',
-                     :content, :chain, NOW())
+                    (:eid, 'system_slo', 'system', :aid, '1.0.0',
+                     'slo_alert', :content, :eid, NOW())
             """), {
-                "eid": str(uuid7()),
+                "eid": eid,
                 "aid": agent_id,
                 "content": json.dumps({
                     "slo": status.slo.name,
@@ -207,7 +208,6 @@ class SLOMonitor:
                     "target": status.slo.target,
                     "bad_days": status.bad_days,
                 }),
-                "chain": f"slo_{agent_id}",
             })
             self.db.commit()
         except Exception as e:

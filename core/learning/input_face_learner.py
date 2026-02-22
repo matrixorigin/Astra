@@ -29,7 +29,7 @@ logger = get_logger(__name__)
 
 
 class InputFace(str, Enum):
-    """Learnable input dimensions beyond skill selection."""
+    """Learnable input dimensions."""
 
     PROMPT = "prompt"
     CONTEXT_BUDGET = "context_budget"
@@ -328,7 +328,7 @@ class InputFaceLearner:
         commit or neither does.
         """
         try:
-            from uuid_utils import uuid7
+            from core.utils.id_generator import generate_id
 
             qr = self._db.execute(
                 text("""
@@ -347,16 +347,17 @@ class InputFaceLearner:
                 result.proposal = {"action": "quarantined", "count": count}
                 result.applied = True
                 result.gate_verdict = "auto"
+                eid = generate_id()
                 self._db.execute(
                     text("""
                         INSERT INTO conversation_events
-                        (event_id, session_id, user_id, event_type, content, created_at)
-                        VALUES (:eid, :sid, :uid, :etype, :content, UTC_TIMESTAMP())
+                        (event_id, session_id, user_id, agent_id, agent_version,
+                         event_type, content, causal_chain_id, created_at)
+                        VALUES (:eid, 'system', 'system', 'system', '1.0.0',
+                                :etype, :content, :eid, UTC_TIMESTAMP())
                     """),
                     {
-                        "eid": str(uuid7()),
-                        "sid": "system",
-                        "uid": "system",
+                        "eid": eid,
                         "etype": "input_face_learning",
                         "content": json.dumps({
                             "face": InputFace.KNOWLEDGE.value,
@@ -385,18 +386,19 @@ class InputFaceLearner:
     ) -> None:
         """Record learning action as a conversation event for audit trail."""
         try:
-            from uuid_utils import uuid7
+            from core.utils.id_generator import generate_id
 
+            eid = generate_id()
             self._db.execute(
                 text("""
                     INSERT INTO conversation_events
-                    (event_id, session_id, user_id, event_type, content, created_at)
-                    VALUES (:eid, :sid, :uid, :etype, :content, UTC_TIMESTAMP())
+                    (event_id, session_id, user_id, agent_id, agent_version,
+                     event_type, content, causal_chain_id, created_at)
+                    VALUES (:eid, 'system', 'system', 'system', '1.0.0',
+                            :etype, :content, :eid, UTC_TIMESTAMP())
                 """),
                 {
-                    "eid": str(uuid7()),
-                    "sid": "system",
-                    "uid": "system",
+                    "eid": eid,
                     "etype": "input_face_learning",
                     "content": json.dumps({
                         "face": face.value,

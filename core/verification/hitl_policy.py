@@ -233,16 +233,17 @@ class HITLPolicyEngine:
             return
         try:
             import json
-            from uuid_extensions import uuid7
+            from core.utils.id_generator import generate_id
+            eid = generate_id()
             self.db.execute(text("""
                 INSERT INTO conversation_events
-                    (event_id, session_id, user_id, agent_id, event_type,
-                     content, causal_chain_id, created_at)
+                    (event_id, session_id, user_id, agent_id, agent_version,
+                     event_type, content, causal_chain_id, created_at)
                 VALUES
-                    (:eid, 'system_hitl', :uid, :aid, 'hitl_policy_evaluation',
-                     :content, :chain, NOW())
+                    (:eid, 'system_hitl', :uid, :aid, '1.0.0',
+                     'hitl_policy_evaluation', :content, :eid, NOW())
             """), {
-                "eid": str(uuid7()),
+                "eid": eid,
                 "uid": "system",
                 "aid": ctx.agent_id or "system",
                 "content": json.dumps({
@@ -252,7 +253,6 @@ class HITLPolicyEngine:
                     "confidence": ctx.confidence,
                     "cost": ctx.estimated_cost,
                 }),
-                "chain": f"hitl_{ctx.agent_id or 'system'}",
             })
             self.db.commit()
         except Exception as e:

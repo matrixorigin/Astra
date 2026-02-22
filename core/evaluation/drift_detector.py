@@ -302,12 +302,13 @@ class DriftCorrector:
         try:
             self.db.execute(text("""
                 INSERT INTO conversation_events
-                    (event_id, session_id, user_id, agent_id, event_type,
-                     content, causal_chain_id, created_at, llm_model_used)
+                    (event_id, session_id, user_id, agent_id, agent_version,
+                     event_type, content, causal_chain_id, created_at, llm_model_used)
                 VALUES
-                    (:event_id, :session_id, :user_id, 'system', 'drift_correction',
-                     :content, :chain_id, NOW(), :model)
+                    (:event_id, :session_id, :user_id, 'system', '1.0.0',
+                     'drift_correction', :content, :chain_id, NOW(), :model)
             """), {
+                # Deterministic event_id: same drift signal → same PK → idempotent re-recording
                 "event_id": f"drift_{signal.model}_{int(signal.detected_at.timestamp())}",
                 "session_id": "system_drift_detection",
                 "user_id": "system",
