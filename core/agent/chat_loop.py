@@ -572,7 +572,18 @@ class ChatLoop:
             from core.verification.streaming_verifier import StreamingVerifier
             sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
-            async for chunk in self.llm.chat_stream(messages, user_id, session_id):
+            async for chunk_msg in self.llm.chat_stream(messages, user_id, session_id):
+                if chunk_msg["type"] == "reasoning":
+                    # Emit reasoning event for CoT audit trail
+                    yield StreamEvent(
+                        event_type=StreamEventType.REASONING_MESSAGE_CONTENT,
+                        data={"content": chunk_msg["content"]},
+                        event_id=user_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                        agent_id=self.agent_id,
+                    )
+                    continue
+                chunk = chunk_msg["content"]
                 warnings = sv.check(chunk)
                 text_event = self.event_logger.create_stream_event(
                     user_id=user_id,
@@ -702,7 +713,15 @@ class ChatLoop:
             tool_calls: list[dict] = []
 
             async for chunk in self.llm.chat_with_tools_stream(messages, tools_schema):
-                if chunk["type"] == "text":
+                if chunk["type"] == "reasoning":
+                    yield StreamEvent(
+                        event_type=StreamEventType.REASONING_MESSAGE_CONTENT,
+                        data={"content": chunk["content"]},
+                        event_id=user_event.event_id,
+                        causal_chain_id=user_event.causal_chain_id,
+                        agent_id=self.agent_id,
+                    )
+                elif chunk["type"] == "text":
                     full_text += chunk["content"]
                     text_event = self.event_logger.create_stream_event(
                         user_id=user_id,
@@ -1036,7 +1055,17 @@ class ChatLoop:
         from core.verification.streaming_verifier import StreamingVerifier
         sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
-        async for chunk in self.llm.chat_stream(messages, user_id, session_id):
+        async for chunk_msg in self.llm.chat_stream(messages, user_id, session_id):
+            if chunk_msg["type"] == "reasoning":
+                yield StreamEvent(
+                    event_type=StreamEventType.REASONING_MESSAGE_CONTENT,
+                    data={"content": chunk_msg["content"]},
+                    event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                    agent_id=self.agent_id,
+                )
+                continue
+            chunk = chunk_msg["content"]
             warnings = sv.check(chunk)
             yield StreamEvent(
                 event_type=StreamEventType.TEXT_DELTA,

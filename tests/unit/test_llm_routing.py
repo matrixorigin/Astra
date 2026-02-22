@@ -258,3 +258,57 @@ class TestRetryJitter:
             assert d >= base
             # Jitter adds up to 50% of base
             assert d <= base * 1.5
+
+
+class TestChatStreamReasoningPassthrough:
+    """Verify chat_stream yields reasoning chunks from provider."""
+
+    @pytest.mark.asyncio
+    async def test_reasoning_chunks_forwarded(self):
+        """Provider reasoning chunks become {"type": "reasoning"} in chat_stream output."""
+        from core.llm.client import LLMClient
+
+        chunks = [
+            {"type": "reasoning", "content": "thinking..."},
+            {"type": "text", "content": "answer"},
+            {"type": "usage", "prompt": 10, "completion": 5},
+        ]
+
+        class FakeProvider:
+            provider = LLMProvider.OPENAI
+            def complete_stream(self, *a, **kw):
+                yield from chunks
+
+        client = LLMClient.__new__(LLMClient)
+        client.config = {"temperature": 0.7}
+        client.router = MagicMock()
+        client.router.resolve_model.return_value = MagicMock(
+            model_name="test", provider=LLMProvider.OPENAI, enable_cache=False,
+        )
+        client.router.resolve_chain.return_value = [
+            MagicMock(model_name="test", provider=LLMProvider.OPENAI, enable_cache=False),
+        ]
+        client.router.calculate_cost.return_value = 0.0
+        client.rate_limiter = MagicMock()
+        client.rate_limiter.get_breaker.return_value = MagicMock(allow_request=MagicMock(return_value=True))
+        client.rate_limiter.wait_and_acquire = MagicMock()
+        client._providers = {LLMProvider.OPENAI: FakeProvider()}
+        client._spend_usd = 0.0
+        client._budget_usd = None
+        client._call_log = []
+        client._resolve_model = MagicMock(return_value="test")
+        client._check_budget = MagicMock()
+        client._resolve_chain = MagicMock(return_value=[
+            MagicMock(model_name="test", provider=LLMProvider.OPENAI, enable_cache=False),
+        ])
+        client._get_provider = MagicMock(return_value=FakeProvider())
+        client._record_spend = MagicMock()
+        client._log_call = MagicMock()
+
+        collected = []
+        async for item in client.chat_stream([], "user1"):
+            collected.append(item)
+
+        assert collected[0] == {"type": "reasoning", "content": "thinking..."}
+        assert collected[1] == {"type": "text", "content": "answer"}
+        assert len(collected) == 2  # usage is consumed, not yielded

@@ -532,7 +532,9 @@ class LLMClient:
                     messages, model_cfg.model_name, temp, max_tok
                 ):
                     if chunk["type"] == "text":
-                        yield chunk["content"]
+                        yield {"type": "text", "content": chunk["content"]}
+                    elif chunk["type"] == "reasoning":
+                        yield {"type": "reasoning", "content": chunk["content"]}
                     elif chunk["type"] == "usage":
                         usage["prompt"] = chunk["prompt"]
                         usage["completion"] = chunk["completion"]

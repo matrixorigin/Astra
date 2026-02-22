@@ -166,6 +166,34 @@ class TestChatStream:
         assert "plan_created" in types
         assert "plan_step_start" in types
 
+    @pytest.mark.asyncio
+    @patch("api.routers.chat._build_chat_loop")
+    async def test_stream_chat_reasoning_events(self, mock_build, mock_db, mock_auth):
+        """Reasoning (CoT) events are forwarded through the SSE stream."""
+        from api.routers.chat import chat_stream, ChatRequest
+
+        events = [
+            StreamEvent(event_type=StreamEventType.RUN_STARTED, data={}, event_id="evt_1"),
+            StreamEvent(event_type=StreamEventType.REASONING_MESSAGE_CONTENT, data={"content": "Let me think..."}, event_id="evt_2"),
+            StreamEvent(event_type=StreamEventType.TEXT_DELTA, data={"chunk": "Answer"}, event_id="evt_3"),
+            StreamEvent(event_type=StreamEventType.RUN_FINISHED, data={}, event_id="evt_4"),
+        ]
+        mock_build.return_value = _make_mock_loop(stream_events=events)
+
+        request = ChatRequest(session_id="sess_123", message="Think about this")
+        response = await chat_stream(request, mock_auth, mock_db)
+
+        collected = []
+        async for chunk in response.body_iterator:
+            s = chunk.decode() if isinstance(chunk, bytes) else chunk
+            if s.startswith("data: "):
+                collected.append(json.loads(s[6:].strip()))
+
+        types = [e["event_type"] for e in collected]
+        assert "reasoning_message_content" in types
+        reasoning_evt = [e for e in collected if e["event_type"] == "reasoning_message_content"][0]
+        assert reasoning_evt["data"]["content"] == "Let me think..."
+
 
 class TestChat:
     """Test /chat (non-streaming) endpoint."""

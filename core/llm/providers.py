@@ -106,6 +106,10 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
+        # OpenAI o-series reasoning tokens
+        reasoning = getattr(delta, "reasoning_content", None)
+        if reasoning:
+            yield {"type": "reasoning", "content": reasoning}
         if delta.content:
             yield {"type": "text", "content": delta.content}
         if delta.tool_calls:
@@ -201,8 +205,14 @@ class OpenAIProvider(BaseProvider):
                     "completion": chunk.usage.completion_tokens,
                     "cache_read": _extract_openai_cached_tokens(chunk.usage),
                 }
-            elif chunk.choices and chunk.choices[0].delta.content:
-                yield {"type": "text", "content": chunk.choices[0].delta.content}
+            elif chunk.choices and chunk.choices[0].delta:
+                delta = chunk.choices[0].delta
+                # OpenAI o-series reasoning tokens
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    yield {"type": "reasoning", "content": reasoning}
+                if delta.content:
+                    yield {"type": "text", "content": delta.content}
 
     def complete_with_tools(self, messages, tools, model, tool_choice, temperature, max_tokens):
         resp = self._with_retry(
@@ -392,8 +402,17 @@ class AnthropicProvider(BaseProvider):
             temperature=temperature,
             max_tokens=max_tokens or 2000,
         ) as stream:
-            for text in stream.text_stream:
-                yield {"type": "text", "content": text}
+            for event in stream:
+                if not hasattr(event, "type"):
+                    continue
+                if event.type == "content_block_delta":
+                    delta = event.delta
+                    # Extended thinking
+                    if getattr(delta, "type", None) == "thinking_delta":
+                        yield {"type": "reasoning", "content": delta.thinking}
+                    # Normal text
+                    elif hasattr(delta, "text"):
+                        yield {"type": "text", "content": delta.text}
             final = stream.get_final_message()
             cache_read, cache_creation = self._extract_cache_usage(final.usage)
             yield {
@@ -469,7 +488,10 @@ class AnthropicProvider(BaseProvider):
         ) as stream:
             for event in stream:
                 if hasattr(event, "type") and event.type == "content_block_delta":
-                    if hasattr(event.delta, "text"):
+                    delta = event.delta
+                    if getattr(delta, "type", None) == "thinking_delta":
+                        yield {"type": "reasoning", "content": delta.thinking}
+                    elif hasattr(delta, "text"):
                         yield {"type": "text", "content": event.delta.text}
             msg = stream.get_final_message()
             for block in msg.content:
