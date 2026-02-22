@@ -108,13 +108,13 @@ class ConfidenceCalibrator:
 
             rows = self.db.execute(text(f"""
                 SELECT
-                    CAST(JSON_EXTRACT(event_metadata, '$.confidence_score') AS DECIMAL) AS conf,
+                    CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.confidence_score')) AS DOUBLE) AS conf,
                     quality_score
                 FROM conversation_events
                 WHERE event_type = 'llm_response'
                   AND quality_score IS NOT NULL
-                  AND event_metadata IS NOT NULL
-                  AND JSON_EXTRACT(event_metadata, '$.confidence_score') IS NOT NULL
+                  AND `metadata` IS NOT NULL
+                  AND JSON_EXTRACT(`metadata`, '$.confidence_score') IS NOT NULL
                   AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
                   {agent_filter}
             """), params).fetchall()

@@ -40,6 +40,7 @@ class SkillRegistry:
         priority: int = 5,
         cost_estimate: str = "medium",
         git_commit_hash: str | None = None,
+        status: str = "active",
     ) -> None:
         """Register a skill version with metadata.
 
@@ -53,7 +54,14 @@ class SkillRegistry:
             priority: Priority (1-10)
             cost_estimate: Cost estimate (low/medium/high)
             git_commit_hash: Git commit hash for precise replay
+            status: Lifecycle status (draft/active/deprecated/archived)
         """
+        if status not in ("draft", "active", "deprecated", "archived"):
+            raise ValueError(f"Invalid skill status: {status}. Must be draft/active/deprecated/archived")
+
+        # Draft skills are never active
+        if status == "draft":
+            is_active = False
         logger.info(f"Registering skill: {skill.name}@{skill.version}")
 
         try:
@@ -78,6 +86,7 @@ class SkillRegistry:
                 existing.code_hash = code_hash
                 existing.git_commit_hash = git_commit_hash
                 existing.is_active = 1 if is_active else 0
+                existing.status = status
                 existing.category = category
                 existing.subcategory = subcategory
                 existing.triggers = triggers
@@ -95,6 +104,7 @@ class SkillRegistry:
                     code_hash=code_hash,
                     git_commit_hash=git_commit_hash,
                     is_active=1 if is_active else 0,
+                    status=status,
                     category=category,
                     subcategory=subcategory,
                     triggers=triggers,
@@ -116,7 +126,8 @@ class SkillRegistry:
             self._get_cached.cache_clear()
 
             # 6. Auto-trigger regression gate (async, non-blocking)
-            if self.gate_trigger and is_active:
+            # Only for active skills — draft skills skip gate
+            if self.gate_trigger and is_active and status == "active":
                 self.gate_trigger.on_skill_change(
                     skill_name=skill.name,
                     version=skill.version,
@@ -124,12 +135,62 @@ class SkillRegistry:
                 )
 
             logger.info(
-                f"Successfully registered skill: {skill.name}@{skill.version} (category={category}, priority={priority})"
+                f"Successfully registered skill: {skill.name}@{skill.version} "
+                f"(status={status}, category={category}, priority={priority})"
             )
 
         except Exception as e:
             logger.error(f"Failed to register skill {skill.name}@{skill.version}: {e}")
             raise DatabaseError(f"Failed to register skill: {e}") from e
+
+    def set_status(self, skill_name: str, version: str, status: str) -> bool:
+        """Transition skill lifecycle status.
+
+        Valid transitions: draft→active, active→deprecated, deprecated→archived.
+        Activating a draft skill triggers regression gate.
+        """
+        if status not in ("draft", "active", "deprecated", "archived"):
+            raise ValueError(f"Invalid status: {status}")
+
+        skill_id = f"{skill_name}@{version}"
+        existing = self.session.query(SkillModel).filter(
+            SkillModel.skill_id == skill_id
+        ).first()
+        if not existing:
+            return False
+
+        old_status = existing.status or "active"
+        valid_transitions = {
+            "draft": {"active"},
+            "active": {"deprecated"},
+            "deprecated": {"archived", "active"},
+            "archived": set(),
+        }
+        if status not in valid_transitions.get(old_status, set()):
+            raise ValueError(f"Invalid transition: {old_status} → {status}")
+
+        existing.status = status
+        if status == "active":
+            # Deactivate other versions of same skill
+            self.session.query(SkillModel).filter(
+                SkillModel.skill_name == skill_name,
+                SkillModel.skill_id != skill_id,
+            ).update({"is_active": 0})
+            existing.is_active = 1
+            # Trigger gate on publish (draft → active)
+            if self.gate_trigger:
+                self.gate_trigger.on_skill_change(
+                    skill_name=skill_name,
+                    version=version,
+                    definition=existing.skill_definition or {},
+                )
+        elif status in ("deprecated", "archived"):
+            existing.is_active = 0
+
+        self.session.commit()
+        self._get_cached.cache_clear()
+        logger.info(f"Skill {skill_id} status: {old_status} → {status}")
+        return True
 
     def get(self, skill_name: str, version: str | None = None) -> Skill | None:
         """Get skill by name and optional version

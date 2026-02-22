@@ -46,6 +46,9 @@ class AgentRun(BaseModel):
     # Parent-child
     parent_run_id: str | None = None
 
+    # Priority (0=highest, 10=lowest, default 5)
+    priority: int = 5
+
     # Timing
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None

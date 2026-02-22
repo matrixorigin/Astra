@@ -101,8 +101,8 @@ class SLOMonitor:
                 SELECT
                     DATE(created_at) AS day,
                     AVG(quality_score) AS avg_quality,
-                    SUM(CASE WHEN event_metadata IS NOT NULL
-                        AND JSON_EXTRACT(event_metadata, '$.hallucination_detected') = 'true'
+                    SUM(CASE WHEN `metadata` IS NOT NULL
+                        AND JSON_EXTRACT(`metadata`, '$.hallucination_detected') = 'true'
                         THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS hallucination_rate,
                     COUNT(*) AS total_responses
                 FROM conversation_events

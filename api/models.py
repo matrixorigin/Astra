@@ -1,7 +1,6 @@
 """SQLAlchemy ORM models."""
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, JSON, ForeignKey, Float, Index, UniqueConstraint
-from sqlalchemy.dialects.mysql import TINYINT
+from sqlalchemy import Column, DateTime, Integer, SmallInteger, String, Text, JSON, ForeignKey, Float, Index, UniqueConstraint
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy.sql import func
 from matrixone import VectorType, VectorPrecision
@@ -16,7 +15,7 @@ class User(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     display_name = Column(String(100))
-    is_active = Column(TINYINT(1), server_default="1", nullable=False)
+    is_active = Column(SmallInteger, server_default="1", nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     last_login_at = Column(DateTime)
 
@@ -29,7 +28,7 @@ class Agent(Base):
     owner_user_id = Column(String(36), nullable=False, index=True)
     agent_config = Column("agent_config", JSON)
     data_source = Column(JSON)  # 新增：数据源配置
-    is_active = Column(TINYINT(1), server_default="1", nullable=False)
+    is_active = Column(SmallInteger, server_default="1", nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -60,7 +59,7 @@ class GateResult(Base):
     sessions_tested = Column(Integer, default=0)  # Number of golden sessions tested
     error_rate = Column(Float, default=0.0)  # Error rate from replay
     score_delta = Column(Float, default=0.0)  # Quality score change
-    passed = Column(TINYINT(1), nullable=False)  # Pass/fail verdict
+    passed = Column(SmallInteger, nullable=False)  # Pass/fail verdict
     metrics = Column(Text)  # JSON metrics (error_rate, score_delta, latency, tokens)
     created_at = Column(DateTime, default=func.now())
 
@@ -118,7 +117,7 @@ class RefreshToken(Base):
     user_id = Column(String(36), nullable=False, index=True)
     token_hash = Column(String(255), nullable=False)
     expires_at = Column(DateTime, nullable=False)
-    is_revoked = Column(TINYINT(1), default=0, nullable=False)
+    is_revoked = Column(SmallInteger, default=0, nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
 
 
@@ -166,8 +165,8 @@ class Event(Base):
     prompt_template_id = Column(String(64))
     skills_snapshot = Column(JSON)
     quality_score = Column(Float)  # Changed from String(10) to Float for aggregation
-    is_flagged = Column(TINYINT(1), server_default="0")
-    training_eligible = Column(TINYINT(1), server_default="0")
+    is_flagged = Column(SmallInteger, server_default="0")
+    training_eligible = Column(SmallInteger, server_default="0")
     llm_model_used = Column(String(50))
     llm_params = Column(JSON)
     skill_name = Column(String(255))
@@ -220,7 +219,8 @@ class SkillRegistry(Base):
     skill_definition = Column(JSON)
     code_hash = Column(String(64))
     git_commit_hash = Column(String(64))
-    is_active = Column(TINYINT(1), default=1)
+    is_active = Column(SmallInteger, default=1)
+    status = Column(String(20), default="active")  # draft/active/deprecated/archived
     category = Column(String(50))
     subcategory = Column(String(50))
     triggers = Column(JSON)
@@ -239,7 +239,7 @@ class PromptTemplate(Base):
     content = Column(Text, nullable=False)
     input_variables = Column(JSON)
     description = Column(String(255))
-    is_active = Column(TINYINT(1), default=1)
+    is_active = Column(SmallInteger, default=1)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -364,7 +364,7 @@ class Token(Base):
     provider = Column(String(50), nullable=False)
     encrypted_value = Column(String(255), nullable=True)  # Nullable if using secret_ref
     secret_ref = Column(String(255))
-    is_active = Column(TINYINT(1), default=1)
+    is_active = Column(SmallInteger, default=1)
     scope_user_id = Column(String(36), index=True)
     scope_repo = Column(String(255), index=True)
     created_at = Column(DateTime, default=func.now())
@@ -384,11 +384,11 @@ class SkillSelectionEvent(Base):
     selection_reasoning = Column(Text)
     candidate_scores = Column(JSON)
     execution_result = Column(JSON)
-    execution_success = Column(TINYINT(1))
+    execution_success = Column(SmallInteger)
     execution_time_ms = Column(Integer)
     execution_cost = Column(Float)
     user_feedback_score = Column(Integer)
-    selection_correctness = Column(TINYINT(1))
+    selection_correctness = Column(SmallInteger)
     correction_suggestion = Column(JSON)
     created_at = Column(DateTime, default=func.now())
 
@@ -409,7 +409,7 @@ class SkillSelectionLearning(Base):
     signal_type = Column(String(50), default="wrong_skill", index=True)
     target_metrics = Column(JSON)  # {"time_ms": 500, "cost": 0.01, "satisfaction": 4}
     context_features = Column(JSON)  # Context features for better matching
-    is_active = Column(TINYINT(1), default=1, index=True)  # Soft-delete for rollback
+    is_active = Column(SmallInteger, default=1, index=True)  # Soft-delete for rollback
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -432,7 +432,7 @@ class SkillExecutionMetric(Base):
     skill_name = Column(String(255), index=True, nullable=False)
     execution_time_ms = Column(Integer, nullable=False)
     execution_cost = Column(Float, default=0.0)
-    success = Column(TINYINT(1), nullable=False)
+    success = Column(SmallInteger, nullable=False)
     error_message = Column(Text)
     created_at = Column(DateTime, default=func.now(), index=True)
 
@@ -487,7 +487,7 @@ class Observation(Base):
     source_event_ids = Column(JSON, nullable=False)  # Events that produced this observation
 
     # Lifecycle
-    is_reflected = Column(TINYINT(1), server_default="0")  # Consumed by Reflector
+    is_reflected = Column(SmallInteger, server_default="0")  # Consumed by Reflector
     version = Column(Integer, default=1)             # Bumped on reflection rewrite
     observed_msg_index = Column(Integer, default=0)  # Messages observed up to this index
     confidence = Column(Float, default=0.75)         # Confidence score (derived from priority)
@@ -504,7 +504,7 @@ class WorkflowDefinition(Base):
     description = Column(Text)
     definition = Column(JSON, nullable=False)  # Workflow.model_dump()
     created_by = Column(String(255))
-    is_active = Column(TINYINT(1), default=1)
+    is_active = Column(SmallInteger, default=1)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -558,7 +558,7 @@ class Trigger(Base):
     secret = Column(String(255))  # webhook auth
     session_id = Column(String(255))  # optional: reuse session
     next_fire_at = Column(DateTime)  # next scheduled fire time
-    is_active = Column(TINYINT(1), default=1)
+    is_active = Column(SmallInteger, default=1)
     created_at = Column(DateTime, default=func.now())
 
 
@@ -574,7 +574,7 @@ class ModelArtifact(Base):
     metrics = Column(JSON)  # {"accuracy": 0.87, "f1": 0.85, "val_loss": 0.32}
     training_config = Column(JSON)  # {"epochs": 5, "lr": 2e-5, "batch_size": 16}
     dataset_size = Column(Integer)  # number of training samples
-    is_active = Column(TINYINT(1), default=0, index=True)  # only 1 active per model_name
+    is_active = Column(SmallInteger, default=0, index=True)  # only 1 active per model_name
     created_by = Column(String(36))
     created_at = Column(DateTime, default=func.now())
 
@@ -591,8 +591,8 @@ class SkillDefinition(Base):
     version = Column(String(20), nullable=False)
     description = Column(Text)
     manifest = Column(JSON, nullable=False)
-    is_active = Column(TINYINT(1), default=1, nullable=False)
-    is_public = Column(TINYINT(1), default=0, nullable=False)
+    is_active = Column(SmallInteger, default=1, nullable=False)
+    is_public = Column(SmallInteger, default=0, nullable=False)
     created_by = Column(String(36))
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, onupdate=func.now())

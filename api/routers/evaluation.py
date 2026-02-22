@@ -489,3 +489,167 @@ def _record_loop_event(
         db.rollback()
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# Trust Report — aggregated trust health indicators
+# ---------------------------------------------------------------------------
+
+class TrustReportResponse(BaseModel):
+    """Aggregated trust health across confidence, SLO, drift, hallucination."""
+    confidence_calibration: dict[str, Any] | None = None
+    slo_summary: dict[str, Any] | None = None
+    drift_summary: dict[str, Any] | None = None
+    hallucination_stats: dict[str, Any] | None = None
+    overall_trust_score: float = 0.0
+
+
+@router.get("/trust-report", response_model=TrustReportResponse)
+def trust_report(
+    agent_id: str = Query(default="dev-agent"),
+    days: int = Query(default=7, ge=1, le=90),
+    current_user: dict = Depends(get_current_user),
+) -> TrustReportResponse:
+    """Aggregated trust health report: confidence, SLO, drift, hallucination."""
+    db = SessionLocal()
+    scores: list[float] = []
+    result = TrustReportResponse()
+    try:
+        # 1. Confidence calibration
+        try:
+            from core.evaluation.confidence_calibrator import ConfidenceCalibrator
+            cal = ConfidenceCalibrator(db)
+            cal_result = cal.measure(agent_id=agent_id, days=days)
+            result.confidence_calibration = {
+                "calibration_error": round(cal_result.calibration_error, 4),
+                "bias": round(cal_result.bias, 4),
+                "sample_count": cal_result.sample_count,
+            }
+            scores.append(max(0, 1.0 - cal_result.calibration_error))
+        except Exception as e:
+            logger.debug("Trust report calibration skipped: %s", e)
+
+        # 2. SLO compliance
+        try:
+            from core.evaluation.slo_monitor import SLOMonitor
+            monitor = SLOMonitor(db)
+            report = monitor.check_agent(agent_id, period_days=days)
+            total = len(report.statuses)
+            met = sum(1 for s in report.statuses if s.met)
+            result.slo_summary = {
+                "total_slos": total,
+                "met": met,
+                "violated": total - met,
+                "compliance_rate": round(met / total, 4) if total else 1.0,
+            }
+            scores.append(met / total if total else 1.0)
+        except Exception as e:
+            logger.debug("Trust report SLO skipped: %s", e)
+
+        # 3. Drift
+        try:
+            from core.evaluation.drift_detector import DriftDetector
+            detector = DriftDetector(db)
+            signals = detector.detect()
+            critical = sum(1 for s in signals if s.severity.value == "critical")
+            result.drift_summary = {
+                "total_signals": len(signals),
+                "critical": critical,
+                "warning": sum(1 for s in signals if s.severity.value == "warning"),
+            }
+            scores.append(1.0 if critical == 0 else max(0, 1.0 - critical * 0.2))
+        except Exception as e:
+            logger.debug("Trust report drift skipped: %s", e)
+
+        # 4. Hallucination stats (from recent events)
+        try:
+            row = db.execute(text("""
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN JSON_EXTRACT(content, '$.safe_to_deliver') = true THEN 1 ELSE 0 END) as safe
+                FROM conversation_events
+                WHERE event_type = 'hallucination_check'
+                  AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+            """), {"days": days}).fetchone()
+            if row and row[0] > 0:
+                result.hallucination_stats = {
+                    "checks_total": row[0],
+                    "safe_deliveries": row[1] or 0,
+                    "safety_rate": round((row[1] or 0) / row[0], 4),
+                }
+                scores.append((row[1] or 0) / row[0])
+        except Exception as e:
+            logger.debug("Trust report hallucination skipped: %s", e)
+
+        result.overall_trust_score = round(sum(scores) / len(scores), 4) if scores else 0.0
+    finally:
+        db.close()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Memory Health — aggregated memory pipeline status
+# ---------------------------------------------------------------------------
+
+class MemoryHealthResponse(BaseModel):
+    observations: dict[str, int] = {}
+    reflections: dict[str, int] = {}
+    knowledge: dict[str, int] = {}
+    pollution: dict[str, int] = {}
+    governance: dict[str, Any] = {}
+
+
+@router.get("/memory-health", response_model=MemoryHealthResponse)
+def memory_health(
+    user_id: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+) -> MemoryHealthResponse:
+    """Memory pipeline health: observations, reflections, knowledge, pollution."""
+    uid = user_id or current_user.get("user_id", "system")
+    db = SessionLocal()
+    result = MemoryHealthResponse()
+    try:
+        # Observations
+        try:
+            row = db.execute(text("""
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN is_reflected = 0 THEN 1 ELSE 0 END) as pending
+                FROM observations WHERE user_id = :uid
+            """), {"uid": uid}).fetchone()
+            if row:
+                result.observations = {"total": row[0], "pending_reflection": row[1] or 0}
+        except Exception:
+            pass
+
+        # Knowledge entries
+        try:
+            row = db.execute(text("""
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN confidence < 0.3 THEN 1 ELSE 0 END) as low_conf,
+                       SUM(CASE WHEN confidence = 0 THEN 1 ELSE 0 END) as quarantined
+                FROM sk_knowledge_entries WHERE user_id = :uid
+            """), {"uid": uid}).fetchone()
+            if row:
+                result.knowledge = {
+                    "total": row[0],
+                    "low_confidence": row[1] or 0,
+                    "quarantined": row[2] or 0,
+                }
+        except Exception:
+            pass
+
+        # Recent governance runs
+        try:
+            rows = db.execute(text("""
+                SELECT task_name, result
+                FROM governance_runs
+                ORDER BY completed_at DESC LIMIT 5
+            """)).fetchall()
+            if rows:
+                result.governance = {r[0]: r[1] for r in rows if r[1]}
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+    return result

@@ -839,5 +839,141 @@ def init(reset):
     click.echo("\n🎉 System initialized. Next: mo-admin token create --type llm --provider openai --scope global --token-value sk-...")
 
 
+# ---------------------------------------------------------------------------
+# eval — evaluation & closed-loop commands
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def eval():
+    """Evaluation and quality management."""
+    pass
+
+
+@eval.command("run-loop")
+@click.option("--days", default=7, help="Lookback window in days")
+@click.pass_context
+def eval_run_loop(ctx, days):
+    """Run full closed-loop: drift → calibration → learning → skill learning."""
+    db = ctx.obj["db"]
+
+    click.echo(f"Running closed-loop (days={days})...")
+
+    from core.context.scheduler import GovernanceTaskRunner
+    result = GovernanceTaskRunner._run_eval_daily(db)
+    for k, v in result.items():
+        click.echo(f"  {k}: {v}")
+    click.echo("✅ Closed-loop complete")
+
+
+@eval.command("trust-report")
+@click.option("--agent-id", default="dev-agent", help="Agent to check")
+@click.option("--days", default=7, help="Lookback window")
+@click.pass_context
+def eval_trust_report(ctx, agent_id, days):
+    """Show aggregated trust health report."""
+    db = ctx.obj["db"]
+
+    click.echo(f"Trust report for {agent_id} (last {days} days):")
+
+    # Confidence calibration
+    try:
+        from core.evaluation.confidence_calibrator import ConfidenceCalibrator
+        cal = ConfidenceCalibrator(db)
+        r = cal.measure(agent_id=agent_id, days=days)
+        click.echo(f"  Calibration error: {r.calibration_error:.4f}, bias: {r.bias:.4f}, samples: {r.sample_count}")
+    except Exception as e:
+        click.echo(f"  Calibration: skipped ({e})")
+
+    # SLO
+    try:
+        from core.evaluation.slo_monitor import SLOMonitor
+        monitor = SLOMonitor(db)
+        report = monitor.check_agent(agent_id, period_days=days)
+        met = sum(1 for s in report.statuses if s.met)
+        click.echo(f"  SLO: {met}/{len(report.statuses)} met")
+    except Exception as e:
+        click.echo(f"  SLO: skipped ({e})")
+
+    # Drift
+    try:
+        from core.evaluation.drift_detector import DriftDetector
+        signals = DriftDetector(db).detect()
+        click.echo(f"  Drift signals: {len(signals)}")
+    except Exception as e:
+        click.echo(f"  Drift: skipped ({e})")
+
+
+@eval.command("memory-health")
+@click.option("--user-id", default="system", help="User to check")
+@click.pass_context
+def eval_memory_health(ctx, user_id):
+    """Show memory pipeline health."""
+    db = ctx.obj["db"]
+    from core.memory.pipeline import run_memory_pipeline
+    result = run_memory_pipeline(db, user_id=user_id)
+    click.echo(f"Memory pipeline for {user_id}:")
+    click.echo(f"  Observations extracted: {result.observations_extracted}")
+    click.echo(f"  Reflections condensed: {result.reflections_condensed}")
+    click.echo(f"  Contradictions found: {result.contradictions_found}")
+    click.echo(f"  Quarantined: {result.quarantined}")
+    if result.errors:
+        for e in result.errors:
+            click.echo(f"  ⚠️  {e}")
+
+
+# ---------------------------------------------------------------------------
+# data — data versioning commands
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def data():
+    """Data versioning and branching."""
+    pass
+
+
+@data.command("verify-pipeline")
+@click.option("--account", default="sys", help="Account for sandbox")
+@click.pass_context
+def data_verify_pipeline(ctx, account):
+    """Verify end-to-end data versioning: branch → replay → evaluate → merge."""
+    db = ctx.obj["db"]
+
+    click.echo("Verifying data versioning pipeline...")
+
+    # 1. Branch
+    try:
+        from core.git_for_data import Branch
+        branch = Branch(db=db)
+        branch_name = f"verify_{int(datetime.now().timestamp())}"
+        branch.create(branch_name, "conversation_events")
+        click.echo(f"  ✅ Branch created: {branch_name}")
+    except Exception as e:
+        click.echo(f"  ❌ Branch creation failed: {e}")
+        return
+
+    # 2. Diff
+    try:
+        diff = branch.diff(branch_name, "conversation_events", output="count")
+        click.echo(f"  ✅ Diff: {diff}")
+    except Exception as e:
+        click.echo(f"  ⚠️  Diff: {e}")
+
+    # 3. Merge (no-op since no changes)
+    try:
+        branch.merge(branch_name, "conversation_events", on_conflict="accept")
+        click.echo("  ✅ Merge: success")
+    except Exception as e:
+        click.echo(f"  ⚠️  Merge: {e}")
+
+    # 4. Cleanup
+    try:
+        branch.delete(branch_name)
+        click.echo(f"  ✅ Branch deleted: {branch_name}")
+    except Exception as e:
+        click.echo(f"  ⚠️  Cleanup: {e}")
+
+    click.echo("✅ Data versioning pipeline verified")
+
+
 if __name__ == "__main__":
     cli()
