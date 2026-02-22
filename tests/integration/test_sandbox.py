@@ -59,14 +59,17 @@ def test_create_with_tables(sandbox, db_session, source_table):
 
 
 def test_list_with_filter(sandbox):
-    sandbox.create("sandbox_exp_test1")
-    sandbox.create("sandbox_prod_test2")
+    name1 = f"sandbox_exp_{generate_id()}"
+    name2 = f"sandbox_prod_{generate_id()}"
+    
+    sandbox.create(name1)
+    sandbox.create(name2)
 
-    exp = sandbox.list_sandboxes(pattern="%exp%")
+    exp = sandbox.list_sandboxes(prefix="", pattern="%exp%")  # Disable prefix filter
     assert any("exp" in s["sandbox_name"] for s in exp)
 
-    sandbox.delete("sandbox_exp_test1")
-    sandbox.delete("sandbox_prod_test2")
+    sandbox.delete(name1)
+    sandbox.delete(name2)
 
 
 # ===========================================================================
