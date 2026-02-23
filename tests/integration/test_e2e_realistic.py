@@ -212,7 +212,7 @@ def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
 
 
 def _chat_and_wait(client, headers: dict, message: str,
-                   session_id: str | None = None, timeout: float = 10.0) -> dict:
+                   session_id: str | None = None, timeout: float = 15.0) -> dict:
     """POST /chat → poll /chat/runs/{run_id} until completed. Returns final status."""
     payload: dict[str, Any] = {"message": message}
     if session_id:
@@ -233,7 +233,7 @@ def _chat_and_wait(client, headers: dict, message: str,
             if status["status"] in ("completed", "failed", "cancelled"):
                 status["_session_id"] = sid
                 return status
-        time.sleep(0.1)  # Keep original polling interval for parallel tests
+        time.sleep(0.1)
 
     pytest.fail(f"Run {run_id} did not complete within {timeout}s")
 
@@ -297,7 +297,7 @@ class TestScenarioA_MultiTurnConversation:
     def test_10_turn_conversation(self, client, auth_headers):
         h = auth_headers
 
-        turns = [Turn(content=f"Answer to question {i+1}.") for i in range(5)]  # Reduced from 10
+        turns = [Turn(content=f"Answer to question {i+1}.") for i in range(10)]
         llm = ScriptedLLM(turns)
 
         with mock_llm_for_chat(_build_patched_chat_loop(llm)):
@@ -306,19 +306,19 @@ class TestScenarioA_MultiTurnConversation:
             assert result["status"] == "completed"
             sid = result["_session_id"]
 
-            # Turns 2-5: same session (reduced from 2-10)
-            for i in range(2, 6):
+            # Turns 2-10: same session
+            for i in range(2, 11):
                 result = _chat_and_wait(client, h, f"Question {i}: Follow-up #{i}", session_id=sid)
                 assert result["status"] == "completed", f"Turn {i} failed: {result}"
 
-        # Verify: session has events from all 5 turns
+        # Verify: session has events from all 10 turns
         resp = client.get(f"/events/session/{sid}", headers=h)
         assert resp.status_code == 200
         events_data = resp.json()
         total = events_data["total"]
         # Each turn produces: user_query + stream events + llm_response
         # At minimum 2 events per turn (user_query + llm_response), plus stream events
-        assert total >= 10, f"Expected ≥10 events for 5 turns, got {total}"  # Updated from ≥20
+        assert total >= 20, f"Expected ≥20 events for 10 turns, got {total}"
 
         # Verify: context snapshots were created
         resp = client.get("/context", params={"session_id": sid}, headers=h)
@@ -326,7 +326,7 @@ class TestScenarioA_MultiTurnConversation:
         snapshots = resp.json()
         # At least 1 snapshot per turn (context_manager.save_snapshot is called each turn)
         snap_count = snapshots.get("total", len(snapshots.get("snapshots", snapshots.get("items", []))))
-        assert snap_count >= 5, f"Expected ≥5 snapshots, got {snap_count}"  # Updated from ≥10
+        assert snap_count >= 10, f"Expected ≥10 snapshots, got {snap_count}"
 
         # Verify: session is queryable (auto-created sessions may lack title,
         # so we query events instead of the session endpoint)
@@ -398,14 +398,14 @@ class TestScenarioC_BulkAndClosedLoop:
         h = auth_headers
         from sqlalchemy import text
 
-        # Phase 1: Run 3 real conversations through /chat API
-        # (Reduced from 5 for speed; 3 is enough to verify accumulation)
-        turns = [Turn(content=f"Here is the answer.") for _ in range(3)]
+        # Phase 1: Run 5 real conversations through /chat API
+        # (20 would be slow; 5 is enough to verify accumulation)
+        turns = [Turn(content=f"Here is the answer.") for _ in range(5)]
         llm = ScriptedLLM(turns)
         session_ids = []
 
         with mock_llm_for_chat(_build_patched_chat_loop(llm)):
-            for i in range(3):  # Reduced from 5
+            for i in range(5):
                 llm._cursor = 0
                 result = _chat_and_wait(client, h, f"Conversation {i+1}: explain topic {i+1}")
                 assert result["status"] == "completed", f"Conv {i+1} failed: {result}"
@@ -431,7 +431,7 @@ class TestScenarioC_BulkAndClosedLoop:
                           params={"days": 1}, headers=h)
         assert resp.status_code == 200
         trend = resp.json()
-        assert trend["total_events"] >= 3, f"Expected ≥3 scored events, got {trend['total_events']}"
+        assert trend["total_events"] >= 5, f"Expected ≥5 scored events, got {trend['total_events']}"
 
         # Phase 4: Run closed loop
         resp = client.post("/api/v1/evaluation/loop",
@@ -672,7 +672,7 @@ class TestScenarioG_CancelRun:
 
         class BlockingLLM(ScriptedLLM):
             async def chat_with_tools_stream(self, messages, tools, **kw):
-                await asyncio.sleep(3)  # Reduced from 30s - enough to test cancellation
+                await asyncio.sleep(30)
                 yield {"type": "text", "content": "never reached"}
 
         blocking_llm = BlockingLLM()
@@ -684,12 +684,12 @@ class TestScenarioG_CancelRun:
             run_id = resp.json()["run_id"]
 
             # Wait for run to enter running state
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 resp = client.get(f"/chat/runs/{run_id}", headers=h)
                 if resp.status_code == 200 and resp.json()["status"] == "running":
                     break
-                time.sleep(0.1)  # Keep original polling interval
+                time.sleep(0.05)
 
             # Cancel — may already be running or still pending
             resp = client.delete(f"/chat/runs/{run_id}", headers=h)
@@ -697,7 +697,7 @@ class TestScenarioG_CancelRun:
             assert resp.status_code in (200, 409)
 
             # Poll to confirm terminal state
-            deadline = time.monotonic() + 3
+            deadline = time.monotonic() + 5
             final_status = None
             while time.monotonic() < deadline:
                 resp = client.get(f"/chat/runs/{run_id}", headers=h)
@@ -706,7 +706,7 @@ class TestScenarioG_CancelRun:
                     if s in ("completed", "failed", "cancelled"):
                         final_status = s
                         break
-                time.sleep(0.1)  # Keep original polling interval
+                time.sleep(0.1)
 
             assert final_status == "cancelled", \
                 f"Expected 'cancelled', got '{final_status}'"
@@ -817,12 +817,12 @@ class TestScenarioI_DataIntegrity:
 
             # Wait for all to finish
             for r in runs:
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
                     resp = client.get(f"/chat/runs/{r['run_id']}", headers=h)
                     if resp.status_code == 200 and resp.json()["status"] in ("completed", "failed"):
                         break
-                    time.sleep(0.1)  # Keep original polling interval
+                    time.sleep(0.1)
 
         # Verify: all 10 runs reached terminal state
         terminal = 0

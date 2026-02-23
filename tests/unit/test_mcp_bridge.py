@@ -209,40 +209,38 @@ class TestMCPRetry:
     @pytest.mark.asyncio
     async def test_call_tool_retries_on_connection_error(self, bridge):
         """Transient ConnectionError should be retried."""
-        with patch('core.skills.mcp_bridge.RETRY_DELAY_SECONDS', 0.1):  # Speed up test
-            session = AsyncMock()
-            list_result = MagicMock()
-            list_result.tools = [_mock_tool("flaky")]
-            session.list_tools.return_value = list_result
+        session = AsyncMock()
+        list_result = MagicMock()
+        list_result.tools = [_mock_tool("flaky")]
+        session.list_tools.return_value = list_result
 
-            # Fail twice with ConnectionError, succeed on third
-            content_item = MagicMock()
-            content_item.text = "ok"
-            del content_item.data
-            success = MagicMock(content=[content_item], isError=False)
-            session.call_tool.side_effect = [ConnectionError("reset"), ConnectionError("reset"), success]
+        # Fail twice with ConnectionError, succeed on third
+        content_item = MagicMock()
+        content_item.text = "ok"
+        del content_item.data
+        success = MagicMock(content=[content_item], isError=False)
+        session.call_tool.side_effect = [ConnectionError("reset"), ConnectionError("reset"), success]
 
-            await bridge._register_server("s", session, "stdio")
-            result = await bridge.call_tool("s__flaky", {})
+        await bridge._register_server("s", session, "stdio")
+        result = await bridge.call_tool("s__flaky", {})
 
-            assert result == "ok"
-            assert session.call_tool.call_count == 3
+        assert result == "ok"
+        assert session.call_tool.call_count == 3
 
     @pytest.mark.asyncio
     async def test_call_tool_exhausts_retries(self, bridge):
         """After MAX_RETRIES+1 attempts, returns error."""
-        with patch('core.skills.mcp_bridge.RETRY_DELAY_SECONDS', 0.1):  # Speed up test
-            session = AsyncMock()
-            list_result = MagicMock()
-            list_result.tools = [_mock_tool("dead")]
-            session.list_tools.return_value = list_result
-            session.call_tool.side_effect = ConnectionError("gone")
+        session = AsyncMock()
+        list_result = MagicMock()
+        list_result.tools = [_mock_tool("dead")]
+        session.list_tools.return_value = list_result
+        session.call_tool.side_effect = ConnectionError("gone")
 
-            await bridge._register_server("s", session, "stdio")
-            result = await bridge.call_tool("s__dead", {})
+        await bridge._register_server("s", session, "stdio")
+        result = await bridge.call_tool("s__dead", {})
 
-            parsed = json.loads(result)
-            assert "gone" in parsed["error"]
+        parsed = json.loads(result)
+        assert "gone" in parsed["error"]
 
     @pytest.mark.asyncio
     async def test_non_transient_error_no_retry(self, bridge):
