@@ -386,7 +386,7 @@ class SkillPipeline:
         """Get selection history for analysis."""
         from sqlalchemy import text
 
-        sql = "SELECT event_id, session_id, user_query, selected_skills, selection_method, created_at FROM skill_selection_events"
+        sql = "SELECT event_id, session_id, user_query, selected_skills, skill_name, selection_method, created_at FROM skill_selection_events"
         params: dict[str, Any] = {}
         if session_id:
             sql += " WHERE session_id = :sid"
@@ -399,8 +399,8 @@ class SkillPipeline:
             return [
                 {
                     "event_id": r[0], "session_id": r[1], "user_query": r[2],
-                    "selected_skills": r[3], "selection_method": r[4],
-                    "created_at": str(r[5]),
+                    "selected_skills": r[3], "skill_name": r[4],
+                    "selection_method": r[5], "created_at": str(r[6]),
                 }
                 for r in rows
             ]
@@ -415,22 +415,43 @@ class SkillPipeline:
     def _record_selection(
         self, query: str, session_id: str, tools: list[dict], retrieval_method: str,
     ) -> str:
-        """Write audit event to DB. Returns event_id."""
+        """Write audit event to DB. Returns event_id.
+
+        ``skill_name`` stores the top-ranked candidate (index 0).  This is
+        the skill ChatLoop will actually invoke, so deprecation / regression
+        queries that filter by ``skill_name`` match the *executed* skill.
+        """
         event_id = str(uuid7())
         skill_names = [t["function"]["name"] for t in tools]
+        top_skill = skill_names[0] if skill_names else None
+
+        # Resolve current active version from registry
+        skill_version = None
+        if top_skill:
+            try:
+                row = self._db.execute(
+                    text("SELECT version FROM skills_registry WHERE skill_name = :n AND is_active = 1 ORDER BY created_at DESC LIMIT 1"),
+                    {"n": top_skill},
+                ).fetchone()
+                if row:
+                    skill_version = row[0]
+            except Exception:
+                pass  # version is best-effort
 
         try:
             self._db.execute(
                 text("""INSERT INTO skill_selection_events
                        (event_id, session_id, user_query, selected_skills,
-                        selection_method, created_at)
+                        skill_name, skill_version, selection_method, created_at)
                        VALUES (:event_id, :session_id, :user_query, :selected_skills,
-                        :selection_method, :created_at)"""),
+                        :skill_name, :skill_version, :selection_method, :created_at)"""),
                 {
                     "event_id": event_id,
                     "session_id": session_id,
                     "user_query": query,
                     "selected_skills": json.dumps(skill_names),
+                    "skill_name": top_skill,
+                    "skill_version": skill_version,
                     "selection_method": retrieval_method,
                     "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
                 },

@@ -77,9 +77,8 @@ class KnowledgeRegression:
         result = self.db.execute(text(f"""
             SELECT COUNT(DISTINCT session_id) as session_count,
                    COUNT(DISTINCT event_id) as decision_count
-            FROM {self.source_db}.conversation_events
-            WHERE event_type = 'skill_selection'
-            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_name')) = :skill_name
+            FROM {self.source_db}.skill_selection_events
+            WHERE skill_name = :skill_name
             AND created_at < :deprecated_at
         """), {"skill_name": skill_name, "deprecated_at": deprecated_at}).fetchone()
         
@@ -103,47 +102,33 @@ class KnowledgeRegression:
         old_version: str,
         new_version: str,
     ) -> RegressionSignal:
-        """Detect performance regression after skill update via quality score comparison.
-        
-        Args:
-            skill_name: Skill name
-            old_version: Previous version
-            new_version: New version
-            
-        Returns:
-            RegressionSignal with regression metrics
+        """Detect performance regression after skill update.
+
+        Compares execution success rate between old and new version using
+        ``skill_selection_events`` (indexed ``skill_name`` + ``skill_version``).
         """
-        # Query quality scores before/after update
-        before = self.db.execute(text(f"""
-            SELECT AVG(CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.quality_score')) AS DECIMAL(3,2))) as avg_quality,
-                   COUNT(*) as sample_count,
-                   STDDEV(CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.quality_score')) AS DECIMAL(3,2))) as stddev
-            FROM {self.source_db}.conversation_events
-            WHERE event_type = 'llm_response'
-            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_name')) = :skill_name
-            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_version')) = :old_version
-        """), {"skill_name": skill_name, "old_version": old_version}).fetchone()
-        
-        after = self.db.execute(text(f"""
-            SELECT AVG(CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.quality_score')) AS DECIMAL(3,2))) as avg_quality,
-                   COUNT(*) as sample_count,
-                   STDDEV(CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.quality_score')) AS DECIMAL(3,2))) as stddev
-            FROM {self.source_db}.conversation_events
-            WHERE event_type = 'llm_response'
-            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_name')) = :skill_name
-            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_version')) = :new_version
-        """), {"skill_name": skill_name, "new_version": new_version}).fetchone()
-        
-        before_quality = float(before[0]) if before and before[0] else 1.0
-        before_count = int(before[1]) if before and before[1] else 0
-        after_quality = float(after[0]) if after and after[0] else 1.0
-        after_count = int(after[1]) if after and after[1] else 0
-        
-        # Detect regression if quality dropped significantly
-        quality_drop = before_quality - after_quality
-        regression_detected = quality_drop > 0.05  # 5% drop threshold
+        def _stats(version: str):
+            row = self.db.execute(text(f"""
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) as ok,
+                       AVG(user_feedback_score) as avg_feedback
+                FROM {self.source_db}.skill_selection_events
+                WHERE skill_name = :skill_name
+                AND skill_version = :ver
+            """), {"skill_name": skill_name, "ver": version}).fetchone()
+            total = int(row[0]) if row and row[0] else 0
+            ok = int(row[1]) if row and row[1] else 0
+            avg_fb = float(row[2]) if row and row[2] else 0.0
+            success_rate = ok / total if total else 1.0
+            return total, success_rate, avg_fb
+
+        before_count, before_rate, before_fb = _stats(old_version)
+        after_count, after_rate, after_fb = _stats(new_version)
+
+        quality_drop = before_rate - after_rate
+        regression_detected = quality_drop > 0.05
         confidence = min(abs(quality_drop), 1.0) if regression_detected else 0.0
-        
+
         return RegressionSignal(
             signal_id=f"update_{skill_name}_{old_version}_{new_version}",
             regression_type=RegressionType.SKILL_UPDATED,
@@ -155,11 +140,13 @@ class KnowledgeRegression:
             metadata={
                 "old_version": old_version,
                 "new_version": new_version,
-                "before_quality": before_quality,
-                "after_quality": after_quality,
+                "before_success_rate": before_rate,
+                "after_success_rate": after_rate,
                 "quality_drop": quality_drop,
                 "before_sample_count": before_count,
                 "after_sample_count": after_count,
+                "before_avg_feedback": before_fb,
+                "after_avg_feedback": after_fb,
             },
         )
     
@@ -281,9 +268,8 @@ class KnowledgeRegression:
                     COUNT(e.event_id) as event_count,
                     MIN(e.created_at) as first_use,
                     MAX(e.created_at) as last_use
-                FROM {self.source_db}.conversation_events e
-                WHERE e.event_type = 'skill_selection'
-                AND JSON_UNQUOTE(JSON_EXTRACT(e.`metadata`, '$.skill_name')) = :skill_name
+                FROM {self.source_db}.skill_selection_events e
+                WHERE e.skill_name = :skill_name
                 GROUP BY e.session_id
                 LIMIT :limit
             """), {"skill_name": skill_name, "limit": limit}).fetchall()

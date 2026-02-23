@@ -225,6 +225,33 @@ Pipeline Phase 3 (PollutionDetector) quarantines entries
   → Pipeline result includes regression_signals count
 ```
 
+### Skill Regression Detection
+
+Separate from knowledge regression, skill-level regressions are detected via
+`skill_selection_events` — the audit table written by `SkillPipeline._record_selection`.
+
+**Denormalized columns** (indexed for direct queries, no JSON extraction):
+
+| Column | Source | Purpose |
+|--------|--------|---------|
+| `skill_name` | `tools[0]["function"]["name"]` (top-ranked candidate) | Deprecation impact, affected sessions |
+| `skill_version` | `skills_registry.version` (active at selection time) | Version-to-version regression comparison |
+| `execution_success` | Post-execution feedback | Success rate comparison |
+| `user_feedback_score` | User signal | Quality trend |
+
+**Two detection modes:**
+
+```
+detect_skill_deprecation(skill_name, deprecated_at)
+  → skill_selection_events WHERE skill_name = :name AND created_at < :deprecated_at
+  → Composite index (skill_name, created_at) — index-only range scan
+
+detect_skill_update_regression(skill_name, old_version, new_version)
+  → skill_selection_events WHERE skill_name = :name AND skill_version = :ver
+  → Compares execution success rate between versions
+  → Confidence > 0 when quality_drop > 5%
+```
+
 ---
 
 ## 4. Training Data Pipeline

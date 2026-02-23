@@ -379,12 +379,17 @@ class Token(Base):
 
 class SkillSelectionEvent(Base):
     __tablename__ = "skill_selection_events"
+    __table_args__ = (
+        Index("ix_sse_skill_created", "skill_name", "created_at"),  # deprecation + update queries
+    )
     event_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), index=True)
     user_query = Column(Text)
     context_snapshot = Column(String(255))
     available_skills = Column(JSON)
     selected_skills = Column(JSON)
+    skill_name = Column(String(128))  # top-ranked selected skill (index 0); covered by composite ix_sse_skill_created
+    skill_version = Column(String(32))  # version of skill_name at selection time
     selection_method = Column(String(50))
     selection_reasoning = Column(Text)
     candidate_scores = Column(JSON)
@@ -395,9 +400,7 @@ class SkillSelectionEvent(Base):
     user_feedback_score = Column(Integer)
     selection_correctness = Column(SmallInteger)
     correction_suggestion = Column(JSON)
-    created_at = Column(DateTime, default=func.now())
-
-
+    created_at = Column(DateTime, default=func.now(), index=True)  # selection_history ORDER BY
 class SkillSelectionLearning(Base):
     __tablename__ = "skill_selection_learning"
     learning_id = Column(String(36), primary_key=True)
