@@ -40,11 +40,20 @@ TEST_DATABASE_CONFIG = {
 @pytest.fixture(scope="session")
 def test_engine():
     """Use the same engine as production, already pointed at test DB via env var."""
+    import time
     from api import database
     from api.database import init_db
 
     engine = database.engine
-    init_db()
+    for attempt in range(3):
+        try:
+            init_db()
+            break
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(0.5)
+
     yield engine
     
     # Cleanup worker databases on session end
