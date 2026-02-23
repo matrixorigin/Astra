@@ -407,6 +407,9 @@ class Token(Base):
 
 class UserFeedback(Base):
     __tablename__ = "user_feedback"
+    __table_args__ = (
+        Index("ix_feedback_agent_created", "agent_id", "created_at"),
+    )
     feedback_id = Column(String(64), primary_key=True)
     user_id = Column(String(255), nullable=False, index=True)
     agent_id = Column(String(255), index=True)

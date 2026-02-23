@@ -119,19 +119,20 @@ class TokenResolver:
         self, repo_id: str | None, repo_url: str | None, user_id: str
     ) -> Token | None:
         """Get repo-specific token from repos table."""
-        from api.models import Token as TokenModel, Repo as RepoModel
-        
+        from api.models import Repo as RepoModel
+        from api.models import Token as TokenModel
+
         query = self.db.query(TokenModel).join(
             RepoModel, RepoModel.token_id == TokenModel.token_id
         ).filter(TokenModel.is_active == 1)
-        
+
         if repo_id:
             query = query.filter(RepoModel.repo_id == repo_id, RepoModel.user_id == user_id)
         elif repo_url:
             query = query.filter(RepoModel.repo_url == repo_url, RepoModel.user_id == user_id)
         else:
             return None
-        
+
         result = query.first()
         return self._to_model(result) if result else None
 
@@ -163,27 +164,36 @@ class TokenResolver:
             Token.scope_type == scope_type,
             Token.is_active == True
         ).order_by(Token.created_at.desc()).first()
-        
+
         return result if result else None
 
     def _allow_global_token(self) -> bool:
         """Check if global token fallback is allowed using ORM."""
-        from sqlalchemy import text
-        
+
         result = self.db.execute(
             text("SELECT value FROM configs WHERE key_name = 'allow_global_repo_token'")
         ).first()
-        
+
         if not result:
             return False
         return result[0].lower() in ("true", "1", "yes")
 
     def _to_model(self, row) -> Token:
-        """Convert ORM object to Token model."""
+        """Convert ORM object to Token model.
+        
+        Automatically decrypts encrypted_value if present.
+        """
+        from core.auth.encryption import decrypt_token
+
         metadata = getattr(row, 'token_metadata', None)
         if isinstance(metadata, str):
             metadata = json.loads(metadata)
-        
+
+        # Decrypt encrypted_value if present
+        decrypted_value = None
+        if row.encrypted_value:
+            decrypted_value = decrypt_token(row.encrypted_value)
+
         return Token(
             token_id=row.token_id,
             token_type=TokenType(row.type),
@@ -191,7 +201,7 @@ class TokenResolver:
             scope_user_id=row.scope_user_id,
             scope_repo=row.scope_repo,
             secret_ref=row.secret_ref,
-            encrypted_value=row.encrypted_value,
+            encrypted_value=decrypted_value,  # Return decrypted value
             is_active=bool(row.is_active),
             expires_at=row.expires_at,
             created_at=row.created_at,

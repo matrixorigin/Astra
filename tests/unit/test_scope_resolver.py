@@ -25,12 +25,13 @@ def db():
 def test_resolve_token_priority(db):
     """Test token resolution follows scope priority: user > global."""
     from uuid_utils import uuid7
+    from core.auth.encryption import encrypt_token
 
     db.add(Token(
         token_id=str(uuid7()),
         type="llm",
         provider="openai",
-        encrypted_value="global_key",
+        encrypted_value=encrypt_token("global_key"),
         is_active=True,
     ))
     db.add(Token(
@@ -38,7 +39,7 @@ def test_resolve_token_priority(db):
         type="llm",
         provider="openai",
         scope_user_id="alice",
-        encrypted_value="alice_key",
+        encrypted_value=encrypt_token("alice_key"),
         is_active=True,
     ))
     db.commit()
@@ -54,12 +55,13 @@ def test_resolve_token_priority(db):
 def test_resolve_token_fallback(db):
     """Test token resolution falls back to global when no user token."""
     from uuid_utils import uuid7
+    from core.auth.encryption import encrypt_token
 
     db.add(Token(
         token_id=str(uuid7()),
         type="llm",
         provider="openai",
-        encrypted_value="global_key",
+        encrypted_value=encrypt_token("global_key"),
         is_active=True,
     ))
     db.commit()

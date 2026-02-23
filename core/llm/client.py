@@ -6,17 +6,17 @@ import os
 import time
 from datetime import datetime, timezone
 
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
+from api.database import get_db_session
 from core.llm.models import LLMCallLog, LLMMessage, LLMProvider, LLMResponse
 from core.llm.providers import AnthropicProvider, BaseProvider, GroqProvider, OpenAIProvider
 from core.llm.rate_limiter import RateLimiter
 from core.llm.router import ModelConfig, ModelRouter
 from core.repos.token_resolver import TokenResolver
 from core.scope.scope_resolver import ScopeChainBuilder, ScopeResolver
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 logger = logging.getLogger(__name__)
 
@@ -260,7 +260,12 @@ class LLMClient:
         return None
 
     def _resolve_llm_token(self, provider: str):
-        """Resolve LLM token: user-scoped first, then global."""
+        """Resolve LLM token: user-scoped first, then global.
+        
+        Returns decrypted token value.
+        """
+        from core.auth.encryption import decrypt_token
+
         queries = []
         if self.user_id:
             queries.append((
@@ -275,7 +280,11 @@ class LLMClient:
             result = self.db.execute(text(sql), params)
             row = result.first()
             if row:
-                return self._token_from_row(row)
+                token = self._token_from_row(row)
+                # Decrypt encrypted_value if present
+                if token.encrypted_value:
+                    token.encrypted_value = decrypt_token(token.encrypted_value)
+                return token
         return None
 
     def _token_from_row(self, row):

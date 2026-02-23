@@ -41,6 +41,8 @@ class EmbeddingService:
             try:
                 import openai
 
+                from core.auth.encryption import decrypt_token
+
                 api_key = None
                 base_url = None
                 actual_provider = None
@@ -59,7 +61,9 @@ class EmbeddingService:
                                     text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
                                 ).first()
                             if row:
-                                api_key = row[0]
+                                # Decrypt encrypted_value
+                                encrypted_value = row[0]
+                                api_key = decrypt_token(encrypted_value) if encrypted_value else None
                                 actual_provider = row[1]
                                 # Extract base_url from metadata
                                 meta = row[2]
@@ -237,15 +241,15 @@ class EmbeddingService:
         from sqlalchemy import text
         # Build params dict
         params_dict = {"vec1": vec_str, "vec2": vec_str, "limit": limit}
-        
+
         # Add session_id and filters params
         if session_id:
             params_dict["session_id"] = session_id
-        
+
         if filters:
             for i, (key, value) in enumerate(filters.items()):
                 param_name = f"filter_{i}"
                 params_dict[param_name] = value
-        
+
         result = self.db.execute(text(query), params_dict)
         return [dict(row._mapping) for row in result.fetchall()]

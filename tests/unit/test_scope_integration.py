@@ -24,13 +24,14 @@ def db():
 def test_scope_based_token_resolution(db):
     """Test that ScopeResolver resolves tokens correctly."""
     from uuid_utils import uuid7
+    from core.auth.encryption import encrypt_token
 
     # Global token
     db.add(Token(
         token_id=str(uuid7()),
         type="llm",
         provider="openai",
-        encrypted_value="global_key",
+        encrypted_value=encrypt_token("global_key"),
         is_active=True,
     ))
     # User token
@@ -39,7 +40,7 @@ def test_scope_based_token_resolution(db):
         type="llm",
         provider="openai",
         scope_user_id="alice",
-        encrypted_value="alice_key",
+        encrypted_value=encrypt_token("alice_key"),
         is_active=True,
     ))
     db.commit()
@@ -70,12 +71,13 @@ def test_scope_chain_builder_integration():
 def test_scope_resolver_with_real_db_structure(db):
     """Test ScopeResolver with realistic database structure."""
     from uuid_utils import uuid7
+    from core.auth.encryption import encrypt_token
 
     db.add(Token(
         token_id=str(uuid7()),
         type="llm",
         provider="openai",
-        encrypted_value="global_key",
+        encrypted_value=encrypt_token("global_key"),
         is_active=True,
     ))
     db.commit()
