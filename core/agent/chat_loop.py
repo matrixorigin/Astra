@@ -706,7 +706,9 @@ class ChatLoop:
             from core.verification.streaming_verifier import StreamingVerifier
             sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
-            async for chunk_msg in self.llm.chat_stream(messages, user_id, session_id):
+            async for chunk_msg in self.llm.chat_stream(
+                messages, user_id, session_id, model=self._check_slo_escalation(session_id),
+            ):
                 if chunk_msg["type"] == "reasoning":
                     # Emit reasoning event for CoT audit trail
                     yield StreamEvent(
@@ -846,7 +848,9 @@ class ChatLoop:
             full_text = ""
             tool_calls: list[dict] = []
 
-            async for chunk in self.llm.chat_with_tools_stream(messages, tools_schema):
+            async for chunk in self.llm.chat_with_tools_stream(
+                messages, tools_schema, model=self._check_slo_escalation(session_id),
+            ):
                 if chunk["type"] == "reasoning":
                     yield StreamEvent(
                         event_type=StreamEventType.REASONING_MESSAGE_CONTENT,
@@ -1080,7 +1084,9 @@ class ChatLoop:
         from core.verification.streaming_verifier import StreamingVerifier
         sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
-        async for chunk_msg in self.llm.chat_stream(messages, user_id, session_id):
+        async for chunk_msg in self.llm.chat_stream(
+            messages, user_id, session_id, model=self._check_slo_escalation(session_id),
+        ):
             if chunk_msg["type"] == "reasoning":
                 yield StreamEvent(
                     event_type=StreamEventType.REASONING_MESSAGE_CONTENT,

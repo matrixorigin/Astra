@@ -226,15 +226,20 @@ class SLOMonitor:
         elif sev == SLOSeverity.CRITICAL:
             # Trigger replay gate to validate recent changes
             if self._gate_trigger is not None:
+                # Find most recent prompt/skill/config change to bind as regression source
+                recent_change = self._find_recent_change(agent_id)
+                change_id = recent_change["change_id"] if recent_change else f"slo_critical:{agent_id}:{slo_name}"
+                change_content = {
+                    "agent_id": agent_id,
+                    "slo": slo_name,
+                    "burn_rate": status.burn_rate,
+                    "current_value": status.current_value,
+                    "suspected_cause": recent_change,  # Link to actual change
+                }
                 self._gate_trigger.trigger(
                     change_type="slo_critical",
-                    change_id=f"slo_critical:{agent_id}:{slo_name}",
-                    change_content={
-                        "agent_id": agent_id,
-                        "slo": slo_name,
-                        "burn_rate": status.burn_rate,
-                        "current_value": status.current_value,
-                    },
+                    change_id=change_id,
+                    change_content=change_content,
                 )
             # Model escalation intent — same as breach
             self._write_event(agent_id, "slo_model_escalation", {
@@ -278,6 +283,57 @@ class SLOMonitor:
                 "SLO BREACH for %s/%s — post-mortem + escalation + HITL tightening",
                 agent_id, slo_name,
             )
+
+    def _find_recent_change(self, agent_id: str) -> dict[str, Any] | None:
+        """Find most recent skill/prompt change (global, not agent-specific).
+        
+        Returns change metadata to bind as suspected regression source.
+        Note: skills_registry and prompt_templates are global resources without agent_id,
+        so this returns the most recent change across all agents within 7 days.
+        """
+        try:
+            # Find most recent skill change
+            skill_row = self.db.execute(text("""
+                SELECT skill_name, version, updated_at
+                FROM skills_registry
+                WHERE updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """)).fetchone()
+            
+            # Find most recent prompt change
+            prompt_row = self.db.execute(text("""
+                SELECT template_id, version, created_at
+                FROM prompt_templates
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                ORDER BY created_at DESC
+                LIMIT 1
+            """)).fetchone()
+            
+            # Return the most recent of the two
+            skill_ts = skill_row[2] if skill_row else None
+            prompt_ts = prompt_row[2] if prompt_row else None
+            
+            if skill_ts and (not prompt_ts or skill_ts > prompt_ts):
+                return {
+                    "change_type": "skill_version_changed",
+                    "change_id": f"{skill_row[0]}@{skill_row[1]}",
+                    "skill_name": skill_row[0],
+                    "version": skill_row[1],
+                    "timestamp": skill_ts.isoformat(),
+                }
+            elif prompt_ts:
+                return {
+                    "change_type": "prompt_template_changed",
+                    "change_id": f"{prompt_row[0]}@{prompt_row[1]}",
+                    "template_id": prompt_row[0],
+                    "version": prompt_row[1],
+                    "timestamp": prompt_ts.isoformat(),
+                }
+            return None
+        except Exception as e:
+            logger.warning("Failed to query recent changes: %s", e)
+            return None
 
     def _write_event(self, agent_id: str, event_type: str, payload: dict[str, Any]) -> None:
         """Write an auditable system event for SLO auto-response actions.

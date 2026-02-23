@@ -27,6 +27,7 @@ class ChangeType(str, Enum):
     SELECTOR = "selector"
     CONTEXT_BUDGET = "context_budget"
     KNOWLEDGE = "knowledge"
+    SLO_CRITICAL = "slo_critical"
 
 
 class RegressionGate:
@@ -289,6 +290,47 @@ class RegressionGate:
                         "entry_id": entry_id,
                         "confidence": change_content.get("confidence", 0.8),
                     })
+
+            elif change_type == ChangeType.SLO_CRITICAL:
+                # SLO critical: apply suspected cause change if available
+                suspected = change_content.get("suspected_cause")
+                if suspected and suspected.get("change_type") == "skill_version_changed":
+                    # Normalize to ChangeType.SKILL payload format
+                    skill_name = suspected.get("skill_name") or suspected.get("name")
+                    version = suspected.get("version")
+                    if skill_name and version:
+                        self.db.execute(text(f"""
+                            INSERT INTO {sandbox_name}.skills_registry 
+                            (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
+                            SELECT skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at
+                            FROM skills_registry
+                            WHERE skill_name = :skill_name AND version = :version
+                            ON DUPLICATE KEY UPDATE
+                            skill_definition = VALUES(skill_definition),
+                            is_active = 1,
+                            updated_at = NOW()
+                        """), {"skill_name": skill_name, "version": version})
+                        logger.info(f"Applied suspected skill change {skill_name}@{version} to sandbox {sandbox_name}")
+                    else:
+                        logger.warning(f"SLO_CRITICAL suspected skill change missing name/version: {suspected}")
+                elif suspected and suspected.get("change_type") == "prompt_template_changed":
+                    # Normalize to ChangeType.PROMPT payload format
+                    template_id = suspected.get("template_id")
+                    version = suspected.get("version")
+                    if template_id and version:
+                        self.db.execute(text(f"""
+                            INSERT INTO {sandbox_name}.prompt_templates (template_id, version, content, created_at)
+                            SELECT template_id, version, content, created_at
+                            FROM prompt_templates
+                            WHERE template_id = :template_id AND version = :version
+                            ON DUPLICATE KEY UPDATE content = VALUES(content)
+                        """), {"template_id": template_id, "version": version})
+                        logger.info(f"Applied suspected prompt change {template_id}@{version} to sandbox {sandbox_name}")
+                    else:
+                        logger.warning(f"SLO_CRITICAL suspected prompt change missing template_id/version: {suspected}")
+                else:
+                    logger.warning(f"SLO_CRITICAL change {change_id} has no valid suspected_cause — replaying without change binding")
+
             
             self.db.commit()
             logger.info(f"Applied {change_type} change {change_id} to sandbox {sandbox_name}")
