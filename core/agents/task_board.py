@@ -252,8 +252,8 @@ class TaskBoard:
                 "SELECT event_id, content, metadata, created_at "
                 "FROM conversation_events "
                 "WHERE session_id = :sid AND event_type = 'team_task' "
-                "AND JSON_EXTRACT(metadata, '$.team_id') = :team_id "
-                "AND JSON_EXTRACT(metadata, '$.status') = 'open' "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.team_id')) = :team_id "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.status')) = 'open' "
                 "ORDER BY created_at ASC"
             ),
             {"sid": session_id, "team_id": team_id},
@@ -348,7 +348,7 @@ class TaskBoard:
                 "SELECT event_id, content, metadata, created_at "
                 "FROM conversation_events "
                 "WHERE session_id = :sid AND event_type = 'agent_message' "
-                "AND JSON_EXTRACT(metadata, '$.to_agent') = :agent_id "
+                "AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.to_agent')) = :agent_id "
                 "ORDER BY created_at DESC LIMIT :limit"
             ),
             {"sid": session_id, "agent_id": agent_id, "limit": limit},

@@ -565,7 +565,7 @@ def trust_report(
         try:
             row = db.execute(text("""
                 SELECT COUNT(*) as total,
-                       SUM(CASE WHEN JSON_EXTRACT(content, '$.safe_to_deliver') = true THEN 1 ELSE 0 END) as safe
+                       SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' THEN 1 ELSE 0 END) as safe
                 FROM conversation_events
                 WHERE event_type = 'hallucination_check'
                   AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
