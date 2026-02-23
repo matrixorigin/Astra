@@ -9,6 +9,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from api.models import (
@@ -79,11 +80,49 @@ class SkillManager:
                 f"Skill '{skill_name}' is not installed. Run: /skill install {skill_name}"
             )
 
+    def require_executable(self, user_id: str, skill_name: str) -> None:
+        """Runtime check: installed + active + has permission + all dependencies installed.
+
+        No-op for builtin skills (not in skill_definitions).
+
+        Raises:
+            SkillNotInstalledError: skill not installed or dependency missing
+            PermissionDeniedError: user lacks permission or skill deactivated
+        """
+        # Single query — no is_active filter — distinguishes builtin / deactivated / active
+        defn = self._db.query(SkillDefinition).filter_by(name=skill_name).first()
+        if defn is None:
+            return  # Builtin skill — not in catalog at all
+        if not defn.is_active:
+            raise PermissionDeniedError(
+                f"Skill '{skill_name}' definition not found or deactivated"
+            )
+
+        if self.get_installation(user_id, skill_name) is None:
+            raise SkillNotInstalledError(
+                f"Skill '{skill_name}' is not installed. Run: /skill install {skill_name}"
+            )
+
+        if not self.check_permission(user_id, skill_name, _defn=defn):
+            raise PermissionDeniedError(
+                f"Permission to execute '{skill_name}' has been revoked"
+            )
+
+        # Check direct dependencies
+        if defn.manifest:
+            for dep in defn.manifest.get("depends_on", []):
+                if self.get_installation(user_id, dep) is None:
+                    raise SkillNotInstalledError(
+                        f"Dependency '{dep}' required by '{skill_name}' is not installed"
+                    )
+
     # ── permission check ──────────────────────────────────────────────────────
 
-    def check_permission(self, user_id: str, skill_name: str) -> bool:
+    def check_permission(
+        self, user_id: str, skill_name: str, *, _defn: "SkillDefinition | None" = None
+    ) -> bool:
         """Return True if user can install this skill."""
-        defn = self.get_definition(skill_name)
+        defn = _defn or self.get_definition(skill_name)
         if defn is None:
             return False
         if defn.is_public:
@@ -121,6 +160,7 @@ class SkillManager:
         existing = self.get_installation(user_id, skill_name)
         if existing is not None:
             return existing
+        
         installation = SkillInstallation(
             installation_id=_uuid(),
             user_id=user_id,
@@ -129,8 +169,18 @@ class SkillManager:
             status="installed",
             installed_at=_now(),
         )
-        self._db.add(installation)
-        self._db.commit()
+        try:
+            self._db.add(installation)
+            self._db.commit()
+        except IntegrityError:
+            self._db.rollback()
+            return self.get_installation(user_id, skill_name)  # type: ignore[return-value]
+        except OperationalError as e:
+            self._db.rollback()
+            if "20619" in str(e):
+                # MatrixOne w-w conflict — concurrent insert won
+                return self.get_installation(user_id, skill_name)  # type: ignore[return-value]
+            raise
         return installation
 
     # ── uninstall ─────────────────────────────────────────────────────────────

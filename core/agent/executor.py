@@ -33,10 +33,16 @@ class AgentExecutor:
         self.mock_layer = ToolMockingLayer(mode, db)
         self._pipeline = pipeline
         self._skill_manager = skill_manager
-        self._marketplace_skills: dict[str, bool] = {}  # cache: name → is_marketplace
 
         from core.agent.execution_backend import BackendRouter
         self._backend_router = BackendRouter()
+
+    def _enforce_runtime_checks(self, skill_name: str, params: dict[str, Any]) -> None:
+        """Enforce installation + permission + dependency checks for marketplace skills."""
+        if not self._skill_manager:
+            return
+        user_id = params.get("user_id", "system")
+        self._skill_manager.require_executable(user_id, skill_name)
 
     def execute_skill(
         self,
@@ -72,16 +78,7 @@ class AgentExecutor:
             params["user_id"] = getattr(self, "_current_user_id", "system")
 
         # 1.6. Enforce skill installation for marketplace skills
-        if self._skill_manager:
-            user_id = params.get("user_id", "system")
-            if skill_name not in self._marketplace_skills:
-                from api.models import SkillDefinition
-                defn = self.db.query(SkillDefinition).filter_by(
-                    name=skill_name, is_active=1
-                ).first()
-                self._marketplace_skills[skill_name] = defn is not None
-            if self._marketplace_skills[skill_name]:
-                self._skill_manager.require_installed(user_id, skill_name)
+        self._enforce_runtime_checks(skill_name, params)
 
         # 2. Check if skill needs heavyweight backend
         exec_req = self._get_execution_requirements(skill)
@@ -237,6 +234,14 @@ class AgentExecutor:
         skill = self.registry.get(skill_name)
         if not skill:
             raise ValueError(f"Skill '{skill_name}' not found in registry.")
+
+        # 1.5. Auto-inject framework fields
+        params.setdefault("session_id", session_id)
+        if "user_id" not in params:
+            params["user_id"] = getattr(self, "_current_user_id", "system")
+
+        # 1.6. Enforce runtime checks (same as non-streaming path)
+        self._enforce_runtime_checks(skill_name, params)
 
         # 2. Check if skill supports streaming
         if not hasattr(skill, 'execute_stream'):
