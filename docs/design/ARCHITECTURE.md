@@ -91,6 +91,7 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt auto-evolution, implicit feedback mining, self-improving agents, meta-learning closed loop |
+| [Write Path Optimization](write-path-optimization.md) | Async event pipeline: fire-and-forget emit, background batch flush, embedding fully decoupled into `event_embeddings`, event tiering — 60x hot-path latency reduction |
 | [Feedback Classification Model](feedback-classification-model.md) | Native feedback classifier: data pipeline, model training, deployment as platform skill, continuous learning |
 | [Deployment Architecture](deployment-architecture.md) | Deployment topologies (single machine → K8s), execution backend abstraction, GPU scheduling, Ray integration |
 
@@ -170,6 +171,7 @@ All state flows through `conversation_events` with causal chain tracking. This e
 | MemGPT/EverMemOS: cognitive memory architecture | Hybrid memory recall — vector + fulltext + quality in one query, self-curating |
 | Braintrust/Maxim: agent evaluation, regression testing | Clone-test-merge — zero-risk evolution, regression gate as database operation |
 | Microsoft zero-trust: auditable, verifiable agent decisions | Snapshot-as-ground-truth — every decision reconstructable at any future point |
+| LangSmith/OpenTelemetry: async event pipeline, fire-and-forget tracing | Async EventPipeline: in-memory queue → background batch flush → bulk INSERT. Event tiering (critical/durable/ephemeral). See [Write Path Optimization](write-path-optimization.md) |
 | Industry-wide: too many systems to integrate | Single platform DB with `sk_` prefix for skill data; enhanced services for MatrixOne users |
 
 ## What This Is NOT
@@ -249,29 +251,49 @@ The hottest path. Every agent action produces at least one event. Under multi-ag
 ```
 Optimizations:
   │
-  ├── 1. WRITE BATCHING
-  │   A single agent turn often produces multiple events
-  │   (tool_call + tool_result + llm_response).
-  │   Batch into single transaction instead of 3 round-trips.
+  ├── 1. ASYNC EVENT PIPELINE (fire-and-forget)
+  │   Event writes never block the hot path.
+  │   emit() enqueues in-memory (<1μs), returns immediately.
+  │   Background task drains queue every 200ms, bulk INSERTs.
+  │   Only 2 sync flush points per turn:
+  │   (1) after user_query, for build_context to read;
+  │   (2) after run status (completed/failed/cancelled), for cross-worker polling.
+  │   See [Write Path Optimization](write-path-optimization.md).
   │
-  │   Single-agent turn: 1 transaction with 2-5 events
-  │   Team turn: 1 transaction per agent (not per event)
+  │   Industry alignment: LangSmith SDK uses identical pattern —
+  │   PriorityQueue + background thread + batch drain + operation merging.
   │
-  ├── 2. ASYNC SNAPSHOT WRITES
+  ├── 2. EMBEDDING FULLY DECOUPLED
+  │   Embeddings are NOT in the event write path at all.
+  │   Events write to conversation_events with no embedding column.
+  │   Async EmbeddingWorker generates embeddings into event_embeddings
+  │   table (separate lifecycle, separate worker, separate DB session).
+  │   Only user_query, llm_response, plan_created, knowledge_extracted
+  │   get embeddings — stream events are never embedded.
+  │   See [Write Path Optimization](write-path-optimization.md).
+  │
+  ├── 3. EVENT TIERING (critical / durable / ephemeral)
+  │   Critical (user_query, llm_response) → conversation_events
+  │   Durable (run_started, run_completed) → conversation_events
+  │   Ephemeral (stream_text_delta, etc.) → run_events only
+  │   No tier touches embeddings. Eliminates dual-write overhead for 60% of events.
+  │   See [Write Path Optimization](write-path-optimization.md).
+  │
+  ├── 4. ASYNC SNAPSHOT WRITES
   │   Context snapshots are large (full prompt content).
   │   Write async — the LLM call doesn't need to wait.
   │   Snapshot ID assigned synchronously, content flushed async.
   │   If crash before flush: snapshot marked incomplete (audit still works,
   │   just with "snapshot content lost" flag).
   │
-  ├── 3. PARTITION BY DEPLOYMENT SCOPE
+  ├── 5. PARTITION BY DEPLOYMENT SCOPE
   │   In multi-tenant deployments, each account is a separate
   │   database namespace (MatrixOne Multi-Account).
   │   Tenant A's write storm doesn't contend with Tenant B's reads.
   │   Agent code is identical — isolation is infrastructure-level.
   │   In single-tenant deployments, this is a no-op.
   │
-  └── 4. APPEND-ONLY DESIGN
+  └── 6. APPEND-ONLY DESIGN
       Events are never updated, only appended.
       No row-level locks, no update contention.
       MatrixOne's HTAP engine optimizes for append workloads.
@@ -384,6 +406,7 @@ When the system approaches capacity:
 │                                                             │
 │  DB write latency > 100ms (p95)                             │
 │    → Increase write batch size (trade latency for throughput)│
+│    → Skip embedding for non-critical events (already default)│
 │    → Shed P3 (speculative) agent tasks                      │
 │                                                             │
 │  Context assembly latency > 500ms (p95)                     │

@@ -69,7 +69,7 @@ Perceive → Encode → Store → Consolidate → Retrieve → Update → Decay/
 |-------|-------------|-----------|
 | **Perceive** | Raw input enters sensory buffer | HTTP request, tool result, stream chunk |
 | **Encode** | Extract structured information | Event creation with metadata, entity extraction |
-| **Store** | Persist to appropriate layer | MatrixOne (events, knowledge), vector store (embeddings) |
+| **Store** | Persist to appropriate layer | MatrixOne (events, knowledge); embeddings async into `event_embeddings` |
 | **Consolidate** | Promote, summarize, connect | Post-chain hooks: summarization, knowledge extraction, entity linking |
 | **Retrieve** | Find relevant memories for current task | Hybrid search: causal chain + semantic + temporal + entity overlap |
 | **Update** | Revise beliefs based on new evidence | Knowledge entry versioning, confidence decay |
@@ -341,7 +341,7 @@ conversation_events:
   created_at
 ```
 
-Retrieval: by session (recent), by causal chain (thread), by user (cross-session), by semantic similarity (embedding search).
+Retrieval: by session (recent), by causal chain (thread), by user (cross-session), by semantic similarity (via `event_embeddings` JOIN).
 
 ### Semantic Memory: knowledge_entries
 
@@ -481,9 +481,22 @@ ALTER TABLE knowledge_entries ADD COLUMN embedding VECF64(1536);
 CREATE INDEX idx_knowledge_vec USING HNSW ON knowledge_entries(embedding);
 CREATE FULLTEXT INDEX idx_knowledge_ft ON knowledge_entries(value);
 
--- conversation_events stores embeddings for episodic search
-ALTER TABLE conversation_events ADD COLUMN embedding VECF64(1536);
-CREATE INDEX idx_events_vec USING HNSW ON conversation_events(embedding);
+-- conversation_events: NO embedding column. Events are pure fact records.
+-- Embeddings live in event_embeddings table (async generation, separate lifecycle).
+-- See write-path-optimization.md for rationale.
+ALTER TABLE conversation_events DROP COLUMN IF EXISTS embedding;
+
+-- event_embeddings: async-generated, separate table for vector search
+-- Narrow table = better HNSW index cache hit rate
+-- Can be regenerated when embedding model changes
+CREATE TABLE IF NOT EXISTS event_embeddings (
+    event_id VARCHAR(36) PRIMARY KEY,
+    embedding VECF32(1536),
+    model_name VARCHAR(50),
+    model_version VARCHAR(32),
+    created_at DATETIME DEFAULT NOW()
+);
+CREATE INDEX idx_embeddings_vec USING HNSW ON event_embeddings(embedding);
 CREATE FULLTEXT INDEX idx_events_ft ON conversation_events(content);
 ```
 
@@ -493,14 +506,16 @@ MatrixOne's unique capability: **vector + fulltext + SQL filters in a single que
 
 ```sql
 -- Episodic memory retrieval: one query, three signals
-SELECT event_id, content,
-  (0.35 * l2_distance(embedding, @query_vec) +
-   0.25 * MATCH(content) AGAINST(@query_text IN NATURAL LANGUAGE MODE) +
-   0.20 * EXP(-TIMESTAMPDIFF(HOUR, created_at, NOW()) / 24.0)
+-- JOIN event_embeddings for vector search (embedding decoupled from events)
+SELECT e.event_id, e.content,
+  (0.35 * l2_distance(emb.embedding, @query_vec) +
+   0.25 * MATCH(e.content) AGAINST(@query_text IN NATURAL LANGUAGE MODE) +
+   0.20 * EXP(-TIMESTAMPDIFF(HOUR, e.created_at, NOW()) / 24.0)
   ) AS relevance
-FROM conversation_events
-WHERE user_id = @user_id
-  AND created_at > NOW() - INTERVAL 30 DAY
+FROM conversation_events e
+JOIN event_embeddings emb ON e.event_id = emb.event_id
+WHERE e.user_id = @user_id
+  AND e.created_at > NOW() - INTERVAL 30 DAY
 ORDER BY relevance DESC
 LIMIT @top_k;
 
@@ -515,11 +530,13 @@ ORDER BY (0.5 * vec_score + 0.3 * ft_score + 0.2 * confidence) DESC
 LIMIT @top_k;
 ```
 
-**Why this matters**:
-- **No sync problem**: Embeddings live next to the data they describe. No eventual consistency between vector DB and relational DB.
+**Why this matters** (for `knowledge_entries`):
+- **No sync problem**: Knowledge embeddings live in the same row as the data they describe. No eventual consistency between vector DB and relational DB.
 - **Transactional consistency**: Vector search respects MVCC — snapshot isolation means replay sees the exact same vectors.
 - **Time-travel for vectors**: `RESTORE SNAPSHOT` restores embeddings too. Replay a past decision with the exact vector index state.
 - **One less system**: No Pinecone/Milvus to deploy, monitor, pay for, or debug.
+
+**Note on `event_embeddings`**: Event embeddings are in a separate table, generated asynchronously by `EmbeddingWorker`. This means event vector search has eventual consistency (typically <1s lag). This is acceptable because the current turn's query is never a search target — only historical events are searched, and those already have embeddings. See [write-path-optimization.md](write-path-optimization.md#deferred-embedding-strategy).
 
 ### Python UDF for In-Database Intelligence
 

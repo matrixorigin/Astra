@@ -405,20 +405,21 @@ Exact data state at T1 — including vector indexes, knowledge entries, event hi
 **Our solution**: MatrixOne does vector + fulltext + SQL in a single query.
 
 ```sql
-SELECT event_id, content, quality_score,
-  l2_distance(embedding, @query_vec) AS semantic_score,
-  MATCH(content) AGAINST(@keywords IN BOOLEAN MODE) AS keyword_score
-FROM conversation_events
-WHERE user_id = @user_id
-  AND created_at > NOW() - INTERVAL 7 DAY
-  AND quality_score > 3.0
+SELECT e.event_id, e.content, e.quality_score,
+  l2_distance(emb.embedding, @query_vec) AS semantic_score,
+  MATCH(e.content) AGAINST(@keywords IN BOOLEAN MODE) AS keyword_score
+FROM conversation_events e
+JOIN event_embeddings emb ON e.event_id = emb.event_id
+WHERE e.user_id = @user_id
+  AND e.created_at > NOW() - INTERVAL 7 DAY
+  AND e.quality_score > 3.0
 ORDER BY (0.5 * semantic_score + 0.3 * keyword_score + 0.2 * quality_score) DESC
 LIMIT 10;
 ```
 
 **What this replaces**: Pinecone + Elasticsearch + PostgreSQL. Three deployments, three bills, three sync jobs, eventual consistency bugs. Gone.
 
-**New concept this enables: "Memory with opinions."** Because quality_score lives next to the embedding, retrieval naturally prefers high-quality memories. Bad experiences decay not just by time, but by quality. The agent's memory is self-curating.
+**New concept this enables: "Memory with opinions."** Because quality_score lives next to the event, and embedding lives in a narrow index table, retrieval naturally prefers high-quality memories. Bad experiences decay not just by time, but by quality. The agent's memory is self-curating.
 
 ### Workflow 4: "Publication-as-Marketplace" — Skill Distribution Without Infrastructure (Platform-internal)
 
