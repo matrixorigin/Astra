@@ -6,15 +6,21 @@ Sandbox-isolated prompt variants with A/B testing, statistical significance test
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from core.sandbox import Sandbox, Branch
+
+if TYPE_CHECKING:
+    from core.evaluation.regression_gate import RegressionGate
+
+logger = logging.getLogger(__name__)
 
 
 class ExperimentStatus(str, Enum):
@@ -105,7 +111,7 @@ class PromptExperiment:
             source_db: Source database for branching
         """
         self.db = db
-        self.sandbox = Sandbox(db=db, account=account)
+        self.sandbox = Sandbox(db=db, source_db=source_db, account=account)
         self.branch = Branch(database=source_db, db=db)
         self.source_db = source_db
     
@@ -274,10 +280,10 @@ class PromptExperiment:
                     "costs": [],
                     "satisfactions": [],
                 }
-            variant_data[variant_id]["accuracies"].append(accuracy or 0.0)
-            variant_data[variant_id]["latencies"].append(latency or 0)
-            variant_data[variant_id]["costs"].append(cost or 0.0)
-            variant_data[variant_id]["satisfactions"].append(satisfaction or 0.0)
+            variant_data[variant_id]["accuracies"].append(float(accuracy or 0))
+            variant_data[variant_id]["latencies"].append(int(latency or 0))
+            variant_data[variant_id]["costs"].append(float(cost or 0))
+            variant_data[variant_id]["satisfactions"].append(float(satisfaction or 0))
         
         # Get baseline for comparison
         baseline_id = None
@@ -493,30 +499,78 @@ class PromptExperiment:
         
         return best_variant
     
-    def complete_experiment(self, experiment_id: str) -> str:
-        """Complete experiment and determine winner.
-        
+    def complete_experiment(
+        self,
+        experiment_id: str,
+        regression_gate: Optional[RegressionGate] = None,
+    ) -> str:
+        """Complete experiment, optionally gating the winner through regression validation.
+
         Args:
             experiment_id: Experiment ID
-            
+            regression_gate: If provided, winner must pass gate before promotion.
+
         Returns:
-            Winner variant_id
+            Winner variant_id, or "gate_failed" / "unknown".
         """
         winner_id = self.determine_winner(experiment_id)
-        
-        if winner_id:
-            self.db.execute(text(f"""
-                UPDATE {experiment_id}.experiment_config
-                SET status = :status, completed_at = CURRENT_TIMESTAMP, winner_variant_id = :winner
+
+        if not winner_id:
+            return "unknown"
+
+        # Gate: validate winner against golden sessions before promoting
+        if regression_gate is not None:
+            from core.evaluation.regression_gate import ChangeType
+
+            # Fetch winner prompt content from config
+            config_row = self.db.execute(text(f"""
+                SELECT baseline_variant, test_variants
+                FROM {experiment_id}.experiment_config
                 WHERE experiment_id = :exp_id
-            """), {
-                "status": ExperimentStatus.COMPLETED.value,
-                "winner": winner_id,
-                "exp_id": experiment_id,
-            })
-        
+            """), {"exp_id": experiment_id}).fetchone()
+
+            prompt_content = ""
+            if config_row:
+                baseline = json.loads(config_row[0])
+                if baseline["variant_id"] == winner_id:
+                    prompt_content = baseline.get("system_prompt", "")
+                else:
+                    for v in json.loads(config_row[1]):
+                        if v["variant_id"] == winner_id:
+                            prompt_content = v.get("system_prompt", "")
+                            break
+
+            gate_result = regression_gate.validate_change(
+                change_type=ChangeType.PROMPT,
+                change_id=f"{experiment_id}:{winner_id}",
+                change_content={"content": prompt_content, "template_id": experiment_id},
+            )
+
+            if gate_result["verdict"] != "pass":
+                logger.warning(
+                    "Experiment %s winner %s failed regression gate: %s",
+                    experiment_id, winner_id, gate_result["reason"],
+                )
+                self.db.execute(text(f"""
+                    UPDATE {experiment_id}.experiment_config
+                    SET status = 'gate_failed'
+                    WHERE experiment_id = :exp_id
+                """), {"exp_id": experiment_id})
+                self.db.commit()
+                return "gate_failed"
+
+        self.db.execute(text(f"""
+            UPDATE {experiment_id}.experiment_config
+            SET status = :status, completed_at = CURRENT_TIMESTAMP, winner_variant_id = :winner
+            WHERE experiment_id = :exp_id
+        """), {
+            "status": ExperimentStatus.COMPLETED.value,
+            "winner": winner_id,
+            "exp_id": experiment_id,
+        })
+
         self.db.commit()
-        return winner_id or "unknown"
+        return winner_id
     
     def cleanup_experiment(self, experiment_id: str) -> None:
         """Archive experiment and cleanup sandbox.

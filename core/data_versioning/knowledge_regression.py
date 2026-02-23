@@ -79,7 +79,7 @@ class KnowledgeRegression:
                    COUNT(DISTINCT event_id) as decision_count
             FROM {self.source_db}.conversation_events
             WHERE event_type = 'skill_selection'
-            AND JSON_EXTRACT(metadata, '$.skill_name') = :skill_name
+            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_name')) = :skill_name
             AND created_at < :deprecated_at
         """), {"skill_name": skill_name, "deprecated_at": deprecated_at}).fetchone()
         
@@ -115,23 +115,23 @@ class KnowledgeRegression:
         """
         # Query quality scores before/after update
         before = self.db.execute(text(f"""
-            SELECT AVG(CAST(JSON_EXTRACT(metadata, '$.quality_score') AS DECIMAL(3,2))) as avg_quality,
+            SELECT AVG(CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.quality_score')) AS DECIMAL(3,2))) as avg_quality,
                    COUNT(*) as sample_count,
-                   STDDEV(CAST(JSON_EXTRACT(metadata, '$.quality_score') AS DECIMAL(3,2))) as stddev
+                   STDDEV(CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.quality_score')) AS DECIMAL(3,2))) as stddev
             FROM {self.source_db}.conversation_events
             WHERE event_type = 'llm_response'
-            AND JSON_EXTRACT(metadata, '$.skill_name') = :skill_name
-            AND JSON_EXTRACT(metadata, '$.skill_version') = :old_version
+            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_name')) = :skill_name
+            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_version')) = :old_version
         """), {"skill_name": skill_name, "old_version": old_version}).fetchone()
         
         after = self.db.execute(text(f"""
-            SELECT AVG(CAST(JSON_EXTRACT(metadata, '$.quality_score') AS DECIMAL(3,2))) as avg_quality,
+            SELECT AVG(CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.quality_score')) AS DECIMAL(3,2))) as avg_quality,
                    COUNT(*) as sample_count,
-                   STDDEV(CAST(JSON_EXTRACT(metadata, '$.quality_score') AS DECIMAL(3,2))) as stddev
+                   STDDEV(CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.quality_score')) AS DECIMAL(3,2))) as stddev
             FROM {self.source_db}.conversation_events
             WHERE event_type = 'llm_response'
-            AND JSON_EXTRACT(metadata, '$.skill_name') = :skill_name
-            AND JSON_EXTRACT(metadata, '$.skill_version') = :new_version
+            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_name')) = :skill_name
+            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.skill_version')) = :new_version
         """), {"skill_name": skill_name, "new_version": new_version}).fetchone()
         
         before_quality = float(before[0]) if before and before[0] else 1.0
@@ -183,7 +183,7 @@ class KnowledgeRegression:
                    COUNT(DISTINCT event_id) as decision_count
             FROM {self.source_db}.conversation_events
             WHERE event_type = 'context_snapshot'
-            AND JSON_EXTRACT(metadata, '$.knowledge_domain') = :domain
+            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.knowledge_domain')) = :domain
             AND created_at < :changed_at
         """), {"domain": knowledge_domain, "changed_at": changed_at}).fetchone()
         
@@ -280,7 +280,7 @@ class KnowledgeRegression:
                     MAX(e.created_at) as last_use
                 FROM {self.source_db}.conversation_events e
                 WHERE e.event_type = 'skill_selection'
-                AND JSON_EXTRACT(e.metadata, '$.skill_name') = :skill_name
+                AND JSON_UNQUOTE(JSON_EXTRACT(e.`metadata`, '$.skill_name')) = :skill_name
                 GROUP BY e.session_id
                 LIMIT :limit
             """), {"skill_name": skill_name, "limit": limit}).fetchall()
