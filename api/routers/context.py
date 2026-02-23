@@ -1,15 +1,15 @@
 """Context API Router - 上下文快照管理"""
 
-from typing import Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
 from api.services.context_service import ContextService
-from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
-
+from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 
 router = APIRouter()
 
@@ -18,7 +18,7 @@ class CreateSnapshotRequest(BaseModel):
     """创建快照请求"""
     session_id: str
     event_id: str
-    context_data: Dict[str, Any]
+    context_data: dict[str, Any]
 
 
 class SnapshotResponse(BaseModel):
@@ -26,13 +26,13 @@ class SnapshotResponse(BaseModel):
     context_capture_id: str
     session_id: str
     event_id: str
-    context_data: Dict[str, Any]
+    context_data: dict[str, Any]
     created_at: str
 
 
 class SnapshotListResponse(BaseModel):
     """快照列表响应"""
-    snapshots: list[Dict[str, Any]]
+    snapshots: list[dict[str, Any]]
     total: int
     limit: int
     offset: int
@@ -64,7 +64,7 @@ async def create_snapshot(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"创建快照失败: {str(e)}"
+            detail=f"创建快照失败: {e!s}"
         )
 
 
@@ -74,7 +74,7 @@ async def create_snapshot(
     summary="列出上下文快照"
 )
 async def list_snapshots(
-    session_id: Optional[str] = Query(None),
+    session_id: str | None = Query(None),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db_session),

@@ -1,15 +1,14 @@
 """Replay API Router - 会话重放"""
 
-from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
+from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from api.services.replay_service import ReplayService
-from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
-
 
 router = APIRouter()
 
@@ -17,7 +16,7 @@ router = APIRouter()
 # Request/Response Models
 class ReplaySessionRequest(BaseModel):
     """重放会话请求"""
-    sandbox_name: Optional[str] = None
+    sandbox_name: str | None = None
     mock_mode: bool = True
 
 
@@ -27,7 +26,7 @@ class ReplayResponse(BaseModel):
     session_id: str
     status: str
     events_replayed: int
-    sandbox_name: Optional[str] = None
+    sandbox_name: str | None = None
     mock_mode: bool
     created_at: str
 
@@ -79,7 +78,7 @@ async def replay_session(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"重放失败: {str(e)}"
+            detail=f"重放失败: {e!s}"
         )
 
 
@@ -100,21 +99,21 @@ async def compare_replay(
     """
     try:
         service = ReplayService(db)
-        
+
         # 先执行重放
         replay_result = service.replay_session(
             session_id=session_id,
             user_id=current_user["user_id"],
             mock_mode=True
         )
-        
+
         # 对比结果
         comparison = service.compare_outputs(
             session_id=session_id,
             user_id=current_user["user_id"],
             replay_result=replay_result["result"]
         )
-        
+
         return comparison
     except ResourceNotFoundError as e:
         raise HTTPException(
@@ -129,5 +128,5 @@ async def compare_replay(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"对比失败: {str(e)}"
+            detail=f"对比失败: {e!s}"
         )

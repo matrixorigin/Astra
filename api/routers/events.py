@@ -1,15 +1,15 @@
 """Event API Router - 使用服务层"""
 
-from typing import Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
 from api.services.event_service import EventService
-from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
-
+from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 
 router = APIRouter()
 
@@ -20,11 +20,11 @@ class CreateEventRequest(BaseModel):
     session_id: str
     event_type: str
     content: str
-    agent_id: Optional[str] = None
-    agent_version: Optional[str] = None
-    parent_event_id: Optional[str] = None
-    causal_chain_id: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+    agent_id: str | None = None
+    agent_version: str | None = None
+    parent_event_id: str | None = None
+    causal_chain_id: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class EventResponse(BaseModel):
@@ -34,11 +34,11 @@ class EventResponse(BaseModel):
     session_id: str
     event_type: str
     content: str
-    agent_id: Optional[str] = None
-    agent_version: Optional[str] = None
-    parent_event_id: Optional[str] = None
+    agent_id: str | None = None
+    agent_version: str | None = None
+    parent_event_id: str | None = None
     causal_chain_id: str
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
     created_at: str
 
 
@@ -106,7 +106,7 @@ async def create_event(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"创建 Event 失败: {str(e)}"
+            detail=f"创建 Event 失败: {e!s}"
         )
 
 
@@ -117,10 +117,10 @@ async def create_event(
     description="列出当前用户的事件"
 )
 async def list_events(
-    session_id: Optional[str] = Query(None, description="过滤Session ID"),
-    event_type: Optional[str] = Query(None, description="过滤事件类型"),
-    agent_id: Optional[str] = Query(None, description="过滤Agent ID"),
-    causal_chain_id: Optional[str] = Query(None, description="过滤因果链ID"),
+    session_id: str | None = Query(None, description="过滤Session ID"),
+    event_type: str | None = Query(None, description="过滤事件类型"),
+    agent_id: str | None = Query(None, description="过滤Agent ID"),
+    causal_chain_id: str | None = Query(None, description="过滤因果链ID"),
     limit: int = Query(50, ge=1, le=100, description="限制数量"),
     offset: int = Query(0, ge=0, description="偏移量"),
     db: Session = Depends(get_db_session),
@@ -142,7 +142,7 @@ async def list_events(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取 Events 失败: {str(e)}"
+            detail=f"获取 Events 失败: {e!s}"
         )
 
 
@@ -180,7 +180,7 @@ async def get_event(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取 Event 失败: {str(e)}"
+            detail=f"获取 Event 失败: {e!s}"
         )
 
 
@@ -206,7 +206,7 @@ async def get_causal_chain(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取因果链失败: {str(e)}"
+            detail=f"获取因果链失败: {e!s}"
         )
 
 
@@ -251,7 +251,7 @@ async def get_session_events(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取Session事件失败: {str(e)}"
+            detail=f"获取Session事件失败: {e!s}"
         )
 
 
@@ -288,5 +288,5 @@ async def delete_event(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"删除 Event 失败: {str(e)}"
+            detail=f"删除 Event 失败: {e!s}"
         )

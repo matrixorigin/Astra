@@ -3,14 +3,14 @@
 import json
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from api.dependencies import get_current_user
 from api.database import get_db_session
-from api.routers.chat import _ensure_session, _build_chat_loop
+from api.dependencies import get_current_user
+from api.routers.chat import _build_chat_loop, _ensure_session
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)

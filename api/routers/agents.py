@@ -1,6 +1,7 @@
 """Agent API Router - 使用服务层"""
 
-from typing import Dict, Any, Optional
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -9,7 +10,6 @@ from api.database import get_db_session
 from api.dependencies import get_current_user
 from api.services.agent_service import AgentService
 
-
 router = APIRouter()
 
 
@@ -17,16 +17,16 @@ router = APIRouter()
 class CreateAgentRequest(BaseModel):
     """创建 Agent 请求"""
     name: str
-    agent_config: Optional[Dict[str, Any]] = None
-    data_source: Optional[Dict[str, Any]] = None
+    agent_config: dict[str, Any] | None = None
+    data_source: dict[str, Any] | None = None
 
 
 class UpdateAgentRequest(BaseModel):
     """更新 Agent 请求"""
-    name: Optional[str] = None
-    agent_config: Optional[Dict[str, Any]] = None
-    data_source: Optional[Dict[str, Any]] = None
-    is_active: Optional[bool] = None
+    name: str | None = None
+    agent_config: dict[str, Any] | None = None
+    data_source: dict[str, Any] | None = None
+    is_active: bool | None = None
 
 
 class AgentResponse(BaseModel):
@@ -35,11 +35,11 @@ class AgentResponse(BaseModel):
     name: str
     agent_type: str
     owner_user_id: str
-    agent_config: Dict[str, Any]
-    data_source: Dict[str, Any]
+    agent_config: dict[str, Any]
+    data_source: dict[str, Any]
     is_active: bool
     created_at: str
-    updated_at: Optional[str] = None
+    updated_at: str | None = None
 
 
 class AgentListResponse(BaseModel):
@@ -79,7 +79,7 @@ async def create_agent(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"创建 Agent 失败: {str(e)}"
+            detail=f"创建 Agent 失败: {e!s}"
         )
 
 
@@ -104,7 +104,7 @@ async def list_agents(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取 Agents 失败: {str(e)}"
+            detail=f"获取 Agents 失败: {e!s}"
         )
 
 
@@ -132,7 +132,7 @@ async def get_agent(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取 Agent 失败: {str(e)}"
+            detail=f"获取 Agent 失败: {e!s}"
         )
 
 
@@ -168,7 +168,7 @@ async def update_agent(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"更新 Agent 失败: {str(e)}"
+            detail=f"更新 Agent 失败: {e!s}"
         )
 
 
@@ -195,5 +195,5 @@ async def delete_agent(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"删除 Agent 失败: {str(e)}"
+            detail=f"删除 Agent 失败: {e!s}"
         )

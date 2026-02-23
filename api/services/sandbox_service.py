@@ -7,18 +7,18 @@
 """
 
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import Any
 
 from sqlalchemy.orm import Session
 
-from core.sandbox import Sandbox
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
+from core.sandbox import Sandbox
 
 
 class SandboxService:
     """Sandbox 业务服务"""
-    
+
     def __init__(self, db_session: Session):
         """初始化服务
         
@@ -30,14 +30,14 @@ class SandboxService:
         self.sandbox = Sandbox(db=db_session, source_db=get_settings().matrixone_database)
         self.audit = AuditLogger(db_session)
         self.permission = PermissionChecker(db_session)
-    
+
     def create_sandbox(
         self,
         name: str,
         user_id: str,
         description: str = "",
         created_by: str = ""
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """创建 sandbox
         
         Args:
@@ -57,11 +57,11 @@ class SandboxService:
         # 生产模式需要检查: self.permission.has_role(user_id, "mo_agent_user")
         # 当前开发模式: 跳过RBAC检查
         pass
-        
+
         # 2. 参数验证
         if not name or not name.strip():
             raise ValueError("Sandbox name 不能为空")
-        
+
         # 3. 创建 sandbox
         try:
             self.sandbox.create(
@@ -69,7 +69,7 @@ class SandboxService:
                 description=description,
                 created_by=created_by or user_id
             )
-            
+
             # 4. 审计日志
             self.audit.log(
                 user_id=user_id,
@@ -79,7 +79,7 @@ class SandboxService:
                 details={"description": description},
                 status="success"
             )
-            
+
             # 5. 返回结果
             return {
                 "sandbox_name": name,
@@ -87,7 +87,7 @@ class SandboxService:
                 "created_by": created_by or user_id,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
-            
+
         except Exception as e:
             # 审计失败
             self.audit.log(
@@ -99,12 +99,12 @@ class SandboxService:
                 status="failed"
             )
             raise
-    
+
     def list_sandboxes(
         self,
         user_id: str,
         pattern: str = "%"
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """列出 sandboxes
         
         Args:
@@ -117,16 +117,16 @@ class SandboxService:
         # 开发模式: 返回所有sandboxes
         # 生产模式: 需要权限检查和过滤
         sandboxes = self.sandbox.list_sandboxes(prefix="", pattern=pattern)
-        
+
         # Convert datetime to string for API response
         for sandbox in sandboxes:
             if sandbox.get("created_at"):
                 sandbox["created_at"] = sandbox["created_at"].isoformat()
             if sandbox.get("updated_at"):
                 sandbox["updated_at"] = sandbox["updated_at"].isoformat()
-        
+
         return sandboxes
-    
+
     def delete_sandbox(
         self,
         name: str,
@@ -146,11 +146,11 @@ class SandboxService:
         sandboxes = self.sandbox.list_sandboxes(prefix="", pattern=name)
         if not any(s["sandbox_name"] == name for s in sandboxes):
             raise ValueError(f"Sandbox {name} 不存在")
-        
+
         # 删除 sandbox
         try:
             self.sandbox.delete(name)
-            
+
             # 审计日志
             self.audit.log(
                 user_id=user_id,
@@ -160,7 +160,7 @@ class SandboxService:
                 details={},
                 status="success"
             )
-            
+
         except Exception as e:
             self.audit.log(
                 user_id=user_id,
@@ -171,12 +171,12 @@ class SandboxService:
                 status="failed"
             )
             raise
-    
+
     def get_sandbox_info(
         self,
         name: str,
         user_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """获取 sandbox 信息
         
         Args:
@@ -192,14 +192,14 @@ class SandboxService:
         # 开发模式: 允许查看任何sandbox
         sandboxes = self.sandbox.list_sandboxes(prefix="", pattern=name)
         sandbox_info = next((s for s in sandboxes if s["sandbox_name"] == name), None)
-        
+
         if not sandbox_info:
             raise ValueError(f"Sandbox {name} 不存在")
-        
+
         # Convert datetime to string for API response
         if sandbox_info.get("created_at"):
             sandbox_info["created_at"] = sandbox_info["created_at"].isoformat()
         if sandbox_info.get("updated_at"):
             sandbox_info["updated_at"] = sandbox_info["updated_at"].isoformat()
-        
+
         return sandbox_info

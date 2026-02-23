@@ -1,20 +1,20 @@
 """Decision Service - 决策审计管理"""
 
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Any
+
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
-from api.repositories import DecisionRepository, SessionRepository, EventRepository
-from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
+from api.repositories import DecisionRepository, EventRepository, SessionRepository
+from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
+
 # from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 
 class DecisionService:
     """Decision 业务服务"""
-    
+
     def __init__(self, db_session: Session):
         self.db_session = db_session
         self.decision_repo = DecisionRepository(db_session)
@@ -22,7 +22,7 @@ class DecisionService:
         self.event_repo = EventRepository(db_session)
         # self.db = next(get_db_session())
         self.audit = AuditLogger(db_session)
-    
+
     def record_decision(
         self,
         user_id: str,
@@ -30,9 +30,9 @@ class DecisionService:
         event_id: str,
         context_capture_id: str,
         decision_type: str,
-        decision_output: Dict[str, Any],
-        model_params: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+        decision_output: dict[str, Any],
+        model_params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """记录决策
         
         Args:
@@ -51,10 +51,10 @@ class DecisionService:
         session = self.session_repo.get_by_id(session_id)
         if not session or session.user_id != user_id:
             raise PermissionDeniedError(f"无权限访问 Session {session_id}")
-        
+
         try:
             decision_id = str(uuid7())
-            
+
             # 使用 ORM 插入决策记录
             decision_data = {
                 "decision_id": decision_id,
@@ -65,9 +65,9 @@ class DecisionService:
                 "decision_output": decision_output,
                 "model_params": model_params or {}
             }
-            
+
             decision = self.decision_repo.create(decision_data)
-            
+
             # 审计日志
             self.audit.log(
                 user_id=user_id,
@@ -81,7 +81,7 @@ class DecisionService:
                 },
                 status="success"
             )
-            
+
             return {
                 "decision_id": decision.decision_id,
                 "session_id": decision.session_id,
@@ -92,7 +92,7 @@ class DecisionService:
                 "model_params": decision.model_params,
                 "created_at": decision.created_at.isoformat()
             }
-            
+
         except Exception as e:
             self.audit.log(
                 user_id=user_id,
@@ -103,18 +103,18 @@ class DecisionService:
                 status="failed"
             )
             raise
-    
+
     def get_decision(
         self,
         decision_id: str,
         user_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """获取决策记录"""
         decision = self.decision_repo.get_by_id_with_user(decision_id, user_id)
-        
+
         if not decision:
             raise ResourceNotFoundError(f"Decision {decision_id} 不存在")
-        
+
         return {
             "decision_id": decision.decision_id,
             "session_id": decision.session_id,
@@ -125,23 +125,23 @@ class DecisionService:
             "model_params": decision.model_params,
             "created_at": decision.created_at.isoformat()
         }
-    
+
     def get_decision_with_context(
         self,
         decision_id: str,
         user_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """获取决策及其完整上下文（用于审计）"""
         from api.models import ContextSnapshot
-        
+
         # 获取决策
         decision = self.get_decision(decision_id, user_id)
-        
+
         # 使用 ORM 获取上下文快照
         snapshot = self.db_session.query(ContextSnapshot).filter(
             ContextSnapshot.context_capture_id == decision["context_capture_id"]
         ).first()
-        
+
         if snapshot:
             decision["context"] = {
                 "system_prompt": snapshot.system_prompt,
@@ -150,24 +150,24 @@ class DecisionService:
                 "code_context": snapshot.code_context,
                 "documentation": snapshot.documentation,
             }
-        
+
         return decision
-    
+
     def list_decisions(
         self,
         user_id: str,
-        session_id: Optional[str] = None,
-        decision_type: Optional[str] = None,
+        session_id: str | None = None,
+        decision_type: str | None = None,
         limit: int = 50,
         offset: int = 0
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """列出决策记录"""
         if session_id:
             # 验证权限
             session = self.session_repo.get_by_id(session_id)
             if not session or session.user_id != user_id:
                 raise PermissionDeniedError(f"无权限访问 Session {session_id}")
-            
+
             decisions, total = self.decision_repo.list_by_session(
                 session_id=session_id,
                 limit=limit,
@@ -180,7 +180,7 @@ class DecisionService:
                 limit=limit,
                 offset=offset
             )
-        
+
         return {
             "decisions": [
                 {

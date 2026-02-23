@@ -1,33 +1,33 @@
 """Session Service - 业务逻辑层"""
 
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Any
+
 from sqlalchemy.orm import Session
 
+# from sqlalchemy.orm import Session
 from api.repositories import SessionRepository
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
-# from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 
 class SessionService:
     """Session 业务服务"""
-    
+
     def __init__(self, db_session: Session):
         self.db_session = db_session
         self.session_repo = SessionRepository(db_session)
         # self.db = next(get_db_session())  # For audit and permission
         self.audit = AuditLogger(db_session)
         self.permission = PermissionChecker(db_session)
-    
+
     def create_session(
         self,
         user_id: str,
-        agent_id: Optional[str] = None,
-        title: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+        agent_id: str | None = None,
+        title: str | None = None,
+        metadata: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """创建 Session
         
         Args:
@@ -44,10 +44,10 @@ class SessionService:
             metadata = {}
         if title is None:
             title = f"Session {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')}"
-        
+
         try:
             from uuid_utils import uuid7
-            
+
             session_data = {
                 "session_id": str(uuid7()),  # 生成session_id
                 "user_id": user_id,
@@ -57,9 +57,9 @@ class SessionService:
                 "status": "active",
                 "event_count": 0
             }
-            
+
             session = self.session_repo.create(session_data)
-            
+
             # 审计日志
             self.audit.log(
                 user_id=user_id,
@@ -69,7 +69,7 @@ class SessionService:
                 details={"title": title, "agent_id": agent_id},
                 status="success"
             )
-            
+
             return {
                 "session_id": session.session_id,
                 "user_id": session.user_id,
@@ -82,7 +82,7 @@ class SessionService:
                 "updated_at": session.updated_at.isoformat() if session.updated_at else None,
                 "ended_at": session.ended_at.isoformat() if session.ended_at else None
             }
-            
+
         except Exception as e:
             # 审计失败
             self.audit.log(
@@ -94,8 +94,8 @@ class SessionService:
                 status="failed"
             )
             raise
-    
-    def get_session(self, session_id: str, user_id: str) -> Dict[str, Any]:
+
+    def get_session(self, session_id: str, user_id: str) -> dict[str, Any]:
         """获取 Session 信息
         
         Args:
@@ -109,14 +109,14 @@ class SessionService:
             ValueError: Session不存在或无权限
         """
         session = self.session_repo.get_by_id(session_id)
-        
+
         if not session:
             raise ValueError(f"Session {session_id} 不存在")
-        
+
         # 权限检查 - 只能访问自己的Session
         if session.user_id != user_id:
             raise ValueError(f"无权限访问 Session {session_id}")
-        
+
         return {
             "session_id": session.session_id,
             "user_id": session.user_id,
@@ -129,15 +129,15 @@ class SessionService:
             "updated_at": session.updated_at.isoformat() if session.updated_at else None,
             "ended_at": session.ended_at.isoformat() if session.ended_at else None
         }
-    
+
     def list_sessions(
         self,
         user_id: str,
-        agent_id: Optional[str] = None,
-        status: Optional[str] = None,
+        agent_id: str | None = None,
+        status: str | None = None,
         limit: int = 50,
         offset: int = 0
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """列出用户的 Sessions
         
         Args:
@@ -157,7 +157,7 @@ class SessionService:
             limit=limit,
             offset=offset
         )
-        
+
         return {
             "sessions": [
                 {
@@ -178,15 +178,15 @@ class SessionService:
             "limit": limit,
             "offset": offset
         }
-    
+
     def update_session(
         self,
         session_id: str,
         user_id: str,
-        title: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        status: Optional[str] = None
-    ) -> Dict[str, Any]:
+        title: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        status: str | None = None
+    ) -> dict[str, Any]:
         """更新 Session
         
         Args:
@@ -203,14 +203,14 @@ class SessionService:
             ValueError: Session不存在或无权限
         """
         session = self.session_repo.get_by_id(session_id)
-        
+
         if not session:
             raise ValueError(f"Session {session_id} 不存在")
-        
+
         # 权限检查
         if session.user_id != user_id:
             raise ValueError(f"无权限修改 Session {session_id}")
-        
+
         # 准备更新数据
         update_data = {}
         if title is not None:
@@ -223,14 +223,14 @@ class SessionService:
                 update_data["ended_at"] = datetime.now(timezone.utc)
             if status in ("closed", "ended"):
                 self._cleanup_sandbox(session_id)
-        
+
         if not update_data:
             # 没有更新内容，直接返回当前信息
             return self.get_session(session_id, user_id)
-        
+
         try:
             updated_session = self.session_repo.update(session_id, update_data)
-            
+
             # 审计日志
             self.audit.log(
                 user_id=user_id,
@@ -240,7 +240,7 @@ class SessionService:
                 details=update_data,
                 status="success"
             )
-            
+
             return {
                 "session_id": updated_session.session_id,
                 "user_id": updated_session.user_id,
@@ -253,7 +253,7 @@ class SessionService:
                 "updated_at": updated_session.updated_at.isoformat() if updated_session.updated_at else None,
                 "ended_at": updated_session.ended_at.isoformat() if updated_session.ended_at else None
             }
-            
+
         except Exception as e:
             # 审计失败
             self.audit.log(
@@ -265,7 +265,7 @@ class SessionService:
                 status="failed"
             )
             raise
-    
+
     def delete_session(self, session_id: str, user_id: str) -> None:
         """删除 Session
         
@@ -277,17 +277,17 @@ class SessionService:
             ValueError: Session不存在或无权限
         """
         session = self.session_repo.get_by_id(session_id)
-        
+
         if not session:
             raise ValueError(f"Session {session_id} 不存在")
-        
+
         # 权限检查
         if session.user_id != user_id:
             raise ValueError(f"无权限删除 Session {session_id}")
-        
+
         try:
             self.session_repo.delete(session_id)
-            
+
             # 审计日志
             self.audit.log(
                 user_id=user_id,
@@ -297,7 +297,7 @@ class SessionService:
                 details={"title": session.title},
                 status="success"
             )
-            
+
         except Exception as e:
             # 审计失败
             self.audit.log(
@@ -309,7 +309,7 @@ class SessionService:
                 status="failed"
             )
             raise
-    
+
     def increment_event_count(self, session_id: str, user_id: str) -> None:
         """增加事件计数
         
@@ -321,20 +321,20 @@ class SessionService:
             ValueError: Session不存在或无权限
         """
         session = self.session_repo.get_by_id(session_id)
-        
+
         if not session:
             raise ValueError(f"Session {session_id} 不存在")
-        
+
         # 权限检查
         if session.user_id != user_id:
             raise ValueError(f"无权限修改 Session {session_id}")
-        
+
         try:
             self.session_repo.update(session_id, {
                 "event_count": session.event_count + 1
             })
-            
-        except Exception as e:
+
+        except Exception:
             # 静默失败，不影响主流程
             pass
 
@@ -342,6 +342,7 @@ class SessionService:
         """Clean up sandboxes associated with this session."""
         try:
             from sqlalchemy import text
+
             from core.sandbox import Sandbox
             result = self.db_session.execute(
                 text("SELECT sandbox_name FROM sandbox_metadata WHERE session_id = :sid AND status = 'active'"),

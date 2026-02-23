@@ -1,7 +1,8 @@
 """Permission checker using App-Layer RBAC."""
 
 from sqlalchemy.orm import Session
-from api.models import User, Role, UserRole
+
+from api.models import Role, User, UserRole
 
 
 class PermissionChecker:
@@ -23,10 +24,10 @@ class PermissionChecker:
             .join(User, UserRole.user_id == User.user_id)
             .filter(Role.role_name == role_name)
         )
-        
+
         # Support both UUID (user_id) and Username
         query = query.filter((User.user_id == user_id) | (User.username == user_id))
-        
+
         return query.count() > 0
 
     def is_admin(self, user_id: str) -> bool:
@@ -50,13 +51,13 @@ class PermissionChecker:
 
         if scope == "global":
             return False  # Only admin can manage global models
-            
+
         if scope == "account":
             return False  # Only admin can manage account models for now
-            
+
         if scope == "user" and scope_id == user_id:
             return self.is_user(user_id)
-            
+
         return False
 
     def can_manage_skills(self, user_id: str, scope: str, scope_id: str | None = None) -> bool:
@@ -68,13 +69,13 @@ class PermissionChecker:
         """
         if self.is_admin(user_id):
             return True
-            
+
         if scope in ["global", "account"]:
             return False
-            
+
         if scope == "user" and scope_id == user_id:
             return self.is_user(user_id)
-            
+
         return False
 
     def can_view_audit_logs(self, user_id: str, target_user: str | None = None) -> bool:

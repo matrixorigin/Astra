@@ -1,15 +1,15 @@
 """Skill API Router - 技能管理"""
 
-from typing import Dict, Any, Optional, List
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
-from api.services.skill_service import SkillService
 from api.services.exceptions import ResourceNotFoundError
-
+from api.services.skill_service import SkillService
 
 router = APIRouter()
 
@@ -20,8 +20,8 @@ class RegisterSkillRequest(BaseModel):
     skill_name: str
     skill_version: str
     skill_code: str
-    description: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+    description: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class SkillResponse(BaseModel):
@@ -30,13 +30,13 @@ class SkillResponse(BaseModel):
     skill_name: str
     version: str
     description: str
-    metadata: Dict[str, Any]
-    created_at: Optional[str] = None
+    metadata: dict[str, Any]
+    created_at: str | None = None
 
 
 class SkillListResponse(BaseModel):
     """技能列表响应"""
-    skills: List[Dict[str, Any]]
+    skills: list[dict[str, Any]]
     total: int
     limit: int
     offset: int
@@ -46,7 +46,7 @@ class SkillVersionResponse(BaseModel):
     """技能版本响应"""
     version: str
     description: str
-    created_at: Optional[str] = None
+    created_at: str | None = None
 
 
 @router.post(
@@ -76,7 +76,7 @@ async def register_skill(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"注册技能失败: {str(e)}"
+            detail=f"注册技能失败: {e!s}"
         )
 
 
@@ -103,7 +103,7 @@ async def list_skills(
 )
 async def get_skill(
     skill_id: str,
-    version: Optional[str] = Query(None),
+    version: str | None = Query(None),
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -117,7 +117,7 @@ async def get_skill(
 
 @router.get(
     "/{skill_id}/versions",
-    response_model=List[SkillVersionResponse],
+    response_model=list[SkillVersionResponse],
     summary="列出技能版本"
 )
 async def list_skill_versions(

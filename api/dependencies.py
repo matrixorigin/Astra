@@ -1,6 +1,6 @@
 """Authentication dependencies with SQLAlchemy."""
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -18,25 +18,25 @@ def get_current_user(
     """Get current authenticated user."""
     try:
         payload = decode_token(credentials.credentials)
-        
+
         if not verify_token_type(payload, "access"):
             raise HTTPException(status_code=401, detail="Invalid token type")
-        
+
         user_id = payload.get("sub")
         username = payload.get("username")
-        
+
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token")
-        
+
         # Verify user exists
         repo = UserRepository(db)
         user = repo.get_by_id(user_id)
-        
+
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
-        
+
         return {"user_id": user_id, "username": username}
-        
+
     except HTTPException:
         raise
     except Exception:

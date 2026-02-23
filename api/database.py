@@ -1,11 +1,10 @@
 """Database connection and session management with SQLAlchemy."""
 
 from contextlib import contextmanager
-import json
 from decimal import Decimal
 
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy import text
+from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import get_settings
 
@@ -114,8 +113,9 @@ def get_db_context():
 
 def init_db():
     """Initialize database - create tables and indexes if not exist."""
-    from api.models import Base
     from sqlalchemy import inspect
+
+    from api.models import Base
 
     # Auto-discover skill models (skills/*/models.py) so their tables are in Base.metadata
     _import_skill_models()

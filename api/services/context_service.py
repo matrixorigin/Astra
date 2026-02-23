@@ -1,45 +1,45 @@
 """Context Service - 上下文快照管理"""
 
+import json
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
+from typing import Any
+
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
-import json
 
-from api.repositories import SessionRepository, EventRepository
-from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
-from core.auth.audit_logger import AuditLogger
 # from sqlalchemy.orm import Session
-from api.database import get_db_session
+from api.repositories import EventRepository, SessionRepository
+from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
+from core.auth.audit_logger import AuditLogger
 
 
 class ContextService:
     """Context 业务服务"""
-    
+
     def __init__(self, db_session: Session):
         self.db_session = db_session
         self.session_repo = SessionRepository(db_session)
         self.event_repo = EventRepository(db_session)
         # self.db = next(get_db_session())
         self.audit = AuditLogger(db_session)
-    
+
     def create_snapshot(
         self,
         user_id: str,
         session_id: str,
         event_id: str,
-        context_data: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        context_data: dict[str, Any]
+    ) -> dict[str, Any]:
         """创建上下文快照"""
         # 验证权限
         session = self.session_repo.get_by_id(session_id)
         if not session or session.user_id != user_id:
             raise PermissionDeniedError(f"无权限访问 Session {session_id}")
-        
+
         try:
             context_capture_id = str(uuid7())
-            
+
             # 插入快照 - 使用实际的表字段
             self.db_session.execute(
                 text("""
@@ -69,7 +69,7 @@ class ContextService:
                 }
             )
             self.db_session.commit()
-            
+
             # 审计日志
             self.audit.log(
                 user_id=user_id,
@@ -79,7 +79,7 @@ class ContextService:
                 details={"session_id": session_id, "event_id": event_id},
                 status="success"
             )
-            
+
             return {
                 "context_capture_id": context_capture_id,
                 "session_id": session_id,
@@ -87,7 +87,7 @@ class ContextService:
                 "context_data": context_data,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
-            
+
         except Exception as e:
             self.audit.log(
                 user_id=user_id,
@@ -98,12 +98,12 @@ class ContextService:
                 status="failed"
             )
             raise
-    
+
     def get_snapshot(
         self,
         context_capture_id: str,
         user_id: str
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """获取上下文快照"""
         try:
             result = self.db_session.execute(
@@ -119,14 +119,14 @@ class ContextService:
                     """),
                 {"context_capture_id": context_capture_id, "user_id": user_id}
                 )
-            
+
             row = result.first()
-            
+
             if not row:
                 raise ResourceNotFoundError(f"Snapshot {context_capture_id} 不存在")
-            
+
             result_dict = dict(row._mapping)
-            
+
             # 重构为 context_data
             context_data = {
                 "system_prompt": result_dict["system_prompt"],
@@ -140,7 +140,7 @@ class ContextService:
                 "relevance_scores": json.loads(result_dict["relevance_scores"]) if result_dict["relevance_scores"] else {},
                 "task_type": result_dict["task_type"]
             }
-            
+
             return {
                 "context_capture_id": result_dict["context_capture_id"],
                 "session_id": result_dict["session_id"],
@@ -151,15 +151,15 @@ class ContextService:
         except ResourceNotFoundError:
             raise
         except Exception as e:
-            raise ResourceNotFoundError(f"获取快照失败: {str(e)}")
-    
+            raise ResourceNotFoundError(f"获取快照失败: {e!s}")
+
     def list_snapshots(
         self,
         user_id: str,
-        session_id: Optional[str] = None,
+        session_id: str | None = None,
         limit: int = 50,
         offset: int = 0
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """列出上下文快照"""
         try:
             if session_id:
@@ -167,7 +167,7 @@ class ContextService:
                 session = self.session_repo.get_by_id(session_id)
                 if not session or session.user_id != user_id:
                     raise PermissionDeniedError(f"无权限访问 Session {session_id}")
-                
+
                 result = self.db_session.execute(
                     text("""
                         SELECT context_capture_id, session_id, event_id, created_at
@@ -179,7 +179,7 @@ class ContextService:
                     {"session_id": session_id, "limit": limit, "offset": offset}
                 )
                 snapshots = [dict(row._mapping) for row in result]
-                
+
                 count_result = self.db_session.execute(
                     text("SELECT COUNT(*) as total FROM context_snapshots WHERE session_id = :session_id"),
                     {"session_id": session_id}
@@ -198,7 +198,7 @@ class ContextService:
                     {"user_id": user_id, "limit": limit, "offset": offset}
                 )
                 snapshots = [dict(row._mapping) for row in result]
-                
+
                 count_result = self.db_session.execute(
                     text("""
                         SELECT COUNT(*) as total
@@ -209,7 +209,7 @@ class ContextService:
                     {"user_id": user_id}
                 )
                 total = count_result.first()._mapping["total"]
-            
+
             return {
                 "snapshots": [
                     {

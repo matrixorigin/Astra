@@ -3,7 +3,6 @@
 提供 Sandbox 管理的 REST API endpoints
 """
 
-from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -12,7 +11,6 @@ from sqlalchemy.orm import Session
 from api.database import get_db_session
 from api.dependencies import get_current_user
 from api.services.sandbox_service import SandboxService
-
 
 router = APIRouter(prefix="/sandbox", tags=["sandbox"])
 
@@ -34,7 +32,7 @@ class SandboxResponse(BaseModel):
 
 class SandboxListResponse(BaseModel):
     """Sandbox 列表响应"""
-    sandboxes: List[dict]
+    sandboxes: list[dict]
     total: int
 
 
@@ -77,7 +75,7 @@ async def create_sandbox(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"创建 sandbox 失败: {str(e)}"
+            detail=f"创建 sandbox 失败: {e!s}"
         )
 
 
@@ -88,7 +86,7 @@ async def create_sandbox(
     description="列出当前用户可访问的所有 sandboxes"
 )
 async def list_sandboxes(
-    pattern: Optional[str] = "%",
+    pattern: str | None = "%",
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
@@ -117,7 +115,7 @@ async def list_sandboxes(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"列出 sandboxes 失败: {str(e)}"
+            detail=f"列出 sandboxes 失败: {e!s}"
         )
 
 
@@ -152,7 +150,7 @@ async def get_sandbox(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取 sandbox 信息失败: {str(e)}"
+            detail=f"获取 sandbox 信息失败: {e!s}"
         )
 
 
@@ -188,5 +186,5 @@ async def delete_sandbox(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"删除 sandbox 失败: {str(e)}"
+            detail=f"删除 sandbox 失败: {e!s}"
         )

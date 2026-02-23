@@ -1,5 +1,15 @@
 """Router package."""
 
-from api.routers import agents, auth, events, sessions, replay, skills, context, decisions, streaming
+from api.routers import (
+    agents,
+    auth,
+    context,
+    decisions,
+    events,
+    replay,
+    sessions,
+    skills,
+    streaming,
+)
 
-__all__ = ["agents", "auth", "events", "sessions", "replay", "skills", "context", "decisions", "streaming"]
+__all__ = ["agents", "auth", "context", "decisions", "events", "replay", "sessions", "skills", "streaming"]

@@ -1,15 +1,15 @@
 """Decision API Router - 决策审计"""
 
-from typing import Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
 from api.services.decision_service import DecisionService
-from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
-
+from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 
 router = APIRouter()
 
@@ -20,8 +20,8 @@ class RecordDecisionRequest(BaseModel):
     event_id: str
     context_capture_id: str
     decision_type: str
-    decision_output: Dict[str, Any]
-    model_params: Optional[Dict[str, Any]] = None
+    decision_output: dict[str, Any]
+    model_params: dict[str, Any] | None = None
 
 
 class DecisionResponse(BaseModel):
@@ -31,8 +31,8 @@ class DecisionResponse(BaseModel):
     event_id: str
     context_capture_id: str
     decision_type: str
-    decision_output: Dict[str, Any]
-    model_params: Dict[str, Any]
+    decision_output: dict[str, Any]
+    model_params: dict[str, Any]
     created_at: str
 
 
@@ -43,15 +43,15 @@ class DecisionWithContextResponse(BaseModel):
     event_id: str
     context_capture_id: str
     decision_type: str
-    decision_output: Dict[str, Any]
-    model_params: Dict[str, Any]
-    context: Optional[Dict[str, Any]] = None
+    decision_output: dict[str, Any]
+    model_params: dict[str, Any]
+    context: dict[str, Any] | None = None
     created_at: str
 
 
 class DecisionListResponse(BaseModel):
     """决策列表响应"""
-    decisions: list[Dict[str, Any]]
+    decisions: list[dict[str, Any]]
     total: int
     limit: int
     offset: int
@@ -86,7 +86,7 @@ async def record_decision(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"记录决策失败: {str(e)}"
+            detail=f"记录决策失败: {e!s}"
         )
 
 
@@ -96,8 +96,8 @@ async def record_decision(
     summary="列出决策"
 )
 async def list_decisions(
-    session_id: Optional[str] = Query(None),
-    decision_type: Optional[str] = Query(None),
+    session_id: str | None = Query(None),
+    decision_type: str | None = Query(None),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db_session),

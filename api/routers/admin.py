@@ -5,11 +5,14 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
+from api.models import AuditLog, Token, UserFeedback
+from core.auth.encryption import encrypt_token
+from core.auth.permission_checker import PermissionChecker
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -56,7 +59,7 @@ class AuditLogResponse(BaseModel):
     resource_type: str
     resource_id: str | None
     timestamp: datetime
-    metadata: dict | None
+    details: dict | None  # Changed from metadata to details
 
 
 class PromptOptimizeRequest(BaseModel):
@@ -108,21 +111,11 @@ def require_admin(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_session),
 ) -> dict:
-    """Verify user has admin role."""
+    """Verify user has admin role using PermissionChecker."""
     user_id = current_user["user_id"]
+    checker = PermissionChecker(db)
 
-    # Check if user has mo_agent_admin role
-    result = db.execute(
-        text("""
-            SELECT r.role_name
-            FROM user_roles ur
-            JOIN roles r ON ur.role_id = r.role_id
-            WHERE ur.user_id = :user_id AND r.role_name = 'mo_agent_admin'
-        """),
-        {"user_id": user_id},
-    ).fetchone()
-
-    if not result:
+    if not checker.is_admin(user_id):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin role required",
@@ -154,10 +147,10 @@ def init_database(
             tables_created=0,  # init_db doesn't return count
         )
     except Exception as e:
-        return InitResponse(
-            message=f"Database initialization completed with warnings: {e!s}",
-            tables_created=0,
-        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database initialization failed: {e!s}",
+        ) from e
 
 
 @router.post("/tokens", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
@@ -166,50 +159,36 @@ def create_token(
     db: Session = Depends(get_db_session),
     _admin: dict = Depends(require_admin),
 ) -> TokenResponse:
-    """Create API/LLM token."""
-    try:
-        token_id = str(uuid4())
+    """Create API/LLM token with encryption."""
+    token_id = str(uuid4())
 
-        # Insert token into existing tokens table
-        db.execute(
-            text("""
-                INSERT INTO tokens (
-                    token_id, type, provider, encrypted_value, is_active,
-                    scope_user_id, scope_repo, created_at, metadata
-                ) VALUES (
-                    :token_id, :type, :provider, :encrypted_value, 1,
-                    :scope_user_id, :scope_repo, NOW(), :metadata
-                )
-            """),
-            {
-                "token_id": token_id,
-                "type": request.token_type,
-                "provider": request.provider or "unknown",
-                "encrypted_value": request.token_value or "",
-                "scope_user_id": request.scope_id if request.scope == "user" else None,
-                "scope_repo": request.scope_id if request.scope == "repo" else None,
-                "metadata": '{"scope": "' + request.scope + '"}',
-            },
-        )
-        db.commit()
+    # Encrypt token value if provided
+    encrypted_value = encrypt_token(request.token_value) if request.token_value else None
 
-        # Fetch created token
-        result = db.execute(
-            text("SELECT * FROM tokens WHERE token_id = :token_id"),
-            {"token_id": token_id},
-        ).fetchone()
+    # Create token using ORM
+    token = Token(
+        token_id=token_id,
+        type=request.token_type,
+        provider=request.provider or "unknown",
+        encrypted_value=encrypted_value,
+        is_active=1,
+        scope_user_id=request.scope_id if request.scope == "user" else None,
+        scope_repo=request.scope_id if request.scope == "repo" else None,
+        token_metadata={"scope": request.scope},
+    )
 
-        return TokenResponse(
-            token_id=result.token_id,
-            token_type=result.type,
-            provider=result.provider,
-            scope=request.scope,
-            scope_id=result.scope_user_id or result.scope_repo,
-            created_at=result.created_at,
-        )
-    except Exception:
-        db.rollback()
-        raise
+    db.add(token)
+    db.commit()
+    db.refresh(token)
+
+    return TokenResponse(
+        token_id=token.token_id,
+        token_type=token.type,
+        provider=token.provider,
+        scope=request.scope,
+        scope_id=token.scope_user_id or token.scope_repo,
+        created_at=token.created_at,
+    )
 
 
 @router.get("/tokens", response_model=list[TokenResponse])
@@ -219,45 +198,36 @@ def list_tokens(
     db: Session = Depends(get_db_session),
     _admin: dict = Depends(require_admin),
 ) -> list[TokenResponse]:
-    """List tokens."""
-    query = """
-        SELECT token_id, type, provider, scope_user_id, scope_repo, created_at,
-               CASE
-                   WHEN scope_user_id IS NOT NULL THEN 'user'
-                   WHEN scope_repo IS NOT NULL THEN 'repo'
-                   ELSE 'global'
-               END as scope_type,
-               COALESCE(scope_user_id, scope_repo) as scope_id
-        FROM tokens WHERE 1=1
-    """
-    params = {}
+    """List tokens using ORM."""
+    query = db.query(Token)
 
     if token_type:
-        query += " AND type = :token_type"
-        params["token_type"] = token_type
+        query = query.filter(Token.type == token_type)
 
     if scope:
         if scope == "user":
-            query += " AND scope_user_id IS NOT NULL"
+            query = query.filter(Token.scope_user_id.isnot(None))
         elif scope == "repo":
-            query += " AND scope_repo IS NOT NULL"
+            query = query.filter(Token.scope_repo.isnot(None))
         elif scope == "global":
-            query += " AND scope_user_id IS NULL AND scope_repo IS NULL"
+            query = query.filter(Token.scope_user_id.is_(None), Token.scope_repo.is_(None))
 
-    query += " ORDER BY created_at DESC"
-
-    results = db.execute(text(query), params).fetchall()
+    tokens = query.order_by(Token.created_at.desc()).all()
 
     return [
         TokenResponse(
-            token_id=row.token_id,
-            token_type=row.type,
-            provider=row.provider,
-            scope=row.scope_type,
-            scope_id=row.scope_id,
-            created_at=row.created_at,
+            token_id=token.token_id,
+            token_type=token.type,
+            provider=token.provider,
+            scope=(
+                "user" if token.scope_user_id
+                else "repo" if token.scope_repo
+                else "global"
+            ),
+            scope_id=token.scope_user_id or token.scope_repo,
+            created_at=token.created_at,
         )
-        for row in results
+        for token in tokens
     ]
 
 
@@ -269,34 +239,28 @@ def get_audit_logs(
     db: Session = Depends(get_db_session),
     _admin: dict = Depends(require_admin),
 ) -> list[AuditLogResponse]:
-    """Query audit logs."""
-    query = "SELECT * FROM audit_logs WHERE 1=1"
-    params = {"limit": limit}
+    """Query audit logs using ORM."""
+    query = db.query(AuditLog)
 
     if user_id:
-        query += " AND user_id = :user_id"
-        params["user_id"] = user_id
+        query = query.filter(AuditLog.user_id == user_id)
 
     if since:
-        query += " AND created_at >= :since"
-        params["since"] = since
+        query = query.filter(AuditLog.created_at >= since)
 
-    query += " ORDER BY created_at DESC LIMIT :limit"
+    logs = query.order_by(AuditLog.created_at.desc()).limit(limit).all()
 
-    results = db.execute(text(query), params).fetchall()
-
-    import json
     return [
         AuditLogResponse(
-            log_id=row.log_id,
-            user_id=row.user_id,
-            action=row.action,
-            resource_type=row.resource_type,
-            resource_id=row.resource_id,
-            timestamp=row.created_at,
-            metadata=json.loads(row.details) if hasattr(row, 'details') and row.details else None,
+            log_id=log.log_id,
+            user_id=log.user_id,
+            action=log.action,
+            resource_type=log.resource_type,
+            resource_id=log.resource_id,
+            timestamp=log.created_at,
+            details=log.details,  # Already a dict from JSON column
         )
-        for row in results
+        for log in logs
     ]
 
 
@@ -329,74 +293,42 @@ def get_feedback_stats(
     db: Session = Depends(get_db_session),
     _admin: dict = Depends(require_admin),
 ) -> FeedbackStatsResponse:
-    """Get feedback statistics."""
-    try:
-        # Create user_feedback table if not exists
-        db.execute(
-            text("""
-                CREATE TABLE IF NOT EXISTS user_feedback (
-                    feedback_id VARCHAR(64) PRIMARY KEY,
-                    user_id VARCHAR(255) NOT NULL,
-                    agent_id VARCHAR(255),
-                    session_id VARCHAR(64),
-                    event_id VARCHAR(64),
-                    rating INT,
-                    feedback_type VARCHAR(32),
-                    comment TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_agent (agent_id, created_at),
-                    INDEX idx_user (user_id, created_at)
-                )
-            """)
-        )
-        db.commit()
+    """Get feedback statistics using ORM."""
+    query = db.query(
+        func.count(UserFeedback.feedback_id).label("total"),
+        func.sum(func.if_(UserFeedback.rating >= 4, 1, 0)).label("positive"),
+        func.sum(func.if_(UserFeedback.rating <= 2, 1, 0)).label("negative"),
+        func.avg(UserFeedback.rating).label("avg_rating"),
+    )
 
-        query = """
-            SELECT
-                COUNT(*) as total,
-                SUM(CASE WHEN rating >= 4 THEN 1 ELSE 0 END) as positive,
-                SUM(CASE WHEN rating <= 2 THEN 1 ELSE 0 END) as negative,
-                AVG(rating) as avg_rating
-            FROM user_feedback
-            WHERE 1=1
-        """
-        params = {}
+    if agent_id:
+        query = query.filter(UserFeedback.agent_id == agent_id)
+    if since:
+        query = query.filter(UserFeedback.created_at >= since)
 
-        if agent_id:
-            query += " AND agent_id = :agent_id"
-            params["agent_id"] = agent_id
+    result = query.one()
 
-        if since:
-            query += " AND created_at >= :since"
-            params["since"] = since
+    # Get feedback by type
+    type_query = db.query(
+        UserFeedback.feedback_type,
+        func.count(UserFeedback.feedback_id).label("count"),
+    ).filter(UserFeedback.feedback_type.isnot(None))
 
-        result = db.execute(text(query), params).fetchone()
+    if agent_id:
+        type_query = type_query.filter(UserFeedback.agent_id == agent_id)
+    if since:
+        type_query = type_query.filter(UserFeedback.created_at >= since)
 
-        # Get feedback by type
-        type_query = """
-            SELECT feedback_type, COUNT(*) as count
-            FROM user_feedback
-            WHERE 1=1
-        """
-        if agent_id:
-            type_query += " AND agent_id = :agent_id"
-        if since:
-            type_query += " AND created_at >= :since"
-        type_query += " GROUP BY feedback_type"
+    type_results = type_query.group_by(UserFeedback.feedback_type).all()
+    feedback_by_type = {row.feedback_type: row.count for row in type_results}
 
-        type_results = db.execute(text(type_query), params).fetchall()
-        feedback_by_type = {row.feedback_type: row.count for row in type_results if row.feedback_type}
-
-        return FeedbackStatsResponse(
-            total_feedback=result.total or 0,
-            positive_feedback=result.positive or 0,
-            negative_feedback=result.negative or 0,
-            avg_rating=float(result.avg_rating) if result.avg_rating else None,
-            feedback_by_type=feedback_by_type,
-        )
-    except Exception:
-        db.rollback()
-        raise
+    return FeedbackStatsResponse(
+        total_feedback=result.total or 0,
+        positive_feedback=result.positive or 0,
+        negative_feedback=result.negative or 0,
+        avg_rating=float(result.avg_rating) if result.avg_rating else None,
+        feedback_by_type=feedback_by_type,
+    )
 
 
 @router.post("/feedback/export", response_model=FeedbackExportResponse)

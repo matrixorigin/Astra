@@ -1,13 +1,13 @@
 """Trigger API — create/manage webhook + cron triggers that fire AgentRuns."""
 
-from typing import Annotated, Optional
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from api.dependencies import get_current_user
 from api.database import get_db_session
+from api.dependencies import get_current_user
 
 router = APIRouter(prefix="/triggers")
 
@@ -17,14 +17,14 @@ class CreateTriggerRequest(BaseModel):
     name: str = Field(description="Human-readable name")
     agent_id: str = Field(default="dev-agent")
     user_input: str = Field(description="Message to send to the agent when fired")
-    context: Optional[dict] = None
-    cron_expr: Optional[str] = Field(default=None, description="Cron expression (for schedule)")
-    session_id: Optional[str] = Field(default=None, description="Reuse existing session")
+    context: dict | None = None
+    cron_expr: str | None = Field(default=None, description="Cron expression (for schedule)")
+    session_id: str | None = Field(default=None, description="Reuse existing session")
 
 
 class WebhookFireRequest(BaseModel):
     secret: str = Field(description="Webhook secret for authentication")
-    payload: Optional[dict] = None
+    payload: dict | None = None
 
 
 @router.post("")
@@ -61,7 +61,7 @@ async def delete_trigger(
     current_user: Annotated[dict, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db_session)],
 ):
-    from core.agent.triggers import get_trigger, delete_trigger
+    from core.agent.triggers import delete_trigger, get_trigger
     trig = get_trigger(db, trigger_id)
     if not trig:
         raise HTTPException(status_code=404, detail="Trigger not found")
@@ -78,7 +78,7 @@ async def fire_webhook(
     db: Annotated[Session, Depends(get_db_session)],
 ):
     """Fire a webhook trigger. No auth header needed — uses secret instead."""
-    from core.agent.triggers import get_trigger, fire_trigger, verify_secret
+    from core.agent.triggers import fire_trigger, get_trigger, verify_secret
     trig = get_trigger(db, trigger_id)
     if not trig:
         raise HTTPException(status_code=404, detail="Trigger not found")

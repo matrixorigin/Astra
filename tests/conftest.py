@@ -5,6 +5,9 @@ import os
 # Must be set BEFORE any app imports so database.py uses test DB on first import
 # os.environ takes priority over .env file in pydantic-settings
 
+# Set test encryption key
+os.environ["TOKEN_ENCRYPTION_KEY"] = "test-encryption-key-for-unit-tests-only"
+
 # Support parallel testing with worker-specific databases
 def get_worker_id():
     """Get pytest-xdist worker ID for database isolation."""

@@ -7,7 +7,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.database import init_db
-from api.routers import agents, auth, events, sessions, sandbox, replay, skills, context, decisions, streaming, marketplace, admin
+from api.routers import (
+    admin,
+    agents,
+    auth,
+    context,
+    decisions,
+    events,
+    marketplace,
+    replay,
+    sandbox,
+    sessions,
+    skills,
+    streaming,
+)
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -30,15 +43,15 @@ async def lifespan(app: FastAPI):
     await scheduler.start()
 
     # Restore workflows that were waiting when process died
-    from core.agent.async_tools import restore_waiting_workflows, cleanup_stale_workflows
+    from core.agent.async_tools import cleanup_stale_workflows, restore_waiting_workflows
     restored = restore_waiting_workflows()
     if restored:
         logger.info(f"Restored {restored} waiting workflow(s)")
 
     # Seed predefined agent roles
     try:
-        from core.agent.seed_agents import seed_agents
         from api.database import get_db_session
+        from core.agent.seed_agents import seed_agents
         db = next(get_db_session())
         seeded = seed_agents(db)
         if seeded:
@@ -60,8 +73,8 @@ async def lifespan(app: FastAPI):
         while True:
             await asyncio.sleep(30)
             try:
-                from core.agent.triggers import get_due_triggers, fire_trigger, claim_and_advance
                 from api.database import get_db_session as _get_db
+                from core.agent.triggers import claim_and_advance, fire_trigger, get_due_triggers
                 db = next(_get_db())
                 try:
                     due = get_due_triggers(db)
@@ -168,32 +181,40 @@ app.include_router(streaming.router, tags=["streaming (deprecated)"])
 
 # Chat API — unified conversation entry point
 from api.routers import chat
+
 app.include_router(chat.router, tags=["chat"])
 
 from api.routers import jobs
+
 app.include_router(jobs.router, tags=["jobs"])
 
 from api.routers import workflows
+
 app.include_router(workflows.router, tags=["workflows"])
 
 # Learning service API
 from api.routers import learning
+
 app.include_router(learning.router, tags=["learning"])
 
 # Evaluation — quality trends, drift, gate history, calibration
 from api.routers import evaluation
+
 app.include_router(evaluation.router, tags=["evaluation"])
 
 # Branches — zero-copy data branching (diff, merge, cost estimation)
 from api.routers import branches
+
 app.include_router(branches.router, tags=["branches"])
 
 # Triggers — webhook + cron → AgentRun
 from api.routers import triggers
+
 app.include_router(triggers.router, tags=["triggers"])
 
 # Data Versioning — checkpoints, lineage, sandbox checkpoint/restore
 from api.routers import data_versioning
+
 app.include_router(data_versioning.router)
 
 # Admin — system management (requires admin role)
@@ -203,9 +224,8 @@ app.include_router(admin.router, tags=["admin"])
 @app.get("/health")
 def health_check():
     """Health check endpoint."""
-    from sqlalchemy.orm import Session
     from api.database import get_db_session
-    
+
     db = next(get_db_session())
     # Simple health check - try to execute a query
     try:

@@ -9,10 +9,10 @@ from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
-from core.skills.pipeline import SkillPipeline
 from core.llm.client import LLMClient
 from core.logging_config import get_logger
 from core.skills.learning_signals import SignalType, SignalWeights
+from core.skills.pipeline import SkillPipeline
 
 logger = get_logger(__name__)
 
@@ -113,12 +113,12 @@ async def trigger_learning(
     try:
         # Parse signal types
         signal_types = [SignalType(st) for st in request.signal_types]
-        
+
         # Parse weights if provided
         weights = None
         if request.weights:
             weights = SignalWeights(**request.weights)
-        
+
         llm_client = LLMClient(db)
         pipeline = SkillPipeline(
             db, llm_client,
@@ -126,7 +126,7 @@ async def trigger_learning(
             learning=True,
             learning_weights=weights,
         )
-        
+
         # Trigger learning
         learn_result = pipeline.learn(days=request.days)
         result = {
@@ -136,7 +136,7 @@ async def trigger_learning(
         }
         if learn_result.error:
             result["error"] = learn_result.error
-        
+
         # Handle errors
         if result.get("error"):
             return LearningTriggerResponse(
@@ -146,7 +146,7 @@ async def trigger_learning(
                 error=result["error"],
                 message=result.get("message"),
             )
-        
+
         # Success
         return LearningTriggerResponse(
             status="success",
@@ -156,7 +156,7 @@ async def trigger_learning(
             improvement_pct=result.get("improvement_pct"),
             test_count=result.get("test_count"),
         )
-        
+
     except Exception as e:
         logger.error(f"Learning trigger failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -203,9 +203,9 @@ async def get_learning_stats(
     try:
         llm_client = LLMClient(db)
         pipeline = SkillPipeline(db, llm_client, audit=False, learning=True)
-        
+
         stats = pipeline.stats()
-        
+
         return LearningStatsResponse(
             total_learnings=stats["total_learnings"],
             high_confidence=stats["high_confidence"],
@@ -221,7 +221,7 @@ async def get_learning_stats(
             pass_rate=stats["regression_gates"]["pass_rate"],
             avg_improvement_pct=stats["regression_gates"]["avg_improvement_pct"],
         )
-        
+
     except Exception as e:
         logger.error(f"Get stats failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -250,31 +250,31 @@ async def submit_feedback(
     """
     try:
         from api.models import SkillSelectionEvent
-        
+
         # Find event
         event = db.query(SkillSelectionEvent).filter(
             SkillSelectionEvent.event_id == request.event_id
         ).first()
-        
+
         if not event:
             raise HTTPException(status_code=404, detail="Event not found")
-        
+
         # Update event based on feedback type
         if request.feedback_type == "wrong_skill":
             event.selection_correctness = 0
             event.correction_suggestion = request.correct_skills
-        
+
         if request.satisfaction_score:
             event.user_feedback_score = request.satisfaction_score
             event.selection_correctness = 1 if request.satisfaction_score >= 4 else 0
-        
+
         db.commit()
-        
+
         return FeedbackResponse(
             status="success",
             message=f"Feedback recorded for event {request.event_id}"
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:

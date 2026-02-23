@@ -52,14 +52,29 @@ conda create -n dev-agent python=3.11
 conda activate dev-agent
 make setup
 
-# 2. Start services (MatrixOne + Redis)
+# 2. Configure security (REQUIRED)
+# Generate encryption key
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+# Add to .env file:
+# TOKEN_ENCRYPTION_KEY=<generated-key>
+# JWT_SECRET_KEY=<your-secret-key-min-32-chars>
+
+# 3. Start services (MatrixOne + Redis)
 make dev-up
 
-# 3. Start API server
+# 4. Start API server
 uvicorn api.main:app --reload --port 8000
 
-# 4. Visit interactive docs
+# 5. Visit interactive docs
 open http://localhost:8000/docs
+```
+
+### Security Check
+
+```bash
+# Before deployment, run security check
+python scripts/check_security.py
 ```
 
 ### CLI Usage

@@ -23,7 +23,7 @@ _SAFE_IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]{0,127}$")
 
 def _check_ident(v: str) -> str:
     if not _SAFE_IDENT.match(v):
-        raise ValueError(f"Invalid identifier: must match [a-zA-Z_][a-zA-Z0-9_.]*")
+        raise ValueError("Invalid identifier: must match [a-zA-Z_][a-zA-Z0-9_.]*")
     return v
 
 
@@ -86,8 +86,8 @@ class CostEstimateResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _get_branch(db: Session):
-    from core.sandbox.branch import Branch
     from api.database import settings
+    from core.sandbox.branch import Branch
     return Branch(database=settings.matrixone_database, db=db)
 
 

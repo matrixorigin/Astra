@@ -1,16 +1,13 @@
 """User management module - ORM Version."""
 
-import hashlib
 from datetime import datetime, timezone
-from typing import Optional
 
+from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
+from api.models import RefreshToken, User
 from core.auth.password import hash_password, verify_password
 from core.logging_config import get_logger
-from sqlalchemy.orm import Session
-from api.database import get_db_session
-from api.models import User, RefreshToken
 
 logger = get_logger(__name__)
 
@@ -31,7 +28,7 @@ class UserManager:
         username: str,
         email: str,
         password: str,
-        display_name: Optional[str] = None,
+        display_name: str | None = None,
     ) -> dict:
         """Create a new user using ORM.
 
@@ -83,7 +80,7 @@ class UserManager:
             "display_name": display_name,
         }
 
-    def authenticate_user(self, username: str, password: str) -> Optional[dict]:
+    def authenticate_user(self, username: str, password: str) -> dict | None:
         """Authenticate user with username and password using ORM.
 
         Args:
@@ -112,7 +109,7 @@ class UserManager:
             "is_active": user.is_active,
         }
 
-    def get_user(self, user_id: str) -> Optional[dict]:
+    def get_user(self, user_id: str) -> dict | None:
         """Get user by ID using ORM.
 
         Args:
@@ -187,7 +184,7 @@ class UserManager:
             Token ID
         """
         from core.auth.password import hash_password
-        
+
         token_id = str(uuid7())
         refresh_token = RefreshToken(
             token_id=token_id,
@@ -201,7 +198,7 @@ class UserManager:
         self.db.commit()
         return token_id
 
-    def verify_refresh_token(self, token: str) -> Optional[str]:
+    def verify_refresh_token(self, token: str) -> str | None:
         """Verify refresh token using ORM.
 
         Args:
@@ -211,7 +208,7 @@ class UserManager:
             User ID if token is valid, None otherwise
         """
         from core.auth.password import verify_password
-        
+
         rt = self.db.query(RefreshToken).filter(RefreshToken.expires_at > datetime.now(timezone.utc)).all()
 
         for refresh_token in rt:
@@ -230,7 +227,7 @@ class UserManager:
             True if revoked successfully, False if token not found
         """
         from core.auth.password import verify_password
-        
+
         rt = self.db.query(RefreshToken).all()
 
         for refresh_token in rt:

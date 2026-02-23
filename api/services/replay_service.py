@@ -11,14 +11,15 @@ Key feature: ToolMockingLayer integration for safe replay without side effects
 
 import json
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Any
+
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
-from api.repositories import SessionRepository, EventRepository
-from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
+from api.repositories import EventRepository, SessionRepository
+from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
-from core.skills.mocking import ToolMockingLayer, MockMode
+from core.skills.mocking import MockMode, ToolMockingLayer
 
 
 class ReplayService:
@@ -29,7 +30,7 @@ class ReplayService:
     - compare_outputs: Compare original and replayed outputs
     - _replay_event: Replay single event (internal method)
     """
-    
+
     def __init__(self, db_session: Session):
         """Initialize Replay service
         
@@ -40,15 +41,15 @@ class ReplayService:
         self.session_repo = SessionRepository(db_session)
         self.event_repo = EventRepository(db_session)
         self.audit = AuditLogger(db_session)
-    
+
     def replay_session(
         self,
         session_id: str,
         user_id: str,
-        sandbox_name: Optional[str] = None,
+        sandbox_name: str | None = None,
         mock_mode: bool = True,
-        skill_version_override: Optional[Dict[str, str]] = None
-    ) -> Dict[str, Any]:
+        skill_version_override: dict[str, str] | None = None
+    ) -> dict[str, Any]:
         """Replay a session with side-effect isolation
         
         Uses ToolMockingLayer to prevent real-world side effects during replay.
@@ -94,14 +95,14 @@ class ReplayService:
         session = self.session_repo.get_by_id(session_id)
         if not session:
             raise ResourceNotFoundError(f"Session {session_id} not found")
-        
+
         if session.user_id != user_id:
             raise PermissionDeniedError(f"Permission denied for Session {session_id}")
-        
+
         try:
             # 2. Fetch all events from session (in chronological order)
             events, total = self.event_repo.get_by_session(session_id)
-            
+
             # 3. Replay each event
             replayed_events = []
             for event in events:
@@ -111,10 +112,10 @@ class ReplayService:
                     skill_version_override=skill_version_override
                 )
                 replayed_events.append(replayed_event)
-            
+
             # 4. Generate replay ID
             replay_id = str(uuid7())
-            
+
             # 5. Build replay result
             replay_result = {
                 "events": replayed_events,
@@ -122,7 +123,7 @@ class ReplayService:
                 "successful": sum(1 for e in replayed_events if e.get("success", False)),
                 "failed": sum(1 for e in replayed_events if not e.get("success", False))
             }
-            
+
             # 6. Record audit log
             self.audit.log(
                 user_id=user_id,
@@ -139,7 +140,7 @@ class ReplayService:
                 },
                 status="success"
             )
-            
+
             return {
                 "replay_id": replay_id,
                 "session_id": session_id,
@@ -150,7 +151,7 @@ class ReplayService:
                 "result": replay_result,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
-            
+
         except Exception as e:
             # Record audit failure
             self.audit.log(
@@ -162,13 +163,13 @@ class ReplayService:
                 status="failed"
             )
             raise
-    
+
     def _replay_event(
         self,
         event: Any,
         mock_mode: bool,
-        skill_version_override: Optional[Dict[str, str]]
-    ) -> Dict[str, Any]:
+        skill_version_override: dict[str, str] | None
+    ) -> dict[str, Any]:
         """Replay a single event with side-effect isolation
         
         Uses ToolMockingLayer for safe replay:
@@ -195,24 +196,24 @@ class ReplayService:
             session=self.db_session,
             session_id=event.session_id if mock_mode else None
         )
-        
+
         try:
             if event.event_type == "skill_invocation":
                 # Replay skill invocation
                 skill_name = event.skill_name
                 skill_version = skill_version_override.get(skill_name) if skill_version_override else event.skill_version
-                
+
                 # Parse skill params from metadata
                 metadata = json.loads(event.metadata) if event.metadata else {}
                 skill_params = metadata.get("skill_params", {})
-                
+
                 # Invoke skill through mocking layer
                 result = mocker.invoke_skill(
                     skill_name=skill_name,
                     params=skill_params,
                     skill_version=skill_version
                 )
-                
+
                 return {
                     "event_id": event.event_id,
                     "event_type": event.event_type,
@@ -220,7 +221,7 @@ class ReplayService:
                     "content": json.dumps(result),
                     "error": None
                 }
-            
+
             else:
                 # For other event types, return original content
                 return {
@@ -230,7 +231,7 @@ class ReplayService:
                     "content": event.content,
                     "error": None
                 }
-        
+
         except Exception as e:
             return {
                 "event_id": event.event_id,
@@ -239,13 +240,13 @@ class ReplayService:
                 "content": None,
                 "error": str(e)
             }
-    
+
     def compare_outputs(
         self,
         session_id: str,
         user_id: str,
-        replay_result: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        replay_result: dict[str, Any]
+    ) -> dict[str, Any]:
         """Compare original outputs with replayed outputs
         
         Compares original session with replayed results for:
@@ -269,14 +270,14 @@ class ReplayService:
         session = self.session_repo.get_by_id(session_id)
         if not session or session.user_id != user_id:
             raise PermissionDeniedError(f"Permission denied for Session {session_id}")
-        
+
         # 2. Fetch original events
         original_events, _ = self.event_repo.get_by_session(session_id)
-        
+
         # 3. Simple comparison: Calculate event count difference
         original_count = len(original_events)
         replay_count = len(replay_result.get("events", []))
-        
+
         # 4. Detailed comparison: Per-event content comparison
         details = []
         mismatched = 0
@@ -292,7 +293,7 @@ class ReplayService:
                     "replayed": replay.get("content", "")[:100],
                     "match": False
                 })
-        
+
         return {
             "session_id": session_id,
             "original_event_count": original_count,

@@ -5,8 +5,8 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from api.dependencies import get_current_user
 from api.database import get_db_session
+from api.dependencies import get_current_user
 from core.jobs.backend import JobRequirements, JobStatus
 from core.jobs.router import JobRouter
 

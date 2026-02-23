@@ -1,20 +1,20 @@
 """Event Service - 业务逻辑层"""
 
-from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Any
+
 from sqlalchemy.orm import Session
 
 from api.repositories import EventRepository, SessionRepository
-from api.services.exceptions import ResourceNotFoundError, PermissionDeniedError
+from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
+
 # from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 
 class EventService:
     """Event 业务服务"""
-    
+
     def __init__(self, db_session: Session):
         self.db_session = db_session
         self.event_repo = EventRepository(db_session)
@@ -22,19 +22,19 @@ class EventService:
         # self.db = next(get_db_session())  # For audit and permission
         self.audit = AuditLogger(db_session)
         self.permission = PermissionChecker(db_session)
-    
+
     def create_event(
         self,
         user_id: str,
         session_id: str,
         event_type: str,
         content: str,
-        agent_id: Optional[str] = None,
-        agent_version: Optional[str] = None,
-        parent_event_id: Optional[str] = None,
-        causal_chain_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+        agent_id: str | None = None,
+        agent_version: str | None = None,
+        parent_event_id: str | None = None,
+        causal_chain_id: str | None = None,
+        metadata: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """创建 Event
         
         Args:
@@ -59,19 +59,19 @@ class EventService:
         if not session or session.user_id != user_id:
             # 统一返回"不存在"，避免泄露资源存在性
             raise ResourceNotFoundError(f"Session {session_id} 不存在")
-        
+
         # 2. 设置默认值
         if metadata is None:
             metadata = {}
-        
+
         # 3. 如果没有提供causal_chain_id，生成新的
         if causal_chain_id is None:
             from uuid_utils import uuid7
             causal_chain_id = str(uuid7())
-        
+
         try:
             from uuid_utils import uuid7
-            
+
             event_data = {
                 "event_id": str(uuid7()),  # 生成event_id
                 "user_id": user_id,
@@ -84,9 +84,9 @@ class EventService:
                 "causal_chain_id": causal_chain_id,
                 "event_metadata": metadata  # 使用正确的字段名
             }
-            
+
             event = self.event_repo.create(event_data)
-            
+
             # 4. 更新Session的事件计数
             try:
                 self.session_repo.update(session_id, {
@@ -95,7 +95,7 @@ class EventService:
             except:
                 # 静默失败，不影响主流程
                 pass
-            
+
             # 5. 审计日志
             self.audit.log(
                 user_id=user_id,
@@ -109,7 +109,7 @@ class EventService:
                 },
                 status="success"
             )
-            
+
             return {
                 "event_id": event.event_id,
                 "user_id": event.user_id,
@@ -123,7 +123,7 @@ class EventService:
                 "metadata": event.event_metadata or {},
                 "created_at": event.created_at.isoformat()
             }
-            
+
         except Exception as e:
             # 审计失败
             self.audit.log(
@@ -135,8 +135,8 @@ class EventService:
                 status="failed"
             )
             raise
-    
-    def get_event(self, event_id: str, user_id: str) -> Dict[str, Any]:
+
+    def get_event(self, event_id: str, user_id: str) -> dict[str, Any]:
         """获取 Event 信息
         
         Args:
@@ -150,14 +150,14 @@ class EventService:
             ValueError: Event不存在或无权限
         """
         event = self.event_repo.get_by_id(event_id)
-        
+
         if not event:
             raise ResourceNotFoundError(f"Event {event_id} 不存在")
-        
+
         # 权限检查 - 只能访问自己的Event
         if event.user_id != user_id:
             raise PermissionDeniedError(f"无权限访问 Event {event_id}")
-        
+
         return {
             "event_id": event.event_id,
             "user_id": event.user_id,
@@ -171,17 +171,17 @@ class EventService:
             "metadata": event.event_metadata or {},
             "created_at": event.created_at.isoformat()
         }
-    
+
     def list_events(
         self,
         user_id: str,
-        session_id: Optional[str] = None,
-        event_type: Optional[str] = None,
-        agent_id: Optional[str] = None,
-        causal_chain_id: Optional[str] = None,
+        session_id: str | None = None,
+        event_type: str | None = None,
+        agent_id: str | None = None,
+        causal_chain_id: str | None = None,
         limit: int = 50,
         offset: int = 0
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """列出用户的 Events
         
         Args:
@@ -205,7 +205,7 @@ class EventService:
             limit=limit,
             offset=offset
         )
-        
+
         return {
             "events": [
                 {
@@ -227,12 +227,12 @@ class EventService:
             "limit": limit,
             "offset": offset
         }
-    
+
     def get_causal_chain(
         self,
         causal_chain_id: str,
         user_id: str
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """获取因果链中的所有事件
         
         Args:
@@ -243,7 +243,7 @@ class EventService:
             因果链中的所有事件，按时间排序
         """
         events = self.event_repo.get_by_causal_chain(causal_chain_id, user_id)
-        
+
         return [
             {
                 "event_id": event.event_id,
@@ -260,14 +260,14 @@ class EventService:
             }
             for event in events
         ]
-    
+
     def get_session_events(
         self,
         session_id: str,
         user_id: str,
         limit: int = 100,
         offset: int = 0
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """获取Session中的所有事件
         
         Args:
@@ -286,16 +286,16 @@ class EventService:
         session = self.session_repo.get_by_id(session_id)
         if not session:
             raise ValueError(f"Session {session_id} 不存在")
-        
+
         if session.user_id != user_id:
             raise ValueError(f"无权限访问 Session {session_id}")
-        
+
         events, total = self.event_repo.get_by_session(
             session_id=session_id,
             limit=limit,
             offset=offset
         )
-        
+
         return {
             "events": [
                 {
@@ -317,7 +317,7 @@ class EventService:
             "limit": limit,
             "offset": offset
         }
-    
+
     def delete_event(self, event_id: str, user_id: str) -> None:
         """删除 Event
         
@@ -329,17 +329,17 @@ class EventService:
             ValueError: Event不存在或无权限
         """
         event = self.event_repo.get_by_id(event_id)
-        
+
         if not event:
             raise ValueError(f"Event {event_id} 不存在")
-        
+
         # 权限检查
         if event.user_id != user_id:
             raise ValueError(f"无权限删除 Event {event_id}")
-        
+
         try:
             self.event_repo.delete(event_id)
-            
+
             # 审计日志
             self.audit.log(
                 user_id=user_id,
@@ -349,7 +349,7 @@ class EventService:
                 details={"event_type": event.event_type},
                 status="success"
             )
-            
+
         except Exception as e:
             # 审计失败
             self.audit.log(

@@ -1,16 +1,16 @@
 """Chat API endpoints — unified conversation entry point with durable AgentRun."""
 
 import json
-from typing import Annotated, Optional
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
-from api.dependencies import get_current_user
 from api.database import get_db_session
+from api.dependencies import get_current_user
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -24,9 +24,9 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     """Chat request — session_id optional (auto-created if omitted)."""
     message: str = Field(description="User message")
-    session_id: Optional[str] = Field(default=None, description="Session ID (auto-created if omitted)")
-    agent_id: Optional[str] = Field(default=None, description="Agent ID")
-    context: Optional[dict] = Field(default=None, description="Optional context")
+    session_id: str | None = Field(default=None, description="Session ID (auto-created if omitted)")
+    agent_id: str | None = Field(default=None, description="Agent ID")
+    context: dict | None = Field(default=None, description="Optional context")
     max_candidates: int = Field(default=5, description="Max skill candidates")
 
 
@@ -41,7 +41,7 @@ class RunStatusResponse(BaseModel):
     run_id: str
     session_id: str
     status: str
-    waiting_for: Optional[str] = None
+    waiting_for: str | None = None
     events_count: int = 0
 
 
@@ -49,7 +49,7 @@ class RunStatusResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _ensure_session(db: Session, user_id: str, session_id: Optional[str], agent_id: Optional[str]) -> str:
+def _ensure_session(db: Session, user_id: str, session_id: str | None, agent_id: str | None) -> str:
     """Return existing session_id or create a new one."""
     if session_id:
         row = db.execute(
@@ -70,22 +70,22 @@ def _build_chat_loop(db: Session):
     """Build ChatLoop with all dependencies."""
     from core.agent.chat_loop import ChatLoop
     from core.agent.executor import AgentExecutor
+    from core.code_executor import CodeExecutor
     from core.context.manager import ContextManager
     from core.events.event_logger import EventLogger
-    from core.verification.firewall import HallucinationFirewall
     from core.llm.client import LLMClient
+    from core.runtime import IsolationLevel, create_runtime
+    from core.skills.builtin import register_builtin_skills
     from core.skills.pipeline import SkillPipeline
     from core.skills.registry import SkillRegistry
-    from core.skills.builtin import register_builtin_skills
-    from core.runtime import create_runtime, IsolationLevel
-    from core.code_executor import CodeExecutor
+    from core.verification.firewall import HallucinationFirewall
 
     event_logger = EventLogger(db)
     llm_client = LLMClient()
 
     # Wire GateTrigger so skill/prompt changes auto-trigger regression gate
-    from core.evaluation.gate_trigger import GateTrigger
     from api.database import SessionLocal as _gate_session_factory
+    from core.evaluation.gate_trigger import GateTrigger
     gate_trigger = GateTrigger(db_factory=_gate_session_factory)
 
     skill_registry = SkillRegistry(db, gate_trigger=gate_trigger)
@@ -97,9 +97,9 @@ def _build_chat_loop(db: Session):
     context_manager = ContextManager(db, gate_trigger=gate_trigger)
     selector = SkillPipeline(db, llm_client, audit=True, learning=True)
 
-    from core.skills.skill_manager import SkillManager
-    from core.skills.credential_manager import CredentialManager
     from config.settings import get_settings
+    from core.skills.credential_manager import CredentialManager
+    from core.skills.skill_manager import SkillManager
     skill_mgr = SkillManager(db, CredentialManager(get_settings().secret_key))
     executor = AgentExecutor(db, skill_registry, skill_manager=skill_mgr)
 

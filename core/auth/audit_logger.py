@@ -1,9 +1,7 @@
 """Audit logger for tracking admin operations."""
 
-import json
 from datetime import datetime
 from typing import Any
-from uuid_utils import uuid7
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -31,8 +29,9 @@ class AuditLogger:
         log_id = f"log_{generate_log_id()}"
 
         from sqlalchemy import insert
+
         from api.models import AuditLog
-        
+
         self.db.execute(
             insert(AuditLog).values(
                 log_id=log_id,
@@ -107,8 +106,7 @@ class AuditLogger:
         limit: int = 100,
     ):
         """Query audit logs."""
-        from sqlalchemy import text
-        
+
         conditions = []
         params = {}
 

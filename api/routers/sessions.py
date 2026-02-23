@@ -1,7 +1,8 @@
 """Session API Router - 使用服务层"""
 
-from typing import Dict, Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -9,37 +10,36 @@ from api.database import get_db_session
 from api.dependencies import get_current_user
 from api.services.session_service import SessionService
 
-
 router = APIRouter()
 
 
 # Request/Response Models
 class CreateSessionRequest(BaseModel):
     """创建 Session 请求"""
-    agent_id: Optional[str] = None
-    title: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+    agent_id: str | None = None
+    title: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class UpdateSessionRequest(BaseModel):
     """更新 Session 请求"""
-    title: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
-    status: Optional[str] = None
+    title: str | None = None
+    metadata: dict[str, Any] | None = None
+    status: str | None = None
 
 
 class SessionResponse(BaseModel):
     """Session 响应"""
     session_id: str
     user_id: str
-    agent_id: Optional[str] = None
+    agent_id: str | None = None
     title: str
-    metadata: Dict[str, Any]
+    metadata: dict[str, Any]
     status: str
     event_count: int
     created_at: str
-    updated_at: Optional[str] = None
-    ended_at: Optional[str] = None
+    updated_at: str | None = None
+    ended_at: str | None = None
 
 
 class SessionListResponse(BaseModel):
@@ -81,7 +81,7 @@ async def create_session(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"创建 Session 失败: {str(e)}"
+            detail=f"创建 Session 失败: {e!s}"
         )
 
 
@@ -92,8 +92,8 @@ async def create_session(
     description="列出当前用户的会话"
 )
 async def list_sessions(
-    agent_id: Optional[str] = Query(None, description="过滤Agent ID"),
-    session_status: Optional[str] = Query(None, description="过滤状态"),
+    agent_id: str | None = Query(None, description="过滤Agent ID"),
+    session_status: str | None = Query(None, description="过滤状态"),
     limit: int = Query(50, ge=1, le=100, description="限制数量"),
     offset: int = Query(0, ge=0, description="偏移量"),
     db: Session = Depends(get_db_session),
@@ -113,7 +113,7 @@ async def list_sessions(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取 Sessions 失败: {str(e)}"
+            detail=f"获取 Sessions 失败: {e!s}"
         )
 
 
@@ -141,7 +141,7 @@ async def get_session(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"获取 Session 失败: {str(e)}"
+            detail=f"获取 Session 失败: {e!s}"
         )
 
 
@@ -176,7 +176,7 @@ async def update_session(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"更新 Session 失败: {str(e)}"
+            detail=f"更新 Session 失败: {e!s}"
         )
 
 
@@ -203,7 +203,7 @@ async def delete_session(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"删除 Session 失败: {str(e)}"
+            detail=f"删除 Session 失败: {e!s}"
         )
 
 
@@ -235,5 +235,5 @@ async def close_session(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"关闭 Session 失败: {str(e)}"
+            detail=f"关闭 Session 失败: {e!s}"
         )

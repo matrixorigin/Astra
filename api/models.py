@@ -1,9 +1,21 @@
 """SQLAlchemy ORM models."""
 
-from sqlalchemy import Column, DateTime, Integer, SmallInteger, String, Text, JSON, ForeignKey, Float, Index, UniqueConstraint
+from matrixone import VectorPrecision, VectorType
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
+from sqlalchemy import (
+    JSON,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.sql import func
-from matrixone import VectorType, VectorPrecision
 
 from api.base import Base
 
@@ -51,7 +63,7 @@ class SelectorGateResult(Base):
 class GateResult(Base):
     """Unified gate validation results for all change types."""
     __tablename__ = "gate_results"
-    
+
     gate_id = Column(String(36), primary_key=True)
     change_type = Column(String(20), nullable=False)  # prompt/skill/config/selector
     change_id = Column(String(128), nullable=False)  # e.g., "code_review@v3"
@@ -74,7 +86,7 @@ class Config(Base):
     description = Column(Text)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-    
+
     __table_args__ = (
         # Unique constraint for the logical key
         UniqueConstraint('key_name', 'scope_type', 'scope_user_id', name='uq_config_scope'),
@@ -145,7 +157,7 @@ class Event(Base):
     __table_args__ = (
         FulltextIndex("ft_content_session", ["content", "session_id"], parser=FulltextParserType.NGRAM),
     )
-    
+
     event_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), nullable=False, index=True)
     user_id = Column(String(36), nullable=False, index=True)
@@ -172,7 +184,7 @@ class Event(Base):
     skill_name = Column(String(255))
     skill_version = Column(String(32))
     skill_result = Column(JSON)
-    
+
     # High-frequency query fields extracted from JSON for indexing
     run_id = Column(String(255), index=True)
     parent_run_id = Column(String(255), index=True)
@@ -393,6 +405,19 @@ class Token(Base):
     token_metadata = Column("metadata", JSON)
 
 
+class UserFeedback(Base):
+    __tablename__ = "user_feedback"
+    feedback_id = Column(String(64), primary_key=True)
+    user_id = Column(String(255), nullable=False, index=True)
+    agent_id = Column(String(255), index=True)
+    session_id = Column(String(64))
+    event_id = Column(String(64))
+    rating = Column(Integer)
+    feedback_type = Column(String(32))
+    comment = Column(Text)
+    created_at = Column(DateTime, default=func.now())
+
+
 class SkillSelectionEvent(Base):
     __tablename__ = "skill_selection_events"
     __table_args__ = (
@@ -469,23 +494,23 @@ class AgentScratchpad(Base):
         Index('idx_scratchpad_user', 'user_id'),
         Index('idx_scratchpad_type', 'note_type'),
     )
-    
+
     note_id = Column(String(64), primary_key=True)
     session_id = Column(String(64), nullable=False)
     user_id = Column(String(64), nullable=False)
     agent_id = Column(String(64))
-    
+
     # Note content
     note_type = Column(String(50), nullable=False)  # plan | hypothesis | finding | todo | decision
     content = Column(Text, nullable=False)
-    
+
     # Lifecycle
     status = Column(String(20), default="active")  # active | completed | superseded
-    
+
     # Linkage
     related_event_ids = Column(JSON)
     related_note_ids = Column(JSON)
-    
+
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

@@ -808,7 +808,7 @@ def extract_training_data(
     _user: dict = Depends(get_current_user),
 ):
     """Extract high-quality conversation pairs as training data."""
-    from core.data_versioning.training_data_pipeline import TrainingDataPipeline, DatasetConfig
+    from core.data_versioning.training_data_pipeline import DatasetConfig, TrainingDataPipeline
     from core.utils.id_generator import generate_id
     pipeline = TrainingDataPipeline(db)
     dataset_id = generate_id()

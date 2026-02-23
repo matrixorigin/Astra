@@ -1,6 +1,6 @@
 """Marketplace API Router — skill install/uninstall/upgrade + credential management."""
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -9,10 +9,10 @@ from api.dependencies import get_current_user
 from config.settings import get_settings
 from core.skills.credential_manager import CredentialManager
 from core.skills.skill_manager import (
+    PermissionDeniedError,
     SkillManager,
     SkillNotFoundError,
     SkillNotInstalledError,
-    PermissionDeniedError,
 )
 
 router = APIRouter()
