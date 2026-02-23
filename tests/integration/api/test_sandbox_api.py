@@ -45,10 +45,7 @@ def auth_token(test_user):
     })
 
 
-@pytest.fixture
-def auth_headers(auth_token):
-    """Auth headers"""
-    return {"Authorization": f"Bearer {auth_token}"}
+# auth_headers fixture now provided by tests/integration/conftest.py
 
 
 @pytest.fixture(autouse=True)

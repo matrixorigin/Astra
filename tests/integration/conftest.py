@@ -1,5 +1,6 @@
 """Shared fixtures for integration tests."""
 
+import os
 import pytest
 from uuid import uuid4
 
@@ -7,13 +8,24 @@ from api.repositories.user_repository import UserRepository
 from core.auth.password import hash_password
 
 
+def _get_worker_suffix():
+    """Get unique suffix for parallel test workers."""
+    worker_id = os.getenv("PYTEST_XDIST_WORKER", "master")
+    return f"_{worker_id}" if worker_id != "master" else ""
+
+
 @pytest.fixture
 def test_user(db_session):
-    """Create a test user for API tests."""
+    """Create a test user for API tests (worker-isolated)."""
     repo = UserRepository(db_session)
     
+    # Use worker-specific username/email to avoid conflicts
+    worker_suffix = _get_worker_suffix()
+    username = f"testuser{worker_suffix}"
+    email = f"test{worker_suffix}@example.com"
+    
     # Clean up any existing test user
-    existing = repo.get_by_username("testuser")
+    existing = repo.get_by_username(username)
     if existing:
         repo.delete(existing.user_id)
         db_session.commit()
@@ -21,8 +33,8 @@ def test_user(db_session):
     # Create new test user
     user_data = {
         "user_id": str(uuid4()),
-        "username": "testuser",
-        "email": "test@example.com",
+        "username": username,
+        "email": email,
         "password_hash": hash_password("testpass123"),
         "is_active": True,
     }
@@ -38,6 +50,22 @@ def test_user(db_session):
         db_session.commit()
     except:
         pass
+
+
+@pytest.fixture
+def auth_headers(client, test_user):
+    """Get authentication headers (worker-isolated)."""
+    # Login with the worker-specific username
+    response = client.post(
+        "/auth/login",
+        json={
+            "username": test_user.username,
+            "password": "testpass123",
+        },
+    )
+    
+    token = response.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.fixture

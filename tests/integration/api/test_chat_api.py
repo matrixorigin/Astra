@@ -25,10 +25,7 @@ def db_session():
     session.close()
 
 
-@pytest.fixture
-def auth_headers(client, test_user):
-    resp = client.post("/auth/login", json={"username": "testuser", "password": "testpass123"})
-    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+# auth_headers fixture now provided by tests/integration/conftest.py
 
 
 def _mock_engine(reply="Hello back!", status=RunStatus.PENDING):

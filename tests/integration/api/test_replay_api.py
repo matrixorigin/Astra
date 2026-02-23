@@ -22,20 +22,7 @@ def db_session():
     session.close()
 
 
-@pytest.fixture
-def auth_headers(client, test_user):
-    """Get authentication headers."""
-    # Login to get token
-    response = client.post(
-        "/auth/login",
-        json={
-            "username": "testuser",
-            "password": "testpass123",
-        },
-    )
-    
-    token = response.json()["access_token"]
-    return {"Authorization": f"Bearer {token}"}
+# auth_headers fixture now provided by tests/integration/conftest.py
 
 
 @pytest.fixture
