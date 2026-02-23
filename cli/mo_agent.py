@@ -12,26 +12,29 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import asyncio
 import json
 
-from core.agent.chat_loop import ChatLoop
-from core.agent.executor import AgentExecutor
-from core.context import ContextManager
-from core.events.event_logger import EventLogger
-from core.events.models import StreamEventType
-from core.events.session_manager import SessionManager
-from core.llm.client import LLMClient
-from core.skills.builtin import register_builtin_skills
-from core.skills.mocking import MockMode
-from core.skills.pipeline import SkillPipeline
-from core.skills.registry import SkillRegistry
-from sqlalchemy.orm import Session
-from api.database import get_db_session
+
+# Global context for API mode
+class CLIContext:
+    def __init__(self):
+        self.api_mode = False
+        self.api_client = None
+
+
+pass_context = click.make_pass_decorator(CLIContext, ensure=True)
 
 
 @click.group()
+@click.option("--api", is_flag=True, help="Use API mode (default: direct DB)")
+@click.option("--api-url", default="http://localhost:8000", help="API server URL")
+@click.pass_context
 @click.version_option(version="0.1.0")
-def cli():
+def cli(ctx, api, api_url):
     """mo-agent - Event-centric intelligent agent platform."""
-    pass
+    ctx.obj = CLIContext()
+    ctx.obj.api_mode = api
+    if api:
+        from cli.api_client import APIClient
+        ctx.obj.api_client = APIClient(base_url=api_url)
 
 
 @cli.command()

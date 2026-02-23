@@ -59,5 +59,7 @@ temp/
 # Docker volumes
 mo-data/
 
+feedback_export.jsonl
+
 # VCR cassettes (optional - commit them for CI)
 # fixtures/vcr_cassettes/*.yaml

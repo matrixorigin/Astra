@@ -127,6 +127,20 @@ class APIClient:
     # Authentication
     # ============================================================================
 
+    async def ensure_authenticated(self) -> bool:
+        """Check if user is authenticated.
+        
+        Returns:
+            True if authenticated, False otherwise
+        """
+        if not self._access_token:
+            return False
+        try:
+            await self.get_current_user()
+            return True
+        except Exception:
+            return False
+
     async def register(self, username: str, password: str, email: str) -> dict[str, Any]:
         """Register new user."""
         response = await self._request(
