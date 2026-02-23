@@ -68,6 +68,11 @@ class MemoryGovernanceEngine:
     def __init__(self, db: Session, llm_client=None):
         self.db = db
         self.llm_client = llm_client
+
+    def _get_agent_ids(self) -> list[str]:
+        """Return all agent IDs for SLO checking."""
+        from api.models import Agent
+        return [a.agent_id for a in self.db.query(Agent.agent_id).all()]
     
     def run_hourly_tasks(self) -> dict[str, int]:
         """Run hourly governance tasks.
@@ -139,11 +144,12 @@ class MemoryGovernanceEngine:
         try:
             from core.evaluation.slo_monitor import SLOMonitor
             monitor = SLOMonitor(self.db)
-            # Check default agent — SLO violations are logged as warnings
-            report = monitor.check_agent("dev-agent", period_days=7)
-            results["slo_violations"] = sum(
-                1 for s in report.statuses if not s.met
-            )
+            agent_ids = self._get_agent_ids()
+            total_violations = 0
+            for aid in (agent_ids or ["dev-agent"]):
+                report = monitor.check_agent(aid, period_days=7)
+                total_violations += sum(1 for s in report.statuses if not s.met)
+            results["slo_violations"] = total_violations
         except Exception as e:
             logger.debug("SLO check skipped: %s", e)
         

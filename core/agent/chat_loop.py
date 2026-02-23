@@ -1329,10 +1329,22 @@ class ChatLoop:
                         )
                     
                     if tool_found or tools_schema:
+                        # CoT audit: check for goal hijacking before execution
+                        from core.verification.cot_audit import audit_tool_call
+                        audit = audit_tool_call(
+                            user_query=user_input,
+                            tool_name=skill_name,
+                            tool_args={"input": step.description},
+                            assistant_reasoning=step.description,
+                            llm_client=self.llm,
+                        )
+                        if not audit.safe:
+                            logger.warning("CoT audit blocked planning skill %s: %s", skill_name, audit.reason)
+                            result = f"Blocked by CoT audit: {audit.reason}"
+                            step.status = "blocked"  # type: ignore
                         # HITL policy check
-                        hitl_ok, hitl_msg = self._evaluate_hitl(skill_name, {"input": step.description})
-                        if not hitl_ok:
-                            result = hitl_msg
+                        elif not (hitl_ret := self._evaluate_hitl(skill_name, {"input": step.description}))[0]:
+                            result = hitl_ret[1]
                             step.status = "blocked"  # type: ignore
                         # Execute skill with automatic feedback recording
                         elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(skill_name):
@@ -1353,6 +1365,10 @@ class ChatLoop:
                 else:
                     # Use plain chat for step execution
                     result = "Step executed"
+
+                # Record HITL outcome for adaptive supervision decay
+                if skill_name and self.hitl_policy and step.status != "blocked":
+                    self.hitl_policy.record_outcome(skill_name, success=True)
 
                 step.status = step.status if step.status == "blocked" else "completed"  # type: ignore
                 step.result = str(result)

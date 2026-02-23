@@ -4,6 +4,7 @@ import os
 import pytest
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
+from sqlalchemy.exc import IntegrityError
 from core.context.lifecycle import MemoryGovernanceEngine, TRUST_TIER_HALF_LIVES
 
 
@@ -199,7 +200,7 @@ class TestGovernanceTaskRunner:
 
         factory, db = mock_db_ctx
         # INSERT fails (lock exists)
-        db.add.side_effect = Exception("Duplicate key")
+        db.add.side_effect = IntegrityError("Duplicate key", params=None, orig=None)
         # CAS UPDATE matches 0 rows (lock not expired)
         cas_result = Mock()
         cas_result.rowcount = 0
@@ -216,7 +217,7 @@ class TestGovernanceTaskRunner:
 
         factory, db = mock_db_ctx
         # INSERT fails (lock exists)
-        db.add.side_effect = Exception("Duplicate key")
+        db.add.side_effect = IntegrityError("Duplicate key", params=None, orig=None)
         # CAS UPDATE matches 1 row (lock expired, takeover succeeds)
         cas_result = Mock()
         cas_result.rowcount = 1

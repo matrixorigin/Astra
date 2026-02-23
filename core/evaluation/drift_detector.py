@@ -10,6 +10,7 @@ Three-phase pipeline:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -291,6 +292,7 @@ class DriftCorrector:
                     signal.model, cfg.fallback_to, signal.week_delta,
                 )
                 cfg.is_active = False  # disable drifted model
+                self.db.commit()
                 return CorrectionAction.FALLBACK_MODEL
             return CorrectionAction.ESCALATE_HUMAN
         except Exception as e:
@@ -312,7 +314,7 @@ class DriftCorrector:
                 "event_id": f"drift_{signal.model}_{int(signal.detected_at.timestamp())}",
                 "session_id": "system_drift_detection",
                 "user_id": "system",
-                "content": str(correction),
+                "content": json.dumps(correction, default=str),
                 "chain_id": f"drift_{signal.model}",
                 "model": signal.model,
             })

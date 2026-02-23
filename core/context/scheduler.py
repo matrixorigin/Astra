@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
@@ -190,7 +191,7 @@ class GovernanceTaskRunner:
             ))
             db.commit()
             return True
-        except Exception:
+        except (IntegrityError, OperationalError):
             db.rollback()
 
         # Slow path: atomic CAS — take over only if expired

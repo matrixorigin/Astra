@@ -16,6 +16,8 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError, OperationalError
+
 from core.evaluation.regression_gate import ChangeType, RegressionGate
 from core.logging_config import get_logger
 
@@ -122,7 +124,7 @@ class GateTrigger:
             ))
             db.commit()
             return True
-        except Exception:
+        except (IntegrityError, OperationalError):
             db.rollback()
 
         # Slow path: take over only if expired (previous gate crashed)

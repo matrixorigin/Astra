@@ -514,7 +514,8 @@ class TestSLOWeeklyGovernance:
         )
 
         with patch("core.evaluation.slo_monitor.SLOMonitor.check_agent", return_value=mock_report):
-            result = engine.run_weekly_tasks()
+            with patch("core.context.lifecycle.MemoryGovernanceEngine._get_agent_ids", return_value=["dev-agent"]):
+                result = engine.run_weekly_tasks()
 
         assert "slo_violations" in result
         assert result["slo_violations"] == 1  # quality SLO not met

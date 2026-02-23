@@ -6,6 +6,7 @@ Extends replay gating from selector to all versioned inputs.
 from datetime import datetime, timezone
 from typing import Any, Optional
 from enum import Enum
+import json
 
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -254,7 +255,7 @@ class RegressionGate:
                     SET value = :value, updated_at = NOW()
                     WHERE key_name = 'selector_config'
                 """), {
-                    "value": str(change_content),
+                    "value": json.dumps(change_content, default=str),
                 })
 
             elif change_type == ChangeType.CONTEXT_BUDGET:
@@ -264,7 +265,7 @@ class RegressionGate:
                     VALUES ('context_budget_ratios', :value, NOW())
                     ON DUPLICATE KEY UPDATE value = :value, updated_at = NOW()
                 """), {
-                    "value": str(change_content),
+                    "value": json.dumps(change_content, default=str),
                 })
 
             elif change_type == ChangeType.KNOWLEDGE:
