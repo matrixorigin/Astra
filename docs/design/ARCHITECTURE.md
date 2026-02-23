@@ -94,6 +94,7 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Write Path Optimization](write-path-optimization.md) | Async event pipeline: fire-and-forget emit, background batch flush, embedding fully decoupled into `event_embeddings`, event tiering — 60x hot-path latency reduction |
 | [Feedback Classification Model](feedback-classification-model.md) | Native feedback classifier: data pipeline, model training, deployment as platform skill, continuous learning |
 | [Deployment Architecture](deployment-architecture.md) | Deployment topologies (single machine → K8s), CLI-as-API-client architecture, execution backend abstraction, GPU scheduling, Ray integration |
+| [Implementation Plan](implementation-plan.md) | Unified execution plan: write path optimization (A1-A5) + CLI SaaS architecture (B1-B5), acceptance criteria, risk register |
 
 ### Supporting Documents (Implementation)
 
