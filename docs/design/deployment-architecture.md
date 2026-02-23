@@ -42,6 +42,119 @@ mo-agent-engine consists of these runtime components:
 
 ---
 
+## 1.1. CLI Architecture: API Client, Not DB Client
+
+> **Status**: Current code is CLI → DB (prototype). Target architecture is CLI → API → DB (SaaS-ready).
+
+### The Problem
+
+The current CLI (`mo_agent.py`, `mo_admin.py`) directly imports core libraries and connects to MatrixOne:
+
+```
+Current (prototype):
+  mo-agent chat → get_db_session() → MatrixOne
+  mo-admin init → get_db_session() → MatrixOne
+
+  Problems:
+  - CLI needs database credentials (connection string, user, password)
+  - No authentication — anyone with DB access can do anything
+  - No authorization — no RBAC, no permission boundaries
+  - No audit trail — CLI operations bypass API audit logging
+  - Cannot deploy as SaaS — clients cannot have direct DB access
+  - Two code paths — API and CLI diverge, bugs in one don't surface in the other
+```
+
+### Target Architecture
+
+```
+Target (SaaS-ready):
+  mo-agent chat → HTTP POST /chat/stream → API Server → MatrixOne
+  mo-admin init → HTTP POST /admin/init  → API Server → MatrixOne
+
+  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+  │  CLI          │  HTTPS  │  API Server  │  TCP    │  MatrixOne   │
+  │  (mo-agent)   │────────▶│  (FastAPI)   │────────▶│  (Database)  │
+  │               │         │              │         │              │
+  │  Holds: JWT   │         │  Holds: DB   │         │  Holds: Data │
+  │  No DB creds  │         │  credentials │         │              │
+  └──────────────┘         └──────────────┘         └──────────────┘
+```
+
+### Design Principles
+
+1. **CLI is a thin HTTP client.** It formats user input, calls API endpoints, renders responses. Zero business logic, zero DB access.
+2. **API is the single entry point.** All mutations go through API. Authentication, authorization, rate limiting, audit logging — all enforced at API layer.
+3. **Same API for CLI, SDK, and web UI.** The CLI is just one client. A future Python SDK or web dashboard uses the same endpoints.
+4. **Dev mode shortcut (optional).** For local development, `mo-agent --local <command>` and `mo-admin --local <command>` MAY bypass the API and use core libraries directly. This applies to ALL CLI commands, not just `chat`. It is a convenience for developers who have direct DB access, not the default. It must be explicitly opted into and is not available in SaaS deployments.
+
+### CLI → API Endpoint Mapping
+
+| CLI Command | Current (direct) | Target (API) |
+|---|---|---|
+| `mo-agent chat` | `ChatLoop` + `get_db_session()` | `POST /chat/stream` (SSE) |
+| `mo-agent session list` | `SessionManager` + DB query | `GET /sessions` |
+| `mo-agent session show` | `SessionManager` + DB query | `GET /sessions/{id}` |
+| `mo-agent replay` | `stream_replay` + DB query | `POST /sessions/{id}/replay` |
+| `mo-agent skill list` | `SkillRegistry` + DB query | `GET /skills` |
+| `mo-agent model list` | DB query | `GET /models` |
+| `mo-admin init` | DDL execution via `get_db_session()` | `POST /admin/init` (admin-only) |
+| `mo-admin token create` | Direct DB insert | `POST /admin/tokens` (admin-only) |
+| `mo-admin audit logs` | Direct DB query | `GET /admin/audit` (admin-only) |
+| `mo-admin prompt optimize` | `PromptOptimizer` + DB | `POST /admin/prompts/optimize` (admin-only) |
+
+### Authentication Flow
+
+```
+1. mo-agent login --user alice --password ***
+   → POST /auth/login → JWT (access + refresh tokens)
+   → Tokens stored in ~/.mo-agent/credentials.json
+
+2. mo-agent chat "hello"
+   → POST /chat/stream
+     Authorization: Bearer <access_token>
+   → SSE response stream
+
+3. Token expired:
+   → 401 response
+   → CLI auto-refreshes: POST /auth/refresh
+   → Retry original request
+
+4. mo-admin (admin operations):
+   → Same JWT flow, but API checks role == admin
+   → Non-admin users get 403
+```
+
+### Implementation Plan
+
+**Phase 1: API client module** — Create `cli/api_client.py` with typed methods for each endpoint. Uses `httpx` for HTTP + SSE streaming. Handles JWT storage, auto-refresh, error mapping.
+
+**Phase 2: Migrate mo-agent** — Replace all `get_db_session()` / core library imports with `api_client` calls. `chat` command becomes SSE consumer. Session/skill/model commands become simple GET requests.
+
+**Phase 3: Migrate mo-admin** — Replace direct DB operations with admin API calls. Requires new API endpoints that do not exist yet:
+- `POST /admin/init` — run DDL migrations (admin-only)
+- `POST /admin/tokens` — create API/LLM tokens (admin-only)
+- `GET /admin/audit` — query audit logs (admin-only)
+- `POST /admin/prompts/optimize` — trigger prompt optimization (admin-only)
+
+These must be added to `api/routers/` before mo-admin migration can begin.
+
+**Phase 4: Remove direct DB path** — Delete `from api.database import get_db_session` from CLI. CLI no longer depends on `core/` or `api/database.py`. Optional: keep `--local` flag for dev mode behind explicit opt-in.
+
+### What This Enables
+
+| Capability | Before (CLI → DB) | After (CLI → API → DB) |
+|---|---|---|
+| SaaS deployment | ❌ Impossible | ✅ CLI connects to cloud API |
+| Authentication | ❌ None | ✅ JWT with refresh |
+| Authorization | ❌ None | ✅ RBAC at API layer |
+| Audit trail | ❌ CLI ops invisible | ✅ All ops logged via API middleware |
+| Rate limiting | ❌ None | ✅ API-level rate limiting |
+| Multi-tenant | ❌ Shared DB access | ✅ Tenant isolation at API layer |
+| SDK / Web UI | ❌ Must duplicate CLI logic | ✅ Same API endpoints |
+| Credential security | ❌ DB creds on client | ✅ Only JWT on client |
+
+---
+
 ## 2. Deployment Topologies
 
 ### Topology 1: Single Machine (Development)
@@ -55,7 +168,7 @@ mo-agent-engine consists of these runtime components:
 │  │ (Docker) │  │ (Docker) │  │  (conda env)     │  │
 │  │ :6001    │  │ :6379    │  │                   │  │
 │  └──────────┘  └──────────┘  │  API Server       │  │
-│                               │  (optional, :8000)│  │
+│                               │  :8000            │  │
 │                               └──────────────────┘  │
 └─────────────────────────────────────────────────────┘
 ```
@@ -64,11 +177,13 @@ mo-agent-engine consists of these runtime components:
 ```bash
 conda activate agent-engine
 make dev-up                          # MatrixOne + Redis in Docker
-mo-admin init                        # Init DB
-mo-agent chat                        # Direct CLI usage
-# OR
-uvicorn api.main:app --port 8000     # API server (optional)
+uvicorn api.main:app --port 8000     # API server (required, unless --local)
+mo-admin init                        # Init DB (via API after migration)
+mo-agent chat                        # CLI → API Server → DB
+# OR: mo-agent --local chat          # Dev shortcut: CLI → DB directly
 ```
+
+> **Note**: In the current prototype, all CLI commands connect directly to DB. After the CLI architecture migration (§1.1), the default path is CLI → API server. The `--local` flag preserves direct-DB mode for development convenience (requires DB credentials and a local MatrixOne instance).
 
 **Skill execution**: In-process, same Python process as CLI/API.  
 **ML inference**: In-process, model loaded into same process.  
