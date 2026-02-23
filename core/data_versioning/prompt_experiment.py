@@ -221,32 +221,64 @@ class PromptExperiment:
         cost_usd: float,
         satisfaction: float,
     ) -> None:
-        """Record result for variant with full lineage.
-        
-        Args:
-            experiment_id: Experiment ID
-            variant_id: Variant ID
-            session_id: Session ID (for lineage)
-            event_id: Event ID (for lineage)
-            accuracy: Accuracy score (0-1)
-            latency_ms: Response latency in ms
-            cost_usd: Token cost in USD
-            satisfaction: User satisfaction (0-1)
+        """Record single result for variant. Commits immediately.
+
+        For high-volume recording, prefer record_variant_results_batch().
         """
-        self.db.execute(text(f"""
-            INSERT INTO {experiment_id}.variant_results
-            (variant_id, session_id, event_id, accuracy, latency_ms, cost_usd, satisfaction)
-            VALUES (:variant_id, :session_id, :event_id, :accuracy, :latency, :cost, :satisfaction)
-        """), {
+        self.record_variant_results_batch(experiment_id, [{
             "variant_id": variant_id,
             "session_id": session_id,
             "event_id": event_id,
             "accuracy": accuracy,
-            "latency": latency_ms,
-            "cost": cost_usd,
+            "latency_ms": latency_ms,
+            "cost_usd": cost_usd,
             "satisfaction": satisfaction,
-        })
+        }])
+
+    def record_variant_results_batch(
+        self,
+        experiment_id: str,
+        results: list[dict],
+    ) -> int:
+        """Batch-insert variant results in a single transaction.
+
+        Chunks into statements of at most BATCH_LIMIT rows to avoid
+        oversized SQL packets.  All chunks share one commit.
+
+        Args:
+            experiment_id: Experiment ID (sandbox database name)
+            results: List of dicts with keys: variant_id, session_id, event_id,
+                     accuracy, latency_ms, cost_usd, satisfaction
+
+        Returns:
+            Number of rows inserted
+        """
+        if not results:
+            return 0
+        BATCH_LIMIT = 100
+        for chunk_start in range(0, len(results), BATCH_LIMIT):
+            chunk = results[chunk_start:chunk_start + BATCH_LIMIT]
+            placeholders = []
+            params: dict = {}
+            for i, r in enumerate(chunk):
+                placeholders.append(
+                    f"(:v{i}, :s{i}, :e{i}, :a{i}, :l{i}, :c{i}, :sat{i})"
+                )
+                params[f"v{i}"] = r["variant_id"]
+                params[f"s{i}"] = r["session_id"]
+                params[f"e{i}"] = r["event_id"]
+                params[f"a{i}"] = r["accuracy"]
+                params[f"l{i}"] = r["latency_ms"]
+                params[f"c{i}"] = r["cost_usd"]
+                params[f"sat{i}"] = r["satisfaction"]
+            sql = (
+                f"INSERT INTO {experiment_id}.variant_results "
+                f"(variant_id, session_id, event_id, accuracy, latency_ms, cost_usd, satisfaction) "
+                f"VALUES {', '.join(placeholders)}"
+            )
+            self.db.execute(text(sql), params)
         self.db.commit()
+        return len(results)
     
     def get_experiment_results(self, experiment_id: str) -> dict[str, ExperimentResult]:
         """Get aggregated results with statistical significance testing.

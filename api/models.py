@@ -652,4 +652,5 @@ class SkillPermission(Base):
 # Knowledge models moved to skills/knowledge/models.py (sk_knowledge_ prefix).
 # Re-exported here so existing `from api.models import KnowledgeEntry` still works.
 from skills.knowledge.models import SkKnowledgeEntry as KnowledgeEntry  # noqa: F401
+from skills.knowledge.models import SkKnowledgeEntrySource as KnowledgeEntrySource  # noqa: F401
 from skills.knowledge.models import SkKnowledgeRelation as KnowledgeRelation  # noqa: F401

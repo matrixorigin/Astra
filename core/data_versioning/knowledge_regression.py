@@ -165,40 +165,43 @@ class KnowledgeRegression:
     
     def detect_knowledge_change_impact(
         self,
-        knowledge_domain: str,
-        changed_at: datetime,
+        entry_id: str,
+        category: str,
     ) -> RegressionSignal:
-        """Detect sessions affected by knowledge change via context snapshots.
-        
+        """Detect sessions affected by quarantined knowledge entry.
+
+        Traces impact via source_event_ids: the events that produced the
+        knowledge entry are looked up in conversation_events to find
+        affected sessions.
+
         Args:
-            knowledge_domain: Domain of knowledge (e.g., "matrixone_sql")
-            changed_at: When knowledge changed
-            
+            entry_id: Quarantined KnowledgeEntry.entry_id
+            category: Entry category (used as domain label in signal)
+
         Returns:
-            RegressionSignal with affected session count
+            RegressionSignal with affected session/decision count
         """
-        # Query sessions that referenced domain before change
+        # Single JOIN via relation table — both sides hit indexes
         result = self.db.execute(text(f"""
-            SELECT COUNT(DISTINCT session_id) as session_count,
-                   COUNT(DISTINCT event_id) as decision_count
-            FROM {self.source_db}.conversation_events
-            WHERE event_type = 'context_snapshot'
-            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.knowledge_domain')) = :domain
-            AND created_at < :changed_at
-        """), {"domain": knowledge_domain, "changed_at": changed_at}).fetchone()
-        
+            SELECT COUNT(DISTINCT ce.session_id) as session_count,
+                   COUNT(DISTINCT ce.event_id) as decision_count
+            FROM {self.source_db}.sk_knowledge_entry_sources kes
+            JOIN {self.source_db}.conversation_events ce ON kes.event_id = ce.event_id
+            WHERE kes.entry_id = :entry_id
+        """), {"entry_id": entry_id}).fetchone()
+
         session_count = result[0] if result and result[0] else 0
         decision_count = result[1] if result and result[1] else 0
-        
+
         return RegressionSignal(
-            signal_id=f"knowledge_{knowledge_domain}_{int(changed_at.timestamp())}",
+            signal_id=f"knowledge_{entry_id}",
             regression_type=RegressionType.KNOWLEDGE_CHANGED,
-            affected_skill=knowledge_domain,
+            affected_skill=category,
             affected_sessions=session_count,
             affected_decisions=decision_count,
             confidence=0.7 if session_count > 0 else 0.0,
             detected_at=datetime.utcnow(),
-            metadata={"changed_at": changed_at.isoformat()},
+            metadata={"entry_id": entry_id, "category": category},
         )
     
     def generate_regression_report(

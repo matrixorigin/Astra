@@ -35,7 +35,6 @@ def _insert_entry(db, user_id, *, key_name="lang", value="python", confidence=0.
         category="user_preference",
         key_name=key_name,
         value=value,
-        source_event_ids=json.dumps(["evt-1"]),
         extraction_method="test",
         trust_tier=trust_tier,
         confidence=confidence,

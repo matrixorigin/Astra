@@ -146,17 +146,83 @@ CREATE TABLE prompt_experiments (
 );
 ```
 
-### Knowledge Regression Detection
+### Experiment Result Recording: Batch Write with Tolerance
 
-When knowledge changes:
+Experiment results (variant_results) are high-volume, append-only metrics. A single experiment may produce hundreds to thousands of results as users interact with variants. These results are **statistical inputs** — the downstream consumer (`determine_winner`) computes aggregates (AVG, COUNT). Individual result loss is tolerable; systematic loss is not.
+
+**Write strategy: batch with periodic flush.**
 
 ```
-1. Identify past decisions that depended on the old knowledge
-   (via context_snapshot.semantic_entries)
-2. Create sandbox with updated knowledge
-3. Replay affected decisions in sandbox
-4. Compare outputs: did the answer change? Is the new answer better?
-5. Flag regressions for human review
+Agent interaction produces variant result
+  → Accumulate in local buffer (in-memory list)
+  → Flush to DB when:
+    (a) buffer reaches batch_size (default 50), OR
+    (b) flush_interval elapsed (default 30s), OR
+    (c) experiment completes (explicit final flush)
+  → Single INSERT ... VALUES (...), (...), ... + single COMMIT per flush
+  → Hard cap: BATCH_LIMIT=100 rows per SQL statement.
+    Flushes exceeding this are chunked into multiple statements
+    within the same transaction.  Prevents oversized SQL packets
+    in distributed / high-concurrency scenarios.
+```
+
+**Failure modes and tolerance:**
+
+| Failure | Impact | Handling |
+|---|---|---|
+| Process crash before flush | Lose buffered results (≤50) | Acceptable: statistical aggregates degrade gracefully. `determine_winner` uses COUNT to assess sample sufficiency — low count → low confidence, not wrong answer |
+| DB write fails mid-batch | Entire batch lost (transactional) | Retry once. If retry fails, log warning + discard. Next batch proceeds independently |
+| Network partition during flush | Timeout → batch lost | Same as DB write failure. Agent continues accumulating; next flush succeeds when network recovers |
+
+**Why this is safe for downstream consumers:**
+
+1. `determine_winner()` computes `AVG(accuracy)` and `COUNT(*)` — missing a few rows shifts the average negligibly
+2. Winner determination requires `sample_size` minimum — if too many results lost, experiment stays in `running` state (not enough data to conclude), which is the correct behavior
+3. `complete_experiment()` does a final flush before computing winner — the only results that can be lost are from a crash *during* the final flush, which is a process-level failure that would abort the completion anyway
+
+**What must NOT be batched:**
+
+- `create_experiment` / `start_experiment` / `complete_experiment` — state transitions, must be immediately committed
+- `experiment_config` writes — schema/metadata, low frequency, must be durable
+- Regression gate verdict — single write, must be durable
+
+### Knowledge Regression Detection
+
+When knowledge is quarantined (pollution detected), identify past decisions that depended on it:
+
+```
+1. Quarantined entry has source_event_ids → trace to conversation_events
+2. From those events, get session_ids = affected sessions
+3. Count affected sessions and decisions
+4. If impact exceeds threshold → flag for review or automated re-evaluation
+```
+
+**Tracing path** (relation table, pure index JOINs):
+
+```
+knowledge_entry_sources.entry_id  →  knowledge_entry_sources.event_id
+                                          ↓
+                                    conversation_events.event_id (PK)
+                                          ↓
+                                    conversation_events.session_id
+                                          ↓
+                                    affected session count + decision count
+```
+
+This uses a dedicated relation table instead of a JSON array column, ensuring
+predictable query performance regardless of how many source events exist.
+
+**Integration with memory pipeline:**
+
+```
+Pipeline Phase 3 (PollutionDetector) quarantines entries
+  → Phase 4: for each quarantined entry with severity ≥ high:
+    KnowledgeRegression.detect_knowledge_change_impact(
+      entry_id=entry_id,
+      category=category
+    )
+  → Returns RegressionSignal with affected_sessions count
+  → Pipeline result includes regression_signals count
 ```
 
 ---

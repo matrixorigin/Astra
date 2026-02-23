@@ -101,21 +101,26 @@ def _seed_knowledge(db, user_id: str, n: int = 4):
     ]
     for i in range(min(n, len(states))):
         conf, tier = states[i]
+        eid = generate_id()
+        source_eid = generate_id()
         db.execute(text("""
             INSERT INTO sk_knowledge_entries
                 (entry_id, user_id, key_name, category, value,
-                 confidence, trust_tier, source_event_ids, created_at)
+                 confidence, trust_tier, created_at)
             VALUES (:eid, :uid, :key, 'preference', :val,
-                    :conf, :tier, :sources, NOW())
+                    :conf, :tier, NOW())
         """), {
-            "eid": generate_id(),
+            "eid": eid,
             "uid": user_id,
             "key": f"pref_{i}",
             "val": f"Knowledge entry {i}",
             "conf": conf,
             "tier": tier,
-            "sources": json.dumps([generate_id()]),
         })
+        db.execute(text("""
+            INSERT INTO sk_knowledge_entry_sources (entry_id, event_id)
+            VALUES (:eid, :evid)
+        """), {"eid": eid, "evid": source_eid})
     db.commit()
 
 

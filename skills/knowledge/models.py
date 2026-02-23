@@ -1,6 +1,6 @@
 """Knowledge skill tables — platform DB with sk_knowledge_ prefix."""
 
-from sqlalchemy import Column, DateTime, Float, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, UniqueConstraint
 from sqlalchemy.sql import func
 
 from api.base import Base
@@ -19,8 +19,7 @@ class SkKnowledgeEntry(Base):
     key_name = Column(String(255), nullable=False, index=True)
     value = Column(Text, nullable=False)
 
-    # Provenance
-    source_event_ids = Column(JSON, nullable=False)
+    # Provenance: see SkKnowledgeEntrySource
     extraction_method = Column(String(50))
 
     # Trust & Lifecycle
@@ -40,6 +39,13 @@ class SkKnowledgeEntry(Base):
 
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class SkKnowledgeEntrySource(Base):
+    """Provenance: which events directly produced each knowledge entry."""
+    __tablename__ = "sk_knowledge_entry_sources"
+    entry_id = Column(String(64), primary_key=True)
+    event_id = Column(String(64), primary_key=True, index=True)
 
 
 class SkKnowledgeRelation(Base):

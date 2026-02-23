@@ -361,8 +361,7 @@ CREATE TABLE knowledge_entries (
   key             VARCHAR(255) NOT NULL, -- e.g. "user.preferred_language", "repo.auth_pattern"
   value           TEXT NOT NULL,         -- The knowledge itself
   
-  -- Provenance
-  source_event_ids JSON NOT NULL,        -- Which events produced this knowledge
+  -- Provenance: see knowledge_entry_sources table below
   extraction_method VARCHAR(50),         -- 'llm_extraction' | 'user_explicit' | 'observation'
   
   -- Lifecycle
@@ -383,6 +382,19 @@ CREATE TABLE knowledge_entries (
   INDEX idx_user_category (user_id, category),
   INDEX idx_key (key),
   INDEX idx_confidence (confidence DESC)
+);
+
+-- Provenance: which events directly produced each knowledge entry.
+-- Only the events the extractor actually read are recorded — not the entire
+-- causal chain.  This keeps the table small and queries index-friendly.
+-- Rows are append-only: reinforcement adds new source events to existing entries.
+-- Composite PK (entry_id, event_id) provides natural dedup — concurrent
+-- INSERT IGNORE / ON DUPLICATE KEY from multiple extractors is safe.
+CREATE TABLE knowledge_entry_sources (
+  entry_id  VARCHAR(64) NOT NULL,
+  event_id  VARCHAR(64) NOT NULL,
+  PRIMARY KEY (entry_id, event_id),
+  INDEX idx_event (event_id)
 );
 
 -- Vector index for semantic search
@@ -689,10 +701,23 @@ Severity classification:
 
 ### Cascade Impact Analysis
 
-When a polluted entry is quarantined, trace its blast radius:
+When a polluted entry is quarantined, trace its blast radius via two complementary paths:
+
+**Path 1: Provenance tracing** (precise, uses `knowledge_entry_sources` relation table):
 
 ```sql
--- Find all decisions that used this memory entry
+-- Direct index JOIN — no JSON parsing, no full-table scan
+SELECT COUNT(DISTINCT ce.session_id) AS session_count,
+       COUNT(DISTINCT ce.event_id) AS decision_count
+FROM knowledge_entry_sources kes
+JOIN conversation_events ce ON kes.event_id = ce.event_id
+WHERE kes.entry_id = @quarantined_entry_id;
+```
+
+**Path 2: Retrieval tracing** (broader, catches indirect usage via context snapshots):
+
+```sql
+-- Find decisions whose context snapshot included this entry
 SELECT ce.event_id, ce.content, ce.quality_score, ce.created_at
 FROM conversation_events ce
 JOIN context_snapshots cs ON ce.snapshot_id = cs.snapshot_id
@@ -700,7 +725,13 @@ WHERE cs.snapshot_data LIKE CONCAT('%', @quarantined_entry_id, '%')
 ORDER BY ce.created_at DESC;
 ```
 
+Path 1 answers "which sessions created this knowledge?" Path 2 answers "which decisions consumed this knowledge?" Together they define the full blast radius.
+
 If any of those decisions themselves became memory entries (hallucination crystallization chain), quarantine those too. This is recursive — the system traces the full contamination graph.
+
+**Integration with memory pipeline:**
+
+The memory pipeline (`run_memory_pipeline`) runs Phase 3 (PollutionDetector) which quarantines entries. Phase 4 feeds quarantined entries with severity ≥ high into `KnowledgeRegression.detect_knowledge_change_impact()` to quantify the blast radius. The pipeline result includes `regression_signals` count so callers know if quarantine had downstream impact.
 
 ### Proactive Hygiene
 

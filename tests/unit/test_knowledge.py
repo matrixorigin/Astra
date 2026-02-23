@@ -58,7 +58,6 @@ def test_confidence_decay(db_session):
         category="user_preference",
         key_name="test_key",
         value="test_value",
-        source_event_ids='["event1"]',
         confidence=1.0,
         initial_confidence=1.0,
         trust_tier="T3",
@@ -85,7 +84,6 @@ def test_semantic_retrieval(db_session):
         category="user_preference",
         key_name="language",
         value="typescript",
-        source_event_ids='["event1"]',
         confidence=0.8,
         trust_tier="T3",
     )
@@ -96,7 +94,6 @@ def test_semantic_retrieval(db_session):
         category="codebase_pattern",
         key_name="auth.pattern",
         value="dependency_injection",
-        source_event_ids='["event2"]',
         confidence=0.6,
         trust_tier="T3",
     )
@@ -128,7 +125,6 @@ def test_low_confidence_quarantine(db_session):
         category="domain_fact",
         key_name="test_fact",
         value="low confidence fact",
-        source_event_ids='["event1"]',
         confidence=0.2,  # Below threshold
         trust_tier="T4",
     )
@@ -188,7 +184,6 @@ def test_contradiction_detection(db_session):
         category="user_preference",
         key_name="language",
         value="java",
-        source_event_ids='["e1"]',
         confidence=0.9,
         initial_confidence=0.9,
         trust_tier="T3",
@@ -257,7 +252,6 @@ def test_synonym_match_reinforces_not_contradicts(db_session):
         category="user_preference",
         key_name="preferred_language",
         value="javascript",
-        source_event_ids="[]",
         extraction_method="test",
         trust_tier="T3",
         confidence=0.8,
@@ -283,3 +277,49 @@ def test_synonym_match_reinforces_not_contradicts(db_session):
     assert stored[0]["action"] == "updated"  # reinforced, NOT contradiction
     db_session.refresh(existing)
     assert existing.confidence == pytest.approx(0.9, abs=0.01)
+
+
+def test_reinforcement_appends_source_ids(db_session):
+    """Reinforcement (same value) must append new source_event_ids to relation table."""
+    from api.models import KnowledgeEntry, KnowledgeEntrySource
+    from skills.knowledge.api import KnowledgeExtractor
+    from uuid_utils import uuid7
+
+    user_id = str(uuid7())[:36]
+    entry_id = str(uuid7())
+    extractor = KnowledgeExtractor(db_session)
+
+    existing = KnowledgeEntry(
+        entry_id=entry_id,
+        user_id=user_id,
+        category="user_preference",
+        key_name="lang",
+        value="python",
+        extraction_method="test",
+        trust_tier="T3",
+        confidence=0.8,
+        initial_confidence=0.8,
+        version=1,
+    )
+    db_session.add(existing)
+    db_session.add(KnowledgeEntrySource(entry_id=entry_id, event_id="evt_old"))
+    db_session.commit()
+
+    # Reinforce with new source events (one overlapping, one new)
+    entries = [{
+        "user_id": user_id,
+        "category": "user_preference",
+        "key_name": "lang",
+        "value": "python",
+        "source_event_ids": ["evt_old", "evt_new"],
+        "extraction_method": "test",
+        "trust_tier": "T3",
+        "confidence": 0.8,
+    }]
+    stored = extractor._batch_store_knowledge(entries)
+    assert stored[0]["action"] == "updated"
+
+    sources = db_session.query(KnowledgeEntrySource).filter(
+        KnowledgeEntrySource.entry_id == entry_id,
+    ).all()
+    assert {s.event_id for s in sources} == {"evt_old", "evt_new"}

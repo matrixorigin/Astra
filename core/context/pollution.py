@@ -263,19 +263,14 @@ class PollutionDetector:
                 break
 
             # Find knowledge entries sourced from those decision events
-            all_entries = self.db.query(KnowledgeEntry).all()
-            for ke in all_entries:
-                if ke.entry_id in affected_entries:
-                    continue
-                source_ids = ke.source_event_ids or "[]"
-                if isinstance(source_ids, str):
-                    try:
-                        source_ids = json.loads(source_ids)
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                if set(source_ids) & new_decision_event_ids:
-                    affected_entries.add(ke.entry_id)
-                    next_frontier.add(ke.entry_id)
+            from api.models import KnowledgeEntrySource
+            sources = self.db.query(KnowledgeEntrySource.entry_id).filter(
+                KnowledgeEntrySource.event_id.in_(new_decision_event_ids),
+            ).all()
+            for (eid,) in sources:
+                if eid not in affected_entries:
+                    affected_entries.add(eid)
+                    next_frontier.add(eid)
 
             frontier = next_frontier
 

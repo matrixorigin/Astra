@@ -20,6 +20,7 @@ class PipelineResult:
     reflections_condensed: int = 0
     contradictions_found: int = 0
     quarantined: int = 0
+    regression_signals: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -88,6 +89,7 @@ def run_memory_pipeline(
         result.errors.append(f"reflector: {e}")
 
     # Phase 3: PollutionDetector — scan for contradictions
+    quarantined_entries: list[dict] = []
     try:
         from core.context.pollution import PollutionDetector
         detector = PollutionDetector(db)
@@ -97,8 +99,33 @@ def run_memory_pipeline(
             if c.get("severity") in ("high", "critical"):
                 detector.quarantine_entry(c["entry_id"], severity=c["severity"])
                 result.quarantined += 1
+                quarantined_entries.append(c)
     except Exception as e:
         logger.error("Memory pipeline pollution failed: %s", e)
         result.errors.append(f"pollution: {e}")
+
+    # Phase 4: Knowledge regression — trace impact of quarantined entries
+    if quarantined_entries:
+        try:
+            import os
+            from core.data_versioning.knowledge_regression import KnowledgeRegression
+            source_db = os.environ.get("MATRIXONE_DATABASE")
+            if not source_db:
+                raise RuntimeError("MATRIXONE_DATABASE env var not set; cannot run regression detection")
+            kr = KnowledgeRegression(db, source_db=source_db)
+            for entry in quarantined_entries:
+                signal = kr.detect_knowledge_change_impact(
+                    entry_id=entry["entry_id"],
+                    category=entry.get("category", "unknown"),
+                )
+                if signal.affected_sessions > 0:
+                    result.regression_signals += 1
+                    logger.warning(
+                        "Quarantined entry %s impacts %d sessions",
+                        entry["entry_id"], signal.affected_sessions,
+                    )
+        except Exception as e:
+            logger.error("Memory pipeline regression detection failed: %s", e)
+            result.errors.append(f"regression: {e}")
 
     return result

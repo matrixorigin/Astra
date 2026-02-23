@@ -392,7 +392,7 @@ class KnowledgeExtractor:
         return None
 
     def _batch_store_knowledge(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        from api.models import KnowledgeEntry
+        from api.models import KnowledgeEntry, KnowledgeEntrySource
 
         if not entries:
             return []
@@ -421,6 +421,7 @@ class KnowledgeExtractor:
                 existing_entries[(e.user_id, e.category, e.key_name)] = e
 
         for key, entry in entries_by_key.items():
+            source_ids = entry.get("source_event_ids", [])
             if key in existing_entries:
                 existing = existing_entries[key]
                 now = datetime.now()
@@ -429,6 +430,11 @@ class KnowledgeExtractor:
                     existing.version += 1
                     existing.last_validated_at = now
                     existing.updated_at = now
+                    for eid in source_ids:
+                        self.db.execute(text(
+                            "INSERT IGNORE INTO sk_knowledge_entry_sources (entry_id, event_id) "
+                            "VALUES (:eid, :evid)"
+                        ), {"eid": existing.entry_id, "evid": eid})
                     stored.append({
                         "entry_id": existing.entry_id,
                         "action": "updated",
@@ -448,7 +454,6 @@ class KnowledgeExtractor:
                         category=entry["category"],
                         key_name=entry["key_name"],
                         value=entry["value"],
-                        source_event_ids=json.dumps(entry["source_event_ids"]),
                         extraction_method=entry.get("extraction_method", "observation"),
                         trust_tier=entry["trust_tier"],
                         confidence=entry["confidence"],
@@ -456,6 +461,8 @@ class KnowledgeExtractor:
                     )
                     existing.superseded_by = entry_id
                     self.db.add(knowledge)
+                    for eid in source_ids:
+                        self.db.add(KnowledgeEntrySource(entry_id=entry_id, event_id=eid))
                     stored.append({
                         "entry_id": entry_id,
                         "action": "contradiction",
@@ -469,13 +476,14 @@ class KnowledgeExtractor:
                     category=entry["category"],
                     key_name=entry["key_name"],
                     value=entry["value"],
-                    source_event_ids=json.dumps(entry["source_event_ids"]),
                     extraction_method=entry["extraction_method"],
                     trust_tier=entry["trust_tier"],
                     confidence=entry["confidence"],
                     initial_confidence=entry["confidence"],
                 )
                 self.db.add(knowledge)
+                for eid in source_ids:
+                    self.db.add(KnowledgeEntrySource(entry_id=entry_id, event_id=eid))
                 stored.append({
                     "entry_id": entry_id,
                     "action": "created",

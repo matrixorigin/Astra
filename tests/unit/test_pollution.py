@@ -153,20 +153,24 @@ class TestPollutionDetector:
         decision.event_id = "evt_from_dec"
 
         # Knowledge entry sourced from the decision's event
-        downstream = Mock()
-        downstream.entry_id = "ke_downstream"
-        downstream.source_event_ids = json.dumps(["evt_from_dec"])
+        source_row = Mock()
+        source_row.entry_id = "ke_downstream"
 
         # Wire up db.query routing
         def route_query(model):
             m = Mock()
-            name = model.__tablename__
+            # model may be a column attribute (e.g. KnowledgeEntrySource.entry_id)
+            try:
+                name = model.__tablename__
+            except AttributeError:
+                # Column attribute — get parent table name
+                name = model.class_.__tablename__
             if name == "context_snapshots":
                 m.all.return_value = [snap]
             elif name == "decision_audit":
                 m.filter.return_value.all.return_value = [decision]
-            elif name == "sk_knowledge_entries":
-                m.all.return_value = [downstream]
+            elif name == "sk_knowledge_entry_sources":
+                m.filter.return_value.all.return_value = [("ke_downstream",)]
             return m
 
         mock_db.query.side_effect = route_query
