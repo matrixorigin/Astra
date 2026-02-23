@@ -152,3 +152,37 @@ async def delete_credential(
     )
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Credential not found")
+
+
+# ── Lifecycle transitions ─────────────────────────────────────────────────────
+
+@router.post("/skills/{skill_name}/publish", status_code=status.HTTP_200_OK)
+def publish_skill(
+    skill_name: str,
+    db: Session = Depends(get_db_session),
+    _user: dict = Depends(get_current_user),
+):
+    """Publish a skill: draft → active. Triggers regression gate if configured."""
+    from core.skills.registry import SkillRegistry
+    registry = SkillRegistry(db)
+    try:
+        registry.publish(skill_name)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"skill_name": skill_name, "status": "active"}
+
+
+@router.post("/skills/{skill_name}/deprecate", status_code=status.HTTP_200_OK)
+def deprecate_skill(
+    skill_name: str,
+    db: Session = Depends(get_db_session),
+    _user: dict = Depends(get_current_user),
+):
+    """Deprecate a skill: active → deprecated."""
+    from core.skills.registry import SkillRegistry
+    registry = SkillRegistry(db)
+    try:
+        registry.deprecate(skill_name)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"skill_name": skill_name, "status": "deprecated"}

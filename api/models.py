@@ -601,6 +601,7 @@ class SkillDefinition(Base):
     manifest = Column(JSON, nullable=False)
     is_active = Column(SmallInteger, default=1, nullable=False)
     is_public = Column(SmallInteger, default=0, nullable=False)
+    status = Column(String(20), default="active")  # draft | active | deprecated | archived
     created_by = Column(String(36))
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, onupdate=func.now())

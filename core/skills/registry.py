@@ -343,3 +343,38 @@ class SkillRegistry:
             cls = skill.__class__
             code = f"{cls.__module__}.{cls.__qualname__}:{getattr(skill, 'version', '')}"
         return hashlib.sha256(code.encode()).hexdigest()
+
+    # ── Lifecycle transitions ──────────────────────────────────────
+
+    def publish(self, skill_name: str) -> None:
+        """Transition skill from draft → active. Triggers gate if configured."""
+        from api.models import SkillDefinition
+        row = self.session.query(SkillDefinition).filter(
+            SkillDefinition.name == skill_name,
+        ).first()
+        if not row:
+            raise ValueError(f"Skill '{skill_name}' not found")
+        if row.status not in ("draft", "deprecated"):
+            raise ValueError(f"Cannot publish skill in '{row.status}' state")
+        row.status = "active"
+        row.is_active = 1
+        self.session.commit()
+        self._get_cached.cache_clear()
+        if self.gate_trigger:
+            try:
+                self.gate_trigger.on_skill_change(skill_name, row.version, row.manifest or {})
+            except Exception as e:
+                logger.warning("Gate trigger on publish failed: %s", e)
+
+    def deprecate(self, skill_name: str) -> None:
+        """Transition skill from active → deprecated."""
+        from api.models import SkillDefinition
+        row = self.session.query(SkillDefinition).filter(
+            SkillDefinition.name == skill_name, SkillDefinition.status == "active",
+        ).first()
+        if not row:
+            raise ValueError(f"No active skill '{skill_name}' to deprecate")
+        row.status = "deprecated"
+        row.is_active = 0
+        self.session.commit()
+        self._get_cached.cache_clear()

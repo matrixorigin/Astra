@@ -588,6 +588,137 @@ def trust_report(
 
 
 # ---------------------------------------------------------------------------
+# SLO Dashboard — per-agent SLO status + history + auto-response
+# ---------------------------------------------------------------------------
+
+class SLODashboardEntry(BaseModel):
+    agent_id: str
+    statuses: list[dict[str, Any]]
+    period_days: int
+
+
+class SLODashboardResponse(BaseModel):
+    agents: list[SLODashboardEntry]
+
+
+@router.get("/slo/dashboard", response_model=SLODashboardResponse)
+def slo_dashboard(
+    period_days: int = Query(default=30, ge=1, le=90),
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """SLO dashboard: check all agents and return compliance status."""
+    try:
+        rows = db.execute(text("""
+            SELECT DISTINCT agent_id FROM conversation_events
+            WHERE event_type = 'llm_response'
+              AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+              AND agent_id IS NOT NULL
+        """), {"days": period_days}).fetchall()
+        agent_ids = [r[0] for r in rows] if rows else []
+
+        from core.evaluation.slo_monitor import SLOMonitor
+        monitor = SLOMonitor(db)
+        entries = []
+        for aid in agent_ids:
+            report = monitor.check_agent(aid, period_days=period_days)
+            entries.append(SLODashboardEntry(
+                agent_id=aid,
+                statuses=[
+                    {
+                        "slo": s.slo.name,
+                        "target": s.slo.target,
+                        "current": s.current_value,
+                        "met": s.met,
+                        "burn_rate": s.burn_rate,
+                        "severity": s.severity.value,
+                        "bad_days": s.bad_days,
+                    }
+                    for s in report.statuses
+                ],
+                period_days=period_days,
+            ))
+        return SLODashboardResponse(agents=entries)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/slo/{agent_id}/history")
+def slo_history(
+    agent_id: str,
+    days: int = Query(default=30, ge=1, le=90),
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """SLO history: daily metrics for a single agent."""
+    from core.evaluation.slo_monitor import SLOMonitor
+    monitor = SLOMonitor(db)
+    metrics = monitor.get_daily_metrics(agent_id, days)
+    return {"agent_id": agent_id, "days": days, "daily_metrics": metrics}
+
+
+# ---------------------------------------------------------------------------
+# Observability Metrics — 6-layer aggregation
+# ---------------------------------------------------------------------------
+
+@router.get("/observability/metrics")
+def observability_metrics(
+    agent_id: str = Query(default="dev-agent"),
+    days: int = Query(default=7, ge=1, le=90),
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Aggregated observability metrics across 6 layers (trust-and-safety.md §5)."""
+    result: dict[str, Any] = {}
+
+    # Decision layer
+    row = db.execute(text("""
+        SELECT AVG(quality_score) as avg_quality,
+               COUNT(*) as total_responses
+        FROM conversation_events
+        WHERE agent_id = :aid AND event_type = 'llm_response'
+          AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+    """), {"aid": agent_id, "days": days}).fetchone()
+    result["decision"] = {
+        "avg_quality": round(float(row[0]), 4) if row and row[0] else 0,
+        "total_responses": int(row[1]) if row else 0,
+    }
+
+    # Session layer
+    row = db.execute(text("""
+        SELECT COUNT(DISTINCT session_id) as sessions,
+               AVG(turn_count) as avg_turns
+        FROM (
+            SELECT session_id, COUNT(*) as turn_count
+            FROM conversation_events
+            WHERE agent_id = :aid
+              AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+            GROUP BY session_id
+        ) sub
+    """), {"aid": agent_id, "days": days}).fetchone()
+    result["session"] = {
+        "active_sessions": int(row[0]) if row and row[0] else 0,
+        "avg_turns_per_session": round(float(row[1]), 1) if row and row[1] else 0,
+    }
+
+    # Skill layer
+    row = db.execute(text("""
+        SELECT COUNT(*) as total,
+               SUM(CASE WHEN execution_success = 1 THEN 1 ELSE 0 END) as ok
+        FROM skill_selection_events
+        WHERE created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+    """), {"days": days}).fetchone()
+    total_sel = int(row[0]) if row and row[0] else 0
+    ok_sel = int(row[1]) if row and row[1] else 0
+    result["skill"] = {
+        "total_selections": total_sel,
+        "success_rate": round(ok_sel / total_sel, 4) if total_sel else 0,
+    }
+
+    return {"agent_id": agent_id, "period_days": days, "metrics": result}
+
+
+# ---------------------------------------------------------------------------
 # Memory Health — aggregated memory pipeline status
 # ---------------------------------------------------------------------------
 
@@ -653,3 +784,64 @@ def memory_health(
         db.close()
 
     return result
+
+
+# ── Training Data Pipeline ─────────────────────────────────────────────────────
+
+class TrainingDataExtractRequest(BaseModel):
+    name: str = "auto_extract"
+    description: str = ""
+    quality_threshold: float = 0.75
+    sample_size: int | None = None
+
+
+class TrainingDatasetResponse(BaseModel):
+    dataset_id: str
+    example_count: int
+    avg_quality: float | None = None
+
+
+@router.post("/training-data/extract", response_model=TrainingDatasetResponse)
+def extract_training_data(
+    req: TrainingDataExtractRequest,
+    db: Session = Depends(get_db_session),
+    _user: dict = Depends(get_current_user),
+):
+    """Extract high-quality conversation pairs as training data."""
+    from core.data_versioning.training_data_pipeline import TrainingDataPipeline, DatasetConfig
+    from core.utils.id_generator import generate_id
+    pipeline = TrainingDataPipeline(db)
+    dataset_id = generate_id()
+    config = DatasetConfig(
+        dataset_id=dataset_id,
+        name=req.name,
+        description=req.description,
+        quality_threshold=req.quality_threshold,
+        sample_size=req.sample_size,
+    )
+    pipeline.create_dataset(config)
+    examples = pipeline.extract_examples(dataset_id, quality_threshold=req.quality_threshold)
+    avg_q = sum(e.quality_score for e in examples) / len(examples) if examples else None
+    return TrainingDatasetResponse(
+        dataset_id=dataset_id,
+        example_count=len(examples),
+        avg_quality=round(avg_q, 2) if avg_q else None,
+    )
+
+
+@router.get("/training-data/{dataset_id}/export")
+def export_training_data(
+    dataset_id: str,
+    format: str = "jsonl",
+    db: Session = Depends(get_db_session),
+    _user: dict = Depends(get_current_user),
+):
+    """Export a training dataset as JSONL file."""
+    from core.data_versioning.training_data_pipeline import TrainingDataPipeline
+    pipeline = TrainingDataPipeline(db)
+    try:
+        output_path = pipeline.export_dataset(dataset_id, format=format)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    from fastapi.responses import FileResponse
+    return FileResponse(path=output_path, media_type="application/jsonl", filename=f"{dataset_id}.{format}")

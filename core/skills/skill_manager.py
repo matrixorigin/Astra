@@ -93,6 +93,12 @@ class SkillManager:
         defn = self._db.query(SkillDefinition).filter_by(name=skill_name).first()
         if defn is None:
             return  # Builtin skill — not in catalog at all
+        # Reject non-active lifecycle states (covers draft, deprecated, archived, deactivated)
+        status = getattr(defn, "status", "active") or "active"
+        if status != "active":
+            raise PermissionDeniedError(
+                f"Skill '{skill_name}' is in '{status}' state — only 'active' skills can execute"
+            )
         if not defn.is_active:
             raise PermissionDeniedError(
                 f"Skill '{skill_name}' definition not found or deactivated"

@@ -92,6 +92,12 @@ class SLOMonitor:
 
         return report
 
+    def get_daily_metrics(
+        self, agent_id: str, period_days: int,
+    ) -> list[dict[str, Any]]:
+        """Query daily aggregated metrics for an agent."""
+        return self._query_daily_metrics(agent_id, period_days)
+
     def _query_daily_metrics(
         self, agent_id: str, period_days: int,
     ) -> list[dict[str, Any]]:

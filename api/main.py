@@ -192,6 +192,10 @@ app.include_router(branches.router, tags=["branches"])
 from api.routers import triggers
 app.include_router(triggers.router, tags=["triggers"])
 
+# Data Versioning — checkpoints, lineage, sandbox checkpoint/restore
+from api.routers import data_versioning
+app.include_router(data_versioning.router)
+
 
 @app.get("/health")
 def health_check():
