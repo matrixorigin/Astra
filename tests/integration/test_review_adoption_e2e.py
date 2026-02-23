@@ -208,6 +208,73 @@ class TestSLODashboard:
         for s in report.statuses:
             assert s.burn_rate == 0.0
 
+    def test_slo_auto_response_warning(self, db_session):
+        """Warning severity writes slo_monitoring_increased event."""
+        from core.evaluation.slo_monitor import SLOMonitor, SLOSeverity, SLOStatus, SLOTarget
+        monitor = SLOMonitor(db_session)
+        agent_id = f"slo_warn_{os.urandom(4).hex()}"
+
+        status = SLOStatus(
+            slo=SLOTarget("quality", "avg_quality", 4.0, ">="),
+            current_value=3.5, met=False, burn_rate=2.0,
+            severity=SLOSeverity.WARNING, days_elapsed=5, bad_days=3,
+        )
+        monitor._auto_respond(agent_id, status)
+        db_session.commit()
+
+        row = db_session.execute(text("""
+            SELECT event_type FROM conversation_events
+            WHERE agent_id = :aid AND event_type = 'slo_monitoring_increased'
+            LIMIT 1
+        """), {"aid": agent_id}).fetchone()
+        assert row is not None
+
+    def test_slo_auto_response_critical_fires_gate(self, db_session):
+        """Critical severity calls gate_trigger.trigger() public method."""
+        from unittest.mock import MagicMock
+        from core.evaluation.slo_monitor import SLOMonitor, SLOSeverity, SLOStatus, SLOTarget
+
+        gate_trigger = MagicMock()
+        monitor = SLOMonitor(db_session, gate_trigger=gate_trigger)
+        agent_id = f"slo_crit_{os.urandom(4).hex()}"
+
+        status = SLOStatus(
+            slo=SLOTarget("quality", "avg_quality", 4.0, ">="),
+            current_value=2.0, met=False, burn_rate=4.0,
+            severity=SLOSeverity.CRITICAL, days_elapsed=10, bad_days=8,
+        )
+        monitor._auto_respond(agent_id, status)
+        db_session.commit()
+
+        gate_trigger.trigger.assert_called_once()
+        kwargs = gate_trigger.trigger.call_args.kwargs
+        assert kwargs["change_type"] == "slo_critical"
+        assert agent_id in kwargs["change_id"]
+
+    def test_slo_auto_response_breach_creates_postmortem(self, db_session):
+        """Breach severity writes post-mortem, model escalation, and HITL tightening events."""
+        from core.evaluation.slo_monitor import SLOMonitor, SLOSeverity, SLOStatus, SLOTarget
+        monitor = SLOMonitor(db_session)
+        agent_id = f"slo_breach_{os.urandom(4).hex()}"
+
+        status = SLOStatus(
+            slo=SLOTarget("quality", "avg_quality", 4.0, ">="),
+            current_value=1.5, met=False, burn_rate=10.0,
+            severity=SLOSeverity.BREACH, days_elapsed=30, bad_days=25,
+        )
+        monitor._auto_respond(agent_id, status)
+        db_session.commit()
+        rows = db_session.execute(text("""
+            SELECT event_type FROM conversation_events
+            WHERE agent_id = :aid
+              AND event_type IN ('slo_post_mortem', 'slo_model_escalation', 'slo_hitl_tightened')
+            ORDER BY event_type
+        """), {"aid": agent_id}).fetchall()
+        event_types = {r[0] for r in rows}
+        assert "slo_post_mortem" in event_types
+        assert "slo_model_escalation" in event_types
+        assert "slo_hitl_tightened" in event_types
+
     def test_observability_metrics_query(self, db_session):
         """Observability metrics query runs without error."""
         # Decision layer query
@@ -226,3 +293,168 @@ class TestSLODashboard:
             WHERE created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
         """)).fetchone()
         assert row is not None
+
+    def test_chatloop_slo_escalation(self, db_session):
+        """ChatLoop._check_slo_escalation uses ModelRouter.escalate, not hardcoded names."""
+        from unittest.mock import MagicMock
+        from core.agent.chat_loop import ChatLoop
+        from core.llm.router import ModelRouter
+
+        agent_id = f"esc_{os.urandom(4).hex()}"
+
+        # Write escalation event directly
+        db_session.execute(text("""
+            INSERT INTO conversation_events
+                (event_id, session_id, user_id, agent_id, agent_version,
+                 event_type, content, causal_chain_id, created_at)
+            VALUES (:eid, 'system_slo', 'system', :aid, '1.0.0',
+                    'slo_model_escalation', '{}', :eid, NOW())
+        """), {"eid": os.urandom(8).hex(), "aid": agent_id})
+        db_session.commit()
+
+        mock_llm = MagicMock()
+        mock_llm.config = {"model": "gpt-4o-mini"}
+        mock_llm.router = ModelRouter()  # real router with DEFAULT_MODELS
+        chat_loop = ChatLoop(
+            selector=MagicMock(), executor=MagicMock(), llm_client=mock_llm,
+            event_logger=MagicMock(), context_manager=MagicMock(),
+            firewall=MagicMock(), agent_id=agent_id,
+        )
+        chat_loop.event_logger.session = db_session
+
+        escalated = chat_loop._check_slo_escalation("s1")
+        assert escalated == "gpt-4o"  # gpt-4o.fallback_to == "gpt-4o-mini"
+        assert chat_loop._check_slo_escalation("s1") == "gpt-4o"  # cache hit
+
+    def test_hitl_slo_tightening(self, db_session):
+        """HITLPolicy appends tightening policy when slo_hitl_tightened event exists."""
+        from core.verification.hitl_policy import HITLPolicyEngine, SupervisionAction
+
+        agent_id = f"hitl_{os.urandom(4).hex()}"
+        db_session.execute(text("""
+            INSERT INTO conversation_events
+                (event_id, session_id, user_id, agent_id, agent_version,
+                 event_type, content, causal_chain_id, created_at)
+            VALUES (:eid, 'system_slo', 'system', :aid, '1.0.0',
+                    'slo_hitl_tightened', '{}', :eid, NOW())
+        """), {"eid": os.urandom(8).hex(), "aid": agent_id})
+        db_session.commit()
+
+        engine = HITLPolicyEngine(db=db_session)
+        engine.load_policies(agent_id)
+
+        names = [p.name for p in engine._policies]
+        assert "slo_breach_tightening" in names
+        tightening = next(p for p in engine._policies if p.name == "slo_breach_tightening")
+        assert tightening.trigger.cost_exceeds == 0.10
+        assert tightening.action == SupervisionAction.APPROVE_REJECT
+
+
+class TestPromptEvolutionGate:
+    """Prompt variant promotion must pass regression gate before deploying."""
+
+    @pytest.fixture(autouse=True)
+    def ensure_tables(self, db_session):
+        """Ensure prompt_variants table exists (may not be in test DB schema yet)."""
+        db_session.execute(text("""
+            CREATE TABLE IF NOT EXISTS prompt_variants (
+                variant_id VARCHAR(64) PRIMARY KEY,
+                prompt_template_id VARCHAR(64) NOT NULL,
+                version INT NOT NULL,
+                content TEXT NOT NULL,
+                quality_score FLOAT,
+                description VARCHAR(255),
+                created_at DATETIME DEFAULT NOW()
+            )
+        """))
+        db_session.commit()
+
+    def test_promote_without_gate_succeeds(self, db_session):
+        """Without gate, promote_variant updates template directly."""
+        from core.evaluation.prompt_evolution import PromptEvolver
+
+        evolver = PromptEvolver(db_session)
+        template_id = f"tmpl_{os.urandom(4).hex()}"
+        variant_id = f"var_{os.urandom(4).hex()}"
+
+        # Seed template and variant
+        db_session.execute(text("""
+            INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+            VALUES (:tid, 1, 'old content', 1, NOW(), NOW())
+        """), {"tid": template_id})
+        db_session.execute(text("""
+            INSERT INTO prompt_variants
+                (variant_id, prompt_template_id, version, content, quality_score, created_at)
+            VALUES (:vid, :tid, 1, 'new content', 4.5, NOW())
+        """), {"vid": variant_id, "tid": template_id})
+        db_session.commit()
+
+        result = evolver.promote_variant(variant_id, template_id)
+        assert result["promoted"] is True
+
+        row = db_session.execute(text(
+            "SELECT content FROM prompt_templates WHERE template_id = :tid"
+        ), {"tid": template_id}).fetchone()
+        assert row[0] == "new content"
+
+    def test_promote_gate_approved_deploys(self, db_session):
+        """Gate approved → variant is promoted."""
+        from unittest.mock import MagicMock
+        from core.evaluation.prompt_evolution import PromptEvolver
+
+        gate = MagicMock()
+        gate.validate_change.return_value = {"verdict": "approved", "metrics": {}}
+        evolver = PromptEvolver(db_session, regression_gate=gate)
+
+        template_id = f"tmpl_{os.urandom(4).hex()}"
+        variant_id = f"var_{os.urandom(4).hex()}"
+        db_session.execute(text("""
+            INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+            VALUES (:tid, 1, 'old', 1, NOW(), NOW())
+        """), {"tid": template_id})
+        db_session.execute(text("""
+            INSERT INTO prompt_variants
+                (variant_id, prompt_template_id, version, content, quality_score, created_at)
+            VALUES (:vid, :tid, 1, 'improved', 4.8, NOW())
+        """), {"vid": variant_id, "tid": template_id})
+        db_session.commit()
+
+        result = evolver.promote_variant(variant_id, template_id)
+        assert result["promoted"] is True
+        gate.validate_change.assert_called_once()
+        # Verify template was updated
+        row = db_session.execute(text(
+            "SELECT content FROM prompt_templates WHERE template_id = :tid"
+        ), {"tid": template_id}).fetchone()
+        assert row[0] == "improved"
+
+    def test_promote_gate_rejected_blocks(self, db_session):
+        """Gate rejected → variant is NOT promoted, template unchanged."""
+        from unittest.mock import MagicMock
+        from core.evaluation.prompt_evolution import PromptEvolver
+
+        gate = MagicMock()
+        gate.validate_change.return_value = {"verdict": "rejected", "reason": "score_regression"}
+        evolver = PromptEvolver(db_session, regression_gate=gate)
+
+        template_id = f"tmpl_{os.urandom(4).hex()}"
+        variant_id = f"var_{os.urandom(4).hex()}"
+        db_session.execute(text("""
+            INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+            VALUES (:tid, 1, 'original', 1, NOW(), NOW())
+        """), {"tid": template_id})
+        db_session.execute(text("""
+            INSERT INTO prompt_variants
+                (variant_id, prompt_template_id, version, content, quality_score, created_at)
+            VALUES (:vid, :tid, 1, 'worse variant', 2.0, NOW())
+        """), {"vid": variant_id, "tid": template_id})
+        db_session.commit()
+
+        result = evolver.promote_variant(variant_id, template_id)
+        assert result["promoted"] is False
+        assert result["reason"] == "gate_rejected"
+        # Template must be unchanged
+        row = db_session.execute(text(
+            "SELECT content FROM prompt_templates WHERE template_id = :tid"
+        ), {"tid": template_id}).fetchone()
+        assert row[0] == "original"

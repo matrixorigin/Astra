@@ -58,6 +58,10 @@ class GateTrigger:
             change_content={"template_id": template_id, "version": version, "content": content},
         )
 
+    def trigger(self, change_type: str, change_id: str, change_content: dict[str, Any]):
+        """Generic trigger for any change type (e.g., SLO violations)."""
+        self._fire_async(change_type, change_id, change_content)
+
     def _fire_async(self, change_type: str, change_id: str, change_content: dict[str, Any]):
         thread = threading.Thread(
             target=self._run_gate,

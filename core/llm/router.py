@@ -388,6 +388,17 @@ class ModelRouter:
     def register(self, config: ModelConfig):
         self.registry.register(config)
 
+    def escalate(self, model: str) -> str | None:
+        """Return a higher-tier model that falls back to `model`, or None.
+        
+        When multiple candidates exist, picks the one with highest prompt price
+        (proxy for capability).
+        """
+        candidates = [c for c in self.registry.list_active() if c.fallback_to == model]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda c: c.price_per_1k_prompt).model_name
+
     def reload(self, db):
         """Hot reload (#4)."""
         self.registry.reload(db)

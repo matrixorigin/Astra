@@ -52,13 +52,14 @@ class TestPromptEvolver:
     def test_promote_variant(self):
         db = _mock_db()
         db.execute.side_effect = [
-            Mock(fetchone=Mock(return_value=("New prompt",))),  # Get variant
+            Mock(fetchone=Mock(return_value=("New prompt", 2))),  # Get variant (content, version)
             None,  # Update template
         ]
 
         evolver = PromptEvolver(db)
-        evolver.promote_variant("var-1", "template-1")
+        result = evolver.promote_variant("var-1", "template-1")
 
+        assert result["promoted"] is True
         db.execute.assert_called()
 
     def test_get_best_variant(self):

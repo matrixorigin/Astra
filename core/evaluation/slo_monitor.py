@@ -1,14 +1,20 @@
-"""Agent SLOs and burn-rate alerting.
+"""Agent SLOs and burn-rate alerting with auto-response.
 
 Ref: trust-and-safety.md §11
 
 Measures agent effectiveness (not just infra uptime):
   - quality, task completion, hallucination rate, latency, cost efficiency
   - burn-rate alerts when error budget consumption exceeds threshold
+
+Auto-response (three-tier):
+  - warning  → increase monitoring frequency (slo_monitoring_increased event)
+  - critical → trigger replay gate asynchronously
+  - breach   → create post-mortem event + record model escalation intent
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -69,9 +75,11 @@ class SLOMonitor:
     MONTHLY_DAYS = 30
     SLO_COMPLIANCE_TARGET = 0.95  # 95% of days must meet SLO
 
-    def __init__(self, db: Session, slos: list[SLOTarget] | None = None):
+    def __init__(self, db: Session, slos: list[SLOTarget] | None = None,
+                 gate_trigger=None):
         self.db = db
         self.slos = slos or DEFAULT_SLOS
+        self._gate_trigger = gate_trigger  # GateTrigger | None
 
     def check_agent(self, agent_id: str, period_days: int = 30) -> AgentSLOReport:
         """Check all SLOs for an agent over the given period."""
@@ -85,10 +93,17 @@ class SLOMonitor:
             created_at=datetime.now(timezone.utc),
         )
 
-        # Record any non-OK statuses
+        # Record any non-OK statuses and trigger auto-response
         for s in statuses:
             if s.severity != SLOSeverity.OK:
                 self._record_alert(agent_id, s)
+                self._auto_respond(agent_id, s)
+
+        # Batch commit all SLO events
+        try:
+            self.db.commit()
+        except Exception as e:
+            logger.debug("Failed to commit SLO events: %s", e)
 
         return report
 
@@ -190,10 +205,86 @@ class SLOMonitor:
             return SLOSeverity.WARNING
         return SLOSeverity.OK
 
-    def _record_alert(self, agent_id: str, status: SLOStatus):
-        """Record SLO alert as auditable event."""
+    def _auto_respond(self, agent_id: str, status: SLOStatus) -> None:
+        """Three-tier auto-response to SLO violations.
+
+        warning  → increase monitoring frequency
+        critical → trigger replay gate asynchronously
+        breach   → post-mortem event + model escalation intent
+        """
+        sev = status.severity
+        slo_name = status.slo.name
+
+        if sev == SLOSeverity.WARNING:
+            self._write_event(agent_id, "slo_monitoring_increased", {
+                "slo": slo_name,
+                "action": "monitoring_frequency_increased",
+                "burn_rate": status.burn_rate,
+            })
+            logger.info("SLO warning for %s/%s — increased monitoring", agent_id, slo_name)
+
+        elif sev == SLOSeverity.CRITICAL:
+            # Trigger replay gate to validate recent changes
+            if self._gate_trigger is not None:
+                self._gate_trigger.trigger(
+                    change_type="slo_critical",
+                    change_id=f"slo_critical:{agent_id}:{slo_name}",
+                    change_content={
+                        "agent_id": agent_id,
+                        "slo": slo_name,
+                        "burn_rate": status.burn_rate,
+                        "current_value": status.current_value,
+                    },
+                )
+            # Model escalation intent — same as breach
+            self._write_event(agent_id, "slo_model_escalation", {
+                "slo": slo_name,
+                "action": "model_escalation_requested",
+                "severity": "critical",
+                "burn_rate": status.burn_rate,
+            })
+            self._write_event(agent_id, "slo_gate_triggered", {
+                "slo": slo_name,
+                "action": "replay_gate_triggered",
+                "burn_rate": status.burn_rate,
+            })
+            logger.warning("SLO critical for %s/%s — gate + model escalation", agent_id, slo_name)
+
+        elif sev == SLOSeverity.BREACH:
+            # Post-mortem event
+            self._write_event(agent_id, "slo_post_mortem", {
+                "slo": slo_name,
+                "action": "post_mortem_created",
+                "current_value": status.current_value,
+                "target": status.slo.target,
+                "bad_days": status.bad_days,
+                "days_elapsed": status.days_elapsed,
+            })
+            # Model escalation intent — ChatLoop reads this to upgrade model tier
+            self._write_event(agent_id, "slo_model_escalation", {
+                "slo": slo_name,
+                "action": "model_escalation_requested",
+                "severity": "breach",
+                "reason": f"SLO breach: {slo_name} = {status.current_value:.4f} "
+                          f"(target {status.slo.operator} {status.slo.target})",
+            })
+            # HITL policy tightening intent
+            self._write_event(agent_id, "slo_hitl_tightened", {
+                "slo": slo_name,
+                "action": "hitl_policy_tightening_requested",
+                "reason": "SLO breach requires increased human oversight",
+            })
+            logger.error(
+                "SLO BREACH for %s/%s — post-mortem + escalation + HITL tightening",
+                agent_id, slo_name,
+            )
+
+    def _write_event(self, agent_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        """Write an auditable system event for SLO auto-response actions.
+        
+        Note: Does NOT commit — caller is responsible for committing the batch.
+        """
         try:
-            import json
             from core.utils.id_generator import generate_id
             eid = generate_id()
             self.db.execute(text("""
@@ -202,19 +293,23 @@ class SLOMonitor:
                      event_type, content, causal_chain_id, created_at)
                 VALUES
                     (:eid, 'system_slo', 'system', :aid, '1.0.0',
-                     'slo_alert', :content, :eid, NOW())
+                     :etype, :content, :eid, NOW())
             """), {
                 "eid": eid,
                 "aid": agent_id,
-                "content": json.dumps({
-                    "slo": status.slo.name,
-                    "severity": status.severity.value,
-                    "burn_rate": status.burn_rate,
-                    "current_value": status.current_value,
-                    "target": status.slo.target,
-                    "bad_days": status.bad_days,
-                }),
+                "etype": event_type,
+                "content": json.dumps(payload),
             })
-            self.db.commit()
         except Exception as e:
-            logger.debug("Failed to record SLO alert: %s", e)
+            logger.debug("Failed to write SLO event %s: %s", event_type, e)
+
+    def _record_alert(self, agent_id: str, status: SLOStatus):
+        """Record SLO alert as auditable event."""
+        self._write_event(agent_id, "slo_alert", {
+            "slo": status.slo.name,
+            "severity": status.severity.value,
+            "burn_rate": status.burn_rate,
+            "current_value": status.current_value,
+            "target": status.slo.target,
+            "bad_days": status.bad_days,
+        })

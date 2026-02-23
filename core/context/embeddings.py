@@ -49,12 +49,15 @@ class EmbeddingService:
                         from sqlalchemy import text
                         # Try openai first, then any available provider
                         for prov in ("openai", None):
-                            where = "type='llm' AND is_active=TRUE"
                             if prov:
-                                where += f" AND provider='{prov}'"
-                            row = self.db.execute(
-                                text(f"SELECT encrypted_value, provider, metadata FROM tokens WHERE {where} ORDER BY created_at DESC LIMIT 1")
-                            ).first()
+                                row = self.db.execute(
+                                    text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE AND provider=:provider ORDER BY created_at DESC LIMIT 1"),
+                                    {"provider": prov}
+                                ).first()
+                            else:
+                                row = self.db.execute(
+                                    text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
+                                ).first()
                             if row:
                                 api_key = row[0]
                                 actual_provider = row[1]

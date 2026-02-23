@@ -249,6 +249,21 @@ class PromptTemplate(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
+class PromptVariant(Base):
+    __tablename__ = "prompt_variants"
+    variant_id = Column(String(64), primary_key=True)
+    prompt_template_id = Column(String(64), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    content = Column(Text, nullable=False)
+    quality_score = Column(Float)
+    description = Column(String(255))
+    created_at = Column(DateTime, default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('prompt_template_id', 'version', name='uq_template_version'),
+    )
+
+
 class ContextSnapshot(Base):
     __tablename__ = "context_snapshots"
     context_capture_id = Column(String(36), primary_key=True)

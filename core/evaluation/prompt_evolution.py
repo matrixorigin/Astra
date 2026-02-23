@@ -40,10 +40,12 @@ class PromptEvolver:
         llm_client: LLMClient for LLM-as-judge scoring (optional)
     """
 
-    def __init__(self, db: Session, replay_service=None, llm_client=None) -> None:
+    def __init__(self, db: Session, replay_service=None, llm_client=None,
+                 regression_gate=None) -> None:
         self.db = db
         self.replay_service = replay_service
         self.llm_client = llm_client
+        self.regression_gate = regression_gate  # RegressionGate | None
 
     def create_variant(
         self,
@@ -126,26 +128,52 @@ class PromptEvolver:
         logger.info(f"Evaluated variant {variant_id}: {avg_score:.2f}")
         return avg_score
 
-    def promote_variant(self, variant_id: str, prompt_template_id: str) -> None:
-        """Promote a variant to be the active prompt."""
+    def promote_variant(self, variant_id: str, prompt_template_id: str) -> dict[str, Any]:
+        """Promote a variant to be the active prompt.
+
+        If a regression_gate is configured, validates the change first.
+        Returns a result dict with 'promoted' bool and optional 'gate_result'.
+        """
         row = self.db.execute(
-            text("SELECT content FROM prompt_variants WHERE variant_id = :id"),
+            text("SELECT content, version FROM prompt_variants WHERE variant_id = :id"),
             {"id": variant_id},
         ).fetchone()
 
         if not row:
             logger.error(f"Variant {variant_id} not found")
-            return
+            return {"promoted": False, "reason": "variant_not_found"}
+
+        content, version = row[0], row[1]
+
+        # Gate check before promotion
+        if self.regression_gate is not None:
+            from core.evaluation.regression_gate import ChangeType
+            gate_result = self.regression_gate.validate_change(
+                change_type=ChangeType.PROMPT,
+                change_id=f"{prompt_template_id}@{variant_id}",
+                change_content={
+                    "template_id": prompt_template_id,
+                    "version": version,
+                    "content": content,
+                },
+            )
+            if gate_result.get("verdict") != "approved":
+                logger.warning(
+                    "Regression gate rejected prompt variant %s: %s",
+                    variant_id, gate_result.get("verdict"),
+                )
+                return {"promoted": False, "reason": "gate_rejected", "gate_result": gate_result}
 
         self.db.execute(
             text(
                 "UPDATE prompt_templates SET content = :content, updated_at = NOW() "
                 "WHERE template_id = :template_id"
             ),
-            {"content": row[0], "template_id": prompt_template_id},
+            {"content": content, "template_id": prompt_template_id},
         )
         self.db.commit()
         logger.info(f"Promoted variant {variant_id} to template {prompt_template_id}")
+        return {"promoted": True}
 
     def get_best_variant(self, prompt_template_id: str) -> PromptVariant | None:
         """Get the best-performing variant for a template."""

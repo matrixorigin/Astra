@@ -146,6 +146,28 @@ class HITLPolicyEngine:
                 ))
         except Exception as e:
             logger.warning("Failed to load supervision policies: %s", e)
+        self._load_slo_tightening(agent_id)
+
+    def _load_slo_tightening(self, agent_id: str | None):
+        """Append tightened approval policy if a recent SLO breach event exists."""
+        if not self.db or not agent_id:
+            return
+        try:
+            row = self.db.execute(text("""
+                SELECT 1 FROM conversation_events
+                WHERE agent_id = :aid AND event_type = 'slo_hitl_tightened'
+                  AND created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+                LIMIT 1
+            """), {"aid": agent_id}).fetchone()
+            if row:
+                self._policies.append(SupervisionPolicy(
+                    name="slo_breach_tightening",
+                    trigger=SupervisionTrigger(cost_exceeds=0.10),
+                    action=SupervisionAction.APPROVE_REJECT,
+                ))
+                logger.info("SLO breach tightening active for agent %s", agent_id)
+        except Exception as e:
+            logger.debug("SLO tightening check failed: %s", e)
 
     def add_policy(self, policy: SupervisionPolicy):
         """Add policy programmatically (for testing or bootstrap)."""

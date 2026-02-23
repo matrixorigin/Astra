@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from sqlalchemy import text
@@ -203,6 +204,9 @@ class Sandbox:
     def list_tables(self, sandbox: str) -> list[str]:
         """List tables in sandbox."""
         try:
+            # Validate sandbox name to prevent SQL injection
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', sandbox):
+                raise ValueError(f"Invalid sandbox name: {sandbox}")
             result = self.db.execute(text(f"SHOW TABLES FROM {sandbox}"))
             return [row._mapping[f"Tables_in_{sandbox}"] for row in result]
         except Exception:

@@ -16,6 +16,8 @@ from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+_UNSET = object()  # Sentinel for "not yet checked"
+
 MAX_TOOL_ROUNDS = 10
 
 # Scratchpad tool schemas — injected alongside skill tools when scratchpad is enabled
@@ -176,6 +178,7 @@ class ChatLoop:
         self.observer = None  # Set via set_observer()
         self.mcp_bridge = None  # Set via set_mcp_bridge()
         self._few_shot = None  # Initialized lazily on first use
+        self._escalated_model: str | None | object = _UNSET  # SLO escalation cache
         try:
             from core.context.few_shot import FewShotRetriever
             if hasattr(llm_client, 'db') and llm_client.db:
@@ -297,6 +300,7 @@ class ChatLoop:
                 messages=messages,
                 tools=tools_schema,
                 tool_choice="auto",
+                model=self._check_slo_escalation(session_id),
             )
 
             tool_calls = llm_result.get("tool_calls", [])
@@ -1731,3 +1735,27 @@ class ChatLoop:
         # Post-turn: run Observer on the conversation messages
         if messages:
             self._run_observer(session_id, user_id, messages)
+
+    def _check_slo_escalation(self, session_id: str) -> str | None:
+        """Return escalated model name if a recent SLO escalation event exists."""
+        if self._escalated_model is not _UNSET:
+            return self._escalated_model
+        try:
+            from sqlalchemy import text
+            row = self.event_logger.session.execute(text("""
+                SELECT 1 FROM conversation_events
+                WHERE agent_id = :aid AND event_type = 'slo_model_escalation'
+                  AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                LIMIT 1
+            """), {"aid": self.agent_id}).fetchone()
+            if row and hasattr(self.llm, 'router'):
+                current = self.llm.config.get("model", "gpt-4o-mini")
+                escalated = self.llm.router.escalate(current)
+                if escalated:
+                    self._escalated_model = escalated
+                    logger.info("SLO escalation: %s → %s", current, escalated)
+                    return escalated
+        except Exception as e:
+            logger.debug("SLO escalation check failed: %s", e)
+        self._escalated_model = None
+        return None
