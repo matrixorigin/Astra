@@ -541,7 +541,7 @@ class RunEngine:
             row = self.db.execute(
                 text(
                     "SELECT 1 FROM conversation_events "
-                    "WHERE event_type = :et AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :run_id "
+                    "WHERE event_type = :et AND run_id = :run_id "
                     "LIMIT 1"
                 ),
                 {"et": EventType.RUN_CANCELLED.value, "run_id": run_id},
@@ -554,8 +554,8 @@ class RunEngine:
         try:
             row = self.db.execute(
                 text(
-                    "SELECT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) FROM conversation_events "
-                    "WHERE event_type = :et AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.waiting_for')) = :handle "
+                    "SELECT run_id FROM conversation_events "
+                    "WHERE event_type = :et AND waiting_for = :handle "
                     "ORDER BY created_at DESC LIMIT 1"
                 ),
                 {"et": EventType.RUN_WAITING.value, "handle": handle},
@@ -627,9 +627,9 @@ class RunEngine:
         try:
             rows = self.db.execute(
                 text(
-                    "SELECT DISTINCT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) FROM conversation_events "
+                    "SELECT DISTINCT run_id FROM conversation_events "
                     "WHERE event_type = :et "
-                    "AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.parent_run_id')) = :pid"
+                    "AND parent_run_id = :pid"
                 ),
                 {"et": EventType.RUN_STARTED.value, "pid": parent_run_id},
             ).fetchall()

@@ -52,6 +52,12 @@ class EventLogger:
             except Exception as e:
                 logger.warning(f"Failed to generate embedding: {e}")
         
+        # Extract high-frequency query fields from metadata
+        metadata = event.metadata or {}
+        run_id = metadata.get('run_id')
+        parent_run_id = metadata.get('parent_run_id')
+        waiting_for = metadata.get('waiting_for')
+        
         db_event = EventModel(
             event_id=event.event_id,
             user_id=event.user_id,
@@ -76,6 +82,10 @@ class EventLogger:
             causal_chain_id=event.causal_chain_id,
             llm_model_used=event.llm_model_used,
             llm_params=event.llm_params,
+            # High-frequency query fields
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            waiting_for=waiting_for,
         )
         
         self.session.add(db_event)

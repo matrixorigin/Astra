@@ -172,6 +172,11 @@ class Event(Base):
     skill_name = Column(String(255))
     skill_version = Column(String(32))
     skill_result = Column(JSON)
+    
+    # High-frequency query fields extracted from JSON for indexing
+    run_id = Column(String(255), index=True)
+    parent_run_id = Column(String(255), index=True)
+    waiting_for = Column(String(255), index=True)
 
 
 class QualityAssessment(Base):
