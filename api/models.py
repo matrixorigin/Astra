@@ -177,6 +177,7 @@ class Event(Base):
     run_id = Column(String(255), index=True)
     parent_run_id = Column(String(255), index=True)
     waiting_for = Column(String(255), index=True)
+    dedup_key = Column(String(255), index=True)
 
 
 class QualityAssessment(Base):
@@ -634,6 +635,7 @@ class SkillInstallation(Base):
     user_id = Column(String(36), nullable=False)
     skill_name = Column(String(100), nullable=False)
     skill_version = Column(String(20), nullable=False)
+    previous_version = Column(String(20))  # for rollback
     status = Column(String(20), default="installed")   # installed | uninstalled
     installed_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, onupdate=func.now())

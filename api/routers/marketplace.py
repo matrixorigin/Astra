@@ -105,6 +105,25 @@ async def upgrade_skill(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
+@router.post("/rollback", response_model=InstallationResponse)
+async def rollback_skill(
+    req: InstallRequest,
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Rollback a skill to its previous version."""
+    try:
+        inst = _mgr(db).rollback(current_user["user_id"], req.skill_name)
+        return InstallationResponse(
+            installation_id=inst.installation_id,
+            skill_name=inst.skill_name,
+            skill_version=inst.skill_version,
+            status=inst.status,
+        )
+    except SkillNotInstalledError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
 @router.get("/installed", response_model=InstalledListResponse)
 async def list_installed(
     db: Session = Depends(get_db_session),

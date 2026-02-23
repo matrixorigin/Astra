@@ -264,6 +264,13 @@ class MemoryGovernanceEngine:
         )
         self.db.commit()
 
+        # Write governance event for audit trail
+        if ids:
+            self._write_governance_event(
+                "governance_quarantine",
+                {"entry_ids": ids, "threshold": threshold, "count": len(ids)},
+            )
+
         logger.info(
             "Quarantined %d low-confidence entries (threshold=%.2f): %s",
             len(ids), threshold, ids,
@@ -271,66 +278,186 @@ class MemoryGovernanceEngine:
         return len(ids)
     
     def _compress_episodic_events(self, ttl_days: int = 90) -> int:
-        """Compress old episodic events to summaries.
-        
-        Args:
-            ttl_days: Days after which to compress events
-            
-        Returns:
-            Number of events compressed
+        """Compress old episodic events to session summaries.
+
+        Groups events by session, generates a summary (LLM if available,
+        else truncated concatenation), writes a ``session_summary`` event,
+        and marks originals as compressed.
         """
         from api.models import Event
-        
+        from sqlalchemy import text
+
         cutoff = datetime.now() - timedelta(days=ttl_days)
-        
-        # Find old events not yet compressed
+
         events = self.db.query(Event).filter(
             Event.created_at < cutoff,
-            Event.event_type.in_(["user_query", "llm_response"])
+            Event.event_type.in_(["user_query", "llm_response"]),
         ).limit(1000).all()
-        
-        # In production, compress to session summaries
-        # For now, just count
-        count = len(events)
-        
-        logger.debug(f"Compressed {count} old events")
-        return count
+
+        if not events:
+            return 0
+
+        from uuid_utils import uuid7
+
+        # Group by session
+        by_session: dict[str, list] = {}
+        for e in events:
+            by_session.setdefault(e.session_id, []).append(e)
+
+        compressed = 0
+        for sid, sess_events in by_session.items():
+            texts = [e.content or "" for e in sess_events]
+            concat = "\n".join(texts)
+
+            # Generate summary
+            if self.llm_client and len(concat) > 500:
+                try:
+                    from core.llm.models import LLMMessage
+                    resp = self.llm_client.chat(
+                        messages=[
+                            LLMMessage(role="system", content="Summarize this conversation in ≤3 sentences."),
+                            LLMMessage(role="user", content=concat[:4000]),
+                        ],
+                        user_id="system",
+                    )
+                    summary = resp.content or concat[:500]
+                except Exception:
+                    summary = concat[:500]
+            else:
+                summary = concat[:500]
+
+            # Write session_summary event
+            sum_eid = str(uuid7())
+            self.db.execute(
+                text("""INSERT INTO conversation_events
+                        (event_id, session_id, user_id, agent_id, agent_version,
+                         event_type, content, causal_chain_id, dedup_key, created_at)
+                        VALUES (:eid, :sid, 'system', 'governance', '1.0',
+                                'session_summary', :content, :cid, NULL, :ts)"""),
+                {
+                    "eid": sum_eid, "sid": sid,
+                    "content": summary, "cid": sum_eid, "ts": datetime.now(),
+                },
+            )
+
+            # Mark originals as compressed (batch UPDATE)
+            eids = [e.event_id for e in sess_events]
+            if eids:
+                self.db.execute(
+                    text("UPDATE conversation_events SET event_type = 'compressed' WHERE event_id IN :eids"),
+                    {"eids": tuple(eids)},
+                )
+            compressed += len(sess_events)
+
+        self.db.commit()
+
+        # Write governance audit event
+        if compressed > 0:
+            self._write_governance_event(
+                "episodic_compression",
+                {"sessions": len(by_session), "events_compressed": compressed, "ttl_days": ttl_days},
+            )
+
+        logger.info("Compressed %d events across %d sessions", compressed, len(by_session))
+        return compressed
     
     def _scan_contradictions(self) -> int:
         """Scan for contradicting knowledge entries.
-        
-        Returns:
-            Number of contradictions found
+
+        Uses SQL aggregation to find (category, key) pairs with multiple distinct values,
+        then batch-checks which have already been reported.
         """
         from api.models import KnowledgeEntry
-        
-        # Find entries with same category and key but different values
-        entries = self.db.query(KnowledgeEntry).filter(
+        from sqlalchemy import text, func
+
+        # SQL aggregation: find (category, key) with >1 distinct value
+        conflicts = self.db.query(
+            KnowledgeEntry.category,
+            KnowledgeEntry.key_name,
+            func.count(func.distinct(KnowledgeEntry.value)).label("val_count"),
+        ).filter(
             KnowledgeEntry.confidence > 0.3
-        ).all()
-        
-        # Group by (category, key)
-        groups: dict[tuple[str, str], list] = {}
-        for entry in entries:
-            key = (entry.category, entry.key_name)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(entry)
-        
-        # Find groups with multiple different values
+        ).group_by(
+            KnowledgeEntry.category, KnowledgeEntry.key_name
+        ).having(
+            func.count(func.distinct(KnowledgeEntry.value)) > 1
+        ).limit(100).all()
+
+        if not conflicts:
+            return 0
+
+        # Batch query: which dedup_keys already reported?
+        dedup_keys = [f"{c.category}:{c.key_name}" for c in conflicts]
+        reported = set()
+        if dedup_keys:
+            rows = self.db.execute(
+                text("""SELECT dedup_key FROM conversation_events
+                        WHERE event_type = 'contradiction_detected'
+                        AND dedup_key IN :keys"""),
+                {"keys": tuple(dedup_keys)},
+            ).fetchall()
+            reported = {r[0] for r in rows}
+
         contradictions = 0
-        for key, group in groups.items():
-            if len(group) > 1:
-                values = set(e.value for e in group)
-                if len(values) > 1:
-                    contradictions += 1
-                    logger.warning(
-                        f"Contradiction detected: {key[0]}.{key[1]} "
-                        f"has {len(values)} different values"
-                    )
-        
+        for c in conflicts:
+            dk = f"{c.category}:{c.key_name}"
+            if dk in reported:
+                continue
+
+            # Fetch entry_ids and values for this conflict (small query)
+            entries = self.db.query(KnowledgeEntry).filter(
+                KnowledgeEntry.category == c.category,
+                KnowledgeEntry.key_name == c.key_name,
+                KnowledgeEntry.confidence > 0.3,
+            ).limit(10).all()
+
+            contradictions += 1
+            self._write_governance_event(
+                "contradiction_detected",
+                {
+                    "dedup_key": dk,
+                    "category": c.category,
+                    "key": c.key_name,
+                    "entry_ids": [e.entry_id for e in entries],
+                    "values": list(set(e.value for e in entries))[:5],
+                },
+                dedup_key=dk,
+            )
+            logger.warning(
+                "Contradiction: %s.%s has %d different values",
+                c.category, c.key_name, c.val_count,
+            )
+
         return contradictions
     
+    def _write_governance_event(self, event_type: str, content: dict[str, Any], dedup_key: str | None = None) -> None:
+        """Write a structured governance event to conversation_events."""
+        import json
+        from uuid_utils import uuid7
+        from sqlalchemy import text
+
+        eid = str(uuid7())
+        try:
+            self.db.execute(
+                text("""INSERT INTO conversation_events
+                        (event_id, session_id, user_id, agent_id, agent_version,
+                         event_type, content, causal_chain_id, dedup_key, created_at)
+                        VALUES (:eid, 'system_governance', 'system', 'governance', '1.0',
+                                :etype, :content, :cid, :dk, :ts)"""),
+                {
+                    "eid": eid,
+                    "etype": event_type,
+                    "content": json.dumps(content, default=str),
+                    "cid": eid,
+                    "dk": dedup_key,
+                    "ts": datetime.now(),
+                },
+            )
+            self.db.commit()
+        except Exception as e:
+            logger.debug("governance event write failed: %s", e)
+            self.db.rollback()
+
     def _generate_health_reports(self) -> int:
         """Generate memory health reports per user.
         

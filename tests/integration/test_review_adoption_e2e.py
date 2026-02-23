@@ -249,7 +249,9 @@ class TestSLODashboard:
         gate_trigger.trigger.assert_called_once()
         kwargs = gate_trigger.trigger.call_args.kwargs
         assert kwargs["change_type"] == "slo_critical"
-        assert agent_id in kwargs["change_id"]
+        # change_id is either recent_change["change_id"] or fallback with agent_id
+        assert kwargs["change_id"]  # non-empty
+        assert kwargs["change_content"]["agent_id"] == agent_id
 
     def test_slo_auto_response_breach_creates_postmortem(self, db_session):
         """Breach severity writes post-mortem, model escalation, and HITL tightening events."""

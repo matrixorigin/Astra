@@ -49,6 +49,8 @@ class TestMemoryGovernanceEngine:
         """Test weekly governance tasks."""
         # Mock knowledge entries query
         mock_db.query.return_value.filter.return_value.all.return_value = []
+        # Mock SQL aggregation for contradictions (empty)
+        mock_db.query.return_value.filter.return_value.group_by.return_value.having.return_value.limit.return_value.all.return_value = []
         # Mock distinct users query
         from sqlalchemy import distinct
         mock_db.query.return_value.all.return_value = [("alice",), ("bob",)]
@@ -89,7 +91,7 @@ class TestMemoryGovernanceEngine:
         count = engine._quarantine_low_confidence(threshold=0.3)
 
         assert count == 2
-        mock_db.commit.assert_called_once()
+        assert mock_db.commit.call_count >= 1  # quarantine + governance event
 
     def test_decay_skips_entry_with_no_dates(self, engine, mock_db):
         """Entry with both last_validated_at and created_at as None is skipped."""
@@ -125,25 +127,27 @@ class TestMemoryGovernanceEngine:
     
     def test_contradiction_scan(self, engine, mock_db):
         """Test contradiction detection."""
-        # Create mock entries with same key but different values
-        entry1 = Mock()
-        entry1.entry_id = "ke_1"
-        entry1.category = "user_preference"
-        entry1.key_name = "language"
-        entry1.value = "python"
-        entry1.confidence = 0.8
-        
-        entry2 = Mock()
-        entry2.entry_id = "ke_2"
-        entry2.category = "user_preference"
-        entry2.key_name = "language"
-        entry2.value = "typescript"
-        entry2.confidence = 0.7
-        
-        mock_db.query.return_value.filter.return_value.all.return_value = [entry1, entry2]
-        
+        from unittest.mock import Mock
+
+        # Mock SQL aggregation result
+        conflict = Mock()
+        conflict.category = "user_preference"
+        conflict.key_name = "language"
+        conflict.val_count = 2
+
+        # Mock chain: query().filter().group_by().having().limit().all()
+        mock_db.query.return_value.filter.return_value.group_by.return_value.having.return_value.limit.return_value.all.return_value = [conflict]
+
+        # Mock entries fetch for conflict details
+        entry1 = Mock(entry_id="ke_1", category="user_preference", key_name="language", value="python")
+        entry2 = Mock(entry_id="ke_2", category="user_preference", key_name="language", value="typescript")
+        mock_db.query.return_value.filter.return_value.limit.return_value.all.return_value = [entry1, entry2]
+
+        # Dedup check returns empty (no existing contradiction events)
+        mock_db.execute.return_value.fetchall.return_value = []
+
         count = engine._scan_contradictions()
-        
+
         assert count == 1
     
     def test_memory_health_stats(self, engine, mock_db):

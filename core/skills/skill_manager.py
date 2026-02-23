@@ -219,7 +219,24 @@ class SkillManager:
             raise SkillNotFoundError(f"Skill '{skill_name}' not found")
         if inst.skill_version == defn.version:
             return inst
+        inst.previous_version = inst.skill_version
         inst.skill_version = defn.version
+        inst.updated_at = _now()
+        self._db.commit()
+        return inst
+
+    def rollback(self, user_id: str, skill_name: str) -> SkillInstallation:
+        """Rollback a skill to its previous version.
+
+        Raises SkillNotInstalledError if not installed or no previous version.
+        """
+        inst = self.get_installation(user_id, skill_name)
+        if inst is None:
+            raise SkillNotInstalledError(f"'{skill_name}' is not installed")
+        prev = getattr(inst, "previous_version", None)
+        if not prev:
+            raise SkillNotInstalledError(f"'{skill_name}' has no previous version to rollback to")
+        inst.skill_version, inst.previous_version = prev, inst.skill_version
         inst.updated_at = _now()
         self._db.commit()
         return inst

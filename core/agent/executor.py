@@ -147,19 +147,36 @@ class AgentExecutor:
             The result of the skill execution.
         """
         _t0 = time.monotonic()
+        _success = True
+        _cost = 0.0
+        _result = None
         try:
-            return self.execute_skill(
+            _result = self.execute_skill(
                 skill_name=skill_name,
                 params=params,
                 session_id=session_id,
                 parent_event_id=parent_event_id,
             )
+            if isinstance(_result, dict):
+                _cost = _result.get("cost", 0.0)
+            return _result
+        except Exception:
+            _success = False
+            raise
         finally:
-            # Always record feedback, even on failure
+            _elapsed_ms = (time.monotonic() - _t0) * 1000
+
+            # Write back execution metrics to skill_selection_events
+            # so learn_from_failures() can read them
+            if selection_event_id:
+                self._backfill_selection_event(
+                    selection_event_id, int(_elapsed_ms), _cost, _success,
+                )
+
+            # Buffer feedback signal (existing path)
             if self._pipeline and selection_event_id:
                 from core.skills.learning_signals import SignalType
                 
-                _elapsed_ms = (time.monotonic() - _t0) * 1000
                 feedback_data = {"ms": _elapsed_ms, "skill": skill_name}
                 if extra_feedback_data:
                     feedback_data.update(extra_feedback_data)
@@ -170,6 +187,23 @@ class AgentExecutor:
                     feedback_data,
                 )
     
+    def _backfill_selection_event(
+        self, event_id: str, time_ms: int, cost: float, success: bool,
+    ) -> None:
+        """Update skill_selection_events with post-execution metrics."""
+        try:
+            from sqlalchemy import text
+            self.db.execute(
+                text("""UPDATE skill_selection_events
+                        SET execution_time_ms = :t, execution_cost = :c, execution_success = :s
+                        WHERE event_id = :eid"""),
+                {"t": time_ms, "c": cost, "s": 1 if success else 0, "eid": event_id},
+            )
+            self.db.commit()
+        except Exception as e:
+            logger.debug("backfill selection event failed: %s", e)
+            self.db.rollback()
+
     def _record_execution_metrics(
         self,
         skill_name: str,
