@@ -37,15 +37,23 @@ class TokenEncryption:
         return self._fernet.decrypt(ciphertext.encode()).decode()
 
 
-# Global instance
-_encryptor = TokenEncryption()
+# Global instance - lazy initialization
+_encryptor = None
+
+
+def _get_encryptor() -> TokenEncryption:
+    """Get or create global encryptor instance."""
+    global _encryptor
+    if _encryptor is None:
+        _encryptor = TokenEncryption()
+    return _encryptor
 
 
 def encrypt_token(token: str) -> str:
     """Encrypt a token value."""
-    return _encryptor.encrypt(token)
+    return _get_encryptor().encrypt(token)
 
 
 def decrypt_token(encrypted: str) -> str:
     """Decrypt a token value."""
-    return _encryptor.decrypt(encrypted)
+    return _get_encryptor().decrypt(encrypted)

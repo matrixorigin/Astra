@@ -19,7 +19,15 @@ class SyncAPIClient:
     
     def _run(self, coro):
         """Run async coroutine synchronously."""
-        return asyncio.run(coro)
+        try:
+            # Try to get existing event loop
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, we can't use asyncio.run()
+            # This is a limitation - we need to be in sync context
+            raise RuntimeError("Cannot run sync client in async context")
+        except RuntimeError:
+            # No running loop, safe to use asyncio.run()
+            return asyncio.run(coro)
     
     def chat_stream(self, message: str, session_id: str | None = None, agent_id: str | None = None):
         """Stream chat response synchronously."""
@@ -27,6 +35,26 @@ class SyncAPIClient:
             async with APIClient(base_url=self.base_url) as client:
                 async for chunk in client.chat_stream(message, session_id, agent_id):
                     yield chunk
+        
+        # Run async generator synchronously
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            gen = _stream()
+            while True:
+                try:
+                    yield loop.run_until_complete(gen.__anext__())
+                except StopAsyncIteration:
+                    break
+        finally:
+            loop.close()
+    
+    def stream_run_events(self, run_id: str):
+        """Stream run events synchronously."""
+        async def _stream():
+            async with APIClient(base_url=self.base_url) as client:
+                async for event in client.stream_run_events(run_id):
+                    yield event
         
         # Run async generator synchronously
         loop = asyncio.new_event_loop()

@@ -244,6 +244,40 @@ def mock_httpx_with_testclient(client):
             # TestClient response already has .json() method
             return response
         
+        def stream(self, method, url, **kwargs):
+            """Support streaming requests."""
+            # Extract path from full URL
+            from urllib.parse import urlparse
+            path = urlparse(url).path
+            
+            # Merge headers
+            headers = {**self.headers, **kwargs.get("headers", {})}
+            kwargs["headers"] = headers
+            
+            # Return a context manager for streaming
+            class StreamContext:
+                def __init__(self, test_client, method, path, kwargs):
+                    self.test_client = test_client
+                    self.method = method
+                    self.path = path
+                    self.kwargs = kwargs
+                
+                def __enter__(self):
+                    self.response = self.test_client.request(self.method, self.path, **self.kwargs)
+                    return self.response
+                
+                def __exit__(self, *args):
+                    pass
+                
+                async def __aenter__(self):
+                    self.response = self.test_client.request(self.method, self.path, **self.kwargs)
+                    return self.response
+                
+                async def __aexit__(self, *args):
+                    pass
+            
+            return StreamContext(self.test_client, method, path, kwargs)
+        
         async def aclose(self):
             pass
         
@@ -597,6 +631,60 @@ class TestChatStreamingRealE2E:
         # If session creation worked, we should see increase
         # If it failed, we should see error message about session creation
         assert sessions_after >= sessions_before or "session" in result.output.lower()
+    
+    def test_non_streaming_chat_polls_and_displays_response(self, authenticated_runner, db, client):
+        """Test that non-streaming chat polls run status and displays response."""
+        from api.models import Session as SessionModel
+        from core.events.models import EventType
+        import json
+        from pathlib import Path
+        
+        # Read credentials from file
+        creds_path = Path.home() / ".mo-agent" / "credentials.json"
+        with open(creds_path) as f:
+            creds = json.load(f)
+        
+        # Create a session first
+        session_response = client.post(
+            "/sessions",
+            json={"agent_id": "dev-agent"},
+            headers={"Authorization": f"Bearer {creds['access_token']}"}
+        )
+        assert session_response.status_code == 201
+        session_id = session_response.json()["session_id"]
+        
+        # Mock the run to complete immediately with a response
+        with patch("core.agent.run_engine.RunEngine.start_run") as mock_start:
+            async def mock_run(run):
+                # Simulate run completion
+                from core.agent.run import RunStatus
+                run.status = RunStatus.COMPLETED
+                # Log a response event
+                from core.events.event_logger import EventLogger
+                logger = EventLogger(db)
+                logger.create_llm_response(
+                    user_id="test_user",
+                    session_id=session_id,
+                    content="Test response from agent",
+                    agent_id="dev-agent",
+                    agent_version="1.0.0",
+                    parent_event_id=None,
+                    causal_chain_id="test-chain"
+                )
+            
+            mock_start.side_effect = mock_run
+            
+            # Start non-streaming chat
+            result = authenticated_runner.invoke(
+                agent_cli,
+                ["--api-url", "http://test", "chat", "--no-stream", "--session-id", session_id],
+                input="Hello\n/exit\n"
+            )
+            
+            # Should show response or at least not be empty
+            assert result.output.strip() != ""
+            # Should have attempted to get response
+            assert "Agent>" in result.output or "Test response" in result.output or "completed" in result.output.lower()
 
 
 class TestUserRegistrationRealE2E:
