@@ -174,12 +174,16 @@ class SkillManager:
             self._db.commit()
         except IntegrityError:
             self._db.rollback()
-            return self.get_installation(user_id, skill_name)  # type: ignore[return-value]
+            result = self.get_installation(user_id, skill_name)
+            assert result is not None, f"Installation vanished after IntegrityError: {user_id}/{skill_name}"
+            return result
         except OperationalError as e:
             self._db.rollback()
-            if "20619" in str(e):
+            if getattr(e.orig, "args", (None,))[0] == 20619:
                 # MatrixOne w-w conflict — concurrent insert won
-                return self.get_installation(user_id, skill_name)  # type: ignore[return-value]
+                result = self.get_installation(user_id, skill_name)
+                assert result is not None, f"Installation vanished after w-w conflict: {user_id}/{skill_name}"
+                return result
             raise
         return installation
 
