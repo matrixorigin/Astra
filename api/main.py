@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.database import init_db
-from api.routers import agents, auth, events, sessions, sandbox, replay, skills, context, decisions, streaming, marketplace
+from api.routers import agents, auth, events, sessions, sandbox, replay, skills, context, decisions, streaming, marketplace, admin
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -195,6 +195,9 @@ app.include_router(triggers.router, tags=["triggers"])
 # Data Versioning — checkpoints, lineage, sandbox checkpoint/restore
 from api.routers import data_versioning
 app.include_router(data_versioning.router)
+
+# Admin — system management (requires admin role)
+app.include_router(admin.router, tags=["admin"])
 
 
 @app.get("/health")
