@@ -40,14 +40,14 @@ def cli(ctx, api_url):
 
 
 @cli.command()
-@click.option("--email", prompt=True)
+@click.option("--username", prompt=True)
 @click.option("--password", prompt=True, hide_input=True)
 @click.pass_context
-def login(ctx, email, password):
+def login(ctx, username, password):
     """Login as admin."""
     try:
-        result = ctx.obj["client"].login(email, password)
-        click.echo(f"✅ Logged in as {result['email']}")
+        result = ctx.obj["client"].login(username, password)
+        click.echo(f"✅ Logged in as {result.get('username', result.get('email', 'user'))}")
     except Exception as e:
         click.echo(f"❌ Login failed: {e}")
         sys.exit(1)
@@ -99,9 +99,8 @@ def token_create(ctx, token_type, provider, value, scope_type, scope_id, descrip
             token_type=token_type,
             provider=provider,
             token_value=value,
-            scope_type=scope_type,
+            scope=scope_type,  # API expects 'scope', not 'scope_type'
             scope_id=scope_id,
-            description=description,
         )
         click.echo(f"✅ Token created: {result['token_id']}")
     except Exception as e:
@@ -120,10 +119,9 @@ def token_list(ctx, token_type, provider, active_only):
     require_auth(client)
     
     try:
+        # API only accepts token_type and scope, not provider or active_only
         tokens = client.admin_list_tokens(
             token_type=token_type,
-            provider=provider,
-            active_only=active_only,
         )
         if not tokens:
             click.echo("No tokens found")
@@ -133,7 +131,11 @@ def token_list(ctx, token_type, provider, active_only):
         click.echo("=" * 100)
         for t in tokens:
             status = "🟢" if t.get("is_active") else "⚪"
-            click.echo(f"{status} {t['token_id'][:8]}... | {t['type']:8} | {t['provider']:15} | {t['scope_type']:10}")
+            # API returns token_type, not type
+            token_type_str = t.get('token_type', 'unknown')
+            provider_str = t.get('provider', 'unknown')
+            scope_str = t.get('scope', 'unknown')
+            click.echo(f"{status} {t['token_id'][:8]}... | {token_type_str:8} | {provider_str:15} | {scope_str:10}")
     except Exception as e:
         click.echo(f"❌ Error: {e}")
 
@@ -159,9 +161,9 @@ def audit_logs(ctx, user, action, since, limit):
         if since:
             since_date = datetime.strptime(since, "%Y-%m-%d").isoformat()
         
+        # API only accepts user_id, since, limit - not action
         logs = client.admin_audit_logs(
             user_id=user,
-            action=action,
             since=since_date,
             limit=limit,
         )
@@ -211,19 +213,25 @@ def feedback_stats(ctx, agent_id, days):
 @click.option("--days", default=30)
 @click.pass_context
 def feedback_export(ctx, output, min_rating, days):
-    """Export feedback."""
+    """Export feedback (async job)."""
     client = ctx.obj["client"]
     require_auth(client)
     
     try:
-        since = (datetime.now() - timedelta(days=days)).isoformat()
-        result = client.admin_feedback_export(min_rating=min_rating, since=since)
+        # API only accepts agent_id and format, not min_rating or since
+        result = client.admin_feedback_export()
         
-        with open(output, "w") as f:
-            for item in result.get("data", []):
-                f.write(json.dumps(item) + "\n")
+        # API returns async job info, not data
+        job_id = result.get("job_id")
+        status = result.get("status")
+        download_url = result.get("download_url")
         
-        click.echo(f"✅ Exported {result.get('count', 0)} items to {output}")
+        if download_url:
+            click.echo(f"✅ Export ready: {download_url}")
+        else:
+            click.echo(f"📋 Export job created: {job_id}")
+            click.echo(f"   Status: {status}")
+            click.echo(f"   Check job status with: mo-admin job status {job_id}")
     except Exception as e:
         click.echo(f"❌ Error: {e}")
 

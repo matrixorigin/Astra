@@ -269,14 +269,16 @@ class TestAdminCLI:
         with patch("cli.mo_admin_api.SyncAPIClient") as mock_client_class:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
+            # API returns async job info, not data
             mock_client.admin_feedback_export.return_value = {
-                "count": 50,
-                "data": []
+                "job_id": "job-123",
+                "status": "queued",
+                "download_url": None
             }
             
             result = runner.invoke(admin_cli, ["feedback", "export"])
             assert result.exit_code == 0
-            assert "✅ Exported" in result.output
+            assert "Export job created" in result.output or "Export ready" in result.output
 
     def test_whoami(self, runner):
         """Test whoami command."""

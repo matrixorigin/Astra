@@ -134,11 +134,16 @@ class APIClient:
             True if authenticated, False otherwise
         """
         if not self._access_token:
+            print(f"[DEBUG] ensure_authenticated: No access token")
             return False
         try:
-            await self.get_current_user()
+            user = await self.get_current_user()
+            print(f"[DEBUG] ensure_authenticated: Success, user={user.get('username')}")
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG] ensure_authenticated: Failed with {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     async def register(self, username: str, password: str, email: str) -> dict[str, Any]:

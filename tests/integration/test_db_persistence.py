@@ -1,11 +1,13 @@
-"""End-to-end tests for CLI → API → DB flow.
+"""Database persistence tests for API models.
 
 These tests verify that:
-1. CLI commands properly call API endpoints
-2. API endpoints correctly persist data to database
-3. Database queries return expected results
-4. RBAC and authentication are enforced
-5. Data integrity is maintained through the full stack
+1. API models correctly persist data to database
+2. Database queries return expected results
+3. Data integrity is maintained (encryption, constraints)
+4. Database schema is correctly configured
+
+Note: These are NOT CLI → API → DB end-to-end tests.
+For true E2E tests, see test_cli_to_api_e2e.py
 """
 
 import pytest
@@ -47,8 +49,8 @@ def db():
     session.close()
 
 
-class TestAgentCLIE2E:
-    """End-to-end tests for agent CLI with real database."""
+class TestDatabasePersistence:
+    """Database persistence tests for API models."""
 
     def test_session_list_queries_real_db(self, runner, db):
         """Test session list command queries real database."""
@@ -111,8 +113,8 @@ class TestAgentCLIE2E:
         assert result > 0, "skills_registry table should exist"
 
 
-class TestAdminCLIE2E:
-    """End-to-end tests for admin CLI with real database."""
+class TestAdminAPIPersistence:
+    """Database persistence tests for admin API models."""
 
     def test_token_create_persists_encrypted_value(self, runner, db):
         """Test token creation stores encrypted value in database."""
@@ -329,8 +331,8 @@ class TestAdminCLIE2E:
         assert results[0].agent_id == "agent1"
 
 
-class TestCLIAuthenticationE2E:
-    """End-to-end tests for CLI authentication requirements."""
+class TestAuthenticationPersistence:
+    """Database persistence tests for authentication requirements."""
 
     def test_agent_cli_requires_auth_for_protected_commands(self, runner):
         """Test that protected agent CLI commands require authentication."""
@@ -363,8 +365,8 @@ class TestCLIAuthenticationE2E:
             assert callable(require_auth)
 
 
-class TestCLIAPIDataConsistency:
-    """Test data consistency between CLI, API, and database."""
+class TestDataConsistency:
+    """Test data consistency and integrity in database."""
 
     def test_token_encryption_consistency(self, runner, db):
         """Test that token encryption is consistent across stack."""

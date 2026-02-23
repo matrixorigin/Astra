@@ -1,0 +1,288 @@
+"""Unit tests for CLI command parsing and argument handling.
+
+⚠️ IMPORTANT: These are NOT end-to-end tests!
+
+These tests use mocks and only verify:
+- Click command structure and argument parsing
+- CLI calls the correct API Client methods with correct parameters
+- Error handling and output formatting
+
+They do NOT test:
+- Real HTTP requests to API server
+- API response format correctness
+- Database persistence
+- Complete CLI → API → DB flow
+
+For true end-to-end tests, see tests/integration/test_real_e2e.py
+
+Note: Mock return values should match real API response formats.
+If API changes response format, these tests must be updated.
+"""
+
+import pytest
+from click.testing import CliRunner
+from unittest.mock import patch, MagicMock
+import json
+
+from cli.mo_agent_api import cli as agent_cli
+from cli.mo_admin_api import cli as admin_cli
+
+
+@pytest.fixture
+def runner():
+    return CliRunner()
+
+
+@pytest.fixture
+def mock_api_client():
+    """Mock API client to verify CLI → API calls."""
+    with patch("cli.mo_agent_api.SyncAPIClient") as mock:
+        client_instance = MagicMock()
+        mock.return_value = client_instance
+        yield client_instance
+
+
+@pytest.fixture
+def mock_admin_api_client():
+    """Mock API client for admin CLI."""
+    with patch("cli.mo_admin_api.SyncAPIClient") as mock:
+        client_instance = MagicMock()
+        mock.return_value = client_instance
+        yield client_instance
+
+
+class TestAgentCLIToAPI:
+    """Test CLI commands correctly call API client methods."""
+
+    def test_login_calls_api_client(self, runner, mock_api_client):
+        """Test login command calls API client login method."""
+        mock_api_client.login.return_value = {"email": "test@example.com"}
+        
+        result = runner.invoke(
+            agent_cli,
+            ["login"],
+            input="test@example.com\npassword123\n"
+        )
+        
+        assert result.exit_code == 0
+        mock_api_client.login.assert_called_once_with("test@example.com", "password123")
+        assert "✅ Logged in" in result.output
+
+    def test_register_calls_api_client(self, runner, mock_api_client):
+        """Test register command calls API client register method."""
+        mock_api_client.register.return_value = {"email": "new@example.com"}
+        
+        result = runner.invoke(
+            agent_cli,
+            ["register"],
+            input="new@example.com\npassword123\npassword123\ntestuser\n"
+        )
+        
+        assert result.exit_code == 0
+        mock_api_client.register.assert_called_once_with("testuser", "password123", "new@example.com")
+        assert "✅ Registered" in result.output
+
+    def test_session_list_calls_api_client(self, runner, mock_api_client):
+        """Test session list command calls API client."""
+        mock_api_client.ensure_authenticated.return_value = True
+        # API returns {"sessions": [...], "total": ...}
+        mock_api_client.list_sessions.return_value = {
+            "sessions": [
+                {"session_id": "sess-1", "user_id": "alice", "status": "active", "event_count": 5},
+                {"session_id": "sess-2", "user_id": "alice", "status": "closed", "event_count": 3},
+            ],
+            "total": 2
+        }
+        
+        # API filters by JWT automatically, no --user-id parameter
+        result = runner.invoke(agent_cli, ["session", "list"])
+        
+        assert result.exit_code == 0
+        mock_api_client.list_sessions.assert_called_once_with(limit=20)
+        assert "sess-1" in result.output
+        assert "sess-2" in result.output
+
+    def test_session_show_calls_api_client(self, runner, mock_api_client):
+        """Test session show command calls API client."""
+        mock_api_client.get_session.return_value = {
+            "session_id": "sess-123",
+            "user_id": "alice",
+            "status": "active",
+            "event_count": 5
+        }
+        
+        result = runner.invoke(agent_cli, ["session", "show", "sess-123"])
+        
+        assert result.exit_code == 0
+        mock_api_client.get_session.assert_called_once_with("sess-123")
+        assert "sess-123" in result.output
+        assert "alice" in result.output
+
+    def test_skill_list_calls_api_client(self, runner, mock_api_client):
+        """Test skill list command calls API client."""
+        mock_api_client.ensure_authenticated.return_value = True
+        mock_api_client.list_skills.return_value = [
+            {"skill_name": "code_search", "version": "1.0", "is_active": True, "description": "Search code"},
+            {"skill_name": "web_search", "version": "1.0", "is_active": True, "description": "Search web"},
+        ]
+        
+        result = runner.invoke(agent_cli, ["skill", "list"])
+        
+        assert result.exit_code == 0
+        mock_api_client.list_skills.assert_called_once()
+        assert "code_search" in result.output
+
+    def test_skill_register_calls_api_client(self, runner, mock_api_client, tmp_path):
+        """Test skill register command calls API client."""
+        skill_file = tmp_path / "skill.json"
+        skill_data = {
+            "skill_name": "test_skill",
+            "version": "1.0",
+            "description": "Test skill"
+        }
+        skill_file.write_text(json.dumps(skill_data))
+        
+        mock_api_client.ensure_authenticated.return_value = True
+        mock_api_client.register_skill.return_value = {"skill_name": "test_skill", "version": "1.0"}
+        
+        result = runner.invoke(agent_cli, ["skill", "register", str(skill_file)])
+        
+        assert result.exit_code == 0
+        mock_api_client.register_skill.assert_called_once()
+        assert "✅ Registered" in result.output
+
+    def test_replay_calls_api_client(self, runner, mock_api_client):
+        """Test replay command calls API client."""
+        mock_api_client.ensure_authenticated.return_value = True
+        mock_api_client.replay_session.return_value = {
+            "replay_id": "replay-123",
+            "events_replayed": 5
+        }
+        
+        result = runner.invoke(agent_cli, ["replay", "sess-123"])
+        
+        assert result.exit_code == 0
+        # Check that replay_session was called (don't enforce exact kwargs)
+        mock_api_client.replay_session.assert_called_once()
+        assert "Replayed 5 events" in result.output
+
+
+class TestAdminCLIToAPI:
+    """Test admin CLI commands correctly call API client methods."""
+
+    def test_token_create_calls_api_client(self, runner, mock_admin_api_client):
+        """Test token create command calls API client."""
+        mock_admin_api_client.ensure_authenticated.return_value = True
+        mock_admin_api_client.admin_create_token.return_value = {
+            "token_id": "tok-123",
+            "token_type": "llm",
+            "provider": "openai"
+        }
+        
+        result = runner.invoke(
+            admin_cli,
+            ["token", "create", "--type", "llm", "--provider", "openai"],
+            input="sk-test-key\n"
+        )
+        
+        assert result.exit_code == 0
+        mock_admin_api_client.admin_create_token.assert_called_once()
+        assert "✅" in result.output or "tok-123" in result.output
+
+    def test_token_list_calls_api_client(self, runner, mock_admin_api_client):
+        """Test token list command calls API client."""
+        mock_admin_api_client.ensure_authenticated.return_value = True
+        mock_admin_api_client.admin_list_tokens.return_value = [
+            {"token_id": "tok-1", "type": "llm", "provider": "openai", "is_active": True, "scope_type": "global"},
+            {"token_id": "tok-2", "type": "github", "provider": "github", "is_active": True, "scope_type": "global"},
+        ]
+        
+        result = runner.invoke(admin_cli, ["token", "list"])
+        
+        assert result.exit_code == 0
+        mock_admin_api_client.admin_list_tokens.assert_called_once()
+        assert "tok-1" in result.output
+        assert "openai" in result.output
+
+    def test_audit_logs_calls_api_client(self, runner, mock_admin_api_client):
+        """Test audit logs command calls API client."""
+        mock_admin_api_client.admin_audit_logs.return_value = [
+            {"user_id": "alice", "action": "login", "timestamp": "2026-02-23T10:00:00Z"},
+            {"user_id": "bob", "action": "create_session", "timestamp": "2026-02-23T11:00:00Z"},
+        ]
+        
+        result = runner.invoke(admin_cli, ["audit", "logs", "--user", "alice"])
+        
+        assert result.exit_code == 0
+        mock_admin_api_client.admin_audit_logs.assert_called_once()
+        assert "alice" in result.output
+        assert "login" in result.output
+
+    def test_feedback_stats_calls_api_client(self, runner, mock_admin_api_client):
+        """Test feedback stats command calls API client."""
+        mock_admin_api_client.admin_feedback_stats.return_value = {
+            "total": 100,
+            "positive": 80,
+            "negative": 20,
+            "avg_rating": 4.2
+        }
+        
+        result = runner.invoke(admin_cli, ["feedback", "stats"])
+        
+        assert result.exit_code == 0
+        mock_admin_api_client.admin_feedback_stats.assert_called_once()
+        assert "100" in result.output
+        assert "4.2" in result.output
+
+
+class TestStreamingE2E:
+    """Test streaming functionality end-to-end."""
+
+    def test_chat_stream_calls_api_client(self, runner, mock_api_client):
+        """Test chat command with streaming calls API client."""
+        # Mock streaming response
+        def mock_stream(*args, **kwargs):
+            yield {"type": "content", "content": "Hello"}
+            yield {"type": "content", "content": " world"}
+            yield {"type": "done"}
+        
+        mock_api_client.ensure_authenticated.return_value = True
+        mock_api_client.create_session.return_value = {"session_id": "sess-123"}
+        mock_api_client.chat_stream.return_value = mock_stream()
+        mock_api_client.close_session.return_value = {}
+        
+        result = runner.invoke(
+            agent_cli,
+            ["chat", "--user-id", "alice"],
+            input="test message\nexit\n"
+        )
+        
+        # Verify streaming was called
+        mock_api_client.chat_stream.assert_called()
+        assert "Hello world" in result.output or "Agent>" in result.output
+
+    def test_chat_no_stream_calls_regular_api(self, runner, mock_api_client):
+        """Test chat command with --no-stream uses regular API and polls for result."""
+        mock_api_client.ensure_authenticated.return_value = True
+        mock_api_client.create_session.return_value = {"session_id": "sess-123"}
+        # API returns run_id, not response
+        mock_api_client.chat.return_value = {"run_id": "run-123", "status": "queued"}
+        mock_api_client.get_run_status.return_value = {"status": "completed", "run_id": "run-123"}
+        
+        def mock_stream_events(*args, **kwargs):
+            yield {"type": "content", "content": "Hello world"}
+            yield {"type": "done"}
+        
+        mock_api_client.stream_run_events.return_value = mock_stream_events()
+        mock_api_client.close_session.return_value = {}
+        
+        result = runner.invoke(
+            agent_cli,
+            ["chat", "--user-id", "alice", "--no-stream"],
+            input="test message\nexit\n"
+        )
+        
+        # Verify non-streaming was called and polled for result
+        mock_api_client.chat.assert_called()
+        mock_api_client.get_run_status.assert_called()
+        assert "Hello world" in result.output

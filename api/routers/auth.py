@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
+from api.dependencies import get_current_user
 from api.repositories.user_repository import UserRepository
 from core.auth.jwt_manager import create_access_token, create_refresh_token, decode_token
 from core.auth.password import hash_password, verify_password
@@ -156,3 +157,24 @@ def logout(request: RefreshRequest, db: Session = Depends(get_db_session)):
     repo.revoke_refresh_token(token_hash)
 
     return {"message": "Logged out successfully"}
+
+
+@router.get("/me", response_model=UserResponse)
+def get_current_user_info(
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get current user information."""
+    repo = UserRepository(db)
+    user = repo.get_by_id(current_user["user_id"])
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return UserResponse(
+        user_id=user.user_id,
+        username=user.username,
+        email=user.email,
+        is_active=bool(user.is_active),
+        created_at=user.created_at.isoformat(),
+    )

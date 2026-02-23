@@ -21,6 +21,26 @@ class SyncAPIClient:
         """Run async coroutine synchronously."""
         return asyncio.run(coro)
     
+    def chat_stream(self, message: str, session_id: str | None = None, agent_id: str | None = None):
+        """Stream chat response synchronously."""
+        async def _stream():
+            async with APIClient(base_url=self.base_url) as client:
+                async for chunk in client.chat_stream(message, session_id, agent_id):
+                    yield chunk
+        
+        # Run async generator synchronously
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            gen = _stream()
+            while True:
+                try:
+                    yield loop.run_until_complete(gen.__anext__())
+                except StopAsyncIteration:
+                    break
+        finally:
+            loop.close()
+    
     def __getattr__(self, name):
         """Wrap all async methods to run synchronously."""
         async def wrapper(*args, **kwargs):
@@ -42,14 +62,14 @@ def cli(ctx, api_url):
 
 
 @cli.command()
-@click.option("--email", prompt=True)
+@click.option("--username", prompt=True)
 @click.option("--password", prompt=True, hide_input=True)
 @click.pass_context
-def login(ctx, email, password):
+def login(ctx, username, password):
     """Login to mo-agent API."""
     try:
-        result = ctx.obj["client"].login(email, password)
-        click.echo(f"✅ Logged in as {result['email']}")
+        result = ctx.obj["client"].login(username, password)
+        click.echo(f"✅ Logged in as {result.get('username', result.get('email', 'user'))}")
     except Exception as e:
         click.echo(f"❌ Login failed: {e}")
         sys.exit(1)
@@ -73,9 +93,10 @@ def register(ctx, email, password, username):
 @cli.command()
 @click.option("--user-id", default="cli_user")
 @click.option("--session-id", default=None)
+@click.option("--no-stream", is_flag=True, help="Disable streaming output")
 @click.pass_context
-def chat(ctx, user_id, session_id):
-    """Start interactive chat (streaming not yet supported in sync mode)."""
+def chat(ctx, user_id, session_id, no_stream):
+    """Start interactive chat with streaming support."""
     client = ctx.obj["client"]
     
     click.echo("🤖 mo-agent interactive chat")
@@ -86,7 +107,9 @@ def chat(ctx, user_id, session_id):
         sys.exit(1)
     
     if not session_id:
-        result = client.create_session(user_id=user_id)
+        # API expects agent_id, not user_id
+        # Use user_id as agent_id for now (or use default agent)
+        result = client.create_session(agent_id=user_id or "default-agent")
         session_id = result["session_id"]
         click.echo(f"📝 Session: {session_id}\n")
     
@@ -96,8 +119,38 @@ def chat(ctx, user_id, session_id):
             if user_input.lower() in ["exit", "quit"]:
                 break
             
-            result = client.chat(user_input, session_id=session_id)
-            click.echo(f"Agent> {result.get('response', '')}\n")
+            if no_stream:
+                # Non-streaming mode: poll for result
+                result = client.chat(user_input, session_id=session_id)
+                run_id = result.get("run_id")
+                
+                # Poll for completion
+                import time
+                while True:
+                    status = client.get_run_status(run_id)
+                    if status["status"] in ["completed", "failed", "cancelled"]:
+                        break
+                    time.sleep(0.5)
+                
+                # Get final response from run events
+                if status["status"] == "completed":
+                    # Stream events to get response
+                    response_text = ""
+                    for event in client.stream_run_events(run_id):
+                        if event.get("type") == "content":
+                            response_text += event.get("content", "")
+                    click.echo(f"Agent> {response_text}\n")
+                else:
+                    click.echo(f"❌ Run {status['status']}\n")
+            else:
+                # Streaming mode
+                click.echo("Agent> ", nl=False)
+                for chunk in client.chat_stream(user_input, session_id=session_id):
+                    if chunk.get("type") == "content":
+                        click.echo(chunk.get("content", ""), nl=False)
+                    elif chunk.get("type") == "done":
+                        click.echo()  # Newline after completion
+                click.echo()  # Extra newline for spacing
     
     except KeyboardInterrupt:
         click.echo("\n\nInterrupted")
@@ -111,8 +164,14 @@ def chat(ctx, user_id, session_id):
 
 def require_auth(client):
     """Ensure user is authenticated."""
-    if not client.ensure_authenticated():
-        click.echo("❌ Please login first: mo-agent login")
+    try:
+        if not client.ensure_authenticated():
+            click.echo("❌ Please login first: mo-agent login")
+            sys.exit(1)
+    except Exception as e:
+        click.echo(f"❌ Authentication check failed: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
@@ -122,16 +181,18 @@ def session():
 
 
 @session.command("list")
-@click.option("--user-id", default=None)
 @click.option("--limit", default=20)
 @click.pass_context
-def session_list(ctx, user_id, limit):
+def session_list(ctx, limit):
     """List sessions."""
     client = ctx.obj["client"]
     require_auth(client)
     
     try:
-        sessions = client.list_sessions(user_id=user_id, limit=limit)
+        result = client.list_sessions(limit=limit)
+        # API returns {"sessions": [...], "total": ...}
+        sessions = result.get("sessions", []) if isinstance(result, dict) else result
+        
         if not sessions:
             click.echo("No sessions found")
             return

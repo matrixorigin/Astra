@@ -33,7 +33,7 @@ class SessionResponse(BaseModel):
     session_id: str
     user_id: str
     agent_id: str | None = None
-    title: str
+    title: str | None = None  # Title is optional
     metadata: dict[str, Any]
     status: str
     event_count: int
