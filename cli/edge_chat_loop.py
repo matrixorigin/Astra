@@ -138,6 +138,7 @@ async def edge_chat_loop(
                 project_rules=project_rules if turn == 0 else None,
                 agent_id=agent_id,
                 model=model,
+                edge_tools=tool_router.get_schemas() if turn == 0 else None,
             )
             result = await _consume_turn(sse_stream, renderer)
         except KeyboardInterrupt:

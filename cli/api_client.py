@@ -315,6 +315,7 @@ class APIClient:
         project_rules: str | None = None,
         agent_id: str | None = None,
         model: str | None = None,
+        edge_tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Call /chat/turn — one LLM turn in the edge-cloud loop.
 
@@ -338,6 +339,8 @@ class APIClient:
             payload["agent_id"] = agent_id
         if model:
             payload["model"] = model
+        if edge_tools:
+            payload["edge_tools"] = edge_tools
 
         url = f"{self.base_url}/chat/turn"
         async with aconnect_sse(

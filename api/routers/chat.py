@@ -1,7 +1,7 @@
 """Chat API endpoints — unified conversation entry point with durable AgentRun."""
 
 import json
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -29,6 +29,17 @@ class ChatRequest(BaseModel):
     model: str | None = Field(default=None, description="Model to use for this request")
     context: dict | None = Field(default=None, description="Optional context")
     max_candidates: int = Field(default=5, description="Max skill candidates")
+
+
+class ChatTurnRequest(BaseModel):
+    """Edge-cloud /chat/turn request — one LLM turn in the agentic loop."""
+    messages: list[dict[str, Any]] = Field(description="Conversation messages from edge")
+    session_id: str | None = Field(default=None, description="Session ID (auto-created on first turn)")
+    tool_results: list[dict[str, Any]] | None = Field(default=None, description="Tool execution results from edge")
+    project_rules: str | None = Field(default=None, description="Project rules (sent on first turn)")
+    agent_id: str | None = Field(default=None, description="Agent ID")
+    model: str | None = Field(default=None, description="Model override")
+    edge_tools: list[dict[str, Any]] | None = Field(default=None, description="Edge tool schemas (OpenAI format)")
 
 
 class ChatResponse(BaseModel):
@@ -288,3 +299,129 @@ async def cancel_run(
     if not engine.cancel_run(run_id):
         raise HTTPException(status_code=409, detail="Run already finished")
     return {"run_id": run_id, "status": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# /chat/turn — Edge-Cloud agentic loop endpoint
+# ---------------------------------------------------------------------------
+
+# In-memory conversation history per session (production: persist in MatrixOne)
+_turn_histories: dict[str, list[dict[str, Any]]] = {}
+
+
+def _build_turn_messages(
+    session_id: str,
+    messages: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]] | None,
+    project_rules: str | None,
+) -> list[dict[str, Any]]:
+    """Build LLM messages from edge turn data + server-side history."""
+    history = _turn_histories.get(session_id, [])
+
+    # First turn: initialize with system prompt
+    if not history:
+        system = "You are a development assistant. Use the available tools to help the user."
+        if project_rules:
+            system += f"\n\n# Project Rules\n{project_rules}"
+        history = [{"role": "system", "content": system}]
+
+    # Append new user messages from edge
+    for msg in messages:
+        if msg.get("role") and msg.get("content"):
+            history.append(msg)
+
+    # Append tool results as tool messages (OpenAI format)
+    if tool_results:
+        for tr in tool_results:
+            history.append({
+                "role": "tool",
+                "tool_call_id": tr["tool_call_id"],
+                "content": tr.get("result", ""),
+            })
+
+    _turn_histories[session_id] = history
+    return history
+
+
+@router.post("/chat/turn")
+async def chat_turn(
+    request: ChatTurnRequest,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db_session)],
+):
+    """One LLM turn in the edge-cloud agentic loop.
+
+    Edge sends messages + tool_results → cloud does context enrichment + LLM call →
+    returns SSE stream of text_delta, tool_call, usage, turn_complete events.
+    """
+    user_id = current_user["user_id"]
+    session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
+
+    # Build conversation messages
+    llm_messages = _build_turn_messages(
+        session_id, request.messages, request.tool_results, request.project_rules,
+    )
+
+    # Resolve tools: use edge_tools if provided, else empty
+    tools_schema = request.edge_tools or []
+
+    # Resolve model
+    model = request.model
+
+    async def event_generator():
+        # Session info (always first)
+        yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id})}\n\n"
+
+        try:
+            from core.llm.client import LLMClient
+            llm = LLMClient(db=db)
+
+            full_text = ""
+            tool_calls: list[dict[str, Any]] = []
+
+            if tools_schema:
+                async for chunk in llm.chat_with_tools_stream(
+                    llm_messages, tools_schema, model=model,
+                ):
+                    if chunk["type"] == "text":
+                        full_text += chunk["content"]
+                        yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
+                    elif chunk["type"] == "tool_call":
+                        tc = chunk["data"]
+                        tool_calls.append(tc)
+                    elif chunk["type"] == "usage":
+                        yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
+            else:
+                async for chunk in llm.chat_stream(
+                    llm_messages, user_id, session_id, model=model,
+                ):
+                    if chunk["type"] == "text":
+                        full_text += chunk["content"]
+                        yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
+
+            # Emit accumulated tool calls
+            for tc in tool_calls:
+                args = tc.get("function", {}).get("arguments", "{}")
+                try:
+                    parsed_args = json.loads(args) if isinstance(args, str) else args
+                except json.JSONDecodeError:
+                    parsed_args = {}
+                yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc.get('function', {}).get('name', ''), 'arguments': parsed_args})}\n\n"
+
+            # Append assistant message to history
+            assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text}
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            _turn_histories.setdefault(session_id, []).append(assistant_msg)
+
+            yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"
+
+        except Exception as e:
+            logger.error(f"chat_turn error: {e}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
