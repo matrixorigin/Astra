@@ -11,12 +11,9 @@ from core.events.models import StreamEvent, StreamEventType
 @pytest.fixture(autouse=True)
 def clean_fan_in_tasks():
     """Clean fan-in tasks after each test."""
-    from core.agent.run_engine import _fan_in_tasks
+    from core.agent.run_engine import cleanup_fan_in_tasks
     yield
-    # Cancel any pending fan-in tasks
-    for task in _fan_in_tasks:
-        task.cancel()
-    _fan_in_tasks.clear()
+    cleanup_fan_in_tasks()
 
 
 @pytest.fixture

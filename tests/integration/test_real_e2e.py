@@ -639,16 +639,21 @@ class TestChatStreamingRealE2E:
         import json
         from pathlib import Path
         
-        # Read credentials from file
+        # Read credentials from file (new profile format)
         creds_path = Path.home() / ".mo-agent" / "credentials.json"
         with open(creds_path) as f:
             creds = json.load(f)
+        
+        # Get access token from current profile
+        current_profile = creds.get("current_profile", "default")
+        profile_data = creds.get("profiles", {}).get(current_profile, {})
+        access_token = profile_data.get("access_token")
         
         # Create a session first
         session_response = client.post(
             "/sessions",
             json={"agent_id": "dev-agent"},
-            headers={"Authorization": f"Bearer {creds['access_token']}"}
+            headers={"Authorization": f"Bearer {access_token}"}
         )
         assert session_response.status_code == 201
         session_id = session_response.json()["session_id"]

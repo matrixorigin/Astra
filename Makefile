@@ -196,7 +196,14 @@ check-runtime:
 .PHONY: dev-deps-up
 dev-deps-up:
 	@echo "Starting dependency services (MatrixOne + Redis)..."
-	@cd deployment/all-in-one && docker compose up -d matrixone redis
+	@if [ -d deployment/all-in-one/data ] && [ "$$(stat -c '%u' deployment/all-in-one/data 2>/dev/null || stat -f '%u' deployment/all-in-one/data 2>/dev/null)" != "$$(id -u)" ]; then \
+		echo "❌ Error: Data directory owned by root"; \
+		echo "   Run: make dev-clean (to delete data)"; \
+		echo "   Or:  sudo chown -R $$(id -u):$$(id -g) deployment/all-in-one/data (to fix permissions)"; \
+		exit 1; \
+	fi
+	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/redis
+	@cd deployment/all-in-one && UID=$$(id -u) GID=$$(id -g) docker compose up -d matrixone redis
 	@echo "✅ Dependency services started"
 
 .PHONY: dev-deps-down
@@ -211,7 +218,14 @@ dev-deps-clean:
 	@printf "Are you sure? [y/N] " && read REPLY && \
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
 		cd deployment/all-in-one && docker compose down -v; \
-		rm -f api_server.pid api_server.log; \
+		if [ -d data ]; then \
+			if [ "$$(stat -c '%u' data 2>/dev/null || stat -f '%u' data 2>/dev/null)" != "$$(id -u)" ]; then \
+				sudo rm -rf data; \
+			else \
+				rm -rf data; \
+			fi; \
+		fi; \
+		cd ../.. && rm -f api_server.pid api_server.log; \
 		echo "✅ All dependency data removed"; \
 	else \
 		echo "Cancelled"; \
@@ -342,8 +356,8 @@ dev-api-docker-scale:
 # Development - Composite Commands (Most Used)
 # ============================================================================
 
-.PHONY: dev-start
-dev-start: dev-deps-up dev-deps-wait dev-api-start
+.PHONY: dev-up
+dev-up: dev-deps-up dev-deps-wait dev-api-start
 	@echo ""
 	@echo "✅ Development environment started!"
 	@echo "   API: http://localhost:8000"
@@ -357,22 +371,22 @@ dev-start: dev-deps-up dev-deps-wait dev-api-start
 	@echo "  NO_PROXY=localhost mo-agent login"
 	@echo "  NO_PROXY=localhost mo-agent chat"
 
-.PHONY: dev-start-docker
-dev-start-docker: dev-deps-up dev-deps-wait dev-api-docker-up
+.PHONY: dev-up-docker
+dev-up-docker: dev-deps-up dev-deps-wait dev-api-docker-up
 	@sleep 3
 	@echo ""
 	@echo "✅ Development environment ready (Docker mode)!"
 	@echo "   API: http://localhost:8000"
 	@echo "   Docs: http://localhost:8000/docs"
 
-.PHONY: dev-stop
-dev-stop: dev-api-stop dev-deps-down
+.PHONY: dev-down
+dev-down: dev-api-stop dev-deps-down
 	@echo "✅ All services stopped"
 
 .PHONY: dev-restart
-dev-restart: dev-stop
+dev-restart: dev-down
 	@sleep 1
-	@$(MAKE) dev-start
+	@$(MAKE) dev-up
 
 .PHONY: dev-status
 dev-status:

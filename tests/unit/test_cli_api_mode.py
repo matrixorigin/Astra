@@ -293,3 +293,53 @@ class TestAdminCLI:
             result = runner.invoke(admin_cli, ["whoami"])
             assert result.exit_code == 0
             assert "admin@example.com" in result.output
+
+    def test_user_grant_role_success(self, runner):
+        """Test granting role to user."""
+        with patch("cli.mo_admin_api.SyncAPIClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.ensure_authenticated.return_value = True
+            mock_client.admin_grant_role.return_value = {
+                "username": "alice",
+                "role_name": "mo_agent_admin",
+                "message": "Role granted successfully"
+            }
+            
+            result = runner.invoke(admin_cli, ["user", "grant-role", "alice", "mo_agent_admin"])
+            assert result.exit_code == 0
+            assert "✅" in result.output
+            assert "granted" in result.output.lower()
+
+    def test_user_grant_role_not_authenticated(self, runner):
+        """Test granting role requires authentication."""
+        with patch("cli.mo_admin_api.SyncAPIClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.ensure_authenticated.return_value = False
+            
+            result = runner.invoke(admin_cli, ["user", "grant-role", "alice", "mo_agent_admin"])
+            assert result.exit_code == 1
+            assert "login first" in result.output.lower()
+
+    def test_user_revoke_role_success(self, runner):
+        """Test revoking role from user."""
+        with patch("cli.mo_admin_api.SyncAPIClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.ensure_authenticated.return_value = True
+            mock_client.admin_revoke_role.return_value = {
+                "username": "alice",
+                "role_name": "mo_agent_admin",
+                "message": "Role revoked successfully"
+            }
+            
+            result = runner.invoke(admin_cli, ["user", "revoke-role", "alice", "mo_agent_admin"])
+            assert result.exit_code == 0
+            assert "✅" in result.output
+            assert "revoked" in result.output.lower()
+
+    def test_user_grant_role_invalid_role(self, runner):
+        """Test granting invalid role name."""
+        result = runner.invoke(admin_cli, ["user", "grant-role", "alice", "invalid_role"])
+        assert result.exit_code != 0  # Click validation should fail

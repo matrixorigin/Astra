@@ -36,11 +36,27 @@ def db(db_session):
             "value2": config_data,
         },
     )
+    # Register gpt-4 model in registry (no longer hardcoded)
+    models_json = json.dumps([{
+        "model_name": "gpt-4",
+        "provider": "openai",
+        "context_window": 8192,
+        "pricing": {"prompt": 0.03, "completion": 0.06},
+        "is_active": True,
+    }])
+    db_session.execute(text("DELETE FROM configs WHERE key_name = 'model_registry' AND scope_type = 'global'"))
+    db_session.execute(
+        text("""
+        INSERT INTO configs (config_id, key_name, scope_type, scope_user_id, value)
+        VALUES ('test_model_reg', 'model_registry', 'global', NULL, :value)
+        """),
+        {"value": models_json},
+    )
     db_session.commit()
     yield db_session
     # Cleanup
     db_session.execute(text("DELETE FROM llm_call_logs WHERE event_id LIKE 'test_%'"))
-    db_session.execute(text("DELETE FROM configs WHERE config_id = 'llm_config'"))
+    db_session.execute(text("DELETE FROM configs WHERE config_id IN ('test_llm_config_001', 'test_model_reg')"))
     db_session.commit()
 
 
@@ -60,17 +76,15 @@ def test_load_config(client):
 
 def test_chat_error_logging(client, db):
     """Test error logging when LLM call fails."""
-    # Test that invalid provider raises error
-    client.config["provider"] = "unsupported"
-
     messages = [LLMMessage(role="user", content="Hello")]
 
-    # Should raise ValueError for invalid provider
-    with pytest.raises(ValueError):
+    # Model 'nonexistent' is not registered — should raise PermissionError
+    with pytest.raises(PermissionError):
         client.chat(
             messages=messages,
             event_id="test_event_error",
             user_id="test_user",
+            model="nonexistent",
         )
 
 

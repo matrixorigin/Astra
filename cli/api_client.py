@@ -21,20 +21,24 @@ class APIClient:
         self,
         base_url: str | None = None,
         credentials_path: Path | None = None,
+        profile: str | None = None,
     ):
         """Initialize API client.
 
         Args:
             base_url: API server URL. Defaults to MO_AGENT_API_URL env var or http://localhost:8000
             credentials_path: Path to credentials file. Defaults to ~/.mo-agent/credentials.json
+            profile: Profile name to use. Defaults to current_profile in credentials file
         """
         self.base_url = (
             base_url or os.getenv("MO_AGENT_API_URL", "http://localhost:8000")
         ).rstrip("/")
         self.credentials_path = credentials_path or Path.home() / ".mo-agent" / "credentials.json"
+        self.profile = profile or os.getenv("MO_AGENT_PROFILE")
         self._client: httpx.AsyncClient | None = None
         self._access_token: str | None = None
         self._refresh_token: str | None = None
+        self._current_username: str | None = None
 
     async def __aenter__(self) -> "APIClient":
         """Async context manager entry."""
@@ -48,23 +52,46 @@ class APIClient:
             await self._client.aclose()
 
     async def _load_credentials(self) -> None:
-        """Load JWT tokens from credentials file."""
+        """Load JWT tokens from credentials file (profile-based)."""
         if not self.credentials_path.exists():
             return
         try:
             data = json.loads(self.credentials_path.read_text())
-            self._access_token = data.get("access_token")
-            self._refresh_token = data.get("refresh_token")
+            profile_name = self.profile or data.get("current_profile", "default")
+            profile_data = data.get("profiles", {}).get(profile_name, {})
+            self._access_token = profile_data.get("access_token")
+            self._refresh_token = profile_data.get("refresh_token")
+            self._current_username = profile_data.get("username")
         except Exception:
             pass
 
-    async def _save_credentials(self) -> None:
-        """Save JWT tokens to credentials file."""
+    async def _save_credentials(self, username: str | None = None) -> None:
+        """Save JWT tokens to credentials file (profile-based)."""
         self.credentials_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
+        
+        # Load existing data
+        if self.credentials_path.exists():
+            try:
+                data = json.loads(self.credentials_path.read_text())
+            except Exception:
+                data = {"current_profile": "default", "profiles": {}}
+        else:
+            data = {"current_profile": "default", "profiles": {}}
+        
+        # Determine profile name
+        profile_name = self.profile or username or "default"
+        
+        # Save to profile
+        data["profiles"][profile_name] = {
+            "username": username or self._current_username,
             "access_token": self._access_token,
             "refresh_token": self._refresh_token,
         }
+        
+        # Update current_profile if not using explicit profile
+        if not self.profile:
+            data["current_profile"] = profile_name
+        
         self.credentials_path.write_text(json.dumps(data, indent=2))
         self.credentials_path.chmod(0o600)
 
@@ -171,7 +198,8 @@ class APIClient:
         data = response.json()
         self._access_token = data["access_token"]
         self._refresh_token = data["refresh_token"]
-        await self._save_credentials()
+        self._current_username = username
+        await self._save_credentials(username=username)
         return data
 
     async def get_current_user(self) -> dict[str, Any]:
@@ -188,16 +216,21 @@ class APIClient:
         message: str,
         session_id: str | None = None,
         agent_id: str | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         """Send chat message and get response."""
+        payload = {
+            "message": message,
+            "session_id": session_id,
+            "agent_id": agent_id,
+        }
+        if model:
+            payload["model"] = model
+        
         response = await self._request(
             "POST",
             "/chat",
-            json={
-                "message": message,
-                "session_id": session_id,
-                "agent_id": agent_id,
-            },
+            json=payload,
         )
         return response.json()
 
@@ -206,6 +239,7 @@ class APIClient:
         message: str,
         session_id: str | None = None,
         agent_id: str | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream chat response as SSE."""
         if not self._client:
@@ -215,16 +249,20 @@ class APIClient:
         if self._access_token:
             headers["Authorization"] = f"Bearer {self._access_token}"
 
+        payload = {
+            "message": message,
+            "session_id": session_id,
+            "agent_id": agent_id,
+        }
+        if model:
+            payload["model"] = model
+
         url = f"{self.base_url}/chat/stream"
         async with aconnect_sse(
             self._client,
             "POST",
             url,
-            json={
-                "message": message,
-                "session_id": session_id,
-                "agent_id": agent_id,
-            },
+            json=payload,
             headers=headers,
         ) as event_source:
             async for sse in event_source.aiter_sse():
@@ -561,4 +599,30 @@ class APIClient:
     async def admin_list_models(self) -> list[dict[str, Any]]:
         """List all models."""
         response = await self._request("GET", "/models")
+        return response.json()
+
+    async def admin_grant_role(
+        self,
+        username: str,
+        role_name: str,
+    ) -> dict[str, Any]:
+        """Grant a role to a user."""
+        response = await self._request(
+            "POST",
+            "/admin/users/grant-role",
+            json={"username": username, "role_name": role_name},
+        )
+        return response.json()
+
+    async def admin_revoke_role(
+        self,
+        username: str,
+        role_name: str,
+    ) -> dict[str, Any]:
+        """Revoke a role from a user."""
+        response = await self._request(
+            "POST",
+            "/admin/users/revoke-role",
+            json={"username": username, "role_name": role_name},
+        )
         return response.json()

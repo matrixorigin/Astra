@@ -19,19 +19,17 @@ from core.llm.providers import _should_retry, RETRY_BASE_DELAY, MAX_RETRIES, Bas
 class TestTaskBasedStrategy:
     def test_tag_conflict_tiebreak_by_cost(self):
         """Models with same tag score should be ordered by cost (cheaper first)."""
-        registry = ModelRegistry(use_defaults=False)
+        registry = ModelRegistry()
         expensive = ModelConfig(
             model_name="expensive",
             provider=LLMProvider.OPENAI,
-            price_per_1k_prompt=0.03,
-            price_per_1k_completion=0.06,
+            pricing={"prompt": 0.03, "completion": 0.06},
             tags=["code", "reasoning"],
         )
         cheap = ModelConfig(
             model_name="cheap",
             provider=LLMProvider.OPENAI,
-            price_per_1k_prompt=0.001,
-            price_per_1k_completion=0.002,
+            pricing={"prompt": 0.001, "completion": 0.002},
             tags=["code", "reasoning"],
         )
         registry.register(expensive)
@@ -46,19 +44,17 @@ class TestTaskBasedStrategy:
 
     def test_higher_tag_score_wins_over_cost(self):
         """Model with more tag matches should rank higher even if more expensive."""
-        registry = ModelRegistry(use_defaults=False)
+        registry = ModelRegistry()
         cheap_one_tag = ModelConfig(
             model_name="cheap",
             provider=LLMProvider.OPENAI,
-            price_per_1k_prompt=0.001,
-            price_per_1k_completion=0.001,
+            pricing={"prompt": 0.001, "completion": 0.001},
             tags=["code"],
         )
         expensive_two_tags = ModelConfig(
             model_name="expensive",
             provider=LLMProvider.OPENAI,
-            price_per_1k_prompt=0.03,
-            price_per_1k_completion=0.06,
+            pricing={"prompt": 0.03, "completion": 0.06},
             tags=["code", "reasoning"],
         )
         registry.register(cheap_one_tag)

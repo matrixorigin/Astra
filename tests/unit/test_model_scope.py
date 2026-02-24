@@ -16,44 +16,40 @@ def db_session():
 
 
 def test_global_scope_models(db_session):
-    """Test global scope returns default models."""
-    registry = ModelRegistry(use_defaults=False)
+    """Test global scope loads models from DB."""
+    registry = ModelRegistry()
     registry.load_from_db(db_session)
-    models = registry.list_models()
-    assert isinstance(models, list)
+    assert isinstance(registry.list_models(), list)
 
 
 def test_user_scope_models(db_session):
-    """Test user scope includes user-specific models."""
-    registry = ModelRegistry(use_defaults=False)
+    """Test user scope loads models from DB."""
+    registry = ModelRegistry()
     registry.load_from_db(db_session, user_id="alice")
-    models = registry.list_models()
-    assert isinstance(models, list)
+    assert isinstance(registry.list_models(), list)
 
 
 def test_scope_hierarchy(db_session):
-    """Test scope hierarchy: user > global."""
-    global_registry = ModelRegistry(use_defaults=False)
+    """Test scope hierarchy: user overrides global."""
+    global_registry = ModelRegistry()
     global_registry.load_from_db(db_session)
-    global_models = global_registry.list_models()
 
-    user_registry = ModelRegistry(use_defaults=False)
+    user_registry = ModelRegistry()
     user_registry.load_from_db(db_session, user_id="alice")
-    user_models = user_registry.list_models()
 
-    assert isinstance(global_models, list)
-    assert isinstance(user_models, list)
+    assert isinstance(global_registry.list_models(), list)
+    assert isinstance(user_registry.list_models(), list)
 
 
 def test_model_not_found(db_session):
-    """Test behavior when model is not found."""
-    registry = ModelRegistry(use_defaults=False)
+    """Test get returns None for nonexistent model."""
+    registry = ModelRegistry()
     registry.load_from_db(db_session, user_id="alice")
     assert registry.get("nonexistent-model") is None
 
 
 def test_empty_scope(db_session):
-    """Test behavior with empty scope."""
-    registry = ModelRegistry(use_defaults=False)
+    """Test empty scope for nonexistent user."""
+    registry = ModelRegistry()
     registry.load_from_db(db_session, user_id="nonexistent_user")
     assert isinstance(registry.list_models(), list)

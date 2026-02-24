@@ -529,3 +529,72 @@ class AnthropicProvider(BaseProvider):
             "description": fn.get("description", ""),
             "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
         }
+
+
+class MockEchoProvider(BaseProvider):
+    """Mock provider that echoes back the user message. For testing only."""
+    
+    provider = LLMProvider.MOCK
+    
+    def __init__(self):
+        pass
+    
+    def complete(self, messages: list[dict], model: str, temperature: float, max_tokens: int | None) -> LLMResponse:
+        # Echo the last user message
+        user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        return LLMResponse(
+            content=f"Echo: {user_msg}",
+            model=model,
+            provider=self.provider,
+            tokens_prompt=10,
+            tokens_completion=10,
+            tokens_total=20,
+            latency_ms=1,
+            cost_usd=0.0,
+        )
+    
+    def complete_stream(self, messages: list[dict], model: str, temperature: float, max_tokens: int | None) -> Iterator[dict]:
+        user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        response = f"Echo: {user_msg}"
+        
+        for word in response.split():
+            yield {"type": "text", "content": word + " "}
+        
+        yield {"type": "usage", "prompt": 10, "completion": 10}
+    
+    def complete_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str,
+        model: str,
+        temperature: float,
+        max_tokens: int | None,
+    ) -> dict:
+        # Echo without tool calls
+        user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        return {
+            "content": f"Echo: {user_msg}",
+            "tool_calls": [],
+            "model": model,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+    
+    def complete_with_tools_stream(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str,
+        model: str,
+        temperature: float,
+        max_tokens: int | None,
+    ) -> Iterator[dict]:
+        user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
+        response = f"Echo: {user_msg}"
+        
+        for word in response.split():
+            yield {"type": "text", "content": word + " "}
+        
+        yield {"type": "usage", "prompt": 10, "completion": 10}
+
+

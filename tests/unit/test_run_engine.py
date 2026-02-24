@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from core.agent.run import AgentRun, RunStatus, RunTrigger
 from core.agent.run_engine import (
     RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks,
-    _child_runs, _fan_in_tasks, _MAX_RESUME_INPUT_CHARS,
-    _MAX_COMPLETED_RUNS,
+    _child_runs, _MAX_RESUME_INPUT_CHARS,
+    _MAX_COMPLETED_RUNS, cleanup_fan_in_tasks,
 )
 from core.events.models import EventType
 
@@ -42,14 +42,14 @@ def clean_state():
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
-    _fan_in_tasks.clear()
+    cleanup_fan_in_tasks()
     yield
     _active_runs.clear()
     _run_events.clear()
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
-    _fan_in_tasks.clear()
+    cleanup_fan_in_tasks()
 
 
 class TestRunEngineCreate:
@@ -410,11 +410,9 @@ class TestMultiAgentRuns:
             c2 = await engine.create_child_run(parent.run_id, "reviewer_b", "review B")
             t2 = _run_tasks[c2.run_id]
 
-            # Wait for children, then fan-in
+            # Wait for children (fan-in happens synchronously in their finally blocks)
             await t1
             await t2
-            for t in list(_fan_in_tasks):
-                await t
 
         assert c1.status == RunStatus.COMPLETED
         assert c2.status == RunStatus.COMPLETED

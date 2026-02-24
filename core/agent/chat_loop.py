@@ -239,6 +239,9 @@ class ChatLoop:
             mcp_tools = await self.mcp_bridge.get_tools_schema()
             tools_schema = list(tools_schema) + mcp_tools
 
+        # Get model from context
+        model = (context or {}).get("model")
+        
         if not tools_schema:
             # No tools available — plain chat
             response = self.llm.chat(
@@ -247,6 +250,7 @@ class ChatLoop:
                 ],
                 user_id=user_id,
                 session_id=session_id,
+                model=model,
             )
             plain_content = response.content or ""
             verification = self.firewall.verify_response(plain_content, context_capture_id, mode=self.firewall_mode)
@@ -296,11 +300,14 @@ class ChatLoop:
                 
                 messages = compact(messages, max_tokens, llm_summarize=llm_summarize)
 
+            # Get model from context or use SLO escalation
+            model = (context or {}).get("model") or self._check_slo_escalation(session_id)
+            
             llm_result = self.llm.chat_with_tools(
                 messages=messages,
                 tools=tools_schema,
                 tool_choice="auto",
-                model=self._check_slo_escalation(session_id),
+                model=model,
             )
 
             tool_calls = llm_result.get("tool_calls", [])
@@ -706,8 +713,11 @@ class ChatLoop:
             from core.verification.streaming_verifier import StreamingVerifier
             sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
+            # Use model from context if provided, otherwise use SLO escalation
+            model = (context or {}).get("model") or self._check_slo_escalation(session_id)
+
             async for chunk_msg in self.llm.chat_stream(
-                messages, user_id, session_id, model=self._check_slo_escalation(session_id),
+                messages, user_id, session_id, model=model,
             ):
                 if chunk_msg["type"] == "reasoning":
                     # Emit reasoning event for CoT audit trail
@@ -848,8 +858,11 @@ class ChatLoop:
             full_text = ""
             tool_calls: list[dict] = []
 
+            # Use model from context if provided, otherwise use SLO escalation
+            model = (context or {}).get("model") or self._check_slo_escalation(session_id)
+
             async for chunk in self.llm.chat_with_tools_stream(
-                messages, tools_schema, model=self._check_slo_escalation(session_id),
+                messages, tools_schema, model=model,
             ):
                 if chunk["type"] == "reasoning":
                     yield StreamEvent(

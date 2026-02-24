@@ -122,21 +122,22 @@ class TestEventFieldConsistency:
     @pytest.fixture(autouse=True)
     def clean_state(self):
         from core.agent.run_engine import (
-            _active_runs, _run_events, _child_runs, _run_waiters, _run_tasks, _fan_in_tasks,
+            _active_runs, _run_events, _child_runs, _run_waiters, _run_tasks,
+            cleanup_fan_in_tasks,
         )
         _active_runs.clear()
         _run_events.clear()
         _child_runs.clear()
         _run_waiters.clear()
         _run_tasks.clear()
-        _fan_in_tasks.clear()
+        cleanup_fan_in_tasks()
         yield
         _active_runs.clear()
         _run_events.clear()
         _child_runs.clear()
         _run_waiters.clear()
         _run_tasks.clear()
-        _fan_in_tasks.clear()
+        cleanup_fan_in_tasks()
 
     @pytest.fixture
     def engine(self):

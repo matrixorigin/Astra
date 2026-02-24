@@ -91,9 +91,14 @@ class RegressionGate:
                     sessions_tested=0,
                 )
             
-            # 2. Create snapshot + sandbox
+            # 2. Create snapshot + sandbox (clone tables needed for replay)
             snapshot_id = self._create_snapshot()
-            self.sandbox.create(sandbox_name, description=f"Gate {gate_id}", created_by="system")
+            self.sandbox.create(
+                sandbox_name,
+                description=f"Gate {gate_id}",
+                created_by="system",
+                tables=["prompt_templates", "skills_registry", "configs", "conversation_events", "sk_knowledge_entries"],
+            )
             
             # 3. Apply change to sandbox
             self._apply_change_to_sandbox(

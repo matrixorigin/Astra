@@ -28,6 +28,7 @@ services:
       - ./matrixone-entrypoint.sh:/entrypoint.sh:ro
     environment:
       - TZ=Asia/Shanghai
+    user: "${UID:-1000}:${GID:-1000}"
     networks:
       - mo-net
     healthcheck:
@@ -50,6 +51,7 @@ services:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
       - ${REDIS_DATA_DIR:-./data/redis}:/data
+    user: "${UID:-1000}:${GID:-1000}"
     networks:
       - mo-net
     healthcheck:

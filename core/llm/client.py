@@ -46,20 +46,16 @@ class LLMClient:
         self,
         db: Session | None = None,
         user_id: str | None = None,
-        use_default_models: bool = True,
         scope_context: dict | None = None,
     ) -> None:
-        """Initialize LLM client.
+        """Initialize LLM client. Models must be registered in database.
 
         Args:
-            use_default_models: If True, use DEFAULT_MODELS as fallback. Set to False
-                               in production to enforce strict scope-based access control.
             scope_context: Optional scope context for resolver, e.g.,
                           {'repo': 'matrixone', 'project': 'backend'}
         """
         self.db = db or next(get_db_session())
         self.user_id = user_id
-        self.use_default_models = use_default_models
         self.scope_context = scope_context or {}
 
         # Initialize scope resolver
@@ -73,9 +69,7 @@ class LLMClient:
             self.scope_resolver = ScopeResolver(self.db, scope_chain)
 
         self._providers: dict[str, BaseProvider] = {}
-        self.router = ModelRouter(
-            db=self.db, user_id=user_id, use_defaults=use_default_models
-        )
+        self.router = ModelRouter(db=self.db, user_id=user_id)
         self.rate_limiter = RateLimiter()
         self.token_resolver = TokenResolver(db=self.db)
         self._load_config()
@@ -105,9 +99,7 @@ class LLMClient:
             self.scope_resolver = ScopeResolver(self.db, scope_chain)
 
         # Reload router with new context
-        self.router = ModelRouter(
-            db=self.db, user_id=user_id, use_defaults=self.use_default_models
-        )
+        self.router = ModelRouter(db=self.db, user_id=user_id)
         # Re-initialize providers with new API keys
         self._init_providers()
 
@@ -190,10 +182,20 @@ class LLMClient:
             pass
 
         # Always try well-known providers
-        for p in ["openai", "groq", "anthropic"]:
+        for p in ["openai", "groq", "anthropic", "mock"]:
             providers_to_init.add(p)
 
         for provider_name in providers_to_init:
+            # Special case: mock provider doesn't need API key
+            if provider_name == "mock":
+                try:
+                    from core.llm.providers import MockEchoProvider
+                    self._providers["mock"] = MockEchoProvider()
+                    logger.debug("Initialized mock provider")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize mock provider: {e}")
+                continue
+            
             api_key = self._get_api_key(provider_name)
             if not api_key:
                 logger.debug(f"No API key found for {provider_name}, skipping")
@@ -359,7 +361,7 @@ class LLMClient:
             # Group by provider for better readability
             by_provider: dict[str, list[str]] = {}
             for m in available_models:
-                provider = m.provider.value
+                provider = m.provider.value if isinstance(m.provider, LLMProvider) else str(m.provider)
                 if provider not in by_provider:
                     by_provider[provider] = []
                 by_provider[provider].append(m.model_name)
@@ -529,7 +531,8 @@ class LLMClient:
         chain = self._resolve_chain(model, task_hint=task_hint)
 
         for model_cfg in chain:
-            breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
+            provider_name = model_cfg.provider.value if isinstance(model_cfg.provider, LLMProvider) else str(model_cfg.provider)
+            breaker = self.rate_limiter.get_breaker(provider_name)
             if not breaker.allow_request():
                 continue
             try:
@@ -605,7 +608,8 @@ class LLMClient:
         chain = self._resolve_chain(model, task_hint=task_hint)
 
         for model_cfg in chain:
-            breaker = self.rate_limiter.get_breaker(model_cfg.provider.value)
+            provider_name = model_cfg.provider.value if isinstance(model_cfg.provider, LLMProvider) else str(model_cfg.provider)
+            breaker = self.rate_limiter.get_breaker(provider_name)
             if not breaker.allow_request():
                 continue
             try:

@@ -18,7 +18,8 @@ router = APIRouter(tags=["authentication"])
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def register(request: RegisterRequest, db: Session = Depends(get_db_session)):
-    """Register a new user."""
+    """Register a new user. First user automatically becomes admin."""
+    from sqlalchemy import text
     repo = UserRepository(db)
 
     # Check if username exists
@@ -38,6 +39,23 @@ def register(request: RegisterRequest, db: Session = Depends(get_db_session)):
         "display_name": request.display_name,
         "is_active": 1,
     })
+
+    # Atomically assign admin role if no admin exists yet.
+    # INSERT ... SELECT ensures only one concurrent registration wins.
+    try:
+        db.execute(
+            text(
+                "INSERT INTO user_roles (user_id, role_id) "
+                "SELECT :uid, r.role_id FROM roles r "
+                "WHERE r.role_name = 'mo_agent_admin' "
+                "AND NOT EXISTS (SELECT 1 FROM user_roles ur JOIN roles r2 "
+                "ON ur.role_id = r2.role_id WHERE r2.role_name = 'mo_agent_admin')"
+            ),
+            {"uid": user.user_id},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
 
     return UserResponse(
         user_id=user.user_id,

@@ -316,7 +316,12 @@ class TestSLODashboard:
 
         mock_llm = MagicMock()
         mock_llm.config = {"model": "gpt-4o-mini"}
-        mock_llm.router = ModelRouter()  # real router with DEFAULT_MODELS
+        router = ModelRouter()
+        # Register models (no longer hardcoded defaults)
+        from core.llm.router import ModelConfig
+        router.register(ModelConfig(model_name="gpt-4o", provider="openai", pricing={"prompt": 0.0025, "completion": 0.01}, fallback_to="gpt-4o-mini"))
+        router.register(ModelConfig(model_name="gpt-4o-mini", provider="openai", pricing={"prompt": 0.00015, "completion": 0.0006}))
+        mock_llm.router = router
         chat_loop = ChatLoop(
             selector=MagicMock(), executor=MagicMock(), llm_client=mock_llm,
             event_logger=MagicMock(), context_manager=MagicMock(),

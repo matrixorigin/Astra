@@ -351,3 +351,118 @@ def export_feedback(
         status="queued",
         download_url=None,
     )
+
+
+# ============================================================================
+# User Role Management
+# ============================================================================
+
+
+class UserRoleRequest(BaseModel):
+    """User role management request."""
+    username: str
+    role_name: str  # "mo_agent_admin" or "mo_agent_user"
+
+
+class UserRoleResponse(BaseModel):
+    """User role management response."""
+    username: str
+    role_name: str
+    message: str
+
+
+@router.post("/users/grant-role", response_model=UserRoleResponse)
+def grant_role(
+    request: UserRoleRequest,
+    db: Session = Depends(get_db_session),
+    _admin: dict = Depends(require_admin),
+) -> UserRoleResponse:
+    """Grant a role to a user."""
+    from sqlalchemy import text
+    
+    # Check if user exists
+    user = db.execute(
+        text("SELECT user_id FROM users WHERE username = :username"),
+        {"username": request.username}
+    ).fetchone()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check if role exists
+    role = db.execute(
+        text("SELECT role_id FROM roles WHERE role_name = :role_name"),
+        {"role_name": request.role_name}
+    ).fetchone()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    
+    # Check if user already has this role
+    existing = db.execute(
+        text("SELECT 1 FROM user_roles WHERE user_id = :uid AND role_id = :rid"),
+        {"uid": user[0], "rid": role[0]}
+    ).fetchone()
+    if existing:
+        return UserRoleResponse(
+            username=request.username,
+            role_name=request.role_name,
+            message="User already has this role"
+        )
+    
+    # Grant role
+    db.execute(
+        text("INSERT INTO user_roles (user_id, role_id) VALUES (:uid, :rid)"),
+        {"uid": user[0], "rid": role[0]}
+    )
+    db.commit()
+    
+    return UserRoleResponse(
+        username=request.username,
+        role_name=request.role_name,
+        message="Role granted successfully"
+    )
+
+
+@router.post("/users/revoke-role", response_model=UserRoleResponse)
+def revoke_role(
+    request: UserRoleRequest,
+    db: Session = Depends(get_db_session),
+    _admin: dict = Depends(require_admin),
+) -> UserRoleResponse:
+    """Revoke a role from a user."""
+    from sqlalchemy import text
+    
+    # Check if user exists
+    user = db.execute(
+        text("SELECT user_id FROM users WHERE username = :username"),
+        {"username": request.username}
+    ).fetchone()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check if role exists
+    role = db.execute(
+        text("SELECT role_id FROM roles WHERE role_name = :role_name"),
+        {"role_name": request.role_name}
+    ).fetchone()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    
+    # Revoke role
+    result = db.execute(
+        text("DELETE FROM user_roles WHERE user_id = :uid AND role_id = :rid"),
+        {"uid": user[0], "rid": role[0]}
+    )
+    db.commit()
+    
+    if result.rowcount == 0:
+        return UserRoleResponse(
+            username=request.username,
+            role_name=request.role_name,
+            message="User does not have this role"
+        )
+    
+    return UserRoleResponse(
+        username=request.username,
+        role_name=request.role_name,
+        message="Role revoked successfully"
+    )

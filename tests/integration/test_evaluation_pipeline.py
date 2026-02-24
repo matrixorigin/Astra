@@ -313,11 +313,13 @@ class TestEvaluationActionAPI:
 
     def test_gate_validate_skip_no_golden(self, client, headers):
         """Gate returns skip when no golden sessions exist."""
-        resp = client.post("/api/v1/evaluation/gate/validate", json={
-            "change_type": "prompt",
-            "change_id": "test_prompt@v1",
-            "change_content": {"content": "You are helpful."},
-        }, headers=headers)
+        from unittest.mock import patch
+        with patch("core.evaluation.regression_gate.RegressionGate._get_golden_sessions", return_value=[]):
+            resp = client.post("/api/v1/evaluation/gate/validate", json={
+                "change_type": "prompt",
+                "change_id": "test_prompt@v1",
+                "change_content": {"content": "You are helpful."},
+            }, headers=headers)
         assert resp.status_code == 200
         data = resp.json()
         assert data["verdict"] == "skip"

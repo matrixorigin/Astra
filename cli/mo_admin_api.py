@@ -15,15 +15,16 @@ from cli.api_client import APIClient
 class SyncAPIClient:
     """Synchronous wrapper for APIClient."""
     
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, profile: str | None = None):
         self.base_url = base_url
+        self.profile = profile
     
     def _run(self, coro):
         return asyncio.run(coro)
     
     def __getattr__(self, name):
         async def wrapper(*args, **kwargs):
-            async with APIClient(base_url=self.base_url) as client:
+            async with APIClient(base_url=self.base_url, profile=self.profile) as client:
                 method = getattr(client, name)
                 return await method(*args, **kwargs)
         return lambda *args, **kwargs: self._run(wrapper(*args, **kwargs))
@@ -31,12 +32,13 @@ class SyncAPIClient:
 
 @click.group()
 @click.option("--api-url", default="http://localhost:8000", envvar="MO_AGENT_API_URL")
+@click.option("--profile", default=None, envvar="MO_AGENT_PROFILE", help="Profile to use")
 @click.pass_context
 @click.version_option(version="0.1.0")
-def cli(ctx, api_url):
+def cli(ctx, api_url, profile):
     """mo-admin - Administrative interface."""
     ctx.ensure_object(dict)
-    ctx.obj["client"] = SyncAPIClient(api_url)
+    ctx.obj["client"] = SyncAPIClient(api_url, profile=profile)
 
 
 @cli.command()
@@ -324,6 +326,45 @@ def whoami(ctx):
             click.echo(f"Role: {result['role']}")
     except Exception as e:
         click.echo(f"❌ Error: {e}")
+        sys.exit(1)
+
+
+@cli.group()
+def user():
+    """Manage users."""
+
+
+@user.command("grant-role")
+@click.argument("username")
+@click.argument("role_name", type=click.Choice(["mo_agent_admin", "mo_agent_user"]))
+@click.pass_context
+def user_grant_role(ctx, username, role_name):
+    """Grant a role to a user."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    
+    try:
+        result = client.admin_grant_role(username=username, role_name=role_name)
+        click.echo(f"✅ {result.get('message', 'Role granted')}")
+    except Exception as e:
+        click.echo(f"❌ Failed: {e}")
+        sys.exit(1)
+
+
+@user.command("revoke-role")
+@click.argument("username")
+@click.argument("role_name", type=click.Choice(["mo_agent_admin", "mo_agent_user"]))
+@click.pass_context
+def user_revoke_role(ctx, username, role_name):
+    """Revoke a role from a user."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    
+    try:
+        result = client.admin_revoke_role(username=username, role_name=role_name)
+        click.echo(f"✅ {result.get('message', 'Role revoked')}")
+    except Exception as e:
+        click.echo(f"❌ Failed: {e}")
         sys.exit(1)
 
 

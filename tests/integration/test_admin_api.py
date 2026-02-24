@@ -277,3 +277,187 @@ def test_feedback_export(client, admin_user):
     data = response.json()
     assert "job_id" in data
     assert data["status"] == "queued"
+
+
+def test_grant_role_requires_admin(client, regular_user):
+    """Test that granting roles requires admin role."""
+    response = client.post(
+        "/admin/users/grant-role",
+        headers={"Authorization": f"Bearer {regular_user['token']}"},
+        json={"username": "someuser", "role_name": "mo_agent_admin"},
+    )
+    assert response.status_code == 403
+
+
+def test_grant_role_user_not_found(client, admin_user):
+    """Test granting role to non-existent user."""
+    response = client.post(
+        "/admin/users/grant-role",
+        headers={"Authorization": f"Bearer {admin_user['token']}"},
+        json={"username": "nonexistent", "role_name": "mo_agent_admin"},
+    )
+    assert response.status_code == 404
+    assert "user not found" in response.json()["detail"].lower()
+
+
+def test_grant_role_invalid_role(client, admin_user, db_session):
+    """Test granting invalid role."""
+    # Create a test user
+    unique_id = str(uuid.uuid4())[:8]
+    username = f"testuser_{unique_id}"
+    response = client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "password": "test12345",
+            "email": f"{username}@test.com",
+        },
+    )
+    assert response.status_code == 201
+
+    # Try to grant invalid role
+    response = client.post(
+        "/admin/users/grant-role",
+        headers={"Authorization": f"Bearer {admin_user['token']}"},
+        json={"username": username, "role_name": "invalid_role"},
+    )
+    assert response.status_code == 404
+    assert "role not found" in response.json()["detail"].lower()
+
+
+def test_grant_and_revoke_role_success(client, admin_user, db_session):
+    """Test successful role grant and revoke."""
+    # Create a test user
+    unique_id = str(uuid.uuid4())[:8]
+    username = f"testuser_{unique_id}"
+    response = client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "password": "test12345",
+            "email": f"{username}@test.com",
+        },
+    )
+    assert response.status_code == 201
+
+    # Grant admin role
+    response = client.post(
+        "/admin/users/grant-role",
+        headers={"Authorization": f"Bearer {admin_user['token']}"},
+        json={"username": username, "role_name": "mo_agent_admin"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["username"] == username
+    assert data["role_name"] == "mo_agent_admin"
+    assert "granted" in data["message"].lower()
+
+    # Verify user has role
+    result = db_session.execute(
+        text("""
+            SELECT 1 FROM user_roles ur
+            JOIN users u ON ur.user_id = u.user_id
+            JOIN roles r ON ur.role_id = r.role_id
+            WHERE u.username = :username AND r.role_name = :role_name
+        """),
+        {"username": username, "role_name": "mo_agent_admin"},
+    ).fetchone()
+    assert result is not None
+
+    # Grant same role again (should be idempotent)
+    response = client.post(
+        "/admin/users/grant-role",
+        headers={"Authorization": f"Bearer {admin_user['token']}"},
+        json={"username": username, "role_name": "mo_agent_admin"},
+    )
+    assert response.status_code == 200
+    assert "already has" in response.json()["message"].lower()
+
+    # Revoke role
+    response = client.post(
+        "/admin/users/revoke-role",
+        headers={"Authorization": f"Bearer {admin_user['token']}"},
+        json={"username": username, "role_name": "mo_agent_admin"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert "revoked" in data["message"].lower()
+
+    # Verify role was revoked
+    result = db_session.execute(
+        text("""
+            SELECT 1 FROM user_roles ur
+            JOIN users u ON ur.user_id = u.user_id
+            JOIN roles r ON ur.role_id = r.role_id
+            WHERE u.username = :username AND r.role_name = :role_name
+        """),
+        {"username": username, "role_name": "mo_agent_admin"},
+    ).fetchone()
+    assert result is None
+
+    # Revoke again (should be idempotent)
+    response = client.post(
+        "/admin/users/revoke-role",
+        headers={"Authorization": f"Bearer {admin_user['token']}"},
+        json={"username": username, "role_name": "mo_agent_admin"},
+    )
+    assert response.status_code == 200
+    assert "does not have" in response.json()["message"].lower()
+
+
+def test_first_user_becomes_admin(client, db_session):
+    """Test that first registered user automatically becomes admin."""
+    # Clear all users
+    db_session.execute(text("DELETE FROM user_roles"))
+    db_session.execute(text("DELETE FROM users"))
+    db_session.commit()
+
+    # Register first user
+    unique_id = str(uuid.uuid4())[:8]
+    username = f"firstuser_{unique_id}"
+    response = client.post(
+        "/auth/register",
+        json={
+            "username": username,
+            "password": "first12345",
+            "email": f"{username}@test.com",
+        },
+    )
+    assert response.status_code == 201
+
+    # Verify user has admin role
+    result = db_session.execute(
+        text("""
+            SELECT r.role_name FROM user_roles ur
+            JOIN users u ON ur.user_id = u.user_id
+            JOIN roles r ON ur.role_id = r.role_id
+            WHERE u.username = :username
+        """),
+        {"username": username},
+    ).fetchone()
+    assert result is not None
+    assert result[0] == "mo_agent_admin"
+
+    # Register second user
+    username2 = f"seconduser_{unique_id}"
+    response = client.post(
+        "/auth/register",
+        json={
+            "username": username2,
+            "password": "second12345",
+            "email": f"{username2}@test.com",
+        },
+    )
+    assert response.status_code == 201
+
+    # Verify second user does NOT have admin role
+    result = db_session.execute(
+        text("""
+            SELECT r.role_name FROM user_roles ur
+            JOIN users u ON ur.user_id = u.user_id
+            JOIN roles r ON ur.role_id = r.role_id
+            WHERE u.username = :username
+        """),
+        {"username": username2},
+    ).fetchone()
+    assert result is None

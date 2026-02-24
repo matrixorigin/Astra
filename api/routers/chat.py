@@ -26,6 +26,7 @@ class ChatRequest(BaseModel):
     message: str = Field(description="User message")
     session_id: str | None = Field(default=None, description="Session ID (auto-created if omitted)")
     agent_id: str | None = Field(default=None, description="Agent ID")
+    model: str | None = Field(default=None, description="Model to use for this request")
     context: dict | None = Field(default=None, description="Optional context")
     max_candidates: int = Field(default=5, description="Max skill candidates")
 
@@ -81,12 +82,17 @@ def _build_chat_loop(db: Session):
     from core.verification.firewall import HallucinationFirewall
 
     event_logger = EventLogger(db)
-    llm_client = LLMClient()
+    llm_client = LLMClient(db=db)
 
     # Wire GateTrigger so skill/prompt changes auto-trigger regression gate
-    from api.database import SessionLocal as _gate_session_factory
-    from core.evaluation.gate_trigger import GateTrigger
-    gate_trigger = GateTrigger(db_factory=_gate_session_factory)
+    # Disable in tests to avoid DB session conflicts
+    import os
+    if os.environ.get('DISABLE_GATE_TRIGGER'):
+        gate_trigger = None
+    else:
+        from api.database import SessionLocal as _gate_session_factory
+        from core.evaluation.gate_trigger import GateTrigger
+        gate_trigger = GateTrigger(db_factory=_gate_session_factory)
 
     skill_registry = SkillRegistry(db, gate_trigger=gate_trigger)
     code_executor = CodeExecutor(
@@ -143,11 +149,17 @@ async def chat(
     session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
 
     engine = _get_engine(db)
+    
+    # Pass model to context if specified
+    context = request.context or {}
+    if request.model:
+        context["model"] = request.model
+    
     run = engine.create_run(
         session_id=session_id,
         user_id=user_id,
         user_input=request.message,
-        context=request.context,
+        context=context,
     )
 
     import asyncio
@@ -169,11 +181,17 @@ async def chat_stream(
     session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
 
     engine = _get_engine(db)
+    
+    # Pass model to context if specified
+    context = request.context or {}
+    if request.model:
+        context["model"] = request.model
+    
     run = engine.create_run(
         session_id=session_id,
         user_id=user_id,
         user_input=request.message,
-        context=request.context,
+        context=context,
     )
 
     import asyncio

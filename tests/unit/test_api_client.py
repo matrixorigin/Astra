@@ -37,10 +37,16 @@ async def test_api_client_initialization(mock_credentials_path: Path):
 @pytest.mark.asyncio
 async def test_load_credentials(mock_credentials_path: Path):
     """Test loading credentials from file."""
-    # Write credentials
+    # Write credentials in new profile format
     credentials = {
-        "access_token": "test_access",
-        "refresh_token": "test_refresh",
+        "current_profile": "default",
+        "profiles": {
+            "default": {
+                "username": "test_user",
+                "access_token": "test_access",
+                "refresh_token": "test_refresh",
+            }
+        }
     }
     mock_credentials_path.write_text(json.dumps(credentials))
 
@@ -55,12 +61,13 @@ async def test_save_credentials(mock_credentials_path: Path):
     async with APIClient(credentials_path=mock_credentials_path) as client:
         client._access_token = "new_access"
         client._refresh_token = "new_refresh"
-        await client._save_credentials()
+        await client._save_credentials(username="test_user")
 
     # Verify file contents
     data = json.loads(mock_credentials_path.read_text())
-    assert data["access_token"] == "new_access"
-    assert data["refresh_token"] == "new_refresh"
+    assert data["current_profile"] == "test_user"
+    assert data["profiles"]["test_user"]["access_token"] == "new_access"
+    assert data["profiles"]["test_user"]["refresh_token"] == "new_refresh"
 
     # Verify file permissions
     assert mock_credentials_path.stat().st_mode & 0o777 == 0o600
@@ -148,9 +155,10 @@ async def test_login(mock_credentials_path: Path):
             assert client._access_token == "access_123"
             assert client._refresh_token == "refresh_123"
 
-            # Verify credentials were saved
+            # Verify credentials were saved in profile format
             data = json.loads(mock_credentials_path.read_text())
-            assert data["access_token"] == "access_123"
+            assert data["current_profile"] == "testuser"
+            assert data["profiles"]["testuser"]["access_token"] == "access_123"
 
 
 @pytest.mark.asyncio

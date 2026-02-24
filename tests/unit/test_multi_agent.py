@@ -11,8 +11,8 @@ from unittest.mock import MagicMock, patch, AsyncMock
 
 from core.agent.run import RunStatus
 from core.agent.run_engine import (
-    RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks, _child_runs, _fan_in_tasks,
-    _MAX_RESUME_INPUT_CHARS,
+    RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks, _child_runs,
+    _MAX_RESUME_INPUT_CHARS, cleanup_fan_in_tasks,
 )
 from core.events.models import StreamEvent, StreamEventType
 
@@ -24,14 +24,14 @@ def clean_state():
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
-    _fan_in_tasks.clear()
+    cleanup_fan_in_tasks()
     yield
     _active_runs.clear()
     _run_events.clear()
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
-    _fan_in_tasks.clear()
+    cleanup_fan_in_tasks()
 
 
 @pytest.fixture
@@ -141,8 +141,8 @@ class TestMultiAgentE2E:
             parent.status = RunStatus.WAITING
             parent.waiting_for = f"children:{parent.run_id}"
 
-            # Wait for child to complete
-            await asyncio.sleep(0.15)
+            # Wait for child task to complete
+            await _run_tasks[child.run_id]
 
         assert child.status == RunStatus.COMPLETED
         assert parent.status == RunStatus.COMPLETED
@@ -201,7 +201,8 @@ class TestMultiAgentE2E:
                 c = await engine.create_child_run(parent.run_id, agent_id, task)
                 children.append(c)
 
-            await asyncio.sleep(0.15)
+            # Wait for all child tasks to complete
+            await asyncio.gather(*[_run_tasks[c.run_id] for c in children])
 
         # All children completed
         for c in children:
@@ -243,7 +244,11 @@ class TestMultiAgentE2E:
             c_ok = await engine.create_child_run(parent.run_id, "reviewer-a", "Review OK part")
             c_fail = await engine.create_child_run(parent.run_id, "reviewer-b", "Review FAIL part")
 
-            await asyncio.sleep(0.15)
+            # Wait for all child tasks (some may raise)
+            await asyncio.gather(
+                _run_tasks[c_ok.run_id], _run_tasks[c_fail.run_id],
+                return_exceptions=True,
+            )
 
         assert c_ok.status == RunStatus.COMPLETED
         assert c_fail.status == RunStatus.FAILED
@@ -311,16 +316,19 @@ class TestMultiAgentE2E:
             child = await engine.create_child_run(parent.run_id, "reviewer", "review")
             await started.wait()
 
+            # Save task ref before cancel_run pops it from _run_tasks
+            child_task = _run_tasks.get(child.run_id)
+
             # Cancel parent — should propagate to child
             engine.cancel_run(parent.run_id)
 
-            # Wait for child task to finish (cancelled)
-            task = _run_tasks.get(child.run_id)
-            if task and not task.done():
+            # Await cancelled task to let finally block run
+            if child_task and not child_task.done():
                 try:
-                    await task
+                    await child_task
                 except asyncio.CancelledError:
                     pass
+            await asyncio.sleep(0)
 
         assert parent.status == RunStatus.CANCELLED
         assert child.status == RunStatus.CANCELLED

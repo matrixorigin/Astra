@@ -14,8 +14,9 @@ from cli.api_client import APIClient
 class SyncAPIClient:
     """Synchronous wrapper for APIClient."""
     
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str, profile: str | None = None):
         self.base_url = base_url
+        self.profile = profile
     
     def _run(self, coro):
         """Run async coroutine synchronously."""
@@ -29,11 +30,11 @@ class SyncAPIClient:
             # No running loop, safe to use asyncio.run()
             return asyncio.run(coro)
     
-    def chat_stream(self, message: str, session_id: str | None = None, agent_id: str | None = None):
+    def chat_stream(self, message: str, session_id: str | None = None, agent_id: str | None = None, model: str | None = None):
         """Stream chat response synchronously."""
         async def _stream():
-            async with APIClient(base_url=self.base_url) as client:
-                async for chunk in client.chat_stream(message, session_id, agent_id):
+            async with APIClient(base_url=self.base_url, profile=self.profile) as client:
+                async for chunk in client.chat_stream(message, session_id=session_id, agent_id=agent_id, model=model):
                     yield chunk
         
         # Run async generator synchronously
@@ -52,7 +53,7 @@ class SyncAPIClient:
     def stream_run_events(self, run_id: str):
         """Stream run events synchronously."""
         async def _stream():
-            async with APIClient(base_url=self.base_url) as client:
+            async with APIClient(base_url=self.base_url, profile=self.profile) as client:
                 async for event in client.stream_run_events(run_id):
                     yield event
         
@@ -72,7 +73,7 @@ class SyncAPIClient:
     def __getattr__(self, name):
         """Wrap all async methods to run synchronously."""
         async def wrapper(*args, **kwargs):
-            async with APIClient(base_url=self.base_url) as client:
+            async with APIClient(base_url=self.base_url, profile=self.profile) as client:
                 method = getattr(client, name)
                 return await method(*args, **kwargs)
         
@@ -81,12 +82,14 @@ class SyncAPIClient:
 
 @click.group()
 @click.option("--api-url", default="http://localhost:8000", envvar="MO_AGENT_API_URL")
+@click.option("--profile", default=None, envvar="MO_AGENT_PROFILE", help="Profile to use")
 @click.pass_context
 @click.version_option(version="0.1.0")
-def cli(ctx, api_url):
+def cli(ctx, api_url, profile):
     """mo-agent - Event-centric intelligent agent platform."""
     ctx.ensure_object(dict)
-    ctx.obj["client"] = SyncAPIClient(api_url)
+    ctx.obj["client"] = SyncAPIClient(api_url, profile=profile)
+    ctx.obj["profile"] = profile
 
 
 @cli.command()
@@ -139,8 +142,9 @@ def register(ctx, email, password, username):
 @click.option("--user-id", default="cli_user")
 @click.option("--session-id", default=None)
 @click.option("--no-stream", is_flag=True, help="Disable streaming output")
+@click.option("--model", default=None, help="Model to use for chat")
 @click.pass_context
-def chat(ctx, user_id, session_id, no_stream):
+def chat(ctx, user_id, session_id, no_stream, model):
     """Start interactive chat with streaming support."""
     client = ctx.obj["client"]
     
@@ -170,22 +174,105 @@ def chat(ctx, user_id, session_id, no_stream):
     except Exception:
         username = "You"
     
+    # Track selected model
+    selected_model = model
+    
     if not session_id:
         # API expects agent_id, not user_id
         # Use user_id as agent_id for now (or use default agent)
         result = client.create_session(agent_id=user_id or "default-agent")
         session_id = result["session_id"]
-        click.echo(f"📝 Session: {session_id}\n")
+        click.echo(f"📝 Session: {session_id}")
+        if selected_model:
+            click.echo(f"🤖 Model: {selected_model}")
+        click.echo()
     
     try:
         while True:
             user_input = click.prompt(username, type=str, prompt_suffix="> ")
+            
+            # Handle slash commands
+            if user_input.startswith("/"):
+                cmd_parts = user_input.strip().split(maxsplit=1)
+                cmd = cmd_parts[0].lower()
+                cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else None
+                
+                if cmd in ["/exit", "/quit"]:
+                    break
+                elif cmd == "/help":
+                    click.echo("\nAvailable commands:")
+                    click.echo("  /help           - Show this help")
+                    click.echo("  /model          - List available models")
+                    click.echo("  /model <name>   - Select a model")
+                    click.echo("  /session        - Show current session info")
+                    click.echo("  /clear          - Start a new session")
+                    click.echo("  /exit           - Exit chat")
+                    click.echo()
+                    continue
+                elif cmd == "/model":
+                    try:
+                        models = client.admin_list_models()
+                        if models:
+                            if cmd_arg:
+                                # Select model
+                                model_names = [m['name'] for m in models]
+                                if cmd_arg in model_names:
+                                    selected_model = cmd_arg
+                                    click.echo(f"\n✅ Model selected: {selected_model}\n")
+                                else:
+                                    click.echo(f"\n❌ Model '{cmd_arg}' not found")
+                                    click.echo("Available models:")
+                                    for m in models:
+                                        click.echo(f"  • {m['name']} ({m['provider']})")
+                                    click.echo()
+                            else:
+                                # List models
+                                click.echo("\nAvailable models:")
+                                for m in models:
+                                    marker = "→" if selected_model == m['name'] else " "
+                                    click.echo(f"  {marker} {m['name']} ({m['provider']})")
+                                click.echo()
+                                if selected_model:
+                                    click.echo(f"Current: {selected_model}")
+                                else:
+                                    click.echo("To select: /model <name>")
+                                click.echo()
+                        else:
+                            click.echo("\n⚠️  No models configured")
+                            click.echo("Configure models: make dev-setup-demo → Configure models")
+                            click.echo()
+                    except Exception as e:
+                        click.echo(f"\n❌ Failed to list models: {e}\n")
+                    continue
+                elif cmd == "/session":
+                    click.echo(f"\n📝 Session ID: {session_id}")
+                    click.echo(f"👤 User: {username}")
+                    if selected_model:
+                        click.echo(f"🤖 Model: {selected_model}")
+                    else:
+                        click.echo(f"🤖 Model: (default)")
+                    click.echo()
+                    continue
+                elif cmd == "/clear":
+                    try:
+                        client.close_session(session_id)
+                        result = client.create_session(agent_id=user_id or "default-agent")
+                        session_id = result["session_id"]
+                        click.echo(f"\n✅ New session: {session_id}\n")
+                    except Exception as e:
+                        click.echo(f"\n❌ Failed to create new session: {e}\n")
+                    continue
+                else:
+                    click.echo(f"\n❌ Unknown command: {user_input}")
+                    click.echo("Type /help for available commands\n")
+                    continue
+            
             if user_input.lower() in ["exit", "quit"]:
                 break
             
             if no_stream:
                 # Non-streaming mode: poll for result
-                result = client.chat(user_input, session_id=session_id)
+                result = client.chat(user_input, session_id=session_id, model=selected_model)
                 run_id = result.get("run_id")
                 
                 # Poll for completion
@@ -209,7 +296,7 @@ def chat(ctx, user_id, session_id, no_stream):
             else:
                 # Streaming mode
                 click.echo("Agent> ", nl=False)
-                for chunk in client.chat_stream(user_input, session_id=session_id):
+                for chunk in client.chat_stream(user_input, session_id=session_id, model=selected_model):
                     if chunk.get("type") == "content":
                         click.echo(chunk.get("content", ""), nl=False)
                     elif chunk.get("type") == "done":
@@ -360,6 +447,61 @@ def whoami(ctx):
         click.echo(f"User ID: {user['user_id']}")
     except Exception as e:
         click.echo(f"❌ Not authenticated: {e}")
+
+
+@cli.group()
+def profile():
+    """Manage user profiles."""
+    pass
+
+
+@profile.command("list")
+def profile_list():
+    """List all profiles."""
+    from cli.profile_manager import ProfileManager
+    
+    manager = ProfileManager()
+    profiles = manager.list_profiles()
+    
+    if not profiles:
+        click.echo("No profiles found")
+        return
+    
+    click.echo("Profiles:")
+    for p in profiles:
+        marker = "* " if p["current"] else "  "
+        click.echo(f"{marker}{p['name']} ({p['username']})")
+
+
+@profile.command("use")
+@click.argument("profile_name")
+def profile_use(profile_name):
+    """Switch to a different profile."""
+    from cli.profile_manager import ProfileManager
+    
+    manager = ProfileManager()
+    try:
+        manager.set_current_profile(profile_name)
+        click.echo(f"✅ Switched to profile: {profile_name}")
+    except ValueError as e:
+        click.echo(f"❌ {e}")
+        sys.exit(1)
+
+
+@profile.command("delete")
+@click.argument("profile_name")
+@click.confirmation_option(prompt="Are you sure you want to delete this profile?")
+def profile_delete(profile_name):
+    """Delete a profile."""
+    from cli.profile_manager import ProfileManager
+    
+    manager = ProfileManager()
+    try:
+        manager.delete_profile(profile_name)
+        click.echo(f"✅ Deleted profile: {profile_name}")
+    except ValueError as e:
+        click.echo(f"❌ {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

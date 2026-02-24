@@ -27,6 +27,8 @@ def test_user(db_session):
     # Clean up any existing test user
     existing = repo.get_by_username(username)
     if existing:
+        from sqlalchemy import text as _text
+        db_session.execute(_text("DELETE FROM user_roles WHERE user_id = :uid"), {"uid": existing.user_id})
         repo.delete(existing.user_id)
         db_session.commit()
     
@@ -44,12 +46,14 @@ def test_user(db_session):
     
     yield user
     
-    # Cleanup
+    # Cleanup (user_roles first due to FK)
     try:
+        from sqlalchemy import text as _text
+        db_session.execute(_text("DELETE FROM user_roles WHERE user_id = :uid"), {"uid": user.user_id})
         repo.delete(user.user_id)
         db_session.commit()
     except:
-        pass
+        db_session.rollback()
 
 
 @pytest.fixture
@@ -64,6 +68,38 @@ def auth_headers(client, test_user):
         },
     )
     
+    token = response.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def admin_headers(client, test_user, db_session):
+    """Get admin authentication headers."""
+    from sqlalchemy import text
+    from core.auth.seed_roles import seed_roles
+
+    # Ensure roles exist (may not be seeded yet in parallel runs)
+    seed_roles(db_session)
+
+    role = db_session.execute(
+        text("SELECT role_id FROM roles WHERE role_name = 'mo_agent_admin' LIMIT 1")
+    ).fetchone()
+    if role:
+        existing = db_session.execute(
+            text("SELECT 1 FROM user_roles WHERE user_id = :uid AND role_id = :rid"),
+            {"uid": test_user.user_id, "rid": role[0]},
+        ).fetchone()
+        if not existing:
+            db_session.execute(
+                text("INSERT INTO user_roles (user_id, role_id) VALUES (:uid, :rid)"),
+                {"uid": test_user.user_id, "rid": role[0]},
+            )
+            db_session.commit()
+
+    response = client.post(
+        "/auth/login",
+        json={"username": test_user.username, "password": "testpass123"},
+    )
     token = response.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
 

@@ -16,18 +16,16 @@ from core.llm.router import ModelConfig, ModelRouter
 class TestCacheAwareCost:
     @pytest.fixture
     def router(self):
-        r = ModelRouter(use_defaults=False)
+        r = ModelRouter()
         r.registry.register(ModelConfig(
             model_name="claude-sonnet",
             provider=LLMProvider.ANTHROPIC,
-            price_per_1k_prompt=0.003,
-            price_per_1k_completion=0.015,
+            pricing={"prompt": 0.003, "completion": 0.015},
         ))
         r.registry.register(ModelConfig(
             model_name="gpt-4o",
             provider=LLMProvider.OPENAI,
-            price_per_1k_prompt=0.005,
-            price_per_1k_completion=0.015,
+            pricing={"prompt": 0.005, "completion": 0.015},
         ))
         return r
 
@@ -74,14 +72,11 @@ class TestCacheAwareCost:
 
     def test_custom_cache_pricing(self):
         """Explicit cache pricing overrides provider defaults."""
-        router = ModelRouter(use_defaults=False)
+        router = ModelRouter()
         router.registry.register(ModelConfig(
             model_name="custom",
             provider=LLMProvider.ANTHROPIC,
-            price_per_1k_prompt=0.01,
-            price_per_1k_completion=0.03,
-            price_per_1k_cache_read=0.002,   # custom, not 0.1x
-            price_per_1k_cache_write=0.015,   # custom, not 1.25x
+            pricing={"prompt": 0.01, "completion": 0.03, "cache_read": 0.002, "cache_write": 0.015},
         ))
         cost = router.calculate_cost("custom", 1000, 0,
                                      cache_read_tokens=500, cache_creation_tokens=200)

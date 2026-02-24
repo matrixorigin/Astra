@@ -4,6 +4,7 @@ Distributed-safe: all coordination through DB, no cross-worker in-memory deps.
 """
 
 import asyncio
+import contextvars
 import gc
 import json
 from collections.abc import AsyncIterator
@@ -18,6 +19,10 @@ from core.events.event_logger import EventLogger
 from core.events.models import EventType, StreamEvent, StreamEventType
 from core.logging_config import get_logger
 
+# Per-task DB session override (set by start_run, used by internal methods)
+_task_db: contextvars.ContextVar[Session | None] = contextvars.ContextVar("_task_db", default=None)
+_task_event_logger: contextvars.ContextVar[EventLogger | None] = contextvars.ContextVar("_task_event_logger", default=None)
+
 logger = get_logger(__name__)
 
 # In-memory: only for THIS worker's active runs (not shared across workers)
@@ -27,6 +32,15 @@ _run_waiters: dict[str, asyncio.Event] = {}
 _run_tasks: dict[str, asyncio.Task] = {}
 _child_runs: dict[str, set[str]] = {}  # parent_run_id → {child_run_ids}
 _fan_in_tasks: set[asyncio.Task] = set()  # Track fan-in tasks for cleanup
+
+
+def cleanup_fan_in_tasks() -> None:
+    """Cancel all pending fan-in tasks. Call during shutdown or test teardown."""
+    for t in list(_fan_in_tasks):
+        if not t.done():
+            t.cancel()
+    _fan_in_tasks.clear()
+
 
 # Max size for resume user_input to prevent token explosion on adversarial loops
 _MAX_RESUME_INPUT_CHARS = 4000
@@ -69,10 +83,33 @@ class RunEngine:
     """Drives AgentRun execution. Not bound to HTTP request lifecycle."""
 
     def __init__(self, db: Session):
-        self.db = db
-        self.event_logger = EventLogger(db)
+        self._default_db = db
+        self._default_event_logger = EventLogger(db)
         # Start GC task on first engine instantiation
         _start_gc_task()
+
+    @property
+    def db(self) -> Session:
+        """Return per-task DB session if set, otherwise the default."""
+        return _task_db.get() or self._default_db
+
+    @db.setter
+    def db(self, value: Session) -> None:
+        self._default_db = value
+
+    @property
+    def event_logger(self) -> EventLogger:
+        """Return per-task event logger if set, otherwise the default."""
+        return _task_event_logger.get() or self._default_event_logger
+
+    @event_logger.setter
+    def event_logger(self, value: EventLogger) -> None:
+        self._default_event_logger = value
+
+    def _new_db(self) -> Session:
+        """Create a fresh DB session for background tasks."""
+        from api.database import SessionLocal
+        return SessionLocal()
 
     # ── Public API ────────────────────────────────────────────
 
@@ -164,11 +201,19 @@ class RunEngine:
         return None
 
     async def start_run(self, run: AgentRun) -> None:
-        """Execute an AgentRun using ChatLoop. Streams events to buffer."""
+        """Execute an AgentRun using ChatLoop. Streams events to buffer.
+        
+        Uses a dedicated DB session via contextvars so concurrent runs
+        each get their own session without overwriting shared state.
+        """
         run.status = RunStatus.RUNNING
+        bg_db = self._new_db()
+        bg_event_logger = EventLogger(bg_db)
+        tok_db = _task_db.set(bg_db)
+        tok_el = _task_event_logger.set(bg_event_logger)
         try:
             from api.routers.chat import _build_chat_loop
-            loop = _build_chat_loop(self.db)
+            loop = _build_chat_loop(bg_db)
             loop._current_run_id = run.run_id
 
             coro = self._consume_stream(loop, run)
@@ -177,7 +222,7 @@ class RunEngine:
 
             if run.status == RunStatus.RUNNING:
                 self._complete_run(run)
-        except asyncio.TimeoutError as e:
+        except asyncio.TimeoutError:
             logger.error(f"Run {run.run_id} timed out after {timeout}s")
             run.status = RunStatus.FAILED
             self._log_run_event(run, EventType.RUN_FAILED, {"error": f"Run timed out after {timeout}s"})
@@ -188,6 +233,7 @@ class RunEngine:
             raise  # Re-raise to ensure proper cleanup
         except asyncio.CancelledError:
             run.status = RunStatus.CANCELLED
+            run._cancelled_externally = True  # Skip fan-in; parent handles it
             self._log_run_event(run, EventType.RUN_CANCELLED)
             raise  # Re-raise to ensure proper cleanup
         except Exception as e:
@@ -203,17 +249,23 @@ class RunEngine:
             _run_tasks.pop(run.run_id, None)
             _run_waiters.get(run.run_id, asyncio.Event()).set()
             # Fan-in: if this is a child run that ended, check parent
-            if run.parent_run_id and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
-                coro = self._check_fan_in(run.parent_run_id)
+            # Skip if externally cancelled — parent's cancel_run already handles children
+            if run.parent_run_id and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED) \
+                    and not getattr(run, '_cancelled_externally', False):
                 try:
-                    task = asyncio.create_task(coro)
-                    _fan_in_tasks.add(task)
-                    task.add_done_callback(lambda t: _fan_in_tasks.discard(t))
-                except RuntimeError:
-                    coro.close()  # No running event loop (shutdown)
+                    await self._check_fan_in(run.parent_run_id)
+                except Exception:
+                    pass  # Best-effort; don't let fan-in failure break cleanup
             # Cleanup completed runs to prevent memory leak
             if run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                 self._maybe_gc()
+            # Close background DB session and restore contextvars
+            try:
+                bg_db.close()
+            except Exception:
+                pass
+            _task_db.reset(tok_db)
+            _task_event_logger.reset(tok_el)
 
     async def _consume_stream(self, loop, run: AgentRun) -> None:
         """Consume ChatLoop stream, parking on wait_for signals.

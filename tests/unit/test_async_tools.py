@@ -18,18 +18,9 @@ from core.agent.run import RunStatus
 @pytest.fixture(autouse=True)
 def clean_fan_in_tasks():
     """Clean fan-in tasks after each test."""
-    from core.agent.run_engine import _fan_in_tasks
+    from core.agent.run_engine import cleanup_fan_in_tasks
     yield
-    # Wait for pending fan-in tasks to complete
-    import asyncio
-    if _fan_in_tasks:
-        try:
-            loop = asyncio.get_event_loop()
-            if not loop.is_closed():
-                loop.run_until_complete(asyncio.gather(*list(_fan_in_tasks), return_exceptions=True))
-        except Exception:
-            pass
-    _fan_in_tasks.clear()
+    cleanup_fan_in_tasks()
 
 
 class TestAsyncToolRegistry:

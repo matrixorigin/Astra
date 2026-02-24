@@ -37,10 +37,10 @@ from core.agent.run_engine import (
     RunEngine,
     _active_runs,
     _child_runs,
-    _fan_in_tasks,
     _run_events,
     _run_tasks,
     _run_waiters,
+    cleanup_fan_in_tasks,
 )
 from core.events.models import StreamEvent, StreamEventType
 from core.utils.id_generator import generate_id
@@ -107,12 +107,12 @@ def _clean_globals():
     for d in (_active_runs, _run_events, _run_waiters, _run_tasks,
               _child_runs):
         d.clear()
-    _fan_in_tasks.clear()
+    cleanup_fan_in_tasks()
     yield
     for d in (_active_runs, _run_events, _run_waiters, _run_tasks,
               _child_runs):
         d.clear()
-    _fan_in_tasks.clear()
+    cleanup_fan_in_tasks()
 
 
 @pytest.fixture
