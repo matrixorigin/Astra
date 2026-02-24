@@ -2,7 +2,6 @@
 """mo-agent CLI - API mode with sync wrapper."""
 
 import sys
-import threading
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -10,18 +9,6 @@ import asyncio
 import json
 import click
 from cli.api_client import APIClient
-
-
-def _spinner(stop_event: threading.Event, label: str = "Thinking"):
-    """Show a spinner until stop_event is set."""
-    import itertools, time
-    chars = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-    while not stop_event.is_set():
-        sys.stderr.write(f"\r\033[2m{next(chars)} {label}...\033[0m")
-        sys.stderr.flush()
-        time.sleep(0.08)
-    sys.stderr.write("\r\033[K")  # clear line
-    sys.stderr.flush()
 
 
 class SyncAPIClient:
@@ -151,19 +138,48 @@ def register(ctx, email, password, username):
         sys.exit(1)
 
 
+async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, auto_approve):
+    """Run one edge chat loop turn using the async APIClient."""
+    import os
+    from cli.edge_chat_loop import edge_chat_loop
+    from cli.permissions import PermissionManager
+    from cli.tools.router import ToolRouter
+    from cli.tools.file_ops import register_file_tools
+    from cli.tools.shell import register_shell_tools
+    from cli.tools.git import register_git_tools
+    from cli.tools.search import register_search_tools
+
+    project_root = os.getcwd()
+    router = ToolRouter()
+    register_file_tools(router, project_root)
+    register_shell_tools(router, project_root)
+    register_git_tools(router, project_root)
+    register_search_tools(router, project_root)
+
+    perms = PermissionManager(auto_approve=auto_approve)
+
+    async with APIClient(base_url=sync_client.base_url, profile=sync_client.profile) as api:
+        await edge_chat_loop(
+            user_input, api, router, perms,
+            session_id=session_id, project_root=project_root,
+            model=model, agent_id=agent_id,
+        )
+
+
 @cli.command()
 @click.option("--user-id", default="cli_user")
 @click.option("--session-id", default=None)
-@click.option("--no-stream", is_flag=True, help="Disable streaming output")
 @click.option("--model", default=None, help="Model to use for chat")
+@click.option("--auto-approve", is_flag=True, help="Auto-approve tool execution (dangerous commands still blocked)")
+@click.option("--debug", is_flag=True, help="Print full traceback on errors")
 @click.pass_context
-def chat(ctx, user_id, session_id, no_stream, model):
-    """Start interactive chat with streaming support."""
+def chat(ctx, user_id, session_id, model, auto_approve, debug):
+    """Start interactive chat with edge tool execution."""
     client = ctx.obj["client"]
-    
+
     click.echo("🤖 mo-agent interactive chat")
     click.echo("=" * 50)
-    
+
     auth_result = client.ensure_authenticated()
     if auth_result == "session_expired" or not auth_result:
         click.echo("❌ Not logged in")
@@ -173,7 +189,6 @@ def chat(ctx, user_id, session_id, no_stream, model):
             type=click.IntRange(1, 3), default=1,
         )
         if choice == 3:
-            click.echo("Run: mo-agent login  or  mo-agent register")
             sys.exit(0)
 
         username = click.prompt("Username")
@@ -188,25 +203,21 @@ def chat(ctx, user_id, session_id, no_stream, model):
                 click.echo(f"❌ Registration failed: {e}")
                 sys.exit(1)
 
-        # Login (after register, or direct login)
         try:
             client.login(username, password)
             click.echo("✅ Logged in")
         except Exception as e:
             click.echo(f"❌ Login failed: {e}")
-            click.echo("Run: mo-agent register  to create an account first")
             sys.exit(1)
-    
-    # Get current user info
+
     try:
         user_info = client.get_current_user()
         username = user_info.get("username", "You")
     except Exception:
         username = "You"
-    
-    # Track selected model
+
     selected_model = model
-    
+
     try:
         if not session_id:
             result = client.create_session(agent_id=user_id or "default-agent")
@@ -218,69 +229,42 @@ def chat(ctx, user_id, session_id, no_stream, model):
 
         while True:
             user_input = click.prompt(username, type=str, prompt_suffix="> ")
-            
-            # Handle slash commands
+
             if user_input.startswith("/"):
                 cmd_parts = user_input.strip().split(maxsplit=1)
                 cmd = cmd_parts[0].lower()
                 cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else None
-                
-                if cmd in ["/exit", "/quit"]:
+
+                if cmd in ("/exit", "/quit"):
                     break
                 elif cmd == "/help":
-                    click.echo("\nAvailable commands:")
-                    click.echo("  /help           - Show this help")
-                    click.echo("  /model          - List available models")
-                    click.echo("  /model <name>   - Select a model")
-                    click.echo("  /session        - Show current session info")
-                    click.echo("  /clear          - Start a new session")
-                    click.echo("  /exit           - Exit chat")
-                    click.echo()
-                    continue
+                    click.echo("\n  /help           Show this help")
+                    click.echo("  /model          List available models")
+                    click.echo("  /model <name>   Select a model")
+                    click.echo("  /session        Show current session info")
+                    click.echo("  /clear          Start a new session")
+                    click.echo("  /exit           Exit chat\n")
                 elif cmd == "/model":
                     try:
                         models = client.admin_list_models()
-                        if models:
-                            if cmd_arg:
-                                # Select model
-                                model_names = [m['name'] for m in models]
-                                if cmd_arg in model_names:
-                                    selected_model = cmd_arg
-                                    click.echo(f"\n✅ Model selected: {selected_model}\n")
-                                else:
-                                    click.echo(f"\n❌ Model '{cmd_arg}' not found")
-                                    click.echo("Available models:")
-                                    for m in models:
-                                        click.echo(f"  • {m['name']} ({m['provider']})")
-                                    click.echo()
+                        if cmd_arg:
+                            if cmd_arg in [m["name"] for m in models]:
+                                selected_model = cmd_arg
+                                click.echo(f"\n✅ Model: {selected_model}\n")
                             else:
-                                # List models
-                                click.echo("\nAvailable models:")
+                                click.echo(f"\n❌ Unknown model '{cmd_arg}'")
                                 for m in models:
-                                    marker = "→" if selected_model == m['name'] else " "
-                                    click.echo(f"  {marker} {m['name']} ({m['provider']})")
-                                click.echo()
-                                if selected_model:
-                                    click.echo(f"Current: {selected_model}")
-                                else:
-                                    click.echo("To select: /model <name>")
+                                    click.echo(f"  • {m['name']} ({m['provider']})")
                                 click.echo()
                         else:
-                            click.echo("\n⚠️  No models configured")
-                            click.echo("Configure models: make dev-setup-demo → Configure models")
+                            for m in models:
+                                marker = "→" if selected_model == m["name"] else " "
+                                click.echo(f"  {marker} {m['name']} ({m['provider']})")
                             click.echo()
                     except Exception as e:
-                        click.echo(f"\n❌ Failed to list models: {e}\n")
-                    continue
+                        click.echo(f"\n❌ {e}\n")
                 elif cmd == "/session":
-                    click.echo(f"\n📝 Session ID: {session_id}")
-                    click.echo(f"👤 User: {username}")
-                    if selected_model:
-                        click.echo(f"🤖 Model: {selected_model}")
-                    else:
-                        click.echo(f"🤖 Model: (default)")
-                    click.echo()
-                    continue
+                    click.echo(f"\n📝 {session_id}  👤 {username}  🤖 {selected_model or '(default)'}\n")
                 elif cmd == "/clear":
                     try:
                         client.close_session(session_id)
@@ -288,79 +272,27 @@ def chat(ctx, user_id, session_id, no_stream, model):
                         session_id = result["session_id"]
                         click.echo(f"\n✅ New session: {session_id}\n")
                     except Exception as e:
-                        click.echo(f"\n❌ Failed to create new session: {e}\n")
-                    continue
+                        click.echo(f"\n❌ {e}\n")
                 else:
-                    click.echo(f"\n❌ Unknown command: {user_input}")
-                    click.echo("Type /help for available commands\n")
-                    continue
-            
-            if user_input.lower() in ["exit", "quit"]:
+                    click.echo("❌ Unknown command. Type /help\n")
+                continue
+
+            if user_input.lower() in ("exit", "quit"):
                 break
-            
-            if no_stream:
-                # Non-streaming mode: poll for result
-                result = client.chat(user_input, session_id=session_id, model=selected_model)
-                run_id = result.get("run_id")
-                
-                # Poll for completion
-                import time
-                while True:
-                    status = client.get_run_status(run_id)
-                    if status["status"] in ["completed", "failed", "cancelled"]:
-                        break
-                    time.sleep(0.5)
-                
-                # Get final response from run events
-                if status["status"] == "completed":
-                    # Stream events to get response
-                    response_text = ""
-                    for event in client.stream_run_events(run_id):
-                        if event.get("type") == "content":
-                            response_text += event.get("content", "")
-                    click.echo(f"Agent> {response_text}\n")
+
+            try:
+                asyncio.run(_run_edge_turn(
+                    user_input, client, session_id,
+                    selected_model, user_id, auto_approve,
+                ))
+            except Exception as e:
+                if debug:
+                    import traceback
+                    click.echo(traceback.format_exc())
                 else:
-                    click.echo(f"❌ Run {status['status']}\n")
-            else:
-                # Streaming mode — show spinner until first content arrives
-                stop = threading.Event()
-                spin = threading.Thread(target=_spinner, args=(stop,), daemon=True)
-                spin.start()
-                first_content = True
-                try:
-                    for event in client.chat_stream(user_input, session_id=session_id, model=selected_model):
-                        et = event.get("event_type", "")
-                        data = event.get("data", {})
-                        if et == "text_delta":
-                            if first_content:
-                                stop.set()
-                                spin.join(timeout=0.2)
-                                click.echo("")  # newline after spinner
-                                first_content = False
-                            click.echo(data.get("chunk", ""), nl=False)
-                        elif et == "tool_call_start":
-                            if first_content:
-                                stop.set()
-                                spin.join(timeout=0.2)
-                                click.echo("")
-                                first_content = False
-                            click.echo(f"\n  🔧 {data.get('tool', '')}... ", nl=False)
-                        elif et == "tool_result":
-                            click.echo("✓")
-                        elif et in ("text_done", "run_finished"):
-                            pass
-                        elif et == "run_error":
-                            stop.set()
-                            spin.join(timeout=0.2)
-                            click.echo(f"\n❌ {data.get('error', 'Unknown error')}")
-                except Exception as e:
-                    stop.set()
-                    spin.join(timeout=0.2)
                     click.echo(f"\n❌ {type(e).__name__}: {e}")
-                finally:
-                    stop.set()
-                click.echo()  # Newline for spacing
-    
+            click.echo()
+
     except KeyboardInterrupt:
         click.echo("\n\nInterrupted")
     except RuntimeError as e:
@@ -371,7 +303,7 @@ def chat(ctx, user_id, session_id, no_stream, model):
     finally:
         try:
             client.close_session(session_id)
-            click.echo(f"✅ Session closed")
+            click.echo("✅ Session closed")
         except Exception:
             pass
 

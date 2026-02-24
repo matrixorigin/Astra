@@ -354,3 +354,94 @@ class TestAdminCLI:
         """Test granting invalid role name."""
         result = runner.invoke(admin_cli, ["user", "grant-role", "alice", "invalid_role"])
         assert result.exit_code != 0  # Click validation should fail
+
+
+# ============================================================================
+# Tests: CLI edge mode integration
+# ============================================================================
+
+class TestCLIEdgeMode:
+    """Test edge mode integration in mo-agent chat."""
+
+    def test_run_edge_turn_registers_all_tools(self):
+        """_run_edge_turn initializes router with all 10 tools."""
+        import asyncio
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from cli.mo_agent_api import _run_edge_turn
+
+        captured = {}
+
+        async def fake_edge_chat_loop(user_input, api, router, perms, **kwargs):
+            captured["tools"] = list(router._tools.keys())
+            captured["auto_approve"] = perms._auto_approve
+            captured["kwargs"] = kwargs
+
+        mock_client = MagicMock()
+        mock_client.base_url = "http://localhost:8000"
+        mock_client.profile = None
+
+        with patch("cli.mo_agent_api.APIClient") as MockAPI, \
+             patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop):
+            # Make APIClient context manager work
+            mock_api_instance = AsyncMock()
+            MockAPI.return_value.__aenter__ = AsyncMock(return_value=mock_api_instance)
+            MockAPI.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            asyncio.run(_run_edge_turn("test", mock_client, "ses_1", "gpt-4", "agent-1", True))
+
+        expected_tools = {
+            "read_file", "write_file", "str_replace", "list_dir",
+            "bash", "git_status", "git_diff", "git_log", "grep", "glob",
+        }
+        assert set(captured["tools"]) == expected_tools
+        assert captured["auto_approve"] is True
+        assert captured["kwargs"]["session_id"] == "ses_1"
+        assert captured["kwargs"]["model"] == "gpt-4"
+        assert captured["kwargs"]["agent_id"] == "agent-1"
+
+    def test_chat_uses_edge_path(self, runner):
+        """Chat always uses _run_edge_turn."""
+        from unittest.mock import patch, MagicMock, AsyncMock
+
+        with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
+             patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.ensure_authenticated.return_value = True
+            mock_client.get_current_user.return_value = {"username": "alice"}
+            mock_client.create_session.return_value = {"session_id": "ses_1"}
+
+            runner.invoke(agent_cli, ["chat"], input="hello\n/exit\n")
+            assert mock_edge.called
+
+    def test_auto_approve_flag_passed(self, runner):
+        """--auto-approve flag is forwarded to _run_edge_turn."""
+        from unittest.mock import patch, MagicMock, AsyncMock
+
+        with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
+             patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.ensure_authenticated.return_value = True
+            mock_client.get_current_user.return_value = {"username": "alice"}
+            mock_client.create_session.return_value = {"session_id": "ses_1"}
+
+            runner.invoke(agent_cli, ["chat", "--auto-approve"], input="hello\n/exit\n")
+            assert args[0][5] is True if (args := mock_edge.call_args) else False
+
+    def test_debug_flag_shows_traceback(self, runner):
+        """--debug prints full traceback on error."""
+        from unittest.mock import patch, MagicMock, AsyncMock
+
+        with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
+             patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
+            mock_edge.side_effect = ValueError("test boom")
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.ensure_authenticated.return_value = True
+            mock_client.get_current_user.return_value = {"username": "alice"}
+            mock_client.create_session.return_value = {"session_id": "ses_1"}
+
+            result = runner.invoke(agent_cli, ["chat", "--debug"], input="hello\n/exit\n")
+            assert "Traceback" in result.output
+            assert "test boom" in result.output

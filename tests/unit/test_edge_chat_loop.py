@@ -546,6 +546,41 @@ class TestRealisticScenarios:
         # Must be under 110KB (100KB + truncation message)
         assert len(result) < 110_000
 
+    @pytest.mark.asyncio
+    async def test_network_timeout_handled(self, router, perms, renderer):
+        """Network timeout during chat_turn → error rendered, loop exits cleanly."""
+        class TimeoutAPI:
+            async def chat_turn(self, **kwargs):
+                raise TimeoutError("Connection timed out")
+                yield  # noqa: E501
+
+        result = await edge_chat_loop("Hi", TimeoutAPI(), router, perms, renderer=renderer)
+        assert any("network error" in e.lower() for e in renderer.errors)
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_connection_error_handled(self, router, perms, renderer):
+        """ConnectionError during SSE stream → error rendered, loop exits."""
+        class ConnErrAPI:
+            async def chat_turn(self, **kwargs):
+                raise ConnectionError("Connection refused")
+                yield  # noqa: E501
+
+        result = await edge_chat_loop("Hi", ConnErrAPI(), router, perms, renderer=renderer)
+        assert any("network error" in e.lower() for e in renderer.errors)
+
+    @pytest.mark.asyncio
+    async def test_keyboard_interrupt_handled(self, router, perms, renderer):
+        """Ctrl+C during chat_turn → graceful exit."""
+        class InterruptAPI:
+            async def chat_turn(self, **kwargs):
+                raise KeyboardInterrupt()
+                yield  # noqa: E501
+
+        result = await edge_chat_loop("Hi", InterruptAPI(), router, perms, renderer=renderer)
+        assert any("interrupt" in e.lower() for e in renderer.errors)
+        assert result == ""
+
 
 # ============================================================================
 # Tests: load_project_rules

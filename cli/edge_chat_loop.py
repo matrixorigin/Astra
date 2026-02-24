@@ -130,16 +130,25 @@ async def edge_chat_loop(
 
     for turn in range(MAX_TURNS):
         # Call cloud
-        sse_stream = api_client.chat_turn(
-            messages=messages,
-            session_id=session_id,
-            tool_results=tool_results if tool_results else None,
-            project_rules=project_rules if turn == 0 else None,
-            agent_id=agent_id,
-            model=model,
-        )
-
-        result = await _consume_turn(sse_stream, renderer)
+        try:
+            sse_stream = api_client.chat_turn(
+                messages=messages,
+                session_id=session_id,
+                tool_results=tool_results if tool_results else None,
+                project_rules=project_rules if turn == 0 else None,
+                agent_id=agent_id,
+                model=model,
+            )
+            result = await _consume_turn(sse_stream, renderer)
+        except KeyboardInterrupt:
+            renderer.error("Interrupted by user")
+            break
+        except (ConnectionError, OSError, TimeoutError) as e:
+            renderer.error(f"Network error: {e}")
+            break
+        except Exception as e:
+            renderer.error(f"{type(e).__name__}: {e}")
+            break
 
         # Track session from first response
         if result.session_id and not session_id:

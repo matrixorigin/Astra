@@ -235,54 +235,40 @@ class TestAdminCLIToAPI:
         assert "4.2" in result.output
 
 
-class TestStreamingE2E:
-    """Test streaming functionality end-to-end."""
+class TestEdgeChatE2E:
+    """Test chat command uses edge execution path."""
 
-    def test_chat_stream_calls_api_client(self, runner, mock_api_client):
-        """Test chat command with streaming calls API client."""
-        # Mock streaming response
-        def mock_stream(*args, **kwargs):
-            yield {"event_type": "text_delta", "data": {"chunk": "Hello"}}
-            yield {"event_type": "text_delta", "data": {"chunk": " world"}}
-            yield {"event_type": "text_done", "data": {}}
-        
+    def test_chat_calls_edge_turn(self, runner, mock_api_client):
+        """Chat command calls _run_edge_turn, not chat_stream."""
+        from unittest.mock import patch, AsyncMock
+
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.create_session.return_value = {"session_id": "sess-123"}
-        mock_api_client.chat_stream.return_value = mock_stream()
         mock_api_client.close_session.return_value = {}
-        
-        result = runner.invoke(
-            agent_cli,
-            ["chat", "--user-id", "alice"],
-            input="test message\nexit\n"
-        )
-        
-        # Verify streaming was called
-        mock_api_client.chat_stream.assert_called()
-        assert "Hello world" in result.output or "Agent>" in result.output
 
-    def test_chat_no_stream_calls_regular_api(self, runner, mock_api_client):
-        """Test chat command with --no-stream uses regular API and polls for result."""
+        with patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
+            result = runner.invoke(
+                agent_cli,
+                ["chat", "--user-id", "alice"],
+                input="test message\nexit\n",
+            )
+            mock_edge.assert_called()
+            assert not mock_api_client.chat_stream.called
+
+    def test_chat_debug_shows_traceback(self, runner, mock_api_client):
+        """--debug flag prints full traceback on error."""
+        from unittest.mock import patch, AsyncMock
+
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.create_session.return_value = {"session_id": "sess-123"}
-        # API returns run_id, not response
-        mock_api_client.chat.return_value = {"run_id": "run-123", "status": "queued"}
-        mock_api_client.get_run_status.return_value = {"status": "completed", "run_id": "run-123"}
-        
-        def mock_stream_events(*args, **kwargs):
-            yield {"type": "content", "content": "Hello world"}
-            yield {"type": "done"}
-        
-        mock_api_client.stream_run_events.return_value = mock_stream_events()
         mock_api_client.close_session.return_value = {}
-        
-        result = runner.invoke(
-            agent_cli,
-            ["chat", "--user-id", "alice", "--no-stream"],
-            input="test message\nexit\n"
-        )
-        
-        # Verify non-streaming was called and polled for result
-        mock_api_client.chat.assert_called()
-        mock_api_client.get_run_status.assert_called()
-        assert "Hello world" in result.output
+
+        with patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
+            mock_edge.side_effect = ValueError("boom")
+            result = runner.invoke(
+                agent_cli,
+                ["chat", "--debug"],
+                input="test message\nexit\n",
+            )
+            assert "Traceback" in result.output
+            assert "boom" in result.output

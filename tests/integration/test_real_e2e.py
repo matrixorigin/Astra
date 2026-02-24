@@ -617,7 +617,7 @@ class TestChatStreamingRealE2E:
         # Try to start chat (will fail at LLM call, but should create session first)
         result = authenticated_runner.invoke(
             agent_cli,
-            ["--api-url", "http://test", "chat", "--no-stream"],
+            ["--api-url", "http://test", "chat"],
             input="/exit\n"
         )
         
@@ -629,64 +629,18 @@ class TestChatStreamingRealE2E:
         # If it failed, we should see error message about session creation
         assert sessions_after >= sessions_before or "session" in result.output.lower()
     
-    def test_non_streaming_chat_polls_and_displays_response(self, authenticated_runner, db, client):
-        """Test that non-streaming chat polls run status and displays response."""
-        from api.models import Session as SessionModel
-        from core.events.models import EventType
-        import json
-        from pathlib import Path
-        
-        # Read credentials from file (new profile format)
-        creds_path = Path.home() / ".mo-agent" / "credentials.json"
-        with open(creds_path) as f:
-            creds = json.load(f)
-        
-        # Get access token from current profile
-        current_profile = creds.get("current_profile", "default")
-        profile_data = creds.get("profiles", {}).get(current_profile, {})
-        access_token = profile_data.get("access_token")
-        
-        # Create a session first
-        session_response = client.post(
-            "/sessions",
-            json={"agent_id": "dev-agent"},
-            headers={"Authorization": f"Bearer {access_token}"}
-        )
-        assert session_response.status_code == 201
-        session_id = session_response.json()["session_id"]
-        
-        # Mock the run to complete immediately with a response
-        with patch("core.agent.run_engine.RunEngine.start_run") as mock_start:
-            async def mock_run(run):
-                # Simulate run completion
-                from core.agent.run import RunStatus
-                run.status = RunStatus.COMPLETED
-                # Log a response event
-                from core.events.event_logger import EventLogger
-                logger = EventLogger(db)
-                logger.create_llm_response(
-                    user_id="test_user",
-                    session_id=session_id,
-                    content="Test response from agent",
-                    agent_id="dev-agent",
-                    agent_version="1.0.0",
-                    parent_event_id=None,
-                    causal_chain_id="test-chain"
-                )
-            
-            mock_start.side_effect = mock_run
-            
-            # Start non-streaming chat
+    def test_chat_uses_edge_execution(self, authenticated_runner, db, client):
+        """Test that chat command uses edge execution path."""
+        from unittest.mock import patch, AsyncMock
+
+        with patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
             result = authenticated_runner.invoke(
                 agent_cli,
-                ["--api-url", "http://test", "chat", "--no-stream", "--session-id", session_id],
+                ["--api-url", "http://test", "chat"],
                 input="Hello\n/exit\n"
             )
-            
-            # Should show response or at least not be empty
-            assert result.output.strip() != ""
-            # Should have attempted to get response
-            assert "Agent>" in result.output or "Test response" in result.output or "completed" in result.output.lower()
+            # Should have called edge turn, not cloud chat
+            mock_edge.assert_called()
 
 
 class TestUserRegistrationRealE2E:
