@@ -110,6 +110,7 @@ def test_retrieval_storage_and_replay():
     print(f"✓ Saved snapshot: {context_capture_id[:8]}")
     
     # Load snapshot
+    ctx_mgr.flush_writes()
     loaded_context = ctx_mgr.load_snapshot(context_capture_id)
     
     print(f"✓ Loaded snapshot")

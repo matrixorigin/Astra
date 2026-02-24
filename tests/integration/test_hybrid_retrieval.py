@@ -106,6 +106,7 @@ def test_replay_consistency():
     )
     
     # Load snapshot
+    ctx_mgr.flush_writes()
     loaded_context = ctx_mgr.load_snapshot(context_capture_id)
     
     # Verify retrieved_events are preserved

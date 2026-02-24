@@ -7,6 +7,7 @@ Enhanced version with:
 """
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from core.logging_config import get_logger
@@ -18,6 +19,9 @@ from core.verification.structured_verifier import (
 )
 
 logger = get_logger(__name__)
+
+# Shared thread pool for async verification writes
+_fw_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fw_log")
 
 
 @dataclass
@@ -397,25 +401,55 @@ class HallucinationFirewall:
     def log_verification(
         self, session_id: str, event_id: str, result: FirewallResult, context_capture_id: str
     ) -> None:
-        """Log verification result with evidence backlinks.
+        """Log verification result with evidence backlinks (async).
 
-        Args:
-            session_id: Session ID
-            event_id: Event ID being verified
-            result: Verification result
-            context_capture_id: Context capture ID (business-level)
+        Offloaded to a background thread — fire-and-forget.
         """
         if not session_id or not event_id:
             logger.error("Missing session_id or event_id for verification logging")
             return
 
+        # Serialize contradiction data on caller thread (objects may not be thread-safe)
+        evidence_rows = []
+        check_id = f"check_{event_id}"
+        for contradiction in result.contradictions:
+            for evidence in contradiction.evidence:
+                evidence_rows.append({
+                    "check_id": check_id,
+                    "claim_type": contradiction.claim.type,
+                    "claim_value": contradiction.claim.value,
+                    "source_type": evidence.source_type,
+                    "source_id": evidence.source_id,
+                    "content": evidence.content,
+                    "location": evidence.location,
+                    "confidence": evidence.confidence,
+                })
+
+        check_row = {
+            "check_id": check_id,
+            "session_id": session_id,
+            "event_id": event_id,
+            "ctx_id": context_capture_id,
+            "total": result.claims_verified + result.claims_failed,
+            "verified": result.claims_verified,
+            "contradicted": result.claims_failed,
+            "confidence": result.confidence_score,
+            "safe": result.safe_to_deliver,
+            "evidence": result.evidence_count,
+        }
+
+        from api.database import SessionLocal
+        from concurrent.futures import ThreadPoolExecutor
+        _fw_pool.submit(self._write_verification, SessionLocal, check_row, evidence_rows)
+
+    @staticmethod
+    def _write_verification(db_factory, check_row: dict, evidence_rows: list[dict]) -> None:
+        """Write verification in background thread."""
+        db = db_factory()
         try:
             from sqlalchemy import text
 
-            # 1. Insert hallucination check record
-            check_id = f"check_{event_id}"
-
-            self.db.execute(
+            db.execute(
                 text(
                     "INSERT INTO hallucination_checks "
                     "(check_id, session_id, event_id, context_capture_id, "
@@ -424,55 +458,33 @@ class HallucinationFirewall:
                     "VALUES (:check_id, :session_id, :event_id, :ctx_id, "
                     ":total, :verified, :contradicted, :confidence, :safe, :evidence, NOW())"
                 ),
-                {
-                    "check_id": check_id,
-                    "session_id": session_id,
-                    "event_id": event_id,
-                    "ctx_id": context_capture_id,
-                    "total": result.claims_verified + result.claims_failed,
-                    "verified": result.claims_verified,
-                    "contradicted": result.claims_failed,
-                    "confidence": result.confidence_score,
-                    "safe": result.safe_to_deliver,
-                    "evidence": result.evidence_count,
-                },
+                check_row,
             )
 
-            # 2. Insert evidence backlinks for each contradiction
-            for contradiction in result.contradictions:
-                for evidence in contradiction.evidence:
-                    self.db.execute(
-                        text(
-                            "INSERT INTO claim_evidence "
-                            "(check_id, claim_type, claim_value, "
-                            "source_type, source_id, content, location, "
-                            "confidence, created_at) "
-                            "VALUES (:check_id, :claim_type, :claim_value, "
-                            ":source_type, :source_id, :content, :location, "
-                            ":confidence, NOW())"
-                        ),
-                        {
-                            "check_id": check_id,
-                            "claim_type": contradiction.claim.type,
-                            "claim_value": contradiction.claim.value,
-                            "source_type": evidence.source_type,
-                            "source_id": evidence.source_id,
-                            "content": evidence.content,
-                            "location": evidence.location,
-                            "confidence": evidence.confidence,
-                        },
-                    )
+            for row in evidence_rows:
+                db.execute(
+                    text(
+                        "INSERT INTO claim_evidence "
+                        "(check_id, claim_type, claim_value, "
+                        "source_type, source_id, content, location, "
+                        "confidence, created_at) "
+                        "VALUES (:check_id, :claim_type, :claim_value, "
+                        ":source_type, :source_id, :content, :location, "
+                        ":confidence, NOW())"
+                    ),
+                    row,
+                )
 
-            self.db.commit()
-
+            db.commit()
             logger.info(
-                f"Verification logged: {result.claims_verified}/{result.claims_verified + result.claims_failed} verified, "
-                f"confidence={result.confidence_score:.2f}, evidence={result.evidence_count}"
+                "Verification logged: %d/%d verified, confidence=%.2f",
+                check_row["verified"], check_row["total"], check_row["confidence"],
             )
-
-        except Exception as e:
-            logger.error(f"Failed to log verification: {e}")
-            self.db.rollback()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to log verification %s", check_row.get("check_id"))
+        finally:
+            db.close()
 
     def _init_tables(self):
         """Initialize database tables (auto-create if not exist)."""

@@ -40,6 +40,9 @@ def test_context_snapshot_save_and_load(db_session, context_manager, event_logge
     )
     assert context_capture_id is not None
 
+    # Wait for async write to complete
+    context_manager.flush_writes()
+
     # Load snapshot
     loaded_context = context_manager.load_snapshot(context_capture_id)
 
@@ -93,6 +96,7 @@ def test_context_snapshot_with_events(db_session, context_manager, event_logger)
     assert context_capture_id is not None
 
     # Load and verify
+    context_manager.flush_writes()
     loaded = context_manager.load_snapshot(context_capture_id)
     assert len(loaded.selected_events) > 0
 
@@ -124,6 +128,7 @@ def test_context_snapshot_task_types(db_session, context_manager, event_logger):
         )
         assert context_capture_id is not None
 
+        context_manager.flush_writes()
         loaded = context_manager.load_snapshot(context_capture_id)
         assert loaded.task_type == task_type
 
@@ -149,6 +154,7 @@ def test_context_snapshot_relevance_scores(db_session, context_manager, event_lo
     )
 
     # Load and verify relevance scores
+    context_manager.flush_writes()
     loaded = context_manager.load_snapshot(context_capture_id)
     assert loaded.relevance_scores is not None
     assert isinstance(loaded.relevance_scores, dict)
@@ -174,6 +180,9 @@ def test_context_snapshot_update_llm_ids(db_session, context_manager, event_logg
 
     # Update with LLM IDs
     context_manager.update_snapshot_llm_ids(context_capture_id, llm_request_id="req_004", llm_response_id="resp_004")
+
+    # Wait for both async writes to complete
+    context_manager.flush_writes()
 
     # Verify update
     from api.models import ContextSnapshot as SnapshotModel

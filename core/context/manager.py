@@ -6,7 +6,10 @@ Implements intelligent context selection and assembly based on:
 - Task-aware optimization
 """
 
+import json
+import logging as _logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -19,6 +22,9 @@ from sqlalchemy.orm import Session
 from api.database import get_db_session
 
 logger = get_logger(__name__)
+
+# Shared thread pool for async DB writes (snapshot, update_llm_ids)
+_write_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ctx_snapshot")
 
 
 class TaskType(str, Enum):
@@ -594,96 +600,122 @@ class ContextManager:
         llm_request_id: str | None = None,
         llm_response_id: str | None = None,
     ) -> str:
-        """Save a business-level context snapshot to database.
+        """Save a business-level context snapshot to database (async).
 
-        This captures what the LLM saw at decision time (system prompt, selected
-        events, skill definitions, code context, documentation). It is NOT a
-        MatrixOne database-level snapshot — those are used for time-travel queries
-        and zero-cost branching at the storage layer.
-
-        Args:
-            context: Context object
-            session_id: Session identifier
-            event_id: Associated event ID
-            llm_request_id: LLM request identifier
-            llm_response_id: LLM response identifier
-
-        Returns:
-            context_capture_id (business-level context capture ID)
+        Returns context_capture_id immediately. The actual DB write happens
+        in a background thread with its own session.
         """
-        import json
-
         from uuid_utils import uuid7
 
         context_capture_id = str(uuid7())
 
-        # Extract skills used (name and version)
+        # Prepare all data synchronously (must happen on caller's thread
+        # because Context object may not be safe to share)
         skills_used = [
             {"skill_name": s.get("skill_name") or s.get("name", ""), "version": s.get("version", "latest")}
             for s in context.skill_definitions
         ]
 
-        # Ensure all data is JSON serializable by round-tripping
-        def ensure_json_serializable(obj):
-            """Ensure object is JSON serializable."""
+        def _json(obj):
             return json.loads(json.dumps(obj, default=str))
 
-        from api.models import ContextSnapshot as SnapshotModel
-        from datetime import datetime, timezone
-        
-        snapshot = SnapshotModel(
-            context_capture_id=context_capture_id,
-            session_id=session_id,
-            event_id=event_id,
-            system_prompt=context.system_prompt,
-            skill_definitions=ensure_json_serializable(context.skill_definitions),
-            selected_events=ensure_json_serializable(context.selected_events),
-            retrieved_events=ensure_json_serializable(context.retrieved_events),
-            code_context=ensure_json_serializable(context.code_context),
-            documentation=ensure_json_serializable(context.documentation),
-            total_tokens=context.total_tokens,
-            token_budget=ensure_json_serializable(context.token_budget),
-            assembly_time_ms=context.assembly_time_ms,
-            relevance_scores=ensure_json_serializable(context.relevance_scores),
-            task_type=context.task_type.value,
-            skills_used=ensure_json_serializable(skills_used),
-            llm_request_id=llm_request_id,
-            llm_response_id=llm_response_id,
-        )
-        self.db.add(snapshot)
-        self.db.commit()
+        payload = {
+            "context_capture_id": context_capture_id,
+            "session_id": session_id,
+            "event_id": event_id,
+            "system_prompt": context.system_prompt,
+            "skill_definitions": _json(context.skill_definitions),
+            "selected_events": _json(context.selected_events),
+            "retrieved_events": _json(context.retrieved_events),
+            "code_context": _json(context.code_context),
+            "documentation": _json(context.documentation),
+            "total_tokens": context.total_tokens,
+            "token_budget": _json(context.token_budget),
+            "assembly_time_ms": context.assembly_time_ms,
+            "relevance_scores": _json(context.relevance_scores),
+            "task_type": context.task_type.value,
+            "skills_used": _json(skills_used),
+            "llm_request_id": llm_request_id,
+            "llm_response_id": llm_response_id,
+        }
 
-        logger.info(f"Context snapshot saved: {context_capture_id} (retrieved: {len(context.retrieved_events or [])} events)")
+        from api.database import SessionLocal
+        _write_pool.submit(self._write_snapshot, SessionLocal, payload)
+
+        logger.info(f"Context snapshot queued: {context_capture_id}")
         return context_capture_id
+
+    @staticmethod
+    def _write_snapshot(db_factory, payload: dict) -> None:
+        """Write snapshot in background thread with its own DB session."""
+        db = db_factory()
+        try:
+            from api.models import ContextSnapshot as SnapshotModel
+            snapshot = SnapshotModel(**payload)
+            db.add(snapshot)
+            db.commit()
+        except Exception:
+            db.rollback()
+            _logging.getLogger(__name__).exception(
+                "Failed to write snapshot %s", payload.get("context_capture_id")
+            )
+        finally:
+            db.close()
+
+    @staticmethod
+    def _update_snapshot(db_factory, context_capture_id: str, update_dict: dict) -> None:
+        """Update snapshot in background thread."""
+        db = db_factory()
+        try:
+            from api.models import ContextSnapshot as SnapshotModel
+            db.query(SnapshotModel).filter(
+                SnapshotModel.context_capture_id == context_capture_id
+            ).update(update_dict)
+            db.commit()
+        except Exception:
+            db.rollback()
+            _logging.getLogger(__name__).exception(
+                "Failed to update snapshot %s", context_capture_id
+            )
+        finally:
+            db.close()
+
+    @staticmethod
+    def flush_writes() -> None:
+        """Block until all pending background snapshot writes complete.
+
+        Useful in tests and before load_snapshot when immediate consistency is needed.
+        """
+        global _write_pool
+        _write_pool.shutdown(wait=True)
+        _write_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ctx_snapshot")
 
     def update_snapshot_llm_ids(
         self, context_capture_id: str, llm_request_id: str | None = None, llm_response_id: str | None = None
     ) -> None:
-        """Update context capture with LLM request/response IDs.
+        """Update context capture with LLM request/response IDs (async).
 
-        Args:
-            context_capture_id: Context capture identifier
-            llm_request_id: LLM request identifier
-            llm_response_id: LLM response identifier
+        Offloaded to background thread — fire-and-forget.
         """
-        from api.models import ContextSnapshot as SnapshotModel
-        
         update_dict = {}
         if llm_request_id:
             update_dict["llm_request_id"] = llm_request_id
         if llm_response_id:
             update_dict["llm_response_id"] = llm_response_id
-
         if not update_dict:
             return
 
-        self.db.query(SnapshotModel).filter(
-            SnapshotModel.context_capture_id == context_capture_id
-        ).update(update_dict)
-        self.db.commit()
+        from api.database import SessionLocal
+        _write_pool.submit(
+            self._update_snapshot, SessionLocal, context_capture_id, update_dict
+        )
 
     def load_snapshot(self, context_capture_id: str) -> Context:
-        """Load context capture from database."""
+        """Load context capture from database.
+
+        Note: if save_snapshot was called recently, call flush_writes() first
+        to ensure the background write has completed.
+        """
         from api.models import ContextSnapshot as SnapshotModel
 
         row = self.db.query(SnapshotModel).filter(
