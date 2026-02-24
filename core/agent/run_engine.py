@@ -152,14 +152,8 @@ class RunEngine:
             raise ValueError(f"Parent run {parent_run_id} not found")
 
         ctx = dict(context or {})
-        # Load agent config from DB (system_prompt, etc.)
-        if "system_prompt" not in ctx:
-            config = self._load_agent_config(agent_id)
-            if config:
-                if config.get("system_prompt"):
-                    ctx["system_prompt"] = config["system_prompt"]
-                if config.get("allowed_tools"):
-                    ctx.setdefault("allowed_tools", config["allowed_tools"])
+        # Load agent config from DB
+        self._apply_agent_config(agent_id, ctx)
 
         # Propagate causal chain from parent for audit traceability
         parent_ctx = parent.context or {}
@@ -200,6 +194,22 @@ class RunEngine:
             logger.warning(f"Failed to load agent config for {agent_id}: {e}")
         return None
 
+    def _apply_agent_config(self, agent_id: str, ctx: dict) -> None:
+        """Load agent config and inject into context (system_prompt, model, etc.)."""
+        config = self._load_agent_config(agent_id)
+        if not config:
+            return
+        if config.get("system_prompt") and "system_prompt" not in ctx:
+            ctx["system_prompt"] = config["system_prompt"]
+        if config.get("allowed_tools"):
+            ctx.setdefault("allowed_tools", config["allowed_tools"])
+        if config.get("model") and "model" not in ctx:
+            ctx["model"] = config["model"]
+            ctx["_model_source"] = "agent_config"  # Audit: tracks where model was resolved from
+            logger.info(f"Agent {agent_id} using model: {config['model']}")
+        if config.get("model_constraints"):
+            ctx.setdefault("model_constraints", config["model_constraints"])
+
     async def start_run(self, run: AgentRun) -> None:
         """Execute an AgentRun using ChatLoop. Streams events to buffer.
         
@@ -212,6 +222,11 @@ class RunEngine:
         tok_db = _task_db.set(bg_db)
         tok_el = _task_event_logger.set(bg_event_logger)
         try:
+            # Load agent config and inject model if not already set
+            if run.agent_id:
+                run.context = run.context or {}
+                self._apply_agent_config(run.agent_id, run.context)
+            
             from api.routers.chat import _build_chat_loop
             loop = _build_chat_loop(bg_db)
             loop._current_run_id = run.run_id

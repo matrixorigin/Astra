@@ -41,6 +41,7 @@ class EventType(str, Enum):
     RUN_FAILED = "run_failed"
     RUN_CANCELLED = "run_cancelled"
     CHILD_RUN_CREATED = "child_run_created"
+    MODEL_SELECTED = "model_selected"
 
     # Streaming events
     STREAM_RUN_STARTED = "stream_run_started"

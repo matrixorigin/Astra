@@ -159,6 +159,7 @@ async def chat(
         session_id=session_id,
         user_id=user_id,
         user_input=request.message,
+        agent_id=request.agent_id or "dev-agent",  # Pass agent_id for model lookup
         context=context,
     )
 
@@ -191,6 +192,7 @@ async def chat_stream(
         session_id=session_id,
         user_id=user_id,
         user_input=request.message,
+        agent_id=request.agent_id or "dev-agent",  # Pass agent_id for model lookup
         context=context,
     )
 

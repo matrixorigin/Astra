@@ -241,6 +241,20 @@ class ChatLoop:
 
         # Get model from context
         model = (context or {}).get("model")
+        model_source = (context or {}).get("_model_source", "request" if model else "default")
+        
+        # Audit: log model selection
+        if model:
+            from core.events.models import ConversationEvent, EventType
+            from uuid_utils import uuid7
+            self.event_logger.log_event(ConversationEvent(
+                event_id=str(uuid7()),
+                user_id=user_id,
+                session_id=session_id,
+                event_type=EventType.MODEL_SELECTED,
+                content=model,
+                metadata={"model": model, "source": model_source},
+            ))
         
         if not tools_schema:
             # No tools available — plain chat
