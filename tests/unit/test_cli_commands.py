@@ -242,9 +242,9 @@ class TestStreamingE2E:
         """Test chat command with streaming calls API client."""
         # Mock streaming response
         def mock_stream(*args, **kwargs):
-            yield {"type": "content", "content": "Hello"}
-            yield {"type": "content", "content": " world"}
-            yield {"type": "done"}
+            yield {"event_type": "text_delta", "data": {"chunk": "Hello"}}
+            yield {"event_type": "text_delta", "data": {"chunk": " world"}}
+            yield {"event_type": "text_done", "data": {}}
         
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.create_session.return_value = {"session_id": "sess-123"}

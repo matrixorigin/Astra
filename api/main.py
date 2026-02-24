@@ -72,17 +72,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.debug(f"Agent seeding skipped: {e}")
 
-    # Seed default models
-    try:
-        from api.database import get_db_session
-        from core.llm.seed_models import seed_models
-        db = next(get_db_session())
-        seeded = seed_models(db)
-        if seeded:
-            logger.info(f"Seeded {seeded} default model(s)")
-        db.close()
-    except Exception as e:
-        logger.debug(f"Model seeding skipped: {e}")
+    # LLM models are registered by admin via API — no auto-seeding
 
     # Periodic workflow cleanup (every hour)
     import asyncio

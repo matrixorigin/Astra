@@ -1,5 +1,6 @@
 """Chat loop with multi-turn tool use and full message chain."""
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -19,6 +20,7 @@ logger = get_logger(__name__)
 _UNSET = object()  # Sentinel for "not yet checked"
 
 MAX_TOOL_ROUNDS = 10
+TOOL_TIMEOUT_SECONDS = 120
 
 # Scratchpad tool schemas — injected alongside skill tools when scratchpad is enabled
 _SCRATCHPAD_TOOLS = [
@@ -67,42 +69,6 @@ _SCRATCHPAD_TOOLS = [
     },
 ]
 
-
-async def _needs_planning(user_input: str, llm_client) -> bool:
-    """Check if user input needs planning using LLM judgment.
-    
-    Uses a lightweight LLM call to determine if the task requires multi-step planning.
-    """
-    prompt = f"""Analyze if this task requires multi-step planning.
-
-Task: {user_input}
-
-Answer with ONLY "yes" or "no".
-
-Answer "yes" if the task:
-- Has multiple distinct steps
-- Requires sequential execution
-- Involves complex dependencies
-- Needs coordination between different actions
-
-Answer "no" if the task:
-- Is a simple query or question
-- Can be done in one step
-- Is just asking for information
-
-Answer:"""
-
-    try:
-        response = llm_client.chat(
-            messages=[{"role": "user", "content": prompt}],
-            user_id="system",
-            temperature=0.0,  # Deterministic
-        )
-        answer = (response.content if hasattr(response, "content") else str(response)).strip().lower()
-        return answer.startswith("yes")
-    except Exception as e:
-        logger.warning(f"Planning check failed: {e}, defaulting to no planning")
-        return False
 
 
 def _merge_tool_call_fragments(fragments: list[dict], new_fragments: list[dict]) -> list[dict]:
@@ -416,14 +382,20 @@ class ChatLoop:
                             fn_name, params, session_id, user_id,
                         )
                     elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
-                        result = await self.mcp_bridge.call_tool(fn_name, params)
+                        result = await asyncio.wait_for(
+                            self.mcp_bridge.call_tool(fn_name, params), timeout=TOOL_TIMEOUT_SECONDS,
+                        )
                     else:
-                        result = self.executor.execute_skill_with_feedback(
-                            skill_name=fn_name,
-                            params=params,
-                            session_id=session_id,
-                            parent_event_id=user_event.event_id,
-                            selection_event_id=self._last_selection_event_id,
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self.executor.execute_skill_with_feedback,
+                                skill_name=fn_name,
+                                params=params,
+                                session_id=session_id,
+                                parent_event_id=user_event.event_id,
+                                selection_event_id=self._last_selection_event_id,
+                            ),
+                            timeout=TOOL_TIMEOUT_SECONDS,
                         )
                     result_str = (
                         json.dumps(result, default=str) if not isinstance(result, str) else result
@@ -588,14 +560,20 @@ class ChatLoop:
                     if fn_name.startswith("scratchpad_") and self.scratchpad:
                         result = self._handle_scratchpad_tool(fn_name, params, session_id, user_id)
                     elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
-                        result = await self.mcp_bridge.call_tool(fn_name, params)
+                        result = await asyncio.wait_for(
+                            self.mcp_bridge.call_tool(fn_name, params), timeout=TOOL_TIMEOUT_SECONDS,
+                        )
                     else:
-                        result = self.executor.execute_skill_with_feedback(
-                            skill_name=fn_name,
-                            params=params,
-                            session_id=session_id,
-                            parent_event_id=user_event.event_id,
-                            selection_event_id=self._last_selection_event_id,
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                self.executor.execute_skill_with_feedback,
+                                skill_name=fn_name,
+                                params=params,
+                                session_id=session_id,
+                                parent_event_id=user_event.event_id,
+                                selection_event_id=self._last_selection_event_id,
+                            ),
+                            timeout=TOOL_TIMEOUT_SECONDS,
                         )
                     result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
                     if self.hitl_policy:
@@ -664,8 +642,8 @@ class ChatLoop:
         context_capture_id = self.context_manager.save_snapshot(ctx, session_id, user_event.event_id)
         logger.debug(f"[stream] Context snapshot: {context_capture_id}")
 
-        # 3. Check if planning is needed
-        if await _needs_planning(user_input, self.llm):
+        # 3. Planning: only when explicitly requested via context.
+        if (context or {}).get("planning"):
             async for event in self.run_step_with_planning(
                 user_input, session_id, user_id, context, max_candidates,
                 context_capture_id=context_capture_id,
@@ -692,7 +670,7 @@ class ChatLoop:
             mcp_tools = await self.mcp_bridge.get_tools_schema()
             tools_schema = list(tools_schema) + mcp_tools
 
-        # Append async tools (submit_job, etc.)
+        # Append async tools (submit_job, etc.) — always available
         from core.agent.async_tools import get_async_tool_registry
         _async_registry = get_async_tool_registry()
         tools_schema = list(tools_schema) + _async_registry.get_schemas()

@@ -42,9 +42,29 @@ class APIClient:
 
     async def __aenter__(self) -> "APIClient":
         """Async context manager entry."""
-        self._client = httpx.AsyncClient(timeout=30.0)
+        # Ensure localhost is in NO_PROXY so httpx bypasses any http_proxy for local API
+        self._ensure_no_proxy()
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0, read=30.0))
         await self._load_credentials()
         return self
+
+    _no_proxy_set = False
+
+    @classmethod
+    def _ensure_no_proxy(cls) -> None:
+        """Add localhost to NO_PROXY if the API target is local. Runs once."""
+        if cls._no_proxy_set:
+            return
+        import os
+        existing = os.environ.get("NO_PROXY", os.environ.get("no_proxy", ""))
+        hosts = {h.strip() for h in existing.split(",") if h.strip()}
+        needed = {"localhost", "127.0.0.1"}
+        if not needed.issubset(hosts):
+            hosts.update(needed)
+            val = ",".join(sorted(hosts))
+            os.environ["NO_PROXY"] = val
+            os.environ["no_proxy"] = val
+        cls._no_proxy_set = True
 
     async def __aexit__(self, *args: Any) -> None:
         """Async context manager exit."""
@@ -126,7 +146,15 @@ class APIClient:
 
         # Auto-refresh on 401
         if response.status_code == 401 and self._refresh_token:
-            await self._refresh_access_token()
+            try:
+                await self._refresh_access_token()
+            except Exception:
+                # Refresh failed — session expired, clear tokens
+                self._access_token = None
+                self._refresh_token = None
+                raise RuntimeError(
+                    "Session expired — please login again: mo-agent login"
+                )
             headers["Authorization"] = f"Bearer {self._access_token}"
             response = await self._client.request(method, url, headers=headers, **kwargs)
 
@@ -165,22 +193,29 @@ class APIClient:
     # Authentication
     # ============================================================================
 
-    async def ensure_authenticated(self) -> bool:
+    async def ensure_authenticated(self) -> bool | str:
         """Check if user is authenticated.
         
         Returns:
-            True if authenticated, False otherwise
+            True if authenticated, False if no credentials,
+            or a string describing why authentication failed.
         """
         if not self._access_token:
             return False
         try:
             await self.get_current_user()
             return True
+        except RuntimeError as e:
+            if "Session expired" in str(e):
+                return "session_expired"
+            return False
         except Exception:
             return False
 
     async def register(self, username: str, password: str, email: str) -> dict[str, Any]:
         """Register new user."""
+        self._access_token = None
+        self._refresh_token = None
         response = await self._request(
             "POST",
             "/auth/register",
@@ -190,6 +225,10 @@ class APIClient:
 
     async def login(self, username: str, password: str) -> dict[str, Any]:
         """Login and get JWT tokens."""
+        # Clear stale tokens so _request doesn't attach an expired Authorization header
+        self._access_token = None
+        self._refresh_token = None
+
         response = await self._request(
             "POST",
             "/auth/login",
@@ -580,25 +619,46 @@ class APIClient:
         self,
         model_name: str,
         provider: str,
-        scope: str = "global",
-        scope_id: str | None = None,
+        api_key: str,
+        base_url: str | None = None,
     ) -> dict[str, Any]:
-        """Register a model."""
-        response = await self._request(
-            "POST",
-            "/models",
-            json={
-                "name": model_name,
-                "provider": provider,
-                "scope": scope,
-                "scope_id": scope_id,
-            },
-        )
+        """Register a model with API key."""
+        payload: dict[str, Any] = {
+            "name": model_name,
+            "provider": provider,
+            "api_key": api_key,
+        }
+        if base_url:
+            payload["base_url"] = base_url
+        response = await self._request("POST", "/models", json=payload)
         return response.json()
 
     async def admin_list_models(self) -> list[dict[str, Any]]:
         """List all models."""
         response = await self._request("GET", "/models")
+        return response.json()
+
+    async def admin_update_model(
+        self,
+        model_name: str,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        is_active: bool | None = None,
+    ) -> dict[str, Any]:
+        """Update model config or API key."""
+        payload: dict[str, Any] = {}
+        if api_key is not None:
+            payload["api_key"] = api_key
+        if base_url is not None:
+            payload["base_url"] = base_url
+        if is_active is not None:
+            payload["is_active"] = is_active
+        response = await self._request("PUT", f"/models/{model_name}", json=payload)
+        return response.json()
+
+    async def admin_check_model(self, model_name: str) -> dict[str, Any]:
+        """Re-check model connectivity."""
+        response = await self._request("POST", f"/models/{model_name}/check")
         return response.json()
 
     async def admin_grant_role(

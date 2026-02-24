@@ -98,6 +98,7 @@ class BatchEventWriter:
 
         except Exception as e:
             logger.error(f"Batch flush failed: {e}")
+            self.db.rollback()
             # Re-queue events
             for event in events:
                 self._queue.put(event)
@@ -138,6 +139,7 @@ class BatchEventWriter:
             )
 
         self.db.execute(query, tuple(params))
+        self.db.commit()
 
 
 # Global batch writer

@@ -1,166 +1,169 @@
-"""Models management API endpoints."""
+"""LLM Model management API — admin registers models with API keys, validates connectivity."""
 
-import json
+import logging
+import re
 from uuid import uuid4
 
-from enum import Enum
-
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
 from api.dependencies import get_current_user
+from api.models import LLMModel
+from core.auth.encryption import decrypt_token, encrypt_token
+from core.llm.constants import PROVIDER_BASE_URLS
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/models", tags=["models"])
 
 
-class ModelScope(str, Enum):
-    GLOBAL = "global"
-    USER = "user"
+# ── Schemas ──
 
 
-def _require_admin_for_global(scope: str, current_user: dict, db: Session):
-    """Require admin role for global scope writes."""
-    if scope != "global":
-        return
-    from core.auth.permission_checker import PermissionChecker
-    if not PermissionChecker(db).is_admin(current_user["user_id"]):
-        raise HTTPException(status_code=403, detail="Admin role required for global scope")
-
-
-# ── Request / Response schemas ──
-
-
-class PricingRequest(BaseModel):
+class PricingSchema(BaseModel):
     prompt: float = 0.0
     completion: float = 0.0
     cache_read: float | None = None
     cache_write: float | None = None
-    image: float | None = None
-    request: float | None = None
 
 
 class ModelCreateRequest(BaseModel):
     name: str
     provider: str
-    scope: ModelScope = ModelScope.GLOBAL
+    api_key: str  # required — the whole point
+    base_url: str | None = None  # override provider default
     context_window: int = 128000
     max_completion_tokens: int | None = None
     input_modalities: list[str] = ["text"]
     output_modalities: list[str] = ["text"]
     supported_parameters: list[str] = []
-    pricing: PricingRequest = PricingRequest()
+    pricing: PricingSchema = PricingSchema()
     architecture: str | None = None
-    parameter_count: str | None = None
     tags: list[str] = []
 
 
 class ModelUpdateRequest(BaseModel):
-    provider: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
     context_window: int | None = None
     max_completion_tokens: int | None = None
     input_modalities: list[str] | None = None
     output_modalities: list[str] | None = None
     supported_parameters: list[str] | None = None
-    pricing: PricingRequest | None = None
+    pricing: PricingSchema | None = None
     architecture: str | None = None
-    parameter_count: str | None = None
     tags: list[str] | None = None
     is_active: bool | None = None
 
 
-class PricingResponse(BaseModel):
-    prompt: float = 0.0
-    completion: float = 0.0
-    cache_read: float | None = None
-    cache_write: float | None = None
-    image: float | None = None
-    request: float | None = None
-
-
 class ModelResponse(BaseModel):
+    model_id: str
     name: str
     provider: str
-    scope: str
+    base_url: str | None = None
+    is_active: bool = True
     context_window: int = 128000
     max_completion_tokens: int | None = None
     input_modalities: list[str] = ["text"]
     output_modalities: list[str] = ["text"]
     supported_parameters: list[str] = []
-    pricing: PricingResponse = PricingResponse()
+    pricing: PricingSchema = PricingSchema()
     architecture: str | None = None
-    parameter_count: str | None = None
     tags: list[str] = []
-    is_active: bool = True
+    connectivity: str | None = None  # "ok" or error message, only on create/update
 
 
 # ── Helpers ──
 
 
-def _load_registry(db, scope: str, scope_user_id: str | None):
-    """Load model registry JSON array from configs table."""
-    result = db.execute(
-        text("""
-            SELECT config_id, value FROM configs
-            WHERE key_name = 'model_registry'
-            AND scope_type = :scope
-            AND (scope_user_id = :uid OR (scope_user_id IS NULL AND :uid IS NULL))
-            LIMIT 1
-        """),
-        {"scope": scope, "uid": scope_user_id},
-    ).fetchone()
-    if result:
-        return result[0], json.loads(result[1])
-    return None, []
+def _require_admin(current_user: dict, db: Session):
+    from core.auth.permission_checker import PermissionChecker
+    if not PermissionChecker(db).is_admin(current_user["user_id"]):
+        raise HTTPException(status_code=403, detail="Admin role required")
 
 
-def _save_registry(db, config_id: str | None, models: list, scope: str, scope_user_id: str | None):
-    """Upsert model registry JSON array into configs table."""
-    if config_id:
-        db.execute(
-            text("UPDATE configs SET value = :value WHERE config_id = :id"),
-            {"value": json.dumps(models), "id": config_id},
-        )
-    else:
-        db.execute(
-            text("""
-                INSERT INTO configs (config_id, key_name, value, scope_type, scope_user_id)
-                VALUES (:id, 'model_registry', :value, :scope, :uid)
-            """),
-            {"id": str(uuid4()), "value": json.dumps(models), "scope": scope, "uid": scope_user_id},
-        )
-    db.commit()
+def _resolve_base_url(provider: str, explicit: str | None) -> str | None:
+    """Resolve base_url: explicit > well-known default."""
+    return explicit or PROVIDER_BASE_URLS.get(provider)
 
 
-def _model_to_response(m: dict, scope: str) -> ModelResponse:
-    """Convert stored model dict to API response."""
-    provider = m.get("provider", "")
-    provider_str = provider.value if hasattr(provider, "value") else str(provider)
+def _sanitize_error(msg: str) -> str:
+    """Remove potential secrets (API keys, tokens) from error messages."""
+    # OpenAI sk-*, Anthropic sk-ant-*, DeepSeek sk-*, and generic long alphanumeric tokens
+    msg = re.sub(r'(sk-[a-zA-Z0-9-]{0,6})[a-zA-Z0-9-]+', r'\1...', msg)
+    msg = re.sub(r'(?<![a-zA-Z0-9])[a-zA-Z0-9]{32,}(?![a-zA-Z0-9])', '<redacted>', msg)
+    return msg[:200]
 
-    # Handle both nested pricing and old flat fields
-    pricing_data = m.get("pricing", {})
-    if not pricing_data:
-        pricing_data = {
-            "prompt": m.get("price_per_1k_prompt", 0.0),
-            "completion": m.get("price_per_1k_completion", 0.0),
-        }
 
+def _validate_connectivity(provider: str, model_name: str, api_key: str, base_url: str | None) -> str | None:
+    """Quick connectivity check — send a tiny request. Returns None on success, error string on failure."""
+    if provider == "mock":
+        return None  # Mock provider needs no connectivity
+    try:
+        if provider == "anthropic" and not base_url:
+            # Anthropic has its own API format
+            r = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": model_name,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                timeout=15.0,
+            )
+        else:
+            # OpenAI-compatible
+            url = (base_url or "https://api.openai.com/v1").rstrip("/")
+            r = httpx.post(
+                f"{url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model_name,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                timeout=15.0,
+            )
+
+        if r.status_code < 400:
+            return None  # success
+        # 401/403 = bad key, others might be transient
+        try:
+            detail = r.json().get("error", {}).get("message", r.text[:200])
+        except Exception:
+            detail = r.text[:200]
+        return f"HTTP {r.status_code}: {_sanitize_error(detail)}"
+    except httpx.ConnectError as e:
+        return f"Connection failed: {_sanitize_error(str(e))}"
+    except httpx.TimeoutException:
+        return "Connection timed out (15s)"
+    except Exception as e:
+        return f"Unexpected error: {_sanitize_error(str(e))}"
+
+
+def _to_response(m: LLMModel, connectivity: str | None = None) -> ModelResponse:
     return ModelResponse(
-        name=m["model_name"],
-        provider=provider_str,
-        scope=scope,
-        context_window=m.get("context_window", 128000),
-        max_completion_tokens=m.get("max_completion_tokens"),
-        input_modalities=m.get("input_modalities", ["text"]),
-        output_modalities=m.get("output_modalities", ["text"]),
-        supported_parameters=m.get("supported_parameters", []),
-        pricing=PricingResponse(**pricing_data),
-        architecture=m.get("architecture"),
-        parameter_count=m.get("parameter_count"),
-        tags=m.get("tags", []),
-        is_active=m.get("is_active", True),
+        model_id=m.model_id,
+        name=m.model_name,
+        provider=m.provider,
+        base_url=m.base_url,
+        is_active=bool(m.is_active),
+        context_window=m.context_window or 128000,
+        max_completion_tokens=m.max_completion_tokens,
+        input_modalities=m.input_modalities or ["text"],
+        output_modalities=m.output_modalities or ["text"],
+        supported_parameters=m.supported_parameters or [],
+        pricing=PricingSchema(**(m.pricing or {})),
+        architecture=m.architecture,
+        tags=m.tags or [],
+        connectivity=connectivity,
     )
 
 
@@ -173,32 +176,50 @@ def create_model(
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Register a new model."""
-    _require_admin_for_global(request.scope, current_user, db)
-    scope_user_id = current_user["user_id"] if request.scope == "user" else None
-    config_id, models = _load_registry(db, request.scope, scope_user_id)
+    """Register a new model with API key. Validates connectivity."""
+    _require_admin(current_user, db)
 
-    if any(m["model_name"] == request.name for m in models):
-        raise HTTPException(status_code=400, detail=f"Model '{request.name}' already exists in {request.scope} scope")
+    # Check duplicate
+    existing = db.query(LLMModel).filter(
+        LLMModel.model_name == request.name,
+        LLMModel.provider == request.provider,
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Model '{request.name}' ({request.provider}) already exists")
 
-    model_config = {
-        "model_name": request.name,
-        "provider": request.provider,
-        "context_window": request.context_window,
-        "max_completion_tokens": request.max_completion_tokens,
-        "input_modalities": request.input_modalities,
-        "output_modalities": request.output_modalities,
-        "supported_parameters": request.supported_parameters,
-        "pricing": request.pricing.model_dump(exclude_none=True),
-        "architecture": request.architecture,
-        "parameter_count": request.parameter_count,
-        "tags": request.tags,
-        "is_active": True,
-    }
-    models.append(model_config)
-    _save_registry(db, config_id, models, request.scope, scope_user_id)
+    # Resolve base_url
+    base_url = _resolve_base_url(request.provider, request.base_url)
 
-    return _model_to_response(model_config, request.scope)
+    # Validate connectivity
+    conn_err = _validate_connectivity(request.provider, request.name, request.api_key, base_url)
+    is_active = 1 if conn_err is None else 0
+
+    model = LLMModel(
+        model_id=str(uuid4()),
+        model_name=request.name,
+        provider=request.provider,
+        api_key_encrypted=encrypt_token(request.api_key),
+        base_url=base_url,
+        is_active=is_active,
+        context_window=request.context_window,
+        max_completion_tokens=request.max_completion_tokens,
+        input_modalities=request.input_modalities,
+        output_modalities=request.output_modalities,
+        supported_parameters=request.supported_parameters,
+        pricing=request.pricing.model_dump(exclude_none=True),
+        architecture=request.architecture,
+        tags=request.tags,
+        created_by=current_user["user_id"],
+    )
+    db.add(model)
+    db.commit()
+    db.refresh(model)
+
+    connectivity = "ok" if conn_err is None else conn_err
+    if conn_err:
+        logger.warning(f"Model '{request.name}' registered as inactive: {conn_err}")
+
+    return _to_response(model, connectivity=connectivity)
 
 
 @router.get("", response_model=list[ModelResponse])
@@ -206,80 +227,113 @@ def list_models(
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """List all models available to the current user."""
-    from core.llm.router import ModelRegistry
+    """List models. Regular users see only active models; admins see all."""
+    from core.auth.permission_checker import PermissionChecker
+    is_admin = PermissionChecker(db).is_admin(current_user["user_id"])
 
-    user_id = current_user.get("user_id")
-    registry = ModelRegistry()
-    registry.load_from_db(db, user_id)
+    query = db.query(LLMModel)
+    if not is_admin:
+        query = query.filter(LLMModel.is_active == 1)
 
-    result = []
-    for m in registry.list_active():
-        provider = m.provider.value if hasattr(m.provider, "value") else str(m.provider)
-        result.append(ModelResponse(
-            name=m.model_name,
-            provider=provider,
-            scope="global",
-            context_window=m.context_window,
-            max_completion_tokens=m.max_completion_tokens,
-            input_modalities=m.input_modalities,
-            output_modalities=m.output_modalities,
-            supported_parameters=m.supported_parameters,
-            pricing=PricingResponse(**m.pricing.model_dump()),
-            architecture=m.architecture,
-            parameter_count=m.parameter_count,
-            tags=m.tags,
-            is_active=m.is_active,
-        ))
-    return result
+    models = query.order_by(LLMModel.provider, LLMModel.model_name).all()
+    return [_to_response(m) for m in models]
+
+
+@router.get("/{model_name}", response_model=ModelResponse)
+def get_model(
+    model_name: str,
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get model details."""
+    model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
+    if not model:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+    return _to_response(model)
 
 
 @router.put("/{model_name}", response_model=ModelResponse)
 def update_model(
     model_name: str,
     request: ModelUpdateRequest,
-    scope: ModelScope = Query(default=ModelScope.GLOBAL),
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Update an existing model."""
-    _require_admin_for_global(scope, current_user, db)
-    scope_user_id = current_user["user_id"] if scope == "user" else None
-    config_id, models = _load_registry(db, scope, scope_user_id)
+    """Update model config or API key. Re-validates connectivity if key changes."""
+    _require_admin(current_user, db)
 
-    if not config_id:
-        raise HTTPException(status_code=404, detail="Model registry not found")
-
-    target = next((m for m in models if m["model_name"] == model_name), None)
-    if not target:
+    model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
+    if not model:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
-    updates = request.model_dump(exclude_none=True)
-    if "pricing" in updates:
-        updates["pricing"] = updates["pricing"].model_dump(exclude_none=True) if hasattr(updates["pricing"], "model_dump") else updates["pricing"]
-    target.update(updates)
+    conn_result = None
 
-    _save_registry(db, config_id, models, scope, scope_user_id)
-    return _model_to_response(target, scope)
+    if request.api_key is not None:
+        model.api_key_encrypted = encrypt_token(request.api_key)
+        # Re-validate connectivity with new key
+        base_url = request.base_url or model.base_url
+        conn_err = _validate_connectivity(model.provider, model.model_name, request.api_key, base_url)
+        conn_result = "ok" if conn_err is None else conn_err
+        if request.is_active is None:
+            # Auto-set active based on connectivity (unless admin explicitly sets it)
+            model.is_active = 1 if conn_err is None else 0
+
+    if request.base_url is not None:
+        model.base_url = request.base_url
+    if request.context_window is not None:
+        model.context_window = request.context_window
+    if request.max_completion_tokens is not None:
+        model.max_completion_tokens = request.max_completion_tokens
+    if request.input_modalities is not None:
+        model.input_modalities = request.input_modalities
+    if request.output_modalities is not None:
+        model.output_modalities = request.output_modalities
+    if request.supported_parameters is not None:
+        model.supported_parameters = request.supported_parameters
+    if request.pricing is not None:
+        model.pricing = request.pricing.model_dump(exclude_none=True)
+    if request.architecture is not None:
+        model.architecture = request.architecture
+    if request.tags is not None:
+        model.tags = request.tags
+    if request.is_active is not None:
+        model.is_active = 1 if request.is_active else 0
+
+    db.commit()
+    db.refresh(model)
+    return _to_response(model, connectivity=conn_result)
 
 
 @router.delete("/{model_name}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_model(
     model_name: str,
-    scope: ModelScope = Query(default=ModelScope.GLOBAL),
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Delete a model from the registry."""
-    _require_admin_for_global(scope, current_user, db)
-    scope_user_id = current_user["user_id"] if scope == "user" else None
-    config_id, models = _load_registry(db, scope, scope_user_id)
+    """Delete a model."""
+    _require_admin(current_user, db)
+    model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
+    if not model:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
+    db.delete(model)
+    db.commit()
 
-    if not config_id:
-        raise HTTPException(status_code=404, detail="Model registry not found")
 
-    new_models = [m for m in models if m["model_name"] != model_name]
-    if len(new_models) == len(models):
+@router.post("/{model_name}/check", response_model=ModelResponse)
+def check_model(
+    model_name: str,
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Re-check model connectivity and update active status."""
+    _require_admin(current_user, db)
+    model = db.query(LLMModel).filter(LLMModel.model_name == model_name).first()
+    if not model:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found")
 
-    _save_registry(db, config_id, new_models, scope, scope_user_id)
+    api_key = decrypt_token(model.api_key_encrypted)
+    conn_err = _validate_connectivity(model.provider, model.model_name, api_key, model.base_url)
+    model.is_active = 1 if conn_err is None else 0
+    db.commit()
+    db.refresh(model)
+    return _to_response(model, connectivity="ok" if conn_err is None else conn_err)

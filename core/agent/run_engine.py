@@ -479,6 +479,7 @@ class RunEngine:
         max_idle_polls = 3000  # ~5 min at 0.1s interval
         idle_count = 0
         db_check_interval = 20  # Check DB every ~2s, not every 0.1s
+        keepalive_interval = 150  # Send keepalive every ~15s (150 * 0.1s)
 
         while idle_count < max_idle_polls:
             # Re-check each iteration (run may be GC'd mid-stream)
@@ -495,6 +496,8 @@ class RunEngine:
                 idle_count = 0  # Reset on activity
             else:
                 idle_count += 1
+                if idle_count % keepalive_interval == 0:
+                    yield {"event_type": "keepalive", "data": {}}
 
             # Check if run is done (DB check only every db_check_interval polls)
             run = _active_runs.get(run_id)

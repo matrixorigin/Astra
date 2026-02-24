@@ -2,6 +2,7 @@
 """mo-agent CLI - API mode with sync wrapper."""
 
 import sys
+import threading
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -9,6 +10,18 @@ import asyncio
 import json
 import click
 from cli.api_client import APIClient
+
+
+def _spinner(stop_event: threading.Event, label: str = "Thinking"):
+    """Show a spinner until stop_event is set."""
+    import itertools, time
+    chars = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+    while not stop_event.is_set():
+        sys.stderr.write(f"\r\033[2m{next(chars)} {label}...\033[0m")
+        sys.stderr.flush()
+        time.sleep(0.08)
+    sys.stderr.write("\r\033[K")  # clear line
+    sys.stderr.flush()
 
 
 class SyncAPIClient:
@@ -151,20 +164,37 @@ def chat(ctx, user_id, session_id, no_stream, model):
     click.echo("🤖 mo-agent interactive chat")
     click.echo("=" * 50)
     
-    if not client.ensure_authenticated():
+    auth_result = client.ensure_authenticated()
+    if auth_result == "session_expired" or not auth_result:
         click.echo("❌ Not logged in")
         click.echo("")
-        if click.confirm("Login now?", default=True):
-            username = click.prompt("Username")
-            password = click.prompt("Password", hide_input=True)
+        choice = click.prompt(
+            "1) Login  2) Register new account  3) Exit",
+            type=click.IntRange(1, 3), default=1,
+        )
+        if choice == 3:
+            click.echo("Run: mo-agent login  or  mo-agent register")
+            sys.exit(0)
+
+        username = click.prompt("Username")
+        password = click.prompt("Password", hide_input=True)
+
+        if choice == 2:
+            email = click.prompt("Email")
             try:
-                client.login(username, password)
-                click.echo("✅ Logged in")
+                client.register(username, password, email)
+                click.echo(f"✅ Registered: {username}")
             except Exception as e:
-                click.echo(f"❌ Login failed: {e}")
+                click.echo(f"❌ Registration failed: {e}")
                 sys.exit(1)
-        else:
-            click.echo("Run: mo-agent login")
+
+        # Login (after register, or direct login)
+        try:
+            client.login(username, password)
+            click.echo("✅ Logged in")
+        except Exception as e:
+            click.echo(f"❌ Login failed: {e}")
+            click.echo("Run: mo-agent register  to create an account first")
             sys.exit(1)
     
     # Get current user info
@@ -177,17 +207,15 @@ def chat(ctx, user_id, session_id, no_stream, model):
     # Track selected model
     selected_model = model
     
-    if not session_id:
-        # API expects agent_id, not user_id
-        # Use user_id as agent_id for now (or use default agent)
-        result = client.create_session(agent_id=user_id or "default-agent")
-        session_id = result["session_id"]
-        click.echo(f"📝 Session: {session_id}")
-        if selected_model:
-            click.echo(f"🤖 Model: {selected_model}")
-        click.echo()
-    
     try:
+        if not session_id:
+            result = client.create_session(agent_id=user_id or "default-agent")
+            session_id = result["session_id"]
+            click.echo(f"📝 Session: {session_id}")
+            if selected_model:
+                click.echo(f"🤖 Model: {selected_model}")
+            click.echo()
+
         while True:
             user_input = click.prompt(username, type=str, prompt_suffix="> ")
             
@@ -294,17 +322,52 @@ def chat(ctx, user_id, session_id, no_stream, model):
                 else:
                     click.echo(f"❌ Run {status['status']}\n")
             else:
-                # Streaming mode
-                click.echo("Agent> ", nl=False)
-                for chunk in client.chat_stream(user_input, session_id=session_id, model=selected_model):
-                    if chunk.get("type") == "content":
-                        click.echo(chunk.get("content", ""), nl=False)
-                    elif chunk.get("type") == "done":
-                        click.echo()  # Newline after completion
-                click.echo()  # Extra newline for spacing
+                # Streaming mode — show spinner until first content arrives
+                stop = threading.Event()
+                spin = threading.Thread(target=_spinner, args=(stop,), daemon=True)
+                spin.start()
+                first_content = True
+                try:
+                    for event in client.chat_stream(user_input, session_id=session_id, model=selected_model):
+                        et = event.get("event_type", "")
+                        data = event.get("data", {})
+                        if et == "text_delta":
+                            if first_content:
+                                stop.set()
+                                spin.join(timeout=0.2)
+                                click.echo("")  # newline after spinner
+                                first_content = False
+                            click.echo(data.get("chunk", ""), nl=False)
+                        elif et == "tool_call_start":
+                            if first_content:
+                                stop.set()
+                                spin.join(timeout=0.2)
+                                click.echo("")
+                                first_content = False
+                            click.echo(f"\n  🔧 {data.get('tool', '')}... ", nl=False)
+                        elif et == "tool_result":
+                            click.echo("✓")
+                        elif et in ("text_done", "run_finished"):
+                            pass
+                        elif et == "run_error":
+                            stop.set()
+                            spin.join(timeout=0.2)
+                            click.echo(f"\n❌ {data.get('error', 'Unknown error')}")
+                except Exception as e:
+                    stop.set()
+                    spin.join(timeout=0.2)
+                    click.echo(f"\n❌ {type(e).__name__}: {e}")
+                finally:
+                    stop.set()
+                click.echo()  # Newline for spacing
     
     except KeyboardInterrupt:
         click.echo("\n\nInterrupted")
+    except RuntimeError as e:
+        if "Session expired" in str(e):
+            click.echo("\n❌ Session expired — please login again: mo-agent login")
+            sys.exit(1)
+        raise
     finally:
         try:
             client.close_session(session_id)
@@ -315,14 +378,12 @@ def chat(ctx, user_id, session_id, no_stream, model):
 
 def require_auth(client):
     """Ensure user is authenticated."""
-    try:
-        if not client.ensure_authenticated():
-            click.echo("❌ Please login first: mo-agent login")
-            sys.exit(1)
-    except Exception as e:
-        click.echo(f"❌ Authentication check failed: {e}")
-        import traceback
-        traceback.print_exc()
+    result = client.ensure_authenticated()
+    if result == "session_expired":
+        click.echo("❌ Session expired — please login again: mo-agent login")
+        sys.exit(1)
+    if not result:
+        click.echo("❌ Please login first: mo-agent login")
         sys.exit(1)
 
 

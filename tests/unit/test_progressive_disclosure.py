@@ -57,7 +57,7 @@ class TestSkillIndex:
         idx = SkillIndex(embed_fn=_deterministic_embed)
         idx.build(skills)
 
-        results = idx.query("review my pull request", top_k=3)
+        results = idx.query("review my pull request", top_k=3, min_score=-1)
         assert isinstance(results, list)
         assert len(results) == 3
         # All skill names present
@@ -68,7 +68,7 @@ class TestSkillIndex:
         idx = SkillIndex(embed_fn=_deterministic_embed)
         idx.build(skills)
 
-        results = idx.query("anything", top_k=3)
+        results = idx.query("anything", top_k=3, min_score=-1)
         assert len(results) == 3
 
     def test_query_empty_index_returns_empty(self):
@@ -265,8 +265,9 @@ class TestFallbackSelection:
         mock_llm = Mock()
         sel = ModernSkillSelector(db, llm_client=mock_llm, embed_fn=_deterministic_embed)
         skill = _make_skill("code_review", description="review code", triggers=["review"])
-        sel.rule_selector.skills["code_review"] = skill
+        sel.rule_selector.skills = {"code_review": skill}  # isolate from DB
         sel._index.build([skill])
+        sel._index.MIN_SCORE = -1
         return sel, mock_llm
 
     def test_fallback_returns_top_ranked_candidate(self, selector_with_llm):
@@ -457,6 +458,7 @@ class TestEmbeddingQuality:
             "deploy_k8s": deploy_k8s,
         }
         sel._index.build([code_review, deploy_k8s])
+        sel._index.MIN_SCORE = -1  # mock embeddings: test pipeline, not quality
         
         # Query: "review PR" should rank code_review higher than deploy_k8s
         tools, method = sel.get_tools_schema("review PR code", max_candidates=3)
@@ -507,6 +509,7 @@ class TestEmbeddingQuality:
         sel = ModernSkillSelector(db, llm_client=None, embed_fn=embed_fn)
         sel.rule_selector.skills = {"code_review": code_review}
         sel._index.build([code_review])
+        sel._index.MIN_SCORE = -1  # mock embeddings: test pipeline, not quality
         
         # Query with synonyms: "inspect merge request"
         tools, method = sel.get_tools_schema("inspect merge request", max_candidates=3)

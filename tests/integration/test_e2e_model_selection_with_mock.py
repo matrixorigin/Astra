@@ -95,8 +95,8 @@ def setup_mock_model(client, auth_headers_e2e):
         headers=auth_headers_e2e,
         json={
             "name": "mock-echo",
-            "provider": "mock",
-            "scope": "global",
+            "provider": "mock", "api_key": "test-key",
+            
             "context_window": 128000,
             "tags": ["test"],
         }
@@ -177,12 +177,12 @@ def test_e2e_different_models_in_different_sessions(client, auth_headers_e2e):
     client.post(
         "/models",
         headers=auth_headers_e2e,
-        json={"name": "mock-echo-1", "provider": "mock", "scope": "global"}
+        json={"name": "mock-echo-1", "provider": "mock", "api_key": "test-key"}
     )
     client.post(
         "/models",
         headers=auth_headers_e2e,
-        json={"name": "mock-echo-2", "provider": "mock", "scope": "global"}
+        json={"name": "mock-echo-2", "provider": "mock", "api_key": "test-key"}
     )
     
     # Session 1 with model 1

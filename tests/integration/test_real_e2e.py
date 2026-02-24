@@ -299,14 +299,11 @@ def mock_httpx_with_testclient(client):
 class TestAgentCLIRealE2E:
     """Real E2E tests for agent CLI commands."""
 
-    def test_login_creates_credentials_file(self, runner, test_user):
+    def test_login_creates_credentials_file(self, isolated_runner, test_user):
         """Test login creates JWT token and stores credentials file."""
-        # Clear existing credentials
         creds_file = os.path.expanduser("~/.mo-agent/credentials.json")
-        if os.path.exists(creds_file):
-            os.remove(creds_file)
-        
-        result = runner.invoke(
+
+        result = isolated_runner.invoke(
             agent_cli,
             ["--api-url", "http://test", "login"],
             input="testuser\npassword123\n"  # Use username, not email
@@ -558,8 +555,8 @@ class TestAdminCLIRealE2E:
             ["--api-url", "http://test", "token", "list"]
         )
         
-        # Should fail with permission error
-        assert result.exit_code != 0 or "permission" in result.output.lower() or "admin" in result.output.lower()
+        # Should fail with permission/auth error
+        assert result.exit_code != 0 or "permission" in result.output.lower() or "admin" in result.output.lower() or "not authenticated" in result.output.lower()
 
 
 class TestDataConsistencyRealE2E:

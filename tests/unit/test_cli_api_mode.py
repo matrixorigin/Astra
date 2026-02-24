@@ -322,6 +322,17 @@ class TestAdminCLI:
             assert result.exit_code == 1
             assert "login first" in result.output.lower()
 
+    def test_user_grant_role_session_expired(self, runner):
+        """Test granting role with expired session shows expiry message."""
+        with patch("cli.mo_admin_api.SyncAPIClient") as mock_client_class:
+            mock_client = MagicMock()
+            mock_client_class.return_value = mock_client
+            mock_client.ensure_authenticated.return_value = "session_expired"
+            
+            result = runner.invoke(admin_cli, ["user", "grant-role", "alice", "mo_agent_admin"])
+            assert result.exit_code == 1
+            assert "expired" in result.output.lower()
+
     def test_user_revoke_role_success(self, runner):
         """Test revoking role from user."""
         with patch("cli.mo_admin_api.SyncAPIClient") as mock_client_class:

@@ -367,9 +367,9 @@ dev-up: dev-deps-up dev-deps-wait dev-api-start
 	@echo "   make dev-status"
 	@echo ""
 	@echo "Next steps:"
-	@echo "  NO_PROXY=localhost mo-agent register"
-	@echo "  NO_PROXY=localhost mo-agent login"
-	@echo "  NO_PROXY=localhost mo-agent chat"
+	@echo "  mo-agent register"
+	@echo "  mo-agent login"
+	@echo "  mo-agent chat"
 
 .PHONY: dev-up-docker
 dev-up-docker: dev-deps-up dev-deps-wait dev-api-docker-up

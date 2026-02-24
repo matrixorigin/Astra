@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from api.models import RefreshToken as RefreshTokenModel
 from api.models import User as UserModel
+from api.models import UserRole as UserRoleModel
 
 
 class UserRepository:
@@ -72,6 +73,11 @@ class UserRepository:
         # Delete refresh tokens first
         self.db.query(RefreshTokenModel).filter(
             RefreshTokenModel.user_id == user_id
+        ).delete()
+
+        # Delete role assignments
+        self.db.query(UserRoleModel).filter(
+            UserRoleModel.user_id == user_id
         ).delete()
 
         # Delete user

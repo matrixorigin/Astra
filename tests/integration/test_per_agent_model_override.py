@@ -74,7 +74,7 @@ def setup_mock_models(client, auth_headers):
         resp = client.post("/models", headers=auth_headers, json={
             "name": model,
             "provider": "mock",
-            "scope": "global",
+            "api_key": "test-key",
             "context_window": 128000,
             "tags": ["test"],
         })
@@ -84,7 +84,7 @@ def setup_mock_models(client, auth_headers):
     
     # Cleanup
     for model in models:
-        client.delete(f"/models/{model}?scope=global", headers=auth_headers)
+        client.delete(f"/models/{model}", headers=auth_headers)
 
 
 @pytest.fixture

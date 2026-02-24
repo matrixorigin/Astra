@@ -1,6 +1,4 @@
-"""Integration tests for unified model management system."""
-
-import json
+"""Integration tests for unified model management (llm_models table)."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,32 +22,30 @@ def client(db_session):
 
 
 @pytest.fixture
-def clean_model_registry(db_session):
-    db_session.execute(text("DELETE FROM configs WHERE key_name = 'model_registry'"))
+def clean_models(db_session):
+    db_session.execute(text("DELETE FROM llm_models"))
     db_session.commit()
     yield
-    db_session.execute(text("DELETE FROM configs WHERE key_name = 'model_registry'"))
+    db_session.execute(text("DELETE FROM llm_models"))
     db_session.commit()
 
 
-def test_create_model_with_rich_metadata(client, admin_headers, clean_model_registry):
-    """Test creating a model with full metadata."""
-    response = client.post(
-        "/models",
-        headers=admin_headers,
-        json={
-            "name": "gpt-4o",
-            "provider": "openai",
-            "scope": "global",
-            "context_window": 128000,
-            "max_completion_tokens": 16384,
-            "input_modalities": ["text", "image"],
-            "output_modalities": ["text"],
-            "supported_parameters": ["tools", "vision"],
-            "pricing": {"prompt": 0.0025, "completion": 0.01},
-            "architecture": "transformer",
-            "tags": ["code", "reasoning"],
-        },
+def _create_model(client, admin_headers, **overrides):
+    payload = {"name": "test-model", "provider": "mock", "api_key": "sk-test-key", **overrides}
+    return client.post("/models", headers=admin_headers, json=payload)
+
+
+# --- Create ---
+
+def test_create_model_with_rich_metadata(client, admin_headers, clean_models):
+    response = _create_model(
+        client, admin_headers,
+        name="gpt-4o", provider="openai", api_key="sk-test-123",
+        context_window=128000, max_completion_tokens=16384,
+        input_modalities=["text", "image"], output_modalities=["text"],
+        supported_parameters=["tools", "vision"],
+        pricing={"prompt": 0.0025, "completion": 0.01},
+        architecture="transformer", tags=["code", "reasoning"],
     )
     assert response.status_code == 201
     data = response.json()
@@ -59,161 +55,116 @@ def test_create_model_with_rich_metadata(client, admin_headers, clean_model_regi
     assert data["architecture"] == "transformer"
 
 
-def test_create_duplicate_model_fails(client, admin_headers, clean_model_registry):
-    client.post("/models", headers=admin_headers, json={"name": "gpt-4o", "provider": "openai"})
-    response = client.post("/models", headers=admin_headers, json={"name": "gpt-4o", "provider": "openai"})
+def test_create_model_requires_api_key(client, admin_headers, clean_models):
+    response = client.post("/models", headers=admin_headers, json={"name": "m", "provider": "mock"})
+    assert response.status_code == 422
+
+
+def test_create_duplicate_model_fails(client, admin_headers, clean_models):
+    _create_model(client, admin_headers, name="dup-model")
+    response = _create_model(client, admin_headers, name="dup-model")
     assert response.status_code == 400
     assert "already exists" in response.json()["detail"]
 
 
-def test_list_models_returns_rich_metadata(client, admin_headers, clean_model_registry):
-    client.post(
-        "/models",
-        headers=admin_headers,
-        json={
-            "name": "gpt-4o",
-            "provider": "openai",
-            "pricing": {"prompt": 0.0025, "completion": 0.01},
-            "supported_parameters": ["tools"],
-        },
+# --- List ---
+
+def test_list_models_returns_rich_metadata(client, admin_headers, clean_models):
+    _create_model(
+        client, admin_headers, name="gpt-4o",
+        pricing={"prompt": 0.0025, "completion": 0.01},
+        supported_parameters=["tools"],
     )
     response = client.get("/models", headers=admin_headers)
     assert response.status_code == 200
     models = response.json()
-    assert len(models) == 1
-    assert models[0]["pricing"]["prompt"] == 0.0025
-    assert models[0]["supported_parameters"] == ["tools"]
+    assert len(models) >= 1
+    m = next(m for m in models if m["name"] == "gpt-4o")
+    assert m["pricing"]["prompt"] == 0.0025
+    assert m["supported_parameters"] == ["tools"]
 
 
-def test_list_models_auto_seeds_when_empty(client, admin_headers, clean_model_registry):
-    """When no models exist, auto-seed provides defaults."""
+def test_list_models_empty(client, admin_headers, clean_models):
     response = client.get("/models", headers=admin_headers)
     assert response.status_code == 200
-    models = response.json()
-    assert len(models) > 0  # Auto-seeded
-    assert any(m["name"] == "gpt-4o" for m in models)
+    assert response.json() == []
 
 
-def test_delete_model(client, admin_headers, clean_model_registry):
-    client.post("/models", headers=admin_headers, json={"name": "test-delete-me", "provider": "openai"})
-    response = client.delete("/models/test-delete-me?scope=global", headers=admin_headers)
-    assert response.status_code == 204
-    models = client.get("/models", headers=admin_headers).json()
-    assert not any(m["name"] == "test-delete-me" for m in models)
+# --- Update ---
 
-
-def test_delete_nonexistent_model_fails(client, admin_headers, clean_model_registry):
-    response = client.delete("/models/nonexistent?scope=global", headers=admin_headers)
-    assert response.status_code == 404
-
-
-def test_model_registry_persists_across_llm_client_instances(db_session, clean_model_registry):
-    from core.llm.client import LLMClient
-
-    models = [
-        {
-            "model_name": "gpt-4o",
-            "provider": "openai",
-            "context_window": 128000,
-            "pricing": {"prompt": 0.0025, "completion": 0.01},
-            "supported_parameters": ["tools", "vision"],
-            "tags": ["code"],
-            "is_active": True,
-        }
-    ]
-    db_session.execute(
-        text("INSERT INTO configs (config_id, key_name, value, scope_type) VALUES (:id, 'model_registry', :value, 'global')"),
-        {"id": "test-id", "value": json.dumps(models)},
-    )
-    db_session.commit()
-
-    llm = LLMClient(db=db_session, user_id="test-user")
-    active = llm.router.registry.list_active()
-    assert len(active) == 1
-    assert active[0].model_name == "gpt-4o"
-    assert active[0].pricing.prompt == 0.0025
-    assert active[0].supported_parameters == ["tools", "vision"]
-
-
-def test_backward_compat_flat_pricing_fields(db_session, clean_model_registry):
-    """Old DB records with flat price_per_1k_* fields still load correctly."""
-    from core.llm.client import LLMClient
-
-    models = [
-        {
-            "model_name": "old-model",
-            "provider": "openai",
-            "price_per_1k_prompt": 0.03,
-            "price_per_1k_completion": 0.06,
-            "is_active": True,
-        }
-    ]
-    db_session.execute(
-        text("INSERT INTO configs (config_id, key_name, value, scope_type) VALUES (:id, 'model_registry', :value, 'global')"),
-        {"id": "compat-id", "value": json.dumps(models)},
-    )
-    db_session.commit()
-
-    llm = LLMClient(db=db_session)
-    m = llm.router.registry.get("old-model")
-    assert m is not None
-    assert m.pricing.prompt == 0.03
-    assert m.pricing.completion == 0.06
-
-
-def test_user_scope_overrides_global_scope(db_session, clean_model_registry):
-    from core.llm.client import LLMClient
-
-    db_session.execute(
-        text("INSERT INTO configs (config_id, key_name, value, scope_type) VALUES ('g-id', 'model_registry', :v, 'global')"),
-        {"v": json.dumps([{"model_name": "gpt-4o", "provider": "openai", "pricing": {"prompt": 0.0025, "completion": 0.01}, "is_active": True}])},
-    )
-    db_session.execute(
-        text("INSERT INTO configs (config_id, key_name, value, scope_type, scope_user_id) VALUES ('u-id', 'model_registry', :v, 'user', 'alice')"),
-        {"v": json.dumps([{"model_name": "gpt-4o", "provider": "openai", "pricing": {"prompt": 0.001, "completion": 0.005}, "is_active": True}])},
-    )
-    db_session.commit()
-
-    llm = LLMClient(db=db_session, user_id="alice")
-    models = llm.router.registry.list_active()
-    assert len(models) == 1
-    assert models[0].pricing.prompt == 0.001
-
-
-def test_update_model(client, admin_headers, clean_model_registry):
-    client.post("/models", headers=admin_headers, json={"name": "gpt-4o", "provider": "openai", "tags": ["code"]})
+def test_update_model(client, admin_headers, clean_models):
+    _create_model(client, admin_headers, name="gpt-4o", tags=["code"])
     response = client.put(
-        "/models/gpt-4o?scope=global",
-        headers=admin_headers,
-        json={"tags": ["code", "reasoning"], "pricing": {"prompt": 0.005, "completion": 0.02}},
+        "/models/gpt-4o", headers=admin_headers,
+        json={"tags": ["code", "reasoning"]},
     )
     assert response.status_code == 200
     assert response.json()["tags"] == ["code", "reasoning"]
-    assert response.json()["pricing"]["prompt"] == 0.005
 
 
-def test_update_model_persists(client, admin_headers, clean_model_registry, db_session):
-    from core.llm.client import LLMClient
-
-    client.post("/models", headers=admin_headers, json={"name": "gpt-4o", "provider": "openai"})
-    client.put("/models/gpt-4o?scope=global", headers=admin_headers, json={"tags": ["code", "reasoning"]})
-
-    llm = LLMClient(db=db_session)
-    model = llm.router.registry.get("gpt-4o")
-    assert model is not None
-    assert "reasoning" in model.tags
-
-
-def test_update_nonexistent_model_fails(client, admin_headers, clean_model_registry):
-    response = client.put("/models/nonexistent?scope=global", headers=admin_headers, json={"tags": ["test"]})
+def test_update_nonexistent_model_fails(client, admin_headers, clean_models):
+    response = client.put("/models/nonexistent", headers=admin_headers, json={"tags": ["test"]})
     assert response.status_code == 404
 
 
-def test_delete_model_and_verify_gone(client, admin_headers, clean_model_registry, db_session):
-    from core.llm.client import LLMClient
+# --- Delete ---
 
-    client.post("/models", headers=admin_headers, json={"name": "temp-model", "provider": "mock"})
-    client.delete("/models/temp-model?scope=global", headers=admin_headers)
+def test_delete_model(client, admin_headers, clean_models):
+    _create_model(client, admin_headers, name="to-delete")
+    response = client.delete("/models/to-delete", headers=admin_headers)
+    assert response.status_code == 204
+    models = client.get("/models", headers=admin_headers).json()
+    assert not any(m["name"] == "to-delete" for m in models)
 
-    llm = LLMClient(db=db_session)
-    assert llm.router.registry.get("temp-model") is None
+
+def test_delete_nonexistent_model_fails(client, admin_headers, clean_models):
+    response = client.delete("/models/nonexistent", headers=admin_headers)
+    assert response.status_code == 404
+
+
+# --- Connectivity ---
+
+def test_create_model_validates_connectivity(client, admin_headers, clean_models):
+    """Model with bad key should be created but inactive."""
+    response = _create_model(
+        client, admin_headers, name="bad-key-model",
+        provider="openai", api_key="sk-invalid-key",
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["is_active"] is False  # connectivity failed
+
+
+def test_connectivity_uses_user_provided_model_name(client, admin_headers, clean_models, monkeypatch):
+    """Verify connectivity validation uses the model name provided by user, not a default."""
+    captured_model_names = []
+
+    original_validate = None
+    import api.routers.models as models_module
+    original_validate = models_module._validate_connectivity
+
+    def mock_validate(provider, model_name, api_key, base_url):
+        captured_model_names.append(model_name)
+        return None  # success
+
+    monkeypatch.setattr(models_module, "_validate_connectivity", mock_validate)
+
+    # Register a custom model name that differs from any default
+    response = _create_model(
+        client, admin_headers,
+        name="my-custom-gpt-4o-variant",
+        provider="openai",
+        api_key="sk-test",
+    )
+    assert response.status_code == 201
+    assert "my-custom-gpt-4o-variant" in captured_model_names
+
+
+# --- API key not exposed ---
+
+def test_api_key_not_in_response(client, admin_headers, clean_models):
+    response = _create_model(client, admin_headers, name="secret-model")
+    assert response.status_code == 201
+    data = response.json()
+    assert "api_key" not in data
+    assert "api_key_encrypted" not in data

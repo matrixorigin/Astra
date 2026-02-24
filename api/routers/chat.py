@@ -102,6 +102,7 @@ def _build_chat_loop(db: Session):
     register_builtin_skills(skill_registry, db, code_executor=code_executor)
     context_manager = ContextManager(db, gate_trigger=gate_trigger)
     selector = SkillPipeline(db, llm_client, audit=True, learning=True)
+    selector.reload_skills(registry=skill_registry)
 
     from config.settings import get_settings
     from core.skills.credential_manager import CredentialManager

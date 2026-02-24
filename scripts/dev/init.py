@@ -89,15 +89,9 @@ def main():
     print("=" * 60)
     print()
     print("Next steps:")
-    print("  1. Review .env file if needed")
-    print("  2. Configure LLM token (one-time):")
-    print("     NO_PROXY=localhost mo-admin login")
-    print("     NO_PROXY=localhost mo-admin token create --type llm --provider openai --scope global")
-    print()
-    print("  3. Start using:")
-    print("     NO_PROXY=localhost mo-agent register")
-    print("     NO_PROXY=localhost mo-agent login")
-    print("     NO_PROXY=localhost mo-agent chat")
+    print("  1. Start services:  make dev-start")
+    print("  2. Run setup:       make dev-setup-demo")
+    print("  3. Start chatting:  mo-agent chat")
 
 
 if __name__ == "__main__":

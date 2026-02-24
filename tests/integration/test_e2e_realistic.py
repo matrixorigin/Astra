@@ -195,6 +195,7 @@ def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
         register_builtin_skills(skill_registry, db, code_executor=code_executor)
         context_manager = ContextManager(db)
         selector = SkillPipeline(db, llm, audit=True, learning=True)
+        selector.reload_skills(registry=skill_registry)
         executor = AgentExecutor(db, skill_registry)
         firewall = HallucinationFirewall(db, context_manager)
 
@@ -266,7 +267,8 @@ def mock_llm_for_chat(builder_fn):
 @pytest.fixture
 def client():
     from api.main import app
-    return TestClient(app)
+    with TestClient(app) as c:
+        yield c
 
 
 @pytest.fixture

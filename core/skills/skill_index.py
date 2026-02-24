@@ -48,6 +48,8 @@ def _skill_text(skill: Any) -> str:
 class SkillIndex:
     """In-memory cosine-similarity index over skill embeddings."""
 
+    MIN_SCORE = 0.35  # Minimum cosine similarity; model-dependent, tune as needed
+
     def __init__(self, embed_fn=None):
         """
         Args:
@@ -100,13 +102,16 @@ class SkillIndex:
     # Query
     # ------------------------------------------------------------------
 
-    def query(self, text: str, top_k: int = 10) -> list[str]:
+    def query(self, text: str, top_k: int = 10, min_score: float | None = None) -> list[str]:
         """Return top-k skill names by cosine similarity to *text*.
 
         Returns empty list if index is empty or embed_fn is None.
+        Skills below min_score are excluded.
         """
         if not self._entries or not self._embed:
             return []
+        if min_score is None:
+            min_score = self.MIN_SCORE
         try:
             q_vec = self._embed(text)
         except Exception as e:  # noqa: BLE001
@@ -115,4 +120,4 @@ class SkillIndex:
 
         scored = [(e.name, _cosine(q_vec, e.vector)) for e in self._entries]
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [name for name, _ in scored[:top_k]]
+        return [name for name, score in scored[:top_k] if score >= min_score]

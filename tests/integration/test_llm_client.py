@@ -88,14 +88,21 @@ def test_chat_error_logging(client, db):
         )
 
 
-def test_calculate_cost(client):
+def test_calculate_cost(client, db):
     """Test cost calculation."""
+    # Register model with known pricing directly in registry
+    from core.llm.router import ModelConfig, ModelPricing
+    client.router.registry._models["gpt-4"] = ModelConfig(
+        model_name="gpt-4", provider="openai",
+        pricing=ModelPricing(prompt=0.03, completion=0.06),
+        is_active=True,
+    )
+
     cost = client.router.calculate_cost(
         model_name="gpt-4",
         tokens_prompt=1000,
         tokens_completion=500,
     )
-    # gpt-4: $0.03/1K prompt + $0.06/1K completion
     expected = (1000 * 0.03 / 1000) + (500 * 0.06 / 1000)
     assert abs(cost - expected) < 0.0001
 

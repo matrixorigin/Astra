@@ -35,6 +35,12 @@ for i in {1..15}; do
     fi
 done
 
+# Load .env into environment (pydantic-settings reads .env into Settings objects,
+# but modules like encryption.py use os.getenv directly)
+if [ -f .env ]; then
+    set -a; source .env; set +a
+fi
+
 # Start server
 NO_PROXY=localhost,127.0.0.1 python -m uvicorn api.main:app --port 8000 > "$LOG_FILE" 2>&1 &
 PID=$!

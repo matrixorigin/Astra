@@ -57,7 +57,11 @@ def login(ctx, username, password):
 
 def require_auth(client):
     """Ensure user is authenticated."""
-    if not client.ensure_authenticated():
+    result = client.ensure_authenticated()
+    if result == "session_expired":
+        click.echo("❌ Session expired — please login again: mo-admin login")
+        sys.exit(1)
+    if not result:
         click.echo("❌ Please login first: mo-admin login")
         sys.exit(1)
 
@@ -246,22 +250,29 @@ def model():
 @model.command("add")
 @click.argument("model_name")
 @click.argument("provider")
-@click.option("--scope", default="global")
-@click.option("--scope-id", default=None)
+@click.option("--api-key", prompt="API key", hide_input=True, help="LLM provider API key")
+@click.option("--base-url", default=None, help="Custom base URL (OpenAI-compatible)")
 @click.pass_context
-def model_add(ctx, model_name, provider, scope, scope_id):
-    """Register a model."""
+def model_add(ctx, model_name, provider, api_key, base_url):
+    """Register a model with API key. Validates connectivity."""
     client = ctx.obj["client"]
     require_auth(client)
-    
+
     try:
         result = client.admin_create_model(
             model_name=model_name,
             provider=provider,
-            scope=scope,
-            scope_id=scope_id,
+            api_key=api_key,
+            base_url=base_url,
         )
-        click.echo(f"✅ Model registered: {model_name}")
+        conn = result.get("connectivity", "unknown")
+        active = result.get("is_active", False)
+        if active:
+            click.echo(f"✅ Model registered: {model_name} ({provider}) — connectivity: {conn}")
+        else:
+            click.echo(f"⚠️  Model registered as INACTIVE: {model_name} ({provider})")
+            click.echo(f"   Reason: {conn}")
+            click.echo(f"   Fix the API key and run: mo-admin model update {model_name} --api-key <key>")
     except Exception as e:
         click.echo(f"❌ Failed: {e}")
         sys.exit(1)
@@ -273,18 +284,79 @@ def model_list(ctx):
     """List models."""
     client = ctx.obj["client"]
     require_auth(client)
-    
+
     try:
         models = client.admin_list_models()
         if not models:
-            click.echo("No models found")
+            click.echo("No models registered")
+            click.echo("")
+            click.echo("Register one with:")
+            click.echo("  mo-admin model add <name> <provider> --api-key <key>")
+            click.echo("")
+            click.echo("Example:")
+            click.echo("  mo-admin model add deepseek-chat deepseek")
             return
-        
+
         click.echo("Models:")
         for m in models:
-            click.echo(f"  {m['name']} ({m['provider']})")
+            status = "✓" if m.get("is_active") else "✗"
+            click.echo(f"  {status} {m['name']} ({m['provider']})")
     except Exception as e:
         click.echo(f"❌ Error: {e}")
+
+
+@model.command("update")
+@click.argument("model_name")
+@click.option("--api-key", default=None, hide_input=True, help="New API key")
+@click.option("--base-url", default=None, help="New base URL")
+@click.option("--activate", is_flag=True, help="Set model active")
+@click.option("--deactivate", is_flag=True, help="Set model inactive")
+@click.pass_context
+def model_update(ctx, model_name, api_key, base_url, activate, deactivate):
+    """Update model config or API key."""
+    client = ctx.obj["client"]
+    require_auth(client)
+
+    if api_key is None and base_url is None and not activate and not deactivate:
+        click.echo("Nothing to update. Use --api-key, --base-url, --activate, or --deactivate")
+        return
+
+    try:
+        is_active = True if activate else (False if deactivate else None)
+        result = client.admin_update_model(
+            model_name=model_name,
+            api_key=api_key,
+            base_url=base_url,
+            is_active=is_active,
+        )
+        conn = result.get("connectivity")
+        if conn and conn != "ok":
+            click.echo(f"⚠️  Updated but connectivity failed: {conn}")
+        else:
+            click.echo(f"✅ Model updated: {model_name}")
+    except Exception as e:
+        click.echo(f"❌ Failed: {e}")
+        sys.exit(1)
+
+
+@model.command("check")
+@click.argument("model_name")
+@click.pass_context
+def model_check(ctx, model_name):
+    """Re-check model connectivity."""
+    client = ctx.obj["client"]
+    require_auth(client)
+
+    try:
+        result = client.admin_check_model(model_name)
+        conn = result.get("connectivity", "unknown")
+        active = result.get("is_active", False)
+        if active:
+            click.echo(f"✅ {model_name}: {conn}")
+        else:
+            click.echo(f"❌ {model_name}: {conn}")
+    except Exception as e:
+        click.echo(f"❌ Failed: {e}")
 
 
 @cli.command()

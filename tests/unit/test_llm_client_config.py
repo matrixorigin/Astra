@@ -25,11 +25,10 @@ class TestSetUserContext:
         assert client.user_id == "bob"
 
     def test_updates_scope_resolver(self, db_session):
-        """set_user_context should rebuild scope resolver for new user."""
+        """set_user_context should update user_id."""
         client = LLMClient(db=db_session, user_id="alice")
         client.set_user_context(user_id="bob", scope_context={"repo": "test"})
         assert client.user_id == "bob"
-        assert client.scope_context == {"repo": "test"}
 
     def test_rebuilds_router(self, db_session):
         """set_user_context should create a new ModelRouter."""

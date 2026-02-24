@@ -15,8 +15,7 @@ from core.llm.models import LLMCallLog, LLMMessage, LLMProvider, LLMResponse
 from core.llm.providers import AnthropicProvider, BaseProvider, GroqProvider, OpenAIProvider
 from core.llm.rate_limiter import RateLimiter
 from core.llm.router import ModelConfig, ModelRouter
-from core.repos.token_resolver import TokenResolver
-from core.scope.scope_resolver import ScopeChainBuilder, ScopeResolver
+from core.auth.encryption import decrypt_token
 
 logger = logging.getLogger(__name__)
 
@@ -46,32 +45,16 @@ class LLMClient:
         self,
         db: Session | None = None,
         user_id: str | None = None,
-        scope_context: dict | None = None,
+        scope_context: dict | None = None,  # kept for backward compat, unused
     ) -> None:
-        """Initialize LLM client. Models must be registered in database.
-
-        Args:
-            scope_context: Optional scope context for resolver, e.g.,
-                          {'repo': 'matrixone', 'project': 'backend'}
-        """
+        """Initialize LLM client. Models must be registered in database."""
         self.db = db or next(get_db_session())
         self.user_id = user_id
-        self.scope_context = scope_context or {}
-
-        # Initialize scope resolver
-        self.scope_resolver: ScopeResolver | None = None
-        if user_id:
-            scope_chain = ScopeChainBuilder.dev_agent(
-                user_id=user_id,
-                repo=self.scope_context.get("repo"),
-                project=self.scope_context.get("project"),
-            )
-            self.scope_resolver = ScopeResolver(self.db, scope_chain)
 
         self._providers: dict[str, BaseProvider] = {}
+        self._model_keys: dict[str, str] = {}  # model_name -> decrypted api_key
         self.router = ModelRouter(db=self.db, user_id=user_id)
         self.rate_limiter = RateLimiter()
-        self.token_resolver = TokenResolver(db=self.db)
         self._load_config()
         self._init_providers()
         self._init_rate_limits()
@@ -81,26 +64,9 @@ class LLMClient:
         user_id: str | None = None,
         scope_context: dict | None = None,
     ):
-        """Update user context for scope-based access control.
-
-        Args:
-            scope_context: Optional scope context, e.g., {'repo': 'matrixone', 'project': 'backend'}
-        """
+        """Update user context and reload router."""
         self.user_id = user_id
-        self.scope_context = scope_context or {}
-
-        # Rebuild scope resolver
-        if user_id:
-            scope_chain = ScopeChainBuilder.dev_agent(
-                user_id=user_id,
-                repo=(scope_context or {}).get("repo"),
-                project=(scope_context or {}).get("project"),
-            )
-            self.scope_resolver = ScopeResolver(self.db, scope_chain)
-
-        # Reload router with new context
         self.router = ModelRouter(db=self.db, user_id=user_id)
-        # Re-initialize providers with new API keys
         self._init_providers()
 
     # ── Config (#4 动态配置) ───────────────────────────────────────
@@ -118,16 +84,17 @@ class LLMClient:
         except Exception:
             pass
         if not config:
-            # Auto-detect default provider/model from first active token
+            # Auto-detect from llm_models table (first active model)
             provider = os.getenv("LLM_PROVIDER", "")
             model = os.getenv("LLM_MODEL", "")
-            if not provider:
+            if not provider or not model:
                 try:
                     row = self.db.execute(
-                        text("SELECT provider FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
+                        text("SELECT model_name, provider FROM llm_models WHERE is_active=1 ORDER BY created_at LIMIT 1")
                     ).first()
                     if row:
-                        provider = row[0]
+                        model = model or row[0]
+                        provider = provider or row[1]
                 except Exception:
                     pass
             provider = provider or "openai"
@@ -166,139 +133,76 @@ class LLMClient:
     # ── Provider init (#3 异构) ────────────────────────────────────
 
     def _init_providers(self) -> None:
-        """Initialize provider clients once (connection pooling).
-
-        All providers use OpenAI-compatible protocol. base_url from token metadata.
-        """
-        # Discover all active LLM tokens from DB
-        providers_to_init = set()
+        """Initialize provider clients from llm_models table (active models only)."""
+        # Init built-in mock provider (no key needed, always available)
         try:
-            rows = self.db.execute(
-                text("SELECT DISTINCT provider FROM tokens WHERE type='llm' AND is_active=TRUE")
-            ).fetchall()
-            for row in rows:
-                providers_to_init.add(row[0])
+            from core.llm.providers import MockEchoProvider
+            self._providers["mock"] = MockEchoProvider()
+            self.router.register(ModelConfig(
+                model_name="mock-echo", provider="mock",
+                tags=["test", "builtin"],
+            ))
         except Exception:
             pass
 
-        # Always try well-known providers
-        for p in ["openai", "groq", "anthropic", "mock"]:
-            providers_to_init.add(p)
+        # Load active models and init their providers (per-model keys)
+        try:
+            rows = self.db.execute(
+                text("SELECT model_name, provider, api_key_encrypted, base_url FROM llm_models WHERE is_active = 1")
+            ).fetchall()
+        except Exception as e:
+            logger.debug(f"Failed to load llm_models: {e}")
+            return
 
-        for provider_name in providers_to_init:
-            # Special case: mock provider doesn't need API key
-            if provider_name == "mock":
-                try:
-                    from core.llm.providers import MockEchoProvider
-                    self._providers["mock"] = MockEchoProvider()
-                    logger.debug("Initialized mock provider")
-                except Exception as e:
-                    logger.warning(f"Failed to initialize mock provider: {e}")
-                continue
-            
-            api_key = self._get_api_key(provider_name)
-            if not api_key:
-                logger.debug(f"No API key found for {provider_name}, skipping")
-                continue
+        for row in rows:
+            provider_name = row.provider
+            model_name = row.model_name
             try:
-                base_url = self._get_provider_base_url(provider_name)
-                # Groq and Anthropic have their own clients
+                api_key = decrypt_token(row.api_key_encrypted)
+            except Exception as e:
+                logger.warning(f"Failed to decrypt key for {model_name}: {e}")
+                continue
+            self._model_keys[model_name] = api_key
+
+            if provider_name in self._providers:
+                continue  # provider already initialized with first model's key
+            try:
+                base_url = row.base_url
                 if provider_name == "groq" and not base_url:
                     self._providers[provider_name] = GroqProvider(api_key)
                 elif provider_name == "anthropic" and not base_url:
                     self._providers[provider_name] = AnthropicProvider(api_key)
                 else:
-                    # Everything else: OpenAI-compatible with optional base_url
                     kwargs = {"base_url": base_url} if base_url else {}
                     self._providers[provider_name] = OpenAIProvider(api_key, **kwargs)
-                logger.debug(f"Initialized {provider_name} provider" + (f" (base_url={base_url})" if base_url else ""))
+                logger.debug(f"Initialized {provider_name} provider")
             except Exception as e:
                 logger.warning(f"Failed to initialize {provider_name} provider: {e}")
 
     def _get_provider_base_url(self, provider: str) -> str | None:
-        """Get base_url from token metadata or config."""
+        """Get base_url from llm_models table."""
+        from core.llm.constants import PROVIDER_BASE_URLS
         try:
             row = self.db.execute(
-                text("SELECT metadata FROM tokens WHERE type='llm' AND provider=:provider AND is_active=TRUE ORDER BY created_at DESC LIMIT 1"),
+                text("SELECT base_url FROM llm_models WHERE provider = :provider AND is_active = 1 LIMIT 1"),
                 {"provider": provider},
             ).first()
-            if row and row.metadata:
-                meta = json.loads(row.metadata) if isinstance(row.metadata, str) else row.metadata
-                if meta.get("base_url"):
-                    return meta["base_url"]
+            if row and row.base_url:
+                return row.base_url
         except Exception:
             pass
-        return self.config.get(f"{provider}_base_url")
+        return PROVIDER_BASE_URLS.get(provider)
 
-    def _get_api_key(self, provider: str) -> str | None:
-        """Get API key with scope-based resolution.
-
-        Priority: scope_resolver > user > configs table
-        """
-        # 1. Try ScopeResolver (supports extended scopes like repo/project)
-        if self.scope_resolver:
-            token = self.scope_resolver.resolve_token("llm", provider)
-            if token:
-                return token.get("encrypted_value") or token.get("secret_ref")
-
-        # 2. Fallback to TokenResolver (user → global)
-        token = self._resolve_llm_token(provider)
-        if token:
-            val = token.encrypted_value or token.secret_ref
-            return str(val) if val else None
-
-        # 3. Fallback to configs table (global)
-        try:
-            result = self.db.execute(
-                text("SELECT value FROM configs WHERE key_name = :key_name AND scope_type = 'global' LIMIT 1"),
-                {"key_name": f"{provider}_api_key"}
-            )
-            row = result.first()
-            if row:
-                return str(row.value) or None
-        except Exception:
-            pass
-
+    def _get_api_key(self, provider: str, model_name: str | None = None) -> str | None:
+        """Get API key — prefer per-model key, fall back to first key for same provider."""
+        if model_name and model_name in self._model_keys:
+            return self._model_keys[model_name]
+        # Fall back to first key whose model belongs to the requested provider
+        for mname, key in self._model_keys.items():
+            cfg = self.router.registry.get(mname)
+            if cfg and str(cfg.provider) == provider:
+                return key
         return None
-
-    def _resolve_llm_token(self, provider: str):
-        """Resolve LLM token: user-scoped first, then global.
-        
-        Returns decrypted token value.
-        """
-        from core.auth.encryption import decrypt_token
-
-        queries = []
-        if self.user_id:
-            queries.append((
-                "SELECT * FROM tokens WHERE type='llm' AND provider=:provider AND scope_user_id=:user_id AND is_active=TRUE ORDER BY created_at DESC LIMIT 1",
-                {"provider": provider, "user_id": self.user_id},
-            ))
-        queries.append((
-            "SELECT * FROM tokens WHERE type='llm' AND provider=:provider AND scope_user_id IS NULL AND is_active=TRUE ORDER BY created_at DESC LIMIT 1",
-            {"provider": provider},
-        ))
-        for sql, params in queries:
-            result = self.db.execute(text(sql), params)
-            row = result.first()
-            if row:
-                token = self._token_from_row(row)
-                # Decrypt encrypted_value if present
-                if token.encrypted_value:
-                    token.encrypted_value = decrypt_token(token.encrypted_value)
-                return token
-        return None
-
-    def _token_from_row(self, row):
-        """Convert DB row to simple token object."""
-        from types import SimpleNamespace
-
-        return SimpleNamespace(
-            token_id=row.token_id,
-            provider=row.provider,
-            encrypted_value=row.encrypted_value if hasattr(row, 'encrypted_value') else None,
-            secret_ref=row.secret_ref if hasattr(row, 'secret_ref') else None,
-        )
 
     def _init_rate_limits(self) -> None:
         for m in self.router.list_models():
@@ -309,8 +213,8 @@ class LLMClient:
         provider = self._providers.get(name)
         if not provider:
             raise ValueError(
-                f"Provider '{name}' is not configured.\n"
-                f"Register via: mo-admin token create --type llm --provider {name} --scope global"
+                f"Provider '{name}' is not available. "
+                f"Check: pip install openai  and  mo-admin model check <model>"
             )
         return provider
 

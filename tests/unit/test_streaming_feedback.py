@@ -1,19 +1,14 @@
 """Test to verify feedback recording in streaming execution path."""
 
-import asyncio
 import pytest
-from unittest.mock import Mock, AsyncMock, patch
+from unittest.mock import Mock
 from core.agent.chat_loop import ChatLoop
 from core.skills.learning_signals import SignalType
 
 
 @pytest.mark.asyncio
-@patch('core.agent.chat_loop._needs_planning', new_callable=AsyncMock)
-async def test_streaming_records_feedback(mock_needs_planning):
+async def test_streaming_records_feedback():
     """Verify that run_step_stream records feedback signals."""
-    
-    # Disable planning for this test
-    mock_needs_planning.return_value = False
     
     # Mock dependencies
     mock_pipeline = Mock()
@@ -115,12 +110,8 @@ async def test_streaming_records_feedback(mock_needs_planning):
 
 
 @pytest.mark.asyncio
-@patch('core.agent.chat_loop._needs_planning', new_callable=AsyncMock)
-async def test_parallel_delegation_records_feedback(mock_needs_planning):
+async def test_parallel_delegation_records_feedback():
     """Verify that parallel delegation records feedback."""
-    
-    # Disable planning for this test
-    mock_needs_planning.return_value = False
     
     # Mock dependencies
     mock_pipeline = Mock()

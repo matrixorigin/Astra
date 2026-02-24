@@ -76,6 +76,34 @@ class GateResult(Base):
     created_at = Column(DateTime, default=func.now())
 
 
+class LLMModel(Base):
+    """Registered LLM model — each row is one usable model with its API key."""
+    __tablename__ = "llm_models"
+    model_id = Column(String(36), primary_key=True)
+    model_name = Column(String(100), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)  # openai, anthropic, deepseek, ...
+    api_key_encrypted = Column(String(512), nullable=False)
+    base_url = Column(String(512), nullable=True)  # custom endpoint (OpenAI-compatible)
+    is_active = Column(SmallInteger, server_default="1", nullable=False)
+    # Model capabilities / metadata (JSON)
+    context_window = Column(Integer, default=128000)
+    max_completion_tokens = Column(Integer, nullable=True)
+    input_modalities = Column(JSON, default=lambda: ["text"])
+    output_modalities = Column(JSON, default=lambda: ["text"])
+    supported_parameters = Column(JSON, default=list)
+    pricing = Column(JSON, default=dict)  # {prompt, completion, cache_read, ...}
+    architecture = Column(String(50), nullable=True)
+    tags = Column(JSON, default=list)
+    # Audit
+    created_by = Column(String(36), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('model_name', 'provider', name='uq_llm_model_name_provider'),
+    )
+
+
 class Config(Base):
     __tablename__ = "configs"
     config_id = Column(String(64), primary_key=True)

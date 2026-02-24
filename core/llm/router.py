@@ -170,59 +170,39 @@ class CostOptimizedStrategy(RoutingStrategy):
 
 
 class ModelRegistry:
-    """In-memory model registry loaded from database only."""
+    """In-memory model registry loaded from llm_models table."""
 
     def __init__(self):
-        """Initialize empty model registry. Models must be loaded from DB."""
         self._models: dict[str, ModelConfig] = {}
 
     def load_from_db(self, db, user_id: str | None = None):
-        """Load model registry from configs table.
-
-        Priority: global → user (user scope overrides global)
-        Auto-seeds default models if no global registry exists.
-        """
-        # Load global scope
+        """Load active models from llm_models table."""
         try:
-            result = db.execute(
-                text("SELECT value FROM configs WHERE key_name = 'model_registry' AND scope_type = 'global' LIMIT 1")
-            ).fetchone()
-            
-            if not result:
-                # Auto-seed: ensures models are available even without API lifespan
-                try:
-                    from core.llm.seed_models import seed_models
-                    seed_models(db)
-                    result = db.execute(
-                        text("SELECT value FROM configs WHERE key_name = 'model_registry' AND scope_type = 'global' LIMIT 1")
-                    ).fetchone()
-                except Exception as e:
-                    logger.debug(f"Auto-seed failed: {e}")
-
-            if result:
-                models = json.loads(result[0])
-                for model_dict in models:
-                    mc = ModelConfig(**model_dict)
-                    self._models[mc.model_name] = mc
+            rows = db.execute(
+                text(
+                    "SELECT model_name, provider, context_window, max_completion_tokens, "
+                    "input_modalities, output_modalities, supported_parameters, "
+                    "pricing, architecture, tags, is_active, base_url "
+                    "FROM llm_models WHERE is_active = 1"
+                )
+            ).fetchall()
+            for row in rows:
+                mc = ModelConfig(
+                    model_name=row.model_name,
+                    provider=row.provider,
+                    context_window=row.context_window or 128000,
+                    max_completion_tokens=row.max_completion_tokens,
+                    input_modalities=json.loads(row.input_modalities) if isinstance(row.input_modalities, str) else (row.input_modalities or ["text"]),
+                    output_modalities=json.loads(row.output_modalities) if isinstance(row.output_modalities, str) else (row.output_modalities or ["text"]),
+                    supported_parameters=json.loads(row.supported_parameters) if isinstance(row.supported_parameters, str) else (row.supported_parameters or []),
+                    pricing=json.loads(row.pricing) if isinstance(row.pricing, str) else (row.pricing or {}),
+                    architecture=row.architecture,
+                    tags=json.loads(row.tags) if isinstance(row.tags, str) else (row.tags or []),
+                    is_active=bool(row.is_active),
+                )
+                self._models[mc.model_name] = mc
         except Exception as e:
-            logger.debug(f"No global model registry in DB: {e}")
-
-        # Load user scope (overrides global)
-        if user_id:
-            try:
-                result = db.execute(
-                    text("SELECT value FROM configs WHERE key_name = 'model_registry' "
-                         "AND scope_type = 'user' AND scope_user_id = :user_id LIMIT 1"),
-                    {"user_id": user_id}
-                ).fetchone()
-                
-                if result:
-                    models = json.loads(result[0])
-                    for model_dict in models:
-                        mc = ModelConfig(**model_dict)
-                        self._models[mc.model_name] = mc
-            except Exception as e:
-                logger.debug(f"No user model registry in DB: {e}")
+            logger.debug(f"Failed to load model registry: {e}")
 
     def get(self, model_name: str) -> ModelConfig | None:
         return self._models.get(model_name)

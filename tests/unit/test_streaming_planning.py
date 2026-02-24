@@ -3,56 +3,8 @@
 import unittest
 from unittest.mock import MagicMock
 
-import pytest
-
-from core.agent.chat_loop import _merge_tool_call_fragments, _needs_planning
+from core.agent.chat_loop import _merge_tool_call_fragments
 from core.agent.planner import Plan, Planner, PlanStatus, PlanStep
-
-
-class TestNeedsPlanning:
-    """Test _needs_planning LLM-based function."""
-
-    @pytest.mark.asyncio
-    async def test_simple_query_no_planning(self):
-        """Test simple query doesn't need planning."""
-        mock_llm = MagicMock()
-        mock_llm.chat = MagicMock(return_value="no")
-        
-        result = await _needs_planning("What is the weather?", mock_llm)
-        
-        assert result is False
-        mock_llm.chat.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_complex_query_needs_planning(self):
-        """Test complex multi-step query needs planning."""
-        mock_llm = MagicMock()
-        mock_llm.chat = MagicMock(return_value="yes")
-        
-        result = await _needs_planning("First analyze the code, then fix bugs, and finally run tests", mock_llm)
-        
-        assert result is True
-        mock_llm.chat.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_llm_error_defaults_to_no_planning(self):
-        """Test LLM error defaults to no planning."""
-        mock_llm = MagicMock()
-        mock_llm.chat = MagicMock(side_effect=Exception("LLM error"))
-        
-        result = await _needs_planning("Some query", mock_llm)
-        
-        assert result is False
-
-    @pytest.mark.asyncio
-    async def test_yes_prefix_detection(self):
-        """Test various 'yes' responses are detected."""
-        mock_llm = MagicMock()
-        
-        for response in ["yes", "Yes", "YES", "yes, this needs planning"]:
-            mock_llm.chat = MagicMock(return_value=response)
-            result = await _needs_planning("query", mock_llm)
-            assert result is True, f"Failed for response: {response}"
 
 
 class TestMergeToolCallFragments(unittest.TestCase):
