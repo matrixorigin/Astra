@@ -604,6 +604,182 @@ class TestDataConsistencyRealE2E:
 
 
 
+class TestChatTurnRealE2E:
+    """Real E2E tests for /chat/turn edge-cloud endpoint."""
+
+    def _get_auth_headers(self, client, db):
+        """Register + login, return auth headers."""
+        from core.auth.password import hash_password
+        # Ensure user exists
+        user = db.query(User).filter(User.username == "edgeuser").first()
+        if not user:
+            user = User(user_id="edge_user", username="edgeuser",
+                        email="edge@test.com", password_hash=hash_password("password123"))
+            db.add(user)
+            db.commit()
+        resp = client.post("/auth/login", json={"username": "edgeuser", "password": "password123"})
+        return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+    def _parse_sse(self, response_text):
+        """Parse SSE events from response text."""
+        import json as _json
+        return [_json.loads(l[6:]) for l in response_text.strip().split("\n") if l.startswith("data: ")]
+
+    def test_chat_turn_returns_session_info(self, client, db):
+        """First event is always session_info with session_id."""
+        headers = self._get_auth_headers(client, db)
+
+        with patch("core.llm.client.LLMClient.chat_stream", return_value=_fake_stream([
+            {"type": "text", "content": "Hello!"},
+        ])):
+            resp = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "hi"}],
+            }, headers=headers)
+
+        assert resp.status_code == 200
+        events = self._parse_sse(resp.text)
+        assert events[0]["type"] == "session_info"
+        assert "session_id" in events[0]
+
+    def test_chat_turn_streams_text_delta(self, client, db):
+        """Text chunks arrive as text_delta events."""
+        headers = self._get_auth_headers(client, db)
+
+        with patch("core.llm.client.LLMClient.chat_stream", return_value=_fake_stream([
+            {"type": "text", "content": "Hello"},
+            {"type": "text", "content": " world"},
+        ])):
+            resp = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "hi"}],
+            }, headers=headers)
+
+        events = self._parse_sse(resp.text)
+        text_events = [e for e in events if e["type"] == "text_delta"]
+        assert len(text_events) == 2
+        assert text_events[0]["content"] == "Hello"
+        assert text_events[1]["content"] == " world"
+
+        # Last event is turn_complete
+        assert events[-1]["type"] == "turn_complete"
+        assert events[-1]["has_tool_calls"] is False
+
+    def test_chat_turn_returns_tool_calls(self, client, db):
+        """Tool calls from LLM are returned as tool_call events."""
+        headers = self._get_auth_headers(client, db)
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=_fake_stream([
+            {"type": "text", "content": "Let me read that."},
+            {"type": "tool_call", "data": {
+                "id": "tc_001", "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "README.md"}'},
+            }},
+        ])):
+            resp = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "read README"}],
+                "edge_tools": [{"type": "function", "function": {"name": "read_file", "description": "Read file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}],
+            }, headers=headers)
+
+        events = self._parse_sse(resp.text)
+        tc_events = [e for e in events if e["type"] == "tool_call"]
+        assert len(tc_events) == 1
+        assert tc_events[0]["name"] == "read_file"
+        assert tc_events[0]["arguments"] == {"path": "README.md"}
+        assert events[-1]["has_tool_calls"] is True
+
+    def test_chat_turn_accepts_tool_results(self, client, db):
+        """Second turn with tool_results is accepted and processed."""
+        headers = self._get_auth_headers(client, db)
+
+        # Turn 1: get tool call
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=_fake_stream([
+            {"type": "tool_call", "data": {
+                "id": "tc_1", "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+            }},
+        ])):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "read a.py"}],
+                "edge_tools": [{"type": "function", "function": {"name": "read_file", "description": "r", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}],
+            }, headers=headers)
+        session_id = self._parse_sse(r1.text)[0]["session_id"]
+
+        # Turn 2: send tool results back
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=_fake_stream([
+            {"type": "text", "content": "The file contains a function."},
+        ])):
+            r2 = client.post("/chat/turn", json={
+                "messages": [],
+                "session_id": session_id,
+                "tool_results": [{"tool_call_id": "tc_1", "name": "read_file", "result": "def foo(): pass"}],
+            }, headers=headers)
+
+        events = self._parse_sse(r2.text)
+        text_events = [e for e in events if e["type"] == "text_delta"]
+        assert text_events[0]["content"] == "The file contains a function."
+        assert events[-1]["has_tool_calls"] is False
+
+    def test_chat_turn_persists_events(self, client, db):
+        """Events are persisted to conversation_events table."""
+        headers = self._get_auth_headers(client, db)
+        from sqlalchemy import text as sql_text
+
+        # Count events before
+        before = db.execute(sql_text(
+            "SELECT COUNT(*) FROM conversation_events WHERE user_id = 'edge_user'"
+        )).scalar()
+
+        with patch("core.llm.client.LLMClient.chat_stream", return_value=_fake_stream([
+            {"type": "text", "content": "Done."},
+        ])):
+            client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "test persist"}],
+            }, headers=headers)
+
+        after = db.execute(sql_text(
+            "SELECT COUNT(*) FROM conversation_events WHERE user_id = 'edge_user'"
+        )).scalar()
+        assert after > before, f"Expected new events: before={before}, after={after}"
+
+    def test_chat_turn_caches_edge_tools(self, client, db):
+        """Edge tools sent on turn 1 are reused on turn 2 without resending."""
+        headers = self._get_auth_headers(client, db)
+        tools = [{"type": "function", "function": {"name": "bash", "description": "run", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}]
+
+        # Turn 1: send edge_tools
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=_fake_stream([
+            {"type": "tool_call", "data": {"id": "tc_1", "type": "function", "function": {"name": "bash", "arguments": '{"command": "ls"}'}}},
+        ])):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "list files"}],
+                "edge_tools": tools,
+            }, headers=headers)
+        session_id = self._parse_sse(r1.text)[0]["session_id"]
+
+        # Turn 2: no edge_tools — should still use tools (chat_with_tools_stream, not chat_stream)
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=_fake_stream([
+            {"type": "text", "content": "Here are the files."},
+        ])) as mock_tools_stream:
+            r2 = client.post("/chat/turn", json={
+                "messages": [],
+                "session_id": session_id,
+                "tool_results": [{"tool_call_id": "tc_1", "name": "bash", "result": "a.py\nb.py"}],
+            }, headers=headers)
+        mock_tools_stream.assert_called_once()
+
+    def test_chat_turn_requires_auth(self, client):
+        """Unauthenticated requests are rejected."""
+        resp = client.post("/chat/turn", json={"messages": [{"role": "user", "content": "hi"}]})
+        assert resp.status_code == 401
+
+
+async def _fake_stream_gen(chunks):
+    for c in chunks:
+        yield c
+
+def _fake_stream(chunks):
+    return _fake_stream_gen(chunks)
+
+
 class TestChatStreamingRealE2E:
     """Test chat command integration with real API."""
     

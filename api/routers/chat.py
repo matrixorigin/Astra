@@ -307,22 +307,84 @@ async def cancel_run(
 
 # In-memory conversation history per session (production: persist in MatrixOne)
 _turn_histories: dict[str, list[dict[str, Any]]] = {}
+# Cache edge_tools per session so subsequent turns reuse them
+_session_tools: dict[str, list[dict[str, Any]]] = {}
+
+
+def _enrich_system_prompt(
+    db: Session,
+    user_id: str,
+    session_id: str,
+    user_query: str,
+    project_rules: str | None,
+) -> str:
+    """Build enriched system prompt with context from cloud services."""
+    sections = ["You are a development assistant. Use the available tools to help the user."]
+
+    if project_rules:
+        sections.append(f"# Project Rules\n{project_rules}")
+
+    # Context enrichment: memory search + few-shot + observations
+    try:
+        from core.context.manager import ContextManager
+        ctx_mgr = ContextManager(db)
+        ctx = ctx_mgr.build_context(session_id=session_id, query=user_query)
+        if ctx.selected_events:
+            history_lines = []
+            for ev in ctx.selected_events[:10]:
+                role = "User" if ev.get("event_type") == "user_query" else "Agent"
+                content = ev.get("content", "")
+                if len(content) > 300:
+                    content = content[:300] + "..."
+                history_lines.append(f"{role}: {content}")
+            if history_lines:
+                sections.append("## Relevant Context\n" + "\n".join(history_lines))
+    except Exception as e:
+        logger.debug(f"Context enrichment skipped: {e}")
+
+    try:
+        from core.context.few_shot import FewShotRetriever
+        fsr = FewShotRetriever(db)
+        examples = fsr.retrieve(user_query)
+        few_shot = fsr.format_for_prompt(examples)
+        if few_shot:
+            sections.append(few_shot)
+    except Exception as e:
+        logger.debug(f"Few-shot retrieval skipped: {e}")
+
+    try:
+        from core.memory.observer import Observer
+        from core.llm.client import LLMClient
+        obs = Observer(db, llm_client=LLMClient(db=db))
+        observations = obs.get_observations(user_id, session_id)
+        obs_section = obs.format_for_context(observations)
+        if obs_section:
+            sections.append(obs_section)
+    except Exception as e:
+        logger.debug(f"Observer skipped: {e}")
+
+    return "\n\n".join(sections)
 
 
 def _build_turn_messages(
+    db: Session,
+    user_id: str,
     session_id: str,
     messages: list[dict[str, Any]],
     tool_results: list[dict[str, Any]] | None,
     project_rules: str | None,
 ) -> list[dict[str, Any]]:
     """Build LLM messages from edge turn data + server-side history."""
-    history = _turn_histories.get(session_id, [])
+    history = _turn_histories.get(session_id)
 
-    # First turn: initialize with system prompt
+    # Recover from DB if not in memory (server restart)
+    if history is None:
+        history = _recover_history_from_db(db, session_id)
+
+    # First turn: build enriched system prompt
     if not history:
-        system = "You are a development assistant. Use the available tools to help the user."
-        if project_rules:
-            system += f"\n\n# Project Rules\n{project_rules}"
+        user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+        system = _enrich_system_prompt(db, user_id, session_id, user_query, project_rules)
         history = [{"role": "system", "content": system}]
 
     # Append new user messages from edge
@@ -343,6 +405,101 @@ def _build_turn_messages(
     return history
 
 
+def _recover_history_from_db(db: Session, session_id: str) -> list[dict[str, Any]]:
+    """Rebuild conversation history from persisted events (for server restart recovery)."""
+    try:
+        rows = db.execute(
+            text("""
+                SELECT event_type, content FROM conversation_events
+                WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response')
+                ORDER BY created_at ASC LIMIT 50
+            """),
+            {"sid": session_id},
+        ).fetchall()
+        if not rows:
+            return []
+        history: list[dict[str, Any]] = [
+            {"role": "system", "content": "You are a development assistant. Use the available tools to help the user."}
+        ]
+        for row in rows:
+            etype, content = row[0], row[1] or ""
+            if etype == "user_query":
+                history.append({"role": "user", "content": content})
+            elif etype == "llm_response":
+                history.append({"role": "assistant", "content": content})
+        return history
+    except Exception as e:
+        logger.debug(f"History recovery failed: {e}")
+        return []
+
+
+def _persist_turn_events(
+    db: Session,
+    user_id: str,
+    session_id: str,
+    messages: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]] | None,
+    full_text: str,
+    tool_calls: list[dict[str, Any]],
+) -> str | None:
+    """Persist events for this turn: user query, tool results, LLM response."""
+    context_capture_id = None
+    try:
+        from core.events.event_logger import EventLogger
+        from uuid_utils import uuid7
+        el = EventLogger(db)
+
+        # Persist user query (first user message only)
+        user_content = next((m["content"] for m in messages if m.get("role") == "user"), None)
+        parent_event_id = None
+        causal_chain_id = str(uuid7())  # always generate a chain ID
+        if user_content:
+            user_ev = el.create_user_query(user_id=user_id, session_id=session_id, content=user_content)
+            parent_event_id = user_ev.event_id
+            causal_chain_id = user_ev.causal_chain_id
+
+        # Persist tool results from edge (tagged source: "edge")
+        if tool_results:
+            for tr in tool_results:
+                el.create_stream_event(
+                    user_id=user_id, session_id=session_id,
+                    event_type="tool_result",
+                    content=json.dumps({"name": tr.get("name", ""), "result": tr.get("result", "")[:2000]}),
+                    parent_event_id=parent_event_id,
+                    causal_chain_id=causal_chain_id,
+                    metadata={"source": "edge", "tool_call_id": tr.get("tool_call_id")},
+                )
+
+        # Persist LLM response
+        if full_text or tool_calls:
+            tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+            response_content = full_text
+            if tc_names:
+                response_content += f"\n[tool_calls: {', '.join(tc_names)}]"
+            el.create_llm_response(
+                user_id=user_id, session_id=session_id,
+                content=response_content,
+                agent_id="dev-agent", agent_version="0.1.0",
+                parent_event_id=parent_event_id,
+                causal_chain_id=causal_chain_id,
+            )
+
+        # Context snapshot + decision audit
+        if parent_event_id:
+            try:
+                from core.context.manager import ContextManager
+                ctx_mgr = ContextManager(db)
+                ctx = ctx_mgr.build_context(session_id=session_id, query=user_content or "")
+                context_capture_id = ctx_mgr.save_snapshot(ctx, session_id, parent_event_id)
+            except Exception as e:
+                logger.debug(f"Context snapshot skipped: {e}")
+
+    except Exception as e:
+        logger.warning(f"Event persistence failed (non-fatal): {e}")
+
+    return context_capture_id
+
+
 @router.post("/chat/turn")
 async def chat_turn(
     request: ChatTurnRequest,
@@ -357,19 +514,20 @@ async def chat_turn(
     user_id = current_user["user_id"]
     session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
 
-    # Build conversation messages
+    # Cache edge_tools on first turn, reuse on subsequent turns
+    if request.edge_tools:
+        _session_tools[session_id] = request.edge_tools
+    tools_schema = _session_tools.get(session_id, [])
+
+    # Build conversation messages with context enrichment
     llm_messages = _build_turn_messages(
-        session_id, request.messages, request.tool_results, request.project_rules,
+        db, user_id, session_id,
+        request.messages, request.tool_results, request.project_rules,
     )
 
-    # Resolve tools: use edge_tools if provided, else empty
-    tools_schema = request.edge_tools or []
-
-    # Resolve model
     model = request.model
 
     async def event_generator():
-        # Session info (always first)
         yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id})}\n\n"
 
         try:
@@ -387,8 +545,7 @@ async def chat_turn(
                         full_text += chunk["content"]
                         yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
                     elif chunk["type"] == "tool_call":
-                        tc = chunk["data"]
-                        tool_calls.append(tc)
+                        tool_calls.append(chunk["data"])
                     elif chunk["type"] == "usage":
                         yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
             else:
@@ -413,6 +570,13 @@ async def chat_turn(
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
             _turn_histories.setdefault(session_id, []).append(assistant_msg)
+
+            # Persist events (non-blocking, best-effort)
+            _persist_turn_events(
+                db, user_id, session_id,
+                request.messages, request.tool_results,
+                full_text, tool_calls,
+            )
 
             yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"
 
