@@ -226,4 +226,4 @@ Every model selection is logged:
 - [x] Update agent API schemas
 - [x] Write integration tests
 - [x] Write E2E tests with real model calls
-- [ ] Add model selection audit event (`model_selected` in conversation_events)
+- [x] Add model selection audit event (`model_selected` in conversation_events)
