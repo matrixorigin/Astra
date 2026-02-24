@@ -44,7 +44,7 @@ Intelligent agent platform with auditable decisions, safe iteration, and version
 
 ## Quick Start
 
-### API Server
+### Development (Recommended)
 
 ```bash
 # 1. Setup environment
@@ -52,62 +52,72 @@ conda create -n dev-agent python=3.11
 conda activate dev-agent
 make setup
 
-# 2. Configure security (REQUIRED)
-# Generate encryption key
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# 2. Initialize and start (< 10 seconds)
+make dev-init          # Auto-generate keys, fix config
+make dev-start         # Start all services
 
-# Add to .env file:
-# TOKEN_ENCRYPTION_KEY=<generated-key>
-# JWT_SECRET_KEY=<your-secret-key-min-32-chars>
+# 3. Check status
+make dev-status
 
-# 3. Start services (MatrixOne + Redis)
-make dev-up
-
-# 4. Start API server
-uvicorn api.main:app --reload --port 8000
-
-# 5. Visit interactive docs
+# 4. Visit interactive docs
 open http://localhost:8000/docs
 ```
 
-### Security Check
+### Production (Docker)
 
 ```bash
-# Before deployment, run security check
-python scripts/check_security.py
-```
+# 1. Configure environment
+cp .env.example .env
+# Edit .env: set TOKEN_ENCRYPTION_KEY, JWT_SECRET_KEY, LLM tokens
 
-### CLI Usage
+# 2. Start all services
+make dev-start-docker
 
-```bash
-# Start using CLI (database auto-initializes)
-mo-agent chat
-
-# Or run tests
-make test
-```
-
-### API Server
-
-```bash
-# Start API server
-uvicorn api.main:app --reload --port 8000
-
-# Visit interactive docs (Swagger UI)
+# 3. Visit API
 open http://localhost:8000/docs
+```
 
-# Or ReDoc
-open http://localhost:8000/redoc
+### Daily Development
 
-# Quick test
-curl http://localhost:8000/health
+```bash
+make dev-start         # Start everything
+make dev-api-restart   # Restart API after code changes
+make dev-test-keep     # Run tests
+make dev-stop          # Stop everything
 ```
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.md) — setup and first steps
-- [API Reference](docs/api-reference.md) — full endpoint documentation
-- Interactive Swagger UI: `http://localhost:8000/docs`
+📖 **[Documentation Hub](docs/README.md)** - Start here for all documentation
+
+### Quick Links
+
+- 🚀 **[5-Minute Quick Start](docs/quickstart/README.md)** - Get running fast
+- 📘 **[Development Workflow](docs/guides/development-workflow.md)** - Daily development guide
+- 📚 **[API Reference](docs/reference/api-reference.md)** - Complete API documentation
+- 🔧 **[Makefile Commands](docs/reference/makefile-commands.md)** - All available commands
+- 🆘 **[Troubleshooting](docs/guides/troubleshooting.md)** - Common issues and solutions
+
+### By Topic
+
+**Getting Started:**
+- [Development Setup](docs/quickstart/development.md)
+- [Docker Deployment](docs/quickstart/docker.md)
+- [Production Deployment](docs/quickstart/production.md)
+
+**Guides:**
+- [Testing Guide](docs/guides/testing.md)
+- [Deployment Guide](docs/guides/deployment.md)
+
+**Reference:**
+- [CLI Commands](docs/reference/cli-commands.md)
+- [Configuration](docs/reference/configuration.md)
+
+**Design & Architecture:**
+- [Architecture](docs/design/ARCHITECTURE.md)
+- [Memory and Context](docs/design/memory-and-context.md)
+- [Trust and Safety](docs/design/trust-and-safety.md)
+- [All Design Docs](docs/design/)
 
 ## API Endpoints
 
@@ -374,35 +384,16 @@ See [examples/](examples/) for more detailed examples.
 - **MatrixOne**: Time-travel, zero-copy branching, HTAP — the data layer that makes audit/regression/lineage possible
 - **Type-safe**: Pydantic models throughout, 100% type annotations
 
-## Documentation
-
-- [Getting Started](docs/getting-started.md) — setup and first steps
-- [Development Guide](docs/development.md) — testing, deployment, code quality
-- [API Reference](docs/api-reference.md) — endpoint documentation
-- [Design Documents](docs/design/)
-  - [Architecture](docs/design/ARCHITECTURE.md) — system overview, data flow, key decisions
-  - [Memory and Context](docs/design/memory-and-context.md) — cognitive memory, context engineering, lifecycle governance
-  - [Trust and Safety](docs/design/trust-and-safety.md) — audit, guardrails, robustness, HITL, SLOs
-  - [Skills and Tools](docs/design/skills-and-tools.md) — skill architecture, marketplace, MCP compatibility
-  - [Agents and Orchestration](docs/design/agents-and-orchestration.md) — ChatLoop, planning, teams, scheduling, model routing
-  - [Data Versioning](docs/design/data-versioning.md) — snapshot, clone, branch, MatrixOne workflows
-  - [Evaluation and Evolution](docs/design/evaluation-and-evolution.md) — quality, replay gating, adversarial eval, CI/CD
-- [Implementation Details](docs/implementation/)
-  - [Authentication](docs/implementation/authentication.md) — JWT, ownership-based authorization
-  - [LLM Integration](docs/implementation/llm-integration.md) — providers, routing, cost tracking
-  - [GitHub Integration](docs/implementation/github-integration.md) — repo operations, token management
-  - [Deployment](docs/implementation/deployment.md) — project structure, Docker, configuration
-  - [Scope Configuration](docs/implementation/scope-configuration.md) — scope-based config resolution
-  - [CI](docs/implementation/ci.md) — GitHub Actions workflows
-- [Examples](examples/)
-
 ## Testing
 
 ```bash
-make test               # All tests (527 tests)
-make test-unit          # Unit tests
-make test-integration   # Integration tests
+make dev-test-keep      # Run all tests (keeps services running)
+make dev-test           # Run all tests (stops services after)
+make dev-test-unit      # Unit tests only
+make dev-test-integration  # Integration tests only
 ```
+
+See [Testing Guide](docs/guides/testing.md) for detailed testing documentation.
 
 ---
 

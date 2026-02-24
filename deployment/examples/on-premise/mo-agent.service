@@ -1,0 +1,26 @@
+[Unit]
+Description=mo-agent API Server
+After=network.target matrixone.service redis.service
+Wants=matrixone.service redis.service
+
+[Service]
+Type=simple
+User=mo-agent
+Group=mo-agent
+WorkingDirectory=/opt/mo-agent
+EnvironmentFile=/opt/mo-agent/.env
+ExecStart=/usr/bin/python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mo-agent/logs
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,207 @@
+# mo-agent Production Docker Compose
+#
+# Production-ready configuration with:
+# - Resource limits
+# - Health checks
+# - Restart policies
+# - Logging configuration
+# - Multiple API replicas
+#
+# Usage:
+#   docker-compose -f docker-compose.prod.yml up -d
+#   docker-compose -f docker-compose.prod.yml up -d --scale api=3
+
+version: '3.8'
+
+services:
+
+  # ─── Database ─────────────────────────────────────────────
+
+  matrixone:
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    hostname: matrixone
+    command: ["/mo-service", "-launch", "/etc/quickstart/launch.toml"]
+    ports:
+      - "${MATRIXONE_PORT:-6001}:6001"
+    volumes:
+      - mo-data:/mo-data
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ─── Cache ────────────────────────────────────────────────
+
+  redis:
+    image: redis:7.2-alpine
+    hostname: redis
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ─── API Server ───────────────────────────────────────────
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: mo-agent:${VERSION:-latest}
+    environment:
+      # Database
+      - MATRIXONE_HOST=matrixone
+      - MATRIXONE_PORT=6001
+      - MATRIXONE_USER=${MATRIXONE_USER:-root}
+      - MATRIXONE_PASSWORD=${MATRIXONE_PASSWORD:-111}
+      - MATRIXONE_DATABASE=${MATRIXONE_DATABASE:-mo_agent}
+      - MATRIXONE_POOL_SIZE=${MATRIXONE_POOL_SIZE:-20}
+      - MATRIXONE_MAX_OVERFLOW=${MATRIXONE_MAX_OVERFLOW:-10}
+      
+      # Redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_POOL_SIZE=${REDIS_POOL_SIZE:-50}
+      
+      # Security
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+      - JWT_REFRESH_TOKEN_EXPIRE_DAYS=${JWT_REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      
+      # LLM
+      - LLM_PROVIDER=${LLM_PROVIDER}
+      - LLM_MODEL=${LLM_MODEL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-60}
+      - LLM_MAX_RETRIES=${LLM_MAX_RETRIES:-3}
+      
+      # API
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - API_WORKERS=${API_WORKERS:-4}
+      - API_RELOAD=false
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_FORMAT=json
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      
+      # Features
+      - ENABLE_METRICS=${ENABLE_METRICS:-true}
+      - METRICS_PORT=9090
+      - ENABLE_RATE_LIMITING=${ENABLE_RATE_LIMITING:-true}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-60}
+    
+    ports:
+      - "${API_PORT:-8000}:8000"
+      - "${METRICS_PORT:-9090}:9090"
+    
+    networks:
+      - mo-net
+    
+    depends_on:
+      matrixone:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    restart: always
+    
+    deploy:
+      replicas: 3
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ─── Nginx Load Balancer ──────────────────────────────────
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    networks:
+      - mo-net
+    depends_on:
+      - api
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ─── Networks ─────────────────────────────────────────────────
+
+networks:
+  mo-net:
+    driver: bridge
+
+# ─── Volumes ──────────────────────────────────────────────────
+
+volumes:
+  mo-data:
+    driver: local
+  redis-data:
+    driver: local

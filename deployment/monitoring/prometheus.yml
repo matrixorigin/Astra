@@ -1,0 +1,37 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'mo-agent'
+    environment: 'production'
+
+scrape_configs:
+  # mo-agent API metrics
+  - job_name: 'mo-agent-api'
+    static_configs:
+      - targets: ['host.docker.internal:9090']
+        labels:
+          service: 'api'
+    metrics_path: '/metrics'
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Node Exporter (system metrics)
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+        labels:
+          instance: 'mo-agent-host'
+
+  # MatrixOne metrics (if exposed)
+  # - job_name: 'matrixone'
+  #   static_configs:
+  #     - targets: ['host.docker.internal:6001']
+
+  # Redis metrics (if redis_exporter is used)
+  # - job_name: 'redis'
+  #   static_configs:
+  #     - targets: ['redis-exporter:9121']

@@ -6,54 +6,78 @@ help:
 	@echo "mo-agent-engine Development Commands"
 	@echo "=================================="
 	@echo ""
-	@echo "Environment Setup:"
-	@echo "  make setup              - Initial project setup (copy .env, install deps)"
-	@echo "  make install            - Install Python dependencies"
-	@echo "  make install-runtime    - Install runtime dependencies (Docker, Firecracker)"
-	@echo "  make check-runtime      - Check runtime environment"
-	@echo "  make lock               - Update dependency lock file (poetry.lock)"
+	@echo "Quick Start:"
+	@echo "  make dev-start          - Start all (deps + API source mode) [MOST USED]"
+	@echo "  make dev-start-docker   - Start all (deps + API Docker mode)"
+	@echo "  make dev-stop           - Stop all services"
+	@echo "  make dev-status         - Show all service status"
+	@echo "  make dev-init           - Initialize development environment"
 	@echo ""
-	@echo "Development Environment:"
-	@echo "  make dev-up             - Start infra (MatrixOne + Redis)"
-	@echo "  make dev-down           - Stop all services"
-	@echo "  make dev-full           - Start everything in containers (build + run)"
-	@echo "  make dev-restart        - Restart all services"
-	@echo "  make dev-logs           - Show all logs (tail -f)"
-	@echo "  make dev-logs-db        - Show MatrixOne logs"
-	@echo "  make dev-ps             - Show service status"
-	@echo "  make dev-clean          - Stop and remove all data (WARNING: destructive!)"
+	@echo "Dependency Services (MatrixOne + Redis):"
+	@echo "  make dev-deps-up        - Start dependency services"
+	@echo "  make dev-deps-down      - Stop dependency services"
+	@echo "  make dev-deps-clean     - Stop and remove all data (WARNING: destructive!)"
+	@echo "  make dev-deps-status    - Show dependency status"
+	@echo "  make dev-deps-logs      - Show all dependency logs"
+	@echo "  make dev-deps-logs-db   - Show MatrixOne logs only"
+	@echo "  make dev-deps-logs-redis - Show Redis logs only"
+	@echo "  make dev-db-connect     - Connect to MatrixOne CLI"
 	@echo ""
-	@echo "Database:"
-	@echo "  make db-init            - Initialize database schema"
-	@echo "  make db-init-agent      - Initialize agent configuration system (RBAC + tables)"
-	@echo "  make db-connect         - Connect to MatrixOne CLI"
-	@echo "  make db-reset           - Reset database (drop + recreate)"
+	@echo "Logging:"
+	@echo "  make dev-logs-clean     - Clear Docker logs"
+	@echo ""
+	@echo "API Server (Source Code Mode):"
+	@echo "  make dev-api-start      - Start API server (hot reload)"
+	@echo "  make dev-api-stop       - Stop API server"
+	@echo "  make dev-api-restart    - Restart API server"
+	@echo "  make dev-api-logs       - Show API server logs"
+	@echo "  make dev-api-status     - Show API server status"
+	@echo ""
+	@echo "API Server (Docker Mode):"
+	@echo "  make dev-api-docker-build - Build API server image"
+	@echo "  make dev-api-docker-up  - Start API server container"
+	@echo "  make dev-api-docker-down - Stop API server container"
+	@echo "  make dev-api-docker-logs - Show container logs"
+	@echo "  make dev-api-docker-scale REPLICAS=N - Scale API server"
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - Run all tests"
-	@echo "  make test-unit          - Run unit tests"
+	@echo "  make test-parallel      - Run all tests in parallel"
+	@echo "  make test-unit          - Run unit tests only"
+	@echo "  make test-unit-parallel - Run unit tests in parallel"
 	@echo "  make test-integration   - Run integration tests"
-	@echo "  make test-api          - Run API integration tests"
-	@echo "  make test-e2e           - Run end-to-end tests"
-	@echo "  make test-runtime       - Run runtime tests (Docker, Firecracker)"
+	@echo "  make test-integration-parallel - Run integration tests in parallel"
+	@echo ""
+	@echo "Environment Setup:"
+	@echo "  make dev-init           - Complete initialization (setup + deps + config)"
+	@echo "  make setup              - Copy .env.example → .env (one-time)"
+	@echo "  make install-dev-deps   - Install Python dev dependencies"
 	@echo ""
 	@echo "Code Quality:"
-	@echo "  make check              - Run all static checks (lint + format + type-check)"
+	@echo "  make check              - Run all static checks"
 	@echo "  make ci                 - Run all CI checks (check + test)"
-	@echo "  make lint               - Run linters (ruff)"
-	@echo "  make lint-fix           - Run linters with auto-fix"
-	@echo "  make type-check         - Run type checker (mypy)"
-	@echo "  make format             - Format code"
-	@echo "  make format-check       - Check code formatting"
+	@echo "  make lint               - Run linters"
+	@echo "  make lint-fix           - Auto-fix linting issues"
 	@echo ""
 	@echo "Examples:"
-	@echo "  make setup && make dev-up                     # First time setup"
-	@echo "  make dev-up && make test                      # Daily development"
-	@echo "  make dev-full                                 # All services + GPU + model"
+	@echo "  make dev-start                    # Daily development"
+	@echo "  make dev-api-restart              # After code changes"
+	@echo "  make test                         # Run all tests"
+	@echo "  make test-parallel                # Run tests in parallel"
+	@echo "  make dev-api-docker-scale REPLICAS=4  # Test load balancing"
 
 # ============================================================================
 # Environment Setup
 # ============================================================================
+
+.PHONY: dev-init
+dev-init: setup install-dev-deps
+	@echo "Initializing development environment..."
+	@python3 scripts/dev/init.py
+	@echo ""
+	@echo "✅ Development environment initialized!"
+	@echo ""
+	@echo "Next: make dev-start"
 
 .PHONY: setup
 setup:
@@ -64,22 +88,13 @@ setup:
 	else \
 		echo "⚠️  .env already exists, skipping"; \
 	fi
-	@echo ""
-	@$(MAKE) install
-	@echo ""
-	@echo "✅ Setup complete! Next steps:"
-	@echo "   1. Review and customize .env file"
-	@echo "   2. Run: make dev-up"
-	@echo "   3. Run: make db-init"
 
-.PHONY: install
-install:
-	@echo "Installing Python dependencies..."
-	@if command -v poetry >/dev/null 2>&1; then \
-		poetry install; \
-	else \
-		pip install -e .; \
-	fi
+.PHONY: install-dev-deps
+install-dev-deps:
+	@echo "Installing all dependencies (runtime + dev)..."
+	@pip install -e .
+	@pip install pytest pytest-asyncio pytest-cov pytest-xdist ruff mypy types-pymysql freezegun vcrpy pre-commit responses
+	@echo "✅ Dependencies installed"
 	@echo "✅ Python dependencies installed"
 
 .PHONY: install-runtime
@@ -172,99 +187,266 @@ check-runtime:
 	@echo "3. Python runtime module:"
 	@python3 -c "from core.runtime import create_runtime; print('   ✅ Runtime module OK')" 2>/dev/null || echo "   ❌ Runtime module error"
 
-.PHONY: lock
-lock:
-	@echo "Updating dependency lock file..."
-	@if command -v poetry >/dev/null 2>&1; then \
-		poetry lock; \
-		echo "✅ poetry.lock updated"; \
-	else \
-		echo "⚠️  Poetry not found, skipping lock (pip doesn't use lock files)"; \
-	fi
-
 # ============================================================================
-# Development Environment
+# Development - Dependency Services (MatrixOne + Redis)
 # ============================================================================
 
-.PHONY: dev-up
-dev-up:
-	@echo "Starting mo-agent-engine development environment..."
-	@cd deployment/all-in-one && docker compose up -d
-	@echo ""
-	@echo "✅ Services started!"
-	@echo "   MatrixOne: mysql -h127.0.0.1 -P6001 -uroot -p111"
-	@echo "   Redis:     redis-cli -h 127.0.0.1 -p 6379"
-	@echo ""
-	@echo "Next: mo-admin init && mo-agent chat"
+.PHONY: dev-deps-up
+dev-deps-up:
+	@echo "Starting dependency services (MatrixOne + Redis)..."
+	@cd deployment/all-in-one && docker compose up -d matrixone redis
+	@echo "✅ Dependency services started"
 
-.PHONY: dev-down
-dev-down:
-	@echo "Stopping mo-agent-engine services..."
+.PHONY: dev-deps-down
+dev-deps-down:
+	@echo "Stopping dependency services..."
 	@cd deployment/all-in-one && docker compose down
+	@echo "✅ Dependency services stopped"
 
-.PHONY: dev-restart
-dev-restart:
-	@echo "Restarting mo-agent-engine services..."
-	@cd deployment/all-in-one && docker compose restart
-
-.PHONY: dev-logs
-dev-logs:
-	@cd deployment/all-in-one && docker compose logs -f
-
-.PHONY: dev-logs-db
-dev-logs-db:
-	@cd deployment/all-in-one && docker compose logs -f matrixone
-
-.PHONY: dev-ps
-dev-ps:
-	@cd deployment/all-in-one && docker compose ps
-
-.PHONY: dev-clean
-dev-clean:
-	@echo "⚠️  WARNING: This will delete all data!"
-	@printf "Are you sure? [y/N] "; \
-	read REPLY; \
+.PHONY: dev-deps-clean
+dev-deps-clean:
+	@echo "⚠️  WARNING: This will delete all dependency data!"
+	@printf "Are you sure? [y/N] " && read REPLY && \
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
-		cd deployment/all-in-one && docker compose --profile full down -v; \
-		echo "✅ All data removed"; \
+		cd deployment/all-in-one && docker compose down -v; \
+		rm -f api_server.pid api_server.log; \
+		echo "✅ All dependency data removed"; \
 	else \
 		echo "Cancelled"; \
 	fi
 
-.PHONY: dev-full
-dev-full:
-	@echo "Starting all services in containers (build + run)..."
-	@cd deployment/all-in-one && docker compose --profile full up -d --build
+.PHONY: dev-deps-status
+dev-deps-status:
+	@echo "Dependency Services Status:"
+	@echo "==========================="
+	@cd deployment/all-in-one && docker compose ps matrixone redis
 
-.PHONY: dev-init
-dev-init: dev-up
-	@echo "✅ Development environment ready!"
+.PHONY: dev-deps-logs
+dev-deps-logs:
+	@cd deployment/all-in-one && docker compose logs -f matrixone redis
+
+.PHONY: dev-deps-logs-db
+dev-deps-logs-db:
+	@cd deployment/all-in-one && docker compose logs -f matrixone
+
+.PHONY: dev-deps-logs-redis
+dev-deps-logs-redis:
+	@cd deployment/all-in-one && docker compose logs -f redis
+
+.PHONY: dev-logs-clean
+dev-logs-clean:
+	@echo "⚠️  Clearing Docker logs..."
+	@docker logs --tail 0 all-in-one-matrixone-1 2>/dev/null || true
+	@docker logs --tail 0 all-in-one-redis-1 2>/dev/null || true
+	@echo "✅ Docker logs cleared"
+
+.PHONY: dev-deps-wait
+dev-deps-wait:
+	@echo "Waiting for dependency services (max 20s)..."
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		if [ "$$(docker inspect --format='{{.State.Running}}' all-in-one-matrixone-1 2>/dev/null)" = "true" ]; then \
+			echo "✅ Dependency services ready"; \
+			exit 0; \
+		fi; \
+		echo "  Waiting... ($$i/10)"; \
+		sleep 2; \
+	done; \
+	echo "❌ Dependency services not ready after 20s"; \
+	echo "   Tip: Services may still be starting. Check with 'make dev-deps-status'"; \
+	exit 1
+
+.PHONY: dev-db-connect
+dev-db-connect:
+	@mysql -h127.0.0.1 -P6001 -uroot -p111
 
 # ============================================================================
-# Database
+# Development - API Server (Source Code Mode)
 # ============================================================================
 
-.PHONY: db-init
-db-init:
-	@echo "Database tables are auto-initialized by FastAPI on startup"
-	@echo "No manual initialization needed"
+.PHONY: dev-api-start
+dev-api-start:
+	@echo "Starting API server (source code mode)..."
+	@if [ -f api_server.pid ] && kill -0 $$(cat api_server.pid) 2>/dev/null; then \
+		echo "⚠️  API server already running (PID: $$(cat api_server.pid))"; \
+	else \
+		NO_PROXY=localhost,127.0.0.1 nohup python -m uvicorn api.main:app --reload --port 8000 > api_server.log 2>&1 & \
+		echo $$! > api_server.pid; \
+		sleep 2; \
+		if kill -0 $$(cat api_server.pid) 2>/dev/null; then \
+			echo "✅ API server started (PID: $$(cat api_server.pid))"; \
+		else \
+			echo "❌ API server failed to start. Check api_server.log"; \
+			exit 1; \
+		fi; \
+	fi
+
+.PHONY: dev-api-stop
+dev-api-stop:
+	@echo "Stopping API server..."
+	@./scripts/dev/stop-api.sh
+
+.PHONY: dev-api-restart
+dev-api-restart: dev-api-stop
+	@sleep 1
+	@$(MAKE) dev-api-start
+
+.PHONY: dev-api-logs
+dev-api-logs:
+	@if [ -f api_server.log ]; then \
+		tail -f api_server.log; \
+	else \
+		echo "❌ api_server.log not found. Is API server running?"; \
+	fi
+
+.PHONY: dev-api-status
+dev-api-status:
+	@echo "API Server Status:"
+	@echo "=================="
+	@if [ -f api_server.pid ] && kill -0 $$(cat api_server.pid) 2>/dev/null; then \
+		echo "  ✅ Running (PID: $$(cat api_server.pid))"; \
+		if command -v jq >/dev/null 2>&1; then \
+			NO_PROXY=localhost curl -s http://localhost:8000/health 2>/dev/null | jq . || echo "  ⚠️  Health check failed"; \
+		else \
+			NO_PROXY=localhost curl -s http://localhost:8000/health 2>/dev/null || echo "  ⚠️  Health check failed"; \
+		fi; \
+	else \
+		echo "  ❌ Not running"; \
+	fi
+
+# ============================================================================
+# Development - API Server (Docker Mode)
+# ============================================================================
+
+.PHONY: dev-api-docker-build
+dev-api-docker-build:
+	@echo "Building API server image..."
+	@docker build -t mo-agent-engine:latest .
+	@echo "✅ Image built"
+
+.PHONY: dev-api-docker-up
+dev-api-docker-up:
+	@echo "Starting API server (Docker mode)..."
+	@cd deployment/all-in-one && docker compose --profile app up -d --build api
+	@echo "✅ API server container started"
+
+.PHONY: dev-api-docker-down
+dev-api-docker-down:
+	@echo "Stopping API server containers..."
+	@cd deployment/all-in-one && docker compose --profile app down
+	@echo "✅ API server containers stopped"
+
+.PHONY: dev-api-docker-logs
+dev-api-docker-logs:
+	@cd deployment/all-in-one && docker compose logs -f api
+
+.PHONY: dev-api-docker-scale
+dev-api-docker-scale:
+	@if [ -z "$(REPLICAS)" ]; then \
+		echo "❌ Usage: make dev-api-docker-scale REPLICAS=N"; \
+		exit 1; \
+	fi
+	@echo "Scaling API server to $(REPLICAS) replicas..."
+	@cd deployment/all-in-one && docker compose --profile app up -d --scale api=$(REPLICAS)
+	@echo "✅ Scaled to $(REPLICAS) replicas"
+
+# ============================================================================
+# Development - Composite Commands (Most Used)
+# ============================================================================
+
+.PHONY: dev-start
+dev-start: dev-deps-up dev-deps-wait dev-api-start
+	@echo ""
+	@echo "✅ Development environment started!"
+	@echo "   API: http://localhost:8000"
+	@echo "   Docs: http://localhost:8000/docs"
+	@echo ""
+	@echo "⚠️  Note: Dependencies may still be starting. Check status with:"
+	@echo "   make dev-status"
+	@echo ""
+	@echo "Next steps:"
+	@echo "  NO_PROXY=localhost mo-agent register"
+	@echo "  NO_PROXY=localhost mo-agent login"
+	@echo "  NO_PROXY=localhost mo-agent chat"
+
+.PHONY: dev-start-docker
+dev-start-docker: dev-deps-up dev-deps-wait dev-api-docker-up
+	@sleep 3
+	@echo ""
+	@echo "✅ Development environment ready (Docker mode)!"
+	@echo "   API: http://localhost:8000"
+	@echo "   Docs: http://localhost:8000/docs"
+
+.PHONY: dev-stop
+dev-stop: dev-api-stop dev-deps-down
+	@echo "✅ All services stopped"
+
+.PHONY: dev-restart
+dev-restart: dev-stop
+	@sleep 1
+	@$(MAKE) dev-start
+
+.PHONY: dev-status
+dev-status:
+	@echo ""
+	@$(MAKE) dev-deps-status
+	@echo ""
+	@$(MAKE) dev-api-status
+
+dev-clean: dev-api-stop dev-deps-clean dev-logs-clean
+	@echo "✅ Development environment cleaned"
+
+.PHONY: dev-reset
+dev-reset: dev-clean
+	@$(MAKE) dev-init
+	@echo "✅ Development environment reset"
+
+# ============================================================================
+# Development - Testing
+# ============================================================================
+
+.PHONY: test
+test: dev-deps-up dev-deps-wait
+	@echo "Running all tests..."
+	@python -m pytest tests/ -v
+
+.PHONY: test-parallel
+test-parallel: dev-deps-up dev-deps-wait
+	@echo "Running all tests in parallel..."
+	@python -m pytest tests/ -n auto --dist loadscope -v
+
+.PHONY: test-unit
+test-unit:
+	@echo "Running unit tests..."
+	@python -m pytest tests/unit/ -v
+
+.PHONY: test-unit-parallel
+test-unit-parallel:
+	@echo "Running unit tests in parallel..."
+	@python -m pytest tests/unit/ -n auto --dist loadscope -v
+
+.PHONY: test-integration
+test-integration: dev-deps-up dev-deps-wait
+	@echo "Running integration tests..."
+	@python -m pytest tests/integration/ -v
+
+.PHONY: test-integration-parallel
+test-integration-parallel: dev-deps-up dev-deps-wait
+	@echo "Running integration tests in parallel..."
+	@python -m pytest tests/integration/ -n auto --dist loadscope -v
+
+# ============================================================================
+# Legacy Aliases (Removed - Use dev-* commands instead)
+# ============================================================================
 
 .PHONY: db-init-agent
 db-init-agent:
-	@echo "Initializing agent configuration system..."
-	@python3 scripts/init_agent_system.py
+	@echo "❌ Deprecated: Use 'make dev-init' instead"
+	@exit 1
 
 .PHONY: db-connect
 db-connect:
-	@echo "Connecting to MatrixOne..."
-	@echo ""
-	@mysql -h127.0.0.1 -P6001 -uroot -p111 2>/dev/null || \
-	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl 2>/dev/null || \
-	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl 2>/dev/null || \
-	(echo "❌ Connection failed. Please try manually:" && \
-	 echo "   mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl   # or" && \
-	 echo "   mysql -h127.0.0.1 -P6001 -uroot -p111 --skip_ssl   # (underscore)" && \
-	 exit 1)
+	@echo "❌ Deprecated: Use 'make dev-db-connect' instead"
+	@exit 1
 
 .PHONY: db-reset
 db-reset:
@@ -291,40 +473,12 @@ db-reset:
 # Testing
 # ============================================================================
 
-.PHONY: test
-test:
-	@echo "Running all tests..."
-	@python -m pytest tests/ -v
 
-.PHONY: test-parallel
-test-parallel:
-	@echo "Running all tests in parallel..."
-	@python -m pytest tests/ -n auto --dist loadscope -v
-
-.PHONY: test-unit
-test-unit:
-	@echo "Running unit tests..."
-	@python -m pytest tests/unit/ -v
-
-.PHONY: test-unit-parallel
-test-unit-parallel:
-	@echo "Running unit tests in parallel..."
-	@python -m pytest tests/unit/ -n auto --dist loadscope -v
-
-.PHONY: test-integration
-test-integration:
-	@echo "Running integration tests..."
-	@python -m pytest tests/integration/ -v
-
-.PHONY: test-integration-parallel
-test-integration-parallel:
-	@echo "Running integration tests in parallel..."
-	@python -m pytest tests/integration/ -n auto --dist loadscope -v
 
 .PHONY: test-cleanup
 test-cleanup:
 	@echo "Cleaning up test databases..."
-	@python scripts/cleanup_test_dbs.py
+	@python scripts/dev/cleanup_test_dbs.py
 
 .PHONY: test-api
 test-api:
@@ -392,5 +546,5 @@ format-check:
 
 .PHONY: pre-commit
 .PHONY: ci
-ci: check test
+ci: dev-deps-up dev-deps-wait check test dev-deps-down
 	@echo "✅ All CI checks passed!"
