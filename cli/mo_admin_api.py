@@ -236,16 +236,95 @@ def feedback_export(ctx, output, min_rating, days):
         click.echo(f"❌ Error: {e}")
 
 
+@cli.group()
+def model():
+    """Manage models."""
+
+
+@model.command("add")
+@click.argument("model_name")
+@click.argument("provider")
+@click.option("--scope", default="global")
+@click.option("--scope-id", default=None)
+@click.pass_context
+def model_add(ctx, model_name, provider, scope, scope_id):
+    """Register a model."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    
+    try:
+        result = client.admin_create_model(
+            model_name=model_name,
+            provider=provider,
+            scope=scope,
+            scope_id=scope_id,
+        )
+        click.echo(f"✅ Model registered: {model_name}")
+    except Exception as e:
+        click.echo(f"❌ Failed: {e}")
+        sys.exit(1)
+
+
+@model.command("list")
+@click.pass_context
+def model_list(ctx):
+    """List models."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    
+    try:
+        models = client.admin_list_models()
+        if not models:
+            click.echo("No models found")
+            return
+        
+        click.echo("Models:")
+        for m in models:
+            click.echo(f"  {m['name']} ({m['provider']})")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
+@cli.command()
+@click.option("--username", prompt=True)
+@click.option("--password", prompt=True, hide_input=True)
+@click.option("--email", default=None)
+@click.pass_context
+def register(ctx, username, password, email):
+    """Register new admin user."""
+    client = ctx.obj["client"]
+    
+    try:
+        result = client.admin_register(
+            username=username,
+            password=password,
+            email=email or f"{username}@admin.local",
+        )
+        click.echo(f"✅ Admin registered: {username}")
+    except Exception as e:
+        click.echo(f"❌ Failed: {e}")
+        sys.exit(1)
+
+
 @cli.command()
 @click.pass_context
 def whoami(ctx):
-    """Show current user."""
+    """Show current user info."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    
     try:
-        user = ctx.obj["client"].get_current_user()
-        click.echo(f"Logged in as: {user['email']}")
-        click.echo(f"Role: {user.get('role', 'N/A')}")
+        result = client.get_current_user()
+        if "username" in result:
+            click.echo(f"Username: {result['username']}")
+        click.echo(f"Email: {result['email']}")
+        if "user_id" in result:
+            click.echo(f"User ID: {result['user_id']}")
+        if "role" in result:
+            click.echo(f"Role: {result['role']}")
     except Exception as e:
-        click.echo(f"❌ Not authenticated: {e}")
+        click.echo(f"❌ Error: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

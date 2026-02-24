@@ -114,7 +114,24 @@ def register(ctx, email, password, username):
         result = ctx.obj["client"].register(username, password, email)
         click.echo(f"✅ Registered as {result['email']}")
     except Exception as e:
-        click.echo(f"❌ Registration failed: {e}")
+        error_msg = str(e)
+        # Extract detail from API error if available
+        if "Username already exists" in error_msg:
+            click.echo(f"❌ Username '{username}' is already taken")
+        elif "Email already exists" in error_msg:
+            click.echo(f"❌ Email '{email}' is already registered")
+        elif "String should have at least 8 characters" in error_msg and "password" in error_msg:
+            click.echo(f"❌ Password must be at least 8 characters")
+        elif "422" in error_msg:
+            # Parse validation error
+            if "password" in error_msg:
+                click.echo(f"❌ Invalid password format")
+            elif "email" in error_msg:
+                click.echo(f"❌ Invalid email format")
+            else:
+                click.echo(f"❌ Invalid input")
+        else:
+            click.echo(f"❌ Registration failed: {error_msg}")
         sys.exit(1)
 
 
@@ -131,8 +148,27 @@ def chat(ctx, user_id, session_id, no_stream):
     click.echo("=" * 50)
     
     if not client.ensure_authenticated():
-        click.echo("❌ Please login first: mo-agent login")
-        sys.exit(1)
+        click.echo("❌ Not logged in")
+        click.echo("")
+        if click.confirm("Login now?", default=True):
+            username = click.prompt("Username")
+            password = click.prompt("Password", hide_input=True)
+            try:
+                client.login(username, password)
+                click.echo("✅ Logged in")
+            except Exception as e:
+                click.echo(f"❌ Login failed: {e}")
+                sys.exit(1)
+        else:
+            click.echo("Run: mo-agent login")
+            sys.exit(1)
+    
+    # Get current user info
+    try:
+        user_info = client.get_current_user()
+        username = user_info.get("username", "You")
+    except Exception:
+        username = "You"
     
     if not session_id:
         # API expects agent_id, not user_id
@@ -143,7 +179,7 @@ def chat(ctx, user_id, session_id, no_stream):
     
     try:
         while True:
-            user_input = click.prompt("You", type=str, prompt_suffix="> ")
+            user_input = click.prompt(username, type=str, prompt_suffix="> ")
             if user_input.lower() in ["exit", "quit"]:
                 break
             

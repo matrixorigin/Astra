@@ -42,14 +42,12 @@ help:
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - Run all tests"
-	@echo "  make test-parallel      - Run all tests in parallel"
 	@echo "  make test-unit          - Run unit tests only"
-	@echo "  make test-unit-parallel - Run unit tests in parallel"
-	@echo "  make test-integration   - Run integration tests"
-	@echo "  make test-integration-parallel - Run integration tests in parallel"
+	@echo "  make test-integration   - Run integration tests only"
 	@echo ""
 	@echo "Environment Setup:"
 	@echo "  make dev-init           - Complete initialization (setup + deps + config)"
+	@echo "  make dev-setup-demo     - Interactive demo setup (admin + model + user)"
 	@echo "  make setup              - Copy .env.example → .env (one-time)"
 	@echo "  make install-dev-deps   - Install Python dev dependencies"
 	@echo ""
@@ -63,7 +61,7 @@ help:
 	@echo "  make dev-start                    # Daily development"
 	@echo "  make dev-api-restart              # After code changes"
 	@echo "  make test                         # Run all tests"
-	@echo "  make test-parallel                # Run tests in parallel"
+	@echo "  make test-unit                    # Run unit tests only"
 	@echo "  make dev-api-docker-scale REPLICAS=4  # Test load balancing"
 
 # ============================================================================
@@ -78,6 +76,10 @@ dev-init: setup install-dev-deps
 	@echo "✅ Development environment initialized!"
 	@echo ""
 	@echo "Next: make dev-start"
+
+.PHONY: dev-setup-demo
+dev-setup-demo:
+	@bash scripts/setup/demo-init.sh
 
 .PHONY: setup
 setup:
@@ -265,20 +267,7 @@ dev-db-connect:
 
 .PHONY: dev-api-start
 dev-api-start:
-	@echo "Starting API server (source code mode)..."
-	@if [ -f api_server.pid ] && kill -0 $$(cat api_server.pid) 2>/dev/null; then \
-		echo "⚠️  API server already running (PID: $$(cat api_server.pid))"; \
-	else \
-		NO_PROXY=localhost,127.0.0.1 nohup python -m uvicorn api.main:app --reload --port 8000 > api_server.log 2>&1 & \
-		echo $$! > api_server.pid; \
-		sleep 2; \
-		if kill -0 $$(cat api_server.pid) 2>/dev/null; then \
-			echo "✅ API server started (PID: $$(cat api_server.pid))"; \
-		else \
-			echo "❌ API server failed to start. Check api_server.log"; \
-			exit 1; \
-		fi; \
-	fi
+	@./scripts/dev/start-api.sh
 
 .PHONY: dev-api-stop
 dev-api-stop:
@@ -405,33 +394,26 @@ dev-reset: dev-clean
 # ============================================================================
 
 .PHONY: test
-test: dev-deps-up dev-deps-wait
+test:
 	@echo "Running all tests..."
-	@python -m pytest tests/ -v
-
-.PHONY: test-parallel
-test-parallel: dev-deps-up dev-deps-wait
-	@echo "Running all tests in parallel..."
+	@if ! docker ps | grep -q matrixone; then \
+		echo "❌ Error: MatrixOne is not running. Start services with 'make dev-start'"; \
+		exit 1; \
+	fi
 	@python -m pytest tests/ -n auto --dist loadscope -v
 
 .PHONY: test-unit
 test-unit:
 	@echo "Running unit tests..."
-	@python -m pytest tests/unit/ -v
-
-.PHONY: test-unit-parallel
-test-unit-parallel:
-	@echo "Running unit tests in parallel..."
 	@python -m pytest tests/unit/ -n auto --dist loadscope -v
 
 .PHONY: test-integration
-test-integration: dev-deps-up dev-deps-wait
+test-integration:
 	@echo "Running integration tests..."
-	@python -m pytest tests/integration/ -v
-
-.PHONY: test-integration-parallel
-test-integration-parallel: dev-deps-up dev-deps-wait
-	@echo "Running integration tests in parallel..."
+	@if ! docker ps | grep -q matrixone; then \
+		echo "❌ Error: MatrixOne is not running. Start services with 'make dev-start'"; \
+		exit 1; \
+	fi
 	@python -m pytest tests/integration/ -n auto --dist loadscope -v
 
 # ============================================================================

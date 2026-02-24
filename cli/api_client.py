@@ -103,7 +103,18 @@ class APIClient:
             headers["Authorization"] = f"Bearer {self._access_token}"
             response = await self._client.request(method, url, headers=headers, **kwargs)
 
-        response.raise_for_status()
+        if response.status_code >= 400:
+            try:
+                error_data = response.json()
+                detail = error_data.get("detail", str(response.text))
+            except Exception:
+                detail = response.text
+            raise httpx.HTTPStatusError(
+                f"{response.status_code} {response.reason_phrase}: {detail}",
+                request=response.request,
+                response=response,
+            )
+        
         return response
 
     async def _refresh_access_token(self) -> None:
@@ -511,4 +522,43 @@ class APIClient:
             "/admin/feedback/export",
             json={"agent_id": agent_id, "format": format},
         )
+        return response.json()
+
+    async def admin_register(
+        self,
+        username: str,
+        password: str,
+        email: str,
+    ) -> dict[str, Any]:
+        """Register new admin user."""
+        response = await self._request(
+            "POST",
+            "/auth/register",
+            json={"username": username, "password": password, "email": email},
+        )
+        return response.json()
+
+    async def admin_create_model(
+        self,
+        model_name: str,
+        provider: str,
+        scope: str = "global",
+        scope_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Register a model."""
+        response = await self._request(
+            "POST",
+            "/models",
+            json={
+                "name": model_name,
+                "provider": provider,
+                "scope": scope,
+                "scope_id": scope_id,
+            },
+        )
+        return response.json()
+
+    async def admin_list_models(self) -> list[dict[str, Any]]:
+        """List all models."""
+        response = await self._request("GET", "/models")
         return response.json()

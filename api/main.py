@@ -220,6 +220,11 @@ app.include_router(data_versioning.router)
 # Admin — system management (requires admin role)
 app.include_router(admin.router, tags=["admin"])
 
+# Models — model management
+from api.routers import models
+
+app.include_router(models.router, tags=["models"])
+
 
 @app.get("/health")
 def health_check():

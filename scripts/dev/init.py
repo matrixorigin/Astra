@@ -43,7 +43,21 @@ def main():
     else:
         print("✅ TOKEN_ENCRYPTION_KEY already configured")
     
-    # 2. Validate LLM configuration
+    # 2. Generate JWT_SECRET_KEY if missing
+    if "JWT_SECRET_KEY" not in content or "CHANGE_ME" in content:
+        import secrets
+        jwt_key = secrets.token_urlsafe(32)
+        
+        # Remove old placeholder if exists
+        lines = [line for line in lines if not line.startswith("JWT_SECRET_KEY=")]
+        lines.append(f"JWT_SECRET_KEY={jwt_key}")
+        
+        print("✅ Generated JWT_SECRET_KEY")
+        modified = True
+    else:
+        print("✅ JWT_SECRET_KEY already configured")
+    
+    # 3. Validate LLM configuration
     llm_provider = None
     llm_model = None
     for line in lines:
