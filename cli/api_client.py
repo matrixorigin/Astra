@@ -307,6 +307,66 @@ class APIClient:
             async for sse in event_source.aiter_sse():
                 yield json.loads(sse.data)
 
+    async def chat_turn(
+        self,
+        messages: list[dict[str, Any]],
+        session_id: str | None = None,
+        tool_results: list[dict[str, Any]] | None = None,
+        project_rules: str | None = None,
+        agent_id: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Call /chat/turn — one LLM turn in the edge-cloud loop.
+
+        Returns SSE events: text_delta, tool_call, usage, turn_complete, session_info.
+        """
+        if not self._client:
+            raise RuntimeError("Client not initialized")
+
+        headers = {}
+        if self._access_token:
+            headers["Authorization"] = f"Bearer {self._access_token}"
+
+        payload: dict[str, Any] = {"messages": messages}
+        if session_id:
+            payload["session_id"] = session_id
+        if tool_results:
+            payload["tool_results"] = tool_results
+        if project_rules:
+            payload["project_rules"] = project_rules
+        if agent_id:
+            payload["agent_id"] = agent_id
+        if model:
+            payload["model"] = model
+
+        url = f"{self.base_url}/chat/turn"
+        async with aconnect_sse(
+            self._client, "POST", url, json=payload, headers=headers,
+        ) as event_source:
+            async for sse in event_source.aiter_sse():
+                yield json.loads(sse.data)
+
+    async def get_pending_runs(self) -> list[dict[str, Any]]:
+        """Get runs in RESUME_PENDING state for current user (mailbox pattern)."""
+        response = await self._request("GET", "/runs/pending")
+        return response.json()
+
+    async def resume_run(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
+        """Resume a RESUME_PENDING run (mailbox pattern)."""
+        if not self._client:
+            raise RuntimeError("Client not initialized")
+
+        headers = {}
+        if self._access_token:
+            headers["Authorization"] = f"Bearer {self._access_token}"
+
+        url = f"{self.base_url}/chat/turn/resume"
+        async with aconnect_sse(
+            self._client, "POST", url, json={"run_id": run_id}, headers=headers,
+        ) as event_source:
+            async for sse in event_source.aiter_sse():
+                yield json.loads(sse.data)
+
     async def get_run_status(self, run_id: str) -> dict[str, Any]:
         """Get run status and progress."""
         response = await self._request("GET", f"/chat/runs/{run_id}")
