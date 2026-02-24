@@ -1,9 +1,12 @@
 """Event logger for writing conversation events.
 
 Handles event creation and persistence to the database.
+When EVENT_PIPELINE_ENABLED=true (default), delegates writes to EventPipeline
+for async batched ingestion. Otherwise falls back to synchronous DB writes.
 """
 
 import json
+import os
 
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
@@ -11,35 +14,45 @@ from uuid_utils import uuid7
 from api.models import Event as EventModel
 from core.events.models import ConversationEvent, EventType
 
+_PIPELINE_ENABLED = os.environ.get("EVENT_PIPELINE_ENABLED", "true").lower() in ("true", "1", "yes")
+
 
 class EventLogger:
     """Logger for conversation events.
 
     Provides methods to create and persist events following the event-centric design.
+    When a pipeline is attached, log_event() delegates to pipeline.emit() (async).
     """
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, pipeline=None) -> None:
         """Initialize event logger.
 
         Args:
             session: SQLAlchemy session (required).
+            pipeline: Optional EventPipeline for async writes.
         """
         if not isinstance(session, Session):
             raise TypeError("session must be a SQLAlchemy Session")
         self.session = session
+        self._pipeline = pipeline
 
     def log_event(self, event: ConversationEvent) -> str:
         """Log a conversation event to the database.
+
+        When pipeline is attached and enabled, delegates to pipeline.emit().
+        Otherwise falls back to synchronous DB write.
 
         Args:
             event: Event to log
 
         Returns:
             str: Event ID
-
-        Raises:
-            Exception: If database operation fails
         """
+        # Async path: delegate to pipeline
+        if self._pipeline and _PIPELINE_ENABLED:
+            return self._pipeline.emit(event)
+
+        # Synchronous path (legacy)
         # Generate embedding for content
         embedding = None
         if event.content:
@@ -91,6 +104,14 @@ class EventLogger:
         self.session.add(db_event)
         self.session.commit()
         return event.event_id
+
+    def flush_critical(self) -> None:
+        """Flush critical events synchronously via pipeline.
+
+        No-op when pipeline is not attached (synchronous writes already committed).
+        """
+        if self._pipeline and _PIPELINE_ENABLED:
+            self._pipeline.flush_critical()
 
     def create_plan_event(
         self,

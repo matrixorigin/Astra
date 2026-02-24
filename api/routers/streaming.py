@@ -57,6 +57,10 @@ async def stream_chat(
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
             yield f"data: {json.dumps({'event_type': 'run_error', 'data': {'error': str(e)}})}\n\n"
+        finally:
+            _pipeline = getattr(getattr(loop, 'event_logger', None), '_pipeline', None)
+            if _pipeline:
+                _pipeline.shutdown()
 
     return StreamingResponse(
         event_generator(),

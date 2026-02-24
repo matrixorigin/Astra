@@ -92,7 +92,19 @@ def _build_chat_loop(db: Session):
     from core.skills.registry import SkillRegistry
     from core.verification.firewall import HallucinationFirewall
 
-    event_logger = EventLogger(db)
+    # Create EventPipeline for async writes (feature-flagged)
+    pipeline = None
+    try:
+        from core.events.pipeline import EventPipeline
+        from core.events.event_logger import _PIPELINE_ENABLED
+        if _PIPELINE_ENABLED:
+            from api.database import SessionLocal
+            pipeline = EventPipeline(SessionLocal)
+            pipeline.start()
+    except Exception:
+        pass
+
+    event_logger = EventLogger(db, pipeline=pipeline)
     llm_client = LLMClient(db=db)
 
     # Wire GateTrigger so skill/prompt changes auto-trigger regression gate

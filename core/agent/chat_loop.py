@@ -174,6 +174,7 @@ class ChatLoop:
             session_id=session_id,
             content=user_input,
         )
+        self.event_logger.flush_critical()  # Must be visible for build_context
 
         # 2. Build context and save context snapshot (always enabled).
         #    This is a *business-level* snapshot of what the LLM sees (system prompt,
@@ -630,6 +631,7 @@ class ChatLoop:
             session_id=session_id,
             content=user_input,
         )
+        self.event_logger.flush_critical()  # Must be visible for build_context
 
         # 2. Build context and save context snapshot (same as non-stream path).
         #    This is a *business-level* snapshot of what the LLM sees (system prompt,
@@ -1189,6 +1191,7 @@ class ChatLoop:
                 session_id=session_id,
                 content=user_input,
             )
+            self.event_logger.flush_critical()  # Must be visible for build_context
 
         if not context_capture_id:
             from core.context.manager import TaskType

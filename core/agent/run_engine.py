@@ -72,10 +72,12 @@ def _start_gc_task() -> None:
     """Start periodic GC task if not already running."""
     global _gc_task
     if _gc_task is None or _gc_task.done():
+        coro = _periodic_gc()
         try:
-            _gc_task = asyncio.create_task(_periodic_gc())
+            _gc_task = asyncio.create_task(coro)
             logger.info("Started periodic GC task")
         except RuntimeError:
+            coro.close()
             logger.warning("Cannot start GC task: no running event loop")
 
 
@@ -221,6 +223,7 @@ class RunEngine:
         bg_event_logger = EventLogger(bg_db)
         tok_db = _task_db.set(bg_db)
         tok_el = _task_event_logger.set(bg_event_logger)
+        loop = None
         try:
             # Load agent config and inject model if not already set
             if run.agent_id:
@@ -261,6 +264,18 @@ class RunEngine:
             })
             raise  # Re-raise to ensure proper cleanup
         finally:
+            # Shutdown EventPipeline to release its DB session and background task
+            try:
+                _pipeline = getattr(getattr(loop, 'event_logger', None), '_pipeline', None) if loop else None
+                if _pipeline:
+                    _shutdown_task = _pipeline.shutdown()
+                    if _shutdown_task:
+                        try:
+                            await asyncio.wait_for(_shutdown_task, timeout=2.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            pass
+            except Exception:
+                pass
             _run_tasks.pop(run.run_id, None)
             _run_waiters.get(run.run_id, asyncio.Event()).set()
             # Fan-in: if this is a child run that ended, check parent
@@ -718,6 +733,8 @@ class RunEngine:
         restored = self.restore_run(run_id)
         return restored.agent_id if restored else run_id
 
+    _TERMINAL_EVENT_TYPES = {EventType.RUN_COMPLETED, EventType.RUN_FAILED, EventType.RUN_CANCELLED}
+
     def _log_run_event(self, run: AgentRun, event_type: EventType, extra_meta: dict | None = None) -> None:
         meta = {"run_id": run.run_id}
         if run.parent_run_id:
@@ -738,6 +755,10 @@ class RunEngine:
             causal_chain_id=causal_chain_id,
             metadata=meta,
         )
+
+        # Terminal states must be visible for cross-worker polling
+        if event_type in self._TERMINAL_EVENT_TYPES:
+            self.event_logger.flush_critical()
 
     def _write_cancel_event_for_run(self, run_id: str, session_id: str, user_id: str) -> None:
         """Write a cancel event to DB for a run on another worker."""

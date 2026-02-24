@@ -192,8 +192,8 @@ class TestSpawnRuns:
                     run_id=parent.run_id,
                 )
             
-            # Let pending tasks run
-            await asyncio.sleep(0.1)
+                # Let pending tasks run while patches are still active
+                await asyncio.sleep(0.1)
 
         assert result["count"] == 2
         assert result["wait_for"] == f"children:{parent.run_id}"
@@ -250,6 +250,6 @@ class TestSpawnRuns:
                     run_id=parent.run_id,
                 )
 
-            await asyncio.sleep(0.1)
+                await asyncio.sleep(0.1)
 
         assert result["count"] == 1  # Only the valid one

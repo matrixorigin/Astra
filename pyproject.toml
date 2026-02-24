@@ -114,6 +114,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+filterwarnings = [
+    "error::RuntimeWarning",
+]
 markers = [
     "integration: marks tests as integration tests (require database setup)",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",

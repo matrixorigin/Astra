@@ -8,6 +8,9 @@ import os
 # Set test encryption key
 os.environ["TOKEN_ENCRYPTION_KEY"] = "test-encryption-key-for-unit-tests-only"
 
+# Disable EventPipeline in tests to prevent background DB sessions from leaking
+os.environ["EVENT_PIPELINE_ENABLED"] = "false"
+
 # Support parallel testing with worker-specific databases
 def get_worker_id():
     """Get pytest-xdist worker ID for database isolation."""
@@ -71,7 +74,10 @@ def _cleanup_worker_databases():
         return  # Only cleanup from master process
     
     try:
+        import logging
         from matrixone import Client
+        # Suppress MatrixOne client logging during teardown (stderr may be closed in xdist workers)
+        logging.getLogger("matrixone").setLevel(logging.CRITICAL)
         client = Client(
             host=TEST_DATABASE_CONFIG["host"],
             port=TEST_DATABASE_CONFIG["port"],
