@@ -1,6 +1,6 @@
 # Feedback Classification Model — Design
 
-> **Status**: Design — native Agent OS capability for implicit feedback detection  
+> **Status**: Design — native Agent Runtime capability for implicit feedback detection  
 > **Last Updated**: 2026-02-21  
 > **Dependencies**: implicit_feedback.py (heuristic layer), llm_feedback table, training data pipeline
 
@@ -24,7 +24,7 @@ Users rarely give explicit feedback. But their next message is rich with implici
 
 ---
 
-## 2. Why This Is a Native Agent OS Capability
+## 2. Why This Is a Native Agent Runtime Capability
 
 The platform already has every piece of the pipeline:
 

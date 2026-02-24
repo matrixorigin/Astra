@@ -270,7 +270,7 @@ LLM batch classification ───────────┘    (query, respons
                                     Replace heuristic layer
 ```
 
-**Why this is a native Agent OS capability:**
+**Why this is a native Agent Runtime capability:**
 - The platform already captures all conversation events with full context
 - Feedback labels accumulate naturally through usage (implicit + explicit)
 - The training data pipeline (§6) already handles versioning and lineage

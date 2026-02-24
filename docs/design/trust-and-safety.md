@@ -1,7 +1,7 @@
 # Trust and Safety
 
 > **Status**: Core Design — single source of truth for audit, verification, and safety  
-> **Last Updated**: 2026-02-20
+> **Last Updated**: 2026-02-25
 
 ---
 
@@ -10,6 +10,20 @@
 The industry is converging on a hard truth: **intelligence is not the bottleneck for agent adoption — trust is.** McKinsey reports only 1% of organizations consider their AI adoption fully mature. The gap is not capability but governance, auditability, and safety.
 
 mo-agent-engine's competitive position is not "smarter agents" but **provably trustworthy agents**. Every capability in this document is platform infrastructure — agents get it automatically, developers don't implement it.
+
+### Edge Trust Boundary
+
+In the [Edge-Cloud Execution](edge-cloud-execution.md) architecture, tool results originate from the user's machine (edge) and are transmitted to the cloud via `/chat/turn`. These are **untrusted inputs**:
+
+| Source | Tag | Trust Level |
+|--------|-----|-------------|
+| Cloud (LLM response, memory, context assembly) | `source: "cloud"` | Verified — produced by platform |
+| Edge (tool_results, file contents, shell output) | `source: "edge"` | Unverified — user-controlled machine |
+
+**Implications for trust subsystems:**
+- **Hallucination Firewall**: tool_results from edge are treated as unverified evidence. The firewall verifies LLM claims against the snapshot, but the snapshot itself may contain edge-sourced data. Claims verified only against cloud-sourced data carry higher confidence.
+- **Decision Audit**: audit events record `source` provenance. Compliance queries can filter to cloud-verified events only.
+- **Guardrails**: input validation (Layer 1) applies to edge-submitted tool_results — prompt injection detection runs on tool output before it enters the LLM context.
 
 ---
 

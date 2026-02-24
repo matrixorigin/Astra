@@ -1,8 +1,8 @@
 # Code Execution
 
 > **Status**: Implementing (Phase 1 MVP)
-> **Last Updated**: 2026-02-20
-> **Dependencies**: [Data Versioning](data-versioning.md), [Trust and Safety](trust-and-safety.md), [Skills and Tools](skills-and-tools.md)
+> **Last Updated**: 2026-02-25
+> **Dependencies**: [Data Versioning](data-versioning.md), [Trust and Safety](trust-and-safety.md), [Skills and Tools](skills-and-tools.md), [Edge-Cloud Execution](edge-cloud-execution.md)
 
 ---
 
@@ -13,6 +13,12 @@ An agent that can only talk is a chatbot. An agent that can execute code is a wo
 The industry has converged on this: OpenAI Codex runs code in sandboxed VMs. Glean (Feb 2026) argues agents need sandboxes as "persistent short-term memory." The Plan-Code-Execute pattern shows agents creating their own tools at runtime via code generation.
 
 **The question is no longer whether agents should execute code, but how.**
+
+### Execution Location in Edge-Cloud Architecture
+
+Code execution is a **cloud skill**. Unlike file/shell/git tools that must run on the user's machine (edge), code sandbox requires isolation guarantees (Docker, resource limits, network control) that the edge cannot reliably provide. The cloud manages sandbox lifecycle, data context (CLONE/Branch), and security enforcement.
+
+Edge agents invoke code execution via tool calls; the cloud intercepts, executes in sandbox, and returns results. See [Edge-Cloud Execution § Skill Classification](edge-cloud-execution.md).
 
 ---
 

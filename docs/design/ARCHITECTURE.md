@@ -7,9 +7,15 @@
 
 ## What We Are
 
-An **Agent Operating System** — not a framework, not a chatbot wrapper.
+An **Agentic Runtime** — not a framework, not a chatbot wrapper, not an OS.
 
-Frameworks (LangChain, CrewAI) give you libraries. An OS gives you **infrastructure guarantees**: every agent on this platform automatically gets auditable decisions, versioned memory, safe experimentation, and cost control. The agent developer writes a system prompt and picks skills. The platform handles everything else.
+- **Framework** (LangChain, CrewAI): gives you libraries. You assemble the pieces. No guarantees.
+- **Coding Assistant** (Claude Code, Cursor): single-purpose tool. Runs locally, no platform services.
+- **Agentic Runtime** (mo-agent): provides **execution environment + infrastructure guarantees**. Every agent on this platform automatically gets auditable decisions, versioned memory, safe experimentation, cost control, and trust verification. The agent developer writes a system prompt and picks skills. The runtime handles everything else.
+
+Why "Runtime" and not "OS"? An OS manages hardware resources (processes, memory, filesystems). We don't. We manage **agent lifecycle resources**: context budget, memory governance, skill versioning, decision audit, cost tracking. The relationship between mo-agent and an agent is analogous to JVM and a Java program — the runtime provides managed execution with guarantees the raw environment doesn't offer.
+
+Why "Agentic"? The runtime is not passive. It has agency of its own — it actively manages the agents running on it: implicit feedback mining → prompt auto-evolution → regression gate → activate. Memory self-curates (confidence decay, quarantine, compression). Skill selection learns from historical outcomes. The runtime is itself an agent that governs other agents.
 
 ## The Problem Space
 
@@ -37,6 +43,11 @@ We don't compete on "smarter LLM." We compete on **trust infrastructure**: every
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
+│                         EDGE                                │
+│  EdgeChatLoop │ Local Tools │ MCP Servers │ Permissions     │
+│  Runs on user's machine. Drives agentic loop.               │
+│  Executes tools locally. Syncs state to cloud.              │
+├─────────────────────────────────────────────────────────────┤
 │                      USER AGENTS (Apps)                     │
 │  Code Review · CI Diagnosis · Data Analysis · Custom        │
 │  Defined by: system_prompt + skill_set + model              │
@@ -45,7 +56,7 @@ We don't compete on "smarter LLM." We compete on **trust infrastructure**: every
 │  Regression · Audit · Tuning · Eval                         │
 │  Same execution model, elevated permissions, auto-triggered │
 ├─────────────────────────────────────────────────────────────┤
-│                  PLATFORM SERVICES (Kernel)                  │
+│                  PLATFORM SERVICES (Cloud)                   │
 │  Memory │ Context │ Skills │ Planning │ Trust Engine │       │
 │  LLM Client │ Streaming │ Evaluation │ Cost Control         │
 ├─────────────────────────────────────────────────────────────┤
@@ -68,10 +79,11 @@ We don't compete on "smarter LLM." We compete on **trust infrastructure**: every
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Key distinction — two data layers**:
+**Three execution layers**:
 
-1. **Platform DB** — single database managed by platform operator. Stores identity, sessions, events, audit trail, skill catalog, credentials, and all skill business data. Core tables have no prefix; skill business tables use `sk_{skill}_{table}` naming convention.
-2. **Enhanced Services** — opt-in capabilities when running on MatrixOne (zero-copy clone, time-travel, hybrid search).
+1. **Edge** — user's machine. Drives the agentic loop (EdgeChatLoop), executes local tools (file, shell, git, MCP). State syncs to cloud. See [Edge-Cloud Execution](edge-cloud-execution.md).
+2. **Platform Services (Cloud)** — API server. Handles LLM calls (API key security, context assembly, memory injection, model routing, budget control, audit). Source of truth for all state. System agents run entirely here.
+3. **Enhanced Services** — opt-in capabilities when running on MatrixOne (zero-copy clone, time-travel, hybrid search).
 
 Skills are **stateful platform capabilities** with platform-defined schemas and typed API layers. Skill tables are defined in `skills/{name}/models.py` and created by `init_db()`. See [Skill-as-Package](skill-as-package.md).
 
@@ -93,8 +105,14 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt auto-evolution, implicit feedback mining, self-improving agents, meta-learning closed loop |
 | [Write Path Optimization](write-path-optimization.md) | Async event pipeline: fire-and-forget emit, background batch flush, embedding fully decoupled into `event_embeddings`, event tiering — 60x hot-path latency reduction |
 | [Feedback Classification Model](feedback-classification-model.md) | Native feedback classifier: data pipeline, model training, deployment as platform skill, continuous learning |
-| [Deployment Architecture](deployment-architecture.md) | Deployment topologies (single machine → K8s), CLI-as-API-client architecture, execution backend abstraction, GPU scheduling, Ray integration |
-| [Implementation Plan](implementation-plan.md) | Unified execution plan: write path optimization (A1-A5) + CLI SaaS architecture (B1-B5), acceptance criteria, risk register |
+| [Deployment Architecture](deployment-architecture.md) | Deployment topologies (single machine → K8s), edge-cloud split execution, `/chat/turn` protocol, execution backend abstraction, GPU scheduling, Ray integration |
+| [Implementation Plan](implementation-plan.md) | Unified execution plan: write path optimization (A1-A5) + CLI edge-cloud architecture (B1-B5), acceptance criteria, risk register |
+
+### Core Design (continued)
+
+| Document | Scope |
+|----------|-------|
+| [Edge-Cloud Execution](edge-cloud-execution.md) | Edge-cloud split execution: `/chat/turn` protocol, skill classification (edge/cloud/hybrid), edge state model, security model, sync protocol |
 
 ### Supporting Documents (Implementation)
 

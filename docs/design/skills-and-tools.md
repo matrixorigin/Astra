@@ -35,17 +35,27 @@ Skills are platform capabilities with deterministic schemas: tables are defined 
 
 ### Execution Model
 
-Skills are **always executed in-process** as function calls within the ChatLoop. This is the
-same approach used by Claude Code, Cursor, LangChain, and CrewAI. No containerization or
-subprocess isolation for individual tool calls.
+Skills execute in two locations depending on what they need access to. See [Edge-Cloud Execution](edge-cloud-execution.md) for the full design.
 
-Three execution paths in ChatLoop:
-1. **Built-in Skill** → `AgentExecutor.execute_skill()` → `ToolMockingLayer.execute()` → `skill.execute()`
-2. **MCP Tool** → `MCPBridge.call_tool()` → MCP server (separate process via stdio/HTTP)
-3. **Scratchpad** → in-memory, no external call
+**Edge skills** (execute on user's machine):
+- File ops, shell, git, grep, glob, MCP servers
+- Need local filesystem — server doesn't have it
+- Executed by edge's tool router; cloud returns `tool_calls`, edge runs them
+
+**Cloud skills** (execute on server):
+- Knowledge search, memory recall, session history, marketplace
+- Need platform data in MatrixOne
+- Executed server-side during `/chat/turn` processing
+
+**Execution paths**:
+1. **Edge Tool** → EdgeChatLoop receives `tool_call` from cloud → `tool_router.execute()` → result sent back in next `/chat/turn`
+2. **Cloud Skill** → `AgentExecutor.execute_skill()` → `ToolMockingLayer.execute()` → `skill.execute()` (server-side, within `/chat/turn`)
+3. **MCP Tool** → `MCPBridge.call_tool()` → MCP server (separate process via stdio/HTTP, on edge)
+4. **Scratchpad** → in-memory, no external call (server-side)
 
 Safety is NOT achieved through isolation, but through:
 - `SideEffectCategory` (READ/WRITE/DESTRUCTIVE) → approval gates
+- Edge permission system (allow/ask/deny) for local tools
 - `ToolMockingLayer` → replay mode blocks destructive ops
 - MCP tools → naturally process-isolated
 

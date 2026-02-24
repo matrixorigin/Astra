@@ -78,6 +78,8 @@ Sources: [LangSmith SDK Background Processing](https://deepwiki.com/langchain-ai
 
 Events are enqueued in-memory (<1μs). A background thread drains, batches, and flushes to DB. The chat turn only blocks on DB for the minimal set of reads it actually needs (build_context, get_tools_schema).
 
+In the [Edge-Cloud Execution](edge-cloud-execution.md) architecture, edge-sourced events (tool_results) arrive via `/chat/turn` and enter this same pipeline on the cloud side. They are tagged `source: "edge"` for audit provenance (see [Trust and Safety § Edge Trust Boundary](trust-and-safety.md)) but follow identical classification, batching, and flush rules.
+
 ### Architecture
 
 ```

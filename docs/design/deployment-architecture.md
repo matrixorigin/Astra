@@ -42,65 +42,169 @@ mo-agent-engine consists of these runtime components:
 
 ---
 
-## 1.1. CLI Architecture: API Client, Not DB Client
+## 1.1. CLI Architecture: Edge-Cloud Split Execution
 
-> **Status**: Current code is CLI → DB (prototype). Target architecture is CLI → API → DB (SaaS-ready).
+> **Status**: Current code is CLI → DB (prototype). Target architecture is split execution with edge-side tool execution and cloud-side LLM + platform services.
+> **Last Updated**: 2026-02-25
 
 ### The Problem
 
-The current CLI (`mo_agent.py`, `mo_admin.py`) directly imports core libraries and connects to MatrixOne:
+The previous design (§1.1 v1) assumed CLI is a "thin HTTP client" with all execution on the server. This has a fundamental flaw: **the server does not have the user's file system.** Agent tools like `read_file`, `bash`, `git_diff` must execute on the user's machine. Routing every tool call through the server is both impossible (no filesystem) and unacceptable (latency).
 
 ```
-Current (prototype):
-  mo-agent chat → get_db_session() → MatrixOne
-  mo-admin init → get_db_session() → MatrixOne
+Previous design (broken for tool execution):
+  CLI ──▶ API Server ──▶ ChatLoop ──▶ AgentExecutor ──▶ skill.execute()
+                                                              │
+                                                        Server has no
+                                                        user files!
 
-  Problems:
-  - CLI needs database credentials (connection string, user, password)
-  - No authentication — anyone with DB access can do anything
-  - No authorization — no RBAC, no permission boundaries
-  - No audit trail — CLI operations bypass API audit logging
-  - Cannot deploy as SaaS — clients cannot have direct DB access
-  - Two code paths — API and CLI diverge, bugs in one don't surface in the other
+Current (prototype, also broken):
+  CLI → get_db_session() → MatrixOne (direct DB access, no auth, no audit)
 ```
 
-### Target Architecture
+### Target Architecture: Edge-Cloud Split
+
+The agentic loop runs on the edge (user's machine). LLM calls go through the cloud API, which enriches context, manages credentials, and persists state.
 
 ```
-Target (SaaS-ready):
-  mo-agent chat → HTTP POST /chat/stream → API Server → MatrixOne
-  mo-admin init → HTTP POST /admin/init  → API Server → MatrixOne
-
-  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-  │  CLI          │  HTTPS  │  API Server  │  TCP    │  MatrixOne   │
-  │  (mo-agent)   │────────▶│  (FastAPI)   │────────▶│  (Database)  │
-  │               │         │              │         │              │
-  │  Holds: JWT   │         │  Holds: DB   │         │  Holds: Data │
-  │  No DB creds  │         │  credentials │         │              │
-  └──────────────┘         └──────────────┘         └──────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  EDGE (CLI process, user's machine)                                  │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  EdgeChatLoop (agentic loop)                                   │  │
+│  │                                                                │  │
+│  │  1. User input                                                 │  │
+│  │  2. POST /chat/turn {messages, tool_results}                   │  │
+│  │       → Cloud enriches context, calls LLM, returns response    │  │
+│  │  3. If response contains tool_calls:                           │  │
+│  │       → Execute tools LOCALLY (file, bash, git, grep...)       │  │
+│  │       → Go to 2 with tool_results                              │  │
+│  │  4. If final answer → render to user                           │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐   │
+│  │ Local Tools       │  │ Local Skills     │  │ Edge State       │   │
+│  │ read_file         │  │ (project-local)  │  │ message history  │   │
+│  │ write_file        │  │                  │  │ skill cache      │   │
+│  │ bash, grep, glob  │  │                  │  │ config cache     │   │
+│  │ git_*             │  │                  │  │ event buffer     │   │
+│  │ MCP servers       │  │                  │  │ JWT credential   │   │
+│  └──────────────────┘  └──────────────────┘  └──────────────────┘   │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │ HTTPS (JWT auth)
+┌──────────────────────────────▼──────────────────────────────────────┐
+│  CLOUD (API Server + MatrixOne)                                      │
+│                                                                      │
+│  POST /chat/turn — the core endpoint:                                │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  1. Auth (JWT) + rate limiting                                 │  │
+│  │  2. Context assembly (memory search, few-shot, skill index)    │  │
+│  │  3. Model routing (cost/quality, SLO escalation)               │  │
+│  │  4. Budget control (pre-estimate, reject if over)              │  │
+│  │  5. Prompt enrichment (inject memory, rules, context)          │  │
+│  │  6. LLM call (streaming, API key stays server-side)            │  │
+│  │  7. Response verification (firewall, confidence scoring)       │  │
+│  │  8. Audit logging (decision + context snapshot)                │  │
+│  │  9. Cost tracking                                              │  │
+│  │  10. Return: {text, tool_calls, usage} via SSE stream          │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  Platform State (MatrixOne):                                         │
+│  users, sessions, events, decisions, memory, skills, snapshots       │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### Design Principles
+### Why This Split
 
-1. **CLI is a thin HTTP client.** It formats user input, calls API endpoints, renders responses. Zero business logic, zero DB access.
-2. **API is the single entry point.** All mutations go through API. Authentication, authorization, rate limiting, audit logging — all enforced at API layer.
-3. **Same API for CLI, SDK, and web UI.** The CLI is just one client. A future Python SDK or web dashboard uses the same endpoints.
-4. **Dev mode shortcut (optional).** For local development, `mo-agent --local <command>` and `mo-admin --local <command>` MAY bypass the API and use core libraries directly. This applies to ALL CLI commands, not just `chat`. It is a convenience for developers who have direct DB access, not the default. It must be explicitly opted into and is not available in SaaS deployments.
+| Concern | Edge | Cloud | Reason |
+|---------|:----:|:-----:|--------|
+| Tool execution (file, bash, git) | ✅ | | Server has no user filesystem |
+| MCP server connections | ✅ | | MCP servers run locally (stdio) |
+| LLM API call | | ✅ | API keys stay server-side; enables context enrichment, routing, budget |
+| Context assembly (memory search) | | ✅ | Memory is in MatrixOne |
+| Model routing / SLO escalation | | ✅ | Historical cost/quality data in DB |
+| Audit logging / decision snapshots | | ✅ | Source of truth in MatrixOne |
+| Firewall verification | | ✅ | Needs context snapshot for claim verification |
+| Rate limiting / budget control | | ✅ | Per-user enforcement at API layer |
+| Prompt caching management | | ✅ | Cross-session cache coordination |
+| Message history (working memory) | ✅ | ✅ | Edge holds current session; cloud persists all |
+| Skill definitions (catalog) | | ✅ | Edge caches; cloud is source of truth |
+| Project rules / config | ✅ | | Local files (.mo-agent/rules.md, CLAUDE.md) |
+| Terminal rendering | ✅ | | User's terminal |
 
-### CLI → API Endpoint Mapping
+### The `/chat/turn` API — Core Protocol
 
-| CLI Command | Current (direct) | Target (API) |
-|---|---|---|
-| `mo-agent chat` | `ChatLoop` + `get_db_session()` | `POST /chat/stream` (SSE) |
-| `mo-agent session list` | `SessionManager` + DB query | `GET /sessions` |
-| `mo-agent session show` | `SessionManager` + DB query | `GET /sessions/{id}` |
-| `mo-agent replay` | `stream_replay` + DB query | `POST /sessions/{id}/replay` |
-| `mo-agent skill list` | `SkillRegistry` + DB query | `GET /skills` |
-| `mo-agent model list` | DB query | `GET /models` |
-| `mo-admin init` | DDL execution via `get_db_session()` | `POST /admin/init` (admin-only) |
-| `mo-admin token create` | Direct DB insert | `POST /admin/tokens` (admin-only) |
-| `mo-admin audit logs` | Direct DB query | `GET /admin/audit` (admin-only) |
-| `mo-admin prompt optimize` | `PromptOptimizer` + DB | `POST /admin/prompts/optimize` (admin-only) |
+The key architectural change: instead of `POST /chat/stream` (send user message, get final answer), the edge calls `POST /chat/turn` in a loop, sending tool results back each turn.
+
+```
+Edge                                Cloud API
+  │                                    │
+  │  POST /chat/turn                   │
+  │  {session_id, messages,            │
+  │   tool_results: [...]}             │
+  ├───────────────────────────────────▶│
+  │                                    │  context assembly
+  │                                    │  + LLM call
+  │                                    │  + verification
+  │  SSE stream:                       │  + audit
+  │  {text: "Let me read...",          │
+  │   tool_calls: [{read_file, ...}]}  │
+  │◀───────────────────────────────────│
+  │                                    │
+  │  [execute tools locally]           │
+  │                                    │
+  │  POST /chat/turn                   │
+  │  {session_id, messages,            │
+  │   tool_results: [{id, result}]}    │
+  ├───────────────────────────────────▶│
+  │                                    │  context assembly
+  │                                    │  + LLM call (with tool results)
+  │  SSE stream:                       │
+  │  {text: "The file contains..."}    │
+  │  (no tool_calls = final answer)    │
+  │◀───────────────────────────────────│
+  │                                    │
+  │  [render to user]                  │
+```
+
+**Why not keep the loop server-side?** Because the server cannot execute `read_file("/home/alice/project/main.go")`. The file is on Alice's machine. The agentic loop (LLM → tool → LLM → tool → ...) must be driven from the edge.
+
+**What the cloud does per turn** (not just "forwarding to LLM"):
+1. **Context enrichment** — inject relevant memory, few-shot examples, cross-session context
+2. **Model routing** — select model based on task complexity, cost budget, SLO
+3. **Budget gate** — estimate cost, reject if user's budget is exhausted
+4. **LLM call** — API key never leaves server; prompt caching managed server-side
+5. **Verification** — firewall checks claims against context snapshot
+6. **Audit** — persist decision + snapshot + tool call metadata
+7. **Event sync** — persist events from edge (tool results, user actions)
+
+### Edge State Model
+
+```
+Edge holds (local):
+  ├── Current session message history (working memory for agentic loop)
+  ├── JWT credential (~/.mo-agent/credentials.json)
+  ├── Configuration cache (~/.mo-agent/config.json, .mo-agent/config.json)
+  ├── Skill definition cache (pulled from cloud, TTL-based)
+  ├── Project rules (local files: .mo-agent/rules.md, CLAUDE.md, etc.)
+  ├── Event buffer (tool results queued for upload)
+  └── Recent session index (for /sessions list without network)
+
+Cloud holds (source of truth):
+  ├── All sessions (complete history)
+  ├── All events (full audit chain)
+  ├── Memory (episodic, semantic, procedural)
+  ├── Skill catalog + versions
+  ├── User identity + RBAC
+  ├── Decisions + context snapshots
+  ├── LLM API keys (encrypted)
+  └── Cost/usage tracking
+
+Sync model:
+  Edge → Cloud: events uploaded per-turn (in /chat/turn request)
+  Cloud → Edge: session resume (pull), skill updates (pull on start)
+  Offline: edge can queue events locally, sync when reconnected
+```
 
 ### Authentication Flow
 
@@ -110,8 +214,8 @@ Target (SaaS-ready):
    → Tokens stored in ~/.mo-agent/credentials.json
 
 2. mo-agent chat "hello"
-   → POST /chat/stream
-     Authorization: Bearer <access_token>
+   → EdgeChatLoop starts
+   → POST /chat/turn (Authorization: Bearer <access_token>)
    → SSE response stream
 
 3. Token expired:
@@ -124,34 +228,46 @@ Target (SaaS-ready):
    → Non-admin users get 403
 ```
 
-### Implementation Plan
+### CLI → API Endpoint Mapping
 
-**Phase 1: API client module** — Create `cli/api_client.py` with typed methods for each endpoint. Uses `httpx` for HTTP + SSE streaming. Handles JWT storage, auto-refresh, error mapping.
+| CLI Command | Current (direct) | Target (API) |
+|---|---|---|
+| `mo-agent chat` | `ChatLoop` + `get_db_session()` | EdgeChatLoop + `POST /chat/turn` (per-turn SSE) |
+| `mo-agent session list` | `SessionManager` + DB query | `GET /sessions` |
+| `mo-agent session show` | `SessionManager` + DB query | `GET /sessions/{id}` |
+| `mo-agent replay` | `stream_replay` + DB query | `POST /sessions/{id}/replay` |
+| `mo-agent skill list` | `SkillRegistry` + DB query | `GET /skills` |
+| `mo-agent model list` | DB query | `GET /models` |
+| `mo-admin init` | DDL execution via `get_db_session()` | `POST /admin/init` (admin-only) |
+| `mo-admin token create` | Direct DB insert | `POST /admin/tokens` (admin-only) |
+| `mo-admin audit logs` | Direct DB query | `GET /admin/audit` (admin-only) |
+| `mo-admin prompt optimize` | `PromptOptimizer` + DB | `POST /admin/prompts/optimize` (admin-only) |
 
-**Phase 2: Migrate mo-agent** — Replace all `get_db_session()` / core library imports with `api_client` calls. `chat` command becomes SSE consumer. Session/skill/model commands become simple GET requests.
+### Design Principles
 
-**Phase 3: Migrate mo-admin** — Replace direct DB operations with admin API calls. Requires new API endpoints that do not exist yet:
-- `POST /admin/init` — run DDL migrations (admin-only)
-- `POST /admin/tokens` — create API/LLM tokens (admin-only)
-- `GET /admin/audit` — query audit logs (admin-only)
-- `POST /admin/prompts/optimize` — trigger prompt optimization (admin-only)
-
-These must be added to `api/routers/` before mo-admin migration can begin.
-
-**Phase 4: Remove direct DB path** — Delete `from api.database import get_db_session` from CLI. CLI no longer depends on `core/` or `api/database.py`. Optional: keep `--local` flag for dev mode behind explicit opt-in.
+1. **Edge drives the agentic loop.** The CLI runs the tool-call cycle because tools need local filesystem access. The cloud provides LLM calls and platform services per-turn.
+2. **LLM keys never leave the server.** Edge sends messages + tool results; cloud calls LLM with enriched context. No API keys on user machines.
+3. **Cloud is not a proxy.** Each `/chat/turn` does context assembly, model routing, budget control, verification, and audit. This is the platform's core value — not available in direct-to-LLM tools like Claude Code.
+4. **All state syncs to cloud.** Edge has caches and buffers, but source of truth is always MatrixOne. Session resume, cross-device, team sharing — all work because state is centralized.
+5. **Same API for CLI, SDK, and web UI.** The `/chat/turn` protocol works for any client that can execute tools locally.
+6. **Dev mode shortcut (optional).** `mo-agent --local` bypasses the API and uses core libraries directly. For developers with local DB access only. Not available in SaaS.
 
 ### What This Enables
 
-| Capability | Before (CLI → DB) | After (CLI → API → DB) |
+| Capability | Before (CLI → DB) | After (Edge-Cloud Split) |
 |---|---|---|
+| Tool execution | ❌ Server has no files | ✅ Tools run on user's machine |
 | SaaS deployment | ❌ Impossible | ✅ CLI connects to cloud API |
 | Authentication | ❌ None | ✅ JWT with refresh |
 | Authorization | ❌ None | ✅ RBAC at API layer |
-| Audit trail | ❌ CLI ops invisible | ✅ All ops logged via API middleware |
+| Audit trail | ❌ CLI ops invisible | ✅ All decisions logged via API |
+| LLM key security | ❌ Keys on client | ✅ Keys stay server-side |
+| Context enrichment | ❌ No memory/few-shot | ✅ Cloud injects memory per-turn |
+| Model routing | ❌ Fixed model | ✅ Cloud routes by cost/quality |
+| Budget control | ❌ None | ✅ Cloud enforces per-user budget |
 | Rate limiting | ❌ None | ✅ API-level rate limiting |
 | Multi-tenant | ❌ Shared DB access | ✅ Tenant isolation at API layer |
-| SDK / Web UI | ❌ Must duplicate CLI logic | ✅ Same API endpoints |
-| Credential security | ❌ DB creds on client | ✅ Only JWT on client |
+| Offline degradation | ❌ N/A | ⚠️ Future: edge queues events, syncs later |
 
 ---
 
@@ -185,8 +301,8 @@ mo-agent chat                        # CLI → API Server → DB
 
 > **Note**: In the current prototype, all CLI commands connect directly to DB. After the CLI architecture migration (§1.1), the default path is CLI → API server. The `--local` flag preserves direct-DB mode for development convenience (requires DB credentials and a local MatrixOne instance).
 
-**Skill execution**: In-process, same Python process as CLI/API.  
-**ML inference**: In-process, model loaded into same process.  
+**Skill execution**: Edge skills (file, shell, git, MCP) run on user's machine via EdgeChatLoop. Cloud skills run in-process on API server. See [Edge-Cloud Execution](edge-cloud-execution.md).  
+**ML inference**: In-process on API server, model loaded into same process.  
 **GPU**: Local GPU if available, CPU fallback.
 
 ---
@@ -232,7 +348,7 @@ docker-compose --profile full up -d
 
 **Database connections**: The platform DB (MatrixOne) stores all state — core tables and skill business tables (with `sk_` prefix). See [skill-as-package.md](skill-as-package.md) for the architecture.
 
-**Skill execution**: Lightweight skills run in-process inside API. Heavy skills (training) dispatched to skill-worker container via Redis queue.  
+**Skill execution**: Edge skills run on user's machine. Cloud skills: lightweight run in-process inside API, heavy skills (training) dispatched to skill-worker container via Redis queue.  
 **ML inference**: In-process by default. With `--profile model`, shared Model Server at `:9527`.  
 **GPU**: `--profile gpu` enables nvidia runtime for skill-worker.
 

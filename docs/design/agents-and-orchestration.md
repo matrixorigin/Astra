@@ -44,29 +44,40 @@ PLATFORM CAPABILITIES — Not agents. APIs that agents call.
 ## 2. The Execution Model: ChatLoop
 
 > **See also**: [Durable Agent Runs](durable-agent-runs.md) — how ChatLoop is wrapped in a durable, resumable AgentRun for complex tasks that outlive a single HTTP request.
+> **See also**: [Edge-Cloud Execution](edge-cloud-execution.md) — how the loop is split between edge (tool execution) and cloud (LLM + platform services).
 
-Every agent — user or system — runs the same loop:
+Every agent — user or system — runs the same loop. In the edge-cloud architecture, this loop is **split across two processes**:
 
 ```
-User Input
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  ChatLoop                                                   │
-│                                                             │
-│  1. Build context (see memory-and-context.md)               │
-│  2. Call LLM with tools                                     │
-│  3. If LLM returns tool_calls:                              │
-│     a. Execute each tool (with side-effect enforcement)     │
-│     b. Append tool results to messages                      │
-│     c. Go to step 2 (multi-turn tool use)                   │
-│  4. If LLM returns text: deliver response                   │
-│  5. Log all events with causal_chain_id                     │
-│                                                             │
-│  Max rounds: configurable (default 10)                      │
-│  Every step: streamed to client in real-time                │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│  EDGE (EdgeChatLoop — user's machine)                                │
+│                                                                      │
+│  1. Collect user input                                               │
+│  2. POST /chat/turn {messages, tool_results} → Cloud                 │
+│  3. Render streaming text from Cloud                                 │
+│  4. If Cloud returns tool_calls:                                     │
+│     a. Check permissions (allow/ask/deny)                            │
+│     b. Execute each tool LOCALLY                                     │
+│     c. Go to step 2 with tool_results                                │
+│  5. If no tool_calls: display final answer                           │
+└──────────────────────────────────┬──────────────────────────────────┘
+                                   │ /chat/turn (per turn)
+┌──────────────────────────────────▼──────────────────────────────────┐
+│  CLOUD (ChatLoop.run_turn — server)                                  │
+│                                                                      │
+│  1. Persist tool_results as events                                   │
+│  2. Build context (memory search, few-shot, skill index)             │
+│  3. Model routing + budget check                                     │
+│  4. Call LLM with tools (streaming)                                  │
+│  5. Verify response (firewall)                                       │
+│  6. Audit (decision + context snapshot)                              │
+│  7. Return: {text_deltas, tool_calls, usage}                         │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Server-only mode** (system agents, background agents): `ChatLoop.run_step_stream()` still runs the full loop server-side. Cloud skills are executed by `AgentExecutor` in-process. This mode is unchanged.
+
+**Edge-cloud mode** (interactive CLI/SDK): `ChatLoop.run_turn()` executes one LLM turn. Edge drives the loop. This is the new path.
 
 ### Streaming
 

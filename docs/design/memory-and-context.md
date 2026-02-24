@@ -795,7 +795,7 @@ Runs hourly via `MemoryGovernanceEngine`. Condenses accumulated observations whe
 - `ChatLoop._build_messages()` → injects observations into system prompt
 - `ChatLoop.run_step/run_step_stream` → pre-fetches observations once before tool loop (`_cached_obs_section`)
 - `MemoryGovernanceEngine.run_hourly_tasks()` → runs Reflector
-- CLI (`mo_agent.py`) and API (`streaming.py`) wire Observer into ChatLoop
+- CLI (`mo_agent.py`) and API (`streaming.py`) wire Observer into ChatLoop. In edge-cloud mode, Observer runs cloud-side during `/chat/turn` processing — edge does not run Observer directly.
 
 ### Storage: observations table
 

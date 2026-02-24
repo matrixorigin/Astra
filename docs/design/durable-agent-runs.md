@@ -1,7 +1,8 @@
 # Execution Architecture: Durable Agent Loops
 
 > **Status**: Design — addresses the fundamental gap between request-response ChatLoop and real-world complex tasks  
-> **Last Updated**: 2026-02-21  
+> **Last Updated**: 2026-02-25  
+> **Dependencies**: [Edge-Cloud Execution](edge-cloud-execution.md) (execution split), [Agents and Orchestration](agents-and-orchestration.md) (ChatLoop)  
 > **Supersedes**: deployment-architecture.md § 3 (Execution Model) for agent execution concerns
 
 ---
@@ -90,41 +91,46 @@ The missing piece: **the agent loop itself needs to be event-driven and resumabl
 
 ### Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  AgentRun                                                       │
-│                                                                 │
-│  A durable unit of agent work. Survives HTTP disconnects,       │
-│  process restarts, and async waits.                             │
-│                                                                 │
-│  States: pending → running → waiting → running → ... → done    │
-│                                                                 │
-│  Persisted as events in conversation_events.                    │
-│  Resumed by replaying events + continuing from last state.      │
-└─────────────────────────────────────────────────────────────────┘
+Two execution modes coexist. See [Edge-Cloud Execution](edge-cloud-execution.md) for the full protocol.
 
-User ──POST /chat──▶ Create AgentRun ──▶ Return run_id immediately
-                          │
-                          ▼
-                    ┌─────────────┐
-                    │  RunEngine  │ (async worker, not HTTP handler)
-                    │             │
-                    │  ChatLoop   │◀── same loop, but decoupled from HTTP
-                    │  + Plan     │
-                    │  + Tools    │
-                    └──────┬──────┘
-                           │
-              ┌────────────┼────────────┐
-              ▼            ▼            ▼
-         In-process    Background    External
-         tool call     Job submit    Event wait
-         (instant)     (returns      (CI done,
-                        job_id)      webhook)
-                           │            │
-                           └────────────┘
-                                 │
-                           ▼ (event arrives)
-                    RunEngine resumes
+**Interactive runs (user agents):** Edge drives the agentic loop. Tools execute locally. LLM calls go through cloud. When a run needs to wait for an async event, edge exits cleanly; cloud holds the mailbox.
+
+**Background runs (system agents, scheduled, webhook-triggered):** Cloud drives the full loop. Tools are cloud skills. No edge involved.
+
+```
+                    INTERACTIVE (edge-driven)
+
+Edge ──POST /chat/turn──▶ Cloud (LLM + context) ──SSE──▶ Edge
+  │                                                        │
+  ▼                                                        ▼
+Execute tools locally                              tool_calls / text
+  │                                                        │
+  └──POST /chat/turn (tool_results)──▶ Cloud ──SSE──▶ Edge │
+                                                           │
+  ... loop until turn_complete{has_tool_calls: false} ...  │
+                                                           │
+  If async wait needed:                                    │
+    Cloud returns turn_complete{status: "waiting"}         │
+    Edge exits. Run status → WAITING.                      │
+                                                           │
+  External event arrives → Cloud: WAITING → RESUME_PENDING │
+  Edge reconnects → GET /runs/pending → resume loop        │
+
+
+                    BACKGROUND (cloud-driven)
+
+Trigger ──▶ Cloud RunEngine ──▶ ChatLoop.run_step_stream()
+                │
+   ┌────────────┼────────────┐
+   ▼            ▼            ▼
+Cloud skill  Background    External
+(in-process) Job submit    Event wait
+             (job_id)      (CI, webhook)
+                │            │
+                └────────────┘
+                      │
+                ▼ (event arrives)
+             RunEngine resumes
 ```
 
 ### The Three Primitives
@@ -135,12 +141,13 @@ A durable unit of work. Created when user sends a message that requires agent ac
 
 ```python
 class RunStatus(str, Enum):
-    PENDING = "pending"       # Created, not yet started
-    RUNNING = "running"       # Agent loop actively executing
-    WAITING = "waiting"       # Blocked on async event (job, webhook, approval)
-    COMPLETED = "completed"   # Finished successfully
-    FAILED = "failed"         # Finished with error
-    CANCELLED = "cancelled"   # User cancelled
+    PENDING = "pending"             # Created, not yet started
+    RUNNING = "running"             # Agent loop actively executing
+    WAITING = "waiting"             # Blocked on async event (job, webhook, approval)
+    RESUME_PENDING = "resume_pending"  # Async event arrived; waiting for edge to pick up
+    COMPLETED = "completed"         # Finished successfully
+    FAILED = "failed"               # Finished with error
+    CANCELLED = "cancelled"         # User cancelled
 
 class AgentRun:
     run_id: str
@@ -162,10 +169,11 @@ class AgentRun:
 
 **Not a new table.** AgentRun is stored as events in conversation_events:
 ```
-event_type = "run_started"    → metadata = {run_id, trigger, ...}
-event_type = "run_waiting"    → metadata = {run_id, waiting_for, ...}
-event_type = "run_resumed"    → metadata = {run_id, resumed_by, ...}
-event_type = "run_completed"  → metadata = {run_id, ...}
+event_type = "run_started"        → metadata = {run_id, trigger, ...}
+event_type = "run_waiting"        → metadata = {run_id, waiting_for, ...}
+event_type = "run_resume_pending" → metadata = {run_id, async_result, ...}
+event_type = "run_resumed"        → metadata = {run_id, resumed_by, ...}
+event_type = "run_completed"      → metadata = {run_id, ...}
 ```
 
 #### 2. RunEngine
@@ -502,34 +510,106 @@ When resuming, the LLM needs conversation history. This is already solved:
 
 ---
 
+## 6.1. Offline-Tolerant Async: The Mailbox Pattern
+
+Edge is ephemeral — users close terminals, laptops sleep, networks drop. But durable runs must survive. The **Mailbox Pattern** solves this: cloud is the mailbox (receives and stores async events), edge is the consumer (picks up and continues execution when online).
+
+### State Transitions
+
+```
+RUNNING ──async wait──▶ WAITING ──event arrives──▶ RESUME_PENDING ──edge picks up──▶ RUNNING
+                                                         │
+                                                    (cloud stores
+                                                     async result
+                                                     as event,
+                                                     does NOT
+                                                     execute)
+```
+
+### Protocol
+
+**1. Suspend** — Edge encounters an async tool (e.g. `wait_for_ci`):
+- Edge sends final `/chat/turn` with tool_results including `{wait_for: "ci:build_123"}`
+- Cloud sets run status → `WAITING`, records `waiting_for` handle
+- Cloud returns SSE `turn_complete{status: "waiting", waiting_for: "ci:build_123"}`
+- Edge process exits cleanly. User can close terminal, shut down machine.
+
+**2. Wakeup** — External event arrives while edge is offline:
+- Webhook hits cloud: `POST /webhooks/ci` with build result
+- Cloud resolves handle → finds waiting run
+- Cloud writes async result to `conversation_events` (event_type: `run_resume_pending`)
+- Cloud sets run status → `RESUME_PENDING`
+- Cloud does NOT continue execution — no edge means no local tools
+- (Optional) Cloud sends notification (email/Slack/push): "Run ready to resume"
+
+**3. Resume** — Edge comes back online:
+- Edge startup (or background poll) calls `GET /runs/pending`
+- Returns all runs in `RESUME_PENDING` state for this user
+- Edge calls `POST /chat/turn/resume` with `{run_id}` — cloud returns the async result + context needed to continue
+- Edge resumes the agentic loop from where it left off
+- Run status → `RUNNING`
+
+### Why Cloud Doesn't Auto-Resume
+
+The run needs local tools. A `RESUME_PENDING` run might need to `read_file`, `git_diff`, or `bash` — all on the user's machine. Cloud cannot execute these. The mailbox pattern explicitly separates **event reception** (cloud) from **execution** (edge).
+
+Exception: if a run is purely cloud-skilled (system agent, no edge tools), cloud CAN auto-resume via RunEngine. The `execution_mode` field on AgentRun distinguishes:
+- `execution_mode: "edge"` → mailbox pattern, wait for edge
+- `execution_mode: "cloud"` → RunEngine auto-resumes immediately
+
+### New API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/runs/pending` | GET | List runs in RESUME_PENDING for current user |
+| `/chat/turn/resume` | POST | Resume a RESUME_PENDING run; returns context + async result as first SSE |
+
+### Edge Reconnection UX
+
+```
+$ mo-agent chat
+⏳ 1 task ready to resume:
+  [run_abc] "修复 CI，跑回归测试" — CI completed (passed) 2h ago
+  
+Resume? [Y/n] y
+Resuming... CI passed ✓. Reading test results...
+```
+
+---
+
 ## 7. What Changes, What Doesn't
 
 ### Doesn't Change
-- **ChatLoop** — same PAOR loop, same tool execution, same streaming
-- **Skill/Tool execution** — still in-process function calls
-- **MCP Bridge** — still process-level isolation via stdio/HTTP
+- **ChatLoop** — same PAOR loop, same streaming. Edge uses `EdgeChatLoop` (per-turn via `/chat/turn`), cloud uses `ChatLoop.run_step_stream()` (full loop for system agents)
+- **MCP Bridge** — still process-level isolation via stdio/HTTP (edge-side)
 - **ToolMockingLayer** — still handles replay/audit
 - **conversation_events schema** — no new tables, just new event_types
 - **SkillRequirement** — no execution resource fields
 
 ### Changes
+- **Tool execution split** — edge tools (file, shell, git, MCP) execute on user's machine; cloud skills execute in-process on server. See [Edge-Cloud Execution](edge-cloud-execution.md)
 - **`/chat` endpoint** — returns `run_id`, supports async
-- **New: RunEngine** — async worker that drives AgentRun execution
-- **New: AgentRun** — durable run state as events
+- **New: `/chat/turn`** — per-turn edge-cloud protocol (edge sends tool_results, cloud returns tool_calls)
+- **New: RunEngine** — async worker that drives background/system AgentRun execution (cloud-only runs)
+- **New: AgentRun** — durable run state as events, with `execution_mode` (edge/cloud)
+- **New: RESUME_PENDING state** — mailbox pattern for offline-tolerant async (§6.1)
+- **New: `/runs/pending`** — edge polls for resumable runs
+- **New: `/chat/turn/resume`** — edge resumes a RESUME_PENDING run
 - **New: AsyncTool protocol** — tools can return `wait_for` instead of blocking
-- **New: Run resume** — job completion / webhook / child run triggers resume
+- **New: Run resume** — job completion / webhook / child run triggers RESUME_PENDING (edge) or direct resume (cloud)
 - **New: `/chat/runs/{run_id}`** — status, stream, cancel endpoints
 - **Planner** — plan state persisted per-run, not per-request
 
 ### New Event Types
 ```
-run_started       — AgentRun begins
-run_waiting       — AgentRun parks (waiting for async event)
-run_resumed       — AgentRun resumes (async event arrived)
-run_completed     — AgentRun finished
-run_failed        — AgentRun failed
-run_cancelled     — AgentRun cancelled
-child_run_created — Parent created a child run
+run_started        — AgentRun begins
+run_waiting        — AgentRun parks (waiting for async event)
+run_resume_pending — Async event arrived; run ready for edge pickup
+run_resumed        — AgentRun resumes (edge picked up, or cloud auto-resumed)
+run_completed      — AgentRun finished
+run_failed         — AgentRun failed
+run_cancelled      — AgentRun cancelled
+child_run_created  — Parent created a child run
 ```
 
 ---

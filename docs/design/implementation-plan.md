@@ -11,16 +11,16 @@
 Two independent workstreams that can be developed in parallel. No dependency between them until the final integration phase.
 
 ```
-Workstream A: Write Path (性能)          Workstream B: CLI Architecture (SaaS)
+Workstream A: Write Path (性能)          Workstream B: CLI Edge-Cloud (SaaS)
 ─────────────────────────────           ──────────────────────────────────────
-A1: EventPipeline core                  B1: API client module
-A2: Wire into ChatLoop/RunEngine        B2: Admin API endpoints
-A3: Embedding decoupling                B3: Migrate mo-agent → API
-A4: Async snapshot + firewall           B4: Migrate mo-admin → API
-A5: Replay migration                    B5: Remove direct DB path
+A1: EventPipeline core                  B1: Edge tools + API client
+A2: Wire into ChatLoop/RunEngine        B2: /chat/turn API + server refactor
+A3: Embedding decoupling                B3: EdgeChatLoop (edge agentic loop)
+A4: Async snapshot + firewall           B4: Admin API + mo-admin migration
+A5: Replay migration                    B5: Remove direct DB path + packaging
          │                                        │
          └──────────── Integration ───────────────┘
-              EventPipeline + API-based CLI
+              EventPipeline + Edge-Cloud CLI
 ```
 
 ---
@@ -131,35 +131,90 @@ A5: Replay migration                    B5: Remove direct DB path
 
 ---
 
-## Workstream B: CLI SaaS Architecture
+## Workstream B: CLI Edge-Cloud Architecture
 
-**Goal**: CLI → API → DB. No DB credentials on client.
+**Goal**: Edge-cloud split execution. Edge runs tools locally, cloud handles LLM + platform services. No DB credentials on client.
 **Design doc**: [deployment-architecture.md](deployment-architecture.md) §1.1
 
-### B1: API client module
+### The Key Insight (2026-02-25 revision)
 
-**New file**: `cli/api_client.py`
+The previous B1-B5 plan assumed CLI is a "thin HTTP client" with all execution server-side. This is wrong — the server has no user filesystem. The agentic loop (LLM → tool → LLM → ...) must be driven from the edge because tools execute locally.
+
+New protocol: `POST /chat/turn` — edge sends messages + tool_results per turn, cloud does context enrichment + LLM call + verification, returns text + tool_calls. Edge executes tool_calls locally, loops.
+
+### B1: Edge tool execution + API client
+
+**New files**: `cli/tools/` (local tool implementations), `cli/api_client.py` (updated)
 
 | Item | Detail |
 |---|---|
-| `APIClient` class | Base URL config, `httpx.AsyncClient` |
-| Auth | JWT storage in `~/.mo-agent/credentials.json`, auto-refresh on 401 |
-| Methods | Typed methods for each endpoint: `chat_stream()`, `list_sessions()`, `list_skills()`, etc. |
-| SSE | `httpx-sse` for streaming chat responses |
-| Error mapping | HTTP status → user-friendly CLI error messages |
-| Config | `MO_AGENT_API_URL` env var, default `http://localhost:8000` |
+| `cli/tools/file_ops.py` | `read_file`, `write_file`, `str_replace`, `list_dir` — execute on user's filesystem |
+| `cli/tools/search.py` | `grep`, `glob` — search user's project files |
+| `cli/tools/shell.py` | `bash` — execute commands on user's machine, with safety checks |
+| `cli/tools/git.py` | `git_status`, `git_diff`, `git_log`, `git_commit` — local git operations |
+| `cli/tools/router.py` | Unified dispatch: tool_name → module.execute(). Returns OpenAI function calling schema for all tools. **Must execute independent tools concurrently** (asyncio.gather / ThreadPool) to minimize ping-pong latency — see [edge-cloud-execution.md §8](edge-cloud-execution.md) |
+| `cli/permissions.py` | allow/ask/deny permission rules for tool execution. Interactive confirmation UI |
+| `APIClient.chat_turn()` | New method: `POST /chat/turn` with messages + tool_results, returns SSE stream |
+| `APIClient` (existing) | Keep existing methods for sessions, skills, models, auth |
 
-**Dependencies**: Add `httpx>=0.27` and `httpx-sse>=0.4` to `pyproject.toml` under a `[project.optional-dependencies] cli` extra. The CLI package should be installable without pulling in the full `core/` dependency tree: `pip install mo-agent-engine[cli]`.
-
-**Validation**: Unit test with mocked HTTP responses for each method.
+**Validation**:
+- Unit test: each tool executes correctly on real filesystem (tmp_path)
+- Unit test: permission manager blocks dangerous commands, allows safe ones
+- Unit test: tool router dispatches to correct module
+- Unit test: API client with mocked HTTP for chat_turn
 
 ---
 
-### B2: Admin API endpoints
+### B2: `/chat/turn` API endpoint + server-side ChatLoop refactor
 
-**New files**: `api/routers/admin.py`
+**New file**: `api/routers/chat_turn.py`
+**Modified files**: `core/agent/chat_loop.py`
 
-Endpoints that don't exist yet, required before mo-admin migration:
+The server-side ChatLoop must be refactored to support per-turn execution (edge sends tool results, server does one LLM round).
+
+| Item | Detail |
+|---|---|
+| `POST /chat/turn` | Accept `{session_id, messages, tool_results, project_rules}`, return SSE stream with `{text, tool_calls, usage}` |
+| Server per-turn | Context assembly → model routing → budget check → LLM call → verification → audit → return |
+| Tool schema | Server returns available tool schemas (from skill registry + edge-registered tools) so LLM knows what tools exist |
+| Event persistence | Server persists: user_query event, llm_response event, tool_call metadata, decision + snapshot |
+| Edge tool results | Server receives tool results from edge, persists as events, includes in next LLM context |
+| Project rules | Edge sends project rules (from local .mo-agent/rules.md etc.) in first turn; server injects into system prompt |
+
+**Key difference from current `/chat/stream`**: Current endpoint runs the full agentic loop server-side (ChatLoop.run_step_stream). New endpoint runs ONE LLM turn, returns tool_calls to edge, waits for edge to call back with results.
+
+**Validation**:
+- Integration test: multi-turn tool use via /chat/turn (mock edge sending tool results)
+- Integration test: context enrichment (memory injected into LLM context)
+- Integration test: audit trail complete (every turn has decision + snapshot)
+
+---
+
+### B3: EdgeChatLoop — the edge-side agentic loop
+
+**New file**: `cli/edge_loop.py`
+
+| Item | Detail |
+|---|---|
+| `EdgeChatLoop` | Drives the agentic loop: user input → /chat/turn → tool execution → /chat/turn → ... → final answer |
+| Tool execution | Dispatches tool_calls to `cli/tools/router.py`, collects results |
+| Permission checking | Before executing each tool, checks `cli/permissions.py`. Interactive Y/N/Always/Deny prompt |
+| Streaming render | Renders LLM text as it streams from /chat/turn SSE |
+| Message history | Maintains current session messages locally (for display and context) |
+| Error handling | Network errors → retry with backoff. Tool errors → return error to LLM. LLM errors → display to user |
+| Max turns | Configurable limit (default 50) to prevent infinite loops |
+
+**Validation**:
+- Unit test: EdgeChatLoop with mocked API client — verifies loop terminates on final answer
+- Unit test: EdgeChatLoop with mocked API client — verifies tool_calls dispatched to router
+- Unit test: permission denial stops tool execution, returns denial to LLM
+- Integration test: full round-trip with real API server (requires dev environment)
+
+---
+
+### B4: Admin API endpoints + mo-admin migration
+
+**Modified file**: `api/routers/admin.py` (already exists), `cli/mo_admin_api.py`
 
 | Endpoint | What it does | Auth |
 |---|---|---|
@@ -168,53 +223,24 @@ Endpoints that don't exist yet, required before mo-admin migration:
 | `GET /admin/tokens` | List tokens | admin role |
 | `GET /admin/audit` | Query audit logs | admin role |
 | `POST /admin/prompts/optimize` | Trigger prompt optimization | admin role |
-| `GET /admin/feedback/stats` | Feedback statistics | admin role |
-| `POST /admin/feedback/export` | Export training data | admin role |
+
+Migrate mo-admin commands to use API client instead of direct DB.
 
 **Validation**: API tests for each endpoint with admin/non-admin JWT.
 
 ---
 
-### B3: Migrate mo-agent
+### B5: Remove direct DB path + CLI packaging
 
-**Modified file**: `cli/mo_agent.py`
-
-| Command | Before | After |
-|---|---|---|
-| `chat` | `ChatLoop` + `get_db_session()` | `api_client.chat_stream()` → render SSE |
-| `session list/show` | `SessionManager` + DB | `api_client.list_sessions()` / `.get_session()` |
-| `replay` | `stream_replay` + DB | `api_client.replay_session()` |
-| `skill list/register/...` | `SkillRegistry` + DB | `api_client.list_skills()` / etc. |
-| `model list/show` | DB query | `api_client.list_models()` / etc. |
-
-**Validation**: All existing CLI behaviors work through API. Manual smoke test of each command.
-
----
-
-### B4: Migrate mo-admin
-
-**Modified file**: `cli/mo_admin.py`
-
-| Command | Before | After |
-|---|---|---|
-| `init` | DDL via `get_db_session()` | `api_client.admin_init()` |
-| `token create/list` | Direct DB insert/query | `api_client.admin_create_token()` / etc. |
-| `audit logs` | Direct DB query | `api_client.admin_audit_logs()` |
-| `prompt optimize` | `PromptOptimizer` + DB | `api_client.admin_optimize_prompt()` |
-| `feedback export/retrain` | Direct DB | `api_client.admin_feedback_*()` |
-
----
-
-### B5: Remove direct DB path
-
-**Modified files**: `cli/mo_agent.py`, `cli/mo_admin.py`
+**Modified files**: `cli/mo_agent_api.py`, `cli/mo_admin_api.py`
 
 | Item | Detail |
 |---|---|
 | Delete | All `from api.database import get_db_session` from CLI |
-| Delete | All `from core.*` imports from CLI |
+| Delete | All `from core.*` imports from CLI (except `cli/tools/` which has no core deps) |
 | `--local` flag | Optional dev shortcut, re-enables direct DB path. Not default. |
 | Verify | CLI package has zero dependency on `core/` or `api/database.py` |
+| Packaging | CLI installable as `pip install mo-agent[cli]` without full server deps |
 
 ---
 
@@ -222,23 +248,23 @@ Endpoints that don't exist yet, required before mo-admin migration:
 
 ```
 Week 1-2:  A1 (EventPipeline core)     ←── no dependency
-           B1 (API client module)       ←── no dependency
-           B2 (Admin API endpoints)     ←── no dependency
+           B1 (Edge tools + API client) ←── no dependency
 
 Week 3:    A2 (Wire ChatLoop/RunEngine) ←── depends on A1
-           B3 (Migrate mo-agent)        ←── depends on B1
+           B2 (/chat/turn API)          ←── no dependency (new endpoint)
 
 Week 4:    A3 (Embedding decoupling)    ←── depends on A2
-           B4 (Migrate mo-admin)        ←── depends on B1 + B2
+           B3 (EdgeChatLoop)            ←── depends on B1 + B2
 
 Week 5:    A4 (Async snapshot/firewall) ←── depends on A2
            A5 (Replay migration)        ←── depends on A2
-           B5 (Remove direct DB path)   ←── depends on B3 + B4
+           B4 (Admin API + mo-admin)    ←── depends on B1
 
-Week 6:    Integration testing + acceptance criteria validation
+Week 6:    B5 (Remove direct DB path)   ←── depends on B3 + B4
+           Integration testing + acceptance criteria validation
 ```
 
-A1-A5 和 B1-B5 两条线完全独立，可以由不同的人并行开发。唯一的交汇点是最终集成测试。
+A1-A5 和 B1-B5 两条线大部分独立。B2 (/chat/turn) 是新增 API endpoint，不修改现有 /chat/stream。B3 (EdgeChatLoop) 依赖 B1 (edge tools) + B2 (/chat/turn API)。
 
 ---
 
@@ -263,11 +289,14 @@ A1-A5 和 B1-B5 两条线完全独立，可以由不同的人并行开发。唯�
 
 | Metric | Target |
 |---|---|
-| CLI → API latency overhead | < 20ms vs direct DB (localhost) |
+| Edge tool execution | All file/shell/git/search tools execute locally, < 1s each |
+| `/chat/turn` round-trip | < 200ms overhead vs direct LLM call (excluding LLM latency) |
+| Context enrichment | Memory + few-shot injected per turn (verified in audit snapshot) |
 | JWT auto-refresh | Transparent to user, zero manual re-login |
 | Admin RBAC | Non-admin gets 403 on all `/admin/*` endpoints |
-| Audit coverage | 100% of CLI operations logged in audit trail |
+| Audit coverage | 100% of LLM calls + tool executions logged in audit trail |
 | Zero DB dependency | CLI package imports zero `core/` or `api/database` modules |
+| Permission system | Dangerous commands blocked; user confirmation for write ops |
 | `--local` dev mode | All commands work in both API and local mode |
 
 ---
@@ -279,8 +308,11 @@ A1-A5 和 B1-B5 两条线完全独立，可以由不同的人并行开发。唯�
 | Replay refactor introduces bugs | Stream replay broken | 5 mandatory test scenarios + 100-run regression | A5 |
 | Fulltext fallback insufficient | Empty context during embedding lag | Integration test: zero-embedding retrieval must return results | A3 |
 | Missed `flush_critical()` point | State machine breaks on crash | "When in doubt, flush" rule; review all state transitions | A2 |
-| Admin API surface too large | Phase B2 blocks B4 | Start with 4 critical endpoints, add rest incrementally | B2 |
-| CLI SSE streaming complexity | Chat UX regression | Reuse existing `stream_run_events` SSE format | B3 |
+| Edge-cloud protocol complexity | Multi-turn state management bugs | Extensive integration tests with mock edge + real server | B2/B3 |
+| Tool execution security | Dangerous commands on user machine | Permission system with deny-list + interactive confirmation | B1 |
+| Network interruption mid-turn | Lost tool results, broken loop | Edge retries with exponential backoff; idempotent /chat/turn | B3 |
+| Context enrichment latency | Slow /chat/turn response | Cache memory search results; incremental context assembly | B2 |
+| Admin API surface too large | Phase B4 blocks progress | Start with 4 critical endpoints, add rest incrementally | B4 |
 | Existing tests break | Regression | Feature flag `EVENT_PIPELINE_ENABLED` for gradual rollout | A2 |
 
 ---
@@ -294,7 +326,10 @@ A1-A5 和 B1-B5 两条线完全独立，可以由不同的人并行开发。唯�
 | A3 | Config flag: read embedding from `conversation_events.embedding` or `event_embeddings` JOIN |
 | A4 | Independent, revert to synchronous snapshot/firewall writes |
 | A5 | Independent, revert to reading stream events from `conversation_events` |
-| B1-B4 | `--local` flag preserves direct DB path throughout migration |
+| B1 | Additive (new files), no impact on existing CLI |
+| B2 | Additive (new endpoint `/chat/turn`), existing `/chat/stream` untouched |
+| B3 | EdgeChatLoop is new code; existing `mo-agent chat` via `/chat/stream` still works |
+| B4 | `--local` flag preserves direct DB path throughout migration |
 | B5 | Don't delete direct DB imports until all commands verified |
 
 ---
