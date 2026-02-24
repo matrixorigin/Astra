@@ -64,24 +64,25 @@ class HybridRetriever:
         try:
             vector_sql = text("""
                 SELECT 
-                    event_id,
-                    session_id,
-                    event_type,
-                    content,
-                    created_at,
-                    causal_chain_id,
-                    parent_event_id,
-                    metadata,
+                    e.event_id,
+                    e.session_id,
+                    e.event_type,
+                    e.content,
+                    e.created_at,
+                    e.causal_chain_id,
+                    e.parent_event_id,
+                    e.metadata,
                     (
-                        :w_semantic * IFNULL(1.0 / (1.0 + l2_distance(embedding, :query_vec)), 0) +
-                        :w_temporal * EXP(-TIMESTAMPDIFF(HOUR, created_at, NOW()) / 24.0) +
+                        :w_semantic * IFNULL(1.0 / (1.0 + l2_distance(ee.embedding, :query_vec)), 0) +
+                        :w_temporal * EXP(-TIMESTAMPDIFF(HOUR, e.created_at, NOW()) / 24.0) +
                         :w_causal * CASE 
-                            WHEN causal_chain_id = :chain_id THEN 1.0 
+                            WHEN e.causal_chain_id = :chain_id THEN 1.0 
                             ELSE 0.0 
                         END
                     ) AS vector_score
-                FROM conversation_events
-                WHERE session_id = :session_id AND embedding IS NOT NULL
+                FROM conversation_events e
+                JOIN event_embeddings ee ON e.event_id = ee.event_id
+                WHERE e.session_id = :session_id
                 ORDER BY vector_score DESC
                 LIMIT :limit
             """)

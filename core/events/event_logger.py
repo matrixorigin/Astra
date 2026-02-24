@@ -53,18 +53,7 @@ class EventLogger:
             return self._pipeline.emit(event)
 
         # Synchronous path (legacy)
-        # Generate embedding for content
-        embedding = None
-        if event.content:
-            try:
-                from core.context.embeddings import EmbeddingService
-                embeddings = EmbeddingService(self.session, provider="mock")
-                embedding_vec = embeddings.embed_text(event.content)
-                # Convert to MatrixOne vector format: "[v1,v2,...]"
-                embedding = "[" + ",".join(str(v) for v in embedding_vec) + "]"
-            except Exception as e:
-                logger.warning(f"Failed to generate embedding: {e}")
-        
+        # Embedding is now decoupled — generated asynchronously by EmbeddingWorker
         # Extract high-frequency query fields from metadata
         metadata = event.metadata or {}
         run_id = metadata.get('run_id')
@@ -84,7 +73,7 @@ class EventLogger:
             context_snapshot=event.context_snapshot.model_dump() if event.context_snapshot else None,
             token_usage=event.token_usage.model_dump() if event.token_usage else None,
             embedding_ref=event.embedding_ref,
-            embedding=embedding,
+            embedding=None,  # No longer written inline; EmbeddingWorker fills event_embeddings
             created_at=event.created_at,
             prompt_template_id=event.prompt_template_id,
             skills_snapshot=event.skills_snapshot,
