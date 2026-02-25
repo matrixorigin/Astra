@@ -214,3 +214,23 @@ def clean_skill_events_db(db_session):
 def db(db_session):
     """Alias for db_session."""
     return db_session
+
+
+def make_run_engine_mock_init():
+    """Return a mock __init__ for RunEngine that initialises all required attributes.
+
+    Used by tests that patch RunEngine.__init__ to avoid real DB/event setup.
+    Kept in conftest so every test file shares the same definition and stays
+    in sync when RunEngine.__init__ gains new attributes.
+    """
+    from unittest.mock import MagicMock
+
+    def mock_init(self, db, chat_loop_factory=None):
+        self.db = db
+        self._default_db = db
+        self.event_logger = MagicMock()
+        self._default_event_logger = self.event_logger
+        self._chat_loop_factory = chat_loop_factory
+        self._pending_event_count = 0
+
+    return mock_init

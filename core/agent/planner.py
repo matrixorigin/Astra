@@ -36,6 +36,10 @@ class PlanStep(BaseModel):
         default=None,
         description="Suggested skill to use (optional)",
     )
+    skill_params: dict[str, Any] | None = Field(
+        default=None,
+        description="Structured parameters for the skill (e.g. file_path, line_number)",
+    )
     sub_plan: "Plan | None" = Field(
         default=None,
         description="Sub-plan for complex steps (hierarchical decomposition)",

@@ -48,6 +48,8 @@ _MAX_RESUME_INPUT_CHARS = 4000
 _MAX_COMPLETED_RUNS = 500
 # Periodic GC interval in seconds
 _GC_INTERVAL_SECONDS = 300
+# Batch flush threshold for run_events (streaming events)
+_RUN_EVENT_FLUSH_SIZE = 20
 
 # Global GC task reference
 _gc_task: asyncio.Task | None = None
@@ -84,9 +86,20 @@ def _start_gc_task() -> None:
 class RunEngine:
     """Drives AgentRun execution. Not bound to HTTP request lifecycle."""
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, chat_loop_factory=None):
+        """
+        Args:
+            db: Default DB session.
+            chat_loop_factory: Callable(Session) -> ChatLoop.  Injected by
+                the API layer to avoid core → API circular dependency.
+        """
         self._default_db = db
         self._default_event_logger = EventLogger(db)
+        self._chat_loop_factory = chat_loop_factory
+        # Per-instance counter for batched event commits.
+        # Must be instance-level to avoid race conditions when multiple
+        # RunEngine instances operate concurrently with different DB sessions.
+        self._pending_event_count = 0
         # Start GC task on first engine instantiation
         _start_gc_task()
 
@@ -230,8 +243,13 @@ class RunEngine:
                 run.context = run.context or {}
                 self._apply_agent_config(run.agent_id, run.context)
             
-            from api.routers.chat import _build_chat_loop
-            loop = _build_chat_loop(bg_db)
+            # Build ChatLoop via injected factory (preferred) or lazy import (backward compat)
+            factory = getattr(self, '_chat_loop_factory', None)
+            if factory:
+                loop = factory(bg_db)
+            else:
+                from api.routers.chat import _build_chat_loop
+                loop = _build_chat_loop(bg_db)
             loop._current_run_id = run.run_id
 
             coro = self._consume_stream(loop, run)
@@ -264,6 +282,8 @@ class RunEngine:
             })
             raise  # Re-raise to ensure proper cleanup
         finally:
+            # Flush any remaining buffered run_events before cleanup
+            self._flush_run_events()
             # Shutdown EventPipeline to release its DB session and background task
             try:
                 _pipeline = getattr(getattr(loop, 'event_logger', None), '_pipeline', None) if loop else None
@@ -301,7 +321,7 @@ class RunEngine:
         """Consume ChatLoop stream, parking on wait_for signals.
 
         Checks for DB cancellation between events so cross-worker cancel
-        is detected even during long tool calls.
+        is detected even for parent runs on remote workers.
         """
         event_count = 0
         async for event in loop.run_step_stream(
@@ -310,10 +330,11 @@ class RunEngine:
             user_id=run.user_id,
             context=run.context,
         ):
-            # Cross-worker cancel: check DB periodically for child runs
-            # (parent runs are cancelled in-memory via cancel_run + task.cancel)
+            # Cross-worker cancel: check DB periodically for ALL runs
+            # (not just child runs — parent runs may be cancelled from
+            # another API replica that wrote a RUN_CANCELLED event to DB)
             event_count += 1
-            if run.parent_run_id and event_count % 5 == 0 and self._is_cancelled_in_db(run.run_id):
+            if event_count % 5 == 0 and self._is_cancelled_in_db(run.run_id):
                 run.status = RunStatus.CANCELLED
                 self._log_run_event(run, EventType.RUN_CANCELLED)
                 return
@@ -387,7 +408,16 @@ class RunEngine:
 
     def cancel_run(self, run_id: str) -> bool:
         run = _active_runs.get(run_id)
-        if not run or run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+        if not run:
+            # Run not on this worker — write cancel event to DB so the
+            # owning worker picks it up via periodic _is_cancelled_in_db check.
+            restored = self.restore_run(run_id)
+            if not restored or restored.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                return False
+            return self._write_cancel_event_for_run(
+                run_id, restored.session_id, restored.user_id,
+            )
+        if run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
             return False
         run.status = RunStatus.CANCELLED
         self._log_run_event(run, EventType.RUN_CANCELLED)
@@ -528,11 +558,16 @@ class RunEngine:
     # ── Event persistence ─────────────────────────────────────
 
     def _append_event(self, run_id: str, sse: dict) -> None:
-        """Append event to local buffer AND persist to DB."""
+        """Append event to local buffer AND persist to DB.
+
+        Individual INSERTs are issued immediately but COMMITs are deferred
+        and batched — _flush_run_events() commits all pending writes at once.
+        This is called automatically every _RUN_EVENT_FLUSH_SIZE events and
+        in _complete_run / finally to ensure nothing is lost.
+        """
         events = _run_events.setdefault(run_id, [])
         idx = len(events)
         events.append(sse)
-        # Persist to run_events table
         try:
             self.db.execute(
                 text(
@@ -548,10 +583,25 @@ class RunEngine:
                     "agent_id": sse.get("agent_id"),
                 },
             )
+            self._pending_event_count += 1
+            if self._pending_event_count >= _RUN_EVENT_FLUSH_SIZE:
+                self._flush_run_events()
+        except Exception as e:
+            self.db.rollback()
+            # Reset counter: rollback discarded all pending INSERTs
+            self._pending_event_count = 0
+            logger.warning(f"Event persist failed for run {run_id} idx {idx}: {e}")
+
+    def _flush_run_events(self) -> None:
+        """Commit all pending run_event INSERTs in a single batch."""
+        if self._pending_event_count <= 0:
+            return
+        try:
             self.db.commit()
         except Exception as e:
             self.db.rollback()
-            logger.warning(f"Event persist failed for run {run_id} idx {idx}: {e}")
+            logger.warning("Event batch commit failed: %s", e)
+        self._pending_event_count = 0
 
     def _load_events_from_db(self, run_id: str, after_index: int = 0) -> list[dict]:
         """Load events from DB for cross-worker streaming."""
@@ -653,6 +703,7 @@ class RunEngine:
     # ── Internal ──────────────────────────────────────────────
 
     def _complete_run(self, run: AgentRun) -> None:
+        self._flush_run_events()  # Flush any remaining buffered events before marking complete
         run.status = RunStatus.COMPLETED
         run.completed_at = datetime.now(timezone.utc)
         self._log_run_event(run, EventType.RUN_COMPLETED)
@@ -687,20 +738,31 @@ class RunEngine:
             if status not in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                 return  # Still waiting for some children
 
-            # Collect output
+            # Collect output — prefer text_done full_text, also gather tool_result
             child_events = _run_events.get(cid)
             if child_events is None:
                 child_events = self._load_events_from_db(cid, 0)
             final_text = ""
+            has_text_done = False
+            tool_results = []
             for ev in child_events:
-                if ev.get("event_type") == "text_delta":
+                et = ev.get("event_type", "")
+                if et == "text_done":
+                    # text_done carries the complete assembled text
+                    final_text = ev.get("data", {}).get("full_text", final_text)
+                    has_text_done = True
+                elif et == "text_delta" and not has_text_done:
+                    # Accumulate deltas only if no text_done seen yet
                     final_text += ev.get("data", {}).get("chunk", "")
+                elif et == "tool_result":
+                    tool_results.append(ev.get("data", {}))
 
             agent_id = child.agent_id if child else cid
             results[agent_id] = {
                 "run_id": cid,
                 "status": status.value if hasattr(status, 'value') else str(status),
                 "output": final_text or "(no text output)",
+                "tool_results": tool_results,
             }
 
         # All done — resume parent
@@ -760,8 +822,11 @@ class RunEngine:
         if event_type in self._TERMINAL_EVENT_TYPES:
             self.event_logger.flush_critical()
 
-    def _write_cancel_event_for_run(self, run_id: str, session_id: str, user_id: str) -> None:
-        """Write a cancel event to DB for a run on another worker."""
+    def _write_cancel_event_for_run(self, run_id: str, session_id: str, user_id: str) -> bool:
+        """Write a cancel event to DB for a run on another worker.
+
+        Returns True if event was written successfully, False otherwise.
+        """
         try:
             self.event_logger.create_stream_event(
                 user_id=user_id,
@@ -770,8 +835,10 @@ class RunEngine:
                 content="{}",
                 metadata={"run_id": run_id},
             )
+            return True
         except Exception as e:
             logger.warning(f"Failed to write cross-worker cancel for {run_id}: {e}")
+            return False
 
     @staticmethod
     def _maybe_gc() -> None:

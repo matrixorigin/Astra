@@ -127,17 +127,32 @@ class SkillSelector:
         return selected
 
     def _calculate_match_score(self, query: str, skill: SkillMetadata) -> float:
-        """Calculate match score for skill."""
-        score = 0.0
+        """Calculate match score for skill using token-level matching.
 
-        # Check each trigger
+        Combines word-level Jaccard similarity with substring containment.
+        Jaccard reduces false positives from partial substring hits while
+        substring matching handles stemming (e.g. "bug" in "bugs").
+        """
+        score = 0.0
+        query_words = set(query.split())
+
         for trigger in skill.triggers:
-            if trigger in query:
-                # Exact match
-                score += 1.0
-            elif any(word in query for word in trigger.split()):
-                # Partial match
+            trigger_lower = trigger.lower()
+            trigger_words = set(trigger_lower.split("_"))
+            trigger_words.add(trigger_lower)
+
+            # Token-level: word intersection
+            overlap = query_words & trigger_words
+            if overlap:
+                jaccard = len(overlap) / len(query_words | trigger_words)
+                score += jaccard + (0.5 if trigger_lower in query else 0)
+            elif trigger_lower in query:
+                # Substring fallback: trigger appears inside a query word
+                # (e.g. "bug" in "bugs"), weaker signal than exact word match
                 score += 0.5
+            elif any(trigger_lower in w for w in query_words):
+                # Trigger is a substring of a query word
+                score += 0.3
 
         # Boost by priority
         score *= skill.priority / 10.0

@@ -219,7 +219,8 @@ class LLMClient:
         return provider
 
     def _resolve_model(self, model: str | None) -> str:
-        return model or self.config.get("model", "gpt-4o")
+        from core.llm.model_resolver import resolve_model
+        return resolve_model(request_model=model, default_model=self.config.get("model", "gpt-4o"))
 
     # ── Budget control (#7) ────────────────────────────────────────
 

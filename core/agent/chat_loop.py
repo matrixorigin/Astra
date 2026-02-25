@@ -152,6 +152,32 @@ class ChatLoop:
         except Exception:
             pass
 
+    def _merge_context(self, ctx, context: dict[str, Any] | None) -> dict[str, Any]:
+        """Merge ContextManager output into request context.
+
+        ContextManager.build_context() returns a Context dataclass with fields like
+        system_prompt, selected_events, code_context, documentation. This method
+        merges those into the request context dict so _build_messages() can use them.
+
+        Args:
+            ctx: Context dataclass from ContextManager.build_context()
+            context: Optional request-level context dict
+
+        Returns:
+            Merged context dict with all fields available for _build_messages()
+        """
+        merged = dict(context or {})
+        # ctx may be a Context dataclass or a dict (in tests); use getattr for safety.
+        # setdefault: request-level context takes priority over ContextManager output.
+        merged.setdefault("system_prompt", getattr(ctx, "system_prompt", None))
+        merged.setdefault("selected_events", getattr(ctx, "selected_events", None))
+        merged.setdefault("token_budget", getattr(ctx, "token_budget", None))
+        if getattr(ctx, "code_context", None):
+            merged.setdefault("code_context", ctx.code_context)
+        if getattr(ctx, "documentation", None):
+            merged.setdefault("documentation", ctx.documentation)
+        return merged
+
     async def run_step(
         self,
         user_input: str,
@@ -188,7 +214,8 @@ class ChatLoop:
         logger.debug(f"Context snapshot: {context_capture_id}")
 
         # 3. Build messages with context
-        messages = self._build_messages(user_input, context, session_id=session_id, user_id=user_id)
+        merged_ctx = self._merge_context(ctx, context)
+        messages = self._build_messages(user_input, merged_ctx, session_id=session_id, user_id=user_id)
 
         # 4. Get available tools schema (with audit + learning)
         _sel = self._pipeline.get_tools_schema(
@@ -282,7 +309,11 @@ class ChatLoop:
                 messages = compact(messages, max_tokens, llm_summarize=llm_summarize)
 
             # Get model from context or use SLO escalation
-            model = (context or {}).get("model") or self._check_slo_escalation(session_id)
+            from core.llm.model_resolver import resolve_model
+            model = resolve_model(
+                request_model=(context or {}).get("model"),
+                slo_escalation_model=self._check_slo_escalation(session_id),
+            )
             
             llm_result = self.llm.chat_with_tools(
                 messages=messages,
@@ -655,7 +686,8 @@ class ChatLoop:
             return
 
         # 4. Build messages with context
-        messages = self._build_messages(user_input, context, session_id=session_id, user_id=user_id)
+        merged_ctx = self._merge_context(ctx, context)
+        messages = self._build_messages(user_input, merged_ctx, session_id=session_id, user_id=user_id)
 
         # 5. Get available tools schema (with audit + learning)
         _sel = self._pipeline.get_tools_schema(
@@ -708,7 +740,11 @@ class ChatLoop:
             sv = StreamingVerifier(firewall=self.firewall, context_capture_id=context_capture_id, llm_client=self.llm)
 
             # Use model from context if provided, otherwise use SLO escalation
-            model = (context or {}).get("model") or self._check_slo_escalation(session_id)
+            from core.llm.model_resolver import resolve_model
+            model = resolve_model(
+                request_model=(context or {}).get("model"),
+                slo_escalation_model=self._check_slo_escalation(session_id),
+            )
 
             async for chunk_msg in self.llm.chat_stream(
                 messages, user_id, session_id, model=model,
@@ -853,7 +889,11 @@ class ChatLoop:
             tool_calls: list[dict] = []
 
             # Use model from context if provided, otherwise use SLO escalation
-            model = (context or {}).get("model") or self._check_slo_escalation(session_id)
+            from core.llm.model_resolver import resolve_model
+            model = resolve_model(
+                request_model=(context or {}).get("model"),
+                slo_escalation_model=self._check_slo_escalation(session_id),
+            )
 
             async for chunk in self.llm.chat_with_tools_stream(
                 messages, tools_schema, model=model,
@@ -1349,10 +1389,12 @@ class ChatLoop:
                     if tool_found or tools_schema:
                         # CoT audit: check for goal hijacking before execution
                         from core.verification.cot_audit import audit_tool_call
+                        # Use structured skill_params if available, fallback to description
+                        exec_params = step.skill_params if isinstance(step.skill_params, dict) else {"input": step.description}
                         audit = audit_tool_call(
                             user_query=user_input,
                             tool_name=skill_name,
-                            tool_args={"input": step.description},
+                            tool_args=exec_params,
                             assistant_reasoning=step.description,
                             llm_client=self.llm,
                         )
@@ -1361,18 +1403,18 @@ class ChatLoop:
                             result = f"Blocked by CoT audit: {audit.reason}"
                             step.status = "blocked"  # type: ignore
                         # HITL policy check
-                        elif not (hitl_ret := self._evaluate_hitl(skill_name, {"input": step.description}))[0]:
+                        elif not (hitl_ret := self._evaluate_hitl(skill_name, exec_params))[0]:
                             result = hitl_ret[1]
                             step.status = "blocked"  # type: ignore
                         # Execute skill with automatic feedback recording
                         elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(skill_name):
                             result = await self.mcp_bridge.call_tool(
-                                skill_name, {"input": step.description},
+                                skill_name, exec_params,
                             )
                         else:
                             result = self.executor.execute_skill_with_feedback(
                                 skill_name=skill_name,
-                                params={"input": step.description},
+                                params=exec_params,
                                 session_id=session_id,
                                 parent_event_id=None,
                                 selection_event_id=selection_event_id,
@@ -1429,15 +1471,32 @@ class ChatLoop:
             causal_chain_id=user_event.causal_chain_id,
         )
 
-        # Final synthesis — with firewall verification + audit (aligned with all paths)
-        final_text = "Planning complete. Executing final synthesis..."
-        yield StreamEvent(
-            event_type=StreamEventType.TEXT_DELTA,
-            data={"chunk": final_text},
-            event_id=_event_id,
-            causal_chain_id=_chain_id,
-            agent_id=self.agent_id,
+        # Final synthesis — LLM summarises step results, then firewall verifies
+        results_summary = "\n".join(
+            f"- Step {r['step_id']}: {str(r['result'])[:500]}" for r in step_results
         )
+        synth_messages = [
+            {"role": "system", "content": "Summarise the results of the executed plan steps into a coherent answer for the user."},
+            {"role": "user", "content": f"Original request: {user_input}\n\nPlan results:\n{results_summary}"},
+        ]
+        from core.llm.model_resolver import resolve_model
+        model = resolve_model(
+            request_model=(context or {}).get("model"),
+            slo_escalation_model=self._check_slo_escalation(session_id),
+        )
+        final_text = ""
+        async for chunk_msg in self.llm.chat_stream(synth_messages, user_id, session_id, model=model):
+            if chunk_msg["type"] == "reasoning":
+                continue
+            chunk = chunk_msg["content"]
+            final_text += chunk
+            yield StreamEvent(
+                event_type=StreamEventType.TEXT_DELTA,
+                data={"chunk": chunk},
+                event_id=_event_id,
+                causal_chain_id=_chain_id,
+                agent_id=self.agent_id,
+            )
 
         verification = self.firewall.verify_response(final_text, context_capture_id, mode=self.firewall_mode)
         self.firewall.log_verification(
@@ -1523,8 +1582,9 @@ class ChatLoop:
         """
         # §1 Role — from DB prompt template or fallback
         role = "You are a development assistant. Use the available tools to help the user."
-        if context and context.get("system_prompt"):
-            role = context["system_prompt"]
+        sp = context.get("system_prompt") if context else None
+        if isinstance(sp, str) and sp:
+            role = sp
 
         # §2 Constraints (stable, always present)
         constraints = (
@@ -1570,12 +1630,15 @@ class ChatLoop:
                 )
 
         # §5 Conversation history (changes every turn, budget-capped)
-        if context and context.get("selected_events"):
+        selected = context.get("selected_events") if context else None
+        if selected and isinstance(selected, list):
             # Budget: ~2000 chars for history (roughly 500 tokens)
-            budget = context.get("token_budget", {}).get("history", {}).get("allocated", 500) * 4
+            tb = context.get("token_budget") if isinstance(context.get("token_budget"), dict) else {}
+            allocated = tb.get("history", {}).get("allocated", 500) if isinstance(tb.get("history"), dict) else 500
+            budget = (allocated if isinstance(allocated, (int, float)) else 500) * 4
             history_lines = []
             used = 0
-            for ev in context["selected_events"]:
+            for ev in selected:
                 role_label = "User" if ev.get("event_type") == "user_query" else "Agent"
                 line = f"{role_label}: {ev.get('content', '')}"
                 line_len = len(line)
@@ -1585,6 +1648,50 @@ class ChatLoop:
                 used += line_len
             if history_lines:
                 sections.append("Recent conversation:\n" + "\n".join(history_lines))
+
+        # §6 Code context — retrieved by ContextManager's hybrid search
+        # Budget is already enforced by ContextManager.build_context() which
+        # respects token_budget["code"]["allocated"]. We apply a safety cap
+        # here to guard against misconfigured or test contexts.
+        code_ctx = context.get("code_context") if context else None
+        if code_ctx and isinstance(code_ctx, list):
+            code_lines = []
+            code_used = 0
+            code_budget = 8000  # ~2000 tokens safety cap
+            for item in code_ctx:
+                if isinstance(item, dict):
+                    path = item.get("path", "unknown")
+                    snippet = item.get("content", item.get("snippet", ""))
+                    entry = f"### {path}\n```\n{snippet}\n```"
+                else:
+                    entry = str(item)
+                if code_used + len(entry) > code_budget and code_lines:
+                    break
+                code_lines.append(entry)
+                code_used += len(entry)
+            if code_lines:
+                sections.append("Relevant code:\n" + "\n\n".join(code_lines))
+
+        # §7 Documentation — retrieved by ContextManager
+        # Same safety cap as §6.
+        doc_ctx = context.get("documentation") if context else None
+        if doc_ctx and isinstance(doc_ctx, list):
+            doc_lines = []
+            doc_used = 0
+            doc_budget = 4000  # ~1000 tokens safety cap
+            for doc in doc_ctx:
+                if isinstance(doc, dict):
+                    title = doc.get("title", "")
+                    body = doc.get("content", doc.get("body", ""))
+                    entry = f"**{title}**\n{body}" if title else body
+                else:
+                    entry = str(doc)
+                if doc_used + len(entry) > doc_budget and doc_lines:
+                    break
+                doc_lines.append(entry)
+                doc_used += len(entry)
+            if doc_lines:
+                sections.append("Relevant documentation:\n" + "\n\n---\n\n".join(doc_lines))
 
         return [
             {"role": "system", "content": "\n\n".join(sections)},

@@ -44,8 +44,8 @@ def mock_db():
 
 @pytest.fixture
 def engine(mock_db):
-    with patch.object(RunEngine, '__init__',
-                      lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
+    from tests.conftest import make_run_engine_mock_init
+    with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
         e = RunEngine(mock_db)
         e._try_claim_resume = MagicMock(return_value=True)
         return e

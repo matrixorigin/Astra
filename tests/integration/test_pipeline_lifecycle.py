@@ -149,8 +149,8 @@ class TestPipelineLifecycleInBuildChatLoop:
 
         mock_loop.run_step_stream = fake_stream
 
-        with patch.object(RunEngine, '__init__',
-                          lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
+        from tests.conftest import make_run_engine_mock_init
+        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
             engine = RunEngine(mock_db)
             run = engine.create_run(session_id="s1", user_id="u1", user_input="test")
             run.status = __import__('core.agent.run_engine', fromlist=['RunStatus']).RunStatus.RUNNING

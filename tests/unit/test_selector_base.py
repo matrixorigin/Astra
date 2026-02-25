@@ -185,3 +185,106 @@ class TestSkillSelector:
         skills = selector.list_skills_by_category("nonexistent")
         
         assert skills == []
+
+
+class TestCalculateMatchScore:
+    """Test _calculate_match_score algorithm with Jaccard + substring matching."""
+
+    def _make_skill(self, triggers: list[str], priority: int = 10) -> SkillMetadata:
+        return SkillMetadata(
+            name="test_skill",
+            version="1.0.0",
+            description="Test",
+            category="test",
+            subcategory="sub",
+            triggers=triggers,
+            dependencies=[],
+            priority=priority,
+            cost_estimate="low",
+        )
+
+    def test_exact_word_match(self, db):
+        """Exact word match should score higher than substring."""
+        selector = SkillSelector(db)
+        skill = self._make_skill(["debug"])
+
+        # Exact word match
+        score_exact = selector._calculate_match_score("debug this code", skill)
+        # Substring match (debug inside debugging)
+        score_substr = selector._calculate_match_score("debugging this code", skill)
+
+        assert score_exact > score_substr
+
+    def test_multiple_trigger_accumulation(self, db):
+        """Multiple matching triggers should accumulate score."""
+        selector = SkillSelector(db)
+        skill_one = self._make_skill(["read"])
+        skill_two = self._make_skill(["read", "file"])
+
+        score_one = selector._calculate_match_score("read file content", skill_one)
+        score_two = selector._calculate_match_score("read file content", skill_two)
+
+        assert score_two > score_one
+
+    def test_underscore_split_triggers(self, db):
+        """Triggers with underscores should match individual words."""
+        selector = SkillSelector(db)
+        skill = self._make_skill(["read_file"])
+
+        # "read" is in trigger_words from split("_")
+        score = selector._calculate_match_score("read the document", skill)
+        assert score > 0
+
+    def test_priority_boost(self, db):
+        """Higher priority skills should get boosted scores."""
+        selector = SkillSelector(db)
+        low_priority = self._make_skill(["test"], priority=5)
+        high_priority = self._make_skill(["test"], priority=10)
+
+        score_low = selector._calculate_match_score("test something", low_priority)
+        score_high = selector._calculate_match_score("test something", high_priority)
+
+        assert score_high > score_low
+
+    def test_no_match_returns_zero(self, db):
+        """No matching triggers should return zero score."""
+        selector = SkillSelector(db)
+        skill = self._make_skill(["database", "sql"])
+
+        score = selector._calculate_match_score("read file content", skill)
+        assert score == 0.0
+
+    def test_trigger_case_insensitive(self, db):
+        """Trigger matching should be case-insensitive."""
+        selector = SkillSelector(db)
+        skill = self._make_skill(["DEBUG"])
+
+        # Query is lowercase, trigger is uppercase
+        score = selector._calculate_match_score("debug this", skill)
+        assert score > 0
+
+    def test_empty_query(self, db):
+        """Empty query should return zero score."""
+        selector = SkillSelector(db)
+        skill = self._make_skill(["test"])
+
+        score = selector._calculate_match_score("", skill)
+        assert score == 0.0
+
+    def test_empty_triggers(self, db):
+        """Skill with no triggers should return zero score."""
+        selector = SkillSelector(db)
+        skill = self._make_skill([])
+
+        score = selector._calculate_match_score("test query", skill)
+        assert score == 0.0
+
+    def test_multi_word_trigger(self, db):
+        """Multi-word trigger like 'read file' matches via substring containment."""
+        selector = SkillSelector(db)
+        skill = self._make_skill(["read file"])
+
+        # "read file" is not split by space (only underscore), so it matches
+        # as a substring of the query, not via word overlap
+        score = selector._calculate_match_score("read file content", skill)
+        assert score > 0

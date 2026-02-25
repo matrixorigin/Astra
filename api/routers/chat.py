@@ -96,7 +96,12 @@ def _ensure_session(db: Session, user_id: str, session_id: str | None, agent_id:
 
 
 def _build_chat_loop(db: Session):
-    """Build ChatLoop with all dependencies."""
+    """Build ChatLoop with all dependencies.
+
+    Per-request objects (EventLogger, DB session, SkillPipeline) are always fresh.
+    SkillPipeline cannot be cached because it holds DB session reference for
+    audit/learning writes - caching would cause stale session across requests.
+    """
     from core.agent.chat_loop import ChatLoop
     from core.agent.executor import AgentExecutor
     from core.code_executor import CodeExecutor
@@ -141,6 +146,8 @@ def _build_chat_loop(db: Session):
     )
     register_builtin_skills(skill_registry, db, code_executor=code_executor)
     context_manager = ContextManager(db, gate_trigger=gate_trigger)
+    # SkillPipeline holds DB session reference internally for audit/learning writes.
+    # Must create fresh instance per-request to avoid stale session issues.
     selector = SkillPipeline(db, llm_client, audit=True, learning=True)
     selector.reload_skills(registry=skill_registry)
 
@@ -169,7 +176,7 @@ def _build_chat_loop(db: Session):
 
 def _get_engine(db: Session):
     from core.agent.run_engine import RunEngine
-    return RunEngine(db)
+    return RunEngine(db, chat_loop_factory=_build_chat_loop)
 
 
 # ---------------------------------------------------------------------------
