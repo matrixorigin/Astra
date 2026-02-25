@@ -231,9 +231,13 @@ class TestSLODashboard:
                 WHERE agent_id = :aid AND event_type = 'slo_monitoring_increased'
                 LIMIT 1
             """), {"aid": agent_id}).fetchone()
+            assert row is not None
         finally:
+            db.execute(text(
+                "DELETE FROM conversation_events WHERE agent_id = :aid"
+            ), {"aid": agent_id})
+            db.commit()
             db.close()
-        assert row is not None
 
     def test_slo_auto_response_critical_fires_gate(self, db_session):
         """Critical severity calls gate_trigger.trigger() public method."""
@@ -249,15 +253,21 @@ class TestSLODashboard:
             current_value=2.0, met=False, burn_rate=4.0,
             severity=SLOSeverity.CRITICAL, days_elapsed=10, bad_days=8,
         )
-        monitor._auto_respond(db_session, agent_id, status)
-        db_session.commit()
+        try:
+            monitor._auto_respond(db_session, agent_id, status)
+            db_session.commit()
 
-        gate_trigger.trigger.assert_called_once()
-        kwargs = gate_trigger.trigger.call_args.kwargs
-        assert kwargs["change_type"] == "slo_critical"
-        # change_id is either recent_change["change_id"] or fallback with agent_id
-        assert kwargs["change_id"]  # non-empty
-        assert kwargs["change_content"]["agent_id"] == agent_id
+            gate_trigger.trigger.assert_called_once()
+            kwargs = gate_trigger.trigger.call_args.kwargs
+            assert kwargs["change_type"] == "slo_critical"
+            # change_id is either recent_change["change_id"] or fallback with agent_id
+            assert kwargs["change_id"]  # non-empty
+            assert kwargs["change_content"]["agent_id"] == agent_id
+        finally:
+            db_session.execute(text(
+                "DELETE FROM conversation_events WHERE agent_id = :aid"
+            ), {"aid": agent_id})
+            db_session.commit()
 
     def test_slo_auto_response_breach_creates_postmortem(self, db_session):
         """Breach severity writes post-mortem, model escalation, and HITL tightening events."""
@@ -283,12 +293,16 @@ class TestSLODashboard:
                   AND event_type IN ('slo_post_mortem', 'slo_model_escalation', 'slo_hitl_tightened')
                 ORDER BY event_type
             """), {"aid": agent_id}).fetchall()
+            event_types = {r[0] for r in rows}
+            assert "slo_post_mortem" in event_types
+            assert "slo_model_escalation" in event_types
+            assert "slo_hitl_tightened" in event_types
         finally:
+            db.execute(text(
+                "DELETE FROM conversation_events WHERE agent_id = :aid"
+            ), {"aid": agent_id})
+            db.commit()
             db.close()
-        event_types = {r[0] for r in rows}
-        assert "slo_post_mortem" in event_types
-        assert "slo_model_escalation" in event_types
-        assert "slo_hitl_tightened" in event_types
 
     def test_observability_metrics_query(self, db_session):
         """Observability metrics query runs without error."""

@@ -59,6 +59,8 @@ class TestEvalDailySessionIsolation:
         assert "skills_learned" in result          # Phase 4 ran
 
         # Every session created by the factory must be closed (no leaks).
+        # This catches real resource leaks: e.g. a phase that calls the factory
+        # but an exception path bypasses _db()'s finally clause.
         assert len(sessions_closed) == len(sessions_created), (
             f"Session leak: {len(sessions_created)} created but {len(sessions_closed)} closed"
         )

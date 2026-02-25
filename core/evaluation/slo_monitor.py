@@ -18,12 +18,15 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import text
 
 from core.logging_config import get_logger
 from core.db_consumer import DbConsumer, DbFactory
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
 
@@ -86,9 +89,18 @@ class SLOMonitor(DbConsumer):
 
         Opens a single session for the entire check: read metrics, evaluate,
         write alert/response events, then batch-commit once.
+
+        If the metrics query fails the report contains zero-data statuses
+        (severity=OK, days_elapsed=0) and the error is logged — callers
+        can detect this via ``all(s.days_elapsed == 0 for s in report.statuses)``.
         """
         with self._db() as db:
-            metrics = self._query_daily_metrics(db, agent_id, period_days)
+            try:
+                metrics = self._query_daily_metrics(db, agent_id, period_days)
+            except Exception as e:
+                logger.error("SLO metrics query failed for %s: %s", agent_id, e)
+                metrics = []
+
             statuses = [self._evaluate_slo(slo, metrics, period_days) for slo in self.slos]
 
             report = AgentSLOReport(
@@ -108,7 +120,7 @@ class SLOMonitor(DbConsumer):
             try:
                 db.commit()
             except Exception as e:
-                logger.debug("Failed to commit SLO events: %s", e)
+                logger.warning("Failed to commit SLO events for %s: %s", agent_id, e)
 
             return report
 
@@ -122,37 +134,37 @@ class SLOMonitor(DbConsumer):
     def _query_daily_metrics(
         self, db: "Session", agent_id: str, period_days: int,
     ) -> list[dict[str, Any]]:
-        """Query daily aggregated metrics. Caller provides the session."""
-        try:
-            rows = db.execute(text("""
-                SELECT
-                    DATE(created_at) AS day,
-                    AVG(quality_score) AS avg_quality,
-                    SUM(CASE WHEN `metadata` IS NOT NULL
-                        AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.hallucination_detected')) = 'true'
-                        THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS hallucination_rate,
-                    COUNT(*) AS total_responses
-                FROM conversation_events
-                WHERE agent_id = :agent_id
-                  AND event_type = 'llm_response'
-                  AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
-                GROUP BY DATE(created_at)
-                ORDER BY day
-            """), {"agent_id": agent_id, "days": period_days}).fetchall()
+        """Query daily aggregated metrics. Caller provides the session.
 
-            return [
-                {
-                    "day": row[0],
-                    "avg_quality": float(row[1]) if row[1] else 0.0,
-                    "hallucination_rate": float(row[2]) if row[2] else 0.0,
-                    "total_responses": int(row[3]),
-                    "completion_rate": 0.95,  # TODO: derive from PAOR terminal states
-                }
-                for row in rows
-            ]
-        except Exception as e:
-            logger.warning("SLO metrics query failed: %s", e)
-            return []
+        Raises on DB errors so the caller can distinguish 'no data' from
+        'query failed' — returning [] would silently produce false-OK reports.
+        """
+        rows = db.execute(text("""
+            SELECT
+                DATE(created_at) AS day,
+                AVG(quality_score) AS avg_quality,
+                SUM(CASE WHEN `metadata` IS NOT NULL
+                    AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.hallucination_detected')) = 'true'
+                    THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS hallucination_rate,
+                COUNT(*) AS total_responses
+            FROM conversation_events
+            WHERE agent_id = :agent_id
+              AND event_type = 'llm_response'
+              AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
+            GROUP BY DATE(created_at)
+            ORDER BY day
+        """), {"agent_id": agent_id, "days": period_days}).fetchall()
+
+        return [
+            {
+                "day": row[0],
+                "avg_quality": float(row[1]) if row[1] else 0.0,
+                "hallucination_rate": float(row[2]) if row[2] else 0.0,
+                "total_responses": int(row[3]),
+                "completion_rate": 0.95,  # TODO: derive from PAOR terminal states
+            }
+            for row in rows
+        ]
 
     def _evaluate_slo(
         self, slo: SLOTarget, daily_metrics: list[dict[str, Any]],
@@ -345,7 +357,11 @@ class SLOMonitor(DbConsumer):
             return None
 
     def _write_event(self, db: "Session", agent_id: str, event_type: str, payload: dict[str, Any]) -> None:
-        """Write an auditable system event. Does NOT commit — caller batches."""
+        """Write an auditable system event. Does NOT commit — caller batches.
+
+        On failure the session is rolled back so subsequent writes on the
+        same session are not poisoned by a dirty transaction state.
+        """
         try:
             from core.utils.id_generator import generate_id
             eid = generate_id()
@@ -363,7 +379,8 @@ class SLOMonitor(DbConsumer):
                 "content": json.dumps(payload),
             })
         except Exception as e:
-            logger.debug("Failed to write SLO event %s: %s", event_type, e)
+            db.rollback()
+            logger.warning("Failed to write SLO event %s: %s", event_type, e)
 
     def _record_alert(self, db: "Session", agent_id: str, status: SLOStatus):
         """Record SLO alert as auditable event."""
