@@ -132,9 +132,44 @@ class TestNoSessionCreation:
 class TestSessionLifecycle:
     """Test that DbConsumer._db() manages session lifecycle."""
 
-    def test_caller_manages_session_lifecycle(self):
+    def test_db_context_manager_closes_session(self):
+        """_db() must close the session when the block exits."""
         mock_session = Mock(spec=Session)
-        factory = lambda: mock_session
-        git = GitForData(factory)
-        assert isinstance(git, DbConsumer)
-        assert git._db_factory is factory
+        git = GitForData(lambda: mock_session)
+
+        with git._db() as db:
+            assert db is mock_session
+        mock_session.close.assert_called_once()
+
+    def test_db_context_manager_rolls_back_on_exception(self):
+        """_db() must rollback before closing when an exception occurs."""
+        mock_session = Mock(spec=Session)
+        git = GitForData(lambda: mock_session)
+
+        with pytest.raises(ValueError):
+            with git._db() as db:
+                raise ValueError("boom")
+        mock_session.rollback.assert_called_once()
+        mock_session.close.assert_called_once()
+
+    def test_event_logger_borrowed_mode_does_not_close(self):
+        """EventLogger.from_session uses a borrowed session — no close on use."""
+        mock_session = Mock(spec=Session)
+        logger = EventLogger.from_session(mock_session)
+        # Borrowed mode: session is not closed by EventLogger
+        mock_session.close.assert_not_called()
+
+    def test_no_session_ownership_attributes(self):
+        """DbConsumer modules must not have legacy session ownership attrs."""
+        mock_session = Mock(spec=Session)
+        mock_session.query.return_value.filter.return_value.all.return_value = []
+        modules = [
+            GitForData(lambda: mock_session),
+            Sandbox(lambda: mock_session),
+            SelfImprovingSelector(lambda: mock_session),
+            SemanticDiff(lambda: mock_session),
+        ]
+        for module in modules:
+            assert not hasattr(module, '_lazy_session'), f"{type(module).__name__} has _lazy_session"
+            assert not hasattr(module, '_owns_session'), f"{type(module).__name__} has _owns_session"
+            assert not hasattr(module, 'db'), f"{type(module).__name__} has legacy .db attribute"

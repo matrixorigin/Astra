@@ -82,9 +82,13 @@ class SLOMonitor(DbConsumer):
         self._gate_trigger = gate_trigger  # GateTrigger | None
 
     def check_agent(self, agent_id: str, period_days: int = 30) -> AgentSLOReport:
-        """Check all SLOs for an agent over the given period."""
+        """Check all SLOs for an agent over the given period.
+
+        Opens a single session for the entire check: read metrics, evaluate,
+        write alert/response events, then batch-commit once.
+        """
         with self._db() as db:
-            metrics = self._query_daily_metrics(agent_id, period_days)
+            metrics = self._query_daily_metrics(db, agent_id, period_days)
             statuses = [self._evaluate_slo(slo, metrics, period_days) for slo in self.slos]
 
             report = AgentSLOReport(
@@ -97,10 +101,10 @@ class SLOMonitor(DbConsumer):
             # Record any non-OK statuses and trigger auto-response
             for s in statuses:
                 if s.severity != SLOSeverity.OK:
-                    self._record_alert(agent_id, s)
-                    self._auto_respond(agent_id, s)
+                    self._record_alert(db, agent_id, s)
+                    self._auto_respond(db, agent_id, s)
 
-            # Batch commit all SLO events
+            # Batch commit all SLO events written above
             try:
                 db.commit()
             except Exception as e:
@@ -112,43 +116,43 @@ class SLOMonitor(DbConsumer):
         self, agent_id: str, period_days: int,
     ) -> list[dict[str, Any]]:
         """Query daily aggregated metrics for an agent."""
-        return self._query_daily_metrics(agent_id, period_days)
+        with self._db() as db:
+            return self._query_daily_metrics(db, agent_id, period_days)
 
     def _query_daily_metrics(
-        self, agent_id: str, period_days: int,
+        self, db: "Session", agent_id: str, period_days: int,
     ) -> list[dict[str, Any]]:
-        """Query daily aggregated metrics for an agent."""
-        with self._db() as db:
-            try:
-                rows = db.execute(text("""
-                    SELECT
-                        DATE(created_at) AS day,
-                        AVG(quality_score) AS avg_quality,
-                        SUM(CASE WHEN `metadata` IS NOT NULL
-                            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.hallucination_detected')) = 'true'
-                            THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS hallucination_rate,
-                        COUNT(*) AS total_responses
-                    FROM conversation_events
-                    WHERE agent_id = :agent_id
-                      AND event_type = 'llm_response'
-                      AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
-                    GROUP BY DATE(created_at)
-                    ORDER BY day
-                """), {"agent_id": agent_id, "days": period_days}).fetchall()
+        """Query daily aggregated metrics. Caller provides the session."""
+        try:
+            rows = db.execute(text("""
+                SELECT
+                    DATE(created_at) AS day,
+                    AVG(quality_score) AS avg_quality,
+                    SUM(CASE WHEN `metadata` IS NOT NULL
+                        AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.hallucination_detected')) = 'true'
+                        THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS hallucination_rate,
+                    COUNT(*) AS total_responses
+                FROM conversation_events
+                WHERE agent_id = :agent_id
+                  AND event_type = 'llm_response'
+                  AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
+                GROUP BY DATE(created_at)
+                ORDER BY day
+            """), {"agent_id": agent_id, "days": period_days}).fetchall()
 
-                return [
-                    {
-                        "day": row[0],
-                        "avg_quality": float(row[1]) if row[1] else 0.0,
-                        "hallucination_rate": float(row[2]) if row[2] else 0.0,
-                        "total_responses": int(row[3]),
-                        "completion_rate": 0.95,  # TODO: derive from PAOR terminal states
-                    }
-                    for row in rows
-                ]
-            except Exception as e:
-                logger.warning("SLO metrics query failed: %s", e)
-                return []
+            return [
+                {
+                    "day": row[0],
+                    "avg_quality": float(row[1]) if row[1] else 0.0,
+                    "hallucination_rate": float(row[2]) if row[2] else 0.0,
+                    "total_responses": int(row[3]),
+                    "completion_rate": 0.95,  # TODO: derive from PAOR terminal states
+                }
+                for row in rows
+            ]
+        except Exception as e:
+            logger.warning("SLO metrics query failed: %s", e)
+            return []
 
     def _evaluate_slo(
         self, slo: SLOTarget, daily_metrics: list[dict[str, Any]],
@@ -207,18 +211,21 @@ class SLOMonitor(DbConsumer):
             return SLOSeverity.WARNING
         return SLOSeverity.OK
 
-    def _auto_respond(self, agent_id: str, status: SLOStatus) -> None:
+    def _auto_respond(self, db: "Session", agent_id: str, status: SLOStatus) -> None:
         """Three-tier auto-response to SLO violations.
 
         warning  → increase monitoring frequency
         critical → trigger replay gate asynchronously
         breach   → post-mortem event + model escalation intent
+
+        Caller provides the session; events are NOT committed here
+        so that check_agent can batch-commit all events atomically.
         """
         sev = status.severity
         slo_name = status.slo.name
 
         if sev == SLOSeverity.WARNING:
-            self._write_event(agent_id, "slo_monitoring_increased", {
+            self._write_event(db, agent_id, "slo_monitoring_increased", {
                 "slo": slo_name,
                 "action": "monitoring_frequency_increased",
                 "burn_rate": status.burn_rate,
@@ -229,7 +236,7 @@ class SLOMonitor(DbConsumer):
             # Trigger replay gate to validate recent changes
             if self._gate_trigger is not None:
                 # Find most recent prompt/skill/config change to bind as regression source
-                recent_change = self._find_recent_change(agent_id)
+                recent_change = self._find_recent_change(db, agent_id)
                 change_id = recent_change["change_id"] if recent_change else f"slo_critical:{agent_id}:{slo_name}"
                 change_content = {
                     "agent_id": agent_id,
@@ -244,13 +251,13 @@ class SLOMonitor(DbConsumer):
                     change_content=change_content,
                 )
             # Model escalation intent — same as breach
-            self._write_event(agent_id, "slo_model_escalation", {
+            self._write_event(db, agent_id, "slo_model_escalation", {
                 "slo": slo_name,
                 "action": "model_escalation_requested",
                 "severity": "critical",
                 "burn_rate": status.burn_rate,
             })
-            self._write_event(agent_id, "slo_gate_triggered", {
+            self._write_event(db, agent_id, "slo_gate_triggered", {
                 "slo": slo_name,
                 "action": "replay_gate_triggered",
                 "burn_rate": status.burn_rate,
@@ -259,7 +266,7 @@ class SLOMonitor(DbConsumer):
 
         elif sev == SLOSeverity.BREACH:
             # Post-mortem event
-            self._write_event(agent_id, "slo_post_mortem", {
+            self._write_event(db, agent_id, "slo_post_mortem", {
                 "slo": slo_name,
                 "action": "post_mortem_created",
                 "current_value": status.current_value,
@@ -268,7 +275,7 @@ class SLOMonitor(DbConsumer):
                 "days_elapsed": status.days_elapsed,
             })
             # Model escalation intent — ChatLoop reads this to upgrade model tier
-            self._write_event(agent_id, "slo_model_escalation", {
+            self._write_event(db, agent_id, "slo_model_escalation", {
                 "slo": slo_name,
                 "action": "model_escalation_requested",
                 "severity": "breach",
@@ -276,7 +283,7 @@ class SLOMonitor(DbConsumer):
                           f"(target {status.slo.operator} {status.slo.target})",
             })
             # HITL policy tightening intent
-            self._write_event(agent_id, "slo_hitl_tightened", {
+            self._write_event(db, agent_id, "slo_hitl_tightened", {
                 "slo": slo_name,
                 "action": "hitl_policy_tightening_requested",
                 "reason": "SLO breach requires increased human oversight",
@@ -286,84 +293,81 @@ class SLOMonitor(DbConsumer):
                 agent_id, slo_name,
             )
 
-    def _find_recent_change(self, agent_id: str) -> dict[str, Any] | None:
+    def _find_recent_change(self, db: "Session", agent_id: str) -> dict[str, Any] | None:
         """Find most recent skill/prompt change (global, not agent-specific).
         
         Returns change metadata to bind as suspected regression source.
         Note: skills_registry and prompt_templates are global resources without agent_id,
         so this returns the most recent change across all agents within 7 days.
         """
-        with self._db() as db:
-            try:
-                # Find most recent skill change
-                skill_row = db.execute(text("""
-                    SELECT skill_name, version, updated_at
-                    FROM skills_registry
-                    WHERE updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-                    ORDER BY updated_at DESC
-                    LIMIT 1
-                """)).fetchone()
-            
-                # Find most recent prompt change
-                prompt_row = db.execute(text("""
-                    SELECT template_id, version, created_at
-                    FROM prompt_templates
-                    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """)).fetchone()
-            
-                # Return the most recent of the two
-                skill_ts = skill_row[2] if skill_row else None
-                prompt_ts = prompt_row[2] if prompt_row else None
-            
-                if skill_ts and (not prompt_ts or skill_ts > prompt_ts):
-                    return {
-                        "change_type": "skill_version_changed",
-                        "change_id": f"{skill_row[0]}@{skill_row[1]}",
-                        "skill_name": skill_row[0],
-                        "version": skill_row[1],
-                        "timestamp": skill_ts.isoformat(),
-                    }
-                elif prompt_ts:
-                    return {
-                        "change_type": "prompt_template_changed",
-                        "change_id": f"{prompt_row[0]}@{prompt_row[1]}",
-                        "template_id": prompt_row[0],
-                        "version": prompt_row[1],
-                        "timestamp": prompt_ts.isoformat(),
-                    }
-                return None
-            except Exception as e:
-                logger.warning("Failed to query recent changes: %s", e)
-                return None
+        try:
+            # Find most recent skill change
+            skill_row = db.execute(text("""
+                SELECT skill_name, version, updated_at
+                FROM skills_registry
+                WHERE updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """)).fetchone()
+        
+            # Find most recent prompt change
+            prompt_row = db.execute(text("""
+                SELECT template_id, version, created_at
+                FROM prompt_templates
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                ORDER BY created_at DESC
+                LIMIT 1
+            """)).fetchone()
+        
+            # Return the most recent of the two
+            skill_ts = skill_row[2] if skill_row else None
+            prompt_ts = prompt_row[2] if prompt_row else None
+        
+            if skill_ts and (not prompt_ts or skill_ts > prompt_ts):
+                return {
+                    "change_type": "skill_version_changed",
+                    "change_id": f"{skill_row[0]}@{skill_row[1]}",
+                    "skill_name": skill_row[0],
+                    "version": skill_row[1],
+                    "timestamp": skill_ts.isoformat(),
+                }
+            elif prompt_ts:
+                return {
+                    "change_type": "prompt_template_changed",
+                    "change_id": f"{prompt_row[0]}@{prompt_row[1]}",
+                    "template_id": prompt_row[0],
+                    "version": prompt_row[1],
+                    "timestamp": prompt_ts.isoformat(),
+                }
+            return None
+        except Exception as e:
+            logger.warning("Failed to query recent changes: %s", e)
+            return None
 
-    def _write_event(self, agent_id: str, event_type: str, payload: dict[str, Any]) -> None:
-        """Write an auditable system event for SLO auto-response actions."""
-        with self._db() as db:
-            try:
-                from core.utils.id_generator import generate_id
-                eid = generate_id()
-                db.execute(text("""
-                    INSERT INTO conversation_events
-                        (event_id, session_id, user_id, agent_id, agent_version,
-                         event_type, content, causal_chain_id, created_at)
-                    VALUES
-                        (:eid, 'system_slo', 'system', :aid, '1.0.0',
-                         :etype, :content, :eid, NOW())
-                """), {
-                    "eid": eid,
-                    "aid": agent_id,
-                    "etype": event_type,
-                    "content": json.dumps(payload),
-                })
-                db.commit()
-            except Exception as e:
-                logger.debug("Failed to write SLO event %s: %s", event_type, e)
+    def _write_event(self, db: "Session", agent_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        """Write an auditable system event. Does NOT commit — caller batches."""
+        try:
+            from core.utils.id_generator import generate_id
+            eid = generate_id()
+            db.execute(text("""
+                INSERT INTO conversation_events
+                    (event_id, session_id, user_id, agent_id, agent_version,
+                     event_type, content, causal_chain_id, created_at)
+                VALUES
+                    (:eid, 'system_slo', 'system', :aid, '1.0.0',
+                     :etype, :content, :eid, NOW())
+            """), {
+                "eid": eid,
+                "aid": agent_id,
+                "etype": event_type,
+                "content": json.dumps(payload),
+            })
+        except Exception as e:
+            logger.debug("Failed to write SLO event %s: %s", event_type, e)
 
-    def _record_alert(self, agent_id: str, status: SLOStatus):
+    def _record_alert(self, db: "Session", agent_id: str, status: SLOStatus):
         """Record SLO alert as auditable event."""
-        self._write_event(agent_id, "slo_alert", {
+        self._write_event(db, agent_id, "slo_alert", {
             "slo": status.slo.name,
             "severity": status.severity.value,
             "burn_rate": status.burn_rate,

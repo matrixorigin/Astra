@@ -280,7 +280,9 @@ class CoordinationPatterns:
             try:
                 from core.agents.conflict_resolver import ConflictResolver as CR
                 from core.agents.conflict_resolver import Proposal
-                resolver = CR(db_factory=lambda: None)  # stateless resolution, no DB needed
+                # detect_conflict, resolve_by_authority, resolve_by_evidence are
+                # pure logic — they never call self._db(), so a null factory is safe.
+                resolver = CR(db_factory=lambda: None)
                 resolutions = []
                 for c in conflicts:
                     proposals = [

@@ -53,7 +53,8 @@ class LLMClient(DbConsumer):
 
         self._providers: dict[str, BaseProvider] = {}
         self._model_keys: dict[str, str] = {}  # model_name -> decrypted api_key
-        self.router = ModelRouter(db=self._db_factory(), user_id=user_id)
+        with self._db() as db:
+            self.router = ModelRouter(db=db, user_id=user_id)
         self.rate_limiter = RateLimiter()
         self._load_config()
         self._init_providers()
@@ -66,7 +67,8 @@ class LLMClient(DbConsumer):
     ):
         """Update user context and reload router."""
         self.user_id = user_id
-        self.router = ModelRouter(db=self._db_factory(), user_id=user_id)
+        with self._db() as db:
+            self.router = ModelRouter(db=db, user_id=user_id)
         self._init_providers()
 
     # ── Config (#4 动态配置) ───────────────────────────────────────

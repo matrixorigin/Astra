@@ -106,21 +106,23 @@ class RegressionGate(DbConsumer):
             
             # 4. Replay golden sessions
             replay_results = []
-            for session in golden_sessions:
-                result = ReplayService(self._db_factory()).replay_session(
-                    session_id=session["session_id"],
-                    user_id=session["user_id"],
-                    sandbox_name=sandbox_name,
-                    mock_mode=True,
-                )
-                replay_results.append({
-                    "session_id": session["session_id"],
-                    "original_score": session["avg_score"],
-                    "replay_status": result["status"],
-                    "events_replayed": result["events_replayed"],
-                    "successful": result["result"]["successful"],
-                    "failed": result["result"]["failed"],
-                })
+            with self._db() as replay_db:
+                replay_svc = ReplayService(replay_db)
+                for session in golden_sessions:
+                    result = replay_svc.replay_session(
+                        session_id=session["session_id"],
+                        user_id=session["user_id"],
+                        sandbox_name=sandbox_name,
+                        mock_mode=True,
+                    )
+                    replay_results.append({
+                        "session_id": session["session_id"],
+                        "original_score": session["avg_score"],
+                        "replay_status": result["status"],
+                        "events_replayed": result["events_replayed"],
+                        "successful": result["result"]["successful"],
+                        "failed": result["result"]["failed"],
+                    })
             
             # 5. Compute metrics
             metrics = self._compute_metrics(golden_sessions, replay_results)

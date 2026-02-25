@@ -220,17 +220,19 @@ class TestSLODashboard:
             current_value=3.5, met=False, burn_rate=2.0,
             severity=SLOSeverity.WARNING, days_elapsed=5, bad_days=3,
         )
-        monitor._auto_respond(agent_id, status)
-
-        check = SessionLocal()
+        # _auto_respond takes an explicit db session; caller commits.
+        db = SessionLocal()
         try:
-            row = check.execute(text("""
+            monitor._auto_respond(db, agent_id, status)
+            db.commit()
+
+            row = db.execute(text("""
                 SELECT event_type FROM conversation_events
                 WHERE agent_id = :aid AND event_type = 'slo_monitoring_increased'
                 LIMIT 1
             """), {"aid": agent_id}).fetchone()
         finally:
-            check.close()
+            db.close()
         assert row is not None
 
     def test_slo_auto_response_critical_fires_gate(self, db_session):
@@ -247,7 +249,7 @@ class TestSLODashboard:
             current_value=2.0, met=False, burn_rate=4.0,
             severity=SLOSeverity.CRITICAL, days_elapsed=10, bad_days=8,
         )
-        monitor._auto_respond(agent_id, status)
+        monitor._auto_respond(db_session, agent_id, status)
         db_session.commit()
 
         gate_trigger.trigger.assert_called_once()
@@ -269,18 +271,20 @@ class TestSLODashboard:
             current_value=1.5, met=False, burn_rate=10.0,
             severity=SLOSeverity.BREACH, days_elapsed=30, bad_days=25,
         )
-        monitor._auto_respond(agent_id, status)
-        # Query with fresh session since monitor committed on its own session
-        check = SessionLocal()
+        # _auto_respond takes an explicit db; caller commits.
+        db = SessionLocal()
         try:
-            rows = check.execute(text("""
+            monitor._auto_respond(db, agent_id, status)
+            db.commit()
+
+            rows = db.execute(text("""
                 SELECT event_type FROM conversation_events
                 WHERE agent_id = :aid
                   AND event_type IN ('slo_post_mortem', 'slo_model_escalation', 'slo_hitl_tightened')
                 ORDER BY event_type
             """), {"aid": agent_id}).fetchall()
         finally:
-            check.close()
+            db.close()
         event_types = {r[0] for r in rows}
         assert "slo_post_mortem" in event_types
         assert "slo_model_escalation" in event_types
