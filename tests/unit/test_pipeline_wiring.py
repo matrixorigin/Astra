@@ -194,11 +194,12 @@ class TestChatLoopFlushOrdering:
 
 
 class TestRunEngineFlushOnTerminal:
-    """Post-refactor: _log_run_event creates bare EventLogger(db) — no pipeline.
+    """_log_run_event creates a bare EventLogger(db) — no pipeline.
 
-    Run lifecycle events are always written synchronously via db.add + db.commit.
-    flush_critical is NOT called because there is no pipeline attached.
-    These tests verify the synchronous write path works for all event types.
+    This is the key design guarantee: run lifecycle events are ALWAYS written
+    synchronously via db.add + db.commit, never deferred through a pipeline.
+    This ensures terminal events (COMPLETED/FAILED/CANCELLED) are immediately
+    visible for cross-worker polling.
     """
 
     def _make_engine_and_run(self):
@@ -215,20 +216,55 @@ class TestRunEngineFlushOnTerminal:
         mock_run.to_event_content.return_value = "{}"
         return engine, mock_session, mock_run
 
-    def test_log_run_event_writes_sync_on_completed(self):
+    def test_log_run_event_writes_sync(self):
+        """All lifecycle events go through synchronous db.add + db.commit."""
         engine, mock_session, mock_run = self._make_engine_and_run()
         engine._log_run_event(mock_run, EventType.RUN_COMPLETED)
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
 
-    def test_log_run_event_writes_sync_on_failed(self):
+    def test_log_run_event_never_uses_pipeline(self):
+        """Even when _PIPELINE_ENABLED is True, _log_run_event bypasses it.
+
+        RunEngine creates EventLogger(db) without a pipeline argument, so
+        log_event() always takes the synchronous path.  This is critical:
+        terminal events must be committed before start_run returns, otherwise
+        cross-worker polling may miss them.
+        """
         engine, mock_session, mock_run = self._make_engine_and_run()
-        engine._log_run_event(mock_run, EventType.RUN_FAILED)
+
+        with patch("core.events.event_logger._PIPELINE_ENABLED", True):
+            engine._log_run_event(mock_run, EventType.RUN_COMPLETED)
+
+        # If pipeline were used, log_event() would call pipeline.emit() and
+        # return early — session.add would NOT be called.  The fact that
+        # session.add IS called proves the synchronous path was taken.
         mock_session.add.assert_called_once()
         mock_session.commit.assert_called_once()
 
-    def test_log_run_event_writes_sync_on_started(self):
-        engine, mock_session, mock_run = self._make_engine_and_run()
+    def test_log_run_event_uses_short_lived_session(self):
+        """Each _log_run_event call acquires and releases its own session."""
+        from core.agent.run_engine import RunEngine
+        sessions_created = []
+        def tracking_factory():
+            s = MagicMock(spec=Session)
+            sessions_created.append(s)
+            return s
+
+        engine = RunEngine(tracking_factory)
+        mock_run = MagicMock()
+        mock_run.run_id = "r1"
+        mock_run.user_id = "u1"
+        mock_run.session_id = "s1"
+        mock_run.parent_run_id = None
+        mock_run.waiting_for = None
+        mock_run.context = {}
+        mock_run.to_event_content.return_value = "{}"
+
         engine._log_run_event(mock_run, EventType.RUN_STARTED)
-        mock_session.add.assert_called_once()
-        mock_session.commit.assert_called_once()
+        engine._log_run_event(mock_run, EventType.RUN_COMPLETED)
+
+        # Two calls → two sessions acquired and closed
+        assert len(sessions_created) == 2
+        for s in sessions_created:
+            s.close.assert_called_once()

@@ -540,8 +540,13 @@ class RunEngine(DbConsumer):
         if len(self._pending_inserts) >= _RUN_EVENT_FLUSH_SIZE:
             self._flush_run_events()
 
-    def _flush_run_events(self) -> None:
-        """Commit all pending run_event INSERTs using a short-lived session."""
+    def _flush_run_events(self, *, _retried: bool = False) -> None:
+        """Commit all pending run_event INSERTs using a short-lived session.
+
+        On failure, retries once with a fresh session (handles transient
+        connection errors).  If the retry also fails, the events are dropped
+        and an error is logged — there is no further caller to retry.
+        """
         if not self._pending_inserts:
             return
         batch = self._pending_inserts
@@ -558,9 +563,12 @@ class RunEngine(DbConsumer):
                     )
                 db.commit()
         except Exception as e:
-            # Put batch back so next flush retries. Prepend to preserve ordering.
-            self._pending_inserts = batch + self._pending_inserts
-            logger.warning("Event batch commit failed (will retry): %s", e)
+            if not _retried:
+                logger.warning("Event batch commit failed, retrying with fresh session: %s", e)
+                self._pending_inserts = batch + self._pending_inserts
+                self._flush_run_events(_retried=True)
+            else:
+                logger.error("Event batch commit failed after retry, %d events dropped: %s", len(batch), e)
 
     def _load_events_from_db(self, run_id: str, after_index: int = 0) -> list[dict]:
         """Load events from DB for cross-worker streaming."""
@@ -622,6 +630,8 @@ class RunEngine(DbConsumer):
                 db.commit()
                 return True
             except IntegrityError:
+                # Explicit rollback required: we swallow the exception (return False),
+                # so DbConsumer._db()'s except clause never fires.
                 db.rollback()
                 return False
             except Exception as e:
@@ -755,8 +765,6 @@ class RunEngine(DbConsumer):
         """Get agent_id for a run from DB. Falls back to run_id."""
         restored = self.restore_run(run_id)
         return restored.agent_id if restored else run_id
-
-    _TERMINAL_EVENT_TYPES = {EventType.RUN_COMPLETED, EventType.RUN_FAILED, EventType.RUN_CANCELLED}
 
     def _log_run_event(self, run: AgentRun, event_type: EventType, extra_meta: dict | None = None) -> None:
         meta = {"run_id": run.run_id}

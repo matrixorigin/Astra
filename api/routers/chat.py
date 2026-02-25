@@ -278,7 +278,6 @@ async def chat_stream(
 async def get_run_status(
     run_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
 ):
     """Get run status and progress."""
     engine = _get_engine()
@@ -304,7 +303,6 @@ async def get_run_status(
 async def stream_run(
     run_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
     last_index: int = Query(default=0, description="Resume from event index (for reconnection)"),
 ):
     """Stream run events as SSE. Supports reconnection via last_index."""
@@ -330,7 +328,6 @@ async def stream_run(
 async def cancel_run(
     run_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
 ):
     """Cancel a running or waiting run."""
     engine = _get_engine()

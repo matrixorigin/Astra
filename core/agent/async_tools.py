@@ -456,7 +456,6 @@ async def _execute_spawn_runs(params: dict[str, Any], run_id: str | None = None)
         return {"error": "spawn_runs requires a parent run_id"}
 
     from core.agent.run_engine import RunEngine, _active_runs
-    from api.database import get_db_session
 
     parent = _active_runs.get(run_id)
     if not parent:

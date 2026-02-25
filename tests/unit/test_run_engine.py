@@ -698,17 +698,21 @@ class TestAgentConfigLogging:
 class TestEventPersistWarning:
     """Test that _append_event logs at warning level on failure."""
 
-    def test_append_event_db_failure_logs_warning(self, engine, mock_db, caplog):
+    def test_append_event_db_failure_logs_error_after_retry(self, engine, mock_db, caplog):
         import logging
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
-        # Make DB write fail
+        # Make DB write fail persistently
         mock_db.execute.side_effect = RuntimeError("disk full")
         with caplog.at_level(logging.WARNING):
             engine._append_event(run.run_id, {"event_type": "test", "data": {}})
-            engine._flush_run_events()  # Force flush to trigger DB write
-        assert "batch commit failed" in caplog.text.lower()
-        # Event should still be in local buffer
+            engine._flush_run_events()  # Triggers write → fail → retry → fail → error
+        # First attempt logs warning, second logs error with "after retry"
+        assert "retrying" in caplog.text.lower()
+        assert "after retry" in caplog.text.lower()
+        # Event should still be in local buffer (in-memory)
         assert len(_run_events[run.run_id]) == 1
+        # Pending inserts should be empty — dropped after retry exhausted
+        assert len(engine._pending_inserts) == 0
 
 
 class TestResumeClaimMultiple:
@@ -873,12 +877,16 @@ class TestCausalChainPropagation:
         # Child should have inherited the causal chain
         assert child.context.get("_causal_chain_id") == "chain-abc-123"
 
-        # Verify causal chain was passed to DB via add() calls
+        # Verify causal chain was passed to DB via add() calls.
+        # ORM column is `event_metadata` (mapped to DB column "metadata"),
+        # not `.metadata` which is SQLAlchemy's schema MetaData object.
         add_calls = mock_db.add.call_args_list
         child_events = [c[0][0] for c in add_calls
-                        if hasattr(c[0][0], 'causal_chain_id') and hasattr(c[0][0], 'metadata')
-                        and isinstance(getattr(c[0][0], 'metadata', None), dict)
-                        and c[0][0].metadata.get("run_id") == child.run_id]
+                        if hasattr(c[0][0], 'causal_chain_id')
+                        and hasattr(c[0][0], 'event_metadata')
+                        and isinstance(getattr(c[0][0], 'event_metadata', None), dict)
+                        and c[0][0].event_metadata.get("run_id") == child.run_id]
+        assert len(child_events) > 0, "Expected at least one DB event for child run"
         for ev in child_events:
             assert ev.causal_chain_id == "chain-abc-123"
 
