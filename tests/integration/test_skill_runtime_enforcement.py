@@ -13,7 +13,6 @@ import uuid
 from datetime import datetime
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
 from api.models import (
     SkillDefinition,
     SkillInstallation,
@@ -39,26 +38,29 @@ _cleanup_skills: list[str] = []
 
 
 @pytest.fixture(autouse=True)
-def _cleanup(db):
+def _cleanup(db_session):
     """Clean up test data after each test."""
     _cleanup_users.clear()
     _cleanup_skills.clear()
     yield
     for skill_name in _cleanup_skills:
-        db.query(SkillPermission).filter_by(skill_name=skill_name).delete()
-        db.query(SkillInstallation).filter_by(skill_name=skill_name).delete()
-        db.query(SkillDefinition).filter_by(name=skill_name).delete()
+        db_session.query(SkillPermission).filter_by(skill_name=skill_name).delete()
+        db_session.query(SkillInstallation).filter_by(skill_name=skill_name).delete()
+        db_session.query(SkillDefinition).filter_by(name=skill_name).delete()
     for user_id in _cleanup_users:
-        db.query(User).filter_by(user_id=user_id).delete()
-    db.commit()
+        db_session.query(User).filter_by(user_id=user_id).delete()
+    db_session.commit()
+
+
+# Use db_session (from root conftest) as the canonical session.
+# db_factory (root conftest) wraps db_session with no-op close + leak detection.
+# The "db" alias below is for convenience in test helpers that take a raw session.
 
 
 @pytest.fixture
-def db():
-    """Platform DB session."""
-    session = next(get_db_session())
-    yield session
-    session.close()
+def db(db_session):
+    """Alias for db_session — same session used by db_factory."""
+    return db_session
 
 
 @pytest.fixture
@@ -68,9 +70,9 @@ def cred_mgr():
 
 
 @pytest.fixture
-def skill_mgr(db, cred_mgr):
+def skill_mgr(db_factory, cred_mgr):
     """Skill manager."""
-    return SkillManager(db, cred_mgr)
+    return SkillManager(db_factory, cred_mgr)
 
 
 def _create_user(db: Session, user_id: str) -> User:
@@ -254,8 +256,8 @@ class TestConcurrentRaceConditions:
 
         def install_thread():
             barrier.wait()  # Start simultaneously
-            s = SessionLocal()
-            mgr = SkillManager(s, CredentialManager(secret_key="test"))
+            # Each SkillManager._db() call creates and closes its own session
+            mgr = SkillManager(SessionLocal, CredentialManager(secret_key="test"))
             try:
                 mgr.install(user_id, skill_name)
                 with lock:
@@ -263,8 +265,6 @@ class TestConcurrentRaceConditions:
             except Exception as e:
                 with lock:
                     results["errors"].append(str(e))
-            finally:
-                s.close()
 
         t1 = threading.Thread(target=install_thread)
         t2 = threading.Thread(target=install_thread)
@@ -297,37 +297,34 @@ class TestConcurrentRaceConditions:
         revoke_done = threading.Event()
 
         def execute_loop():
-            s = SessionLocal()
-            mgr = SkillManager(s, CredentialManager(secret_key="test"))
-            try:
-                # Phase 1: execute until at least one success
-                for _ in range(100):
-                    try:
-                        mgr.require_executable(user_id, skill_name)
-                        with lock:
-                            results["execute_ok"] += 1
-                        got_success.set()
-                        break
-                    except PermissionDeniedError:
-                        with lock:
-                            results["execute_denied"] += 1
-                    except Exception as e:
-                        with lock:
-                            results["errors"].append(str(e))
-                # Phase 2: wait for revoke, then execute again to observe denial
-                revoke_done.wait(timeout=10)
+            # Each SkillManager._db() call creates and closes its own session
+            mgr = SkillManager(SessionLocal, CredentialManager(secret_key="test"))
+            # Phase 1: execute until at least one success
+            for _ in range(100):
                 try:
                     mgr.require_executable(user_id, skill_name)
                     with lock:
                         results["execute_ok"] += 1
+                    got_success.set()
+                    break
                 except PermissionDeniedError:
                     with lock:
                         results["execute_denied"] += 1
                 except Exception as e:
                     with lock:
                         results["errors"].append(str(e))
-            finally:
-                s.close()
+            # Phase 2: wait for revoke, then execute again to observe denial
+            revoke_done.wait(timeout=10)
+            try:
+                mgr.require_executable(user_id, skill_name)
+                with lock:
+                    results["execute_ok"] += 1
+            except PermissionDeniedError:
+                with lock:
+                    results["execute_denied"] += 1
+            except Exception as e:
+                with lock:
+                    results["errors"].append(str(e))
 
         def revoke():
             got_success.wait(timeout=10)
@@ -375,46 +372,42 @@ class TestConcurrentRaceConditions:
         uninstall_done = threading.Event()
 
         def execute_loop():
-            s = SessionLocal()
-            mgr = SkillManager(s, CredentialManager(secret_key="test"))
-            try:
-                # Phase 1: prove it works before uninstall
-                for _ in range(100):
-                    try:
-                        mgr.require_executable(user_id, main_skill)
-                        with lock:
-                            results["execute_ok"] += 1
-                        got_success.set()
-                        break
-                    except SkillNotInstalledError:
-                        with lock:
-                            results["execute_denied"] += 1
-                    except Exception as e:
-                        with lock:
-                            results["errors"].append(str(e))
-                # Phase 2: wait for uninstall, then observe denial
-                uninstall_done.wait(timeout=10)
+            # Each SkillManager._db() call creates and closes its own session
+            mgr = SkillManager(SessionLocal, CredentialManager(secret_key="test"))
+            # Phase 1: prove it works before uninstall
+            for _ in range(100):
                 try:
                     mgr.require_executable(user_id, main_skill)
                     with lock:
                         results["execute_ok"] += 1
+                    got_success.set()
+                    break
                 except SkillNotInstalledError:
                     with lock:
                         results["execute_denied"] += 1
                 except Exception as e:
                     with lock:
                         results["errors"].append(str(e))
-            finally:
-                s.close()
+            # Phase 2: wait for uninstall, then observe denial
+            uninstall_done.wait(timeout=10)
+            try:
+                mgr.require_executable(user_id, main_skill)
+                with lock:
+                    results["execute_ok"] += 1
+            except SkillNotInstalledError:
+                with lock:
+                    results["execute_denied"] += 1
+            except Exception as e:
+                with lock:
+                    results["errors"].append(str(e))
 
         def uninstall_dep():
             got_success.wait(timeout=10)
-            s = SessionLocal()
-            mgr = SkillManager(s, CredentialManager(secret_key="test"))
+            # Each SkillManager._db() call creates and closes its own session
+            mgr = SkillManager(SessionLocal, CredentialManager(secret_key="test"))
             try:
                 mgr.uninstall(user_id, dep_skill)
             finally:
-                s.close()
                 uninstall_done.set()
 
         t1 = threading.Thread(target=execute_loop)

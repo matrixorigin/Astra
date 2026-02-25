@@ -9,8 +9,6 @@ External code should use SkillPipeline from core.skills.pipeline.
 import json
 from typing import Any
 
-from sqlalchemy.orm import Session
-
 from core.logging_config import get_logger
 from core.skills.selector import SkillMetadata, SkillSelector
 
@@ -27,17 +25,16 @@ def _estimate_tokens(obj: Any) -> int:
 class ModernSkillSelector:
     """Skill selector using native LLM function calling (OpenAI/Gemini/DeepSeek)."""
 
-    def __init__(self, session: Session, llm_client=None, *, embed_fn=None):
-        if not isinstance(session, Session):
-            raise TypeError("session must be a SQLAlchemy Session")
-        
-        self.session = session
+    def __init__(self, db_factory, llm_client=None, *, embed_fn=None):
+        if not callable(db_factory):
+            raise TypeError(f"db_factory must be callable, got {type(db_factory).__name__}")
+        self._db_factory = db_factory
         self.llm = llm_client
-        self.rule_selector = SkillSelector(session)
+        self.rule_selector = SkillSelector(db_factory)
 
         # Cache registry for schema lookups (avoid re-instantiation per skill)
         from core.skills.registry import SkillRegistry
-        self._registry = SkillRegistry(lambda: session)
+        self._registry = SkillRegistry(db_factory)
 
         # Semantic index — primary retrieval path when available
         from core.skills.skill_index import SkillIndex
@@ -267,8 +264,8 @@ class ModelRouter:
     This implements "Mixture of Agents" pattern.
     """
 
-    def __init__(self, session: Session | None = None):
-        self._session = session
+    def __init__(self, db_factory=None):
+        self._db_factory = db_factory
         self.model_mapping = {
             # Code-related: Use DeepSeek Coder or Claude
             "code": {"model": "deepseek-coder", "style": "concise", "temperature": 0.2},
@@ -330,10 +327,10 @@ class AdaptiveSkillOrchestrator:
     This is the "千人千面" implementation.
     """
 
-    def __init__(self, session: Session | None = None, llm_client=None):
-        self._session = session
-        self.selector = ModernSkillSelector(session, llm_client)
-        self.router = ModelRouter(session)
+    def __init__(self, db_factory=None, llm_client=None):
+        self._db_factory = db_factory
+        self.selector = ModernSkillSelector(db_factory, llm_client)
+        self.router = ModelRouter(db_factory)
         self.llm = llm_client
 
     async def execute_query(

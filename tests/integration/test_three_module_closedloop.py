@@ -197,7 +197,7 @@ class TestSkillRollback:
         db.commit()
         return sd
 
-    def test_upgrade_preserves_previous_version(self, db_session):
+    def test_upgrade_preserves_previous_version(self, db_session, db_factory):
         """Upgrade stores previous_version for rollback."""
         from core.skills.skill_manager import SkillManager
         from core.skills.credential_manager import CredentialManager
@@ -206,7 +206,7 @@ class TestSkillRollback:
         skill = f"trb_{os.urandom(4).hex()}"
         self._create_skill_def(db_session, skill, "1.0")
 
-        mgr = SkillManager(db_session, CredentialManager("test-secret-key-1234567890123456"))
+        mgr = SkillManager(db_factory, CredentialManager("test-secret-key-1234567890123456"))
         inst = mgr.install(uid, skill)
         assert inst.skill_version == "1.0"
 
@@ -219,7 +219,7 @@ class TestSkillRollback:
         assert inst.skill_version == "2.0"
         assert inst.previous_version == "1.0"
 
-    def test_rollback_restores_previous_version(self, db_session):
+    def test_rollback_restores_previous_version(self, db_session, db_factory):
         """Rollback swaps version back."""
         from core.skills.skill_manager import SkillManager
         from core.skills.credential_manager import CredentialManager
@@ -228,7 +228,7 @@ class TestSkillRollback:
         skill = f"rb_{os.urandom(4).hex()}"
         self._create_skill_def(db_session, skill, "1.0")
 
-        mgr = SkillManager(db_session, CredentialManager("test-secret-key-1234567890123456"))
+        mgr = SkillManager(db_factory, CredentialManager("test-secret-key-1234567890123456"))
         mgr.install(uid, skill)
 
         db_session.execute(text(
@@ -241,7 +241,7 @@ class TestSkillRollback:
         assert inst.skill_version == "1.0"
         assert inst.previous_version == "2.0"
 
-    def test_rollback_no_previous_raises(self, db_session):
+    def test_rollback_no_previous_raises(self, db_session, db_factory):
         """Rollback without previous version raises error."""
         from core.skills.skill_manager import SkillManager, SkillNotInstalledError
         from core.skills.credential_manager import CredentialManager
@@ -250,7 +250,7 @@ class TestSkillRollback:
         skill = f"norb_{os.urandom(4).hex()}"
         self._create_skill_def(db_session, skill, "1.0")
 
-        mgr = SkillManager(db_session, CredentialManager("test-secret-key-1234567890123456"))
+        mgr = SkillManager(db_factory, CredentialManager("test-secret-key-1234567890123456"))
         mgr.install(uid, skill)
 
         with pytest.raises(SkillNotInstalledError, match="no previous version"):

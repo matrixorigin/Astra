@@ -113,8 +113,6 @@ def _build_chat_loop(db_factory):
     from core.skills.registry import SkillRegistry
     from core.verification.firewall import HallucinationFirewall
 
-    db = db_factory()
-
     # Create EventPipeline for async writes (feature-flagged)
     pipeline = None
     try:
@@ -151,7 +149,7 @@ def _build_chat_loop(db_factory):
     from config.settings import get_settings
     from core.skills.credential_manager import CredentialManager
     from core.skills.skill_manager import SkillManager
-    skill_mgr = SkillManager(db, CredentialManager(get_settings().secret_key))
+    skill_mgr = SkillManager(db_factory, CredentialManager(get_settings().secret_key))
     executor = AgentExecutor(db_factory, skill_registry, skill_manager=skill_mgr)
 
     firewall = HallucinationFirewall(db_factory, context_manager)

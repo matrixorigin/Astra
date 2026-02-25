@@ -11,8 +11,6 @@ External code should use SkillPipeline from core.skills.pipeline.
 
 from dataclasses import dataclass
 
-from sqlalchemy.orm import Session
-
 from api.database import get_db_session
 from api.models import SkillRegistry as SkillModel
 from core.logging_config import get_logger
@@ -44,49 +42,35 @@ class SkillMetadata:
 class SkillSelector:
     """Rule-based skill selector with keyword matching."""
 
-    def __init__(self, session: Session | None = None):
-        self._session = session
-        self._owns_session = session is None
+    def __init__(self, db_factory: "Callable[[], Session] | None" = None):
+        from collections.abc import Callable
+        from sqlalchemy.orm import Session
+        self._db_factory = db_factory or (lambda: next(get_db_session()))
         self._load_skills()
-
-    def _get_session(self) -> Session:
-        if self._session is None:
-            self._session = next(get_db_session())
-        return self._session
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        if self._owns_session and self._session:
-            self._session.close()
-
-    def __del__(self):
-        self.close()
 
     def _load_skills(self):
         """Load skills with metadata from database."""
         self.skills = {}
         
-        session = self._get_session()
-        skills_data = session.query(SkillModel).filter(SkillModel.is_active == 1).all()
+        db = self._db_factory()
+        try:
+            skills_data = db.query(SkillModel).filter(SkillModel.is_active == 1).all()
 
-        for skill in skills_data:
-            metadata = SkillMetadata(
-                name=skill.skill_name,
-                version=skill.version,
-                description=skill.description or "",
-                category=skill.category or "general",
-                subcategory=skill.subcategory or "default",
-                triggers=skill.triggers or [],
-                dependencies=skill.dependencies or [],
-                priority=skill.priority or 5,
-                cost_estimate=skill.cost_estimate or "medium",
-            )
-            self.skills[metadata.name] = metadata
+            for skill in skills_data:
+                metadata = SkillMetadata(
+                    name=skill.skill_name,
+                    version=skill.version,
+                    description=skill.description or "",
+                    category=skill.category or "general",
+                    subcategory=skill.subcategory or "default",
+                    triggers=skill.triggers or [],
+                    dependencies=skill.dependencies or [],
+                    priority=skill.priority or 5,
+                    cost_estimate=skill.cost_estimate or "medium",
+                )
+                self.skills[metadata.name] = metadata
+        finally:
+            db.close()
 
         logger.info(f"Loaded {len(self.skills)} skills from database")
 

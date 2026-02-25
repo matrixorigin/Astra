@@ -178,8 +178,7 @@ class SkillPipeline:
                 pass  # no embeddings available — keyword fallback
 
         # Internal engines (not exposed)
-        db = db_factory()
-        self._modern = ModernSkillSelector(db, llm_client, embed_fn=embed_fn)
+        self._modern = ModernSkillSelector(db_factory, llm_client, embed_fn=embed_fn)
         self._improver: SelfImprovingSelector | None = None
         if learning:
             self._improver = SelfImprovingSelector(db_factory, llm_client, weights=learning_weights)

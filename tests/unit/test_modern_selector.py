@@ -22,7 +22,7 @@ def mock_llm():
 @pytest.fixture
 def modern_selector(db, mock_llm):
     """Modern skill selector instance."""
-    return ModernSkillSelector(db, mock_llm)
+    return ModernSkillSelector(lambda: db, mock_llm)
 
 
 @pytest.fixture
@@ -258,7 +258,7 @@ class TestAdaptiveSkillOrchestrator:
     @pytest.fixture
     def orchestrator(self, db, mock_llm):
         """Orchestrator instance."""
-        return AdaptiveSkillOrchestrator(db, mock_llm)
+        return AdaptiveSkillOrchestrator(lambda: db, mock_llm)
 
     @pytest.mark.asyncio
     async def test_execute_query_with_routing(self, orchestrator, mock_llm):
@@ -376,7 +376,7 @@ class TestIntegration:
     async def test_end_to_end_flow(self, db, mock_llm):
         """Test complete flow from query to execution."""
         # Setup
-        orchestrator = AdaptiveSkillOrchestrator(db, mock_llm)
+        orchestrator = AdaptiveSkillOrchestrator(lambda: db, mock_llm)
         
         # Register test skill
         from core.skills.selector import SkillMetadata

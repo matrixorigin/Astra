@@ -17,7 +17,9 @@ from api.models import (
     SkillInstallation,
     SkillPermission,
     UserCredential,
+    UserRole,
 )
+from core.db_consumer import DbConsumer
 from core.skills.credential_manager import CredentialManager
 
 
@@ -33,52 +35,67 @@ class PermissionDeniedError(Exception):
     pass
 
 
-class SkillManager:
+class SkillManager(DbConsumer):
     """Manages skill install/uninstall/upgrade lifecycle.
+
+    Inherits DbConsumer for consistent session management:
+    ``with self._db() as db:`` creates a fresh session per operation,
+    auto-rollbacks on exception, and always closes on exit.
 
     Parameters
     ----------
-    platform_db : Session
-        Platform database session (skill tables, credentials, etc.)
+    db_factory : Callable[[], Session]
+        Factory that returns a new database session.
     credential_mgr : CredentialManager
         Encryption service for user credentials.
     """
 
-    def __init__(self, platform_db: Session, credential_mgr: CredentialManager):
-        self._db = platform_db
+    def __init__(self, db_factory, credential_mgr: CredentialManager):
+        super().__init__(db_factory)
         self._cred = credential_mgr
 
-    # ── queries ───────────────────────────────────────────────────────────────
+    # ── internal queries (accept db to avoid nested sessions) ────────────────
+
+    def _get_definition(self, db: Session, skill_name: str) -> SkillDefinition | None:
+        return db.query(SkillDefinition).filter_by(name=skill_name, is_active=1).first()
+
+    def _get_installation(self, db: Session, user_id: str, skill_name: str) -> SkillInstallation | None:
+        return db.query(SkillInstallation).filter_by(user_id=user_id, skill_name=skill_name, status="installed").first()
+
+    # ── public queries ───────────────────────────────────────────────────────
+    # Returned ORM objects are expunged from the session so callers can safely
+    # access any loaded attribute after the session is closed.
 
     def get_definition(self, skill_name: str) -> SkillDefinition | None:
-        return (
-            self._db.query(SkillDefinition)
-            .filter_by(name=skill_name, is_active=1)
-            .first()
-        )
+        with self._db() as db:
+            row = self._get_definition(db, skill_name)
+            if row is not None:
+                db.expunge(row)
+            return row
 
     def get_installation(self, user_id: str, skill_name: str) -> SkillInstallation | None:
-        return (
-            self._db.query(SkillInstallation)
-            .filter_by(user_id=user_id, skill_name=skill_name, status="installed")
-            .first()
-        )
+        with self._db() as db:
+            row = self._get_installation(db, user_id, skill_name)
+            if row is not None:
+                db.expunge(row)
+            return row
 
     def list_installed(self, user_id: str) -> list[SkillInstallation]:
-        return (
-            self._db.query(SkillInstallation)
-            .filter_by(user_id=user_id, status="installed")
-            .all()
-        )
+        with self._db() as db:
+            rows = db.query(SkillInstallation).filter_by(user_id=user_id, status="installed").all()
+            for r in rows:
+                db.expunge(r)
+            return rows
 
     # ── runtime enforcement ──────────────────────────────────────────────────
 
     def require_installed(self, user_id: str, skill_name: str) -> None:
         """Raise SkillNotInstalledError if skill is not installed for user."""
-        if self.get_installation(user_id, skill_name) is None:
-            raise SkillNotInstalledError(
-                f"Skill '{skill_name}' is not installed. Run: /skill install {skill_name}"
-            )
+        with self._db() as db:
+            if self._get_installation(db, user_id, skill_name) is None:
+                raise SkillNotInstalledError(
+                    f"Skill '{skill_name}' is not installed. Run: /skill install {skill_name}"
+                )
 
     def require_executable(self, user_id: str, skill_name: str) -> None:
         """Runtime check: installed + active + has permission + all dependencies installed.
@@ -89,157 +106,179 @@ class SkillManager:
             SkillNotInstalledError: skill not installed or dependency missing
             PermissionDeniedError: user lacks permission or skill deactivated
         """
-        # Single query — no is_active filter — distinguishes builtin / deactivated / active
-        defn = self._db.query(SkillDefinition).filter_by(name=skill_name).first()
-        if defn is None:
-            return  # Builtin skill — not in catalog at all
-        # Reject non-active lifecycle states (covers draft, deprecated, archived, deactivated)
-        status = getattr(defn, "status", "active") or "active"
-        if status != "active":
-            raise PermissionDeniedError(
-                f"Skill '{skill_name}' is in '{status}' state — only 'active' skills can execute"
-            )
-        if not defn.is_active:
-            raise PermissionDeniedError(
-                f"Skill '{skill_name}' definition not found or deactivated"
-            )
+        with self._db() as db:
+            defn = db.query(SkillDefinition).filter_by(name=skill_name).first()
+            if defn is None:
+                return  # Builtin skill — not in catalog at all
+            status = getattr(defn, "status", "active") or "active"
+            if status != "active":
+                raise PermissionDeniedError(
+                    f"Skill '{skill_name}' is in '{status}' state — only 'active' skills can execute"
+                )
+            if not defn.is_active:
+                raise PermissionDeniedError(
+                    f"Skill '{skill_name}' definition not found or deactivated"
+                )
 
-        if self.get_installation(user_id, skill_name) is None:
-            raise SkillNotInstalledError(
-                f"Skill '{skill_name}' is not installed. Run: /skill install {skill_name}"
-            )
+            if self._get_installation(db, user_id, skill_name) is None:
+                raise SkillNotInstalledError(
+                    f"Skill '{skill_name}' is not installed. Run: /skill install {skill_name}"
+                )
 
-        if not self.check_permission(user_id, skill_name, _defn=defn):
-            raise PermissionDeniedError(
-                f"Permission to execute '{skill_name}' has been revoked"
-            )
+            if not self._check_permission(db, user_id, skill_name, _defn=defn):
+                raise PermissionDeniedError(
+                    f"Permission to execute '{skill_name}' has been revoked"
+                )
 
-        # Check direct dependencies
-        if defn.manifest:
-            for dep in defn.manifest.get("depends_on", []):
-                if self.get_installation(user_id, dep) is None:
-                    raise SkillNotInstalledError(
-                        f"Dependency '{dep}' required by '{skill_name}' is not installed"
-                    )
+            # Check direct dependencies
+            if defn.manifest:
+                for dep in defn.manifest.get("depends_on", []):
+                    if self._get_installation(db, user_id, dep) is None:
+                        raise SkillNotInstalledError(
+                            f"Dependency '{dep}' required by '{skill_name}' is not installed"
+                        )
 
     # ── permission check ──────────────────────────────────────────────────────
 
-    def check_permission(
-        self, user_id: str, skill_name: str, *, _defn: "SkillDefinition | None" = None
+    def _check_permission(
+        self, db: Session, user_id: str, skill_name: str, *, _defn: SkillDefinition | None = None
     ) -> bool:
-        """Return True if user can install this skill."""
-        defn = _defn or self.get_definition(skill_name)
+        defn = _defn or self._get_definition(db, skill_name)
         if defn is None:
             return False
         if defn.is_public:
             return True
-        from api.models import UserRole
-        user_roles = [
-            r.role_id
-            for r in self._db.query(UserRole).filter_by(user_id=user_id).all()
-        ]
-        for g in self._db.query(SkillPermission).filter_by(skill_name=skill_name).all():
+        user_roles = [r.role_id for r in db.query(UserRole).filter_by(user_id=user_id).all()]
+        for g in db.query(SkillPermission).filter_by(skill_name=skill_name).all():
             if g.grantee_type == "user" and g.grantee_id == user_id:
                 return True
             if g.grantee_type == "role" and g.grantee_id in user_roles:
                 return True
         return False
 
+    def check_permission(self, user_id: str, skill_name: str) -> bool:
+        """Return True if user can install this skill.
+
+        Note: _defn is intentionally not exposed in the public API to avoid
+        passing detached ORM objects across session boundaries.  Internal
+        callers that already hold a session use _check_permission() directly.
+        """
+        with self._db() as db:
+            return self._check_permission(db, user_id, skill_name)
+
     # ── install ───────────────────────────────────────────────────────────────
 
     def install(self, user_id: str, skill_name: str) -> SkillInstallation:
         """Install a skill for a user (record only, no DDL)."""
-        defn = self.get_definition(skill_name)
-        if defn is None:
-            raise SkillNotFoundError(f"Skill '{skill_name}' not found")
-        if not self.check_permission(user_id, skill_name):
-            raise PermissionDeniedError(f"No permission to install '{skill_name}'")
+        with self._db() as db:
+            defn = self._get_definition(db, skill_name)
+            if defn is None:
+                raise SkillNotFoundError(f"Skill '{skill_name}' not found")
+            if not self._check_permission(db, user_id, skill_name):
+                raise PermissionDeniedError(f"No permission to install '{skill_name}'")
 
-        # Check dependencies
-        manifest = defn.manifest or {}
-        for dep in manifest.get("depends_on", []):
-            if self.get_installation(user_id, dep) is None:
-                raise SkillNotInstalledError(
-                    f"Dependency '{dep}' must be installed before '{skill_name}'"
-                )
+            # Check dependencies
+            manifest = defn.manifest or {}
+            for dep in manifest.get("depends_on", []):
+                if self._get_installation(db, user_id, dep) is None:
+                    raise SkillNotInstalledError(
+                        f"Dependency '{dep}' must be installed before '{skill_name}'"
+                    )
 
-        existing = self.get_installation(user_id, skill_name)
-        if existing is not None:
-            return existing
-        
-        installation = SkillInstallation(
-            installation_id=_uuid(),
-            user_id=user_id,
-            skill_name=skill_name,
-            skill_version=defn.version,
-            status="installed",
-            installed_at=_now(),
-        )
-        try:
-            self._db.add(installation)
-            self._db.commit()
-        except IntegrityError:
-            self._db.rollback()
-            result = self.get_installation(user_id, skill_name)
-            assert result is not None, f"Installation vanished after IntegrityError: {user_id}/{skill_name}"
-            return result
-        except OperationalError as e:
-            self._db.rollback()
-            if getattr(e.orig, "args", (None,))[0] == 20619:
-                # MatrixOne w-w conflict — concurrent insert won
-                result = self.get_installation(user_id, skill_name)
-                assert result is not None, f"Installation vanished after w-w conflict: {user_id}/{skill_name}"
+            existing = self._get_installation(db, user_id, skill_name)
+            if existing is not None:
+                db.expunge(existing)
+                return existing
+
+            installation = SkillInstallation(
+                installation_id=_uuid(),
+                user_id=user_id,
+                skill_name=skill_name,
+                skill_version=defn.version,
+                status="installed",
+                installed_at=_now(),
+            )
+            try:
+                db.add(installation)
+                db.commit()
+                db.refresh(installation)
+            except IntegrityError:
+                db.rollback()
+                result = self._get_installation(db, user_id, skill_name)
+                if result is None:
+                    raise SkillNotFoundError(
+                        f"Installation vanished after IntegrityError: {user_id}/{skill_name}"
+                    )
+                db.expunge(result)
                 return result
-            raise
-        return installation
+            except OperationalError as e:
+                db.rollback()
+                if getattr(e.orig, "args", (None,))[0] == 20619:
+                    # MatrixOne w-w conflict — concurrent insert won
+                    result = self._get_installation(db, user_id, skill_name)
+                    if result is None:
+                        raise SkillNotFoundError(
+                            f"Installation vanished after w-w conflict: {user_id}/{skill_name}"
+                        )
+                    db.expunge(result)
+                    return result
+                raise
+            db.expunge(installation)
+            return installation
 
     # ── uninstall ─────────────────────────────────────────────────────────────
 
     def uninstall(self, user_id: str, skill_name: str) -> None:
         """Uninstall a skill: mark uninstalled + delete credentials."""
-        inst = self.get_installation(user_id, skill_name)
-        if inst is None:
-            raise SkillNotInstalledError(f"'{skill_name}' is not installed")
-        self._db.query(UserCredential).filter_by(
-            user_id=user_id, skill_name=skill_name
-        ).delete()
-        inst.status = "uninstalled"
-        inst.updated_at = _now()
-        self._db.commit()
+        with self._db() as db:
+            inst = self._get_installation(db, user_id, skill_name)
+            if inst is None:
+                raise SkillNotInstalledError(f"'{skill_name}' is not installed")
+            db.query(UserCredential).filter_by(
+                user_id=user_id, skill_name=skill_name
+            ).delete()
+            inst.status = "uninstalled"
+            inst.updated_at = _now()
+            db.commit()
 
     # ── upgrade ───────────────────────────────────────────────────────────────
 
     def upgrade(self, user_id: str, skill_name: str) -> SkillInstallation:
         """Upgrade a skill to the latest version (version bump only)."""
-        inst = self.get_installation(user_id, skill_name)
-        if inst is None:
-            raise SkillNotInstalledError(f"'{skill_name}' is not installed")
-        defn = self.get_definition(skill_name)
-        if defn is None:
-            raise SkillNotFoundError(f"Skill '{skill_name}' not found")
-        if inst.skill_version == defn.version:
+        with self._db() as db:
+            inst = self._get_installation(db, user_id, skill_name)
+            if inst is None:
+                raise SkillNotInstalledError(f"'{skill_name}' is not installed")
+            defn = self._get_definition(db, skill_name)
+            if defn is None:
+                raise SkillNotFoundError(f"Skill '{skill_name}' not found")
+            if inst.skill_version != defn.version:
+                inst.previous_version = inst.skill_version
+                inst.skill_version = defn.version
+                inst.updated_at = _now()
+                db.commit()
+                db.refresh(inst)
+            db.expunge(inst)
             return inst
-        inst.previous_version = inst.skill_version
-        inst.skill_version = defn.version
-        inst.updated_at = _now()
-        self._db.commit()
-        return inst
 
     def rollback(self, user_id: str, skill_name: str) -> SkillInstallation:
         """Rollback a skill to its previous version.
 
         Raises SkillNotInstalledError if not installed or no previous version.
         """
-        inst = self.get_installation(user_id, skill_name)
-        if inst is None:
-            raise SkillNotInstalledError(f"'{skill_name}' is not installed")
-        prev = getattr(inst, "previous_version", None)
-        if not prev:
-            raise SkillNotInstalledError(f"'{skill_name}' has no previous version to rollback to")
-        inst.skill_version, inst.previous_version = prev, inst.skill_version
-        inst.updated_at = _now()
-        self._db.commit()
-        return inst
+        with self._db() as db:
+            inst = self._get_installation(db, user_id, skill_name)
+            if inst is None:
+                raise SkillNotInstalledError(f"'{skill_name}' is not installed")
+            prev = getattr(inst, "previous_version", None)
+            if not prev:
+                raise SkillNotInstalledError(f"'{skill_name}' has no previous version to rollback to")
+            inst.skill_version, inst.previous_version = prev, inst.skill_version
+            inst.updated_at = _now()
+            db.commit()
+            db.refresh(inst)
+            db.expunge(inst)
+            return inst
 
     # ── credential CRUD ───────────────────────────────────────────────────────
 
@@ -247,53 +286,57 @@ class SkillManager:
         self, user_id: str, skill_name: str, credential_name: str, value: str
     ) -> None:
         encrypted = self._cred.encrypt(value)
-        existing = (
-            self._db.query(UserCredential)
-            .filter_by(user_id=user_id, skill_name=skill_name, credential_name=credential_name)
-            .first()
-        )
-        if existing:
-            existing.value_encrypted = encrypted
-            existing.rotated_at = _now()
-        else:
-            self._db.add(
-                UserCredential(
-                    credential_id=_uuid(),
-                    user_id=user_id,
-                    skill_name=skill_name,
-                    credential_name=credential_name,
-                    value_encrypted=encrypted,
-                    created_at=_now(),
-                )
+        with self._db() as db:
+            existing = (
+                db.query(UserCredential)
+                .filter_by(user_id=user_id, skill_name=skill_name, credential_name=credential_name)
+                .first()
             )
-        self._db.commit()
+            if existing:
+                existing.value_encrypted = encrypted
+                existing.rotated_at = _now()
+            else:
+                db.add(
+                    UserCredential(
+                        credential_id=_uuid(),
+                        user_id=user_id,
+                        skill_name=skill_name,
+                        credential_name=credential_name,
+                        value_encrypted=encrypted,
+                        created_at=_now(),
+                    )
+                )
+            db.commit()
 
     def get_credential(self, user_id: str, skill_name: str, credential_name: str) -> str | None:
-        row = (
-            self._db.query(UserCredential)
-            .filter_by(user_id=user_id, skill_name=skill_name, credential_name=credential_name)
-            .first()
-        )
-        if row is None:
-            return None
-        return self._cred.decrypt(row.value_encrypted)
+        with self._db() as db:
+            row = (
+                db.query(UserCredential)
+                .filter_by(user_id=user_id, skill_name=skill_name, credential_name=credential_name)
+                .first()
+            )
+            if row is None:
+                return None
+            return self._cred.decrypt(row.value_encrypted)
 
     def get_all_credentials(self, user_id: str, skill_name: str) -> dict[str, str]:
-        rows = (
-            self._db.query(UserCredential)
-            .filter_by(user_id=user_id, skill_name=skill_name)
-            .all()
-        )
-        return {r.credential_name: self._cred.decrypt(r.value_encrypted) for r in rows}
+        with self._db() as db:
+            rows = (
+                db.query(UserCredential)
+                .filter_by(user_id=user_id, skill_name=skill_name)
+                .all()
+            )
+            return {r.credential_name: self._cred.decrypt(r.value_encrypted) for r in rows}
 
     def delete_credential(self, user_id: str, skill_name: str, credential_name: str) -> bool:
-        count = (
-            self._db.query(UserCredential)
-            .filter_by(user_id=user_id, skill_name=skill_name, credential_name=credential_name)
-            .delete()
-        )
-        self._db.commit()
-        return count > 0
+        with self._db() as db:
+            count = (
+                db.query(UserCredential)
+                .filter_by(user_id=user_id, skill_name=skill_name, credential_name=credential_name)
+                .delete()
+            )
+            db.commit()
+            return count > 0
 
 
 def _uuid() -> str:

@@ -33,8 +33,8 @@ def cred_mgr():
 
 
 @pytest.fixture
-def mgr(db_session, cred_mgr):
-    return SkillManager(db_session, cred_mgr)
+def mgr(db_factory, cred_mgr):
+    return SkillManager(db_factory, cred_mgr)
 
 
 def _uid():

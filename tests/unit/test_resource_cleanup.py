@@ -2,11 +2,11 @@
 
 Core layer DbConsumer modules use db_factory (callable) instead of raw Session.
 Non-DbConsumer modules (SkillRegistry, ModernSkillSelector, SkillPipeline) still
-use raw Session injection.
+use db_factory but without DbConsumer base class.
 
 This test verifies:
 1. DbConsumer modules require callable db_factory
-2. Non-DbConsumer modules require valid Session
+2. Non-DbConsumer modules with db_factory validate the argument
 3. No module creates its own SessionLocal
 4. DbConsumer modules share the same factory with children
 """
@@ -24,6 +24,8 @@ from core.skills.self_improving_selector import SelfImprovingSelector
 from core.skills.modern_selector import ModernSkillSelector
 from core.replay.semantic_diff import SemanticDiff
 from core.skills.mocking import ToolMockingLayer, MockMode
+from core.skills.skill_manager import SkillManager
+from core.skills.credential_manager import CredentialManager
 from core.db_consumer import DbConsumer
 
 
@@ -59,17 +61,17 @@ class TestSessionInjection:
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
         pipeline = SkillPipeline(lambda: mock_session, llm_client=None)
-        assert pipeline._modern.session is mock_session
+        assert pipeline._modern._db_factory is not None
 
     def test_modern_selector_requires_session(self):
-        """ModernSkillSelector is NOT a DbConsumer — it takes raw Session."""
-        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
-            ModernSkillSelector(session=None)
+        """ModernSkillSelector takes a db_factory callable and validates it."""
+        with pytest.raises(TypeError, match="db_factory must be callable"):
+            ModernSkillSelector(db_factory="not_callable")
 
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
-        selector = ModernSkillSelector(session=mock_session)
-        assert selector.session is mock_session
+        selector = ModernSkillSelector(db_factory=lambda: mock_session)
+        assert selector._db_factory is not None
 
     def test_semantic_diff_requires_session(self):
         with pytest.raises(TypeError, match="db_factory must be callable"):
@@ -78,6 +80,15 @@ class TestSessionInjection:
         mock_session = Mock(spec=Session)
         diff = SemanticDiff(lambda: mock_session)
         assert diff._db_factory is not None
+
+    def test_skill_manager_requires_session(self):
+        """SkillManager inherits DbConsumer — requires callable db_factory."""
+        with pytest.raises(TypeError, match="db_factory must be callable"):
+            SkillManager("not_callable", CredentialManager("test"))
+
+        mock_session = Mock(spec=Session)
+        mgr = SkillManager(lambda: mock_session, CredentialManager("test"))
+        assert mgr._db_factory is not None
 
 
 class TestSessionSharing:
@@ -92,8 +103,9 @@ class TestSessionSharing:
     def test_pipeline_shares_session(self):
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
-        pipeline = SkillPipeline(lambda: mock_session, llm_client=None)
-        assert pipeline._modern.session is mock_session
+        factory = lambda: mock_session
+        pipeline = SkillPipeline(factory, llm_client=None)
+        assert pipeline._modern._db_factory is factory
 
     def test_self_improving_selector_shares_factory(self):
         mock_session = Mock(spec=Session)
@@ -108,7 +120,8 @@ class TestNoSessionCreation:
     def test_modules_dont_have_sessionlocal_import(self):
         import inspect
         for cls in [GitForData, EventLogger, Sandbox, SkillRegistry, SkillPipeline,
-                    ModernSkillSelector, SelfImprovingSelector, ToolMockingLayer, SemanticDiff]:
+                    ModernSkillSelector, SelfImprovingSelector, ToolMockingLayer, SemanticDiff,
+                    SkillManager]:
             source = inspect.getsource(cls.__init__)
             assert "SessionLocal()" not in source, f"{cls.__name__} creates SessionLocal"
 
@@ -120,9 +133,10 @@ class TestNoSessionCreation:
             EventLogger.from_session(mock_session),
             Sandbox(lambda: mock_session),
             SkillRegistry(db_factory=lambda: mock_session),
-            ModernSkillSelector(session=mock_session),
+            ModernSkillSelector(db_factory=lambda: mock_session),
             ToolMockingLayer(MockMode.PRODUCTION, db_factory=lambda: mock_session),
             SemanticDiff(lambda: mock_session),
+            SkillManager(lambda: mock_session, CredentialManager("test")),
         ]
         for module in modules:
             assert not hasattr(module, '_lazy_session'), f"{type(module).__name__} has _lazy_session"
@@ -168,6 +182,7 @@ class TestSessionLifecycle:
             Sandbox(lambda: mock_session),
             SelfImprovingSelector(lambda: mock_session),
             SemanticDiff(lambda: mock_session),
+            SkillManager(lambda: mock_session, CredentialManager("test")),
         ]
         for module in modules:
             assert not hasattr(module, '_lazy_session'), f"{type(module).__name__} has _lazy_session"

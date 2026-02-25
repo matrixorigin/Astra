@@ -161,7 +161,7 @@ class TestProgressiveDisclosure:
     @pytest.fixture
     def selector_with_skills(self, db):
         """Selector with pre-loaded skills and deterministic embeddings."""
-        sel = ModernSkillSelector(db, llm_client=None, embed_fn=_deterministic_embed)
+        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=_deterministic_embed)
         for name in ["code_review", "deploy_k8s", "search_code", "ci_status", "list_prs"]:
             skill = _make_skill(name, description=f"{name} description", triggers=[name.split("_")[0]])
             sel.rule_selector.skills[name] = skill
@@ -186,7 +186,7 @@ class TestProgressiveDisclosure:
 
     def test_keyword_fallback_when_no_embed(self, db):
         """Without embed_fn, falls back to keyword matching."""
-        sel = ModernSkillSelector(db, llm_client=None, embed_fn=None)
+        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=None)
         skill = _make_skill("code_review", triggers=["review", "code"])
         sel.rule_selector.skills["code_review"] = skill
 
@@ -222,7 +222,7 @@ class TestProgressiveDisclosure:
 
     def test_real_token_measurement_varies_by_schema(self, db):
         """Different skills produce different token costs."""
-        sel = ModernSkillSelector(db, llm_client=None, embed_fn=_deterministic_embed)
+        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=_deterministic_embed)
 
         small = _make_skill("tiny", description="x")
         big = _make_skill("huge", description="A very long description " * 50,
@@ -242,7 +242,7 @@ class TestProgressiveDisclosure:
         assert len(tools) <= 2
 
     def test_empty_skill_registry_returns_empty(self, db):
-        sel = ModernSkillSelector(db, llm_client=None, embed_fn=_deterministic_embed)
+        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=_deterministic_embed)
         # Clear all skills to simulate empty registry
         sel.rule_selector.skills.clear()
         sel._index.build([])
@@ -263,7 +263,7 @@ class TestFallbackSelection:
     @pytest.fixture
     def selector_with_llm(self, db):
         mock_llm = Mock()
-        sel = ModernSkillSelector(db, llm_client=mock_llm, embed_fn=_deterministic_embed)
+        sel = ModernSkillSelector(lambda: db, llm_client=mock_llm, embed_fn=_deterministic_embed)
         skill = _make_skill("code_review", description="review code", triggers=["review"])
         sel.rule_selector.skills = {"code_review": skill}  # isolate from DB
         sel._index.build([skill])
@@ -287,7 +287,7 @@ class TestFallbackSelection:
         mock_llm = Mock()
         mock_llm.chat_with_tools.side_effect = RuntimeError("boom")
 
-        sel = ModernSkillSelector(db, llm_client=mock_llm, embed_fn=_deterministic_embed)
+        sel = ModernSkillSelector(lambda: db, llm_client=mock_llm, embed_fn=_deterministic_embed)
         # Add multiple skills
         for name in ["deploy_k8s", "code_review", "search_code"]:
             skill = _make_skill(name, description=f"{name} desc", triggers=[name.split("_")[0]])
@@ -317,7 +317,7 @@ class TestFallbackSelection:
         mock_llm = Mock()
         mock_llm.chat_with_tools.side_effect = RuntimeError("boom")
 
-        sel = ModernSkillSelector(db, llm_client=mock_llm, embed_fn=_deterministic_embed)
+        sel = ModernSkillSelector(lambda: db, llm_client=mock_llm, embed_fn=_deterministic_embed)
         sel.rule_selector.skills.clear()
         sel._index.build([])
 
@@ -381,7 +381,7 @@ class TestRegistryCache:
 
     def test_registry_cached_in_init(self, db):
         """SkillRegistry should be instantiated once in __init__, not per schema call."""
-        sel = ModernSkillSelector(db, llm_client=None)
+        sel = ModernSkillSelector(lambda: db, llm_client=None)
         assert hasattr(sel, "_registry")
 
         # Call _skill_to_tool_schema multiple times — should reuse same registry
@@ -452,7 +452,7 @@ class TestEmbeddingQuality:
             triggers=["deploy", "kubernetes", "k8s", "cluster"]
         )
         
-        sel = ModernSkillSelector(db, llm_client=None, embed_fn=embed_fn)
+        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=embed_fn)
         sel.rule_selector.skills = {
             "code_review": code_review,
             "deploy_k8s": deploy_k8s,
@@ -484,7 +484,7 @@ class TestEmbeddingQuality:
             triggers=["review", "code"]
         )
         
-        sel = ModernSkillSelector(db, llm_client=None, embed_fn=None)
+        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=None)
         sel.rule_selector.skills = {"code_review": code_review}
         
         tools, method = sel.get_tools_schema("review code", max_candidates=3)
@@ -506,7 +506,7 @@ class TestEmbeddingQuality:
             triggers=["review", "pr"]
         )
         
-        sel = ModernSkillSelector(db, llm_client=None, embed_fn=embed_fn)
+        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=embed_fn)
         sel.rule_selector.skills = {"code_review": code_review}
         sel._index.build([code_review])
         sel._index.MIN_SCORE = -1  # mock embeddings: test pipeline, not quality

@@ -13,7 +13,7 @@ class TestSkillSelector:
 
     def test_resolve_dependencies(self, db):
         """Test dependency resolution adds missing dependencies."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         
         # Create mock skills with dependencies
         from core.skills.selector import SkillMetadata
@@ -43,7 +43,7 @@ class TestSkillSelector:
 
     def test_resolve_dependencies_no_duplicates(self, db):
         """Test dependency resolution doesn't add duplicates."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         
         # Create skills manually
         from core.skills.selector import SkillMetadata
@@ -73,7 +73,7 @@ class TestSkillSelector:
 
     def test_resolve_dependencies_missing_dep(self, db):
         """Test dependency resolution handles missing dependencies."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         
         # Create skill with non-existent dependency
         skill = SkillMetadata(
@@ -96,7 +96,7 @@ class TestSkillSelector:
 
     def test_resolve_transitive_dependencies(self, db):
         """A → B → C: selecting A should pull in B and C, ordered C, B, A."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         _m = lambda name, deps=[]: SkillMetadata(
             name=name, version="1.0", description="", category="t",
             subcategory="s", triggers=[], dependencies=deps,
@@ -113,7 +113,7 @@ class TestSkillSelector:
 
     def test_resolve_circular_dependency(self, db):
         """A → B → A: should not crash, returns all skills."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         _m = lambda name, deps=[]: SkillMetadata(
             name=name, version="1.0", description="", category="t",
             subcategory="s", triggers=[], dependencies=deps,
@@ -129,7 +129,7 @@ class TestSkillSelector:
 
     def test_get_skill_by_name(self, db):
         """Test getting skill by name."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         
         # Register test skill
         from core.skills.selector import SkillMetadata
@@ -148,7 +148,7 @@ class TestSkillSelector:
 
     def test_get_skill_by_name_not_found(self, db):
         """Test getting non-existent skill returns None."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         
         skill = selector.get_skill_by_name("nonexistent")
         
@@ -156,7 +156,7 @@ class TestSkillSelector:
 
     def test_list_skills_by_category(self, db):
         """Test listing skills by category."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         
         # Register test skills
         from core.skills.selector import SkillMetadata
@@ -180,7 +180,7 @@ class TestSkillSelector:
 
     def test_list_skills_by_category_empty(self, db):
         """Test listing skills for non-existent category."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         
         skills = selector.list_skills_by_category("nonexistent")
         
@@ -205,7 +205,7 @@ class TestCalculateMatchScore:
 
     def test_exact_word_match(self, db):
         """Exact word match should score higher than substring."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         skill = self._make_skill(["debug"])
 
         # Exact word match
@@ -217,7 +217,7 @@ class TestCalculateMatchScore:
 
     def test_multiple_trigger_accumulation(self, db):
         """Multiple matching triggers should accumulate score."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         skill_one = self._make_skill(["read"])
         skill_two = self._make_skill(["read", "file"])
 
@@ -228,7 +228,7 @@ class TestCalculateMatchScore:
 
     def test_underscore_split_triggers(self, db):
         """Triggers with underscores should match individual words."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         skill = self._make_skill(["read_file"])
 
         # "read" is in trigger_words from split("_")
@@ -237,7 +237,7 @@ class TestCalculateMatchScore:
 
     def test_priority_boost(self, db):
         """Higher priority skills should get boosted scores."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         low_priority = self._make_skill(["test"], priority=5)
         high_priority = self._make_skill(["test"], priority=10)
 
@@ -248,7 +248,7 @@ class TestCalculateMatchScore:
 
     def test_no_match_returns_zero(self, db):
         """No matching triggers should return zero score."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         skill = self._make_skill(["database", "sql"])
 
         score = selector._calculate_match_score("read file content", skill)
@@ -256,7 +256,7 @@ class TestCalculateMatchScore:
 
     def test_trigger_case_insensitive(self, db):
         """Trigger matching should be case-insensitive."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         skill = self._make_skill(["DEBUG"])
 
         # Query is lowercase, trigger is uppercase
@@ -265,7 +265,7 @@ class TestCalculateMatchScore:
 
     def test_empty_query(self, db):
         """Empty query should return zero score."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         skill = self._make_skill(["test"])
 
         score = selector._calculate_match_score("", skill)
@@ -273,7 +273,7 @@ class TestCalculateMatchScore:
 
     def test_empty_triggers(self, db):
         """Skill with no triggers should return zero score."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         skill = self._make_skill([])
 
         score = selector._calculate_match_score("test query", skill)
@@ -281,7 +281,7 @@ class TestCalculateMatchScore:
 
     def test_multi_word_trigger(self, db):
         """Multi-word trigger like 'read file' matches via substring containment."""
-        selector = SkillSelector(db)
+        selector = SkillSelector(lambda: db)
         skill = self._make_skill(["read file"])
 
         # "read file" is not split by space (only underscore), so it matches

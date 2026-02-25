@@ -2,9 +2,8 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
 
-from api.database import SessionLocal, get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from config.settings import get_settings
 from core.skills.credential_manager import CredentialManager
@@ -20,9 +19,14 @@ router = APIRouter()
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _mgr(db: Session) -> SkillManager:
+def _mgr() -> SkillManager:
+    """Build SkillManager with SessionLocal factory.
+
+    Each SkillManager method creates its own short-lived session via the
+    factory, so this helper is stateless and safe to call per-request.
+    """
     settings = get_settings()
-    return SkillManager(db, CredentialManager(settings.secret_key))
+    return SkillManager(SessionLocal, CredentialManager(settings.secret_key))
 
 
 # ── request / response models ────────────────────────────────────────────────
@@ -53,12 +57,11 @@ class InstalledListResponse(BaseModel):
 @router.post("/install", response_model=InstallationResponse, status_code=status.HTTP_201_CREATED)
 async def install_skill(
     req: InstallRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Install a skill for the current user."""
     try:
-        inst = _mgr(db).install(current_user["user_id"], req.skill_name)
+        inst = _mgr().install(current_user["user_id"], req.skill_name)
         return InstallationResponse(
             installation_id=inst.installation_id,
             skill_name=inst.skill_name,
@@ -74,12 +77,11 @@ async def install_skill(
 @router.post("/uninstall", status_code=status.HTTP_204_NO_CONTENT)
 async def uninstall_skill(
     req: InstallRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Uninstall a skill (marks uninstalled + deletes credentials)."""
     try:
-        _mgr(db).uninstall(current_user["user_id"], req.skill_name)
+        _mgr().uninstall(current_user["user_id"], req.skill_name)
     except SkillNotInstalledError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
@@ -87,12 +89,11 @@ async def uninstall_skill(
 @router.post("/upgrade", response_model=InstallationResponse)
 async def upgrade_skill(
     req: InstallRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Upgrade a skill to the latest version."""
     try:
-        inst = _mgr(db).upgrade(current_user["user_id"], req.skill_name)
+        inst = _mgr().upgrade(current_user["user_id"], req.skill_name)
         return InstallationResponse(
             installation_id=inst.installation_id,
             skill_name=inst.skill_name,
@@ -108,12 +109,11 @@ async def upgrade_skill(
 @router.post("/rollback", response_model=InstallationResponse)
 async def rollback_skill(
     req: InstallRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Rollback a skill to its previous version."""
     try:
-        inst = _mgr(db).rollback(current_user["user_id"], req.skill_name)
+        inst = _mgr().rollback(current_user["user_id"], req.skill_name)
         return InstallationResponse(
             installation_id=inst.installation_id,
             skill_name=inst.skill_name,
@@ -126,11 +126,10 @@ async def rollback_skill(
 
 @router.get("/installed", response_model=InstalledListResponse)
 async def list_installed(
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """List all installed skills for the current user."""
-    rows = _mgr(db).list_installed(current_user["user_id"])
+    rows = _mgr().list_installed(current_user["user_id"])
     return InstalledListResponse(
         installations=[
             InstallationResponse(
@@ -149,11 +148,10 @@ async def list_installed(
 @router.post("/credentials", status_code=status.HTTP_204_NO_CONTENT)
 async def save_credential(
     req: CredentialRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Save (or update) an encrypted credential for a skill."""
-    _mgr(db).save_credential(
+    _mgr().save_credential(
         current_user["user_id"], req.skill_name, req.credential_name, req.value,
     )
 
@@ -162,11 +160,10 @@ async def save_credential(
 async def delete_credential(
     skill_name: str = Query(...),
     credential_name: str = Query(...),
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Delete a credential."""
-    deleted = _mgr(db).delete_credential(
+    deleted = _mgr().delete_credential(
         current_user["user_id"], skill_name, credential_name,
     )
     if not deleted:
@@ -182,7 +179,6 @@ def publish_skill(
 ):
     """Publish a skill: draft → active. Triggers regression gate if configured."""
     from core.skills.registry import SkillRegistry
-    # Use SessionLocal as factory so the registry owns its own session lifecycle.
     registry = SkillRegistry(SessionLocal)
     try:
         registry.publish(skill_name)
@@ -198,7 +194,6 @@ def deprecate_skill(
 ):
     """Deprecate a skill: active → deprecated."""
     from core.skills.registry import SkillRegistry
-    # Use SessionLocal as factory so the registry owns its own session lifecycle.
     registry = SkillRegistry(SessionLocal)
     try:
         registry.deprecate(skill_name)

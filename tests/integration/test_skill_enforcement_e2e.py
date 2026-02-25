@@ -38,8 +38,8 @@ def cred_mgr():
 
 
 @pytest.fixture
-def mgr(db_session, cred_mgr):
-    return SkillManager(db_session, cred_mgr)
+def mgr(db_factory, cred_mgr):
+    return SkillManager(db_factory, cred_mgr)
 
 
 @pytest.fixture
@@ -127,7 +127,7 @@ class TestDependencyResolution:
 
 class TestExecutorEnforcement:
 
-    def test_marketplace_skill_blocked_without_install(self, db_session, cred_mgr, _seed_skill):
+    def test_marketplace_skill_blocked_without_install(self, db_factory, cred_mgr, _seed_skill):
         """execute_skill raises SkillNotInstalledError for uninstalled marketplace skill."""
         from core.agent.executor import AgentExecutor
         from core.skills.registry import SkillRegistry
@@ -135,11 +135,11 @@ class TestExecutorEnforcement:
         from core.runtime import create_runtime, IsolationLevel
         from core.code_executor import CodeExecutor
 
-        registry = SkillRegistry(lambda: db_session)
+        registry = SkillRegistry(db_factory)
         code_executor = CodeExecutor(
-            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=lambda: db_session,
+            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=db_factory,
         )
-        register_builtin_skills(registry, lambda: db_session, code_executor=code_executor)
+        register_builtin_skills(registry, db_factory, code_executor=code_executor)
 
         # Register a fake "github" skill in the in-memory registry
         mock_skill = MagicMock()
@@ -149,8 +149,8 @@ class TestExecutorEnforcement:
         mock_skill.input_schema = type("S", (), {"model_json_schema": classmethod(lambda cls: {})})
         registry._skills["github"] = mock_skill
 
-        skill_mgr = SkillManager(db_session, cred_mgr)
-        executor = AgentExecutor(lambda: db_session, registry, skill_manager=skill_mgr)
+        skill_mgr = SkillManager(db_factory, cred_mgr)
+        executor = AgentExecutor(db_factory, registry, skill_manager=skill_mgr)
 
         with pytest.raises(SkillNotInstalledError):
             executor.execute_skill(
@@ -159,7 +159,7 @@ class TestExecutorEnforcement:
                 session_id="sess-1",
             )
 
-    def test_builtin_skill_allowed_without_install(self, db_session, cred_mgr):
+    def test_builtin_skill_allowed_without_install(self, db_factory, cred_mgr):
         """Builtin skills (not in skill_definitions) execute without installation check."""
         from core.agent.executor import AgentExecutor
         from core.skills.registry import SkillRegistry
@@ -167,14 +167,14 @@ class TestExecutorEnforcement:
         from core.runtime import create_runtime, IsolationLevel
         from core.code_executor import CodeExecutor
 
-        registry = SkillRegistry(lambda: db_session)
+        registry = SkillRegistry(db_factory)
         code_executor = CodeExecutor(
-            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=lambda: db_session,
+            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=db_factory,
         )
-        register_builtin_skills(registry, lambda: db_session, code_executor=code_executor)
+        register_builtin_skills(registry, db_factory, code_executor=code_executor)
 
-        skill_mgr = SkillManager(db_session, cred_mgr)
-        executor = AgentExecutor(lambda: db_session, registry, skill_manager=skill_mgr)
+        skill_mgr = SkillManager(db_factory, cred_mgr)
+        executor = AgentExecutor(db_factory, registry, skill_manager=skill_mgr)
 
         # execute_code is a builtin skill — should not raise SkillNotInstalledError
         # It may raise other errors (sandbox, runtime, etc.) which are fine

@@ -131,7 +131,7 @@ class TestSkillLifecycle:
         assert row.status == "deprecated"
         assert row.is_active == 0
 
-    def test_require_executable_rejects_draft(self, db_session):
+    def test_require_executable_rejects_draft(self, db_session, db_factory):
         """require_executable raises for draft skills."""
         from core.skills.skill_manager import SkillManager, PermissionDeniedError
         from core.skills.credential_manager import CredentialManager
@@ -140,11 +140,11 @@ class TestSkillLifecycle:
         name = f"sk_draft_{os.urandom(4).hex()}"
         self._create_skill(db_session, name, status="draft")
 
-        mgr = SkillManager(db_session, CredentialManager(get_settings().secret_key))
+        mgr = SkillManager(db_factory, CredentialManager(get_settings().secret_key))
         with pytest.raises(PermissionDeniedError, match="draft"):
             mgr.require_executable("any_user", name)
 
-    def test_require_executable_rejects_deprecated(self, db_session):
+    def test_require_executable_rejects_deprecated(self, db_session, db_factory):
         """require_executable raises for deprecated skills."""
         from core.skills.skill_manager import SkillManager, PermissionDeniedError
         from core.skills.credential_manager import CredentialManager
@@ -153,7 +153,7 @@ class TestSkillLifecycle:
         name = f"sk_depr_{os.urandom(4).hex()}"
         self._create_skill(db_session, name, status="deprecated")
 
-        mgr = SkillManager(db_session, CredentialManager(get_settings().secret_key))
+        mgr = SkillManager(db_factory, CredentialManager(get_settings().secret_key))
         with pytest.raises(PermissionDeniedError, match="deprecated"):
             mgr.require_executable("any_user", name)
 
