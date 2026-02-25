@@ -11,7 +11,7 @@ from core.llm.client import LLMClient
 @pytest.fixture
 def llm_client(db):
     """LLM client fixture."""
-    return LLMClient(db)
+    return LLMClient(lambda: db)
 
 
 @pytest.fixture

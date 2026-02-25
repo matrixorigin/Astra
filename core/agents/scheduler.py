@@ -17,7 +17,7 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import and_, text
-from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -65,14 +65,14 @@ class ResourceAllocation:
     reason: str | None = None
 
 
-class AgentScheduler:
+class AgentScheduler(DbConsumer):
     """Schedule agent tasks with resource management.
 
     Distributed-safe: all state in DB, no in-memory queues.
     """
 
-    def __init__(self, db: Session) -> None:
-        self.db = db
+    def __init__(self, db_factory: DbFactory) -> None:
+        super().__init__(db_factory)
 
     def submit_task(
         self,
@@ -176,32 +176,33 @@ class AgentScheduler:
     def _get_budget_policy(self, scope_id: str) -> BudgetPolicy:
         """Get budget policy for a scope."""
         # Query DB for budget info
-        row = self.db.execute(
-            text(
-                "SELECT daily_budget, current_spend FROM budget_policies "
-                "WHERE scope_id = :scope_id"
-            ),
-            {"scope_id": scope_id},
-        ).fetchone()
+        with self._db() as db:
+            row = db.execute(
+                text(
+                    "SELECT daily_budget, current_spend FROM budget_policies "
+                    "WHERE scope_id = :scope_id"
+                ),
+                {"scope_id": scope_id},
+            ).fetchone()
 
-        if row:
-            daily_budget, current_spend = row
-        else:
-            # Default: $100/day
-            daily_budget = 100.0
-            current_spend = 0.0
+            if row:
+                daily_budget, current_spend = row
+            else:
+                # Default: $100/day
+                daily_budget = 100.0
+                current_spend = 0.0
 
-        # Calculate remaining hours until midnight
-        now = datetime.now(timezone.utc)
-        midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        remaining_hours = (midnight - now).total_seconds() / 3600
+            # Calculate remaining hours until midnight
+            now = datetime.now(timezone.utc)
+            midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            remaining_hours = (midnight - now).total_seconds() / 3600
 
-        return BudgetPolicy(
-            scope_id=scope_id,
-            daily_budget=daily_budget,
-            current_spend=current_spend,
-            remaining_hours=remaining_hours,
-        )
+            return BudgetPolicy(
+                scope_id=scope_id,
+                daily_budget=daily_budget,
+                current_spend=current_spend,
+                remaining_hours=remaining_hours,
+            )
 
     def _check_resource_pools(self, priority: Priority) -> bool:
         """Check if resource pools have capacity.
@@ -209,24 +210,25 @@ class AgentScheduler:
         Queries active (non-completed) task allocations in the last hour.
         Each priority level has a concurrency limit.
         """
-        limits = {Priority.P0: 50, Priority.P1: 30, Priority.P2: 20, Priority.P3: 10}
-        limit = limits.get(priority, 10)
+        with self._db() as db:
+            limits = {Priority.P0: 50, Priority.P1: 30, Priority.P2: 20, Priority.P3: 10}
+            limit = limits.get(priority, 10)
 
-        row = self.db.execute(
-            text(
-                "SELECT COUNT(*) FROM task_allocations "
-                "WHERE priority = :priority "
-                "AND allocated_at > DATE_SUB(NOW(), INTERVAL 1 HOUR) "
-                "AND completed_at IS NULL"
-            ),
-            {"priority": priority.value},
-        ).fetchone()
+            row = db.execute(
+                text(
+                    "SELECT COUNT(*) FROM task_allocations "
+                    "WHERE priority = :priority "
+                    "AND allocated_at > DATE_SUB(NOW(), INTERVAL 1 HOUR) "
+                    "AND completed_at IS NULL"
+                ),
+                {"priority": priority.value},
+            ).fetchone()
 
-        active = row[0] if row else 0
-        if active >= limit:
-            logger.warning(f"Resource pool exhausted for {priority.name}: {active}/{limit}")
-            return False
-        return True
+            active = row[0] if row else 0
+            if active >= limit:
+                logger.warning(f"Resource pool exhausted for {priority.name}: {active}/{limit}")
+                return False
+            return True
 
     def _record_allocation(
         self,
@@ -237,21 +239,22 @@ class AgentScheduler:
         scope_id: str,
     ) -> None:
         """Record task allocation in DB."""
-        from uuid_utils import uuid7
+        with self._db() as db:
+            from uuid_utils import uuid7
 
-        self.db.execute(
-            text(
-                "INSERT INTO task_allocations "
-                "(allocation_id, task_id, agent_id, priority, estimated_cost, scope_id, allocated_at) "
-                "VALUES (:id, :task_id, :agent_id, :priority, :cost, :scope_id, NOW())"
-            ),
-            {
-                "id": str(uuid7()),
-                "task_id": task_id,
-                "agent_id": agent_id,
-                "priority": priority.value,
-                "cost": estimated_cost,
-                "scope_id": scope_id,
-            },
-        )
-        self.db.commit()
+            db.execute(
+                text(
+                    "INSERT INTO task_allocations "
+                    "(allocation_id, task_id, agent_id, priority, estimated_cost, scope_id, allocated_at) "
+                    "VALUES (:id, :task_id, :agent_id, :priority, :cost, :scope_id, NOW())"
+                ),
+                {
+                    "id": str(uuid7()),
+                    "task_id": task_id,
+                    "agent_id": agent_id,
+                    "priority": priority.value,
+                    "cost": estimated_cost,
+                    "scope_id": scope_id,
+                },
+            )
+            db.commit()

@@ -19,7 +19,7 @@ class TestMemoryGovernanceEngine:
     @pytest.fixture
     def engine(self, mock_db):
         """Create governance engine."""
-        return MemoryGovernanceEngine(mock_db)
+        return MemoryGovernanceEngine(lambda: mock_db)
     
     def test_hourly_tasks(self, engine, mock_db):
         """Test hourly governance tasks."""
@@ -177,9 +177,23 @@ class TestGovernanceTaskRunner:
         from contextlib import contextmanager
 
         db = Mock()
-        db.query.return_value.filter.return_value.all.return_value = []
-        db.query.return_value.filter.return_value.limit.return_value.all.return_value = []
-        db.query.return_value.all.return_value = []
+        # Cover all query chain patterns used by MemoryGovernanceEngine
+        q = db.query.return_value
+        q.filter.return_value.all.return_value = []
+        q.filter.return_value.limit.return_value.all.return_value = []
+        q.filter.return_value.count.return_value = 0
+        q.filter.return_value.first.return_value = None
+        q.filter.return_value.filter.return_value.all.return_value = []
+        q.filter.return_value.filter.return_value.count.return_value = 0
+        q.all.return_value = []
+        q.count.return_value = 0
+        # execute() returns mock with fetchall/fetchone
+        exec_result = Mock()
+        exec_result.fetchall.return_value = []
+        exec_result.fetchone.return_value = None
+        exec_result.rowcount = 0
+        exec_result.scalar.return_value = 0
+        db.execute.return_value = exec_result
 
         @contextmanager
         def factory():
@@ -193,7 +207,8 @@ class TestGovernanceTaskRunner:
 
         factory, db = mock_db_ctx
         runner = GovernanceTaskRunner(factory)
-        result = runner.run("hourly")
+        with patch("api.database.SessionLocal", return_value=db):
+            result = runner.run("hourly")
 
         assert result is not None
         assert "archived_notes" in result
@@ -228,7 +243,8 @@ class TestGovernanceTaskRunner:
         db.execute.return_value = cas_result
 
         runner = GovernanceTaskRunner(factory)
-        result = runner.run("hourly")
+        with patch("api.database.SessionLocal", return_value=db):
+            result = runner.run("hourly")
 
         assert result is not None
         assert "archived_notes" in result

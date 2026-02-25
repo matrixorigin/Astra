@@ -11,7 +11,7 @@ def _calibrator(pairs: list[tuple[float, float]]) -> ConfidenceCalibrator:
     """Build calibrator with mocked DB returning (confidence, quality) pairs."""
     db = Mock()
     db.execute.return_value.fetchall.return_value = pairs
-    return ConfidenceCalibrator(db=db)
+    return ConfidenceCalibrator(lambda: db)
 
 
 class TestMeasure:

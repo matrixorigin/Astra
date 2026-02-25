@@ -19,7 +19,7 @@ class TestPromptEvolver:
             None,  # Insert variant
         ]
 
-        evolver = PromptEvolver(db)
+        evolver = PromptEvolver(lambda: db)
         variant = evolver.create_variant(
             prompt_template_id="template-1",
             content="New prompt content",
@@ -36,7 +36,7 @@ class TestPromptEvolver:
         mock_execute.fetchone.return_value = ("New prompt",)
         db.execute.return_value = mock_execute
 
-        evolver = PromptEvolver(db)
+        evolver = PromptEvolver(lambda: db)
 
         def mock_replay(session_id, content):
             return 4.5
@@ -56,7 +56,7 @@ class TestPromptEvolver:
             None,  # Update template
         ]
 
-        evolver = PromptEvolver(db)
+        evolver = PromptEvolver(lambda: db)
         result = evolver.promote_variant("var-1", "template-1")
 
         assert result["promoted"] is True
@@ -68,7 +68,7 @@ class TestPromptEvolver:
             fetchone=Mock(return_value=("var-1", 2, "Best prompt", 4.8))
         )
 
-        evolver = PromptEvolver(db)
+        evolver = PromptEvolver(lambda: db)
         variant = evolver.get_best_variant("template-1")
 
         assert variant is not None

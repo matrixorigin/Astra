@@ -7,6 +7,7 @@ from typing import Any
 
 from core.logging_config import get_logger
 from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 from api.database import get_db_session
 
 logger = get_logger(__name__)
@@ -14,10 +15,10 @@ logger = get_logger(__name__)
 logger = get_logger(__name__)
 
 
-class BatchEventWriter:
+class BatchEventWriter(DbConsumer):
     """Batch writer for conversation events."""
 
-    def __init__(self, db: Session, batch_size: int = 100, flush_interval: float = 1.0):
+    def __init__(self, db_factory: DbFactory, batch_size: int = 100, flush_interval: float = 1.0):
         """Initialize batch writer.
 
         Args:
@@ -25,7 +26,7 @@ class BatchEventWriter:
             batch_size: Max events per batch
             flush_interval: Max seconds between flushes
         """
-        self.db = db
+        super().__init__(db_factory)
         self.batch_size = batch_size
         self.flush_interval = flush_interval
 
@@ -82,64 +83,66 @@ class BatchEventWriter:
 
     def _flush(self):
         """Flush buffered events to database."""
-        if not self._buffer:
-            return
+        with self._db() as db:
+            if not self._buffer:
+                return
 
-        with self._lock:
-            events = self._buffer[:]
-            self._buffer.clear()
+            with self._lock:
+                events = self._buffer[:]
+                self._buffer.clear()
 
-        try:
-            # Batch insert
-            if events:
-                self._batch_insert(events)
-                self._last_flush = time.time()
-                logger.debug(f"Flushed {len(events)} events")
+            try:
+                # Batch insert
+                if events:
+                    self._batch_insert(events)
+                    self._last_flush = time.time()
+                    logger.debug(f"Flushed {len(events)} events")
 
-        except Exception as e:
-            logger.error(f"Batch flush failed: {e}")
-            self.db.rollback()
-            # Re-queue events
-            for event in events:
-                self._queue.put(event)
+            except Exception as e:
+                logger.error(f"Batch flush failed: {e}")
+                db.rollback()
+                # Re-queue events
+                for event in events:
+                    self._queue.put(event)
 
     def _batch_insert(self, events: list[dict[str, Any]]):
         """Insert events in batch."""
-        if not events:
-            return
+        with self._db() as db:
+            if not events:
+                return
 
-        # Build batch INSERT
-        placeholders = ", ".join("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)" for _ in events)
+            # Build batch INSERT
+            placeholders = ", ".join("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)" for _ in events)
 
-        query = f"""
-            INSERT INTO conversation_events (
-                event_id, user_id, session_id, agent_id, agent_version,
-                event_type, content, parent_event_id, causal_chain_id,
-                created_at, metadata
-            ) VALUES {placeholders}
-        """
+            query = f"""
+                INSERT INTO conversation_events (
+                    event_id, user_id, session_id, agent_id, agent_version,
+                    event_type, content, parent_event_id, causal_chain_id,
+                    created_at, metadata
+                ) VALUES {placeholders}
+            """
 
-        # Flatten parameters
-        params = []
-        for event in events:
-            params.extend(
-                [
-                    event["event_id"],
-                    event["user_id"],
-                    event["session_id"],
-                    event["agent_id"],
-                    event["agent_version"],
-                    event["event_type"],
-                    event["content"],
-                    event.get("parent_event_id"),
-                    event.get("causal_chain_id"),
-                    event.get("created_at"),
-                    event.get("metadata"),
-                ]
-            )
+            # Flatten parameters
+            params = []
+            for event in events:
+                params.extend(
+                    [
+                        event["event_id"],
+                        event["user_id"],
+                        event["session_id"],
+                        event["agent_id"],
+                        event["agent_version"],
+                        event["event_type"],
+                        event["content"],
+                        event.get("parent_event_id"),
+                        event.get("causal_chain_id"),
+                        event.get("created_at"),
+                        event.get("metadata"),
+                    ]
+                )
 
-        self.db.execute(query, tuple(params))
-        self.db.commit()
+            db.execute(query, tuple(params))
+            db.commit()
 
 
 # Global batch writer

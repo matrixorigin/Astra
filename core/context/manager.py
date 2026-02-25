@@ -318,15 +318,14 @@ class ContextManager(DbConsumer):
         query_embedding = self.embeddings.embed_text(query)
         
         # Use hybrid retriever
-        with self._db() as db:
-            retriever = HybridRetriever(db)
-            events = retriever.retrieve_events(
-                query_text=query,
-                query_embedding=query_embedding,
-                session_id=session_id,
-                current_chain_id=current_chain_id,
-                limit=50,  # Get more candidates for scoring
-            )
+        retriever = HybridRetriever(self._db_factory)
+        events = retriever.retrieve_events(
+            query_text=query,
+            query_embedding=query_embedding,
+            session_id=session_id,
+            current_chain_id=current_chain_id,
+            limit=50,  # Get more candidates for scoring
+        )
         
         return events
 
@@ -351,15 +350,14 @@ class ContextManager(DbConsumer):
         try:
             from core.context.hybrid_retrieval import HybridRetriever
             query_embedding = self.embeddings.embed_text(query)
-            with self._db() as db:
-                retriever = HybridRetriever(db)
-                results = retriever.retrieve_knowledge(
-                    query_text=query,
-                    query_embedding=query_embedding,
-                    user_id=user_id,
-                    limit=limit,
-                    confidence_threshold=min_confidence,
-                )
+            retriever = HybridRetriever(self._db_factory)
+            results = retriever.retrieve_knowledge(
+                query_text=query,
+                query_embedding=query_embedding,
+                user_id=user_id,
+                limit=limit,
+                confidence_threshold=min_confidence,
+            )
             if results:
                 logger.debug("Hybrid knowledge retrieval: %d entries for: %s", len(results), query[:50])
                 return results

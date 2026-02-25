@@ -410,7 +410,7 @@ class TestDataContext:
     @pytest.fixture
     def ctx_read(self, mock_branch, mock_db):
         return DataContext(
-            db=mock_db, branch=mock_branch,
+            db_factory=lambda: mock_db, branch=mock_branch,
             sandbox_name="test_sandbox", source_db="dev_agent",
             access=DataAccessLevel.READ,
         )
@@ -418,7 +418,7 @@ class TestDataContext:
     @pytest.fixture
     def ctx_write(self, mock_branch, mock_db):
         return DataContext(
-            db=mock_db, branch=mock_branch,
+            db_factory=lambda: mock_db, branch=mock_branch,
             sandbox_name="test_sandbox", source_db="dev_agent",
             access=DataAccessLevel.WRITE,
         )
@@ -636,7 +636,7 @@ class TestCodeExecutor:
     @pytest.fixture
     def executor(self, mock_runtime, mock_branch, mock_db):
         return CodeExecutor(
-            runtime=mock_runtime, db=mock_db,
+            runtime=mock_runtime, db_factory=lambda: mock_db,
             branch=mock_branch, security=SecurityGuard(),
         )
 

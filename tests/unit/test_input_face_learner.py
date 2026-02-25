@@ -34,7 +34,7 @@ def mock_llm():
 
 @pytest.fixture
 def learner(mock_db, mock_llm):
-    return InputFaceLearner(mock_db, mock_llm)
+    return InputFaceLearner(lambda: mock_db, mock_llm)
 
 
 class TestDiagnoseAndFix:
@@ -321,7 +321,7 @@ class TestPipelineIntegration:
         from core.skills.pipeline import SkillPipeline, LearningResult
 
         pipeline = SkillPipeline.__new__(SkillPipeline)
-        pipeline._db = MagicMock()
+        pipeline._db_factory = MagicMock()
         pipeline._llm = Mock()
 
         mock_improver = Mock()
@@ -349,7 +349,7 @@ class TestPipelineIntegration:
         from core.skills.pipeline import SkillPipeline
 
         pipeline = SkillPipeline.__new__(SkillPipeline)
-        pipeline._db = MagicMock()
+        pipeline._db_factory = MagicMock()
         pipeline._llm = Mock()
 
         mock_improver = Mock()
@@ -379,7 +379,7 @@ class TestPipelineIntegration:
         from core.skills.pipeline import SkillPipeline
 
         pipeline = SkillPipeline.__new__(SkillPipeline)
-        pipeline._db = MagicMock()
+        pipeline._db_factory = MagicMock()
         pipeline._llm = Mock()
 
         mock_improver = Mock()
@@ -396,7 +396,7 @@ class TestPipelineIntegration:
         from core.skills.pipeline import SkillPipeline
 
         pipeline = SkillPipeline.__new__(SkillPipeline)
-        pipeline._db = MagicMock()
+        pipeline._db_factory = MagicMock()
         pipeline._llm = Mock()
 
         mock_improver = Mock()

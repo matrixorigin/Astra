@@ -53,14 +53,14 @@ class TestEvaluateHitl:
         assert msg is None
 
     def test_none_action_allows(self):
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         loop = _make_loop(hitl_policy=engine)
         ok, msg = loop._evaluate_hitl("safe_tool", {})
         assert ok is True
         assert msg is None
 
     def test_observe_only_allows(self):
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         engine.add_policy(SupervisionPolicy(
             name="obs",
             trigger=SupervisionTrigger(novel_skill_use=True),
@@ -72,7 +72,7 @@ class TestEvaluateHitl:
         assert ok is True
 
     def test_approve_reject_blocks(self):
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         engine.add_policy(SupervisionPolicy(
             name="always-block",
             trigger=SupervisionTrigger(confidence_below=2.0),  # confidence defaults 1.0 < 2.0
@@ -86,7 +86,7 @@ class TestEvaluateHitl:
         assert "always-block" in data["triggered_policies"]
 
     def test_takeover_blocks(self):
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         engine.add_policy(SupervisionPolicy(
             name="takeover",
             trigger=SupervisionTrigger(confidence_below=2.0),
@@ -98,7 +98,7 @@ class TestEvaluateHitl:
         assert "takeover" in json.loads(msg)["hitl_action"]
 
     def test_blocked_message_is_valid_json(self):
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         engine.add_policy(SupervisionPolicy(
             name="gate",
             trigger=SupervisionTrigger(confidence_below=2.0),
@@ -118,7 +118,7 @@ class TestNovelSkillAutoDetection:
 
     def test_unseen_skill_is_novel(self):
         """A skill never recorded in success_streak is detected as novel."""
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         engine.add_policy(SupervisionPolicy(
             name="novel-gate",
             trigger=SupervisionTrigger(novel_skill_use=True),
@@ -133,7 +133,7 @@ class TestNovelSkillAutoDetection:
 
     def test_seen_skill_is_not_novel(self):
         """A skill with success history is NOT detected as novel."""
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         engine.add_policy(SupervisionPolicy(
             name="novel-gate",
             trigger=SupervisionTrigger(novel_skill_use=True),
@@ -146,7 +146,7 @@ class TestNovelSkillAutoDetection:
 
     def test_novel_detection_with_decay(self):
         """Novel skill blocked first, then decays after successes."""
-        engine = HITLPolicyEngine(db=None, decay_threshold=2)
+        engine = HITLPolicyEngine(lambda: MagicMock(), decay_threshold=2)
         engine.add_policy(SupervisionPolicy(
             name="novel-gate",
             trigger=SupervisionTrigger(novel_skill_use=True),
@@ -168,7 +168,7 @@ class TestNovelSkillAutoDetection:
 
     def test_ctx_overrides_novel(self):
         """Caller can override is_novel_skill."""
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         engine.add_policy(SupervisionPolicy(
             name="novel-gate",
             trigger=SupervisionTrigger(novel_skill_use=True),
@@ -182,7 +182,7 @@ class TestNovelSkillAutoDetection:
 
 class TestChatLoopConstructor:
     def test_hitl_policy_stored(self):
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         loop = _make_loop(hitl_policy=engine)
         assert loop.hitl_policy is engine
 

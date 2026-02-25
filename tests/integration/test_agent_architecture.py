@@ -75,7 +75,7 @@ class TestAgentArchitecture(unittest.TestCase):
         )
 
         # Use SkillPipeline with mocked internals
-        self.pipeline = SkillPipeline(self.db, self.llm_client, audit=False, learning=False)
+        self.pipeline = SkillPipeline(lambda: self.db, self.llm_client, audit=False, learning=False)
         self.pipeline._modern.get_tools_schema = MagicMock(return_value=(
             [
                 {

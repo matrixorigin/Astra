@@ -59,7 +59,7 @@ class TestConflict:
 class TestConflictResolver:
     def test_detect_conflict_no_conflict(self):
         db = _mock_db()
-        resolver = ConflictResolver(db)
+        resolver = ConflictResolver(lambda: db)
 
         proposals = [
             Proposal("agent_a", "refactor", "improve"),
@@ -71,7 +71,7 @@ class TestConflictResolver:
     def test_detect_conflict_found(self):
         db = _mock_db()
         event_logger = Mock()
-        resolver = ConflictResolver(db, event_logger=event_logger)
+        resolver = ConflictResolver(lambda: db, event_logger=event_logger)
 
         proposals = [
             Proposal("code_agent", "refactor", "improve readability"),
@@ -89,7 +89,7 @@ class TestConflictResolver:
 
     def test_detect_conflict_single_proposal(self):
         db = _mock_db()
-        resolver = ConflictResolver(db)
+        resolver = ConflictResolver(lambda: db)
 
         proposals = [Proposal("agent_a", "refactor", "improve")]
         conflict = resolver.detect_conflict(proposals, "function_X", "sess-1")
@@ -97,7 +97,7 @@ class TestConflictResolver:
 
     def test_resolve_by_authority(self):
         db = _mock_db()
-        resolver = ConflictResolver(db)
+        resolver = ConflictResolver(lambda: db)
 
         proposals = [
             Proposal("code_agent", "refactor", "improve", priority=1),
@@ -119,7 +119,7 @@ class TestConflictResolver:
 
     def test_resolve_by_authority_fallback(self):
         db = _mock_db()
-        resolver = ConflictResolver(db)
+        resolver = ConflictResolver(lambda: db)
 
         proposals = [
             Proposal("agent_a", "action_a", "reason_a"),
@@ -141,7 +141,7 @@ class TestConflictResolver:
 
     def test_resolve_by_evidence_default_scoring(self):
         db = _mock_db()
-        resolver = ConflictResolver(db)
+        resolver = ConflictResolver(lambda: db)
 
         proposals = [
             Proposal("agent_a", "action_a", "reason_a", evidence=None),
@@ -164,7 +164,7 @@ class TestConflictResolver:
 
     def test_resolve_by_evidence_custom_scoring(self):
         db = _mock_db()
-        resolver = ConflictResolver(db)
+        resolver = ConflictResolver(lambda: db)
 
         proposals = [
             Proposal("agent_a", "action_a", "reason_a"),
@@ -186,7 +186,7 @@ class TestConflictResolver:
     def test_request_consensus(self):
         db = _mock_db()
         event_logger = Mock()
-        resolver = ConflictResolver(db, event_logger=event_logger)
+        resolver = ConflictResolver(lambda: db, event_logger=event_logger)
 
         proposal = Proposal("lead", "deploy_to_prod", "ready")
         team = ["code_agent", "security_agent", "ops_agent"]
@@ -199,7 +199,7 @@ class TestConflictResolver:
     def test_record_vote(self):
         db = _mock_db()
         event_logger = Mock()
-        resolver = ConflictResolver(db, event_logger=event_logger)
+        resolver = ConflictResolver(lambda: db, event_logger=event_logger)
 
         resolver.record_vote(
             voter_id="code_agent",
@@ -217,7 +217,7 @@ class TestConflictResolver:
     def test_record_vote_with_objection(self):
         db = _mock_db()
         event_logger = Mock()
-        resolver = ConflictResolver(db, event_logger=event_logger)
+        resolver = ConflictResolver(lambda: db, event_logger=event_logger)
 
         resolver.record_vote(
             voter_id="security_agent",

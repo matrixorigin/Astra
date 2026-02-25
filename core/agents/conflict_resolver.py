@@ -18,6 +18,7 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +63,14 @@ class Conflict:
     resolution: str | None = None
 
 
-class ConflictResolver:
+class ConflictResolver(DbConsumer):
     """Detect and resolve conflicts between agent proposals.
 
     Distributed-safe: all operations are event-based.
     """
 
-    def __init__(self, db: Session, event_logger=None) -> None:
-        self.db = db
+    def __init__(self, db_factory: DbFactory, event_logger=None) -> None:
+        super().__init__(db_factory)
         self.event_logger = event_logger
 
     def detect_conflict(

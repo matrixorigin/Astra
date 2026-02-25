@@ -14,26 +14,27 @@ from core.agent.stream_persistence import StreamPersistence
 from core.agent.stream_replay import StreamReplay
 from core.events.event_logger import EventLogger
 from core.events.models import StreamEvent
+from core.db_consumer import DbConsumer, DbFactory
 
 
-class StreamProcessor:
+class StreamProcessor(DbConsumer):
     """Facade for common stream processing patterns.
     
     Combines StreamValidator, StreamPersistence, and StreamReplay
     into a unified interface for common use cases.
     """
     
-    def __init__(self, db: Session):
+    def __init__(self, db_factory: DbFactory):
         """Initialize stream processor.
         
         Args:
             db: Database session
         """
-        self.db = db
-        self.event_logger = EventLogger.from_session(db)
+        super().__init__(db_factory)
+        self.event_logger = EventLogger(db_factory)
         self.validator = StreamValidator()
         self.persistence = StreamPersistence(self.event_logger)
-        self.replay = StreamReplay(db)
+        self.replay = StreamReplay(db_factory)
     
     async def process_and_persist(
         self,

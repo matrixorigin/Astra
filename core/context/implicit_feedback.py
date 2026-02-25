@@ -20,6 +20,7 @@ from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -95,56 +96,57 @@ class ImplicitFeedbackDetector:
         return ImplicitSignal("neutral", 0.3)
 
 
-class ImplicitFeedbackMiner:
+class ImplicitFeedbackMiner(DbConsumer):
     """Deep async analyzer — batch LLM analysis of conversation pairs."""
 
-    def __init__(self, db: Session, llm_client=None):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, llm_client=None):
+        super().__init__(db_factory)
         self.llm = llm_client
 
     def extract_pairs(self, session_id: str | None = None, limit: int = 50) -> list[ConversationPair]:
         """Extract (query, response, followup) triples from conversation history."""
-        where = "WHERE e.event_type IN ('user_query', 'llm_response')"
-        params: dict[str, Any] = {"limit": limit}
-        if session_id:
-            where += " AND e.session_id = :sid"
-            params["sid"] = session_id
+        with self._db() as db:
+            where = "WHERE e.event_type IN ('user_query', 'llm_response')"
+            params: dict[str, Any] = {"limit": limit}
+            if session_id:
+                where += " AND e.session_id = :sid"
+                params["sid"] = session_id
 
-        rows = self.db.execute(
-            text(f"""
-                SELECT e.event_id, e.session_id, e.event_type, e.content,
-                       e.parent_event_id, e.created_at
-                FROM conversation_events e
-                {where}
-                ORDER BY e.session_id, e.created_at
-                LIMIT :limit
-            """),
-            params,
-        ).fetchall()
+            rows = db.execute(
+                text(f"""
+                    SELECT e.event_id, e.session_id, e.event_type, e.content,
+                           e.parent_event_id, e.created_at
+                    FROM conversation_events e
+                    {where}
+                    ORDER BY e.session_id, e.created_at
+                    LIMIT :limit
+                """),
+                params,
+            ).fetchall()
 
-        # Group by session, build triples
-        sessions: dict[str, list] = {}
-        for r in rows:
-            sid = r[1]
-            sessions.setdefault(sid, []).append({
-                "event_id": r[0], "event_type": r[2],
-                "content": r[3] or "", "parent_event_id": r[4],
-            })
+            # Group by session, build triples
+            sessions: dict[str, list] = {}
+            for r in rows:
+                sid = r[1]
+                sessions.setdefault(sid, []).append({
+                    "event_id": r[0], "event_type": r[2],
+                    "content": r[3] or "", "parent_event_id": r[4],
+                })
 
-        pairs = []
-        for sid, events in sessions.items():
-            for i in range(len(events) - 2):
-                if (events[i]["event_type"] == "user_query"
-                    and events[i+1]["event_type"] == "llm_response"
-                    and events[i+2]["event_type"] == "user_query"):
-                    pairs.append(ConversationPair(
-                        event_id=events[i+1]["event_id"],
-                        user_query=events[i]["content"],
-                        agent_response=events[i+1]["content"],
-                        user_followup=events[i+2]["content"],
-                        session_id=sid,
-                    ))
-        return pairs
+            pairs = []
+            for sid, events in sessions.items():
+                for i in range(len(events) - 2):
+                    if (events[i]["event_type"] == "user_query"
+                        and events[i+1]["event_type"] == "llm_response"
+                        and events[i+2]["event_type"] == "user_query"):
+                        pairs.append(ConversationPair(
+                            event_id=events[i+1]["event_id"],
+                            user_query=events[i]["content"],
+                            agent_response=events[i+1]["content"],
+                            user_followup=events[i+2]["content"],
+                            session_id=sid,
+                        ))
+            return pairs
 
     def analyze_batch(self, pairs: list[ConversationPair] | None = None,
                       session_id: str | None = None) -> list[dict[str, Any]]:
@@ -179,31 +181,28 @@ class ImplicitFeedbackMiner:
 
         Returns number of feedback records created.
         """
-        results = self.analyze_batch(session_id=session_id)
-        count = 0
-        from core.context.prompts import PromptFeedback
-        # Phase 2 bridge: ImplicitFeedbackMiner holds a raw session;
-        # PromptFeedback needs a factory.  Import the real factory so
-        # _db() can safely close its own sessions.
-        from api.database import SessionLocal
-        pf = PromptFeedback(SessionLocal)
-        for r in results:
-            try:
-                pf.record_feedback(
-                    prompt_template_id=template_id,
-                    prompt_version="auto",
-                    llm_request_id=r["event_id"],
-                    user_rating=r["rating"],
-                    user_comment=f"[implicit:{r['signal_type']}] {r['evidence']}",
-                    metadata={"source": "implicit_mining", "confidence": str(r["confidence"])},
-                )
-                count += 1
-            except Exception as e:
-                logger.debug(f"Failed to store implicit feedback: {e}")
-        if count:
-            self.db.commit()
-            logger.info(f"Stored {count} implicit feedback records")
-        return count
+        with self._db() as db:
+            results = self.analyze_batch(session_id=session_id)
+            count = 0
+            from core.context.prompts import PromptFeedback
+            pf = PromptFeedback(self._db_factory)
+            for r in results:
+                try:
+                    pf.record_feedback(
+                        prompt_template_id=template_id,
+                        prompt_version="auto",
+                        llm_request_id=r["event_id"],
+                        user_rating=r["rating"],
+                        user_comment=f"[implicit:{r['signal_type']}] {r['evidence']}",
+                        metadata={"source": "implicit_mining", "confidence": str(r["confidence"])},
+                    )
+                    count += 1
+                except Exception as e:
+                    logger.debug(f"Failed to store implicit feedback: {e}")
+            if count:
+                db.commit()
+                logger.info(f"Stored {count} implicit feedback records")
+            return count
 
     def _signal_to_feedback(self, pair: ConversationPair, signal: ImplicitSignal) -> dict[str, Any]:
         """Convert signal to feedback dict with estimated rating."""

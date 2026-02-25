@@ -113,7 +113,7 @@ def require_admin(
 ) -> dict:
     """Verify user has admin role using PermissionChecker."""
     user_id = current_user["user_id"]
-    checker = PermissionChecker(db)
+    checker = PermissionChecker(lambda: db)
 
     if not checker.is_admin(user_id):
         raise HTTPException(

@@ -103,7 +103,7 @@ class TestBranch:
 
     def test_create_zero_copy(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -111,7 +111,7 @@ class TestBranch:
 
     def test_diff_insert(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -125,7 +125,7 @@ class TestBranch:
 
     def test_diff_update(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -139,7 +139,7 @@ class TestBranch:
 
     def test_diff_delete(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -153,7 +153,7 @@ class TestBranch:
 
     def test_diff_no_changes(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -161,7 +161,7 @@ class TestBranch:
 
     def test_diff_mixed(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -176,7 +176,7 @@ class TestBranch:
 
     def test_merge_accept(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -190,7 +190,7 @@ class TestBranch:
     def test_merge_skip(self, db):
         """Conflict: both sides modify same row differently."""
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -207,7 +207,7 @@ class TestBranch:
 
     def test_merge_conflict_accept(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -222,7 +222,7 @@ class TestBranch:
 
     def test_delete_branch(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -234,7 +234,7 @@ class TestBranch:
 
     def test_diff_after_merge_is_empty(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         uuid_str = str(uuid7()).replace("-", "_")
         branch_name = f"t2_{uuid_str}"
         br.create(branch_name, "t1")
@@ -255,10 +255,10 @@ class TestDataContext:
     def test_full_lifecycle(self, db):
         """ensure_created → ensure_tables → modify → diff → destroy."""
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
 
         ctx = DataContext(
-            db=db, branch=br, sandbox_name=SANDBOX_DB,
+            db_factory=lambda: db, branch=br, sandbox_name=SANDBOX_DB,
             source_db=TEST_DB, access=DataAccessLevel.WRITE,
         )
         ctx.ensure_created()
@@ -281,10 +281,10 @@ class TestDataContext:
 
     def test_ensure_tables_idempotent(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
 
         ctx = DataContext(
-            db=db, branch=br, sandbox_name=SANDBOX_DB,
+            db_factory=lambda: db, branch=br, sandbox_name=SANDBOX_DB,
             source_db=TEST_DB, access=DataAccessLevel.WRITE,
         )
         ctx.ensure_created()
@@ -295,10 +295,10 @@ class TestDataContext:
 
     def test_merge_back_to_source(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
 
         ctx = DataContext(
-            db=db, branch=br, sandbox_name=SANDBOX_DB,
+            db_factory=lambda: db, branch=br, sandbox_name=SANDBOX_DB,
             source_db=TEST_DB, access=DataAccessLevel.WRITE,
         )
         ctx.ensure_created()
@@ -316,10 +316,10 @@ class TestDataContext:
 
     def test_diff_no_changes(self, db):
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
 
         ctx = DataContext(
-            db=db, branch=br, sandbox_name=SANDBOX_DB,
+            db_factory=lambda: db, branch=br, sandbox_name=SANDBOX_DB,
             source_db=TEST_DB, access=DataAccessLevel.WRITE,
         )
         ctx.ensure_created()
@@ -332,10 +332,10 @@ class TestDataContext:
     def test_multiple_tables(self, db):
         _seed(db, "orders", ((10, 100), (20, 200)))
         _seed(db, "items", ((1, 10), (2, 20)))
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
 
         ctx = DataContext(
-            db=db, branch=br, sandbox_name=SANDBOX_DB,
+            db_factory=lambda: db, branch=br, sandbox_name=SANDBOX_DB,
             source_db=TEST_DB, access=DataAccessLevel.WRITE,
         )
         ctx.ensure_created()
@@ -361,9 +361,9 @@ class TestCodeExecutorWrite:
     def test_write_mode_end_to_end(self, db):
         """Full flow: declare tables → execute code → get diff + time_travel."""
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         runtime = SubprocessRuntime()
-        executor = CodeExecutor(runtime=runtime, db=db, branch=br, security=SecurityGuard())
+        executor = CodeExecutor(runtime=runtime, db_factory=lambda: db, branch=br, security=SecurityGuard())
 
         # Use unique session_id (same format as production)
         session_id = generate_id()
@@ -423,9 +423,9 @@ print('inserted')
     def test_write_mode_failed_code_no_diff(self, db):
         """Failed execution (exit_code != 0) should NOT produce diff."""
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         runtime = SubprocessRuntime()
-        executor = CodeExecutor(runtime=runtime, db=db, branch=br, security=SecurityGuard())
+        executor = CodeExecutor(runtime=runtime, db_factory=lambda: db, branch=br, security=SecurityGuard())
 
         result = executor.execute(CodeExecutionRequest(
             code="raise Exception('boom')",
@@ -447,9 +447,9 @@ print('inserted')
     def test_write_mode_no_changes(self, db):
         """Code runs successfully but doesn't modify data → empty diff."""
         _seed(db)
-        br = Branch(database=TEST_DB, db=db)
+        br = Branch(database=TEST_DB, db_factory=lambda: db)
         runtime = SubprocessRuntime()
-        executor = CodeExecutor(runtime=runtime, db=db, branch=br, security=SecurityGuard())
+        executor = CodeExecutor(runtime=runtime, db_factory=lambda: db, branch=br, security=SecurityGuard())
 
         session_id = f"{worker_id}_noop"
         expected_sandbox = f"code_exec_{generate_hash_id(session_id, 8)}"

@@ -93,7 +93,7 @@ class TestPromptExperiment:
     
     def test_welch_ttest_significant_difference(self, db: Session):
         """Test Welch's t-test with significant difference."""
-        exp = PromptExperiment(db)
+        exp = PromptExperiment(lambda: db)
         
         # Group 1: baseline (mean=0.8)
         group1 = [0.78, 0.79, 0.80, 0.81, 0.82] * 10  # 50 samples
@@ -110,7 +110,7 @@ class TestPromptExperiment:
     
     def test_welch_ttest_no_difference(self, db: Session):
         """Test Welch's t-test with no significant difference."""
-        exp = PromptExperiment(db)
+        exp = PromptExperiment(lambda: db)
         
         # Both groups have same mean
         group1 = [0.80, 0.81, 0.79, 0.80, 0.81] * 10
@@ -125,7 +125,7 @@ class TestPromptExperiment:
     
     def test_welch_ttest_small_sample(self, db: Session):
         """Test Welch's t-test with small sample size."""
-        exp = PromptExperiment(db)
+        exp = PromptExperiment(lambda: db)
         
         # Too small samples
         group1 = [0.8]
@@ -139,7 +139,7 @@ class TestPromptExperiment:
     
     def test_normal_cdf_values(self, db: Session):
         """Test normal CDF approximation."""
-        exp = PromptExperiment(db)
+        exp = PromptExperiment(lambda: db)
         
         # Test known values
         cdf_0 = exp._normal_cdf(0.0)

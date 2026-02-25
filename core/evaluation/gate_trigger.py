@@ -82,7 +82,7 @@ class GateTrigger:
                 return
 
             try:
-                gate = RegressionGate(db=db, account=self._account)
+                gate = RegressionGate(db_factory=self._db_factory, account=self._account)
                 result = gate.validate_change(
                     change_type=ChangeType(change_type),
                     change_id=change_id,

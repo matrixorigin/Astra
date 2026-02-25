@@ -11,9 +11,9 @@ import json
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
@@ -21,11 +21,11 @@ logger = get_logger(__name__)
 _TUNABLE_SECTIONS = ("code", "history", "docs", "logs")
 
 
-class ContextBudgetTuner:
+class ContextBudgetTuner(DbConsumer):
     """Tune context budget ratios from quality feedback."""
 
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self, db_factory: DbFactory):
+        super().__init__(db_factory)
 
     def observe(self, days: int = 14) -> list[dict[str, Any]]:
         """Observe quality per task_type from context snapshots.
@@ -34,45 +34,46 @@ class ContextBudgetTuner:
         avg budget utilization per section.
         """
         # Aggregate quality by task_type (no token_budget in GROUP BY)
-        quality_rows = self.db.execute(text("""
-            SELECT
-                cs.task_type,
-                AVG(ce.quality_score) AS avg_quality,
-                COUNT(*) AS sample_count
-            FROM context_snapshots cs
-            JOIN conversation_events ce ON ce.snapshot_id = cs.context_capture_id
-            WHERE ce.quality_score IS NOT NULL
-              AND cs.task_type IS NOT NULL
-              AND ce.created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
-            GROUP BY cs.task_type
-        """), {"days": days}).fetchall()
-
-        stats: dict[str, dict[str, Any]] = {}
-        for row in quality_rows:
-            stats[row[0]] = {
-                "task_type": row[0],
-                "avg_quality": float(row[1]),
-                "sample_count": int(row[2]),
-                "budgets": [],
-            }
-
-        # Collect budget data separately (one row per snapshot)
-        if stats:
-            budget_rows = self.db.execute(text("""
-                SELECT cs.task_type, cs.token_budget
+        with self._db() as db:
+            quality_rows = db.execute(text("""
+                SELECT
+                    cs.task_type,
+                    AVG(ce.quality_score) AS avg_quality,
+                    COUNT(*) AS sample_count
                 FROM context_snapshots cs
-                WHERE cs.task_type IS NOT NULL
-                  AND cs.token_budget IS NOT NULL
-                  AND cs.created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+                JOIN conversation_events ce ON ce.snapshot_id = cs.context_capture_id
+                WHERE ce.quality_score IS NOT NULL
+                  AND cs.task_type IS NOT NULL
+                  AND ce.created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+                GROUP BY cs.task_type
             """), {"days": days}).fetchall()
 
-            for row in budget_rows:
-                task_type = row[0]
-                if task_type in stats and row[1]:
-                    budget = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-                    stats[task_type]["budgets"].append(budget)
+            stats: dict[str, dict[str, Any]] = {}
+            for row in quality_rows:
+                stats[row[0]] = {
+                    "task_type": row[0],
+                    "avg_quality": float(row[1]),
+                    "sample_count": int(row[2]),
+                    "budgets": [],
+                }
 
-        return list(stats.values())
+            # Collect budget data separately (one row per snapshot)
+            if stats:
+                budget_rows = db.execute(text("""
+                    SELECT cs.task_type, cs.token_budget
+                    FROM context_snapshots cs
+                    WHERE cs.task_type IS NOT NULL
+                      AND cs.token_budget IS NOT NULL
+                      AND cs.created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
+                """), {"days": days}).fetchall()
+
+                for row in budget_rows:
+                    task_type = row[0]
+                    if task_type in stats and row[1]:
+                        budget = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+                        stats[task_type]["budgets"].append(budget)
+
+            return list(stats.values())
 
     def diagnose(self, observations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Identify task_types with low quality that might benefit from budget reallocation.
@@ -149,7 +150,7 @@ class ContextBudgetTuner:
         try:
             from core.evaluation.regression_gate import RegressionGate, ChangeType
 
-            gate = RegressionGate(self.db)
+            gate = RegressionGate(self._db_factory)
             result = gate.validate_change(
                 change_type=ChangeType.CONTEXT_BUDGET,
                 change_id="context_budget_ratios",
@@ -184,18 +185,19 @@ class ContextBudgetTuner:
 
     def _deploy(self, proposals: dict[str, dict[str, float]]):
         """Write ratios to configs table."""
-        value = json.dumps(proposals)
-        try:
-            self.db.execute(text("""
-                INSERT INTO configs (key_name, value, updated_at)
-                VALUES ('context_budget_ratios', :value, NOW())
-                ON DUPLICATE KEY UPDATE value = :value, updated_at = NOW()
-            """), {"value": value})
-            self.db.commit()
-        except Exception as e:
-            logger.error("Failed to deploy budget ratios: %s", e)
-            self.db.rollback()
-            raise
+        with self._db() as db:
+            value = json.dumps(proposals)
+            try:
+                db.execute(text("""
+                    INSERT INTO configs (key_name, value, updated_at)
+                    VALUES ('context_budget_ratios', :value, NOW())
+                    ON DUPLICATE KEY UPDATE value = :value, updated_at = NOW()
+                """), {"value": value})
+                db.commit()
+            except Exception as e:
+                logger.error("Failed to deploy budget ratios: %s", e)
+                db.rollback()
+                raise
 
     @staticmethod
     def _compute_avg_utilization(budgets: list[dict]) -> dict[str, float]:

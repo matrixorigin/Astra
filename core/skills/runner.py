@@ -34,9 +34,9 @@ def main() -> None:
         try:
             registry = SkillRegistry(db)
             code_executor = CodeExecutor(
-                runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db=db,
+                runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=db_factory,
             )
-            register_builtin_skills(registry, db, code_executor=code_executor)
+            register_builtin_skills(registry, db_factory, code_executor=code_executor)
 
             skill = registry.get(args.skill)
             if not skill:

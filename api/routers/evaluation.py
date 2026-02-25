@@ -296,7 +296,7 @@ def validate_gate(
     """Trigger regression gate: replay golden sessions against a proposed change."""
     from core.evaluation.regression_gate import ChangeType, RegressionGate
 
-    gate = RegressionGate(db=db)
+    gate = RegressionGate(db_factory=lambda: db)
     result = gate.validate_change(
         change_type=ChangeType(req.change_type),
         change_id=req.change_id,

@@ -53,7 +53,7 @@ def cleanup_sandboxes():
     """Cleanup test sandboxes before and after"""
     # Cleanup before test
     db = next(get_db_session())
-    sandbox = Sandbox(db=db, source_db=SOURCE_DB)
+    sandbox = Sandbox(lambda: db, source_db=SOURCE_DB)
     
     # Clean up both test_sandbox_% and ts_% patterns
     for pattern in ["test_sandbox_%", "ts_%"]:

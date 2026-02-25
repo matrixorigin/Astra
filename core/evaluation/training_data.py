@@ -21,7 +21,7 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +47,14 @@ class TrainingExample:
     contamination_score: float  # 0-1, higher = more contaminated
 
 
-class TrainingDataPipeline:
+class TrainingDataPipeline(DbConsumer):
     """Extract and filter training data from sessions.
 
     Distributed-safe: all state in DB.
     """
 
-    def __init__(self, db: Session, llm_client=None) -> None:
-        self.db = db
+    def __init__(self, db_factory: DbFactory, llm_client=None) -> None:
+        super().__init__(db_factory)
         self.llm_client = llm_client
 
     def extract_examples(
@@ -63,74 +63,76 @@ class TrainingDataPipeline:
         min_quality: DataQuality = DataQuality.SILVER,
     ) -> list[TrainingExample]:
         """Extract training examples from a session."""
-        examples = []
+        with self._db() as db:
+            examples = []
 
-        rows = self.db.execute(
-            text(
-                "SELECT e1.event_id, e1.content, e2.content "
-                "FROM conversation_events e1 "
-                "JOIN conversation_events e2 ON e1.event_id = e2.parent_event_id "
-                "WHERE e1.session_id = :session_id "
-                "AND e1.event_type = 'user_query' "
-                "AND e2.event_type = 'llm_response'"
-            ),
-            {"session_id": session_id},
-        ).fetchall()
+            rows = db.execute(
+                text(
+                    "SELECT e1.event_id, e1.content, e2.content "
+                    "FROM conversation_events e1 "
+                    "JOIN conversation_events e2 ON e1.event_id = e2.parent_event_id "
+                    "WHERE e1.session_id = :session_id "
+                    "AND e1.event_type = 'user_query' "
+                    "AND e2.event_type = 'llm_response'"
+                ),
+                {"session_id": session_id},
+            ).fetchall()
 
-        quality_order = {DataQuality.GOLD: 3, DataQuality.SILVER: 2, DataQuality.BRONZE: 1, DataQuality.REJECTED: 0}
-        min_order = quality_order[min_quality]
+            quality_order = {DataQuality.GOLD: 3, DataQuality.SILVER: 2, DataQuality.BRONZE: 1, DataQuality.REJECTED: 0}
+            min_order = quality_order[min_quality]
 
-        for event_id, user_input, agent_output in rows:
-            quality = self._assess_quality(user_input, agent_output)
+            for event_id, user_input, agent_output in rows:
+                quality = self._assess_quality(user_input, agent_output)
 
-            if quality_order[quality] >= min_order:
-                contamination = self._check_contamination(session_id, user_input, agent_output)
+                if quality_order[quality] >= min_order:
+                    contamination = self._check_contamination(session_id, user_input, agent_output)
 
-                example = TrainingExample(
-                    example_id=event_id,
-                    session_id=session_id,
-                    input_text=user_input,
-                    output_text=agent_output,
-                    quality=quality,
-                    contamination_score=contamination,
-                )
-                examples.append(example)
+                    example = TrainingExample(
+                        example_id=event_id,
+                        session_id=session_id,
+                        input_text=user_input,
+                        output_text=agent_output,
+                        quality=quality,
+                        contamination_score=contamination,
+                    )
+                    examples.append(example)
 
-        logger.info(f"Extracted {len(examples)} training examples from {session_id}")
-        return examples
+            logger.info(f"Extracted {len(examples)} training examples from {session_id}")
+            return examples
 
     def store_example(self, example: TrainingExample) -> None:
         """Store a training example (with dedup by content hash)."""
-        from uuid_utils import uuid7
+        with self._db() as db:
+            from uuid_utils import uuid7
 
-        content_hash = self._content_hash(example.input_text, example.output_text)
+            content_hash = self._content_hash(example.input_text, example.output_text)
 
-        # Dedup: skip if identical content already stored
-        existing = self.db.execute(
-            text("SELECT data_id FROM training_data WHERE content_hash = :h LIMIT 1"),
-            {"h": content_hash},
-        ).fetchone()
-        if existing:
-            logger.debug(f"Skipping duplicate: {content_hash[:16]}")
-            return
+            # Dedup: skip if identical content already stored
+            existing = db.execute(
+                text("SELECT data_id FROM training_data WHERE content_hash = :h LIMIT 1"),
+                {"h": content_hash},
+            ).fetchone()
+            if existing:
+                logger.debug(f"Skipping duplicate: {content_hash[:16]}")
+                return
 
-        self.db.execute(
-            text(
-                "INSERT INTO training_data "
-                "(data_id, session_id, input_text, output_text, quality, contamination_score, content_hash, created_at) "
-                "VALUES (:id, :session_id, :input, :output, :quality, :contamination, :hash, NOW())"
-            ),
-            {
-                "id": str(uuid7()),
-                "session_id": example.session_id,
-                "input": example.input_text,
-                "output": example.output_text,
-                "quality": example.quality.value,
-                "contamination": example.contamination_score,
-                "hash": content_hash,
-            },
-        )
-        self.db.commit()
+            db.execute(
+                text(
+                    "INSERT INTO training_data "
+                    "(data_id, session_id, input_text, output_text, quality, contamination_score, content_hash, created_at) "
+                    "VALUES (:id, :session_id, :input, :output, :quality, :contamination, :hash, NOW())"
+                ),
+                {
+                    "id": str(uuid7()),
+                    "session_id": example.session_id,
+                    "input": example.input_text,
+                    "output": example.output_text,
+                    "quality": example.quality.value,
+                    "contamination": example.contamination_score,
+                    "hash": content_hash,
+                },
+            )
+            db.commit()
 
     def get_dataset(
         self,
@@ -138,39 +140,41 @@ class TrainingDataPipeline:
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
         """Get training dataset filtered by quality."""
-        rows = self.db.execute(
-            text(
-                "SELECT input_text, output_text, contamination_score "
-                "FROM training_data "
-                "WHERE quality = :quality "
-                "AND contamination_score < 0.3 "
-                "ORDER BY contamination_score ASC "
-                "LIMIT :limit"
-            ),
-            {"quality": quality.value, "limit": limit},
-        ).fetchall()
+        with self._db() as db:
+            rows = db.execute(
+                text(
+                    "SELECT input_text, output_text, contamination_score "
+                    "FROM training_data "
+                    "WHERE quality = :quality "
+                    "AND contamination_score < 0.3 "
+                    "ORDER BY contamination_score ASC "
+                    "LIMIT :limit"
+                ),
+                {"quality": quality.value, "limit": limit},
+            ).fetchall()
 
-        return [
-            {"input": row[0], "output": row[1], "contamination": float(row[2])}
-            for row in rows
-        ]
+            return [
+                {"input": row[0], "output": row[1], "contamination": float(row[2])}
+                for row in rows
+            ]
 
     def get_statistics(self) -> dict[str, Any]:
         """Get statistics on training data."""
-        rows = self.db.execute(
-            text(
-                "SELECT quality, COUNT(*) as count, AVG(contamination_score) as avg_contamination "
-                "FROM training_data GROUP BY quality"
-            )
-        ).fetchall()
+        with self._db() as db:
+            rows = db.execute(
+                text(
+                    "SELECT quality, COUNT(*) as count, AVG(contamination_score) as avg_contamination "
+                    "FROM training_data GROUP BY quality"
+                )
+            ).fetchall()
 
-        stats: dict[str, Any] = {"total": sum(r[1] for r in rows), "by_quality": {}}
-        for quality, count, avg_contamination in rows:
-            stats["by_quality"][quality] = {
-                "count": count,
-                "avg_contamination": float(avg_contamination) if avg_contamination else 0.0,
-            }
-        return stats
+            stats: dict[str, Any] = {"total": sum(r[1] for r in rows), "by_quality": {}}
+            for quality, count, avg_contamination in rows:
+                stats["by_quality"][quality] = {
+                    "count": count,
+                    "avg_contamination": float(avg_contamination) if avg_contamination else 0.0,
+                }
+            return stats
 
     # ── Quality Assessment ──────────────────────────────────────────
 
@@ -302,33 +306,34 @@ class TrainingDataPipeline:
         Returns 0.0 (clean) to 1.0 (highly contaminated).
         """
         # Get recent training data for comparison
-        rows = self.db.execute(
-            text(
-                "SELECT input_text, output_text FROM training_data "
-                "WHERE session_id != :session_id "
-                "ORDER BY created_at DESC LIMIT 100"
-            ),
-            {"session_id": session_id},
-        ).fetchall()
+        with self._db() as db:
+            rows = db.execute(
+                text(
+                    "SELECT input_text, output_text FROM training_data "
+                    "WHERE session_id != :session_id "
+                    "ORDER BY created_at DESC LIMIT 100"
+                ),
+                {"session_id": session_id},
+            ).fetchall()
 
-        if not rows:
-            return 0.0
+            if not rows:
+                return 0.0
 
-        # Build n-gram set from current example
-        current_ngrams = self._extract_ngrams(user_input + " " + agent_output, n=3)
-        if not current_ngrams:
-            return 0.0
+            # Build n-gram set from current example
+            current_ngrams = self._extract_ngrams(user_input + " " + agent_output, n=3)
+            if not current_ngrams:
+                return 0.0
 
-        # Check overlap with each stored example
-        max_overlap = 0.0
-        for stored_input, stored_output in rows:
-            stored_ngrams = self._extract_ngrams(stored_input + " " + stored_output, n=3)
-            if not stored_ngrams:
-                continue
-            overlap = len(current_ngrams & stored_ngrams) / len(current_ngrams)
-            max_overlap = max(max_overlap, overlap)
+            # Check overlap with each stored example
+            max_overlap = 0.0
+            for stored_input, stored_output in rows:
+                stored_ngrams = self._extract_ngrams(stored_input + " " + stored_output, n=3)
+                if not stored_ngrams:
+                    continue
+                overlap = len(current_ngrams & stored_ngrams) / len(current_ngrams)
+                max_overlap = max(max_overlap, overlap)
 
-        return round(max_overlap, 3)
+            return round(max_overlap, 3)
 
     def _extract_ngrams(self, text: str, n: int = 3) -> set[str]:
         """Extract word-level n-grams from text."""

@@ -5,42 +5,21 @@ Provides time-travel capabilities to replay conversations at any point in time.
 
 from core.events.event_reader import EventReader
 from core.events.models import ConversationEvent
-from sqlalchemy.orm import Session
-from api.database import get_db_session
 from core.git_for_data import GitForData
+from core.db_consumer import DbConsumer, DbFactory
 
 
-class TimeMachine:
+class TimeMachine(DbConsumer):
     """Time machine for conversation replay.
 
     Enables replaying conversations at specific points in time using
     MatrixOne's Git for Data capabilities.
     """
 
-    def __init__(self, db: Session | None = None) -> None:
-        """Initialize time machine.
-
-        Args:
-            db: SQLAlchemy Session instance. If None, creates a new one.
-        """
-        self._owns_session = db is None
-        self.db = db or next(get_db_session())
-        self.git = GitForData(self.db)
-        self.reader = EventReader(self.db)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        """Close session if owned."""
-        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
-            self.db.close()
-            
-    def __del__(self):
-        self.close()
+    def __init__(self, db_factory: DbFactory) -> None:
+        super().__init__(db_factory)
+        self.git = GitForData(self._db_factory)
+        self.reader = EventReader(self._db_factory)
 
     def create_checkpoint(self, checkpoint_name: str, description: str = "") -> dict:
         """Create a checkpoint at the current time.
@@ -97,42 +76,43 @@ class TimeMachine:
             The current state is never affected.
         """
         # Select only needed columns to avoid large data transfer
-        if columns is None:
-            columns = [
-                "event_id",
-                "user_id",
-                "session_id",
-                "agent_id",
-                "agent_version",
-                "event_type",
-                "content",
-                "metadata",
-                "created_at",
-                "parent_event_id",
-                "causal_chain_id",
-            ]
+        with self._db() as db:
+            if columns is None:
+                columns = [
+                    "event_id",
+                    "user_id",
+                    "session_id",
+                    "agent_id",
+                    "agent_version",
+                    "event_type",
+                    "content",
+                    "metadata",
+                    "created_at",
+                    "parent_event_id",
+                    "causal_chain_id",
+                ]
 
-        cols = ", ".join(columns)
+            cols = ", ".join(columns)
 
-        from sqlalchemy import text
+            from sqlalchemy import text
         
-        if session_id:
-            query = text(f"""
-                SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
-                WHERE session_id = :session_id
-                ORDER BY created_at DESC
-                LIMIT {limit}
-            """)
-            rows = self.db.execute(query, {"session_id": session_id}).fetchall()
-        else:
-            query = text(f"""
-                SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
-                ORDER BY created_at DESC
-                LIMIT {limit}
-            """)
-            rows = self.db.execute(query).fetchall()
+            if session_id:
+                query = text(f"""
+                    SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
+                    WHERE session_id = :session_id
+                    ORDER BY created_at DESC
+                    LIMIT {limit}
+                """)
+                rows = db.execute(query, {"session_id": session_id}).fetchall()
+            else:
+                query = text(f"""
+                    SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
+                    ORDER BY created_at DESC
+                    LIMIT {limit}
+                """)
+                rows = db.execute(query).fetchall()
 
-        return [self.reader._row_to_event(dict(row._mapping)) for row in rows]
+            return [self.reader._row_to_event(dict(row._mapping)) for row in rows]
 
     def list_checkpoints(self) -> list[dict]:
         """List all available checkpoints.

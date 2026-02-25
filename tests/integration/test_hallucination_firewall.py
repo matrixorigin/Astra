@@ -28,7 +28,7 @@ def firewall(db_session):
     from core.context.manager import ContextManager
     
     context_manager = ContextManager(lambda: db_session)
-    return HallucinationFirewall(db_session, context_manager)
+    return HallucinationFirewall(lambda: db_session, context_manager)
 
 
 @pytest.fixture

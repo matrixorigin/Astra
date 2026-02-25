@@ -6,9 +6,9 @@ Runs continuously to maintain memory health without manual intervention.
 
 from datetime import datetime, timedelta
 from typing import Any
-from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 from core.logging_config import get_logger
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
@@ -47,7 +47,7 @@ RETENTION_POLICIES = {
 }
 
 
-class MemoryGovernanceEngine:
+class MemoryGovernanceEngine(DbConsumer):
     """Automated memory lifecycle governance.
     
     Enforces retention policies, confidence decay, and cleanup without
@@ -65,14 +65,15 @@ class MemoryGovernanceEngine:
         >>> engine.run_weekly_tasks()
     """
     
-    def __init__(self, db: Session, llm_client=None):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, llm_client=None):
+        super().__init__(db_factory)
         self.llm_client = llm_client
 
     def _get_agent_ids(self) -> list[str]:
         """Return all agent IDs for SLO checking."""
-        from api.models import Agent
-        return [a.agent_id for a in self.db.query(Agent.agent_id).all()]
+        with self._db() as db:
+            from api.models import Agent
+            return [a.agent_id for a in db.query(Agent.agent_id).all()]
     
     def run_hourly_tasks(self) -> dict[str, int]:
         """Run hourly governance tasks.
@@ -95,7 +96,7 @@ class MemoryGovernanceEngine:
         # Sandbox cleanup (expired, zombie sessions, orphans)
         try:
             from core.sandbox.cleanup import SandboxCleaner
-            cleaner = SandboxCleaner(db=self.db)
+            cleaner = SandboxCleaner(db_factory=self._db_factory)
             cleanup = cleaner.run()
             results["sandbox_cleaned"] = cleanup.get("cleaned", 0)
             results["sandbox_failed"] = cleanup.get("failed", 0)
@@ -143,7 +144,7 @@ class MemoryGovernanceEngine:
         # SLO compliance check
         try:
             from core.evaluation.slo_monitor import SLOMonitor
-            monitor = SLOMonitor(self.db)
+            monitor = SLOMonitor(self._db_factory)
             agent_ids = self._get_agent_ids()
             total_violations = 0
             for aid in (agent_ids or ["dev-agent"]):
@@ -158,38 +159,40 @@ class MemoryGovernanceEngine:
     
     def _archive_closed_notes(self) -> int:
         """Archive completed scratchpad notes."""
-        from api.models import AgentScratchpad
+        with self._db() as db:
+            from api.models import AgentScratchpad
         
-        # Notes marked as completed but not archived
-        notes = self.db.query(AgentScratchpad).filter(
-            AgentScratchpad.status == "completed"
-        ).all()
+            # Notes marked as completed but not archived
+            notes = db.query(AgentScratchpad).filter(
+                AgentScratchpad.status == "completed"
+            ).all()
         
-        # In production, move to archive table
-        # For now, just mark as archived
-        count = len(notes)
+            # In production, move to archive table
+            # For now, just mark as archived
+            count = len(notes)
         
-        logger.debug(f"Archived {count} completed notes")
-        return count
+            logger.debug(f"Archived {count} completed notes")
+            return count
 
     def _run_reflector(self) -> int:
         """Run Reflector on all users with accumulated observations."""
-        from api.models import Observation
-        from sqlalchemy import distinct
+        with self._db() as db:
+            from api.models import Observation
+            from sqlalchemy import distinct
 
-        user_ids = self.db.query(distinct(Observation.user_id)).filter(
-            Observation.is_reflected == 0
-        ).all()
+            user_ids = db.query(distinct(Observation.user_id)).filter(
+                Observation.is_reflected == 0
+            ).all()
 
-        total = 0
-        for (user_id,) in user_ids:
-            from core.memory.reflector import Reflector
-            reflector = Reflector(self.db, llm_client=self.llm_client)
-            result = reflector.reflect(user_id)
-            if result.get("reflected"):
-                total += result.get("before", 0) - result.get("after", 0)
+            total = 0
+            for (user_id,) in user_ids:
+                from core.memory.reflector import Reflector
+                reflector = Reflector(self._db_factory, llm_client=self.llm_client)
+                result = reflector.reflect(user_id)
+                if result.get("reflected"):
+                    total += result.get("before", 0) - result.get("after", 0)
 
-        return total
+            return total
     
     def _apply_confidence_decay(self) -> int:
         """Apply confidence decay to all knowledge entries.
@@ -199,36 +202,37 @@ class MemoryGovernanceEngine:
         Returns:
             Number of entries decayed
         """
-        from api.models import KnowledgeEntry
+        with self._db() as db:
+            from api.models import KnowledgeEntry
         
-        entries = self.db.query(KnowledgeEntry).filter(
-            KnowledgeEntry.confidence > 0.3
-        ).all()
+            entries = db.query(KnowledgeEntry).filter(
+                KnowledgeEntry.confidence > 0.3
+            ).all()
         
-        count = 0
-        now = datetime.now()
-        for entry in entries:
-            # Handle None last_validated_at (use created_at as fallback)
-            anchor = entry.last_validated_at or entry.created_at
-            if anchor is None:
-                continue  # No temporal anchor — skip, don't crash
+            count = 0
+            now = datetime.now()
+            for entry in entries:
+                # Handle None last_validated_at (use created_at as fallback)
+                anchor = entry.last_validated_at or entry.created_at
+                if anchor is None:
+                    continue  # No temporal anchor — skip, don't crash
             
-            half_life = TRUST_TIER_HALF_LIVES.get(entry.trust_tier, 60)
-            days_since = (now - anchor).days
+                half_life = TRUST_TIER_HALF_LIVES.get(entry.trust_tier, 60)
+                days_since = (now - anchor).days
             
-            # Calculate decay
-            decay_factor = 0.5 ** (days_since / half_life)
-            new_confidence = entry.initial_confidence * decay_factor
+                # Calculate decay
+                decay_factor = 0.5 ** (days_since / half_life)
+                new_confidence = entry.initial_confidence * decay_factor
             
-            if new_confidence != entry.confidence:
-                entry.confidence = new_confidence
-                entry.updated_at = now
-                count += 1
+                if new_confidence != entry.confidence:
+                    entry.confidence = new_confidence
+                    entry.updated_at = now
+                    count += 1
         
-        self.db.commit()
+            db.commit()
         
-        logger.info(f"Applied confidence decay to {count} entries")
-        return count
+            logger.info(f"Applied confidence decay to {count} entries")
+            return count
     
     def _quarantine_low_confidence(self, threshold: float = 0.3) -> int:
         """Quarantine entries below confidence threshold.
@@ -242,40 +246,41 @@ class MemoryGovernanceEngine:
         Returns:
             Number of entries quarantined
         """
-        from api.models import KnowledgeEntry
+        with self._db() as db:
+            from api.models import KnowledgeEntry
         
-        # Query first to capture entry_ids for audit
-        to_quarantine = self.db.query(
-            KnowledgeEntry.entry_id, KnowledgeEntry.key_name, KnowledgeEntry.confidence,
-        ).filter(
-            KnowledgeEntry.confidence < threshold,
-            KnowledgeEntry.confidence > 0,
-        ).all()
+            # Query first to capture entry_ids for audit
+            to_quarantine = db.query(
+                KnowledgeEntry.entry_id, KnowledgeEntry.key_name, KnowledgeEntry.confidence,
+            ).filter(
+                KnowledgeEntry.confidence < threshold,
+                KnowledgeEntry.confidence > 0,
+            ).all()
 
-        if not to_quarantine:
-            return 0
+            if not to_quarantine:
+                return 0
 
-        ids = [r[0] for r in to_quarantine]
-        self.db.query(KnowledgeEntry).filter(
-            KnowledgeEntry.entry_id.in_(ids),
-        ).update(
-            {KnowledgeEntry.confidence: 0, KnowledgeEntry.updated_at: datetime.now()},
-            synchronize_session=False,
-        )
-        self.db.commit()
-
-        # Write governance event for audit trail
-        if ids:
-            self._write_governance_event(
-                "governance_quarantine",
-                {"entry_ids": ids, "threshold": threshold, "count": len(ids)},
+            ids = [r[0] for r in to_quarantine]
+            db.query(KnowledgeEntry).filter(
+                KnowledgeEntry.entry_id.in_(ids),
+            ).update(
+                {KnowledgeEntry.confidence: 0, KnowledgeEntry.updated_at: datetime.now()},
+                synchronize_session=False,
             )
+            db.commit()
 
-        logger.info(
-            "Quarantined %d low-confidence entries (threshold=%.2f): %s",
-            len(ids), threshold, ids,
-        )
-        return len(ids)
+            # Write governance event for audit trail
+            if ids:
+                self._write_governance_event(
+                    "governance_quarantine",
+                    {"entry_ids": ids, "threshold": threshold, "count": len(ids)},
+                )
+
+            logger.info(
+                "Quarantined %d low-confidence entries (threshold=%.2f): %s",
+                len(ids), threshold, ids,
+            )
+            return len(ids)
     
     def _compress_episodic_events(self, ttl_days: int = 90) -> int:
         """Compress old episodic events to session summaries.
@@ -284,82 +289,83 @@ class MemoryGovernanceEngine:
         else truncated concatenation), writes a ``session_summary`` event,
         and marks originals as compressed.
         """
-        from api.models import Event
-        from sqlalchemy import text
+        with self._db() as db:
+            from api.models import Event
+            from sqlalchemy import text
 
-        cutoff = datetime.now() - timedelta(days=ttl_days)
+            cutoff = datetime.now() - timedelta(days=ttl_days)
 
-        events = self.db.query(Event).filter(
-            Event.created_at < cutoff,
-            Event.event_type.in_(["user_query", "llm_response"]),
-        ).limit(1000).all()
+            events = db.query(Event).filter(
+                Event.created_at < cutoff,
+                Event.event_type.in_(["user_query", "llm_response"]),
+            ).limit(1000).all()
 
-        if not events:
-            return 0
+            if not events:
+                return 0
 
-        from uuid_utils import uuid7
+            from uuid_utils import uuid7
 
-        # Group by session
-        by_session: dict[str, list] = {}
-        for e in events:
-            by_session.setdefault(e.session_id, []).append(e)
+            # Group by session
+            by_session: dict[str, list] = {}
+            for e in events:
+                by_session.setdefault(e.session_id, []).append(e)
 
-        compressed = 0
-        for sid, sess_events in by_session.items():
-            texts = [e.content or "" for e in sess_events]
-            concat = "\n".join(texts)
+            compressed = 0
+            for sid, sess_events in by_session.items():
+                texts = [e.content or "" for e in sess_events]
+                concat = "\n".join(texts)
 
-            # Generate summary
-            if self.llm_client and len(concat) > 500:
-                try:
-                    from core.llm.models import LLMMessage
-                    resp = self.llm_client.chat(
-                        messages=[
-                            LLMMessage(role="system", content="Summarize this conversation in ≤3 sentences."),
-                            LLMMessage(role="user", content=concat[:4000]),
-                        ],
-                        user_id="system",
-                    )
-                    summary = resp.content or concat[:500]
-                except Exception:
+                # Generate summary
+                if self.llm_client and len(concat) > 500:
+                    try:
+                        from core.llm.models import LLMMessage
+                        resp = self.llm_client.chat(
+                            messages=[
+                                LLMMessage(role="system", content="Summarize this conversation in ≤3 sentences."),
+                                LLMMessage(role="user", content=concat[:4000]),
+                            ],
+                            user_id="system",
+                        )
+                        summary = resp.content or concat[:500]
+                    except Exception:
+                        summary = concat[:500]
+                else:
                     summary = concat[:500]
-            else:
-                summary = concat[:500]
 
-            # Write session_summary event
-            sum_eid = str(uuid7())
-            self.db.execute(
-                text("""INSERT INTO conversation_events
-                        (event_id, session_id, user_id, agent_id, agent_version,
-                         event_type, content, causal_chain_id, dedup_key, created_at)
-                        VALUES (:eid, :sid, 'system', 'governance', '1.0',
-                                'session_summary', :content, :cid, NULL, :ts)"""),
-                {
-                    "eid": sum_eid, "sid": sid,
-                    "content": summary, "cid": sum_eid, "ts": datetime.now(),
-                },
-            )
-
-            # Mark originals as compressed (batch UPDATE)
-            eids = [e.event_id for e in sess_events]
-            if eids:
-                self.db.execute(
-                    text("UPDATE conversation_events SET event_type = 'compressed' WHERE event_id IN :eids"),
-                    {"eids": tuple(eids)},
+                # Write session_summary event
+                sum_eid = str(uuid7())
+                db.execute(
+                    text("""INSERT INTO conversation_events
+                            (event_id, session_id, user_id, agent_id, agent_version,
+                             event_type, content, causal_chain_id, dedup_key, created_at)
+                            VALUES (:eid, :sid, 'system', 'governance', '1.0',
+                                    'session_summary', :content, :cid, NULL, :ts)"""),
+                    {
+                        "eid": sum_eid, "sid": sid,
+                        "content": summary, "cid": sum_eid, "ts": datetime.now(),
+                    },
                 )
-            compressed += len(sess_events)
 
-        self.db.commit()
+                # Mark originals as compressed (batch UPDATE)
+                eids = [e.event_id for e in sess_events]
+                if eids:
+                    db.execute(
+                        text("UPDATE conversation_events SET event_type = 'compressed' WHERE event_id IN :eids"),
+                        {"eids": tuple(eids)},
+                    )
+                compressed += len(sess_events)
 
-        # Write governance audit event
-        if compressed > 0:
-            self._write_governance_event(
-                "episodic_compression",
-                {"sessions": len(by_session), "events_compressed": compressed, "ttl_days": ttl_days},
-            )
+            db.commit()
 
-        logger.info("Compressed %d events across %d sessions", compressed, len(by_session))
-        return compressed
+            # Write governance audit event
+            if compressed > 0:
+                self._write_governance_event(
+                    "episodic_compression",
+                    {"sessions": len(by_session), "events_compressed": compressed, "ttl_days": ttl_days},
+                )
+
+            logger.info("Compressed %d events across %d sessions", compressed, len(by_session))
+            return compressed
     
     def _scan_contradictions(self) -> int:
         """Scan for contradicting knowledge entries.
@@ -367,96 +373,98 @@ class MemoryGovernanceEngine:
         Uses SQL aggregation to find (category, key) pairs with multiple distinct values,
         then batch-checks which have already been reported.
         """
-        from api.models import KnowledgeEntry
-        from sqlalchemy import text, func
+        with self._db() as db:
+            from api.models import KnowledgeEntry
+            from sqlalchemy import text, func
 
-        # SQL aggregation: find (category, key) with >1 distinct value
-        conflicts = self.db.query(
-            KnowledgeEntry.category,
-            KnowledgeEntry.key_name,
-            func.count(func.distinct(KnowledgeEntry.value)).label("val_count"),
-        ).filter(
-            KnowledgeEntry.confidence > 0.3
-        ).group_by(
-            KnowledgeEntry.category, KnowledgeEntry.key_name
-        ).having(
-            func.count(func.distinct(KnowledgeEntry.value)) > 1
-        ).limit(100).all()
+            # SQL aggregation: find (category, key) with >1 distinct value
+            conflicts = db.query(
+                KnowledgeEntry.category,
+                KnowledgeEntry.key_name,
+                func.count(func.distinct(KnowledgeEntry.value)).label("val_count"),
+            ).filter(
+                KnowledgeEntry.confidence > 0.3
+            ).group_by(
+                KnowledgeEntry.category, KnowledgeEntry.key_name
+            ).having(
+                func.count(func.distinct(KnowledgeEntry.value)) > 1
+            ).limit(100).all()
 
-        if not conflicts:
-            return 0
+            if not conflicts:
+                return 0
 
-        # Batch query: which dedup_keys already reported?
-        dedup_keys = [f"{c.category}:{c.key_name}" for c in conflicts]
-        reported = set()
-        if dedup_keys:
-            rows = self.db.execute(
-                text("""SELECT dedup_key FROM conversation_events
-                        WHERE event_type = 'contradiction_detected'
-                        AND dedup_key IN :keys"""),
-                {"keys": tuple(dedup_keys)},
-            ).fetchall()
-            reported = {r[0] for r in rows}
+            # Batch query: which dedup_keys already reported?
+            dedup_keys = [f"{c.category}:{c.key_name}" for c in conflicts]
+            reported = set()
+            if dedup_keys:
+                rows = db.execute(
+                    text("""SELECT dedup_key FROM conversation_events
+                            WHERE event_type = 'contradiction_detected'
+                            AND dedup_key IN :keys"""),
+                    {"keys": tuple(dedup_keys)},
+                ).fetchall()
+                reported = {r[0] for r in rows}
 
-        contradictions = 0
-        for c in conflicts:
-            dk = f"{c.category}:{c.key_name}"
-            if dk in reported:
-                continue
+            contradictions = 0
+            for c in conflicts:
+                dk = f"{c.category}:{c.key_name}"
+                if dk in reported:
+                    continue
 
-            # Fetch entry_ids and values for this conflict (small query)
-            entries = self.db.query(KnowledgeEntry).filter(
-                KnowledgeEntry.category == c.category,
-                KnowledgeEntry.key_name == c.key_name,
-                KnowledgeEntry.confidence > 0.3,
-            ).limit(10).all()
+                # Fetch entry_ids and values for this conflict (small query)
+                entries = db.query(KnowledgeEntry).filter(
+                    KnowledgeEntry.category == c.category,
+                    KnowledgeEntry.key_name == c.key_name,
+                    KnowledgeEntry.confidence > 0.3,
+                ).limit(10).all()
 
-            contradictions += 1
-            self._write_governance_event(
-                "contradiction_detected",
-                {
-                    "dedup_key": dk,
-                    "category": c.category,
-                    "key": c.key_name,
-                    "entry_ids": [e.entry_id for e in entries],
-                    "values": list(set(e.value for e in entries))[:5],
-                },
-                dedup_key=dk,
-            )
-            logger.warning(
-                "Contradiction: %s.%s has %d different values",
-                c.category, c.key_name, c.val_count,
-            )
+                contradictions += 1
+                self._write_governance_event(
+                    "contradiction_detected",
+                    {
+                        "dedup_key": dk,
+                        "category": c.category,
+                        "key": c.key_name,
+                        "entry_ids": [e.entry_id for e in entries],
+                        "values": list(set(e.value for e in entries))[:5],
+                    },
+                    dedup_key=dk,
+                )
+                logger.warning(
+                    "Contradiction: %s.%s has %d different values",
+                    c.category, c.key_name, c.val_count,
+                )
 
-        return contradictions
+            return contradictions
     
     def _write_governance_event(self, event_type: str, content: dict[str, Any], dedup_key: str | None = None) -> None:
         """Write a structured governance event to conversation_events."""
-        import json
-        from uuid_utils import uuid7
-        from sqlalchemy import text
+        with self._db() as db:
+            import json
+            from uuid_utils import uuid7
+            from sqlalchemy import text
 
-        eid = str(uuid7())
-        try:
-            self.db.execute(
-                text("""INSERT INTO conversation_events
-                        (event_id, session_id, user_id, agent_id, agent_version,
-                         event_type, content, causal_chain_id, dedup_key, created_at)
-                        VALUES (:eid, 'system_governance', 'system', 'governance', '1.0',
-                                :etype, :content, :cid, :dk, :ts)"""),
-                {
-                    "eid": eid,
-                    "etype": event_type,
-                    "content": json.dumps(content, default=str),
-                    "cid": eid,
-                    "dk": dedup_key,
-                    "ts": datetime.now(),
-                },
-            )
-            self.db.commit()
-        except Exception as e:
-            logger.debug("governance event write failed: %s", e)
-            self.db.rollback()
+            eid = str(uuid7())
+            try:
+                db.execute(
+                    text("""INSERT INTO conversation_events
+                            (event_id, session_id, user_id, agent_id, agent_version,
+                             event_type, content, causal_chain_id, dedup_key, created_at)
+                            VALUES (:eid, 'system_governance', 'system', 'governance', '1.0',
+                                    :etype, :content, :cid, :dk, :ts)"""),
+                    {
+                        "eid": eid,
+                        "etype": event_type,
+                        "content": json.dumps(content, default=str),
+                        "cid": eid,
+                        "dk": dedup_key,
+                        "ts": datetime.now(),
+                    },
+                )
+                db.commit()
+            except Exception as e:
+                logger.debug("governance event write failed: %s", e)
+                db.rollback()
 
     def _generate_health_reports(self) -> int:
         """Generate memory health reports per user.
@@ -464,50 +472,52 @@ class MemoryGovernanceEngine:
         Returns:
             Number of reports generated
         """
-        from api.models import KnowledgeEntry
-        from sqlalchemy import distinct
+        with self._db() as db:
+            from api.models import KnowledgeEntry
+            from sqlalchemy import distinct
         
-        # Get all users with knowledge entries
-        users = self.db.query(distinct(KnowledgeEntry.user_id)).all()
+            # Get all users with knowledge entries
+            users = db.query(distinct(KnowledgeEntry.user_id)).all()
         
-        reports = 0
-        for (user_id,) in users:
-            stats = self._get_user_memory_stats(user_id)
+            reports = 0
+            for (user_id,) in users:
+                stats = self._get_user_memory_stats(user_id)
             
-            logger.info(
-                f"Memory health for {user_id}: "
-                f"{stats['total_entries']} entries, "
-                f"avg confidence {stats['avg_confidence']:.2f}, "
-                f"{stats['low_confidence']} low confidence"
-            )
-            reports += 1
+                logger.info(
+                    f"Memory health for {user_id}: "
+                    f"{stats['total_entries']} entries, "
+                    f"avg confidence {stats['avg_confidence']:.2f}, "
+                    f"{stats['low_confidence']} low confidence"
+                )
+                reports += 1
         
-        return reports
+            return reports
     
     def _get_user_memory_stats(self, user_id: str) -> dict[str, Any]:
         """Get memory statistics for a user."""
-        from api.models import KnowledgeEntry
+        with self._db() as db:
+            from api.models import KnowledgeEntry
 
-        entries = self.db.query(KnowledgeEntry).filter(
-            KnowledgeEntry.user_id == user_id
-        ).all()
+            entries = db.query(KnowledgeEntry).filter(
+                KnowledgeEntry.user_id == user_id
+            ).all()
 
-        if not entries:
+            if not entries:
+                return {
+                    "total_entries": 0,
+                    "avg_confidence": 0.0,
+                    "low_confidence": 0,
+                }
+
+            total = len(entries)
+            avg_conf = sum(e.confidence for e in entries) / total
+            low_conf = sum(1 for e in entries if e.confidence < 0.3)
+
             return {
-                "total_entries": 0,
-                "avg_confidence": 0.0,
-                "low_confidence": 0,
+                "total_entries": total,
+                "avg_confidence": avg_conf,
+                "low_confidence": low_conf,
             }
-
-        total = len(entries)
-        avg_conf = sum(e.confidence for e in entries) / total
-        low_conf = sum(1 for e in entries if e.confidence < 0.3)
-
-        return {
-            "total_entries": total,
-            "avg_confidence": avg_conf,
-            "low_confidence": low_conf,
-        }
 
     # ------------------------------------------------------------------
     # Observable governance stats
@@ -519,29 +529,30 @@ class MemoryGovernanceEngine:
         Queries live DB state — suitable for dashboards, CLI output,
         and automated acceptance checks.
         """
-        from api.models import KnowledgeEntry
+        with self._db() as db:
+            from api.models import KnowledgeEntry
 
-        entries = self.db.query(KnowledgeEntry).all()
-        total = len(entries)
-        if total == 0:
-            return {"total_entries": 0}
+            entries = db.query(KnowledgeEntry).all()
+            total = len(entries)
+            if total == 0:
+                return {"total_entries": 0}
 
-        confidences = [e.confidence for e in entries]
-        tier_counts: dict[str, int] = {}
-        quarantined = 0
-        for e in entries:
-            tier_counts[e.trust_tier] = tier_counts.get(e.trust_tier, 0) + 1
-            if e.confidence < 0.3:
-                quarantined += 1
+            confidences = [e.confidence for e in entries]
+            tier_counts: dict[str, int] = {}
+            quarantined = 0
+            for e in entries:
+                tier_counts[e.trust_tier] = tier_counts.get(e.trust_tier, 0) + 1
+                if e.confidence < 0.3:
+                    quarantined += 1
 
-        contradictions = self._scan_contradictions()
+            contradictions = self._scan_contradictions()
 
-        return {
-            "total_entries": total,
-            "avg_confidence": sum(confidences) / total,
-            "min_confidence": min(confidences),
-            "quarantined": quarantined,
-            "quarantine_pct": round(quarantined / total * 100, 1),
-            "tier_distribution": tier_counts,
-            "contradictions": contradictions,
-        }
+            return {
+                "total_entries": total,
+                "avg_confidence": sum(confidences) / total,
+                "min_confidence": min(confidences),
+                "quarantined": quarantined,
+                "quarantine_pct": round(quarantined / total * 100, 1),
+                "tier_distribution": tier_counts,
+                "contradictions": contradictions,
+            }

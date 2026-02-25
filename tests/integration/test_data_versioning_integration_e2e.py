@@ -35,7 +35,7 @@ class TestExperimentGateIntegration:
 
     def _create_and_populate_experiment(self, db: Session, exp_id: str) -> PromptExperiment:
         """Helper: create experiment, record results so v1 wins."""
-        exp = PromptExperiment(db, source_db=TEST_DB)
+        exp = PromptExperiment(lambda: db, source_db=TEST_DB)
         config = ExperimentConfig(
             experiment_id=exp_id,
             name="Gate test",
@@ -130,7 +130,7 @@ class TestExperimentGateIntegration:
     def test_batch_chunking_over_limit(self, db: Session):
         """Batch > BATCH_LIMIT (100) is chunked into multiple statements, single commit."""
         exp_id = f"exp_chunk_{datetime.utcnow().strftime('%H%M%S%f')}"
-        exp = PromptExperiment(db, source_db=TEST_DB)
+        exp = PromptExperiment(lambda: db, source_db=TEST_DB)
         config = ExperimentConfig(
             experiment_id=exp_id,
             name="Chunk test",
@@ -177,7 +177,7 @@ class TestKnowledgeRegressionIntegration:
 
     def test_knowledge_regression_detect_change_impact(self, db: Session):
         """detect_knowledge_change_impact returns signal with 0 impact for non-existent entry."""
-        kr = KnowledgeRegression(db, source_db=TEST_DB)
+        kr = KnowledgeRegression(lambda: db, source_db=TEST_DB)
         signal = kr.detect_knowledge_change_impact(
             entry_id="nonexistent_entry_id",
             category="test_domain",
@@ -290,7 +290,7 @@ class TestSkillSelectionEventsFixes:
         """), {"sid": f"{skill_id}@2.1.0", "sn": skill_id})
         db.commit()
 
-        pipe = SkillPipeline(db, MagicMock(), audit=True, learning=False)
+        pipe = SkillPipeline(lambda: db, MagicMock(), audit=True, learning=False)
         tools = [{"type": "function", "function": {"name": skill_id, "description": "t", "parameters": {}}}]
         try:
             eid = pipe._record_selection("q", "sess_ver", tools, "rule")
@@ -315,7 +315,7 @@ class TestSkillSelectionEventsFixes:
         sid = f"sess_hist_{eid}"
         self._seed_selection(db, eid, sid, "my_skill", "1.0.0")
 
-        pipe = SkillPipeline(db, MagicMock(), audit=False, learning=False)
+        pipe = SkillPipeline(lambda: db, MagicMock(), audit=False, learning=False)
         try:
             history = pipe.selection_history(session_id=sid)
             assert len(history) == 1
@@ -341,7 +341,7 @@ class TestSkillSelectionEventsFixes:
             self._seed_selection(db, f"new_{ts}_{i}", f"s_new_{i}", skill, "2.0.0",
                                  execution_success=0)
 
-        kr = KnowledgeRegression(db, source_db=TEST_DB)
+        kr = KnowledgeRegression(lambda: db, source_db=TEST_DB)
         try:
             signal = kr.detect_skill_update_regression(skill, "1.0.0", "2.0.0")
             assert signal.confidence > 0  # regression detected
@@ -362,7 +362,7 @@ class TestSkillSelectionEventsFixes:
             self._seed_selection(db, f"ov_{ts}_{i}", f"so_{i}", skill, "1.0.0", execution_success=1)
             self._seed_selection(db, f"nv_{ts}_{i}", f"sn_{i}", skill, "2.0.0", execution_success=1)
 
-        kr = KnowledgeRegression(db, source_db=TEST_DB)
+        kr = KnowledgeRegression(lambda: db, source_db=TEST_DB)
         try:
             signal = kr.detect_skill_update_regression(skill, "1.0.0", "2.0.0")
             assert signal.confidence == 0.0  # no regression

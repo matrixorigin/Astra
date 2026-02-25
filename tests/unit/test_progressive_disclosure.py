@@ -402,7 +402,7 @@ class TestPipelineEmbedIntegration:
         from core.skills.pipeline import SkillPipeline
 
         custom_embed = Mock(return_value=[0.1] * 32)
-        pipeline = SkillPipeline(db, llm_client=None, audit=False, learning=False,
+        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False,
                                  embed_fn=custom_embed)
         # The internal selector should have a SkillIndex with our embed_fn
         assert pipeline._modern._index._embed is custom_embed
@@ -413,7 +413,7 @@ class TestPipelineEmbedIntegration:
 
         # Patch the module-level import target so EmbeddingService raises
         with patch("core.context.embeddings.EmbeddingService", side_effect=Exception("no embeddings")):
-            pipeline = SkillPipeline(db, llm_client=None, audit=False, learning=False,
+            pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False,
                                      embed_fn=None)
         # Should have fallen back to None
         assert pipeline._modern._index._embed is None

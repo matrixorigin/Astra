@@ -12,12 +12,12 @@ SOURCE_DB = os.environ.get("MATRIXONE_DATABASE", "test_dev_agent_v3")
 
 @pytest.fixture
 def sandbox(db_session):
-    return Sandbox(db=db_session, source_db=SOURCE_DB)
+    return Sandbox(lambda: db_session, source_db=SOURCE_DB)
 
 
 @pytest.fixture
 def cleaner(db_session):
-    return SandboxCleaner(db=db_session, source_db=SOURCE_DB)
+    return SandboxCleaner(lambda: db_session, source_db=SOURCE_DB)
 
 
 def _name():

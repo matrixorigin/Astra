@@ -53,7 +53,7 @@ def setup_tables(db_session):
 @pytest.fixture
 def gate(setup_tables):
     """RegressionGate instance."""
-    return RegressionGate(db=setup_tables)
+    return RegressionGate(lambda: setup_tables)
 
 
 class TestGoldenSessionSelection:
@@ -480,7 +480,7 @@ class TestRollbackMechanism:
         mock_improver.rollback_learnings.return_value = 2
 
         mock_llm = Mock()
-        pipeline = SkillPipeline(setup_tables, mock_llm, learning=False)
+        pipeline = SkillPipeline(lambda: setup_tables, mock_llm, learning=False)
         pipeline._improver = mock_improver
 
         pipeline._rollback_learnings(days=7)
@@ -630,10 +630,9 @@ class TestNewChangeTypes:
 
     def test_apply_context_budget_to_sandbox(self, gate, setup_tables):
         """CONTEXT_BUDGET change should execute upsert SQL."""
+        _mock_db = Mock()
         gate_mock = RegressionGate.__new__(RegressionGate)
-        gate_mock.db = Mock()
-        gate_mock.db.execute = Mock()
-        gate_mock.db.commit = Mock()
+        gate_mock._db_factory = lambda: _mock_db
         gate_mock._apply_change_to_sandbox(
             sandbox_name="test_sb",
             change_type=ChangeType.CONTEXT_BUDGET,
@@ -641,50 +640,47 @@ class TestNewChangeTypes:
             change_content={"debugging": {"logs": 0.50}},
         )
         # Verify execute was called with the right SQL pattern
-        call_args = gate_mock.db.execute.call_args
+        call_args = _mock_db.execute.call_args
         sql_text = call_args[0][0].text
         assert "context_budget_ratios" in sql_text
         assert "test_sb.configs" in sql_text
 
     def test_apply_knowledge_quarantine_to_sandbox(self, gate, setup_tables):
         """KNOWLEDGE quarantine should set confidence=0."""
+        _mock_db = Mock()
         gate_mock = RegressionGate.__new__(RegressionGate)
-        gate_mock.db = Mock()
-        gate_mock.db.execute = Mock()
-        gate_mock.db.commit = Mock()
+        gate_mock._db_factory = lambda: _mock_db
         gate_mock._apply_change_to_sandbox(
             sandbox_name="test_sb",
             change_type=ChangeType.KNOWLEDGE,
             change_id="quarantine_entry123",
             change_content={"entry_id": "entry123", "action": "quarantine"},
         )
-        sql_text = gate_mock.db.execute.call_args[0][0].text
+        sql_text = _mock_db.execute.call_args[0][0].text
         assert "confidence = 0.0" in sql_text
         assert "test_sb.sk_knowledge_entries" in sql_text
 
     def test_apply_knowledge_restore_to_sandbox(self, gate, setup_tables):
         """KNOWLEDGE restore should set confidence to specified value."""
+        _mock_db = Mock()
         gate_mock = RegressionGate.__new__(RegressionGate)
-        gate_mock.db = Mock()
-        gate_mock.db.execute = Mock()
-        gate_mock.db.commit = Mock()
+        gate_mock._db_factory = lambda: _mock_db
         gate_mock._apply_change_to_sandbox(
             sandbox_name="test_sb",
             change_type=ChangeType.KNOWLEDGE,
             change_id="restore_entry123",
             change_content={"entry_id": "entry123", "action": "restore", "confidence": 0.9},
         )
-        sql_text = gate_mock.db.execute.call_args[0][0].text
+        sql_text = _mock_db.execute.call_args[0][0].text
         assert "confidence = :confidence" in sql_text
-        params = gate_mock.db.execute.call_args[0][1]
+        params = _mock_db.execute.call_args[0][1]
         assert params["confidence"] == 0.9
 
     def test_apply_knowledge_missing_entry_id_raises(self, gate, setup_tables):
         """KNOWLEDGE change without entry_id should raise ValueError."""
+        _mock_db = Mock()
         gate_mock = RegressionGate.__new__(RegressionGate)
-        gate_mock.db = Mock()
-        gate_mock.db.execute = Mock()
-        gate_mock.db.commit = Mock()
+        gate_mock._db_factory = lambda: _mock_db
         with pytest.raises(ValueError, match="entry_id"):
             gate_mock._apply_change_to_sandbox(
                 sandbox_name="test_sb",
@@ -701,7 +697,7 @@ class TestPollutionGatedQuarantine:
         from core.context.pollution import PollutionDetector
 
         db = Mock()
-        detector = PollutionDetector(db)
+        detector = PollutionDetector(lambda: db)
         detector.quarantine_entry = Mock(return_value=True)
 
         with patch("core.evaluation.regression_gate.RegressionGate") as MockGate:
@@ -715,7 +711,7 @@ class TestPollutionGatedQuarantine:
         from core.context.pollution import PollutionDetector
 
         db = Mock()
-        detector = PollutionDetector(db)
+        detector = PollutionDetector(lambda: db)
         detector.quarantine_entry = Mock()
 
         with patch("core.evaluation.regression_gate.RegressionGate") as MockGate:
@@ -729,7 +725,7 @@ class TestPollutionGatedQuarantine:
         from core.context.pollution import PollutionDetector
 
         db = Mock()
-        detector = PollutionDetector(db)
+        detector = PollutionDetector(lambda: db)
         detector.quarantine_entry = Mock(return_value=True)
 
         with patch("core.evaluation.regression_gate.RegressionGate", side_effect=Exception("no gate")):
@@ -744,17 +740,16 @@ class TestSkillTableName:
 
     def test_apply_skill_change_uses_skills_registry_table(self):
         """SKILL change should target skills_registry table with correct columns."""
+        _mock_db = Mock()
         gate = RegressionGate.__new__(RegressionGate)
-        gate.db = Mock()
-        gate.db.execute = Mock()
-        gate.db.commit = Mock()
+        gate._db_factory = lambda: _mock_db
         gate._apply_change_to_sandbox(
             sandbox_name="test_sb",
             change_type=ChangeType.SKILL,
             change_id="code_review@v2",
             change_content={"name": "code_review", "version": "2.0.0", "definition": {}},
         )
-        sql_text = gate.db.execute.call_args[0][0].text
+        sql_text = _mock_db.execute.call_args[0][0].text
         assert "test_sb.skills_registry" in sql_text
         assert "skill_name" in sql_text
         assert "skill_definition" in sql_text

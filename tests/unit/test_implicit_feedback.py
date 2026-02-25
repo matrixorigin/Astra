@@ -11,7 +11,7 @@ class TestAnalyzeAndStore:
     def test_stores_positive_feedback(self):
         """Positive ratings (4-5) should also be stored, not just negative."""
         db = Mock()
-        miner = ImplicitFeedbackMiner(db=db)
+        miner = ImplicitFeedbackMiner(lambda: db)
 
         # Mock analyze_batch to return one positive result
         positive = {
@@ -36,7 +36,7 @@ class TestAnalyzeAndStore:
     def test_stores_both_positive_and_negative(self):
         """Both positive and negative feedback should be stored."""
         db = Mock()
-        miner = ImplicitFeedbackMiner(db=db)
+        miner = ImplicitFeedbackMiner(lambda: db)
 
         results = [
             {"event_id": "e1", "session_id": "s1", "signal_type": "correction",

@@ -28,7 +28,7 @@ class TestDataVersioningAPI:
     def test_lineage_trace_upstream(self, db_session):
         """Insert parent→child events, trace upstream returns both."""
         from core.events.event_reader import EventReader
-        reader = EventReader(db=db_session)
+        reader = EventReader(lambda: db_session)
 
         parent_id = f"ev_parent_{os.urandom(4).hex()}"
         child_id = f"ev_child_{os.urandom(4).hex()}"
@@ -64,7 +64,7 @@ class TestDataVersioningAPI:
     def test_causal_chain_query(self, db_session):
         """Events sharing causal_chain_id are returned together."""
         from core.events.event_reader import EventReader
-        reader = EventReader(db=db_session)
+        reader = EventReader(lambda: db_session)
 
         chain_id = f"chain_{os.urandom(4).hex()}"
         sid = f"sess_{os.urandom(4).hex()}"
@@ -194,7 +194,7 @@ class TestSLODashboard:
     def test_slo_monitor_check_agent_returns_report(self, db_session):
         """SLOMonitor.check_agent returns structured report even with no data."""
         from core.evaluation.slo_monitor import SLOMonitor, AgentSLOReport
-        monitor = SLOMonitor(db_session)
+        monitor = SLOMonitor(lambda: db_session)
         report = monitor.check_agent("nonexistent_agent", period_days=7)
         assert isinstance(report, AgentSLOReport)
         assert report.agent_id == "nonexistent_agent"
@@ -203,7 +203,7 @@ class TestSLODashboard:
     def test_slo_burn_rate_calculation(self, db_session):
         """Burn rate is 0 when no data (no bad days)."""
         from core.evaluation.slo_monitor import SLOMonitor
-        monitor = SLOMonitor(db_session)
+        monitor = SLOMonitor(lambda: db_session)
         report = monitor.check_agent("empty_agent", period_days=30)
         for s in report.statuses:
             assert s.burn_rate == 0.0
@@ -211,7 +211,8 @@ class TestSLODashboard:
     def test_slo_auto_response_warning(self, db_session):
         """Warning severity writes slo_monitoring_increased event."""
         from core.evaluation.slo_monitor import SLOMonitor, SLOSeverity, SLOStatus, SLOTarget
-        monitor = SLOMonitor(db_session)
+        from api.database import SessionLocal
+        monitor = SLOMonitor(SessionLocal)
         agent_id = f"slo_warn_{os.urandom(4).hex()}"
 
         status = SLOStatus(
@@ -220,13 +221,16 @@ class TestSLODashboard:
             severity=SLOSeverity.WARNING, days_elapsed=5, bad_days=3,
         )
         monitor._auto_respond(agent_id, status)
-        db_session.commit()
 
-        row = db_session.execute(text("""
-            SELECT event_type FROM conversation_events
-            WHERE agent_id = :aid AND event_type = 'slo_monitoring_increased'
-            LIMIT 1
-        """), {"aid": agent_id}).fetchone()
+        check = SessionLocal()
+        try:
+            row = check.execute(text("""
+                SELECT event_type FROM conversation_events
+                WHERE agent_id = :aid AND event_type = 'slo_monitoring_increased'
+                LIMIT 1
+            """), {"aid": agent_id}).fetchone()
+        finally:
+            check.close()
         assert row is not None
 
     def test_slo_auto_response_critical_fires_gate(self, db_session):
@@ -235,7 +239,7 @@ class TestSLODashboard:
         from core.evaluation.slo_monitor import SLOMonitor, SLOSeverity, SLOStatus, SLOTarget
 
         gate_trigger = MagicMock()
-        monitor = SLOMonitor(db_session, gate_trigger=gate_trigger)
+        monitor = SLOMonitor(lambda: db_session, gate_trigger=gate_trigger)
         agent_id = f"slo_crit_{os.urandom(4).hex()}"
 
         status = SLOStatus(
@@ -256,7 +260,8 @@ class TestSLODashboard:
     def test_slo_auto_response_breach_creates_postmortem(self, db_session):
         """Breach severity writes post-mortem, model escalation, and HITL tightening events."""
         from core.evaluation.slo_monitor import SLOMonitor, SLOSeverity, SLOStatus, SLOTarget
-        monitor = SLOMonitor(db_session)
+        from api.database import SessionLocal
+        monitor = SLOMonitor(SessionLocal)
         agent_id = f"slo_breach_{os.urandom(4).hex()}"
 
         status = SLOStatus(
@@ -265,13 +270,17 @@ class TestSLODashboard:
             severity=SLOSeverity.BREACH, days_elapsed=30, bad_days=25,
         )
         monitor._auto_respond(agent_id, status)
-        db_session.commit()
-        rows = db_session.execute(text("""
-            SELECT event_type FROM conversation_events
-            WHERE agent_id = :aid
-              AND event_type IN ('slo_post_mortem', 'slo_model_escalation', 'slo_hitl_tightened')
-            ORDER BY event_type
-        """), {"aid": agent_id}).fetchall()
+        # Query with fresh session since monitor committed on its own session
+        check = SessionLocal()
+        try:
+            rows = check.execute(text("""
+                SELECT event_type FROM conversation_events
+                WHERE agent_id = :aid
+                  AND event_type IN ('slo_post_mortem', 'slo_model_escalation', 'slo_hitl_tightened')
+                ORDER BY event_type
+            """), {"aid": agent_id}).fetchall()
+        finally:
+            check.close()
         event_types = {r[0] for r in rows}
         assert "slo_post_mortem" in event_types
         assert "slo_model_escalation" in event_types
@@ -347,7 +356,7 @@ class TestSLODashboard:
         """), {"eid": os.urandom(8).hex(), "aid": agent_id})
         db_session.commit()
 
-        engine = HITLPolicyEngine(db=db_session)
+        engine = HITLPolicyEngine(lambda: db_session)
         engine.load_policies(agent_id)
 
         names = [p.name for p in engine._policies]
@@ -380,7 +389,7 @@ class TestPromptEvolutionGate:
         """Without gate, promote_variant updates template directly."""
         from core.evaluation.prompt_evolution import PromptEvolver
 
-        evolver = PromptEvolver(db_session)
+        evolver = PromptEvolver(lambda: db_session)
         template_id = f"tmpl_{os.urandom(4).hex()}"
         variant_id = f"var_{os.urandom(4).hex()}"
 
@@ -411,7 +420,7 @@ class TestPromptEvolutionGate:
 
         gate = MagicMock()
         gate.validate_change.return_value = {"verdict": "approved", "metrics": {}}
-        evolver = PromptEvolver(db_session, regression_gate=gate)
+        evolver = PromptEvolver(lambda: db_session, regression_gate=gate)
 
         template_id = f"tmpl_{os.urandom(4).hex()}"
         variant_id = f"var_{os.urandom(4).hex()}"
@@ -442,7 +451,7 @@ class TestPromptEvolutionGate:
 
         gate = MagicMock()
         gate.validate_change.return_value = {"verdict": "rejected", "reason": "score_regression"}
-        evolver = PromptEvolver(db_session, regression_gate=gate)
+        evolver = PromptEvolver(lambda: db_session, regression_gate=gate)
 
         template_id = f"tmpl_{os.urandom(4).hex()}"
         variant_id = f"var_{os.urandom(4).hex()}"

@@ -21,7 +21,7 @@ def mock_db():
 def regression_gate(mock_db):
     """Create RegressionGate instance with mocked dependencies."""
     with patch('core.evaluation.regression_gate.Sandbox'):
-        gate = RegressionGate(db=mock_db, account="test")
+        gate = RegressionGate(lambda: mock_db, account="test")
         return gate
 
 

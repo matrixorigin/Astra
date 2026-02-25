@@ -22,7 +22,7 @@ def guard():
 @pytest.fixture
 def executor(runtime, guard):
     """CodeExecutor with real runtime, no DB (data_access=NONE only)."""
-    return CodeExecutor(runtime=runtime, db=None, branch=None, security=guard)
+    return CodeExecutor(runtime=runtime, db_factory=lambda: None, branch=None, security=guard)
 
 
 # ===========================================================================
@@ -380,7 +380,7 @@ class TestMissingIntegration:
     @pytest.fixture
     def executor(self):
         return CodeExecutor(
-            runtime=SubprocessRuntime(), db=None, branch=None,
+            runtime=SubprocessRuntime(), db_factory=lambda: None, branch=None,
             security=SecurityGuard(),
         )
 

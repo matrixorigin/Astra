@@ -20,19 +20,20 @@ from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
 DEFAULT_TTL_HOURS = 24
 
 
-class SandboxCleaner:
+class SandboxCleaner(DbConsumer):
     """Scans for and cleans up orphaned/expired sandboxes."""
 
-    def __init__(self, db: Session, source_db: str = "dev_agent"):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, source_db: str = "dev_agent"):
+        super().__init__(db_factory)
         self.source_db = source_db
-        self.sandbox = Sandbox(db=db, source_db=source_db)
+        self.sandbox = Sandbox(db_factory=self._db_factory, source_db=source_db)
 
     def run(self, ttl_hours: int = DEFAULT_TTL_HOURS) -> dict:
         """Scan and clean expired sandboxes. Returns summary."""
@@ -64,65 +65,69 @@ class SandboxCleaner:
 
     def _find_closed_session_sandboxes(self) -> list[str]:
         """Sandboxes whose session is CLOSED — should have been cleaned by Tier 1."""
-        try:
-            r = self.db.execute(text(f"""
-                SELECT m.sandbox_name FROM {self.source_db}.sandbox_metadata m
-                JOIN sessions s ON m.session_id = s.session_id
-                WHERE m.status = 'active' AND s.status = 'closed'
-            """))
-            return [row._mapping["sandbox_name"] for row in r]
-        except Exception:
-            return []
+        with self._db() as db:
+            try:
+                r = db.execute(text(f"""
+                    SELECT m.sandbox_name FROM {self.source_db}.sandbox_metadata m
+                    JOIN sessions s ON m.session_id = s.session_id
+                    WHERE m.status = 'active' AND s.status = 'closed'
+                """))
+                return [row._mapping["sandbox_name"] for row in r]
+            except Exception:
+                return []
 
     def _find_zombie_session_sandboxes(self, cutoff: datetime) -> list[str]:
         """Sandboxes whose session is ACTIVE but has no recent activity."""
-        try:
-            r = self.db.execute(text(f"""
-                SELECT m.sandbox_name FROM {self.source_db}.sandbox_metadata m
-                JOIN sessions s ON m.session_id = s.session_id
-                WHERE m.status = 'active' AND s.status = 'active'
-                  AND s.updated_at < :cutoff
-            """), {"cutoff": cutoff})
-            return [row._mapping["sandbox_name"] for row in r]
-        except Exception:
-            return []
+        with self._db() as db:
+            try:
+                r = db.execute(text(f"""
+                    SELECT m.sandbox_name FROM {self.source_db}.sandbox_metadata m
+                    JOIN sessions s ON m.session_id = s.session_id
+                    WHERE m.status = 'active' AND s.status = 'active'
+                      AND s.updated_at < :cutoff
+                """), {"cutoff": cutoff})
+                return [row._mapping["sandbox_name"] for row in r]
+            except Exception:
+                return []
 
     def _find_expired_unbound(self, cutoff: datetime) -> list[str]:
         """Sandboxes with no session_id and updated_at older than cutoff."""
-        try:
-            r = self.db.execute(text(f"""
-                SELECT sandbox_name FROM {self.source_db}.sandbox_metadata
-                WHERE status = 'active' AND session_id IS NULL
-                  AND updated_at < :cutoff
-            """), {"cutoff": cutoff})
-            return [row._mapping["sandbox_name"] for row in r]
-        except Exception:
-            return []
+        with self._db() as db:
+            try:
+                r = db.execute(text(f"""
+                    SELECT sandbox_name FROM {self.source_db}.sandbox_metadata
+                    WHERE status = 'active' AND session_id IS NULL
+                      AND updated_at < :cutoff
+                """), {"cutoff": cutoff})
+                return [row._mapping["sandbox_name"] for row in r]
+            except Exception:
+                return []
 
     def _find_orphan_databases(self) -> list[str]:
         """sandbox_*/code_exec_* databases with no metadata entry."""
-        try:
-            r = self.db.execute(text("SHOW DATABASES"))
-            all_dbs = [row[0] for row in r]
-            sandbox_dbs = [
-                d for d in all_dbs
-                if d.startswith("sandbox_") or d.startswith("code_exec_")
-            ]
-            if not sandbox_dbs:
-                return []
-
-            known = set()
+        with self._db() as db:
             try:
-                r = self.db.execute(text(
-                    f"SELECT sandbox_name FROM {self.source_db}.sandbox_metadata"
-                ))
-                known = {row._mapping["sandbox_name"] for row in r}
-            except Exception:
-                pass
+                r = db.execute(text("SHOW DATABASES"))
+                all_dbs = [row[0] for row in r]
+                sandbox_dbs = [
+                    d for d in all_dbs
+                    if d.startswith("sandbox_") or d.startswith("code_exec_")
+                ]
+                if not sandbox_dbs:
+                    return []
 
-            return [d for d in sandbox_dbs if d not in known]
-        except Exception:
-            return []
+                known = set()
+                try:
+                    r = db.execute(text(
+                        f"SELECT sandbox_name FROM {self.source_db}.sandbox_metadata"
+                    ))
+                    known = {row._mapping["sandbox_name"] for row in r}
+                except Exception:
+                    pass
+
+                return [d for d in sandbox_dbs if d not in known]
+            except Exception:
+                return []
 
     # ── Helpers ──────────────────────────────────────────────
 

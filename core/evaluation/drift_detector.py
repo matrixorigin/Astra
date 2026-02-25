@@ -17,9 +17,9 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
@@ -58,7 +58,7 @@ class DriftReport:
     created_at: datetime
 
 
-class DriftDetector:
+class DriftDetector(DbConsumer):
     """Detects quality drift per model and prompt template."""
 
     # Thresholds for severity classification
@@ -67,8 +67,8 @@ class DriftDetector:
     SEVERE_THRESHOLD = -1.0
     MIN_SAMPLES = 5  # minimum events to consider
 
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self, db_factory: DbFactory):
+        super().__init__(db_factory)
 
     def detect(self) -> list[DriftSignal]:
         """Detect quality drift across all models and templates.
@@ -86,64 +86,66 @@ class DriftDetector:
         return [s for s in signals if s.severity != DriftSeverity.NONE]
 
     def _detect_model_drift(self) -> list[DriftSignal]:
-        rows = self.db.execute(text("""
-            SELECT
-                llm_model_used,
-                AVG(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
-                    THEN quality_score END) AS recent_avg,
-                AVG(CASE WHEN created_at BETWEEN DATE_SUB(NOW(), INTERVAL 14 DAY)
-                    AND DATE_SUB(NOW(), INTERVAL 7 DAY)
-                    THEN quality_score END) AS previous_avg,
-                COUNT(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
-                    THEN 1 END) AS recent_count
-            FROM conversation_events
-            WHERE event_type = 'llm_response'
-              AND quality_score IS NOT NULL
-              AND llm_model_used IS NOT NULL
-              AND created_at > DATE_SUB(NOW(), INTERVAL 14 DAY)
-            GROUP BY llm_model_used
-        """)).fetchall()
+        with self._db() as db:
+            rows = db.execute(text("""
+                SELECT
+                    llm_model_used,
+                    AVG(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+                        THEN quality_score END) AS recent_avg,
+                    AVG(CASE WHEN created_at BETWEEN DATE_SUB(NOW(), INTERVAL 14 DAY)
+                        AND DATE_SUB(NOW(), INTERVAL 7 DAY)
+                        THEN quality_score END) AS previous_avg,
+                    COUNT(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+                        THEN 1 END) AS recent_count
+                FROM conversation_events
+                WHERE event_type = 'llm_response'
+                  AND quality_score IS NOT NULL
+                  AND llm_model_used IS NOT NULL
+                  AND created_at > DATE_SUB(NOW(), INTERVAL 14 DAY)
+                GROUP BY llm_model_used
+            """)).fetchall()
 
-        return [
-            self._build_signal(
-                model=row[0], template_id=None,
-                recent_avg=row[1], previous_avg=row[2],
-                sample_count=int(row[3]),
-            )
-            for row in rows
-            if row[1] is not None and row[2] is not None
-        ]
+            return [
+                self._build_signal(
+                    model=row[0], template_id=None,
+                    recent_avg=row[1], previous_avg=row[2],
+                    sample_count=int(row[3]),
+                )
+                for row in rows
+                if row[1] is not None and row[2] is not None
+            ]
 
     def _detect_template_drift(self) -> list[DriftSignal]:
-        rows = self.db.execute(text("""
-            SELECT
-                llm_model_used,
-                prompt_template_id,
-                AVG(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
-                    THEN quality_score END) AS recent_avg,
-                AVG(CASE WHEN created_at BETWEEN DATE_SUB(NOW(), INTERVAL 14 DAY)
-                    AND DATE_SUB(NOW(), INTERVAL 7 DAY)
-                    THEN quality_score END) AS previous_avg,
-                COUNT(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
-                    THEN 1 END) AS recent_count
-            FROM conversation_events
-            WHERE event_type = 'llm_response'
-              AND quality_score IS NOT NULL
-              AND llm_model_used IS NOT NULL
-              AND prompt_template_id IS NOT NULL
-              AND created_at > DATE_SUB(NOW(), INTERVAL 14 DAY)
-            GROUP BY llm_model_used, prompt_template_id
-        """)).fetchall()
+        with self._db() as db:
+            rows = db.execute(text("""
+                SELECT
+                    llm_model_used,
+                    prompt_template_id,
+                    AVG(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+                        THEN quality_score END) AS recent_avg,
+                    AVG(CASE WHEN created_at BETWEEN DATE_SUB(NOW(), INTERVAL 14 DAY)
+                        AND DATE_SUB(NOW(), INTERVAL 7 DAY)
+                        THEN quality_score END) AS previous_avg,
+                    COUNT(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+                        THEN 1 END) AS recent_count
+                FROM conversation_events
+                WHERE event_type = 'llm_response'
+                  AND quality_score IS NOT NULL
+                  AND llm_model_used IS NOT NULL
+                  AND prompt_template_id IS NOT NULL
+                  AND created_at > DATE_SUB(NOW(), INTERVAL 14 DAY)
+                GROUP BY llm_model_used, prompt_template_id
+            """)).fetchall()
 
-        return [
-            self._build_signal(
-                model=row[0], template_id=row[1],
-                recent_avg=row[2], previous_avg=row[3],
-                sample_count=int(row[4]),
-            )
-            for row in rows
-            if row[2] is not None and row[3] is not None
-        ]
+            return [
+                self._build_signal(
+                    model=row[0], template_id=row[1],
+                    recent_avg=row[2], previous_avg=row[3],
+                    sample_count=int(row[4]),
+                )
+                for row in rows
+                if row[2] is not None and row[3] is not None
+            ]
 
     def _build_signal(
         self, *, model: str, template_id: str | None,
@@ -174,14 +176,14 @@ class DriftDetector:
         return DriftSeverity.NONE
 
 
-class DriftCorrector:
+class DriftCorrector(DbConsumer):
     """Confirms drift via replay and applies corrections."""
 
     CONFIRM_REPLAY_COUNT = 20
     CONFIRM_THRESHOLD = -0.3  # confirmed if replay delta < this
 
-    def __init__(self, db: Session, regression_gate=None, router=None, prompt_optimizer=None):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, regression_gate=None, router=None, prompt_optimizer=None):
+        super().__init__(db_factory)
         self.regression_gate = regression_gate
         self.router = router
         self.prompt_optimizer = prompt_optimizer
@@ -277,48 +279,50 @@ class DriftCorrector:
 
     def _apply_fallback(self, signal: DriftSignal) -> CorrectionAction:
         """Route affected model to its fallback."""
-        if not self.router:
-            logger.warning(
-                "No router available, cannot apply fallback for %s",
-                signal.model,
-            )
-            return CorrectionAction.ESCALATE_HUMAN
-
-        try:
-            cfg = self.router.get(signal.model)
-            if cfg and cfg.fallback_to:
-                logger.info(
-                    "Drift correction: routing %s → %s (delta=%.2f)",
-                    signal.model, cfg.fallback_to, signal.week_delta,
+        with self._db() as db:
+            if not self.router:
+                logger.warning(
+                    "No router available, cannot apply fallback for %s",
+                    signal.model,
                 )
-                cfg.is_active = False  # disable drifted model
-                self.db.commit()
-                return CorrectionAction.FALLBACK_MODEL
-            return CorrectionAction.ESCALATE_HUMAN
-        except Exception as e:
-            logger.error("Fallback application failed: %s", e)
-            return CorrectionAction.ESCALATE_HUMAN
+                return CorrectionAction.ESCALATE_HUMAN
+
+            try:
+                cfg = self.router.get(signal.model)
+                if cfg and cfg.fallback_to:
+                    logger.info(
+                        "Drift correction: routing %s → %s (delta=%.2f)",
+                        signal.model, cfg.fallback_to, signal.week_delta,
+                    )
+                    cfg.is_active = False  # disable drifted model
+                    db.commit()
+                    return CorrectionAction.FALLBACK_MODEL
+                return CorrectionAction.ESCALATE_HUMAN
+            except Exception as e:
+                logger.error("Fallback application failed: %s", e)
+                return CorrectionAction.ESCALATE_HUMAN
 
     def _record(self, signal: DriftSignal, correction: dict[str, Any]):
         """Record drift event for audit trail."""
-        try:
-            self.db.execute(text("""
-                INSERT INTO conversation_events
-                    (event_id, session_id, user_id, agent_id, agent_version,
-                     event_type, content, causal_chain_id, created_at, llm_model_used)
-                VALUES
-                    (:event_id, :session_id, :user_id, 'system', '1.0.0',
-                     'drift_correction', :content, :chain_id, NOW(), :model)
-            """), {
-                # Deterministic event_id: same drift signal → same PK → idempotent re-recording
-                "event_id": f"drift_{signal.model}_{int(signal.detected_at.timestamp())}",
-                "session_id": "system_drift_detection",
-                "user_id": "system",
-                "content": json.dumps(correction, default=str),
-                "chain_id": f"drift_{signal.model}",
-                "model": signal.model,
-            })
-            self.db.commit()
-        except Exception as e:
-            logger.warning("Failed to record drift correction: %s", e)
-            self.db.rollback()
+        with self._db() as db:
+            try:
+                db.execute(text("""
+                    INSERT INTO conversation_events
+                        (event_id, session_id, user_id, agent_id, agent_version,
+                         event_type, content, causal_chain_id, created_at, llm_model_used)
+                    VALUES
+                        (:event_id, :session_id, :user_id, 'system', '1.0.0',
+                         'drift_correction', :content, :chain_id, NOW(), :model)
+                """), {
+                    # Deterministic event_id: same drift signal → same PK → idempotent re-recording
+                    "event_id": f"drift_{signal.model}_{int(signal.detected_at.timestamp())}",
+                    "session_id": "system_drift_detection",
+                    "user_id": "system",
+                    "content": json.dumps(correction, default=str),
+                    "chain_id": f"drift_{signal.model}",
+                    "model": signal.model,
+                })
+                db.commit()
+            except Exception as e:
+                logger.warning("Failed to record drift correction: %s", e)
+                db.rollback()

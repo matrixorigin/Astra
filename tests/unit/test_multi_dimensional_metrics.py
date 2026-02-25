@@ -61,7 +61,7 @@ class TestSignalExtraction:
     def test_extract_slow_execution_signal(self, db):
         """Test extraction of SLOW_EXECUTION signal."""
         selector = SelfImprovingSelector(
-            session=db,
+            lambda: db,
             thresholds=SignalThresholds(slow_execution_ms=5000)
         )
         
@@ -93,7 +93,7 @@ class TestSignalExtraction:
     def test_extract_high_cost_signal(self, db):
         """Test extraction of HIGH_COST signal."""
         selector = SelfImprovingSelector(
-            session=db,
+            lambda: db,
             thresholds=SignalThresholds(high_cost_usd=0.10)
         )
         
@@ -125,7 +125,7 @@ class TestSignalExtraction:
     def test_extract_low_satisfaction_signal(self, db):
         """Test extraction of LOW_SATISFACTION signal."""
         selector = SelfImprovingSelector(
-            session=db,
+            lambda: db,
             thresholds=SignalThresholds(low_satisfaction=3)
         )
         
@@ -156,7 +156,7 @@ class TestSignalExtraction:
     
     def test_extract_multiple_signal_types(self, db):
         """Test that all signal types can be extracted together."""
-        selector = SelfImprovingSelector(session=db)
+        selector = SelfImprovingSelector(lambda: db)
         
         # Create events with different signal types
         events = [
@@ -229,7 +229,7 @@ class TestLearningFromMetrics:
     
     def test_learn_from_slow_executions(self, db):
         """Test that slow executions generate learnings."""
-        selector = SelfImprovingSelector(session=db)
+        selector = SelfImprovingSelector(lambda: db)
         
         # Create metric for slow execution
         metric = SkillExecutionMetric(
@@ -253,7 +253,7 @@ class TestLearningFromMetrics:
     
     def test_learn_from_expensive_executions(self, db):
         """Test that expensive executions generate learnings."""
-        selector = SelfImprovingSelector(session=db)
+        selector = SelfImprovingSelector(lambda: db)
         
         # Create metric for expensive execution
         metric = SkillExecutionMetric(

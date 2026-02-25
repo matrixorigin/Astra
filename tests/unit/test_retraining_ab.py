@@ -15,7 +15,7 @@ class TestRetrainingMonitor:
 
     def _make(self, feedback_count=0, artifact=None):
         db = MagicMock()
-        monitor = RetrainingMonitor(db)
+        monitor = RetrainingMonitor(lambda: db)
         monitor._feedback_count = MagicMock(return_value=feedback_count)
         monitor._last_artifact = MagicMock(return_value=artifact)
         return monitor

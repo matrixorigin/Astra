@@ -18,15 +18,16 @@ from sqlalchemy.orm import Session
 from api.models import Event
 from core.events.models import StreamEvent, StreamEventType
 from core.logging_config import get_logger
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
 
-class StreamReplay:
+class StreamReplay(DbConsumer):
     """Reconstruct streams from logged events."""
 
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self, db_factory: DbFactory):
+        super().__init__(db_factory)
 
     async def replay_stream(
         self,
@@ -146,17 +147,18 @@ class StreamReplay:
 
     def _is_run_complete(self, run_id: str) -> bool:
         """Check if run has a terminal event in run_events."""
-        placeholders = ", ".join(f":t{i}" for i in range(len(self._TERMINAL_TYPES)))
-        params = {f"t{i}": t for i, t in enumerate(self._TERMINAL_TYPES)}
-        params["run_id"] = run_id
-        row = self.db.execute(
-            text(
-                f"SELECT 1 FROM run_events "
-                f"WHERE run_id = :run_id AND event_type IN ({placeholders}) LIMIT 1"
-            ),
-            params,
-        ).fetchone()
-        return row is not None
+        with self._db() as db:
+            placeholders = ", ".join(f":t{i}" for i in range(len(self._TERMINAL_TYPES)))
+            params = {f"t{i}": t for i, t in enumerate(self._TERMINAL_TYPES)}
+            params["run_id"] = run_id
+            row = db.execute(
+                text(
+                    f"SELECT 1 FROM run_events "
+                    f"WHERE run_id = :run_id AND event_type IN ({placeholders}) LIMIT 1"
+                ),
+                params,
+            ).fetchone()
+            return row is not None
 
     def _load_run_chunks(self, run_id: str) -> list[StreamEvent] | None:
         """Load chunk-level events from run_events.
@@ -165,38 +167,39 @@ class StreamReplay:
             list[StreamEvent]: Events (possibly empty) if run is complete.
             None: If run is not yet complete — caller should fall back.
         """
-        if not self._is_run_complete(run_id):
-            logger.info("Run %s not complete, skipping chunk replay", run_id)
-            return None
+        with self._db() as db:
+            if not self._is_run_complete(run_id):
+                logger.info("Run %s not complete, skipping chunk replay", run_id)
+                return None
 
-        rows = self.db.execute(
-            text(
-                "SELECT event_type, data, event_id, agent_id FROM run_events "
-                "WHERE run_id = :run_id AND idx >= 0 ORDER BY idx"
-            ),
-            {"run_id": run_id},
-        ).fetchall()
+            rows = db.execute(
+                text(
+                    "SELECT event_type, data, event_id, agent_id FROM run_events "
+                    "WHERE run_id = :run_id AND idx >= 0 ORDER BY idx"
+                ),
+                {"run_id": run_id},
+            ).fetchall()
 
-        events = []
-        for row in rows:
-            data = row[1]
-            if isinstance(data, str):
-                data = json.loads(data)
+            events = []
+            for row in rows:
+                data = row[1]
+                if isinstance(data, str):
+                    data = json.loads(data)
 
-            try:
-                stream_type = StreamEventType(row[0])
-            except ValueError:
-                # Not a recognized stream event type — include as raw
-                stream_type = StreamEventType.RAW
+                try:
+                    stream_type = StreamEventType(row[0])
+                except ValueError:
+                    # Not a recognized stream event type — include as raw
+                    stream_type = StreamEventType.RAW
 
-            events.append(StreamEvent(
-                event_type=stream_type,
-                data=data,
-                event_id=row[2],
-                agent_id=row[3],
-            ))
+                events.append(StreamEvent(
+                    event_type=stream_type,
+                    data=data,
+                    event_id=row[2],
+                    agent_id=row[3],
+                ))
 
-        return events
+            return events
 
     # ── Full-text fallback (conversation_events) ──────────────
 
@@ -206,28 +209,29 @@ class StreamReplay:
         Synthesizes stream events from full-text responses when chunk-level
         data is unavailable (crash recovery, missing chunks).
         """
-        rows = self.db.execute(
-            text(
-                "SELECT event_id, content, agent_id, causal_chain_id "
-                "FROM conversation_events "
-                "WHERE run_id = :run_id AND event_type = 'llm_response' "
-                "ORDER BY created_at"
-            ),
-            {"run_id": run_id},
-        ).fetchall()
+        with self._db() as db:
+            rows = db.execute(
+                text(
+                    "SELECT event_id, content, agent_id, causal_chain_id "
+                    "FROM conversation_events "
+                    "WHERE run_id = :run_id AND event_type = 'llm_response' "
+                    "ORDER BY created_at"
+                ),
+                {"run_id": run_id},
+            ).fetchall()
 
-        if not rows:
-            return []
+            if not rows:
+                return []
 
-        logger.info("Full-text replay for run %s: %d llm_response events", run_id, len(rows))
+            logger.info("Full-text replay for run %s: %d llm_response events", run_id, len(rows))
 
-        events = []
-        for row in rows:
-            kwargs = {"event_id": row[0], "agent_id": row[2], "causal_chain_id": row[3]}
-            events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_START, data={"role": "assistant"}, **kwargs))
-            events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_CONTENT, data={"delta": row[1] or ""}, **kwargs))
-            events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_END, data={}, **kwargs))
-        return events
+            events = []
+            for row in rows:
+                kwargs = {"event_id": row[0], "agent_id": row[2], "causal_chain_id": row[3]}
+                events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_START, data={"role": "assistant"}, **kwargs))
+                events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_CONTENT, data={"delta": row[1] or ""}, **kwargs))
+                events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_END, data={}, **kwargs))
+            return events
 
     # ── Legacy path (stream_* in conversation_events) ─────────
 
@@ -238,60 +242,61 @@ class StreamReplay:
         before_timestamp: datetime | None = None,
     ) -> list[Event]:
         """Query stream events from conversation_events (legacy path)."""
-        conditions = [
-            Event.session_id == session_id,
-            Event.event_type.in_(
-                [
-                    "stream_run_started",
-                    "stream_run_finished",
-                    "stream_run_error",
-                    "stream_step_started",
-                    "stream_step_finished",
-                    "stream_text_delta",
-                    "stream_text_done",
-                    "stream_text_message_start",
-                    "stream_text_message_content",
-                    "stream_text_message_end",
-                    "stream_thinking_delta",
-                    "stream_thinking_done",
-                    "stream_reasoning_start",
-                    "stream_reasoning_message_start",
-                    "stream_reasoning_message_content",
-                    "stream_reasoning_message_end",
-                    "stream_reasoning_end",
-                    "stream_tool_call_start",
-                    "stream_tool_call_args",
-                    "stream_tool_call_end",
-                    "stream_tool_result",
-                    "stream_state_snapshot",
-                    "stream_state_delta",
-                    "stream_messages_snapshot",
-                    "stream_plan_created",
-                    "stream_plan_step_start",
-                    "stream_plan_step_done",
-                    "stream_plan_revised",
-                    "stream_agent_delegated",
-                    "stream_agent_progress",
-                    "stream_agent_completed",
-                    "stream_custom",
-                    "stream_raw",
-                ]
-            ),
-        ]
+        with self._db() as db:
+            conditions = [
+                Event.session_id == session_id,
+                Event.event_type.in_(
+                    [
+                        "stream_run_started",
+                        "stream_run_finished",
+                        "stream_run_error",
+                        "stream_step_started",
+                        "stream_step_finished",
+                        "stream_text_delta",
+                        "stream_text_done",
+                        "stream_text_message_start",
+                        "stream_text_message_content",
+                        "stream_text_message_end",
+                        "stream_thinking_delta",
+                        "stream_thinking_done",
+                        "stream_reasoning_start",
+                        "stream_reasoning_message_start",
+                        "stream_reasoning_message_content",
+                        "stream_reasoning_message_end",
+                        "stream_reasoning_end",
+                        "stream_tool_call_start",
+                        "stream_tool_call_args",
+                        "stream_tool_call_end",
+                        "stream_tool_result",
+                        "stream_state_snapshot",
+                        "stream_state_delta",
+                        "stream_messages_snapshot",
+                        "stream_plan_created",
+                        "stream_plan_step_start",
+                        "stream_plan_step_done",
+                        "stream_plan_revised",
+                        "stream_agent_delegated",
+                        "stream_agent_progress",
+                        "stream_agent_completed",
+                        "stream_custom",
+                        "stream_raw",
+                    ]
+                ),
+            ]
 
-        if causal_chain_id:
-            conditions.append(Event.causal_chain_id == causal_chain_id)
-        if before_timestamp:
-            conditions.append(Event.created_at <= before_timestamp)
+            if causal_chain_id:
+                conditions.append(Event.causal_chain_id == causal_chain_id)
+            if before_timestamp:
+                conditions.append(Event.created_at <= before_timestamp)
 
-        stmt = (
-            select(Event)
-            .where(and_(*conditions))
-            .order_by(Event.created_at)
-        )
+            stmt = (
+                select(Event)
+                .where(and_(*conditions))
+                .order_by(Event.created_at)
+            )
 
-        result = self.db.execute(stmt)
-        return list(result.scalars().all())
+            result = db.execute(stmt)
+            return list(result.scalars().all())
 
     def _reconstruct_stream_event(self, event: Event) -> StreamEvent | None:
         """Reconstruct StreamEvent from ConversationEvent."""

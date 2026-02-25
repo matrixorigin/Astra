@@ -189,7 +189,7 @@ class TestEnhancedFirewall:
         context_manager.load_snapshot.return_value = snapshot
 
         firewall = HallucinationFirewall(
-            db=db,
+            db_factory=lambda: db,
             context_manager=context_manager,
             llm_client=llm_client,
             use_llm_extraction=True,
@@ -217,7 +217,7 @@ class TestEnhancedFirewall:
         context_manager.load_snapshot.return_value = snapshot
 
         firewall = HallucinationFirewall(
-            db=db,
+            db_factory=lambda: db,
             context_manager=context_manager,
             llm_client=None,  # No LLM client
             use_llm_extraction=False,
@@ -235,7 +235,7 @@ class TestEnhancedFirewall:
         llm_client = Mock()
 
         firewall = HallucinationFirewall(
-            db=db, context_manager=context_manager, llm_client=llm_client
+            db_factory=lambda: db, context_manager=context_manager, llm_client=llm_client
         )
 
         # Create result with evidence

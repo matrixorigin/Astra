@@ -35,7 +35,7 @@ class TestFeedbackBufferFlush:
 
     def test_feedback_buffer_flush_batch_size(self, db, clean_db):
         """Test that buffer flushes when batch size is reached."""
-        buffer = _FeedbackBuffer(db, batch_size=3, flush_interval=3600)
+        buffer = _FeedbackBuffer(lambda: db, batch_size=3, flush_interval=3600)
         
         event_id = str(uuid7())
         
@@ -54,7 +54,7 @@ class TestFeedbackBufferFlush:
 
     def test_feedback_buffer_flush_manual(self, db, clean_db):
         """Test manual flush."""
-        buffer = _FeedbackBuffer(db, batch_size=10, flush_interval=3600)
+        buffer = _FeedbackBuffer(lambda: db, batch_size=10, flush_interval=3600)
         
         event_id = str(uuid7())
         
@@ -83,7 +83,7 @@ class TestFeedbackBufferFlush:
 
     def test_feedback_buffer_flush_empty(self, db, clean_db):
         """Test flushing empty buffer."""
-        buffer = _FeedbackBuffer(db, batch_size=10, flush_interval=3600)
+        buffer = _FeedbackBuffer(lambda: db, batch_size=10, flush_interval=3600)
         
         flushed = buffer.flush()
         
@@ -95,7 +95,7 @@ class TestFeedbackBufferInterval:
 
     def test_feedback_buffer_interval_not_elapsed(self, db, clean_db):
         """Test maybe_flush when interval not elapsed."""
-        buffer = _FeedbackBuffer(db, batch_size=10, flush_interval=0.1)
+        buffer = _FeedbackBuffer(lambda: db, batch_size=10, flush_interval=0.1)
         
         event_id = str(uuid7())
         buffer.add(event_id, SignalType.WRONG_SKILL, {"reason": "test"})
@@ -114,7 +114,7 @@ class TestFeedbackBufferInterval:
 
     def test_feedback_buffer_interval_elapsed(self, db, clean_db):
         """Test maybe_flush when interval elapsed."""
-        buffer = _FeedbackBuffer(db, batch_size=10, flush_interval=0.05)
+        buffer = _FeedbackBuffer(lambda: db, batch_size=10, flush_interval=0.05)
         
         event_id = str(uuid7())
         buffer.add(event_id, SignalType.WRONG_SKILL, {"reason": "test"})
@@ -140,7 +140,7 @@ class TestFeedbackBufferConcurrent:
 
     def test_feedback_buffer_concurrent(self, db, clean_db):
         """Test concurrent access from multiple threads."""
-        buffer = _FeedbackBuffer(db, batch_size=100, flush_interval=3600)
+        buffer = _FeedbackBuffer(lambda: db, batch_size=100, flush_interval=3600)
         
         event_id = str(uuid7())
         num_threads = 5
@@ -297,7 +297,7 @@ class TestSkillPipelineLearn:
         db.commit()
         
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=True,
@@ -314,7 +314,7 @@ class TestSkillPipelineLearn:
     def test_skill_pipeline_stats(self, db, clean_db):
         """Test getting learning statistics."""
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=True
@@ -348,7 +348,7 @@ class TestSkillPipelineLearn:
         db.commit()
         
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=False
@@ -387,7 +387,7 @@ class TestSkillPipelineIntegration:
         
         # Create pipeline with learning enabled to test feedback
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,  # Skip audit event creation
             learning=True  # Enable learning to record feedback
@@ -412,7 +412,7 @@ class TestSkillPipelineIntegration:
     def test_skill_pipeline_get_tools_schema(self, db, clean_db):
         """Test get_tools_schema with audit enabled."""
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=True,
             learning=False
@@ -426,14 +426,14 @@ class TestSkillPipelineIntegration:
 
     def test_skill_pipeline_get_tools_schema_latency(self, db, clean_db):
         """select_tools should populate latency_ms."""
-        pipeline = SkillPipeline(db=db, llm_client=None, audit=False, learning=False)
+        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False)
         result = pipeline.get_tools_schema("test query", str(uuid7()))
         assert result.latency_ms >= 0
 
     def test_skill_pipeline_record_feedback_no_event_id(self, db, clean_db):
         """Test record_feedback with None event_id (no-op)."""
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=True
@@ -450,7 +450,7 @@ class TestSkillPipelineIntegration:
         event_id = str(uuid7())
         
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=False
@@ -464,7 +464,7 @@ class TestSkillPipelineIntegration:
 
     def test_feedback_buffer_error_handling(self, db, clean_db):
         """Test feedback buffer error handling and re-queueing."""
-        buffer = _FeedbackBuffer(db, batch_size=2, flush_interval=3600)
+        buffer = _FeedbackBuffer(lambda: db, batch_size=2, flush_interval=3600)
         
         event_id = str(uuid7())
         buffer.add(event_id, SignalType.WRONG_SKILL, {"reason": "test1"})
@@ -482,7 +482,7 @@ class TestSkillPipelineIntegration:
 
     def test_skill_pipeline_maybe_flush_timing(self, db, clean_db):
         """Test opportunistic flush timing."""
-        buffer = _FeedbackBuffer(db, batch_size=100, flush_interval=0.05)
+        buffer = _FeedbackBuffer(lambda: db, batch_size=100, flush_interval=0.05)
         
         event_id = str(uuid7())
         buffer.add(event_id, SignalType.WRONG_SKILL, {"reason": "test"})
@@ -517,7 +517,7 @@ class TestSkillPipelineIntegration:
         db.commit()
         
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=True
@@ -541,7 +541,7 @@ class TestSkillPipelineIntegration:
     def test_skill_pipeline_get_tools_schema_with_learning(self, db, clean_db):
         """Test get_tools_schema with learning enabled."""
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=True,
             learning=True,
@@ -556,7 +556,7 @@ class TestSkillPipelineIntegration:
     def test_skill_pipeline_selection_history_empty(self, db, clean_db):
         """Test selection_history with no results."""
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=False
@@ -569,7 +569,7 @@ class TestSkillPipelineIntegration:
     def test_skill_pipeline_learn_with_no_data(self, db, clean_db):
         """Test learn with no recent failure data."""
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=True
@@ -599,7 +599,7 @@ class TestSkillPipelineIntegration:
         db.commit()
         
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=True
@@ -614,7 +614,7 @@ class TestSkillPipelineIntegration:
     def test_skill_pipeline_record_selection_audit(self, db, clean_db):
         """Test _record_selection creates audit event."""
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=True,
             learning=False
@@ -648,7 +648,7 @@ class TestSkillPipelineIntegration:
         
         # Create pipeline
         pipeline = SkillPipeline(
-            db=db,
+            db_factory=lambda: db,
             llm_client=None,
             audit=False,
             learning=True,
@@ -681,7 +681,7 @@ class TestSkillPipelineIntegration:
 
     def test_skill_pipeline_learn_disabled(self, db, clean_db):
         """Test learn() when learning is disabled."""
-        pipeline = SkillPipeline(db=db, llm_client=None, audit=False, learning=False)
+        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False)
         
         result = pipeline.learn(days=7)
         
@@ -690,7 +690,7 @@ class TestSkillPipelineIntegration:
 
     def test_skill_pipeline_stats_disabled(self, db, clean_db):
         """Test stats() when learning is disabled."""
-        pipeline = SkillPipeline(db=db, llm_client=None, audit=False, learning=False)
+        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False)
         
         result = pipeline.stats()
         
@@ -698,7 +698,7 @@ class TestSkillPipelineIntegration:
 
     def test_skill_pipeline_learn_with_error(self, db, clean_db):
         """Test learn() error handling."""
-        pipeline = SkillPipeline(db=db, llm_client=None, audit=False, learning=True)
+        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=True)
         
         # Mock improver to raise exception
         original_improver = pipeline._improver
@@ -735,7 +735,7 @@ class TestSkillPipelineIntegration:
         db.add(learning)
         db.commit()
         
-        pipeline = SkillPipeline(db=db, llm_client=None, audit=False, learning=True)
+        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=True)
         
         # Mock modern selector to return both skills
         class MockModern:
@@ -762,7 +762,7 @@ class TestAuditDBVerification:
 
     def test_retrieval_method_recorded_in_audit_db(self, db, clean_db):
         """Verify retrieval_method is correctly recorded in skill_selection_events."""
-        pipeline = SkillPipeline(db=db, llm_client=None, audit=True, learning=False)
+        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=True, learning=False)
         
         # Mock modern selector to return semantic retrieval
         class MockModernSemantic:
@@ -787,7 +787,7 @@ class TestAuditDBVerification:
 
     def test_keyword_fallback_recorded_in_audit_db(self, db, clean_db):
         """Verify keyword fallback is recorded in audit DB."""
-        pipeline = SkillPipeline(db=db, llm_client=None, audit=True, learning=False)
+        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=True, learning=False)
         
         # Mock modern selector to return keyword retrieval
         class MockModernKeyword:
@@ -812,7 +812,7 @@ class TestAuditDBVerification:
 
     def test_retrieval_method_in_tools_result(self, db, clean_db):
         """Verify retrieval_method is returned in ToolsResult."""
-        pipeline = SkillPipeline(db=db, llm_client=None, audit=False, learning=False)
+        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False)
         
         class MockModern:
             def get_tools_schema(self, query, max_candidates=None, **kwargs):

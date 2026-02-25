@@ -66,7 +66,7 @@ class TestSQLInjectionPrevention:
         from sqlalchemy.orm import Session
         
         mock_db = Mock(spec=Session)
-        sandbox = Sandbox(db=mock_db)
+        sandbox = Sandbox(lambda: mock_db)
         
         # SQL injection attempts should be rejected
         with pytest.raises(ValueError):
@@ -84,7 +84,7 @@ class TestSQLInjectionPrevention:
         from sqlalchemy.orm import Session
         
         mock_db = Mock(spec=Session)
-        sandbox = Sandbox(db=mock_db)
+        sandbox = Sandbox(lambda: mock_db)
         
         with pytest.raises(ValueError):
             sandbox.delete("'; DROP TABLE users--")
@@ -95,7 +95,7 @@ class TestSQLInjectionPrevention:
         from sqlalchemy.orm import Session
         
         mock_db = Mock(spec=Session)
-        sandbox = Sandbox(db=mock_db)
+        sandbox = Sandbox(lambda: mock_db)
         
         with pytest.raises(ValueError):
             sandbox.use("'; DROP TABLE users--")
@@ -106,7 +106,7 @@ class TestSQLInjectionPrevention:
         from sqlalchemy.orm import Session
         
         mock_db = Mock(spec=Session)
-        sandbox = Sandbox(db=mock_db)
+        sandbox = Sandbox(lambda: mock_db)
         
         with pytest.raises(ValueError):
             sandbox.add_table("'; DROP TABLE users--", "t1")

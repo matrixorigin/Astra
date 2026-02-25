@@ -23,6 +23,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -49,7 +50,7 @@ class DiagnosisResult:
     error: str | None = None
 
 
-class InputFaceLearner:
+class InputFaceLearner(DbConsumer):
     """Unified learning loop across prompt, context, and knowledge input faces.
 
     Usage::
@@ -63,8 +64,8 @@ class InputFaceLearner:
     _STALE_CONFIDENCE = 0.3
     _budget_lock = threading.Lock()  # protects read-modify-write on _BUDGET_RATIOS
 
-    def __init__(self, db: Session, llm_client: Any):
-        self._db = db
+    def __init__(self, db_factory: DbFactory, llm_client: Any):
+        super().__init__(db_factory)
         self._llm = llm_client
 
     # ------------------------------------------------------------------
@@ -126,55 +127,56 @@ class InputFaceLearner:
         self, *, days: int, dry_run: bool,
     ) -> DiagnosisResult | None:
         """Find low-rated prompt templates and trigger PromptOptimizer."""
-        row = self._db.execute(
-            text("""
-                SELECT f.prompt_template_id, COUNT(*) as cnt,
-                       AVG(f.rating) as avg_rating
-                FROM llm_feedback f
-                WHERE f.rating <= 2
-                  AND f.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
-                  AND f.prompt_template_id IS NOT NULL
-                GROUP BY f.prompt_template_id
-                HAVING cnt >= 3
-                ORDER BY avg_rating ASC
-                LIMIT 1
-            """),
-            {"days": days},
-        ).first()
+        with self._db() as db:
+            row = db.execute(
+                text("""
+                    SELECT f.prompt_template_id, COUNT(*) as cnt,
+                           AVG(f.rating) as avg_rating
+                    FROM llm_feedback f
+                    WHERE f.rating <= 2
+                      AND f.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
+                      AND f.prompt_template_id IS NOT NULL
+                    GROUP BY f.prompt_template_id
+                    HAVING cnt >= 3
+                    ORDER BY avg_rating ASC
+                    LIMIT 1
+                """),
+                {"days": days},
+            ).first()
 
-        if not row:
-            return None
+            if not row:
+                return None
 
-        template_id, case_count, avg_rating = row[0], row[1], row[2]
-        result = DiagnosisResult(
-            input_face=InputFace.PROMPT,
-            bottleneck=f"Template '{template_id}' has {case_count} low-rated cases (avg={avg_rating:.1f})",
-            evidence={"template_id": template_id, "cases": case_count, "avg_rating": float(avg_rating)},
-        )
+            template_id, case_count, avg_rating = row[0], row[1], row[2]
+            result = DiagnosisResult(
+                input_face=InputFace.PROMPT,
+                bottleneck=f"Template '{template_id}' has {case_count} low-rated cases (avg={avg_rating:.1f})",
+                evidence={"template_id": template_id, "cases": case_count, "avg_rating": float(avg_rating)},
+            )
 
-        from core.context.prompt_optimizer import PromptOptimizer
+            from core.context.prompt_optimizer import PromptOptimizer
 
-        optimizer = PromptOptimizer(self._db, self._llm)
-        try:
-            opt_result = optimizer.optimize(template_id, dry_run=dry_run)
-        except Exception as e:
-            logger.error("PromptOptimizer failed for %s: %s", template_id, e)
-            result.error = str(e)
+            optimizer = PromptOptimizer(self._db_factory, self._llm)
+            try:
+                opt_result = optimizer.optimize(template_id, dry_run=dry_run)
+            except Exception as e:
+                logger.error("PromptOptimizer failed for %s: %s", template_id, e)
+                result.error = str(e)
+                return result
+
+            result.proposal = {
+                "old_version": opt_result.old_version,
+                "new_version": opt_result.new_version,
+                "diagnosis": opt_result.diagnosis,
+            }
+            result.applied = opt_result.activated
+            result.gate_verdict = opt_result.gate_verdict
+            result.error = opt_result.error
+
+            if result.applied:
+                self._record_learning_event(InputFace.PROMPT, result)
+
             return result
-
-        result.proposal = {
-            "old_version": opt_result.old_version,
-            "new_version": opt_result.new_version,
-            "diagnosis": opt_result.diagnosis,
-        }
-        result.applied = opt_result.activated
-        result.gate_verdict = opt_result.gate_verdict
-        result.error = opt_result.error
-
-        if result.applied:
-            self._record_learning_event(InputFace.PROMPT, result)
-
-        return result
 
     # ── Context Budget ────────────────────────────────────────────
 
@@ -182,61 +184,62 @@ class InputFaceLearner:
         self, *, days: int, dry_run: bool,
     ) -> DiagnosisResult | None:
         """Detect task types where context was insufficient (truncation or low quality)."""
-        rows = self._db.execute(
-            text("""
-                SELECT cs.task_type,
-                       COUNT(*) as total,
-                       SUM(CASE WHEN cs.truncated_sections IS NOT NULL
-                                 AND cs.truncated_sections != '[]' THEN 1 ELSE 0 END) as truncated,
-                       AVG(COALESCE(f.rating, 3)) as avg_rating
-                FROM context_snapshots cs
-                LEFT JOIN llm_feedback f ON cs.llm_request_id = f.llm_request_id
-                WHERE cs.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
-                GROUP BY cs.task_type
-                HAVING truncated > total * 0.3 OR avg_rating < 2.5
-                ORDER BY avg_rating ASC
-                LIMIT 1
-            """),
-            {"days": days},
-        ).first()
+        with self._db() as db:
+            rows = db.execute(
+                text("""
+                    SELECT cs.task_type,
+                           COUNT(*) as total,
+                           SUM(CASE WHEN cs.truncated_sections IS NOT NULL
+                                     AND cs.truncated_sections != '[]' THEN 1 ELSE 0 END) as truncated,
+                           AVG(COALESCE(f.rating, 3)) as avg_rating
+                    FROM context_snapshots cs
+                    LEFT JOIN llm_feedback f ON cs.llm_request_id = f.llm_request_id
+                    WHERE cs.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
+                    GROUP BY cs.task_type
+                    HAVING truncated > total * 0.3 OR avg_rating < 2.5
+                    ORDER BY avg_rating ASC
+                    LIMIT 1
+                """),
+                {"days": days},
+            ).first()
 
-        if not rows:
-            return None
+            if not rows:
+                return None
 
-        task_type, total, truncated, avg_rating = rows[0], rows[1], rows[2], rows[3]
-        truncation_rate = truncated / total if total else 0
+            task_type, total, truncated, avg_rating = rows[0], rows[1], rows[2], rows[3]
+            truncation_rate = truncated / total if total else 0
 
-        result = DiagnosisResult(
-            input_face=InputFace.CONTEXT_BUDGET,
-            bottleneck=(
-                f"Task type '{task_type}': {truncation_rate:.0%} truncation rate, "
-                f"avg rating {avg_rating:.1f}"
-            ),
-            evidence={
-                "task_type": task_type,
-                "total": total,
-                "truncated": truncated,
-                "truncation_rate": truncation_rate,
-                "avg_rating": float(avg_rating),
-            },
-        )
+            result = DiagnosisResult(
+                input_face=InputFace.CONTEXT_BUDGET,
+                bottleneck=(
+                    f"Task type '{task_type}': {truncation_rate:.0%} truncation rate, "
+                    f"avg rating {avg_rating:.1f}"
+                ),
+                evidence={
+                    "task_type": task_type,
+                    "total": total,
+                    "truncated": truncated,
+                    "truncation_rate": truncation_rate,
+                    "avg_rating": float(avg_rating),
+                },
+            )
 
-        # Propose + apply under lock to prevent concurrent read-modify-write
-        with self._budget_lock:
-            proposal = self._propose_budget_adjustment(task_type, truncation_rate)
-            result.proposal = proposal
+            # Propose + apply under lock to prevent concurrent read-modify-write
+            with self._budget_lock:
+                proposal = self._propose_budget_adjustment(task_type, truncation_rate)
+                result.proposal = proposal
 
-            if dry_run:
-                result.gate_verdict = "dry_run"
-                return result
+                if dry_run:
+                    result.gate_verdict = "dry_run"
+                    return result
 
-            # Apply: update runtime config
-            self._apply_budget_adjustment(task_type, proposal)
-        result.applied = True
-        result.gate_verdict = "auto"  # budget changes are low-risk, auto-deploy
-        self._record_learning_event(InputFace.CONTEXT_BUDGET, result)
+                # Apply: update runtime config
+                self._apply_budget_adjustment(task_type, proposal)
+            result.applied = True
+            result.gate_verdict = "auto"  # budget changes are low-risk, auto-deploy
+            self._record_learning_event(InputFace.CONTEXT_BUDGET, result)
 
-        return result
+            return result
 
     def _propose_budget_adjustment(
         self, task_type: str, truncation_rate: float,
@@ -287,39 +290,40 @@ class InputFaceLearner:
         self, *, days: int, dry_run: bool,
     ) -> DiagnosisResult | None:
         """Detect stale or contradictory knowledge causing quality issues."""
-        row = self._db.execute(
-            text("""
-                SELECT COUNT(*) as stale_count
-                FROM sk_knowledge_entries
-                WHERE status = 'active'
-                  AND confidence < :threshold
-                  AND last_validated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
-            """),
-            {"days": days, "threshold": self._STALE_CONFIDENCE},
-        ).first()
+        with self._db() as db:
+            row = db.execute(
+                text("""
+                    SELECT COUNT(*) as stale_count
+                    FROM sk_knowledge_entries
+                    WHERE status = 'active'
+                      AND confidence < :threshold
+                      AND last_validated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
+                """),
+                {"days": days, "threshold": self._STALE_CONFIDENCE},
+            ).first()
 
-        stale_count = row[0] if row else 0
-        if stale_count == 0:
-            return None
+            stale_count = row[0] if row else 0
+            if stale_count == 0:
+                return None
 
-        result = DiagnosisResult(
-            input_face=InputFace.KNOWLEDGE,
-            bottleneck=f"{stale_count} knowledge entries are stale (confidence < {self._STALE_CONFIDENCE}, not validated in {days}d)",
-            evidence={"stale_count": stale_count, "days": days},
-        )
+            result = DiagnosisResult(
+                input_face=InputFace.KNOWLEDGE,
+                bottleneck=f"{stale_count} knowledge entries are stale (confidence < {self._STALE_CONFIDENCE}, not validated in {days}d)",
+                evidence={"stale_count": stale_count, "days": days},
+            )
 
-        if dry_run:
-            result.proposal = {"action": "revalidate_or_quarantine", "count": stale_count}
-            result.gate_verdict = "dry_run"
+            if dry_run:
+                result.proposal = {"action": "revalidate_or_quarantine", "count": stale_count}
+                result.gate_verdict = "dry_run"
+                return result
+
+            # Apply: quarantine + audit in one transaction
+            quarantined = self._quarantine_and_record(days, result)
+            result.proposal = {"action": "quarantined", "count": quarantined}
+            result.applied = quarantined > 0
+            result.gate_verdict = "auto"
+
             return result
-
-        # Apply: quarantine + audit in one transaction
-        quarantined = self._quarantine_and_record(days, result)
-        result.proposal = {"action": "quarantined", "count": quarantined}
-        result.applied = quarantined > 0
-        result.gate_verdict = "auto"
-
-        return result
 
     def _quarantine_and_record(self, days: int, result: DiagnosisResult) -> int:
         """Quarantine stale entries and record audit event in one transaction.
@@ -327,28 +331,71 @@ class InputFaceLearner:
         Ensures quarantine and its audit trail are atomic — either both
         commit or neither does.
         """
-        try:
-            from core.utils.id_generator import generate_id
+        with self._db() as db:
+            try:
+                from core.utils.id_generator import generate_id
 
-            qr = self._db.execute(
-                text("""
-                    UPDATE sk_knowledge_entries
-                    SET status = 'quarantined', confidence = 0, updated_at = UTC_TIMESTAMP()
-                    WHERE status = 'active'
-                      AND confidence < :threshold
-                      AND last_validated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
-                """),
-                {"days": days, "threshold": self._STALE_CONFIDENCE},
-            )
-            count = qr.rowcount
+                qr = db.execute(
+                    text("""
+                        UPDATE sk_knowledge_entries
+                        SET status = 'quarantined', confidence = 0, updated_at = UTC_TIMESTAMP()
+                        WHERE status = 'active'
+                          AND confidence < :threshold
+                          AND last_validated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
+                    """),
+                    {"days": days, "threshold": self._STALE_CONFIDENCE},
+                )
+                count = qr.rowcount
 
-            if count > 0:
-                # Audit in same transaction
-                result.proposal = {"action": "quarantined", "count": count}
-                result.applied = True
-                result.gate_verdict = "auto"
+                if count > 0:
+                    # Audit in same transaction
+                    result.proposal = {"action": "quarantined", "count": count}
+                    result.applied = True
+                    result.gate_verdict = "auto"
+                    eid = generate_id()
+                    db.execute(
+                        text("""
+                            INSERT INTO conversation_events
+                            (event_id, session_id, user_id, agent_id, agent_version,
+                             event_type, content, causal_chain_id, created_at)
+                            VALUES (:eid, 'system', 'system', 'system', '1.0.0',
+                                    :etype, :content, :eid, UTC_TIMESTAMP())
+                        """),
+                        {
+                            "eid": eid,
+                            "etype": "input_face_learning",
+                            "content": json.dumps({
+                                "face": InputFace.KNOWLEDGE.value,
+                                "bottleneck": result.bottleneck,
+                                "proposal": result.proposal,
+                                "gate_verdict": result.gate_verdict,
+                                "applied": result.applied,
+                            }),
+                        },
+                    )
+
+                db.commit()
+                logger.info("Quarantined %d stale entries (with audit)", count)
+                return count
+            except Exception as e:
+                logger.error("Quarantine+audit failed: %s", e)
+                db.rollback()
+                return 0
+
+    # ------------------------------------------------------------------
+    # Audit
+    # ------------------------------------------------------------------
+
+    def _record_learning_event(
+        self, face: InputFace, result: DiagnosisResult,
+    ) -> None:
+        """Record learning action as a conversation event for audit trail."""
+        with self._db() as db:
+            try:
+                from core.utils.id_generator import generate_id
+
                 eid = generate_id()
-                self._db.execute(
+                db.execute(
                     text("""
                         INSERT INTO conversation_events
                         (event_id, session_id, user_id, agent_id, agent_version,
@@ -360,7 +407,7 @@ class InputFaceLearner:
                         "eid": eid,
                         "etype": "input_face_learning",
                         "content": json.dumps({
-                            "face": InputFace.KNOWLEDGE.value,
+                            "face": face.value,
                             "bottleneck": result.bottleneck,
                             "proposal": result.proposal,
                             "gate_verdict": result.gate_verdict,
@@ -368,48 +415,7 @@ class InputFaceLearner:
                         }),
                     },
                 )
-
-            self._db.commit()
-            logger.info("Quarantined %d stale entries (with audit)", count)
-            return count
-        except Exception as e:
-            logger.error("Quarantine+audit failed: %s", e)
-            self._db.rollback()
-            return 0
-
-    # ------------------------------------------------------------------
-    # Audit
-    # ------------------------------------------------------------------
-
-    def _record_learning_event(
-        self, face: InputFace, result: DiagnosisResult,
-    ) -> None:
-        """Record learning action as a conversation event for audit trail."""
-        try:
-            from core.utils.id_generator import generate_id
-
-            eid = generate_id()
-            self._db.execute(
-                text("""
-                    INSERT INTO conversation_events
-                    (event_id, session_id, user_id, agent_id, agent_version,
-                     event_type, content, causal_chain_id, created_at)
-                    VALUES (:eid, 'system', 'system', 'system', '1.0.0',
-                            :etype, :content, :eid, UTC_TIMESTAMP())
-                """),
-                {
-                    "eid": eid,
-                    "etype": "input_face_learning",
-                    "content": json.dumps({
-                        "face": face.value,
-                        "bottleneck": result.bottleneck,
-                        "proposal": result.proposal,
-                        "gate_verdict": result.gate_verdict,
-                        "applied": result.applied,
-                    }),
-                },
-            )
-            self._db.commit()
-        except Exception as e:
-            logger.warning("Failed to record learning event: %s", e)
-            self._db.rollback()
+                db.commit()
+            except Exception as e:
+                logger.warning("Failed to record learning event: %s", e)
+                db.rollback()

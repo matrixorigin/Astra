@@ -9,6 +9,8 @@ import asyncio
 import pytest
 from unittest.mock import patch
 
+from api.database import SessionLocal
+
 from core.events.models import ConversationEvent, EventType
 from uuid_utils import uuid7
 from datetime import datetime, timezone
@@ -35,7 +37,7 @@ class TestPipelineLifecycleInBuildChatLoop:
         from api.routers.chat import _build_chat_loop
 
         with patch("core.events.event_logger._PIPELINE_ENABLED", True):
-            loop = _build_chat_loop(lambda: db_session)
+            loop = _build_chat_loop(SessionLocal)
 
         pipeline = loop.event_logger._pipeline
         assert pipeline is not None, "Pipeline should be created when enabled"
@@ -49,7 +51,7 @@ class TestPipelineLifecycleInBuildChatLoop:
         from api.routers.chat import _build_chat_loop
 
         with patch("core.events.event_logger._PIPELINE_ENABLED", False):
-            loop = _build_chat_loop(lambda: db_session)
+            loop = _build_chat_loop(SessionLocal)
 
         assert loop.event_logger._pipeline is None
 
@@ -59,7 +61,7 @@ class TestPipelineLifecycleInBuildChatLoop:
         from api.routers.chat import _build_chat_loop
 
         with patch("core.events.event_logger._PIPELINE_ENABLED", True):
-            loop = _build_chat_loop(lambda: db_session)
+            loop = _build_chat_loop(SessionLocal)
 
         pipeline = loop.event_logger._pipeline
         assert pipeline is not None
@@ -89,7 +91,7 @@ class TestPipelineLifecycleInBuildChatLoop:
         from api.routers.chat import _build_chat_loop
 
         with patch("core.events.event_logger._PIPELINE_ENABLED", True):
-            loop = _build_chat_loop(lambda: db_session)
+            loop = _build_chat_loop(SessionLocal)
 
         pipeline = loop.event_logger._pipeline
         flush_task = pipeline._flush_task

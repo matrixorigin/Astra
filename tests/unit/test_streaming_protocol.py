@@ -153,7 +153,7 @@ class TestStreamReplay:
         mock_db.execute.return_value = mock_result
 
         # Replay
-        replay = StreamReplay(mock_db)
+        replay = StreamReplay(lambda: mock_db)
         events = []
         async for event in replay.replay_stream("session1", "chain1"):
             events.append(event)
@@ -194,7 +194,7 @@ class TestStreamReplay:
         mock_db.execute.return_value = mock_result
 
         # Replay up to timestamp
-        replay = StreamReplay(mock_db)
+        replay = StreamReplay(lambda: mock_db)
         events = []
         async for event in replay.replay_stream_at(
             "session1", datetime.now(timezone.utc), "chain1"
@@ -251,7 +251,7 @@ class TestStreamReplay:
         mock_db.execute.return_value = mock_result
 
         # Get state
-        replay = StreamReplay(mock_db)
+        replay = StreamReplay(lambda: mock_db)
         state = replay.get_stream_state_at(
             "session1", datetime.now(timezone.utc), "chain1"
         )

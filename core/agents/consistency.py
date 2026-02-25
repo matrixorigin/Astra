@@ -17,7 +17,7 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +50,14 @@ class ConsistencyCheck:
     score: float = 1.0  # 0-1, higher is more consistent
 
 
-class ConsistencyVerifier:
+class ConsistencyVerifier(DbConsumer):
     """Verify cross-model consistency.
 
     Distributed-safe: all state in DB.
     """
 
-    def __init__(self, db: Session, llm_client=None, embedding_service=None) -> None:
-        self.db = db
+    def __init__(self, db_factory: DbFactory, llm_client=None, embedding_service=None) -> None:
+        super().__init__(db_factory)
         self.llm_client = llm_client
         self.embedding_service = embedding_service
 
@@ -158,25 +158,26 @@ class ConsistencyVerifier:
             compatible: Whether they're compatible
             score: Compatibility score (0-1)
         """
-        from uuid_utils import uuid7
+        with self._db() as db:
+            from uuid_utils import uuid7
 
-        self.db.execute(
-            text(
-                "INSERT INTO model_compatibility "
-                "(compat_id, task_type, model_a, model_b, compatible, score, recorded_at) "
-                "VALUES (:id, :task_type, :model_a, :model_b, :compatible, :score, NOW())"
-            ),
-            {
-                "id": str(uuid7()),
-                "task_type": task_type,
-                "model_a": model_a,
-                "model_b": model_b,
-                "compatible": compatible,
-                "score": score,
-            },
-        )
-        self.db.commit()
-        logger.info(f"Compatibility recorded: {model_a} → {model_b} for {task_type}: {score}")
+            db.execute(
+                text(
+                    "INSERT INTO model_compatibility "
+                    "(compat_id, task_type, model_a, model_b, compatible, score, recorded_at) "
+                    "VALUES (:id, :task_type, :model_a, :model_b, :compatible, :score, NOW())"
+                ),
+                {
+                    "id": str(uuid7()),
+                    "task_type": task_type,
+                    "model_a": model_a,
+                    "model_b": model_b,
+                    "compatible": compatible,
+                    "score": score,
+                },
+            )
+            db.commit()
+            logger.info(f"Compatibility recorded: {model_a} → {model_b} for {task_type}: {score}")
 
     def get_compatibility_score(
         self,
@@ -194,18 +195,19 @@ class ConsistencyVerifier:
         Returns:
             Compatibility score (0-1), or 0.5 if unknown
         """
-        row = self.db.execute(
-            text(
-                "SELECT score FROM model_compatibility "
-                "WHERE task_type = :task_type AND model_a = :model_a AND model_b = :model_b "
-                "ORDER BY recorded_at DESC LIMIT 1"
-            ),
-            {"task_type": task_type, "model_a": model_a, "model_b": model_b},
-        ).fetchone()
+        with self._db() as db:
+            row = db.execute(
+                text(
+                    "SELECT score FROM model_compatibility "
+                    "WHERE task_type = :task_type AND model_a = :model_a AND model_b = :model_b "
+                    "ORDER BY recorded_at DESC LIMIT 1"
+                ),
+                {"task_type": task_type, "model_a": model_a, "model_b": model_b},
+            ).fetchone()
 
-        if row:
-            return float(row[0])
-        return 0.5  # Unknown, assume neutral
+            if row:
+                return float(row[0])
+            return 0.5  # Unknown, assume neutral
 
     def should_failover(
         self,

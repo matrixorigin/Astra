@@ -115,7 +115,8 @@ class TestHybridRetrievalGraphExpansion:
         from core.context.hybrid_retrieval import HybridRetriever
 
         hr = HybridRetriever.__new__(HybridRetriever)
-        hr.db = MagicMock()
+        _mock_db = MagicMock()
+        hr._db_factory = lambda: _mock_db
 
         # Simulate: main query returns 1 entry, graph expansion raises
         main_row = _make_row(
@@ -134,7 +135,7 @@ class TestHybridRetrievalGraphExpansion:
             # Graph expansion or access tracking
             raise RuntimeError("graph boom")
 
-        hr.db.execute = MagicMock(side_effect=side_effect)
+        _mock_db.execute = MagicMock(side_effect=side_effect)
 
         with patch("skills.knowledge.api.update_access_tracking"):
             entries = hr.retrieve_knowledge(

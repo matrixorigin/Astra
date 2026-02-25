@@ -85,7 +85,7 @@ class TestSessionContinuity:
             ])),
         ]
 
-        sc = SessionContinuity(db)
+        sc = SessionContinuity(lambda: db)
         prior = sc.load_prior_context("alice", current_session_id="s2")
 
         assert len(prior.session_summaries) == 1
@@ -103,13 +103,13 @@ class TestSessionContinuity:
             Mock(fetchall=Mock(return_value=[])),
         ]
 
-        sc = SessionContinuity(db)
+        sc = SessionContinuity(lambda: db)
         prior = sc.load_prior_context("alice")
         assert prior.to_prompt_section() is None
 
     def test_summarize_session_inserts_event(self):
         db = _mock_db()
-        sc = SessionContinuity(db)
+        sc = SessionContinuity(lambda: db)
         sc.summarize_session("sess-1", "User worked on auth module")
         db.execute.assert_called_once()
         db.commit.assert_called_once()
@@ -122,7 +122,7 @@ class TestSessionContinuity:
             Mock(fetchall=Mock(return_value=[])),
         ]
 
-        sc = SessionContinuity(db)
+        sc = SessionContinuity(lambda: db)
         sc.load_prior_context("alice", current_session_id="current-sess")
 
         # First call is session summaries — check the SQL contains exclude
@@ -142,7 +142,7 @@ class TestSessionContinuity:
             Mock(fetchall=Mock(return_value=[])),
         ]
 
-        sc = SessionContinuity(db)
+        sc = SessionContinuity(lambda: db)
         prior = sc.load_prior_context("alice")
         assert len(prior.knowledge_entries) == 1
         assert prior.knowledge_entries[0]["confidence"] == 0.5
@@ -155,7 +155,7 @@ class TestSessionContinuity:
             Mock(fetchall=Mock(return_value=[])),
         ]
 
-        sc = SessionContinuity(db)
+        sc = SessionContinuity(lambda: db)
         sc.load_prior_context("alice", max_summaries=3, max_knowledge=10, max_notes=5)
 
         # Verify limit params passed to each query

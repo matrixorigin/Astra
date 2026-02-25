@@ -100,7 +100,7 @@ class TestAgentScheduler:
             None,  # Record allocation
         ]
 
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         alloc = scheduler.submit_task(
             task_id="t1",
             agent_id="agent-1",
@@ -119,7 +119,7 @@ class TestAgentScheduler:
             fetchone=Mock(return_value=(100.0, 95.0))  # Only $5 left
         )
 
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         alloc = scheduler.submit_task(
             task_id="t1",
             agent_id="agent-1",
@@ -137,7 +137,7 @@ class TestAgentScheduler:
             fetchone=Mock(return_value=(100.0, 10.0))  # Budget OK
         )
 
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         # Mock _check_resource_pools to return False
         scheduler._check_resource_pools = Mock(return_value=False)
 
@@ -154,7 +154,7 @@ class TestAgentScheduler:
 
     def test_get_model_recommendation_high_burn(self):
         db = _mock_db()
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         # High burn: spent 95 of 100, 12h remaining
         # burn_rate = 95/(24-12)=7.9, target = 5/12=0.42 → downgrade
         scheduler._get_budget_policy = Mock(return_value=BudgetPolicy(
@@ -172,7 +172,7 @@ class TestAgentScheduler:
 
     def test_get_model_recommendation_low_burn(self):
         db = _mock_db()
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         # Low burn: spent 10 of 100, 12h remaining
         # burn_rate = 10/(24-12)=0.83, target = 90/12=7.5 → no downgrade
         scheduler._get_budget_policy = Mock(return_value=BudgetPolicy(
@@ -190,17 +190,17 @@ class TestAgentScheduler:
 
     def test_should_shed_load_p0(self):
         db = _mock_db()
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         assert scheduler.should_shed_load(Priority.P0) is False
 
     def test_should_shed_load_p3(self):
         db = _mock_db()
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         assert scheduler.should_shed_load(Priority.P3) is True
 
     def test_should_shed_load_p1_p2(self):
         db = _mock_db()
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         assert scheduler.should_shed_load(Priority.P1) is False
         assert scheduler.should_shed_load(Priority.P2) is False
 
@@ -210,7 +210,7 @@ class TestAgentScheduler:
             fetchone=Mock(return_value=(100.0, 25.0))
         )
 
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         policy = scheduler._get_budget_policy("user-1")
 
         assert policy.daily_budget == 100.0
@@ -221,7 +221,7 @@ class TestAgentScheduler:
         db = _mock_db()
         db.execute.return_value = Mock(fetchone=Mock(return_value=None))
 
-        scheduler = AgentScheduler(db)
+        scheduler = AgentScheduler(lambda: db)
         policy = scheduler._get_budget_policy("user-1")
 
         assert policy.daily_budget == 100.0

@@ -93,7 +93,7 @@ class TestChunkLevelReplay:
         _insert_run_event(db_session, run_id, 4, "run_completed", {"status": "done"})
         db_session.commit()
 
-        replay = StreamReplay(db_session)
+        replay = StreamReplay(lambda: db_session)
         events = []
         async for ev in replay.replay_stream(session_id, run_id=run_id):
             events.append(ev)
@@ -116,7 +116,7 @@ class TestChunkLevelReplay:
         _insert_run_event(db_session, run_id, 5, "run_completed", {})
         db_session.commit()
 
-        replay = StreamReplay(db_session)
+        replay = StreamReplay(lambda: db_session)
         deltas = []
         async for ev in replay.replay_stream(session_id, run_id=run_id):
             if ev.event_type == StreamEventType.TEXT_MESSAGE_CONTENT:
@@ -135,7 +135,7 @@ class TestFulltextFallback:
         _insert_llm_response(db_session, session_id, run_id, chain_id, "Full response text")
         db_session.commit()
 
-        replay = StreamReplay(db_session)
+        replay = StreamReplay(lambda: db_session)
         events = []
         async for ev in replay.replay_stream(session_id, run_id=run_id):
             events.append(ev)
@@ -158,7 +158,7 @@ class TestFulltextFallback:
         _insert_llm_response(db_session, session_id, run_id, chain_id, "Complete response")
         db_session.commit()
 
-        replay = StreamReplay(db_session)
+        replay = StreamReplay(lambda: db_session)
         events = []
         async for ev in replay.replay_stream(session_id, run_id=run_id):
             events.append(ev)
@@ -188,7 +188,7 @@ class TestToolOnlyTurn:
         )
         db_session.commit()
 
-        replay = StreamReplay(db_session)
+        replay = StreamReplay(lambda: db_session)
         events = []
         async for ev in replay.replay_stream(session_id, run_id=run_id):
             events.append(ev)
@@ -205,7 +205,7 @@ class TestCrossWorkerReplay:
         _insert_run_event(db_session, run_id, 0, "text_message_content", {"delta": "chunk"})
         db_session.commit()
 
-        replay = StreamReplay(db_session)
+        replay = StreamReplay(lambda: db_session)
 
         # No terminal event → _is_run_complete returns False → chunks skipped
         assert not replay._is_run_complete(run_id)
@@ -229,7 +229,7 @@ class TestCrossWorkerReplay:
         _insert_run_event(db_session, run_id, 1, "run_failed", {"error": "timeout"})
         db_session.commit()
 
-        replay = StreamReplay(db_session)
+        replay = StreamReplay(lambda: db_session)
         assert replay._is_run_complete(run_id)
 
         events = []
@@ -263,7 +263,7 @@ class TestLegacyPathPreserved:
         )
         db_session.commit()
 
-        replay = StreamReplay(db_session)
+        replay = StreamReplay(lambda: db_session)
         events = []
         async for ev in replay.replay_stream(session_id):
             events.append(ev)

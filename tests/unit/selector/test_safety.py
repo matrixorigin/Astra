@@ -55,14 +55,14 @@ class TestSafety:
         """_ensure_tables should rollback on DDL failure, not leave session dirty."""
         from core.skills.self_improving_selector import SelfImprovingSelector
         
-        si = SelfImprovingSelector(clean_skill_learning_db, mock_llm_selector)
+        si = SelfImprovingSelector(lambda: clean_skill_learning_db, mock_llm_selector)
         si._ensure_tables()
 
         original_commit = clean_skill_learning_db.commit
         clean_skill_learning_db.commit = Mock(side_effect=RuntimeError("DDL failed"))
         try:
             with pytest.raises(RuntimeError, match="DDL failed"):
-                SelfImprovingSelector(clean_skill_learning_db, mock_llm_selector)._ensure_tables()
+                SelfImprovingSelector(lambda: clean_skill_learning_db, mock_llm_selector)._ensure_tables()
         finally:
             clean_skill_learning_db.commit = original_commit
 

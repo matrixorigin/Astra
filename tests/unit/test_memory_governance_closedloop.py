@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock, Mock, patch
 
 from api.models import KnowledgeEntry, Event
+from api.database import SessionLocal
 from skills.knowledge.api import KnowledgeExtractor, update_access_tracking
 from core.context.lifecycle import MemoryGovernanceEngine
 from uuid_utils import uuid7
@@ -146,7 +147,7 @@ def test_quarantine_logs_entry_ids(db_session):
     e2 = _make_entry(db_session, user_id=uid, key_name="k2", confidence=0.1, initial_confidence=0.1)
     _make_entry(db_session, user_id=uid, key_name="k3", confidence=0.8, initial_confidence=0.8)  # should NOT be quarantined
 
-    engine = MemoryGovernanceEngine(db_session)
+    engine = MemoryGovernanceEngine(SessionLocal)
 
     with patch("core.context.lifecycle.logger") as mock_logger:
         count = engine._quarantine_low_confidence(threshold=0.3)
@@ -175,7 +176,7 @@ def test_quarantine_returns_zero_when_none_below_threshold(db_session):
     # that a healthy-only DB returns 0. Run it before other tests create
     # low-confidence entries, or accept count >= 0 from shared DB.
     # We verify the specific entry is NOT quarantined.
-    engine = MemoryGovernanceEngine(db_session)
+    engine = MemoryGovernanceEngine(SessionLocal)
     engine._quarantine_low_confidence(threshold=0.3)
     entry = db_session.query(KnowledgeEntry).filter(
         KnowledgeEntry.user_id == uid,

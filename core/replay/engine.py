@@ -7,16 +7,17 @@ from core.exceptions import ReplayError, SkillNotFoundError
 from core.logging_config import get_logger
 from core.skills import SkillRegistry
 from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 from api.database import get_db_session
 
 logger = get_logger(__name__)
 
 
-class ReplayEngine:
+class ReplayEngine(DbConsumer):
     """Replay conversations with exact skill versions from the past"""
 
-    def __init__(self, db: Session, registry: SkillRegistry, logger_instance: EventLogger):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, registry: SkillRegistry, logger_instance: EventLogger):
+        super().__init__(db_factory)
         self.registry = registry
         self.logger_instance = logger_instance
 
@@ -35,57 +36,58 @@ class ReplayEngine:
         Raises:
             ReplayError: If replay fails
         """
-        logger.info(f"Starting replay for session: {session_id}")
+        with self._db() as db:
+            logger.info(f"Starting replay for session: {session_id}")
 
-        try:
-            # 1. Fetch events
-            from api.models import Event
-            query = self.db.query(Event).filter(Event.session_id == session_id)
+            try:
+                # 1. Fetch events
+                from api.models import Event
+                query = db.query(Event).filter(Event.session_id == session_id)
 
-            if replay_timestamp:
-                query = query.filter(Event.created_at <= replay_timestamp)
+                if replay_timestamp:
+                    query = query.filter(Event.created_at <= replay_timestamp)
 
-            events = query.order_by(Event.created_at).all()
+                events = query.order_by(Event.created_at).all()
 
-            if not events:
-                logger.warning(f"No events found for session {session_id}")
-                raise ReplayError(
-                    f"No events found for session {session_id}", session_id=session_id
+                if not events:
+                    logger.warning(f"No events found for session {session_id}")
+                    raise ReplayError(
+                        f"No events found for session {session_id}", session_id=session_id
+                    )
+
+                # 2. Replay each skill execution event
+                results = []
+                for event_obj in events:
+                    # Convert ORM to dict
+                    event = {
+                        "event_id": event_obj.event_id,
+                        "event_type": event_obj.event_type,
+                        "content": event_obj.content,
+                        "skill_name": event_obj.skill_name,
+                        "skill_version": event_obj.skill_version,
+                        "created_at": event_obj.created_at,
+                        "metadata": event_obj.event_metadata,
+                    }
+                    if event["event_type"] == "skill_exec" and event["skill_name"]:
+                        result = await self._replay_skill_execution(event)
+                        results.append(result)
+
+                logger.info(
+                    f"Replay completed for session {session_id}: {len(results)} events replayed"
                 )
 
-            # 2. Replay each skill execution event
-            results = []
-            for event_obj in events:
-                # Convert ORM to dict
-                event = {
-                    "event_id": event_obj.event_id,
-                    "event_type": event_obj.event_type,
-                    "content": event_obj.content,
-                    "skill_name": event_obj.skill_name,
-                    "skill_version": event_obj.skill_version,
-                    "created_at": event_obj.created_at,
-                    "metadata": event_obj.event_metadata,
+                return {
+                    "success": True,
+                    "session_id": session_id,
+                    "events_replayed": len(results),
+                    "results": results,
                 }
-                if event["event_type"] == "skill_exec" and event["skill_name"]:
-                    result = await self._replay_skill_execution(event)
-                    results.append(result)
 
-            logger.info(
-                f"Replay completed for session {session_id}: {len(results)} events replayed"
-            )
-
-            return {
-                "success": True,
-                "session_id": session_id,
-                "events_replayed": len(results),
-                "results": results,
-            }
-
-        except ReplayError:
-            raise
-        except Exception as e:
-            logger.error(f"Replay failed for session {session_id}: {e}", exc_info=True)
-            raise ReplayError(f"Replay failed: {e}", session_id=session_id) from e
+            except ReplayError:
+                raise
+            except Exception as e:
+                logger.error(f"Replay failed for session {session_id}: {e}", exc_info=True)
+                raise ReplayError(f"Replay failed: {e}", session_id=session_id) from e
 
     async def _replay_skill_execution(self, event: dict) -> dict:
         """Replay a single skill execution.
@@ -206,54 +208,55 @@ class ReplayEngine:
         Returns:
             dict with verification results
         """
-        from api.models import Event
-        events = self.db.query(Event).filter(
-            Event.session_id == session_id
-        ).order_by(Event.created_at).all()
+        with self._db() as db:
+            from api.models import Event
+            events = db.query(Event).filter(
+                Event.session_id == session_id
+            ).order_by(Event.created_at).all()
 
-        issues = []
-        skill_versions_checked = set()
+            issues = []
+            skill_versions_checked = set()
 
-        for event_obj in events:
-            # Convert ORM to dict
-            event = {
-                "event_id": event_obj.event_id,
-                "event_type": event_obj.event_type,
-                "skill_name": event_obj.skill_name,
-                "skill_version": event_obj.skill_version,
-                "metadata": event_obj.event_metadata,
-            }
-            # Check skill availability
-            if event["event_type"] == "skill_exec" and event["skill_name"]:
-                skill_key = f"{event['skill_name']}@{event['skill_version']}"
+            for event_obj in events:
+                # Convert ORM to dict
+                event = {
+                    "event_id": event_obj.event_id,
+                    "event_type": event_obj.event_type,
+                    "skill_name": event_obj.skill_name,
+                    "skill_version": event_obj.skill_version,
+                    "metadata": event_obj.event_metadata,
+                }
+                # Check skill availability
+                if event["event_type"] == "skill_exec" and event["skill_name"]:
+                    skill_key = f"{event['skill_name']}@{event['skill_version']}"
 
-                if skill_key not in skill_versions_checked:
-                    skill = self.registry.get(event["skill_name"], version=event["skill_version"])
-                    if not skill:
+                    if skill_key not in skill_versions_checked:
+                        skill = self.registry.get(event["skill_name"], version=event["skill_version"])
+                        if not skill:
+                            issues.append(
+                                {
+                                    "type": "missing_skill",
+                                    "event_id": event["event_id"],
+                                    "skill": skill_key,
+                                    "message": f"Skill {skill_key} not available",
+                                }
+                            )
+                        skill_versions_checked.add(skill_key)
+
+                    # Check input metadata
+                    metadata = event["metadata"] if event["metadata"] else {}
+                    if not metadata.get("input"):
                         issues.append(
                             {
-                                "type": "missing_skill",
+                                "type": "missing_input",
                                 "event_id": event["event_id"],
-                                "skill": skill_key,
-                                "message": f"Skill {skill_key} not available",
+                                "message": "Event metadata missing input data",
                             }
                         )
-                    skill_versions_checked.add(skill_key)
 
-                # Check input metadata
-                metadata = event["metadata"] if event["metadata"] else {}
-                if not metadata.get("input"):
-                    issues.append(
-                        {
-                            "type": "missing_input",
-                            "event_id": event["event_id"],
-                            "message": "Event metadata missing input data",
-                        }
-                    )
-
-        return {
-            "session_id": session_id,
-            "reproducible": len(issues) == 0,
-            "events_checked": len(events),
-            "issues": issues,
-        }
+            return {
+                "session_id": session_id,
+                "reproducible": len(issues) == 0,
+                "events_checked": len(events),
+                "issues": issues,
+            }

@@ -84,7 +84,7 @@ class AgentService:
         self.db_session = db_session
         self.agent_repo = AgentRepository(db_session)
         self.audit = AuditLogger(db_session)
-        self.permission = PermissionChecker(db_session)
+        self.permission = PermissionChecker(lambda: db_session)
 
     def create_agent(
         self,

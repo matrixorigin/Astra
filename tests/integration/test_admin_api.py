@@ -425,6 +425,9 @@ def test_first_user_becomes_admin(client, db_session):
     )
     assert response.status_code == 201
 
+    # Refresh test session to see committed data from API
+    db_session.commit()
+
     # Verify user has admin role
     result = db_session.execute(
         text("""

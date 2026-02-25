@@ -88,7 +88,7 @@ class CostEstimateResponse(BaseModel):
 def _get_branch(db: Session):
     from api.database import settings
     from core.sandbox.branch import Branch
-    return Branch(database=settings.matrixone_database, db=db)
+    return Branch(database=settings.matrixone_database, db_factory=lambda: db)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +171,7 @@ def estimate_cost(
     """Estimate cost before running a branch operation."""
     from core.sandbox.cost_predictor import BranchCostPredictor
 
-    est = BranchCostPredictor(db).estimate_branch(
+    est = BranchCostPredictor(lambda: db).estimate_branch(
         operation=request.operation, model=request.model,
         session_count=request.session_count,
         budget_remaining=request.budget_remaining,

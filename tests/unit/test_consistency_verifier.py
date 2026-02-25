@@ -57,7 +57,7 @@ class TestConsistencyCheck:
 class TestConsistencyVerifier:
     def test_check_structural_valid(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
 
         output = {"action": "deploy", "target": "prod"}
         schema = {
@@ -74,7 +74,7 @@ class TestConsistencyVerifier:
 
     def test_check_structural_missing_field(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
 
         output = {"action": "deploy"}  # Missing "target"
         schema = {
@@ -92,7 +92,7 @@ class TestConsistencyVerifier:
 
     def test_check_structural_wrong_type(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
 
         output = {"action": "deploy", "target": 123}  # target should be string
         schema = {
@@ -109,7 +109,7 @@ class TestConsistencyVerifier:
 
     def test_check_structural_not_dict(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
 
         output = "not a dict"
         schema = {"type": "object"}
@@ -119,7 +119,7 @@ class TestConsistencyVerifier:
 
     def test_check_semantic_no_llm(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db, llm_client=None)
+        verifier = ConsistencyVerifier(lambda: db, llm_client=None)
 
         check = verifier.check_semantic("output text")
         assert check.passed is True
@@ -129,7 +129,7 @@ class TestConsistencyVerifier:
         llm = Mock()
         # LLM says "yes" these contradict
         llm.chat.return_value = Mock(content="yes")
-        verifier = ConsistencyVerifier(db, llm_client=llm)
+        verifier = ConsistencyVerifier(lambda: db, llm_client=llm)
 
         output = "The function should not be modified"
         prior = ["The function should be refactored"]
@@ -140,7 +140,7 @@ class TestConsistencyVerifier:
 
     def test_check_semantic_with_reference(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db, llm_client=Mock())
+        verifier = ConsistencyVerifier(lambda: db, llm_client=Mock())
 
         output = "Deploy to production environment"
         reference = "Deploy to production"
@@ -152,7 +152,7 @@ class TestConsistencyVerifier:
 
     def test_record_compatibility(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
 
         verifier.record_compatibility(
             task_type="code_review",
@@ -169,7 +169,7 @@ class TestConsistencyVerifier:
         db = _mock_db()
         db.execute.return_value = Mock(fetchone=Mock(return_value=(0.92,)))
 
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
         score = verifier.get_compatibility_score("code_review", "gpt-4", "gpt-3.5")
 
         assert score == 0.92
@@ -178,7 +178,7 @@ class TestConsistencyVerifier:
         db = _mock_db()
         db.execute.return_value = Mock(fetchone=Mock(return_value=None))
 
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
         score = verifier.get_compatibility_score("code_review", "gpt-4", "gpt-3.5")
 
         assert score == 0.5  # Default unknown
@@ -187,7 +187,7 @@ class TestConsistencyVerifier:
         db = _mock_db()
         db.execute.return_value = Mock(fetchone=Mock(return_value=(0.92,)))
 
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
         result = verifier.should_failover("code_review", "gpt-4", "gpt-3.5")
 
         assert result is True
@@ -196,7 +196,7 @@ class TestConsistencyVerifier:
         db = _mock_db()
         db.execute.return_value = Mock(fetchone=Mock(return_value=(0.65,)))
 
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
         result = verifier.should_failover("code_review", "gpt-4", "gpt-3.5")
 
         assert result is False
@@ -205,14 +205,14 @@ class TestConsistencyVerifier:
         db = _mock_db()
         db.execute.return_value = Mock(fetchone=Mock(return_value=None))
 
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
         result = verifier.should_failover("code_review", "gpt-4", "gpt-3.5")
 
         assert result is False  # 0.5 < 0.7
 
     def test_type_matches(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
 
         assert verifier._type_matches("hello", "string") is True
         assert verifier._type_matches(42, "integer") is True
@@ -228,28 +228,28 @@ class TestConsistencyVerifier:
         db = _mock_db()
         llm = Mock()
         llm.chat.return_value = Mock(content="yes")
-        verifier = ConsistencyVerifier(db, llm_client=llm)
+        verifier = ConsistencyVerifier(lambda: db, llm_client=llm)
 
         assert verifier._contradicts("should not modify", "should modify") is True
         llm.chat.assert_called()
 
     def test_contradicts_no_llm_uses_similarity(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)  # No LLM
+        verifier = ConsistencyVerifier(lambda: db)  # No LLM
 
         # Identical text → high similarity → no contradiction
         assert verifier._contradicts("same message", "same message") is False
 
     def test_contradicts_no_llm_low_similarity(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)  # No LLM
+        verifier = ConsistencyVerifier(lambda: db)  # No LLM
 
         # Completely different → low similarity → contradiction
         assert verifier._contradicts("alpha beta gamma", "x y z") is True
 
     def test_semantic_similarity(self):
         db = _mock_db()
-        verifier = ConsistencyVerifier(db)
+        verifier = ConsistencyVerifier(lambda: db)
 
         # Identical
         sim = verifier._semantic_similarity("hello world", "hello world")

@@ -27,7 +27,7 @@ def db():
 @pytest.fixture
 def buffer(db):
     """Create _FeedbackBuffer instance."""
-    return _FeedbackBuffer(db, batch_size=2, flush_interval=60)
+    return _FeedbackBuffer(lambda: db, batch_size=2, flush_interval=60)
 
 
 class TestFeedbackBuffer:

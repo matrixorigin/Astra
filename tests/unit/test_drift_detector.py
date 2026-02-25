@@ -70,7 +70,7 @@ class TestDriftDetectorQuery:
             [(  "gpt-4", 3.0, 4.0, 10)],  # model drift
             [],  # template drift
         ]
-        detector = DriftDetector(db=db)
+        detector = DriftDetector(lambda: db)
         signals = detector.detect()
         assert len(signals) == 1
         assert signals[0].model == "gpt-4"
@@ -82,7 +82,7 @@ class TestDriftDetectorQuery:
             [("gpt-4", 4.0, 4.1, 10)],  # tiny drop → NONE
             [],
         ]
-        detector = DriftDetector(db=db)
+        detector = DriftDetector(lambda: db)
         signals = detector.detect()
         assert signals == []
 
@@ -92,13 +92,13 @@ class TestDriftDetectorQuery:
             [("gpt-4", None, 4.0, 10)],  # recent_avg is None
             [],
         ]
-        detector = DriftDetector(db=db)
+        detector = DriftDetector(lambda: db)
         signals = detector.detect()
         assert signals == []
 
     def test_build_signal_correct_delta(self):
         db = Mock()
-        detector = DriftDetector(db=db)
+        detector = DriftDetector(lambda: db)
         sig = detector._build_signal(
             model="gpt-4", template_id=None,
             recent_avg=3.2, previous_avg=4.0, sample_count=10,
@@ -109,33 +109,33 @@ class TestDriftDetectorQuery:
 
 class TestDriftCorrector:
     def test_no_gate_confirms_significant_drift(self):
-        corrector = DriftCorrector(db=Mock(), regression_gate=None, router=None)
+        corrector = DriftCorrector(lambda: Mock(), regression_gate=None, router=None)
         sig = _signal(current_avg=3.0, previous_avg=4.0)  # SIGNIFICANT
         assert corrector._confirm(sig) is True
 
     def test_no_gate_does_not_confirm_mild_drift(self):
-        corrector = DriftCorrector(db=Mock(), regression_gate=None, router=None)
+        corrector = DriftCorrector(lambda: Mock(), regression_gate=None, router=None)
         sig = _signal(current_avg=3.8, previous_avg=4.0)  # MILD
         assert corrector._confirm(sig) is False
 
     def test_gate_fail_confirms_drift(self):
         gate = Mock()
         gate.validate_change.return_value = {"verdict": "fail"}
-        corrector = DriftCorrector(db=Mock(), regression_gate=gate, router=None)
+        corrector = DriftCorrector(lambda: Mock(), regression_gate=gate, router=None)
         sig = _signal()
         assert corrector._confirm(sig) is True
 
     def test_gate_pass_does_not_confirm(self):
         gate = Mock()
         gate.validate_change.return_value = {"verdict": "pass"}
-        corrector = DriftCorrector(db=Mock(), regression_gate=gate, router=None)
+        corrector = DriftCorrector(lambda: Mock(), regression_gate=gate, router=None)
         sig = _signal()
         assert corrector._confirm(sig) is False
 
     def test_gate_exception_falls_back_to_severity(self):
         gate = Mock()
         gate.validate_change.side_effect = RuntimeError("gate down")
-        corrector = DriftCorrector(db=Mock(), regression_gate=gate, router=None)
+        corrector = DriftCorrector(lambda: Mock(), regression_gate=gate, router=None)
         sig = _signal(current_avg=3.0, previous_avg=4.0)  # SIGNIFICANT
         assert corrector._confirm(sig) is True
 
@@ -144,7 +144,7 @@ class TestDriftCorrector:
         router.get.return_value = Mock(fallback_to="gpt-3.5", is_active=True)
         db = Mock()
         db.execute.return_value = Mock()
-        corrector = DriftCorrector(db=db, regression_gate=None, router=router)
+        corrector = DriftCorrector(lambda: db, regression_gate=None, router=router)
         sig = _signal(current_avg=3.0, previous_avg=4.0)  # SIGNIFICANT
         action = corrector._apply_fallback(sig)
         assert action == CorrectionAction.FALLBACK_MODEL
@@ -152,13 +152,13 @@ class TestDriftCorrector:
     def test_escalate_when_no_fallback(self):
         router = Mock()
         router.get.return_value = Mock(fallback_to=None)
-        corrector = DriftCorrector(db=Mock(), regression_gate=None, router=router)
+        corrector = DriftCorrector(lambda: Mock(), regression_gate=None, router=router)
         sig = _signal()
         action = corrector._apply_fallback(sig)
         assert action == CorrectionAction.ESCALATE_HUMAN
 
     def test_escalate_when_no_router(self):
-        corrector = DriftCorrector(db=Mock(), regression_gate=None, router=None)
+        corrector = DriftCorrector(lambda: Mock(), regression_gate=None, router=None)
         sig = _signal()
         action = corrector._apply_fallback(sig)
         assert action == CorrectionAction.ESCALATE_HUMAN
@@ -166,7 +166,7 @@ class TestDriftCorrector:
     def test_confirm_and_correct_returns_report(self):
         db = Mock()
         db.execute.return_value = Mock()
-        corrector = DriftCorrector(db=db, regression_gate=None, router=None)
+        corrector = DriftCorrector(lambda: db, regression_gate=None, router=None)
         signals = [_signal(current_avg=3.0, previous_avg=4.0)]  # SIGNIFICANT → confirmed
         report = corrector.confirm_and_correct(signals)
         assert len(report.signals) == 1
@@ -175,7 +175,7 @@ class TestDriftCorrector:
 
     def test_mild_signal_not_confirmed(self):
         db = Mock()
-        corrector = DriftCorrector(db=db, regression_gate=None, router=None)
+        corrector = DriftCorrector(lambda: db, regression_gate=None, router=None)
         signals = [_signal(current_avg=3.8, previous_avg=4.0)]  # MILD → not confirmed
         report = corrector.confirm_and_correct(signals)
         assert len(report.confirmed) == 0
@@ -187,7 +187,7 @@ class TestDriftCorrector:
         optimizer.optimize.return_value = Mock(activated=True, old_version="1.0", new_version="1.1")
         db = Mock()
         db.execute.return_value = Mock()
-        corrector = DriftCorrector(db=db, prompt_optimizer=optimizer)
+        corrector = DriftCorrector(lambda: db, prompt_optimizer=optimizer)
         sig = _signal(current_avg=3.0, previous_avg=4.0, template_id="system_general")
         correction = corrector._correct(sig)
         assert correction["action"] == CorrectionAction.OPTIMIZE_PROMPT.value
@@ -201,7 +201,7 @@ class TestDriftCorrector:
         router.get.return_value = Mock(fallback_to="gpt-3.5", is_active=True)
         db = Mock()
         db.execute.return_value = Mock()
-        corrector = DriftCorrector(db=db, prompt_optimizer=optimizer, router=router)
+        corrector = DriftCorrector(lambda: db, prompt_optimizer=optimizer, router=router)
         sig = _signal(current_avg=3.0, previous_avg=4.0, template_id="system_general")
         correction = corrector._correct(sig)
         assert correction["action"] == CorrectionAction.FALLBACK_MODEL.value
@@ -213,7 +213,7 @@ class TestDriftCorrector:
         router.get.return_value = Mock(fallback_to="gpt-3.5", is_active=True)
         db = Mock()
         db.execute.return_value = Mock()
-        corrector = DriftCorrector(db=db, prompt_optimizer=optimizer, router=router)
+        corrector = DriftCorrector(lambda: db, prompt_optimizer=optimizer, router=router)
         sig = _signal(current_avg=3.0, previous_avg=4.0, template_id=None)
         correction = corrector._correct(sig)
         optimizer.optimize.assert_not_called()

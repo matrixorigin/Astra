@@ -53,7 +53,7 @@ def quality_scorer():
 @pytest.fixture
 def golden_selector(db_session):
     """Create golden selector."""
-    return GoldenSessionSelector(db_session)
+    return GoldenSessionSelector(lambda: db_session)
 
 
 class TestQualityScorer:
@@ -212,9 +212,9 @@ class TestGoldenSessionSelector:
     
     def test_golden_selector_initialization(self, db_session):
         """Should initialize golden selector."""
-        selector = GoldenSessionSelector(db_session)
+        selector = GoldenSessionSelector(lambda: db_session)
         assert selector is not None
-        assert selector.db is not None
+        assert selector._db_factory is not None
     
     def test_tag_golden_session(
         self,

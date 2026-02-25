@@ -55,7 +55,7 @@ async def test_real_github_get_pr(github_client):
     from core.repos import AccessScope, OwnerType, RepoRegistry, RepoType
     from api.models import Repo
 
-    registry = RepoRegistry(github_client._session)
+    registry = RepoRegistry(lambda: github_client._session)
 
     # Check if repo exists
     existing = github_client._session.query(Repo).filter(
@@ -95,7 +95,7 @@ async def test_real_github_list_prs(github_client):
     from core.repos import AccessScope, OwnerType, RepoRegistry, RepoType
     from api.models import Repo
 
-    registry = RepoRegistry(github_client._session)
+    registry = RepoRegistry(lambda: github_client._session)
 
     existing = github_client._session.query(Repo).filter(
         Repo.repo_url == "https://github.com/octocat/Hello-World"

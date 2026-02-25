@@ -147,8 +147,8 @@ class ChatLoop:
         self._escalated_model: str | None | object = _UNSET  # SLO escalation cache
         try:
             from core.context.few_shot import FewShotRetriever
-            if hasattr(llm_client, 'db') and llm_client.db:
-                self._few_shot = FewShotRetriever(llm_client.db)
+            if hasattr(llm_client, '_db_factory'):
+                self._few_shot = FewShotRetriever(llm_client._db_factory)
         except Exception:
             pass
 

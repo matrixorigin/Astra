@@ -28,7 +28,7 @@ def modern_selector(db, mock_llm):
 @pytest.fixture
 def model_router(db):
     """Model router instance."""
-    return ModelRouter(db)
+    return ModelRouter(lambda: db)
 
 
 class TestModernSkillSelector:

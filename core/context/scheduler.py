@@ -131,7 +131,7 @@ class GovernanceTaskRunner:
         if task_name == "eval_daily":
             return GovernanceTaskRunner._run_eval_daily(db_factory)
         from core.context.lifecycle import MemoryGovernanceEngine
-        engine = MemoryGovernanceEngine(db)
+        engine = MemoryGovernanceEngine(db_factory)
         return getattr(engine, f"run_{task_name}_tasks")()
 
     @staticmethod
@@ -157,13 +157,9 @@ class GovernanceTaskRunner:
         # Phase 2: Confidence calibration
         try:
             from core.evaluation.confidence_calibrator import ConfidenceCalibrator
-            db = db_factory()
-            try:
-                cal = ConfidenceCalibrator(db)
-                cal_result = cal.measure(days=7)
-                results["calibration_error"] = round(cal_result.calibration_error * 100)
-            finally:
-                db.close()
+            cal = ConfidenceCalibrator(db_factory)
+            cal_result = cal.measure(days=7)
+            results["calibration_error"] = round(cal_result.calibration_error * 100)
         except Exception as e:
             logger.error("eval_daily calibration failed: %s", e)
 
@@ -171,27 +167,19 @@ class GovernanceTaskRunner:
         try:
             from core.learning.input_face_learner import InputFaceLearner
             from core.llm.client import LLMClient
-            db = db_factory()
-            try:
-                llm = LLMClient(db)
-                learner = InputFaceLearner(db, llm)
-                face_results = learner.diagnose_and_fix(days=7)
-                results["faces_fixed"] = sum(1 for r in face_results if r.applied)
-            finally:
-                db.close()
+            llm = LLMClient(db_factory)
+            learner = InputFaceLearner(db_factory, llm)
+            face_results = learner.diagnose_and_fix(days=7)
+            results["faces_fixed"] = sum(1 for r in face_results if r.applied)
         except Exception as e:
             logger.error("eval_daily learning failed: %s", e)
 
         # Phase 4: Skill selection learning
         try:
             from core.skills.self_improving_selector import SelfImprovingSelector
-            db = db_factory()
-            try:
-                selector = SelfImprovingSelector(session=db)
-                skill_result = selector.learn_from_failures(days=7)
-                results["skills_learned"] = skill_result.get("learned", 0)
-            finally:
-                db.close()
+            selector = SelfImprovingSelector(db_factory=db_factory)
+            skill_result = selector.learn_from_failures(days=7)
+            results["skills_learned"] = skill_result.get("learned", 0)
         except Exception as e:
             logger.error("eval_daily skill learning failed: %s", e)
 

@@ -190,7 +190,7 @@ class TestHybridRetrieverJoinPath:
         svc.store_embedding(ev.event_id, svc.embed_text(ev.content))
 
         # Query with same text — should find via JOIN
-        retriever = HybridRetriever(db_session)
+        retriever = HybridRetriever(lambda: db_session)
         query_vec = svc.embed_text("event sourcing")
         results = retriever.retrieve_events(
             query_text="event sourcing",
@@ -211,7 +211,7 @@ class TestHybridRetrieverJoinPath:
         logger.log_event(ev)
 
         # Do NOT create any embeddings — test fulltext-only path
-        retriever = HybridRetriever(db_session)
+        retriever = HybridRetriever(lambda: db_session)
         svc = EmbeddingService(lambda: db_session, provider="mock")
         query_vec = svc.embed_text("MatrixOne HTAP")
 
@@ -241,7 +241,7 @@ class TestHybridRetrieverJoinPath:
         svc = EmbeddingService(lambda: db_session, provider="mock")
         svc.store_embedding(ev_with.event_id, svc.embed_text(ev_with.content))
 
-        retriever = HybridRetriever(db_session)
+        retriever = HybridRetriever(lambda: db_session)
         query_vec = svc.embed_text("databases")
         results = retriever.retrieve_events(
             query_text="databases",
@@ -289,7 +289,7 @@ class TestEndToEndDecoupled:
 
         # 3. Retriever finds it via JOIN
         svc = EmbeddingService(lambda: db_session, provider="mock")
-        retriever = HybridRetriever(db_session)
+        retriever = HybridRetriever(lambda: db_session)
         results = retriever.retrieve_events(
             query_text="MVCC MatrixOne",
             query_embedding=svc.embed_text("MVCC MatrixOne"),

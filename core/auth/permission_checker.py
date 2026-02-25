@@ -1,15 +1,15 @@
 """Permission checker using App-Layer RBAC."""
 
-from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 from api.models import Role, User, UserRole
 
 
-class PermissionChecker:
+class PermissionChecker(DbConsumer):
     """Check user permissions using App-Layer RBAC."""
 
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self, db_factory: DbFactory):
+        super().__init__(db_factory)
 
     def has_role(self, user_id: str, role_name: str) -> bool:
         """Check if user has a specific role.
@@ -18,17 +18,18 @@ class PermissionChecker:
             user_id: User UUID or Username
             role_name: Role name (e.g., 'mo_agent_admin')
         """
-        query = (
-            self.db.query(UserRole)
-            .join(Role, UserRole.role_id == Role.role_id)
-            .join(User, UserRole.user_id == User.user_id)
-            .filter(Role.role_name == role_name)
-        )
+        with self._db() as db:
+            query = (
+                db.query(UserRole)
+                .join(Role, UserRole.role_id == Role.role_id)
+                .join(User, UserRole.user_id == User.user_id)
+                .filter(Role.role_name == role_name)
+            )
 
-        # Support both UUID (user_id) and Username
-        query = query.filter((User.user_id == user_id) | (User.username == user_id))
+            # Support both UUID (user_id) and Username
+            query = query.filter((User.user_id == user_id) | (User.username == user_id))
 
-        return query.count() > 0
+            return query.count() > 0
 
     def is_admin(self, user_id: str) -> bool:
         """Check if user is mo_agent_admin."""

@@ -21,7 +21,7 @@ class EventService:
         self.session_repo = SessionRepository(db_session)
         # self.db = next(get_db_session())  # For audit and permission
         self.audit = AuditLogger(db_session)
-        self.permission = PermissionChecker(db_session)
+        self.permission = PermissionChecker(lambda: db_session)
 
     def create_event(
         self,

@@ -46,7 +46,7 @@ def run_memory_pipeline(
     try:
         from core.memory.observer import Observer
         from sqlalchemy import text
-        observer = Observer(db, llm_client=llm_client)
+        observer = Observer(lambda: db, llm_client=llm_client)
 
         session_ids = [session_id] if session_id else [
             r[0] for r in db.execute(text(
@@ -81,7 +81,7 @@ def run_memory_pipeline(
     # Phase 2: Reflector — condense accumulated observations
     try:
         from core.memory.reflector import Reflector
-        reflector = Reflector(db, llm_client=llm_client)
+        reflector = Reflector(lambda: db, llm_client=llm_client)
         condensed = reflector.reflect(user_id=user_id)
         result.reflections_condensed = condensed.get("after", 0)
     except Exception as e:
@@ -92,7 +92,7 @@ def run_memory_pipeline(
     quarantined_entries: list[dict] = []
     try:
         from core.context.pollution import PollutionDetector
-        detector = PollutionDetector(db)
+        detector = PollutionDetector(lambda: db)
         candidates = detector.detect_pollution_candidates(user_id=user_id)
         result.contradictions_found = len(candidates)
         for c in candidates:
@@ -112,7 +112,7 @@ def run_memory_pipeline(
             source_db = os.environ.get("MATRIXONE_DATABASE")
             if not source_db:
                 raise RuntimeError("MATRIXONE_DATABASE env var not set; cannot run regression detection")
-            kr = KnowledgeRegression(db, source_db=source_db)
+            kr = KnowledgeRegression(lambda: db, source_db=source_db)
             for entry in quarantined_entries:
                 signal = kr.detect_knowledge_change_impact(
                     entry_id=entry["entry_id"],

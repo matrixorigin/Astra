@@ -25,7 +25,7 @@ class TestArtifactManager:
 
     def _make_manager(self):
         db = MagicMock()
-        return ArtifactManager(db), db
+        return ArtifactManager(lambda: db), db
 
     def test_save_without_activate(self):
         mgr, db = self._make_manager()

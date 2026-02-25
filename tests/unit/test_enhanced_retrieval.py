@@ -16,7 +16,7 @@ class TestEnhancedHybridRetrieval:
     @pytest.fixture
     def retriever(self, mock_db):
         """Create hybrid retriever."""
-        return HybridRetriever(mock_db)
+        return HybridRetriever(lambda: mock_db)
     
     def test_retrieve_events(self, retriever, mock_db):
         """Test episodic memory retrieval with hybrid search."""

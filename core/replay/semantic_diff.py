@@ -4,26 +4,19 @@ Provides high-level comparison of agent performance, not just data differences.
 """
 
 from core.events.event_reader import EventReader
-from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 
-class SemanticDiff:
+class SemanticDiff(DbConsumer):
     """Semantic difference analyzer for agent behaviors.
 
     Compares agent decisions, token usage, and execution paths
     rather than just raw data differences.
     """
 
-    def __init__(self, db: Session) -> None:
-        """Initialize semantic diff analyzer.
-
-        Args:
-            db: SQLAlchemy Session instance (required).
-        """
-        if not isinstance(db, Session):
-            raise TypeError("db must be a SQLAlchemy Session")
-        self.db = db
-        self.reader = EventReader(self.db)
+    def __init__(self, db_factory: DbFactory) -> None:
+        super().__init__(db_factory)
+        self.reader = EventReader(self._db_factory)
 
     def compare_sessions(self, session_id1: str, session_id2: str) -> dict:
         """Compare two sessions semantically.
@@ -72,37 +65,38 @@ class SemanticDiff:
         Returns:
             dict: Semantic comparison at two time points
         """
-        from sqlalchemy import text
+        with self._db() as db:
+            from sqlalchemy import text
         
-        # Query events at each checkpoint
-        query1 = text(f"""
-            SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint1}'}}
-            WHERE session_id = :session_id
-            ORDER BY created_at ASC
-        """)
-        events1_rows = self.db.execute(query1, {"session_id": session_id}).fetchall()
-        events1 = [self.reader._row_to_event(dict(row._mapping)) for row in events1_rows]
+            # Query events at each checkpoint
+            query1 = text(f"""
+                SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint1}'}}
+                WHERE session_id = :session_id
+                ORDER BY created_at ASC
+            """)
+            events1_rows = db.execute(query1, {"session_id": session_id}).fetchall()
+            events1 = [self.reader._row_to_event(dict(row._mapping)) for row in events1_rows]
 
-        query2 = text(f"""
-            SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint2}'}}
-            WHERE session_id = :session_id
-            ORDER BY created_at ASC
-        """)
-        events2_rows = self.db.execute(query2, {"session_id": session_id}).fetchall()
-        events2 = [self.reader._row_to_event(dict(row._mapping)) for row in events2_rows]
+            query2 = text(f"""
+                SELECT * FROM conversation_events {{SNAPSHOT = '{checkpoint2}'}}
+                WHERE session_id = :session_id
+                ORDER BY created_at ASC
+            """)
+            events2_rows = db.execute(query2, {"session_id": session_id}).fetchall()
+            events2 = [self.reader._row_to_event(dict(row._mapping)) for row in events2_rows]
 
-        # Compare
-        token_diff = self._compare_token_usage(events1, events2)
-        path_diff = self._compare_decision_paths(events1, events2)
+            # Compare
+            token_diff = self._compare_token_usage(events1, events2)
+            path_diff = self._compare_decision_paths(events1, events2)
 
-        return {
-            "checkpoint1": checkpoint1,
-            "checkpoint2": checkpoint2,
-            "session_id": session_id,
-            "token_usage": token_diff,
-            "decision_paths": path_diff,
-            "event_count_diff": len(events2) - len(events1),
-        }
+            return {
+                "checkpoint1": checkpoint1,
+                "checkpoint2": checkpoint2,
+                "session_id": session_id,
+                "token_usage": token_diff,
+                "decision_paths": path_diff,
+                "event_count_diff": len(events2) - len(events1),
+            }
 
     def _compare_token_usage(self, events1: list, events2: list) -> dict:
         """Compare token usage between two event lists."""

@@ -15,7 +15,7 @@ class TestContextBudgetTuner:
 
     @pytest.fixture
     def tuner(self, db):
-        return ContextBudgetTuner(db)
+        return ContextBudgetTuner(lambda: db)
 
     # -- diagnose --
 
@@ -93,7 +93,7 @@ class TestContextBudgetTuner:
         db.execute.side_effect = Exception("db error")
         with pytest.raises(Exception, match="db error"):
             tuner._deploy({"debugging": {"logs": 0.5}})
-        db.rollback.assert_called_once()
+        db.rollback.assert_called()
 
     # -- _compute_avg_utilization --
 

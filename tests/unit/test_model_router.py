@@ -35,28 +35,28 @@ class TestRouteDecision:
 class TestModelRouter:
     def test_classify_complexity_critical(self):
         db = _mock_db()
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
 
         assert router.classify_complexity("deploy", "Deploy to production") == TaskComplexity.CRITICAL
         assert router.classify_complexity("security", "Security review") == TaskComplexity.CRITICAL
 
     def test_classify_complexity_complex(self):
         db = _mock_db()
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
 
         assert router.classify_complexity("refactor", "Refactor auth module") == TaskComplexity.COMPLEX
         assert router.classify_complexity("design", "Design new API") == TaskComplexity.COMPLEX
 
     def test_classify_complexity_medium(self):
         db = _mock_db()
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
 
         assert router.classify_complexity("edit", "Fix typo") == TaskComplexity.MEDIUM
         assert router.classify_complexity("review", "Review PR") == TaskComplexity.MEDIUM
 
     def test_classify_complexity_simple(self):
         db = _mock_db()
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
 
         assert router.classify_complexity("status", "What's the CI status?") == TaskComplexity.SIMPLE
         assert router.classify_complexity("info", "Tell me about X") == TaskComplexity.SIMPLE
@@ -69,7 +69,7 @@ class TestModelRouter:
         mock_execute.fetchone.return_value = (0.03,)  # cost
         db.execute.return_value = mock_execute
 
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
         decision = router.route(
             task_type="deploy",
             query="Deploy to production",
@@ -88,7 +88,7 @@ class TestModelRouter:
         mock_execute.fetchone.return_value = (0.001,)
         db.execute.return_value = mock_execute
 
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
         decision = router.route(
             task_type="status",
             query="What's the status?",
@@ -102,7 +102,7 @@ class TestModelRouter:
 
     def test_record_quality(self):
         db = _mock_db()
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
 
         router.record_quality(
             task_type="code_review",
@@ -125,7 +125,7 @@ class TestModelRouter:
             )
         )
 
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
         efficiency = router._get_efficiency_ranking("code_review")
 
         assert efficiency["gpt-4"] == 150.0
@@ -135,7 +135,7 @@ class TestModelRouter:
         db = _mock_db()
         db.execute.return_value = Mock(fetchone=Mock(return_value=(0.025,)))
 
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
         cost = router._estimate_cost("gpt-4", "code_review")
 
         assert cost == 0.025
@@ -144,7 +144,7 @@ class TestModelRouter:
         db = _mock_db()
         db.execute.return_value = Mock(fetchone=Mock(return_value=None))
 
-        router = ModelRouter(db)
+        router = ModelRouter(lambda: db)
         cost = router._estimate_cost("gpt-4", "unknown_task")
 
         assert cost == 0.03  # Default for gpt-4

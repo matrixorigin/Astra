@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy.orm import Session
 
 from core.utils.id_generator import generate_short_id, generate_hash_id
 from core.code_executor.data_context import (
@@ -16,6 +15,7 @@ from core.code_executor.data_context import (
 from core.code_executor.security import SecurityGuard, SecurityVerdict
 from core.runtime import ExecutionResult, ResourceProfile, Runtime
 from core.sandbox.branch import Branch
+from core.db_consumer import DbConsumer, DbFactory
 
 
 @dataclass
@@ -46,7 +46,7 @@ class CodeExecutionResult:
     time_travel: TimeTravelInfo | None = None  # Only for WRITE mode
 
 
-class CodeExecutor:
+class CodeExecutor(DbConsumer):
     """Orchestrates security check → data context → runtime execution.
 
     DataContext is session-scoped only. Uses data branch for zero-copy table branching.
@@ -55,12 +55,12 @@ class CodeExecutor:
     def __init__(
         self,
         runtime: Runtime,
-        db: Session | None = None,
+        db_factory: DbFactory,
         branch: Branch | None = None,
         security: SecurityGuard | None = None,
     ):
         self.runtime = runtime
-        self.db = db
+        super().__init__(db_factory)
         self.branch = branch
         self.security = security or SecurityGuard()
         self._session_contexts: dict[str, DataContext] = {}
@@ -159,7 +159,7 @@ class CodeExecutor:
             return self._session_contexts[session_id]
 
         ctx = DataContext(
-            db=self.db,
+            db_factory=self._db_factory,
             branch=self.branch,
             sandbox_name=f"code_exec_{generate_hash_id(session_id, 8)}",
             source_db=source_db,

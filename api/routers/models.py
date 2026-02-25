@@ -80,7 +80,7 @@ class ModelResponse(BaseModel):
 
 def _require_admin(current_user: dict, db: Session):
     from core.auth.permission_checker import PermissionChecker
-    if not PermissionChecker(db).is_admin(current_user["user_id"]):
+    if not PermissionChecker(lambda: db).is_admin(current_user["user_id"]):
         raise HTTPException(status_code=403, detail="Admin role required")
 
 
@@ -229,7 +229,7 @@ def list_models(
 ):
     """List models. Regular users see only active models; admins see all."""
     from core.auth.permission_checker import PermissionChecker
-    is_admin = PermissionChecker(db).is_admin(current_user["user_id"])
+    is_admin = PermissionChecker(lambda: db).is_admin(current_user["user_id"])
 
     query = db.query(LLMModel)
     if not is_admin:

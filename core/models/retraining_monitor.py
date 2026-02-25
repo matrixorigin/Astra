@@ -11,9 +11,9 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
@@ -21,11 +21,11 @@ _GROWTH_THRESHOLD = 0.20  # 20% data growth triggers retrain
 _STALENESS_DAYS = 30
 
 
-class RetrainingMonitor:
+class RetrainingMonitor(DbConsumer):
     """Monitor feedback data and decide if retraining is needed."""
 
-    def __init__(self, db: Session) -> None:
-        self.db = db
+    def __init__(self, db_factory: DbFactory) -> None:
+        super().__init__(db_factory)
 
     def should_retrain(self) -> dict:
         """Check all triggers. Returns {needed: bool, reason: str, stats: dict}."""
@@ -60,19 +60,21 @@ class RetrainingMonitor:
         return {"needed": False, "reason": "up_to_date", "stats": stats}
 
     def _feedback_count(self) -> int:
-        row = self.db.execute(text("SELECT COUNT(*) FROM llm_feedback")).fetchone()
-        return row[0] if row else 0
+        with self._db() as db:
+            row = db.execute(text("SELECT COUNT(*) FROM llm_feedback")).fetchone()
+            return row[0] if row else 0
 
     def _last_artifact(self) -> dict | None:
-        row = self.db.execute(text("""
-            SELECT artifact_id, dataset_size, created_at
-            FROM model_artifacts
-            WHERE model_name = 'feedback_classifier'
-            ORDER BY created_at DESC LIMIT 1
-        """)).fetchone()
-        if not row:
-            return None
-        return {"artifact_id": row[0], "dataset_size": row[1], "created_at": row[2]}
+        with self._db() as db:
+            row = db.execute(text("""
+                SELECT artifact_id, dataset_size, created_at
+                FROM model_artifacts
+                WHERE model_name = 'feedback_classifier'
+                ORDER BY created_at DESC LIMIT 1
+            """)).fetchone()
+            if not row:
+                return None
+            return {"artifact_id": row[0], "dataset_size": row[1], "created_at": row[2]}
 
 
 def _to_utc(dt) -> datetime:

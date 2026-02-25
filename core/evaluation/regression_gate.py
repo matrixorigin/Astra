@@ -14,6 +14,7 @@ from uuid_utils import uuid7
 
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
+from core.db_consumer import DbConsumer, DbFactory
 from api.services.replay_service import ReplayService
 
 logger = get_logger(__name__)
@@ -30,7 +31,7 @@ class ChangeType(str, Enum):
     SLO_CRITICAL = "slo_critical"
 
 
-class RegressionGate:
+class RegressionGate(DbConsumer):
     """Unified regression gate for all versioned inputs.
     
     Validates changes don't degrade quality on golden sessions:
@@ -43,14 +44,9 @@ class RegressionGate:
     7. Record gate result with lineage
     """
     
-    def __init__(self, db: Session, account: str = "sys"):
-        if not isinstance(db, Session):
-            raise TypeError("db must be a SQLAlchemy Session")
-        
-        self.db = db
+    def __init__(self, db_factory: DbFactory, account: str = "sys"):
+        super().__init__(db_factory)
         self.account = account
-        self.sandbox = Sandbox(db=db, account=account)
-        self.replay_service = ReplayService(db)
     
     def validate_change(
         self,
@@ -93,7 +89,7 @@ class RegressionGate:
             
             # 2. Create snapshot + sandbox (clone tables needed for replay)
             snapshot_id = self._create_snapshot()
-            self.sandbox.create(
+            Sandbox(db_factory=self._db_factory, account=self.account).create(
                 sandbox_name,
                 description=f"Gate {gate_id}",
                 created_by="system",
@@ -111,7 +107,7 @@ class RegressionGate:
             # 4. Replay golden sessions
             replay_results = []
             for session in golden_sessions:
-                result = self.replay_service.replay_session(
+                result = ReplayService(self._db_factory()).replay_session(
                     session_id=session["session_id"],
                     user_id=session["user_id"],
                     sandbox_name=sandbox_name,
@@ -156,7 +152,7 @@ class RegressionGate:
         finally:
             # Cleanup sandbox
             try:
-                self.sandbox.delete(sandbox_name)
+                Sandbox(db_factory=self._db_factory, account=self.account).delete(sandbox_name)
             except Exception as e:
                 logger.warning(f"Failed to cleanup sandbox {sandbox_name}: {e}")
     
@@ -169,31 +165,32 @@ class RegressionGate:
         - Multi-turn (event_count >= 3)
         - Recent (last 30 days)
         """
-        result = self.db.execute(text("""
-            SELECT 
-                session_id,
-                user_id,
-                AVG(quality_score) as avg_score,
-                COUNT(*) as event_count
-            FROM conversation_events
-            WHERE quality_score >= 4.0
-              AND training_eligible = TRUE
-              AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
-            GROUP BY session_id, user_id
-            HAVING event_count >= 3
-            ORDER BY avg_score DESC
-            LIMIT :limit
-        """), {"limit": limit})
+        with self._db() as db:
+            result = db.execute(text("""
+                SELECT 
+                    session_id,
+                    user_id,
+                    AVG(quality_score) as avg_score,
+                    COUNT(*) as event_count
+                FROM conversation_events
+                WHERE quality_score >= 4.0
+                  AND training_eligible = TRUE
+                  AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
+                GROUP BY session_id, user_id
+                HAVING event_count >= 3
+                ORDER BY avg_score DESC
+                LIMIT :limit
+            """), {"limit": limit})
         
-        return [
-            {
-                "session_id": row[0],
-                "user_id": row[1],
-                "avg_score": float(row[2]),
-                "event_count": int(row[3]),
-            }
-            for row in result
-        ]
+            return [
+                {
+                    "session_id": row[0],
+                    "user_id": row[1],
+                    "avg_score": float(row[2]),
+                    "event_count": int(row[3]),
+                }
+                for row in result
+            ]
     
     def _create_snapshot(self) -> str:
         """Create snapshot of current production state."""
@@ -209,141 +206,142 @@ class RegressionGate:
         change_content: dict[str, Any],
     ):
         """Apply change to sandbox environment."""
-        try:
-            if change_type == ChangeType.PROMPT:
-                # Update prompt template in sandbox
-                self.db.execute(text(f"""
-                    UPDATE {sandbox_name}.prompt_templates 
-                    SET content = :content, updated_at = NOW()
-                    WHERE template_id = :template_id
-                """), {
-                    "content": change_content.get("content", ""),
-                    "template_id": change_content.get("template_id", change_id),
-                })
-            
-            elif change_type == ChangeType.SKILL:
-                skill_definition = change_content.get("definition")
-                if skill_definition is None:
-                    skill_definition = change_content.get("skill_definition", {})
-                self.db.execute(text(f"""
-                    INSERT INTO {sandbox_name}.skills_registry 
-                    (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
-                    VALUES (:skill_id, :skill_name, :version, :description, :definition, 1, NOW(), NOW())
-                    ON DUPLICATE KEY UPDATE
-                    skill_definition = :definition,
-                    version = :version,
-                    description = :description,
-                    is_active = 1,
-                    updated_at = NOW()
-                """), {
-                    "skill_id": change_id,
-                    "skill_name": change_content.get("skill_name") or change_content.get("name", change_id),
-                    "version": change_content.get("version", "1.0.0"),
-                    "description": change_content.get("description", ""),
-                    "definition": skill_definition,
-                })
-            
-            elif change_type == ChangeType.CONFIG:
-                # Update config in sandbox
-                self.db.execute(text(f"""
-                    UPDATE {sandbox_name}.configs 
-                    SET value = :value, updated_at = NOW()
-                    WHERE key_name = :key_name
-                """), {
-                    "key_name": change_content.get("key", change_id),
-                    "value": change_content.get("value", ""),
-                })
-            
-            elif change_type == ChangeType.SELECTOR:
-                # Update selector config in sandbox
-                self.db.execute(text(f"""
-                    UPDATE {sandbox_name}.configs 
-                    SET value = :value, updated_at = NOW()
-                    WHERE key_name = 'selector_config'
-                """), {
-                    "value": json.dumps(change_content, default=str),
-                })
-
-            elif change_type == ChangeType.CONTEXT_BUDGET:
-                # Update context budget ratios in sandbox
-                self.db.execute(text(f"""
-                    INSERT INTO {sandbox_name}.configs (key_name, value, updated_at)
-                    VALUES ('context_budget_ratios', :value, NOW())
-                    ON DUPLICATE KEY UPDATE value = :value, updated_at = NOW()
-                """), {
-                    "value": json.dumps(change_content, default=str),
-                })
-
-            elif change_type == ChangeType.KNOWLEDGE:
-                # Apply knowledge change (quarantine/restore) in sandbox
-                entry_id = change_content.get("entry_id")
-                if not entry_id:
-                    raise ValueError("KNOWLEDGE change requires entry_id")
-                action = change_content.get("action", "quarantine")
-                if action == "quarantine":
-                    self.db.execute(text(f"""
-                        UPDATE {sandbox_name}.sk_knowledge_entries
-                        SET confidence = 0.0
-                        WHERE entry_id = :entry_id
-                    """), {"entry_id": entry_id})
-                elif action == "restore":
-                    self.db.execute(text(f"""
-                        UPDATE {sandbox_name}.sk_knowledge_entries
-                        SET confidence = :confidence
-                        WHERE entry_id = :entry_id
+        with self._db() as db:
+            try:
+                if change_type == ChangeType.PROMPT:
+                    # Update prompt template in sandbox
+                    db.execute(text(f"""
+                        UPDATE {sandbox_name}.prompt_templates 
+                        SET content = :content, updated_at = NOW()
+                        WHERE template_id = :template_id
                     """), {
-                        "entry_id": entry_id,
-                        "confidence": change_content.get("confidence", 0.8),
+                        "content": change_content.get("content", ""),
+                        "template_id": change_content.get("template_id", change_id),
+                    })
+            
+                elif change_type == ChangeType.SKILL:
+                    skill_definition = change_content.get("definition")
+                    if skill_definition is None:
+                        skill_definition = change_content.get("skill_definition", {})
+                    db.execute(text(f"""
+                        INSERT INTO {sandbox_name}.skills_registry 
+                        (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
+                        VALUES (:skill_id, :skill_name, :version, :description, :definition, 1, NOW(), NOW())
+                        ON DUPLICATE KEY UPDATE
+                        skill_definition = :definition,
+                        version = :version,
+                        description = :description,
+                        is_active = 1,
+                        updated_at = NOW()
+                    """), {
+                        "skill_id": change_id,
+                        "skill_name": change_content.get("skill_name") or change_content.get("name", change_id),
+                        "version": change_content.get("version", "1.0.0"),
+                        "description": change_content.get("description", ""),
+                        "definition": skill_definition,
+                    })
+            
+                elif change_type == ChangeType.CONFIG:
+                    # Update config in sandbox
+                    db.execute(text(f"""
+                        UPDATE {sandbox_name}.configs 
+                        SET value = :value, updated_at = NOW()
+                        WHERE key_name = :key_name
+                    """), {
+                        "key_name": change_content.get("key", change_id),
+                        "value": change_content.get("value", ""),
+                    })
+            
+                elif change_type == ChangeType.SELECTOR:
+                    # Update selector config in sandbox
+                    db.execute(text(f"""
+                        UPDATE {sandbox_name}.configs 
+                        SET value = :value, updated_at = NOW()
+                        WHERE key_name = 'selector_config'
+                    """), {
+                        "value": json.dumps(change_content, default=str),
                     })
 
-            elif change_type == ChangeType.SLO_CRITICAL:
-                # SLO critical: apply suspected cause change if available
-                suspected = change_content.get("suspected_cause")
-                if suspected and suspected.get("change_type") == "skill_version_changed":
-                    # Normalize to ChangeType.SKILL payload format
-                    skill_name = suspected.get("skill_name") or suspected.get("name")
-                    version = suspected.get("version")
-                    if skill_name and version:
-                        self.db.execute(text(f"""
-                            INSERT INTO {sandbox_name}.skills_registry 
-                            (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
-                            SELECT skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at
-                            FROM skills_registry
-                            WHERE skill_name = :skill_name AND version = :version
-                            ON DUPLICATE KEY UPDATE
-                            skill_definition = VALUES(skill_definition),
-                            is_active = 1,
-                            updated_at = NOW()
-                        """), {"skill_name": skill_name, "version": version})
-                        logger.info(f"Applied suspected skill change {skill_name}@{version} to sandbox {sandbox_name}")
+                elif change_type == ChangeType.CONTEXT_BUDGET:
+                    # Update context budget ratios in sandbox
+                    db.execute(text(f"""
+                        INSERT INTO {sandbox_name}.configs (key_name, value, updated_at)
+                        VALUES ('context_budget_ratios', :value, NOW())
+                        ON DUPLICATE KEY UPDATE value = :value, updated_at = NOW()
+                    """), {
+                        "value": json.dumps(change_content, default=str),
+                    })
+
+                elif change_type == ChangeType.KNOWLEDGE:
+                    # Apply knowledge change (quarantine/restore) in sandbox
+                    entry_id = change_content.get("entry_id")
+                    if not entry_id:
+                        raise ValueError("KNOWLEDGE change requires entry_id")
+                    action = change_content.get("action", "quarantine")
+                    if action == "quarantine":
+                        db.execute(text(f"""
+                            UPDATE {sandbox_name}.sk_knowledge_entries
+                            SET confidence = 0.0
+                            WHERE entry_id = :entry_id
+                        """), {"entry_id": entry_id})
+                    elif action == "restore":
+                        db.execute(text(f"""
+                            UPDATE {sandbox_name}.sk_knowledge_entries
+                            SET confidence = :confidence
+                            WHERE entry_id = :entry_id
+                        """), {
+                            "entry_id": entry_id,
+                            "confidence": change_content.get("confidence", 0.8),
+                        })
+
+                elif change_type == ChangeType.SLO_CRITICAL:
+                    # SLO critical: apply suspected cause change if available
+                    suspected = change_content.get("suspected_cause")
+                    if suspected and suspected.get("change_type") == "skill_version_changed":
+                        # Normalize to ChangeType.SKILL payload format
+                        skill_name = suspected.get("skill_name") or suspected.get("name")
+                        version = suspected.get("version")
+                        if skill_name and version:
+                            db.execute(text(f"""
+                                INSERT INTO {sandbox_name}.skills_registry 
+                                (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
+                                SELECT skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at
+                                FROM skills_registry
+                                WHERE skill_name = :skill_name AND version = :version
+                                ON DUPLICATE KEY UPDATE
+                                skill_definition = VALUES(skill_definition),
+                                is_active = 1,
+                                updated_at = NOW()
+                            """), {"skill_name": skill_name, "version": version})
+                            logger.info(f"Applied suspected skill change {skill_name}@{version} to sandbox {sandbox_name}")
+                        else:
+                            logger.warning(f"SLO_CRITICAL suspected skill change missing name/version: {suspected}")
+                    elif suspected and suspected.get("change_type") == "prompt_template_changed":
+                        # Normalize to ChangeType.PROMPT payload format
+                        template_id = suspected.get("template_id")
+                        version = suspected.get("version")
+                        if template_id and version:
+                            db.execute(text(f"""
+                                INSERT INTO {sandbox_name}.prompt_templates (template_id, version, content, created_at)
+                                SELECT template_id, version, content, created_at
+                                FROM prompt_templates
+                                WHERE template_id = :template_id AND version = :version
+                                ON DUPLICATE KEY UPDATE content = VALUES(content)
+                            """), {"template_id": template_id, "version": version})
+                            logger.info(f"Applied suspected prompt change {template_id}@{version} to sandbox {sandbox_name}")
+                        else:
+                            logger.warning(f"SLO_CRITICAL suspected prompt change missing template_id/version: {suspected}")
                     else:
-                        logger.warning(f"SLO_CRITICAL suspected skill change missing name/version: {suspected}")
-                elif suspected and suspected.get("change_type") == "prompt_template_changed":
-                    # Normalize to ChangeType.PROMPT payload format
-                    template_id = suspected.get("template_id")
-                    version = suspected.get("version")
-                    if template_id and version:
-                        self.db.execute(text(f"""
-                            INSERT INTO {sandbox_name}.prompt_templates (template_id, version, content, created_at)
-                            SELECT template_id, version, content, created_at
-                            FROM prompt_templates
-                            WHERE template_id = :template_id AND version = :version
-                            ON DUPLICATE KEY UPDATE content = VALUES(content)
-                        """), {"template_id": template_id, "version": version})
-                        logger.info(f"Applied suspected prompt change {template_id}@{version} to sandbox {sandbox_name}")
-                    else:
-                        logger.warning(f"SLO_CRITICAL suspected prompt change missing template_id/version: {suspected}")
-                else:
-                    logger.warning(f"SLO_CRITICAL change {change_id} has no valid suspected_cause — replaying without change binding")
+                        logger.warning(f"SLO_CRITICAL change {change_id} has no valid suspected_cause — replaying without change binding")
 
             
-            self.db.commit()
-            logger.info(f"Applied {change_type} change {change_id} to sandbox {sandbox_name}")
+                db.commit()
+                logger.info(f"Applied {change_type} change {change_id} to sandbox {sandbox_name}")
             
-        except Exception as e:
-            logger.error(f"Failed to apply change to sandbox: {e}")
-            self.db.rollback()
-            raise
+            except Exception as e:
+                logger.error(f"Failed to apply change to sandbox: {e}")
+                db.rollback()
+                raise
     
     def _compute_metrics(
         self,
@@ -442,66 +440,68 @@ class RegressionGate:
     
     def _record_gate_result(self, gate_result: dict[str, Any]):
         """Record gate result to database with error handling."""
-        try:
-            # Convert ISO datetime string to datetime object
-            created_at_str = gate_result["created_at"]
-            created_at = datetime.fromisoformat(created_at_str.replace('+00:00', ''))
+        with self._db() as db:
+            try:
+                # Convert ISO datetime string to datetime object
+                created_at_str = gate_result["created_at"]
+                created_at = datetime.fromisoformat(created_at_str.replace('+00:00', ''))
             
-            self.db.execute(text("""
-                INSERT INTO gate_results (
+                db.execute(text("""
+                    INSERT INTO gate_results (
+                        gate_id, change_type, change_id,
+                        snapshot_used, sessions_tested,
+                        error_rate, score_delta, passed,
+                        metrics, created_at
+                    ) VALUES (
+                        :gate_id, :change_type, :change_id,
+                        :snapshot_id, :sessions_tested,
+                        :error_rate, :score_delta, :passed,
+                        :metrics, :created_at
+                    )
+                """), {
+                    "gate_id": gate_result["gate_id"],
+                    "change_type": gate_result["change_type"],
+                    "change_id": gate_result["change_id"],
+                    "snapshot_id": gate_result.get("snapshot_id"),
+                    "sessions_tested": gate_result["sessions_tested"],
+                    "error_rate": gate_result["metrics"].get("error_rate", 0.0),
+                    "score_delta": gate_result["metrics"].get("score_delta", 0.0),
+                    "passed": gate_result["verdict"] == "pass",
+                    "metrics": str(gate_result["metrics"]),
+                    "created_at": created_at,
+                })
+                db.commit()
+            except Exception as e:
+                logger.error(f"Failed to record gate result: {e}")
+                db.rollback()
+                raise
+    
+    def get_gate_history(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Get gate validation history."""
+        with self._db() as db:
+            result = db.execute(text("""
+                SELECT 
                     gate_id, change_type, change_id,
                     snapshot_used, sessions_tested,
                     error_rate, score_delta, passed,
                     metrics, created_at
-                ) VALUES (
-                    :gate_id, :change_type, :change_id,
-                    :snapshot_id, :sessions_tested,
-                    :error_rate, :score_delta, :passed,
-                    :metrics, :created_at
-                )
-            """), {
-                "gate_id": gate_result["gate_id"],
-                "change_type": gate_result["change_type"],
-                "change_id": gate_result["change_id"],
-                "snapshot_id": gate_result.get("snapshot_id"),
-                "sessions_tested": gate_result["sessions_tested"],
-                "error_rate": gate_result["metrics"].get("error_rate", 0.0),
-                "score_delta": gate_result["metrics"].get("score_delta", 0.0),
-                "passed": gate_result["verdict"] == "pass",
-                "metrics": str(gate_result["metrics"]),
-                "created_at": created_at,
-            })
-            self.db.commit()
-        except Exception as e:
-            logger.error(f"Failed to record gate result: {e}")
-            self.db.rollback()
-            raise
-    
-    def get_gate_history(self, limit: int = 10) -> list[dict[str, Any]]:
-        """Get gate validation history."""
-        result = self.db.execute(text("""
-            SELECT 
-                gate_id, change_type, change_id,
-                snapshot_used, sessions_tested,
-                error_rate, score_delta, passed,
-                metrics, created_at
-            FROM gate_results
-            ORDER BY created_at DESC
-            LIMIT :limit
-        """), {"limit": limit})
+                FROM gate_results
+                ORDER BY created_at DESC
+                LIMIT :limit
+            """), {"limit": limit})
         
-        return [
-            {
-                "gate_id": row[0],
-                "change_type": row[1],
-                "change_id": row[2],
-                "snapshot_used": row[3],
-                "sessions_tested": row[4],
-                "error_rate": float(row[5]),
-                "score_delta": float(row[6]),
-                "passed": bool(row[7]),
-                "metrics": row[8],
-                "created_at": row[9].isoformat() if row[9] else None,
-            }
-            for row in result
-        ]
+            return [
+                {
+                    "gate_id": row[0],
+                    "change_type": row[1],
+                    "change_id": row[2],
+                    "snapshot_used": row[3],
+                    "sessions_tested": row[4],
+                    "error_rate": float(row[5]),
+                    "score_delta": float(row[6]),
+                    "passed": bool(row[7]),
+                    "metrics": row[8],
+                    "created_at": row[9].isoformat() if row[9] else None,
+                }
+                for row in result
+            ]

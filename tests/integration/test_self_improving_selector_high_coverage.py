@@ -56,7 +56,7 @@ class TestSelfImprovingSelectorHighCoverage:
             db.add(event)
         db.commit()
         
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Learn from all failures
         result = selector.learn_from_failures(days=7)
@@ -68,7 +68,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_signal_extraction_comprehensive(self, db, clean_db):
         """Test signal extraction for all types comprehensively."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Create failure that can trigger all signals
         failure = {
@@ -92,7 +92,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_learning_lifecycle_complete(self, db, clean_db):
         """Test complete learning lifecycle."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Create and update learnings multiple times
         for round_num in range(3):
@@ -131,7 +131,7 @@ class TestSelfImprovingSelectorHighCoverage:
             db.add(learning)
         db.commit()
         
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         from core.skills.pipeline import SkillCandidate
         
@@ -146,7 +146,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_scoring_comprehensive(self, db, clean_db):
         """Test scoring with comprehensive event variations."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         test_cases = [
             # Perfect execution
@@ -174,7 +174,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_normalization_comprehensive(self, db, clean_db):
         """Test normalization across full range."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Test confidence normalization
         for val in [0, 5, 10, 25, 50, 75, 90, 95, 100, None]:
@@ -183,7 +183,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_signal_weights_comprehensive(self, db, clean_db):
         """Test signal weights for all types."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         weights_sum = 0
         for signal_type in SignalType:
@@ -196,7 +196,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_embedding_operations_comprehensive(self, db, clean_db):
         """Test all embedding operations comprehensively."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         test_vectors = [
             [1.0],
@@ -220,7 +220,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_high_confidence_detection_comprehensive(self, db, clean_db):
         """Test high confidence detection with normalized 0-1 values."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         test_cases = [
             (0.0, False),
@@ -257,7 +257,7 @@ class TestSelfImprovingSelectorHighCoverage:
             db.add(event)
         db.commit()
         
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Test different day ranges
         for days in [1, 3, 7, 14]:
@@ -266,7 +266,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_signal_extraction_boundary_comprehensive(self, db, clean_db):
         """Test signal extraction at all boundaries."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Test each signal type at boundaries
         test_cases = [
@@ -305,7 +305,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_learning_persistence_comprehensive(self, db, clean_db):
         """Test learning persistence comprehensively."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Create many learnings
         for i in range(10):
@@ -325,7 +325,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_apply_learnings_edge_cases(self, db, clean_db):
         """Test apply_learnings edge cases."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         from core.skills.pipeline import SkillCandidate
         
@@ -345,7 +345,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_runtime_config_comprehensive(self, db, clean_db):
         """Test runtime config loading comprehensively."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Load multiple times
         configs = []
@@ -380,7 +380,7 @@ class TestSelfImprovingSelectorHighCoverage:
             db.add(event)
         db.commit()
         
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Learn with different parameters
         result1 = selector.learn_from_failures(days=7)
@@ -411,18 +411,18 @@ class TestSelfImprovingSelectorHighCoverage:
     def test_initialization_comprehensive(self, db, clean_db):
         """Test initialization comprehensively."""
         # Valid initialization
-        selector = SelfImprovingSelector(session=db, llm_client=None)
-        assert selector.session is not None
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
+        assert selector._db_factory is not None
         
         # Invalid session
         with pytest.raises(TypeError):
-            SelfImprovingSelector(session="invalid", llm_client=None)
+            SelfImprovingSelector("invalid", llm_client=None)
         
         # With custom parameters
         weights = SignalWeights(accuracy=0.5, speed=0.2, cost=0.2, satisfaction=0.1)
         thresholds = SignalThresholds(slow_execution_ms=3000, high_cost_usd=0.05, low_satisfaction=2)
         selector2 = SelfImprovingSelector(
-            session=db,
+            lambda: db,
             llm_client=None,
             weights=weights,
             thresholds=thresholds
@@ -431,7 +431,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_extract_context_features(self, db, clean_db):
         """Test context features extraction."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Test with various queries
         queries = [
@@ -462,7 +462,7 @@ class TestSelfImprovingSelectorHighCoverage:
             db.add(event)
         db.commit()
         
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         failures = selector.get_recent_failures(days=7, limit=100)
         
         # Should be ordered by date descending
@@ -486,7 +486,7 @@ class TestSelfImprovingSelectorHighCoverage:
         db.add(learning)
         db.commit()
         
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="w"), SkillCandidate(name="c")]
@@ -497,7 +497,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_scoring_with_all_fields_present(self, db, clean_db):
         """Test scoring when all fields are present."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         complete_event = {
             "selection_correctness": 1,
@@ -512,7 +512,7 @@ class TestSelfImprovingSelectorHighCoverage:
 
     def test_normalize_confidence_edge_values(self, db, clean_db):
         """Test confidence normalization at edge values."""
-        selector = SelfImprovingSelector(session=db, llm_client=None)
+        selector = SelfImprovingSelector(lambda: db, llm_client=None)
         
         # Test exact boundaries
         assert normalize_confidence(0) == 0.0

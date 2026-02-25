@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -40,14 +40,14 @@ class RouteDecision:
     estimated_cost: float
 
 
-class ModelRouter:
+class ModelRouter(DbConsumer):
     """Route tasks to models based on quality and cost.
 
     Distributed-safe: all state in DB.
     """
 
-    def __init__(self, db: Session, llm_client=None) -> None:
-        self.db = db
+    def __init__(self, db_factory: DbFactory, llm_client=None) -> None:
+        super().__init__(db_factory)
         self.llm_client = llm_client
 
     def classify_complexity(self, task_type: str, query: str) -> TaskComplexity:
@@ -159,24 +159,25 @@ class ModelRouter:
             quality_score: Quality score (0-5)
             cost: Cost in dollars
         """
-        from uuid_utils import uuid7
+        with self._db() as db:
+            from uuid_utils import uuid7
 
-        self.db.execute(
-            text(
-                "INSERT INTO model_quality_metrics "
-                "(metric_id, task_type, model, quality_score, cost, recorded_at) "
-                "VALUES (:id, :task_type, :model, :quality, :cost, NOW())"
-            ),
-            {
-                "id": str(uuid7()),
-                "task_type": task_type,
-                "model": model,
-                "quality": quality_score,
-                "cost": cost,
-            },
-        )
-        self.db.commit()
-        logger.info(f"Quality recorded: {model} on {task_type}: {quality_score}/5 @ ${cost}")
+            db.execute(
+                text(
+                    "INSERT INTO model_quality_metrics "
+                    "(metric_id, task_type, model, quality_score, cost, recorded_at) "
+                    "VALUES (:id, :task_type, :model, :quality, :cost, NOW())"
+                ),
+                {
+                    "id": str(uuid7()),
+                    "task_type": task_type,
+                    "model": model,
+                    "quality": quality_score,
+                    "cost": cost,
+                },
+            )
+            db.commit()
+            logger.info(f"Quality recorded: {model} on {task_type}: {quality_score}/5 @ ${cost}")
 
     def _get_efficiency_ranking(self, task_type: str) -> dict[str, float]:
         """Get efficiency ranking (quality/cost) for models on a task type.
@@ -187,21 +188,22 @@ class ModelRouter:
         Returns:
             Dict of model → efficiency score
         """
-        rows = self.db.execute(
-            text(
-                "SELECT model, "
-                "  AVG(quality_score) as avg_quality, "
-                "  AVG(cost) as avg_cost, "
-                "  AVG(quality_score) / AVG(cost) as efficiency "
-                "FROM model_quality_metrics "
-                "WHERE task_type = :task_type "
-                "GROUP BY model "
-                "ORDER BY efficiency DESC"
-            ),
-            {"task_type": task_type},
-        ).fetchall()
+        with self._db() as db:
+            rows = db.execute(
+                text(
+                    "SELECT model, "
+                    "  AVG(quality_score) as avg_quality, "
+                    "  AVG(cost) as avg_cost, "
+                    "  AVG(quality_score) / AVG(cost) as efficiency "
+                    "FROM model_quality_metrics "
+                    "WHERE task_type = :task_type "
+                    "GROUP BY model "
+                    "ORDER BY efficiency DESC"
+                ),
+                {"task_type": task_type},
+            ).fetchall()
 
-        return {row[0]: float(row[3]) for row in rows}
+            return {row[0]: float(row[3]) for row in rows}
 
     def _select_by_efficiency(
         self,
@@ -237,15 +239,16 @@ class ModelRouter:
 
     def _get_quality_data(self) -> dict[str, float]:
         """Get average quality per model."""
-        rows = self.db.execute(
-            text(
-                "SELECT model, AVG(quality_score) as avg_quality "
-                "FROM model_quality_metrics "
-                "GROUP BY model"
-            )
-        ).fetchall()
+        with self._db() as db:
+            rows = db.execute(
+                text(
+                    "SELECT model, AVG(quality_score) as avg_quality "
+                    "FROM model_quality_metrics "
+                    "GROUP BY model"
+                )
+            ).fetchall()
 
-        return {row[0]: float(row[1]) for row in rows}
+            return {row[0]: float(row[1]) for row in rows}
 
     def _estimate_cost(self, model: str, task_type: str) -> float:
         """Estimate cost for a model on a task type.
@@ -257,25 +260,26 @@ class ModelRouter:
         Returns:
             Estimated cost in dollars
         """
-        row = self.db.execute(
-            text(
-                "SELECT AVG(cost) FROM model_quality_metrics "
-                "WHERE model = :model AND task_type = :task_type"
-            ),
-            {"model": model, "task_type": task_type},
-        ).fetchone()
+        with self._db() as db:
+            row = db.execute(
+                text(
+                    "SELECT AVG(cost) FROM model_quality_metrics "
+                    "WHERE model = :model AND task_type = :task_type"
+                ),
+                {"model": model, "task_type": task_type},
+            ).fetchone()
 
-        if row:
-            cost = row[0]
-            if cost is not None:
-                return float(cost)
+            if row:
+                cost = row[0]
+                if cost is not None:
+                    return float(cost)
 
-        # Default estimates
-        defaults = {
-            "gpt-4": 0.03,
-            "gpt-3.5": 0.001,
-            "claude-opus": 0.03,
-            "claude-sonnet": 0.003,
-            "claude-haiku": 0.0003,
-        }
-        return defaults.get(model, 0.01)
+            # Default estimates
+            defaults = {
+                "gpt-4": 0.03,
+                "gpt-3.5": 0.001,
+                "claude-opus": 0.03,
+                "claude-sonnet": 0.003,
+                "claude-haiku": 0.0003,
+            }
+            return defaults.get(model, 0.01)

@@ -19,7 +19,7 @@ def branch(db_session):
     result = db_session.execute(text("SELECT DATABASE()"))
     current_db = result.scalar()
     
-    mgr = Branch(database=current_db, db=db_session)
+    mgr = Branch(database=current_db, db_factory=lambda: db_session)
     
     yield mgr
     
@@ -145,7 +145,7 @@ def test_diff_with_snapshot(branch, db_session):
     import time
     suffix = str(int(time.time() * 1000) % 10000)  # 唯一后缀
 
-    git = GitForData(db=db_session)
+    git = GitForData(lambda: db_session)
     
     # Use unique snapshot names
     snap1 = f"snap_{str(uuid7()).replace('-', '_')}"
@@ -206,7 +206,7 @@ def test_diff_with_snapshot_and_count(branch, db_session):
     import time
     suffix = str(int(time.time() * 1000) % 10000)
 
-    git = GitForData(db=db_session)
+    git = GitForData(lambda: db_session)
     snap1 = f"snap_{str(uuid7()).replace('-', '_')}"
     snap2 = f"snap_{str(uuid7()).replace('-', '_')}"
 

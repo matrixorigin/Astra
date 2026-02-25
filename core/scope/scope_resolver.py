@@ -10,12 +10,13 @@ from sqlalchemy.orm import Session
 
 from api.models import Config, Token
 from core.auth.encryption import decrypt_token
+from core.db_consumer import DbConsumer, DbFactory
 
 
-class ScopeResolver:
+class ScopeResolver(DbConsumer):
     """Resolve configuration with extensible scope chain using ORM."""
 
-    def __init__(self, db: Session, scope_chain: list[tuple[str, str | None]]):
+    def __init__(self, db_factory: DbFactory, scope_chain: list[tuple[str, str | None]]):
         """Initialize resolver with priority chain.
 
         Args:
@@ -24,7 +25,7 @@ class ScopeResolver:
                 [('repo', 'matrixone'), ('project', 'backend'),
                  ('user', 'alice'), ('global', None)]
         """
-        self.db = db
+        super().__init__(db_factory)
         self.scope_chain = scope_chain
 
     def resolve_config(self, key_name: str) -> str | None:
@@ -32,22 +33,23 @@ class ScopeResolver:
 
         Returns first matching config from most specific to most general scope.
         """
-        for scope_type, scope_id in self.scope_chain:
-            query = self.db.query(Config).filter(
-                Config.key_name == key_name,
-                Config.scope_type == scope_type
-            )
+        with self._db() as db:
+            for scope_type, scope_id in self.scope_chain:
+                query = db.query(Config).filter(
+                    Config.key_name == key_name,
+                    Config.scope_type == scope_type
+                )
 
-            if scope_id is not None:
-                query = query.filter(Config.scope_user_id == scope_id)
-            else:
-                query = query.filter(Config.scope_user_id.is_(None))
+                if scope_id is not None:
+                    query = query.filter(Config.scope_user_id == scope_id)
+                else:
+                    query = query.filter(Config.scope_user_id.is_(None))
 
-            config = query.first()
-            if config:
-                return config.value
+                config = query.first()
+                if config:
+                    return config.value
 
-        return None
+            return None
 
     def resolve_token(self, token_type: str, provider: str) -> dict | None:
         """Resolve API token by scope chain.
@@ -55,39 +57,40 @@ class ScopeResolver:
         Returns first matching token from most specific to most general scope.
         Automatically decrypts encrypted_value if present.
         """
-        for scope_type, scope_id in self.scope_chain:
-            query = self.db.query(Token).filter(
-                Token.type == token_type,
-                Token.provider == provider,
-                Token.is_active == True
-            )
-
-            # Match scope based on scope_type
-            if scope_type == "user" and scope_id:
-                query = query.filter(Token.scope_user_id == scope_id)
-            elif scope_type == "repo" and scope_id:
-                query = query.filter(Token.scope_repo == scope_id)
-            elif scope_type == "global":
-                query = query.filter(
-                    Token.scope_user_id.is_(None),
-                    Token.scope_repo.is_(None)
+        with self._db() as db:
+            for scope_type, scope_id in self.scope_chain:
+                query = db.query(Token).filter(
+                    Token.type == token_type,
+                    Token.provider == provider,
+                    Token.is_active == True
                 )
 
-            token = query.first()
-            if token:
-                # Decrypt token value if encrypted
-                decrypted_value = None
-                if token.encrypted_value:
-                    decrypted_value = decrypt_token(token.encrypted_value)
+                # Match scope based on scope_type
+                if scope_type == "user" and scope_id:
+                    query = query.filter(Token.scope_user_id == scope_id)
+                elif scope_type == "repo" and scope_id:
+                    query = query.filter(Token.scope_repo == scope_id)
+                elif scope_type == "global":
+                    query = query.filter(
+                        Token.scope_user_id.is_(None),
+                        Token.scope_repo.is_(None)
+                    )
 
-                return {
-                    "token_id": token.token_id,
-                    "provider": token.provider,
-                    "encrypted_value": decrypted_value,  # Return decrypted value
-                    "secret_ref": token.secret_ref,
-                }
+                token = query.first()
+                if token:
+                    # Decrypt token value if encrypted
+                    decrypted_value = None
+                    if token.encrypted_value:
+                        decrypted_value = decrypt_token(token.encrypted_value)
 
-        return None
+                    return {
+                        "token_id": token.token_id,
+                        "provider": token.provider,
+                        "encrypted_value": decrypted_value,  # Return decrypted value
+                        "secret_ref": token.secret_ref,
+                    }
+
+            return None
 
     def list_tokens(self, token_type: str) -> list[dict]:
         """List all accessible tokens across scope chain.
@@ -95,36 +98,37 @@ class ScopeResolver:
         Returns tokens from all scopes in the chain.
         Automatically decrypts encrypted_value if present.
         """
-        tokens = {}
+        with self._db() as db:
+            tokens = {}
 
-        # Iterate in reverse order (general to specific)
-        for scope_type, scope_id in reversed(self.scope_chain):
-            query = self.db.query(Token).filter(
-                Token.token_type == token_type,
-                Token.scope_type == scope_type,
-                Token.is_active == True
-            )
+            # Iterate in reverse order (general to specific)
+            for scope_type, scope_id in reversed(self.scope_chain):
+                query = db.query(Token).filter(
+                    Token.token_type == token_type,
+                    Token.scope_type == scope_type,
+                    Token.is_active == True
+                )
 
-            if scope_id is not None:
-                query = query.filter(Token.scope_user_id == scope_id)
-            else:
-                query = query.filter(Token.scope_user_id.is_(None))
+                if scope_id is not None:
+                    query = query.filter(Token.scope_user_id == scope_id)
+                else:
+                    query = query.filter(Token.scope_user_id.is_(None))
 
-            for token in query.all():
-                # Decrypt token value if encrypted
-                decrypted_value = None
-                if token.encrypted_value:
-                    decrypted_value = decrypt_token(token.encrypted_value)
+                for token in query.all():
+                    # Decrypt token value if encrypted
+                    decrypted_value = None
+                    if token.encrypted_value:
+                        decrypted_value = decrypt_token(token.encrypted_value)
 
-                # More specific scope overrides general
-                tokens[token.provider] = {
-                    "token_id": token.token_id,
-                    "provider": token.provider,
-                    "encrypted_value": decrypted_value,  # Return decrypted value
-                    "secret_ref": token.secret_ref,
-                }
+                    # More specific scope overrides general
+                    tokens[token.provider] = {
+                        "token_id": token.token_id,
+                        "provider": token.provider,
+                        "encrypted_value": decrypted_value,  # Return decrypted value
+                        "secret_ref": token.secret_ref,
+                    }
 
-        return list(tokens.values())
+            return list(tokens.values())
 
 
 class ScopeChainBuilder:

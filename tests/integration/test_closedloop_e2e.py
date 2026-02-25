@@ -104,7 +104,7 @@ class TestGateTriggerProductionWiring:
             original_init(self_gt, db_factory, **kwargs)
 
         with patch.object(GateTrigger, "__init__", spy_init):
-            _build_chat_loop(lambda: db_session)
+            _build_chat_loop(SessionLocal)
 
         # Must be SessionLocal itself, not a lambda wrapping get_db_session
         assert captured_factory["db_factory"] is SessionLocal, \
@@ -493,7 +493,7 @@ class TestSLOWeeklyGovernance:
         from core.context.lifecycle import MemoryGovernanceEngine
         from core.evaluation.slo_monitor import AgentSLOReport, SLOStatus, SLOTarget, SLOSeverity
 
-        engine = MemoryGovernanceEngine(db_session)
+        engine = MemoryGovernanceEngine(lambda: db_session)
 
         # Mock SLOMonitor to return a report with 1 violation
         mock_report = AgentSLOReport(
@@ -525,7 +525,7 @@ class TestSLOWeeklyGovernance:
         """If SLOMonitor crashes, weekly tasks must still complete."""
         from core.context.lifecycle import MemoryGovernanceEngine
 
-        engine = MemoryGovernanceEngine(db_session)
+        engine = MemoryGovernanceEngine(lambda: db_session)
 
         with patch("core.evaluation.slo_monitor.SLOMonitor.__init__", side_effect=RuntimeError("SLO boom")):
             result = engine.run_weekly_tasks()
@@ -543,7 +543,7 @@ class TestSLOWeeklyGovernance:
         _seed_llm_events(db_session, "slo_test_agent", n=15, quality=4.5)
 
         try:
-            monitor = SLOMonitor(db_session)
+            monitor = SLOMonitor(lambda: db_session)
             report = monitor.check_agent("slo_test_agent", period_days=7)
 
             assert report.agent_id == "slo_test_agent"
@@ -888,9 +888,9 @@ class TestChatAPIGateTriggerE2E:
             captured["registry_has_gate"] = registry.gate_trigger is gt
             captured["prompts_has_gate"] = context_manager.prompts.gate_trigger is gt
 
-            selector = SkillPipeline(db, mock_llm, audit=True, learning=True)
+            selector = SkillPipeline(lambda: db, mock_llm, audit=True, learning=True)
             executor = AgentExecutor(lambda: db, registry)
-            firewall = HallucinationFirewall(db, context_manager)
+            firewall = HallucinationFirewall(lambda: db, context_manager)
 
             return ChatLoop(
                 selector=selector, executor=executor,

@@ -6,40 +6,18 @@ Manages causal chains and parent-child relationships between events.
 from sqlalchemy import text
 from core.events.event_reader import EventReader
 from core.events.models import ConversationEvent
-from sqlalchemy.orm import Session
-from api.database import get_db_session
+from core.db_consumer import DbConsumer, DbFactory
 
 
-class CausalChainManager:
+class CausalChainManager(DbConsumer):
     """Manager for causal chains.
 
     Provides methods to track and query event causality.
     """
 
-    def __init__(self, db: Session | None = None) -> None:
-        """Initialize causal chain manager.
-
-        Args:
-            db: SQLAlchemy Session instance. If None, creates a new one.
-        """
-        self._owns_session = db is None
-        self.db = db or next(get_db_session())
-        self.reader = EventReader(self.db)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def close(self):
-        """Close session if owned."""
-        if hasattr(self, "_owns_session") and self._owns_session and hasattr(self, "db"):
-            self.db.close()
-
-    def __del__(self):
-        """Close session if owned."""
-        self.close()
+    def __init__(self, db_factory: DbFactory) -> None:
+        super().__init__(db_factory)
+        self.reader = EventReader(self._db_factory)
 
     def get_chain(self, causal_chain_id: str) -> list[ConversationEvent]:
         """Get all events in a causal chain.
@@ -75,16 +53,17 @@ class CausalChainManager:
         Returns:
             list[ConversationEvent]: Child events
         """
-        query = text("""
-            SELECT * FROM conversation_events
-            WHERE parent_event_id = :event_id
-            ORDER BY created_at ASC
-        """)
+        with self._db() as db:
+            query = text("""
+                SELECT * FROM conversation_events
+                WHERE parent_event_id = :event_id
+                ORDER BY created_at ASC
+            """)
         
-        result = self.db.execute(query, {"event_id": event_id})
-        rows = result.fetchall()
+            result = db.execute(query, {"event_id": event_id})
+            rows = result.fetchall()
         
-        return [self.reader._row_to_event(dict(row._mapping)) for row in rows]
+            return [self.reader._row_to_event(dict(row._mapping)) for row in rows]
 
     def get_chain_summary(self, causal_chain_id: str) -> dict:
         """Get summary statistics for a causal chain.

@@ -8,7 +8,7 @@ from core.repos import AccessScope, OwnerType, RepoRegistry, RepoType
 @pytest.fixture
 def registry(db_session):
     """Repository registry fixture."""
-    return RepoRegistry(db=db_session)
+    return RepoRegistry(lambda: db_session)
 
 
 @pytest.fixture(autouse=True)

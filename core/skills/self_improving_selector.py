@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 from uuid_utils import uuid7
 
 from api.models import SkillSelectionEvent as EventModel, SkillSelectionLearning as LearningModel
@@ -53,23 +54,20 @@ from core.skills.learning_similarity import (
 logger = get_logger(__name__)
 
 
-class SelfImprovingSelector:
+class SelfImprovingSelector(DbConsumer):
     """Skill selector that learns from historical failures automatically.
     
     Key innovation: Uses Git for Data to replay failures in sandbox,
     test corrections, and update selection strategy.
     """
 
-    def __init__(self, session: Session, llm_client=None, account: str = "sys", weights: SignalWeights | None = None, thresholds: SignalThresholds | None = None):
-        if not isinstance(session, Session):
-            raise TypeError("session must be a SQLAlchemy Session")
-        
-        self.session = session
+    def __init__(self, db_factory: DbFactory, llm_client=None, account: str = "sys", weights: SignalWeights | None = None, thresholds: SignalThresholds | None = None):
+        super().__init__(db_factory)
         self.llm = llm_client
         self.account = account
         self.weights = weights or SignalWeights()
         self.thresholds = thresholds or SignalThresholds()
-        self.sandbox = Sandbox(db=session, account=account)
+        self.sandbox = Sandbox(db_factory=self._db_factory, account=account)
         self.embedding_service: EmbeddingService | None = None
         self._runtime_config_cache: dict[str, Any] | None = None
         self._runtime_config_loaded_at: datetime | None = None
@@ -79,41 +77,42 @@ class SelfImprovingSelector:
 
     def _ensure_tables(self):
         """Ensure learning tables exist and evolve schema if needed."""
-        from sqlalchemy import text
+        with self._db() as db:
+            from sqlalchemy import text
 
-        if not hasattr(self.session, "bind") or self.session.bind is None:
-            return
+            if not hasattr(db, "bind") or db.bind is None:
+                return
         
-        # Check if table exists using raw SQL
-        result = self.session.execute(
-            text("SELECT 1 FROM information_schema.tables WHERE table_name = 'skill_selection_learning' LIMIT 1")
-        ).fetchone()
-        if not result:
-            return
+            # Check if table exists using raw SQL
+            result = db.execute(
+                text("SELECT 1 FROM information_schema.tables WHERE table_name = 'skill_selection_learning' LIMIT 1")
+            ).fetchone()
+            if not result:
+                return
         
-        # Get columns using raw SQL to avoid SQLAlchemy type parsing issues
-        columns_result = self.session.execute(
-            text("SELECT column_name FROM information_schema.columns WHERE table_name = 'skill_selection_learning'")
-        ).fetchall()
-        columns = {row[0] for row in columns_result}
+            # Get columns using raw SQL to avoid SQLAlchemy type parsing issues
+            columns_result = db.execute(
+                text("SELECT column_name FROM information_schema.columns WHERE table_name = 'skill_selection_learning'")
+            ).fetchall()
+            columns = {row[0] for row in columns_result}
         
-        if "query_embedding" not in columns:
-            self.session.execute(
-                text("ALTER TABLE skill_selection_learning ADD COLUMN query_embedding TEXT")
-            )
-        if "context_features" not in columns:
-            self.session.execute(
-                text("ALTER TABLE skill_selection_learning ADD COLUMN context_features JSON")
-            )
-        if "is_active" not in columns:
-            self.session.execute(
-                text("ALTER TABLE skill_selection_learning ADD COLUMN is_active TINYINT(1) DEFAULT 1")
-            )
-        try:
-            self.session.commit()
-        except Exception:
-            self.session.rollback()
-            raise
+            if "query_embedding" not in columns:
+                db.execute(
+                    text("ALTER TABLE skill_selection_learning ADD COLUMN query_embedding TEXT")
+                )
+            if "context_features" not in columns:
+                db.execute(
+                    text("ALTER TABLE skill_selection_learning ADD COLUMN context_features JSON")
+                )
+            if "is_active" not in columns:
+                db.execute(
+                    text("ALTER TABLE skill_selection_learning ADD COLUMN is_active TINYINT(1) DEFAULT 1")
+                )
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
 
     # Events scoring above this threshold are "good enough" — skip learning
     _MULTI_FACTOR_SKIP_THRESHOLD = 70.0
@@ -166,16 +165,17 @@ class SelfImprovingSelector:
 
     def rollback_learnings(self, learning_ids: list[str] | None = None, since: datetime | None = None) -> int:
         """Soft-delete learnings by ID list or creation time. Returns count deactivated."""
-        query = self.session.query(LearningModel).filter(LearningModel.is_active == 1)
-        if learning_ids:
-            query = query.filter(LearningModel.learning_id.in_(learning_ids))
-        elif since:
-            query = query.filter(LearningModel.created_at >= since)
-        else:
-            return 0
-        count = query.update({"is_active": 0}, synchronize_session="fetch")
-        self._persist_learning_updates()
-        return count
+        with self._db() as db:
+            query = db.query(LearningModel).filter(LearningModel.is_active == 1)
+            if learning_ids:
+                query = query.filter(LearningModel.learning_id.in_(learning_ids))
+            elif since:
+                query = query.filter(LearningModel.created_at >= since)
+            else:
+                return 0
+            count = query.update({"is_active": 0}, synchronize_session="fetch")
+            db.commit()
+            return count
 
     def get_recent_failures(self, days: int = 7, limit: int = 10) -> list[dict]:
         """Get recent events with any learning signal (not just wrong_skill).
@@ -186,39 +186,40 @@ class SelfImprovingSelector:
         - HIGH_COST: execution_cost > threshold
         - LOW_SATISFACTION: user_feedback_score < threshold
         """
-        from sqlalchemy import or_
+        with self._db() as db:
+            from sqlalchemy import or_
         
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         
-        # Build filter conditions for all signal types
-        conditions = [
-            EventModel.selection_correctness == 0,  # Wrong skill
-            EventModel.execution_time_ms > self.thresholds.slow_execution_ms,  # Slow
-            EventModel.execution_cost > self.thresholds.high_cost_usd,  # Expensive
-            EventModel.user_feedback_score < self.thresholds.low_satisfaction,  # Low satisfaction
-        ]
+            # Build filter conditions for all signal types
+            conditions = [
+                EventModel.selection_correctness == 0,  # Wrong skill
+                EventModel.execution_time_ms > self.thresholds.slow_execution_ms,  # Slow
+                EventModel.execution_cost > self.thresholds.high_cost_usd,  # Expensive
+                EventModel.user_feedback_score < self.thresholds.low_satisfaction,  # Low satisfaction
+            ]
         
-        events = self.session.query(EventModel).filter(
-            or_(*conditions),
-            EventModel.created_at >= cutoff
-        ).order_by(EventModel.created_at.desc()).limit(limit).all()
+            events = db.query(EventModel).filter(
+                or_(*conditions),
+                EventModel.created_at >= cutoff
+            ).order_by(EventModel.created_at.desc()).limit(limit).all()
         
-        return [
-            {
-                "event_id": e.event_id,
-                "user_query": e.user_query,
-                "selected_skills": e.selected_skills,
-                "correction_suggestion": e.correction_suggestion,
-                "execution_time_ms": e.execution_time_ms,
-                "execution_cost": e.execution_cost,
-                "user_feedback_score": e.user_feedback_score,
-                "selection_correctness": e.selection_correctness,
-                "session_id": e.session_id,
-                "selection_method": e.selection_method,
-                "context_snapshot": e.context_snapshot,
-            }
-            for e in events
-        ]
+            return [
+                {
+                    "event_id": e.event_id,
+                    "user_query": e.user_query,
+                    "selected_skills": e.selected_skills,
+                    "correction_suggestion": e.correction_suggestion,
+                    "execution_time_ms": e.execution_time_ms,
+                    "execution_cost": e.execution_cost,
+                    "user_feedback_score": e.user_feedback_score,
+                    "selection_correctness": e.selection_correctness,
+                    "session_id": e.session_id,
+                    "selection_method": e.selection_method,
+                    "context_snapshot": e.context_snapshot,
+                }
+                for e in events
+            ]
     
     def get_slow_executions(self, days: int = 7, limit: int = 10) -> list[dict]:
         """Get recent slow skill executions from metrics table.
@@ -226,45 +227,47 @@ class SelfImprovingSelector:
         This complements get_recent_failures by extracting performance data
         from the skill_execution_metrics table.
         """
-        from api.models import SkillExecutionMetric
+        with self._db() as db:
+            from api.models import SkillExecutionMetric
         
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         
-        metrics = self.session.query(SkillExecutionMetric).filter(
-            SkillExecutionMetric.execution_time_ms > self.thresholds.slow_execution_ms,
-            SkillExecutionMetric.created_at >= cutoff
-        ).order_by(SkillExecutionMetric.created_at.desc()).limit(limit).all()
+            metrics = db.query(SkillExecutionMetric).filter(
+                SkillExecutionMetric.execution_time_ms > self.thresholds.slow_execution_ms,
+                SkillExecutionMetric.created_at >= cutoff
+            ).order_by(SkillExecutionMetric.created_at.desc()).limit(limit).all()
         
-        return [
-            {
-                "skill_name": m.skill_name,
-                "execution_time_ms": m.execution_time_ms,
-                "execution_cost": m.execution_cost,
-                "session_id": m.session_id,
-            }
-            for m in metrics
-        ]
+            return [
+                {
+                    "skill_name": m.skill_name,
+                    "execution_time_ms": m.execution_time_ms,
+                    "execution_cost": m.execution_cost,
+                    "session_id": m.session_id,
+                }
+                for m in metrics
+            ]
     
     def get_expensive_executions(self, days: int = 7, limit: int = 10) -> list[dict]:
         """Get recent expensive skill executions from metrics table."""
-        from api.models import SkillExecutionMetric
+        with self._db() as db:
+            from api.models import SkillExecutionMetric
         
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         
-        metrics = self.session.query(SkillExecutionMetric).filter(
-            SkillExecutionMetric.execution_cost > self.thresholds.high_cost_usd,
-            SkillExecutionMetric.created_at >= cutoff
-        ).order_by(SkillExecutionMetric.created_at.desc()).limit(limit).all()
+            metrics = db.query(SkillExecutionMetric).filter(
+                SkillExecutionMetric.execution_cost > self.thresholds.high_cost_usd,
+                SkillExecutionMetric.created_at >= cutoff
+            ).order_by(SkillExecutionMetric.created_at.desc()).limit(limit).all()
         
-        return [
-            {
-                "skill_name": m.skill_name,
-                "execution_time_ms": m.execution_time_ms,
-                "execution_cost": m.execution_cost,
-                "session_id": m.session_id,
-            }
-            for m in metrics
-        ]
+            return [
+                {
+                    "skill_name": m.skill_name,
+                    "execution_time_ms": m.execution_time_ms,
+                    "execution_cost": m.execution_cost,
+                    "session_id": m.session_id,
+                }
+                for m in metrics
+            ]
     
     def _extract_signal(self, failure: dict, signal_type: SignalType) -> LearningSignal | None:
         """Extract a learning signal from a failure event.
@@ -337,178 +340,185 @@ class SelfImprovingSelector:
     def _update_learnings(self, signal: LearningSignal):
         """Update learning database with new signal (no commit — caller batches)."""
         # Check if similar learning exists
-        existing = self.session.query(LearningModel).filter(
-            LearningModel.query_pattern == signal.query_pattern,
-            LearningModel.signal_type == signal.signal_type.value
-        ).first()
-        embedding = self._embed_query(signal.query_pattern)
+        with self._db() as db:
+            existing = db.query(LearningModel).filter(
+                LearningModel.query_pattern == signal.query_pattern,
+                LearningModel.signal_type == signal.signal_type.value
+            ).first()
+            embedding = self._embed_query(signal.query_pattern)
         
-        if existing:
-            existing.evidence_count += 1
-            existing.confidence = min(99, existing.evidence_count * 10)
-            if existing.query_embedding is None and embedding is not None:
-                existing.query_embedding = embedding
-            if existing.context_features is None and signal.context_features is not None:
-                existing.context_features = signal.context_features
-            # Update target metrics with weighted average
-            if existing.target_metrics and signal.target_metrics:
-                weight_old = (existing.evidence_count - 1) / existing.evidence_count
-                weight_new = 1 / existing.evidence_count
-                for key, value in signal.target_metrics.items():
-                    if key in existing.target_metrics:
-                        existing.target_metrics[key] = (
-                            existing.target_metrics[key] * weight_old + value * weight_new
-                        )
-                    else:
-                        existing.target_metrics[key] = value
-            elif signal.target_metrics:
-                existing.target_metrics = signal.target_metrics
-        else:
-            learning = LearningModel(
-                learning_id=str(uuid7()),
-                query_pattern=signal.query_pattern,
-                query_embedding=embedding,
-                wrong_skills=signal.wrong_skills,
-                correct_skills=signal.correct_skills,
-                improvement_score=10.0,
-                confidence=signal.confidence,
-                signal_type=signal.signal_type.value,
-                target_metrics=signal.target_metrics,
-                context_features=signal.context_features,
-            )
-            self.session.add(learning)
+            if existing:
+                existing.evidence_count += 1
+                existing.confidence = min(99, existing.evidence_count * 10)
+                if existing.query_embedding is None and embedding is not None:
+                    existing.query_embedding = embedding
+                if existing.context_features is None and signal.context_features is not None:
+                    existing.context_features = signal.context_features
+                # Update target metrics with weighted average
+                if existing.target_metrics and signal.target_metrics:
+                    weight_old = (existing.evidence_count - 1) / existing.evidence_count
+                    weight_new = 1 / existing.evidence_count
+                    for key, value in signal.target_metrics.items():
+                        if key in existing.target_metrics:
+                            existing.target_metrics[key] = (
+                                existing.target_metrics[key] * weight_old + value * weight_new
+                            )
+                        else:
+                            existing.target_metrics[key] = value
+                elif signal.target_metrics:
+                    existing.target_metrics = signal.target_metrics
+            else:
+                learning = LearningModel(
+                    learning_id=str(uuid7()),
+                    query_pattern=signal.query_pattern,
+                    query_embedding=embedding,
+                    wrong_skills=signal.wrong_skills,
+                    correct_skills=signal.correct_skills,
+                    improvement_score=10.0,
+                    confidence=signal.confidence,
+                    signal_type=signal.signal_type.value,
+                    target_metrics=signal.target_metrics,
+                    context_features=signal.context_features,
+                )
+                db.add(learning)
+            db.commit()
 
     def apply_learnings(self, query: str, candidates: list) -> list:
         """Apply learned corrections to candidate selection with multi-dimensional scoring."""
-        if not candidates:
-            return candidates
-        if not query:
-            return candidates
+        with self._db() as db:
+            if not candidates:
+                return candidates
+            if not query:
+                return candidates
 
-        query_lower = query.lower()
-        query_features = extract_context_features(query)
-        query_embedding = self._embed_query(query)
+            query_lower = query.lower()
+            query_features = extract_context_features(query)
+            query_embedding = self._embed_query(query)
 
-        runtime_config = self._load_runtime_config()
-        weights = runtime_config["weights"]
-        per_signal_weights = runtime_config["weights_per_signal"]
-        decay = runtime_config["decay"]
-        similarity_threshold = runtime_config["semantic_similarity_threshold"]
+            runtime_config = self._load_runtime_config()
+            weights = runtime_config["weights"]
+            per_signal_weights = runtime_config["weights_per_signal"]
+            decay = runtime_config["decay"]
+            similarity_threshold = runtime_config["semantic_similarity_threshold"]
 
-        similarity_map = semantic_similarity_map(self.session, 
-            query_embedding,
-            similarity_threshold,
-            runtime_config["semantic_match_limit"],
-        )
-        learnings = self.session.query(LearningModel).filter(
-            LearningModel.is_active == 1
-        ).all()
-        matched = []
-        semantic_matches = 0
-        substring_matches = 0
-        for learning in learnings:
-            if not learning.query_pattern:
-                continue
-            if not self._is_high_confidence_value(
-                self._effective_confidence(learning, decay, learning.signal_type)
-            ):
-                continue
-            if not context_matches(learning.context_features, query_features):
-                continue
-            similarity = None
-            if similarity_map is not None:
-                if learning.learning_id in similarity_map:
-                    similarity = similarity_map[learning.learning_id]
-            else:
-                learning_embedding = parse_embedding(learning.query_embedding)
-                if query_embedding is not None and learning_embedding is not None:
-                    similarity = l2_similarity(query_embedding, learning_embedding)
-            if similarity is not None and similarity >= similarity_threshold:
-                matched.append((learning, similarity))
-                semantic_matches += 1
-                continue
-            if pattern_matches(learning.query_pattern.lower(), query_lower):
-                matched.append((learning, 1.0))
-                substring_matches += 1
+            similarity_map = semantic_similarity_map(db, 
+                query_embedding,
+                similarity_threshold,
+                runtime_config["semantic_match_limit"],
+            )
+            learnings = db.query(LearningModel).filter(
+                LearningModel.is_active == 1
+            ).all()
+            matched = []
+            semantic_matches = 0
+            substring_matches = 0
+            for learning in learnings:
+                if not learning.query_pattern:
+                    continue
+                if not self._is_high_confidence_value(
+                    self._effective_confidence(learning, decay, learning.signal_type)
+                ):
+                    continue
+                if not context_matches(learning.context_features, query_features):
+                    continue
+                similarity = None
+                if similarity_map is not None:
+                    if learning.learning_id in similarity_map:
+                        similarity = similarity_map[learning.learning_id]
+                else:
+                    learning_embedding = parse_embedding(learning.query_embedding)
+                    if query_embedding is not None and learning_embedding is not None:
+                        similarity = l2_similarity(query_embedding, learning_embedding)
+                if similarity is not None and similarity >= similarity_threshold:
+                    matched.append((learning, similarity))
+                    semantic_matches += 1
+                    continue
+                if pattern_matches(learning.query_pattern.lower(), query_lower):
+                    matched.append((learning, 1.0))
+                    substring_matches += 1
 
-        if not matched:
-            return candidates
-        logger.info(
-            "Applied learnings match summary: semantic=%s substring=%s",
-            semantic_matches,
-            substring_matches,
-        )
-
-        matched.sort(
-            key=lambda item: (
-                item[1],
-                self._effective_confidence(item[0], decay, item[0].signal_type),
-                item[0].evidence_count or 0,
-                item[0].applied_count or 0,
-            ),
-            reverse=True,
-        )
-        matched = [item[0] for item in matched[:3]]
-
-        candidate_map = {}
-        candidate_scores = {}
-        for candidate in candidates:
-            name = candidate.name
-            candidate_map[name] = candidate
-            candidate_scores[name] = self._normalize_confidence(
-                getattr(candidate, "confidence", 1.0) or 1.0
+            if not matched:
+                return candidates
+            logger.info(
+                "Applied learnings match summary: semantic=%s substring=%s",
+                semantic_matches,
+                substring_matches,
             )
 
-        from core.skills.pipeline import SkillCandidate
+            matched.sort(
+                key=lambda item: (
+                    item[1],
+                    self._effective_confidence(item[0], decay, item[0].signal_type),
+                    item[0].evidence_count or 0,
+                    item[0].applied_count or 0,
+                ),
+                reverse=True,
+            )
+            matched = [item[0] for item in matched[:3]]
 
-        applied_learnings = []
-        for learning in matched:
-            learning_confidence = self._effective_confidence(learning, decay, learning.signal_type)
-            weight = self._get_signal_weight(learning.signal_type, weights, per_signal_weights)
-            delta = learning_confidence * weight
-            if delta <= 0:
-                continue
+            candidate_map = {}
+            candidate_scores = {}
+            for candidate in candidates:
+                name = candidate.name
+                candidate_map[name] = candidate
+                candidate_scores[name] = self._normalize_confidence(
+                    getattr(candidate, "confidence", 1.0) or 1.0
+                )
 
-            wrong_skills = learning.wrong_skills or []
-            correct_skills = learning.correct_skills or []
-            if not wrong_skills and not correct_skills:
-                continue
-            changed = False
+            from core.skills.pipeline import SkillCandidate
 
-            for skill in wrong_skills:
-                if skill in candidate_scores:
-                    current_score = candidate_scores[skill]
-                    next_score = max(0.0, current_score - delta)
-                    if next_score != current_score:
-                        candidate_scores[skill] = next_score
+            applied_learnings = []
+            for learning in matched:
+                learning_confidence = self._effective_confidence(learning, decay, learning.signal_type)
+                weight = self._get_signal_weight(learning.signal_type, weights, per_signal_weights)
+                delta = learning_confidence * weight
+                if delta <= 0:
+                    continue
+
+                wrong_skills = learning.wrong_skills or []
+                correct_skills = learning.correct_skills or []
+                if not wrong_skills and not correct_skills:
+                    continue
+                changed = False
+
+                for skill in wrong_skills:
+                    if skill in candidate_scores:
+                        current_score = candidate_scores[skill]
+                        next_score = max(0.0, current_score - delta)
+                        if next_score != current_score:
+                            candidate_scores[skill] = next_score
+                            changed = True
+
+                for skill in correct_skills:
+                    if skill not in candidate_scores:
+                        candidate_map[skill] = SkillCandidate(name=skill)
+                        candidate_scores[skill] = min(1.0, delta)
                         changed = True
-
-            for skill in correct_skills:
-                if skill not in candidate_scores:
-                    candidate_map[skill] = SkillCandidate(name=skill)
-                    candidate_scores[skill] = min(1.0, delta)
+                    candidate_scores[skill] = min(1.0, candidate_scores[skill] + delta)
                     changed = True
-                candidate_scores[skill] = min(1.0, candidate_scores[skill] + delta)
-                changed = True
 
-            if changed:
-                learning.applied_count += 1
-                learning.last_applied_at = datetime.now(timezone.utc)
-                applied_learnings.append(learning)
+                if changed:
+                    learning.applied_count += 1
+                    learning.last_applied_at = datetime.now(timezone.utc)
+                    applied_learnings.append(learning)
 
-        if not applied_learnings:
-            return candidates
+            if not applied_learnings:
+                return candidates
 
-        self._persist_learning_updates()
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
 
-        scored = [
-            (name, score) for name, score in candidate_scores.items() if score > 0.0
-        ]
-        if not scored:
-            return candidates
+            scored = [
+                (name, score) for name, score in candidate_scores.items() if score > 0.0
+            ]
+            if not scored:
+                return candidates
 
-        scored.sort(key=lambda item: (-item[1], item[0]))
-        return [candidate_map[name] for name, _ in scored]
+            scored.sort(key=lambda item: (-item[1], item[0]))
+            return [candidate_map[name] for name, _ in scored]
 
     def _embed_query(self, query: str) -> list[float] | None:
         if not query:
@@ -516,10 +526,7 @@ class SelfImprovingSelector:
         try:
             if self.embedding_service is None:
                 try:
-                    # Phase 2 bridge: SelfImprovingSelector holds a raw session;
-                    # EmbeddingService needs a factory.
-                    from api.database import SessionLocal
-                    self.embedding_service = EmbeddingService(SessionLocal)
+                    self.embedding_service = EmbeddingService(self._db_factory)
                 except Exception as exc:
                     logger.warning(f"Embedding service init failed: {exc}")
                     return None
@@ -532,14 +539,15 @@ class SelfImprovingSelector:
         return normalize_confidence(value)
 
     def _persist_learning_updates(self) -> None:
-        try:
-            if self.session.in_transaction():
-                self.session.flush()
-            else:
-                self.session.commit()
-        except Exception:
-            self.session.rollback()
-            raise
+        with self._db() as db:
+            try:
+                if db.in_transaction():
+                    db.flush()
+                else:
+                    db.commit()
+            except Exception:
+                db.rollback()
+                raise
 
     def _is_high_confidence_value(self, normalized_value: float | None) -> bool:
         if normalized_value is None:
@@ -616,74 +624,76 @@ class SelfImprovingSelector:
 
     def get_learning_stats(self) -> dict[str, Any]:
         """Get statistics about learned corrections with multi-dimensional breakdown."""
-        runtime_config = self._load_runtime_config()
-        decay = runtime_config["decay"]
+        with self._db() as db:
+            runtime_config = self._load_runtime_config()
+            decay = runtime_config["decay"]
 
-        learnings = self.session.query(LearningModel).all()
-        total = len(learnings)
-        effective_confidences = [
-            self._effective_confidence(learning, decay, learning.signal_type)
-            for learning in learnings
-        ]
-        high_confidence = sum(1 for c in effective_confidences if c >= 0.7)
-        avg_confidence = (
-            sum(effective_confidences) / total * 100.0 if total > 0 else 0.0
-        )
+            learnings = db.query(LearningModel).all()
+            total = len(learnings)
+            effective_confidences = [
+                self._effective_confidence(learning, decay, learning.signal_type)
+                for learning in learnings
+            ]
+            high_confidence = sum(1 for c in effective_confidences if c >= 0.7)
+            avg_confidence = (
+                sum(effective_confidences) / total * 100.0 if total > 0 else 0.0
+            )
         
-        # Breakdown by signal type
-        signal_breakdown = {}
-        for signal_type in SignalType:
-            count = self.session.query(LearningModel).filter(
-                LearningModel.signal_type == signal_type.value
-            ).count()
-            signal_breakdown[signal_type.value] = count
+            # Breakdown by signal type
+            signal_breakdown = {}
+            for signal_type in SignalType:
+                count = db.query(LearningModel).filter(
+                    LearningModel.signal_type == signal_type.value
+                ).count()
+                signal_breakdown[signal_type.value] = count
         
-        # Query regression gate results (validates selector changes before deployment)
-        # Key metrics: pass_rate (safety), avg_improvement_pct (effectiveness)
-        from api.models import SelectorGateResult
-        gate_results = self.session.query(SelectorGateResult).all()
-        total_gates = len(gate_results)
-        passed = sum(1 for g in gate_results if g.verdict == "PASS")
-        failed = total_gates - passed
-        pass_rate = passed / total_gates if total_gates > 0 else 0.0
-        improvements = [g.improvement_pct for g in gate_results if g.improvement_pct is not None]
-        avg_improvement_pct = sum(improvements) / len(improvements) if improvements else 0.0
+            # Query regression gate results (validates selector changes before deployment)
+            # Key metrics: pass_rate (safety), avg_improvement_pct (effectiveness)
+            from api.models import SelectorGateResult
+            gate_results = db.query(SelectorGateResult).all()
+            total_gates = len(gate_results)
+            passed = sum(1 for g in gate_results if g.verdict == "PASS")
+            failed = total_gates - passed
+            pass_rate = passed / total_gates if total_gates > 0 else 0.0
+            improvements = [g.improvement_pct for g in gate_results if g.improvement_pct is not None]
+            avg_improvement_pct = sum(improvements) / len(improvements) if improvements else 0.0
         
-        return {
-            "total_learnings": total,
-            "high_confidence": high_confidence,
-            "low_confidence": total - high_confidence,
-            "avg_confidence": avg_confidence,
-            "by_signal_type": signal_breakdown,
-            "learnings": {
-                "weights": runtime_config["weights"].to_dict(),
-                "weights_per_signal": runtime_config["weights_per_signal"],
-                "decay": runtime_config["decay"],
-            },
-            "regression_gates": {
-                "total_gates": total_gates,
-                "passed": passed,
-                "failed": failed,
-                "pass_rate": pass_rate,
-                "avg_improvement_pct": avg_improvement_pct,
-            },
-            "semantic_similarity_threshold": runtime_config["semantic_similarity_threshold"],
-            "semantic_match_limit": runtime_config["semantic_match_limit"],
-        }
+            return {
+                "total_learnings": total,
+                "high_confidence": high_confidence,
+                "low_confidence": total - high_confidence,
+                "avg_confidence": avg_confidence,
+                "by_signal_type": signal_breakdown,
+                "learnings": {
+                    "weights": runtime_config["weights"].to_dict(),
+                    "weights_per_signal": runtime_config["weights_per_signal"],
+                    "decay": runtime_config["decay"],
+                },
+                "regression_gates": {
+                    "total_gates": total_gates,
+                    "passed": passed,
+                    "failed": failed,
+                    "pass_rate": pass_rate,
+                    "avg_improvement_pct": avg_improvement_pct,
+                },
+                "semantic_similarity_threshold": runtime_config["semantic_similarity_threshold"],
+                "semantic_match_limit": runtime_config["semantic_match_limit"],
+            }
 
     def _load_runtime_config(self) -> dict[str, Any]:
-        result, loaded_at, last_updated = load_runtime_config(
-            self.session,
-            self.weights,
-            cache=self._runtime_config_cache,
-            cache_loaded_at=self._runtime_config_loaded_at,
-            cache_last_updated_at=self._runtime_config_last_updated_at,
-            ttl_seconds=self._runtime_config_ttl_seconds,
-        )
-        self._runtime_config_cache = result
-        self._runtime_config_loaded_at = loaded_at
-        self._runtime_config_last_updated_at = last_updated
-        return result
+        with self._db() as db:
+            result, loaded_at, last_updated = load_runtime_config(
+                db,
+                self.weights,
+                cache=self._runtime_config_cache,
+                cache_loaded_at=self._runtime_config_loaded_at,
+                cache_last_updated_at=self._runtime_config_last_updated_at,
+                ttl_seconds=self._runtime_config_ttl_seconds,
+            )
+            self._runtime_config_cache = result
+            self._runtime_config_loaded_at = loaded_at
+            self._runtime_config_last_updated_at = last_updated
+            return result
 
     def _effective_confidence(self, learning, decay: dict[str, Any], signal_type: str | None) -> float:
         return effective_confidence(learning, decay, signal_type)

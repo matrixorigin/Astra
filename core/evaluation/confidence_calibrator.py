@@ -13,9 +13,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
@@ -30,14 +30,14 @@ class CalibrationResult:
     bucket_errors: list[dict[str, Any]]  # per-bucket breakdown
 
 
-class ConfidenceCalibrator:
+class ConfidenceCalibrator(DbConsumer):
     """Measures and corrects confidence calibration."""
 
     BUCKETS = 5  # split confidence range [0,1] into N buckets
     RECALIBRATION_THRESHOLD = 0.15  # trigger recalibration if error > this
 
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self, db_factory: DbFactory):
+        super().__init__(db_factory)
 
     def measure(self, agent_id: str | None = None, days: int = 30) -> CalibrationResult:
         """Compute calibration error from historical data.
@@ -99,30 +99,31 @@ class ConfidenceCalibrator:
         self, agent_id: str | None, days: int,
     ) -> list[tuple[float, float]]:
         """Query (confidence_score, quality_score) pairs."""
-        try:
-            params: dict[str, Any] = {"days": days}
-            agent_filter = ""
-            if agent_id:
-                agent_filter = "AND agent_id = :agent_id"
-                params["agent_id"] = agent_id
+        with self._db() as db:
+            try:
+                params: dict[str, Any] = {"days": days}
+                agent_filter = ""
+                if agent_id:
+                    agent_filter = "AND agent_id = :agent_id"
+                    params["agent_id"] = agent_id
 
-            rows = self.db.execute(text(f"""
-                SELECT
-                    CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.confidence_score')) AS DOUBLE) AS conf,
-                    quality_score
-                FROM conversation_events
-                WHERE event_type = 'llm_response'
-                  AND quality_score IS NOT NULL
-                  AND `metadata` IS NOT NULL
-                  AND JSON_EXTRACT(`metadata`, '$.confidence_score') IS NOT NULL
-                  AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
-                  {agent_filter}
-            """), params).fetchall()
+                rows = db.execute(text(f"""
+                    SELECT
+                        CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.confidence_score')) AS DOUBLE) AS conf,
+                        quality_score
+                    FROM conversation_events
+                    WHERE event_type = 'llm_response'
+                      AND quality_score IS NOT NULL
+                      AND `metadata` IS NOT NULL
+                      AND JSON_EXTRACT(`metadata`, '$.confidence_score') IS NOT NULL
+                      AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
+                      {agent_filter}
+                """), params).fetchall()
 
-            return [(float(r[0]), float(r[1])) for r in rows if r[0] is not None]
-        except Exception as e:
-            logger.warning("Calibration query failed: %s", e)
-            return []
+                return [(float(r[0]), float(r[1])) for r in rows if r[0] is not None]
+            except Exception as e:
+                logger.warning("Calibration query failed: %s", e)
+                return []
 
     def _compute_ece(
         self, confidences: list[float], qualities: list[float],

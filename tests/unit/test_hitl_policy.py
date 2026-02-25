@@ -15,7 +15,7 @@ from core.verification.hitl_policy import (
 
 
 def _engine(*policies: SupervisionPolicy) -> HITLPolicyEngine:
-    engine = HITLPolicyEngine(db=None)
+    engine = HITLPolicyEngine(lambda: MagicMock())
     for p in policies:
         engine.add_policy(p)
     return engine
@@ -31,7 +31,7 @@ def _policy(name: str, action: SupervisionAction, **trigger_kwargs) -> Supervisi
 
 class TestNoTrigger:
     def test_no_policies_returns_none(self):
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         ctx = ActionContext()
         decision = engine.evaluate(ctx)
         assert decision.action == SupervisionAction.NONE
@@ -137,7 +137,7 @@ class TestMostRestrictiveWins:
 
 class TestDisabledPolicy:
     def test_disabled_policy_not_evaluated(self):
-        engine = HITLPolicyEngine(db=None)
+        engine = HITLPolicyEngine(lambda: MagicMock())
         policy = SupervisionPolicy(
             name="disabled",
             trigger=SupervisionTrigger(cost_exceeds=1.0),

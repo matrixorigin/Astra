@@ -14,7 +14,7 @@ def mock_db():
 @pytest.fixture
 def cleaner(mock_db):
     with patch("core.sandbox.cleanup.Sandbox"):
-        return SandboxCleaner(db=mock_db, source_db="test_db")
+        return SandboxCleaner(lambda: mock_db, source_db="test_db")
 
 
 class TestSandboxCleaner:

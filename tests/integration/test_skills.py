@@ -25,7 +25,7 @@ def github(db_session):
 @pytest.fixture
 def llm(db_session):
     """LLM client fixture"""
-    return LLMClient(db_session)
+    return LLMClient(lambda: db_session)
 
 
 def test_skill_registry_register(db_session, registry, llm, github):
@@ -107,7 +107,7 @@ def test_skill_registry_list_available(db_session, registry, llm, github):
         RepoType as RepoTypeEnum,
     )
 
-    repo_registry = RepoRegistry(db_session)
+    repo_registry = RepoRegistry(lambda: db_session)
     repo = repo_registry.create(
         repo_url=f"https://github.com/test/repo-{int(time.time())}",
         repo_type=RepoTypeEnum.CODE,

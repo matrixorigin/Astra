@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from core.utils.id_generator import generate_note_id
 from uuid_utils import uuid7
 from core.logging_config import get_logger
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
@@ -19,7 +20,7 @@ logger = get_logger(__name__)
 NoteType = Literal["plan", "hypothesis", "finding", "todo", "decision"]
 
 
-class AgentScratchpad:
+class AgentScratchpad(DbConsumer):
     """Working memory for long-horizon tasks.
     
     Maintains structured notes that survive context compaction and session boundaries.
@@ -44,8 +45,8 @@ class AgentScratchpad:
         >>> scratchpad.close_note(note_id, status="completed")
     """
     
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self, db_factory: DbFactory):
+        super().__init__(db_factory)
     
     def create_note(
         self,
@@ -72,31 +73,32 @@ class AgentScratchpad:
         Raises:
             ValueError: If note_type is invalid
         """
-        from api.models import AgentScratchpad as ScratchpadModel
+        with self._db() as db:
+            from api.models import AgentScratchpad as ScratchpadModel
         
-        # Validate note type
-        valid_types = {"plan", "hypothesis", "finding", "todo", "decision"}
-        if note_type not in valid_types:
-            raise ValueError(f"Invalid note_type: {note_type}. Must be one of {valid_types}")
+            # Validate note type
+            valid_types = {"plan", "hypothesis", "finding", "todo", "decision"}
+            if note_type not in valid_types:
+                raise ValueError(f"Invalid note_type: {note_type}. Must be one of {valid_types}")
         
-        note_id = f"note_{generate_note_id()}"
+            note_id = f"note_{generate_note_id()}"
         
-        note = ScratchpadModel(
-            note_id=note_id,
-            session_id=session_id,
-            user_id=user_id,
-            agent_id=agent_id,
-            note_type=note_type,
-            content=content,
-            status="active",
-            related_event_ids=related_event_ids or [],
-        )
+            note = ScratchpadModel(
+                note_id=note_id,
+                session_id=session_id,
+                user_id=user_id,
+                agent_id=agent_id,
+                note_type=note_type,
+                content=content,
+                status="active",
+                related_event_ids=related_event_ids or [],
+            )
         
-        self.db.add(note)
-        self.db.commit()
+            db.add(note)
+            db.commit()
         
-        logger.info(f"Created {note_type} note {note_id} for session {session_id}")
-        return note_id
+            logger.info(f"Created {note_type} note {note_id} for session {session_id}")
+            return note_id
     
     def get_active_notes(
         self,
@@ -112,28 +114,29 @@ class AgentScratchpad:
         Returns:
             List of active notes
         """
-        from api.models import AgentScratchpad as ScratchpadModel
+        with self._db() as db:
+            from api.models import AgentScratchpad as ScratchpadModel
         
-        query = self.db.query(ScratchpadModel).filter(
-            ScratchpadModel.session_id == session_id,
-            ScratchpadModel.status == "active"
-        )
+            query = db.query(ScratchpadModel).filter(
+                ScratchpadModel.session_id == session_id,
+                ScratchpadModel.status == "active"
+            )
         
-        if note_type:
-            query = query.filter(ScratchpadModel.note_type == note_type)
+            if note_type:
+                query = query.filter(ScratchpadModel.note_type == note_type)
         
-        notes = query.order_by(ScratchpadModel.created_at).all()
+            notes = query.order_by(ScratchpadModel.created_at).all()
         
-        return [
-            {
-                "note_id": n.note_id,
-                "note_type": n.note_type,
-                "content": n.content,
-                "created_at": n.created_at.isoformat() if n.created_at else None,
-                "related_event_ids": n.related_event_ids,
-            }
-            for n in notes
-        ]
+            return [
+                {
+                    "note_id": n.note_id,
+                    "note_type": n.note_type,
+                    "content": n.content,
+                    "created_at": n.created_at.isoformat() if n.created_at else None,
+                    "related_event_ids": n.related_event_ids,
+                }
+                for n in notes
+            ]
     
     def get_cross_session_notes(
         self,
@@ -153,31 +156,32 @@ class AgentScratchpad:
         Returns:
             List of active notes across sessions, most recently updated first
         """
-        from api.models import AgentScratchpad as ScratchpadModel
+        with self._db() as db:
+            from api.models import AgentScratchpad as ScratchpadModel
         
-        query = self.db.query(ScratchpadModel).filter(
-            ScratchpadModel.user_id == user_id,
-            ScratchpadModel.status == "active"
-        )
+            query = db.query(ScratchpadModel).filter(
+                ScratchpadModel.user_id == user_id,
+                ScratchpadModel.status == "active"
+            )
         
-        if note_type:
-            query = query.filter(ScratchpadModel.note_type == note_type)
+            if note_type:
+                query = query.filter(ScratchpadModel.note_type == note_type)
         
-        notes = query.order_by(
-            ScratchpadModel.updated_at.desc()
-        ).limit(limit).all()
+            notes = query.order_by(
+                ScratchpadModel.updated_at.desc()
+            ).limit(limit).all()
         
-        return [
-            {
-                "note_id": n.note_id,
-                "session_id": n.session_id,
-                "note_type": n.note_type,
-                "content": n.content,
-                "created_at": n.created_at.isoformat() if n.created_at else None,
-                "updated_at": n.updated_at.isoformat() if n.updated_at else None,
-            }
-            for n in notes
-        ]
+            return [
+                {
+                    "note_id": n.note_id,
+                    "session_id": n.session_id,
+                    "note_type": n.note_type,
+                    "content": n.content,
+                    "created_at": n.created_at.isoformat() if n.created_at else None,
+                    "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+                }
+                for n in notes
+            ]
     
     def update_note(
         self,
@@ -195,26 +199,27 @@ class AgentScratchpad:
         Returns:
             True if updated
         """
-        from api.models import AgentScratchpad as ScratchpadModel
+        with self._db() as db:
+            from api.models import AgentScratchpad as ScratchpadModel
         
-        note = self.db.query(ScratchpadModel).filter(
-            ScratchpadModel.note_id == note_id
-        ).first()
+            note = db.query(ScratchpadModel).filter(
+                ScratchpadModel.note_id == note_id
+            ).first()
         
-        if not note:
-            logger.warning(f"Note {note_id} not found")
-            return False
+            if not note:
+                logger.warning(f"Note {note_id} not found")
+                return False
         
-        if append:
-            note.content = f"{note.content}\n\n{content}"
-        else:
-            note.content = content
+            if append:
+                note.content = f"{note.content}\n\n{content}"
+            else:
+                note.content = content
         
-        note.updated_at = datetime.now()
-        self.db.commit()
+            note.updated_at = datetime.now()
+            db.commit()
         
-        logger.debug(f"Updated note {note_id}")
-        return True
+            logger.debug(f"Updated note {note_id}")
+            return True
     
     def close_note(
         self,
@@ -230,22 +235,23 @@ class AgentScratchpad:
         Returns:
             True if closed
         """
-        from api.models import AgentScratchpad as ScratchpadModel
+        with self._db() as db:
+            from api.models import AgentScratchpad as ScratchpadModel
         
-        note = self.db.query(ScratchpadModel).filter(
-            ScratchpadModel.note_id == note_id
-        ).first()
+            note = db.query(ScratchpadModel).filter(
+                ScratchpadModel.note_id == note_id
+            ).first()
         
-        if not note:
-            logger.warning(f"Note {note_id} not found")
-            return False
+            if not note:
+                logger.warning(f"Note {note_id} not found")
+                return False
         
-        note.status = status
-        note.updated_at = datetime.now()
-        self.db.commit()
+            note.status = status
+            note.updated_at = datetime.now()
+            db.commit()
         
-        logger.info(f"Closed note {note_id} with status {status}")
-        return True
+            logger.info(f"Closed note {note_id} with status {status}")
+            return True
     
     def link_notes(
         self,
@@ -261,19 +267,20 @@ class AgentScratchpad:
         Returns:
             True if linked
         """
-        from api.models import AgentScratchpad as ScratchpadModel
+        with self._db() as db:
+            from api.models import AgentScratchpad as ScratchpadModel
         
-        note = self.db.query(ScratchpadModel).filter(
-            ScratchpadModel.note_id == note_id
-        ).first()
+            note = db.query(ScratchpadModel).filter(
+                ScratchpadModel.note_id == note_id
+            ).first()
         
-        if not note:
-            logger.warning(f"Note {note_id} not found")
-            return False
+            if not note:
+                logger.warning(f"Note {note_id} not found")
+                return False
         
-        note.related_note_ids = related_note_ids
-        note.updated_at = datetime.now()
-        self.db.commit()
+            note.related_note_ids = related_note_ids
+            note.updated_at = datetime.now()
+            db.commit()
         
-        logger.debug(f"Linked note {note_id} to {len(related_note_ids)} notes")
-        return True
+            logger.debug(f"Linked note {note_id} to {len(related_note_ids)} notes")
+            return True

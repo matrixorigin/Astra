@@ -45,7 +45,7 @@ def github(db_session):
 @pytest.fixture
 def llm(db_session):
     """LLM client fixture"""
-    return LLMClient(db_session)
+    return LLMClient(lambda: db_session)
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def logger(db_session):
 @pytest.fixture
 def replay_engine(db_session, registry, logger):
     """Replay engine fixture"""
-    return ReplayEngine(db_session, registry, logger)
+    return ReplayEngine(lambda: db_session, registry, logger)
 
 
 @pytest.mark.asyncio

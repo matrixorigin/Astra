@@ -16,7 +16,7 @@ class TestPollutionDetector:
     @pytest.fixture
     def detector(self, mock_db):
         """Create pollution detector."""
-        return PollutionDetector(mock_db)
+        return PollutionDetector(lambda: mock_db)
     
     def test_detect_pollution_candidates(self, detector, mock_db):
         """Test pollution candidate detection."""

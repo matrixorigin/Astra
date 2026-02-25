@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import get_db_session, SessionLocal
 from api.dependencies import get_current_user
 from core.logging_config import get_logger
 
@@ -98,14 +98,8 @@ def _ensure_session(db: Session, user_id: str, session_id: str | None, agent_id:
 def _build_chat_loop(db_factory):
     """Build ChatLoop with all dependencies.
 
-    Accepts a db_factory (Callable → Session). Creates a fresh session for
-    components that still require one.
-
-    NOTE (Phase 2 limitation): ChatLoop components (EventLogger, LLMClient,
-    SkillRegistry, etc.) still receive a raw Session.  This session lives as
-    long as the ChatLoop — up to 30 min.  Migrating these components to
-    db_factory is Phase 3/4 work.  RunEngine itself no longer holds a long
-    session; only the ChatLoop internals do.
+    Accepts a db_factory (Callable → Session). All components receive the
+    factory and create their own short-lived sessions.
     """
     from core.agent.chat_loop import ChatLoop
     from core.agent.executor import AgentExecutor
@@ -127,14 +121,13 @@ def _build_chat_loop(db_factory):
         from core.events.pipeline import EventPipeline
         from core.events.event_logger import _PIPELINE_ENABLED
         if _PIPELINE_ENABLED:
-            from api.database import SessionLocal
-            pipeline = EventPipeline(SessionLocal)
+            pipeline = EventPipeline(db_factory)
             pipeline.start()
     except Exception:
         pass
 
     event_logger = EventLogger(db_factory, pipeline=pipeline)
-    llm_client = LLMClient(db=db)
+    llm_client = LLMClient(db_factory=db_factory)
 
     # Wire GateTrigger so skill/prompt changes auto-trigger regression gate
     # Disable in tests to avoid DB session conflicts
@@ -142,20 +135,17 @@ def _build_chat_loop(db_factory):
     if os.environ.get('DISABLE_GATE_TRIGGER'):
         gate_trigger = None
     else:
-        from api.database import SessionLocal as _gate_session_factory
         from core.evaluation.gate_trigger import GateTrigger
-        gate_trigger = GateTrigger(db_factory=_gate_session_factory)
+        gate_trigger = GateTrigger(db_factory=db_factory)
 
     skill_registry = SkillRegistry(db, gate_trigger=gate_trigger)
     code_executor = CodeExecutor(
         runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
-        db=db,
+        db_factory=db_factory,
     )
-    register_builtin_skills(skill_registry, db, code_executor=code_executor)
+    register_builtin_skills(skill_registry, db_factory, code_executor=code_executor)
     context_manager = ContextManager(db_factory, gate_trigger=gate_trigger)
-    # SkillPipeline holds DB session reference internally for audit/learning writes.
-    # Must create fresh instance per-request to avoid stale session issues.
-    selector = SkillPipeline(db, llm_client, audit=True, learning=True)
+    selector = SkillPipeline(db_factory, llm_client, audit=True, learning=True)
     selector.reload_skills(registry=skill_registry)
 
     from config.settings import get_settings
@@ -164,7 +154,7 @@ def _build_chat_loop(db_factory):
     skill_mgr = SkillManager(db, CredentialManager(get_settings().secret_key))
     executor = AgentExecutor(db_factory, skill_registry, skill_manager=skill_mgr)
 
-    firewall = HallucinationFirewall(db, context_manager)
+    firewall = HallucinationFirewall(db_factory, context_manager)
 
     loop = ChatLoop(
         selector=selector,
@@ -176,7 +166,7 @@ def _build_chat_loop(db_factory):
     )
 
     from core.memory.observer import Observer
-    loop.set_observer(Observer(db, llm_client=llm_client))
+    loop.set_observer(Observer(db_factory, llm_client=llm_client))
 
     return loop
 
@@ -464,7 +454,7 @@ def _build_turn_messages(
             edge_tools=edge_tools or [],
             edge_profile=edge_profile or {},
         )
-        assembled = PromptAssembler(db).assemble(
+        assembled = PromptAssembler(SessionLocal).assemble(
             agent_id=agent_id,
             user_query=user_query,
             session_id=session_id,
@@ -528,7 +518,7 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
         # edge will re-send these on the next fresh session.
         first_query = next((r[1] for r in rows if r[0] == "user_query"), "")
         from core.context.prompt_assembler import PromptAssembler
-        assembled = PromptAssembler(db).assemble(
+        assembled = PromptAssembler(SessionLocal).assemble(
             agent_id=agent_id, user_query=first_query,
             session_id=session_id, user_id=user_id,
         )
@@ -561,7 +551,7 @@ def _persist_turn_events(
     try:
         from core.events.event_logger import EventLogger
         from uuid_utils import uuid7
-        el = EventLogger.from_session(db)
+        el = EventLogger(SessionLocal)
 
         # Persist user query (first user message only)
         user_content = next((m["content"] for m in messages if m.get("role") == "user"), None)
@@ -604,7 +594,6 @@ def _persist_turn_events(
         # Context snapshot + decision audit
         if parent_event_id:
             try:
-                from api.database import SessionLocal
                 from core.context.manager import ContextManager
                 ctx_mgr = ContextManager(SessionLocal)
                 ctx = ctx_mgr.build_context(session_id=session_id, query=user_content or "")
@@ -660,7 +649,7 @@ async def chat_turn(
 
         try:
             from core.llm.client import LLMClient
-            llm = LLMClient(db=db)
+            llm = LLMClient(SessionLocal)
 
             full_text = ""
             tool_calls: list[dict[str, Any]] = []

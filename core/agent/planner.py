@@ -741,7 +741,7 @@ def execute_plan_in_sandbox(
         import time
         sandbox_name = f"plan_dry_run_{int(time.time() * 1000)}_{str(uuid7())[:8]}"
     
-    sandbox = Sandbox(db=db)
+    sandbox = Sandbox(db_factory=lambda: db)
     results = {
         "sandbox_name": sandbox_name,
         "plan_id": plan.plan_id,

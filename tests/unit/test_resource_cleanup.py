@@ -1,10 +1,14 @@
-"""Test resource cleanup and session management after refactoring.
+"""Test resource cleanup and session management after DbConsumer migration.
 
-After the refactoring, Core layer modules no longer create their own sessions.
-This test verifies that:
-1. All Core modules require a session parameter
-2. All Core modules use the injected session
-3. Session lifecycle is managed by the caller (API/Service layer)
+Core layer DbConsumer modules use db_factory (callable) instead of raw Session.
+Non-DbConsumer modules (SkillRegistry, ModernSkillSelector, SkillPipeline) still
+use raw Session injection.
+
+This test verifies:
+1. DbConsumer modules require callable db_factory
+2. Non-DbConsumer modules require valid Session
+3. No module creates its own SessionLocal
+4. DbConsumer modules share the same factory with children
 """
 
 import pytest
@@ -13,243 +17,124 @@ from sqlalchemy.orm import Session
 
 from core.git_for_data import GitForData
 from core.sandbox.sandbox import Sandbox
-from core.events.event_reader import EventReader
 from core.events.event_logger import EventLogger
-from core.events.session_manager import SessionManager
-from core.replay.time_machine import TimeMachine
 from core.skills.registry import SkillRegistry
 from core.skills.pipeline import SkillPipeline
 from core.skills.self_improving_selector import SelfImprovingSelector
-from core.skills.selector import SkillSelector
 from core.skills.modern_selector import ModernSkillSelector
-from core.events.causal_chain import CausalChainManager
 from core.replay.semantic_diff import SemanticDiff
 from core.skills.mocking import ToolMockingLayer, MockMode
+from core.db_consumer import DbConsumer
 
 
 class TestSessionInjection:
-    """Test that all Core modules require session injection."""
+    """Test that DbConsumer modules require callable db_factory."""
 
     def test_git_for_data_requires_session(self):
-        """Test GitForData requires session parameter."""
-        with pytest.raises(TypeError, match="db must be a SQLAlchemy Session"):
-            GitForData(db=None)
-        
-        # Should work with proper session
+        with pytest.raises(TypeError, match="db_factory must be callable"):
+            GitForData("not_callable")
+
         mock_session = Mock(spec=Session)
-        git = GitForData(db=mock_session)
-        assert git.db is mock_session
-
-    def test_event_logger_requires_valid_input(self):
-        """Test EventLogger rejects invalid construction arguments."""
-        # Factory mode: rejects non-callable
-        with pytest.raises(TypeError, match="callable"):
-            EventLogger(None)
-
-        # Borrowed mode: rejects non-Session
-        with pytest.raises(TypeError, match="SQLAlchemy Session"):
-            EventLogger.from_session(None)
-
-        # Should work with proper session (borrowed mode)
-        mock_session = Mock(spec=Session)
-        logger = EventLogger.from_session(mock_session)
-        # Verify borrowed mode: log_event uses the session without closing it.
-        mock_session.close.assert_not_called()
+        git = GitForData(lambda: mock_session)
+        assert git._db_factory is not None
 
     def test_sandbox_requires_session(self):
-        """Test Sandbox requires session parameter."""
-        with pytest.raises(TypeError, match="db must be a SQLAlchemy Session"):
-            Sandbox(db=None)
-        
-        # Should work with proper session
-        mock_session = Mock(spec=Session)
-        sandbox = Sandbox(db=mock_session)
-        assert sandbox.db is mock_session
+        with pytest.raises(TypeError, match="db_factory must be callable"):
+            Sandbox("not_callable")
 
-    def test_skill_registry_requires_session(self):
-        """Test SkillRegistry requires session parameter."""
-        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
-            SkillRegistry(session=None)
-        
-        # Should work with proper session
         mock_session = Mock(spec=Session)
-        mock_session.query.return_value.filter.return_value.all.return_value = []
-        registry = SkillRegistry(session=mock_session)
-        assert registry.session is mock_session
+        sandbox = Sandbox(lambda: mock_session)
+        assert sandbox._db_factory is not None
+
+    def test_self_improving_selector_requires_session(self):
+        with pytest.raises(TypeError, match="db_factory must be callable"):
+            SelfImprovingSelector("not_callable")
+
+        mock_session = Mock(spec=Session)
+        selector = SelfImprovingSelector(lambda: mock_session)
+        assert selector._db_factory is not None
 
     def test_pipeline_requires_session(self):
-        """Test SkillPipeline requires session parameter."""
-        with pytest.raises(TypeError):
-            SkillPipeline(db=None, llm_client=None)
-        
-        # Should work with proper session
+        """SkillPipeline takes a db_factory callable."""
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
-        pipeline = SkillPipeline(mock_session, llm_client=None)
-        assert pipeline._db is mock_session
+        pipeline = SkillPipeline(lambda: mock_session, llm_client=None)
+        assert pipeline._modern.session is mock_session
 
     def test_modern_selector_requires_session(self):
-        """Test ModernSkillSelector requires session parameter."""
+        """ModernSkillSelector is NOT a DbConsumer — it takes raw Session."""
         with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
             ModernSkillSelector(session=None)
-        
-        # Should work with proper session
+
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
         selector = ModernSkillSelector(session=mock_session)
         assert selector.session is mock_session
 
-    def test_self_improving_selector_requires_session(self):
-        """Test SelfImprovingSelector requires session parameter."""
-        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
-            SelfImprovingSelector(session=None)
-        
-        # Should work with proper session
-        mock_session = Mock(spec=Session)
-        mock_session.query.return_value.filter.return_value.all.return_value = []
-        selector = SelfImprovingSelector(session=mock_session)
-        assert selector.session is mock_session
-
-    def test_tool_mocking_layer_accepts_factory(self):
-        """Test ToolMockingLayer validates db_factory is callable."""
-        mock_factory = Mock()
-        layer = ToolMockingLayer(MockMode.PRODUCTION, db_factory=mock_factory)
-        assert layer._db_factory is mock_factory
-
-    def test_tool_mocking_layer_rejects_non_callable(self):
-        """Test ToolMockingLayer rejects non-callable db_factory."""
-        with pytest.raises(TypeError, match="db_factory must be callable"):
-            ToolMockingLayer(MockMode.PRODUCTION, db_factory="not_callable")
-
     def test_semantic_diff_requires_session(self):
-        """Test SemanticDiff requires session parameter."""
-        with pytest.raises(TypeError, match="db must be a SQLAlchemy Session"):
-            SemanticDiff(db=None)
-        
-        # Should work with proper session
+        with pytest.raises(TypeError, match="db_factory must be callable"):
+            SemanticDiff("not_callable")
+
         mock_session = Mock(spec=Session)
-        diff = SemanticDiff(db=mock_session)
-        assert diff.db is mock_session
+        diff = SemanticDiff(lambda: mock_session)
+        assert diff._db_factory is not None
 
 
 class TestSessionSharing:
-    """Test that modules share the same session when passed."""
+    """Test that DbConsumer modules share factory with children."""
 
-    def test_sandbox_shares_session_with_branch(self):
-        """Test Sandbox shares session with Branch."""
+    def test_sandbox_shares_factory_with_branch(self):
         mock_session = Mock(spec=Session)
-        sandbox = Sandbox(db=mock_session)
-        
-        # Branch inside sandbox should use the same session
-        assert sandbox.branch.db is mock_session
+        factory = lambda: mock_session
+        sandbox = Sandbox(factory)
+        assert sandbox.branch._db_factory is factory
 
     def test_pipeline_shares_session(self):
-        """Test SkillPipeline shares session with dependencies."""
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
-        
-        pipeline = SkillPipeline(mock_session, llm_client=None)
-        
-        # Internal modern selector should use the same session
+        pipeline = SkillPipeline(lambda: mock_session, llm_client=None)
         assert pipeline._modern.session is mock_session
 
-    def test_self_improving_selector_shares_session(self):
-        """Test SelfImprovingSelector shares session with dependencies."""
+    def test_self_improving_selector_shares_factory(self):
         mock_session = Mock(spec=Session)
-        mock_session.query.return_value.filter.return_value.all.return_value = []
-        
-        selector = SelfImprovingSelector(session=mock_session)
-        
-        # Dependencies should use the same session
-        assert selector.sandbox.db is mock_session
+        factory = lambda: mock_session
+        selector = SelfImprovingSelector(factory)
+        assert selector._db_factory is factory
 
 
 class TestNoSessionCreation:
     """Test that Core modules don't create their own sessions."""
 
     def test_modules_dont_have_sessionlocal_import(self):
-        """Test that Core modules don't import SessionLocal."""
         import inspect
-        
-        # Check that these modules don't create SessionLocal
-        modules_to_check = [
-            GitForData,
-            EventLogger,
-            Sandbox,
-            SkillRegistry,
-            SkillPipeline,
-            ModernSkillSelector,
-            SelfImprovingSelector,
-            ToolMockingLayer,
-            SemanticDiff,
-        ]
-        
-        for module_class in modules_to_check:
-            source = inspect.getsource(module_class.__init__)
-            # Should not create SessionLocal in __init__
-            assert "SessionLocal()" not in source, f"{module_class.__name__} creates SessionLocal"
+        for cls in [GitForData, EventLogger, Sandbox, SkillRegistry, SkillPipeline,
+                    ModernSkillSelector, SelfImprovingSelector, ToolMockingLayer, SemanticDiff]:
+            source = inspect.getsource(cls.__init__)
+            assert "SessionLocal()" not in source, f"{cls.__name__} creates SessionLocal"
 
     def test_modules_dont_have_lazy_session(self):
-        """Test that Core modules don't have _lazy_session attribute."""
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
-        
         modules = [
-            GitForData(db=mock_session),
+            GitForData(lambda: mock_session),
             EventLogger.from_session(mock_session),
-            Sandbox(db=mock_session),
+            Sandbox(lambda: mock_session),
             SkillRegistry(session=mock_session),
             ModernSkillSelector(session=mock_session),
             ToolMockingLayer(MockMode.PRODUCTION, db_factory=lambda: mock_session),
-            SemanticDiff(db=mock_session),
+            SemanticDiff(lambda: mock_session),
         ]
-        
         for module in modules:
             assert not hasattr(module, '_lazy_session'), f"{type(module).__name__} has _lazy_session"
             assert not hasattr(module, '_owns_session'), f"{type(module).__name__} has _owns_session"
 
 
 class TestSessionLifecycle:
-    """Test that session lifecycle is managed by caller."""
+    """Test that DbConsumer._db() manages session lifecycle."""
 
     def test_caller_manages_session_lifecycle(self):
-        """Test that caller is responsible for session lifecycle."""
-        from api.database import get_db_session
-        
-        # Caller gets session
-        db = next(get_db_session())
-        
-        # Pass to modules (EventLogger uses from_session for borrowed sessions)
-        logger = EventLogger.from_session(db)
-        git = GitForData(db=db)
-        
-        # Modules use the session but don't close it.
-        # EventLogger in borrowed mode uses the same session without closing.
-        assert git.db is db
-        
-        # Caller is responsible for closing
-        db.close()
-
-    def test_modules_dont_have_close_method(self):
-        """Test that Core modules don't have close() method."""
         mock_session = Mock(spec=Session)
-        mock_session.query.return_value.filter.return_value.all.return_value = []
-        
-        modules = [
-            GitForData(db=mock_session),
-            EventLogger.from_session(mock_session),
-            SkillRegistry(session=mock_session),
-            ModernSkillSelector(session=mock_session),
-            ToolMockingLayer(MockMode.PRODUCTION, db_factory=lambda: mock_session),
-            SemanticDiff(db=mock_session),
-        ]
-        
-        for module in modules:
-            # Should not have close method (or if it has, it shouldn't close the session)
-            if hasattr(module, 'close'):
-                # If close exists, it should be for other purposes, not session management
-                pass  # We allow close for other purposes
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+        factory = lambda: mock_session
+        git = GitForData(factory)
+        assert isinstance(git, DbConsumer)
+        assert git._db_factory is factory

@@ -58,7 +58,7 @@ def run_drift_pipeline(db_factory: Callable) -> PipelineResult:
         regression_gate = _try_build_regression_gate(db)
         prompt_optimizer = _try_build_prompt_optimizer(db)
         corrector = DriftCorrector(
-            db=db,
+            db_factory=lambda: db,
             regression_gate=regression_gate,
             prompt_optimizer=prompt_optimizer,
         )
@@ -123,7 +123,7 @@ def _try_build_prompt_optimizer(db):
     try:
         from core.context.prompt_optimizer import PromptOptimizer
         from core.llm.client import LLMClient
-        llm = LLMClient(db=db)
-        return PromptOptimizer(db, llm)
+        llm = LLMClient(db_factory=lambda: db)
+        return PromptOptimizer(lambda: db, llm)
     except Exception:
         return None

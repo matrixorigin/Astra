@@ -119,9 +119,9 @@ async def trigger_learning(
         if request.weights:
             weights = SignalWeights(**request.weights)
 
-        llm_client = LLMClient(db)
+        llm_client = LLMClient(lambda: db)
         pipeline = SkillPipeline(
-            db, llm_client,
+            lambda: db, llm_client,
             audit=False,
             learning=True,
             learning_weights=weights,
@@ -201,8 +201,8 @@ async def get_learning_stats(
         Learning statistics
     """
     try:
-        llm_client = LLMClient(db)
-        pipeline = SkillPipeline(db, llm_client, audit=False, learning=True)
+        llm_client = LLMClient(lambda: db)
+        pipeline = SkillPipeline(lambda: db, llm_client, audit=False, learning=True)
 
         stats = pipeline.stats()
 

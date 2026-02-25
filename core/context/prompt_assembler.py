@@ -22,6 +22,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -139,14 +140,14 @@ class AssembledPrompt:
     sections: dict[str, str] = field(default_factory=dict)
 
 
-class PromptAssembler:
+class PromptAssembler(DbConsumer):
     """Assemble the full system prompt from distributed state.
 
     Single entry point for both /chat (cloud-only) and /chat/turn (edge-cloud).
     """
 
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self, db_factory: DbFactory):
+        super().__init__(db_factory)
 
     def assemble(
         self,
@@ -248,35 +249,37 @@ class PromptAssembler:
         schema.  Any other exception propagates — programming errors should
         not be silently swallowed.
         """
-        if agent_id:
-            try:
-                row = self.db.execute(
-                    text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
-                    {"aid": agent_id},
-                ).fetchone()
-                if row and row[0]:
-                    raw = row[0]
-                    # Guard against empty/whitespace-only strings from DB
-                    config = raw if isinstance(raw, dict) else json.loads(raw) if isinstance(raw, str) and raw.strip() else None
-                    if config and config.get("system_prompt"):
-                        return config["system_prompt"]
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning("Failed to load agent %s (%s): %s", agent_id, type(e).__name__, e)
-            except SQLAlchemyError as e:
-                logger.warning("DB error loading agent %s (%s): %s", agent_id, type(e).__name__, e)
-        return "You are a development assistant. Use the available tools to help the user."
+        with self._db() as db:
+            if agent_id:
+                try:
+                    row = db.execute(
+                        text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
+                        {"aid": agent_id},
+                    ).fetchone()
+                    if row and row[0]:
+                        raw = row[0]
+                        # Guard against empty/whitespace-only strings from DB
+                        config = raw if isinstance(raw, dict) else json.loads(raw) if isinstance(raw, str) and raw.strip() else None
+                        if config and config.get("system_prompt"):
+                            return config["system_prompt"]
+                except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    logger.warning("Failed to load agent %s (%s): %s", agent_id, type(e).__name__, e)
+                except SQLAlchemyError as e:
+                    logger.warning("DB error loading agent %s (%s): %s", agent_id, type(e).__name__, e)
+            return "You are a development assistant. Use the available tools to help the user."
 
     def _get_agent_type(self, agent_id: str | None) -> str:
-        if not agent_id:
-            return "default"
-        try:
-            row = self.db.execute(
-                text("SELECT agent_type FROM agents WHERE agent_id = :aid"),
-                {"aid": agent_id},
-            ).fetchone()
-            return row[0] if row and row[0] else "default"
-        except SQLAlchemyError:
-            return "default"
+        with self._db() as db:
+            if not agent_id:
+                return "default"
+            try:
+                row = db.execute(
+                    text("SELECT agent_type FROM agents WHERE agent_id = :aid"),
+                    {"aid": agent_id},
+                ).fetchone()
+                return row[0] if row and row[0] else "default"
+            except SQLAlchemyError:
+                return "default"
 
     def _build_self_model(
         self,
@@ -285,72 +288,73 @@ class PromptAssembler:
         edge_context: EdgeContext | None,
     ) -> str:
         """§2: Agent self-awareness — capabilities, boundaries, learned insights."""
-        parts = ["## Self-Model"]
-        parts.append("When users ask about YOUR skills, capabilities, or what you can do, answer from this section — do not explore the filesystem.")
+        with self._db() as db:
+            parts = ["## Self-Model"]
+            parts.append("When users ask about YOUR skills, capabilities, or what you can do, answer from this section — do not explore the filesystem.")
 
-        # Capabilities — list actual tool names so LLM knows exactly what it has
-        parts.append("\n### My Skills & Tools")
-        if edge_context and edge_context.edge_tools:
-            tool_names = [t.get("function", {}).get("name", "unknown") for t in edge_context.edge_tools]
-            parts.append(f"- Available tools: {', '.join(tool_names)}")
-            # Also show categories for context
-            categories = _categorize_tools(tool_names)
-            if categories:
-                parts.append(f"- Categories: {', '.join(categories)}")
-        else:
-            parts.append("- Local tools: file operations, shell commands, git, search")
+            # Capabilities — list actual tool names so LLM knows exactly what it has
+            parts.append("\n### My Skills & Tools")
+            if edge_context and edge_context.edge_tools:
+                tool_names = [t.get("function", {}).get("name", "unknown") for t in edge_context.edge_tools]
+                parts.append(f"- Available tools: {', '.join(tool_names)}")
+                # Also show categories for context
+                categories = _categorize_tools(tool_names)
+                if categories:
+                    parts.append(f"- Categories: {', '.join(categories)}")
+            else:
+                parts.append("- Local tools: file operations, shell commands, git, search")
 
-        # Cloud skills
-        try:
-            rows = self.db.execute(
-                text("SELECT skill_name FROM skills_registry WHERE is_active = 1 LIMIT 20")
-            ).fetchall()
-            if rows:
-                names = [r[0] for r in rows]
-                parts.append(f"- Cloud skills: {', '.join(names)}")
-        except SQLAlchemyError:
-            pass
-
-        # Delegation
-        if agent_id:
+            # Cloud skills
             try:
-                row = self.db.execute(
-                    text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
-                    {"aid": agent_id},
-                ).fetchone()
-                if row and row[0]:
-                    config = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-                    delegates = config.get("delegate_to") or config.get("allowed_delegates")
-                    if delegates:
-                        parts.append(f"- Can delegate to: {', '.join(delegates)}")
-            except (SQLAlchemyError, json.JSONDecodeError, KeyError, TypeError):
+                rows = db.execute(
+                    text("SELECT skill_name FROM skills_registry WHERE is_active = 1 LIMIT 20")
+                ).fetchall()
+                if rows:
+                    names = [r[0] for r in rows]
+                    parts.append(f"- Cloud skills: {', '.join(names)}")
+            except SQLAlchemyError:
                 pass
 
-        # Boundaries
-        parts.append("\n### Boundaries")
-        parts.append("- You need user permission for: shell commands, file writes")
-        parts.append("- If uncertain, say so rather than guess")
+            # Delegation
+            if agent_id:
+                try:
+                    row = db.execute(
+                        text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
+                        {"aid": agent_id},
+                    ).fetchone()
+                    if row and row[0]:
+                        config = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                        delegates = config.get("delegate_to") or config.get("allowed_delegates")
+                        if delegates:
+                            parts.append(f"- Can delegate to: {', '.join(delegates)}")
+                except (SQLAlchemyError, json.JSONDecodeError, KeyError, TypeError):
+                    pass
 
-        # Learned insights (or cold start baseline)
-        insight = self._get_learned_insight(agent_id, agent_type)
-        parts.append(f"\n### What I've Learned\n{insight}")
+            # Boundaries
+            parts.append("\n### Boundaries")
+            parts.append("- You need user permission for: shell commands, file writes")
+            parts.append("- If uncertain, say so rather than guess")
 
-        # Introspection hint
-        parts.append("\nFor detailed runtime state, use the `get_agent_info` tool.")
+            # Learned insights (or cold start baseline)
+            insight = self._get_learned_insight(agent_id, agent_type)
+            parts.append(f"\n### What I've Learned\n{insight}")
 
-        result = "\n".join(parts)
-        # Hard cap: drop learned insights if self-model exceeds token budget
-        if _estimate_tokens(result) > _FIXED_SELF_MODEL:
-            # Compress: keep header + capabilities + boundaries, drop learned insights
-            keep = []
-            drop_after = "### What I've Learned"
-            for p in parts:
-                if p.strip().startswith(drop_after):
-                    break
-                keep.append(p)
-            result = "\n".join(keep)
-            result += "\nFor full details, use `get_agent_info`."
-        return result
+            # Introspection hint
+            parts.append("\nFor detailed runtime state, use the `get_agent_info` tool.")
+
+            result = "\n".join(parts)
+            # Hard cap: drop learned insights if self-model exceeds token budget
+            if _estimate_tokens(result) > _FIXED_SELF_MODEL:
+                # Compress: keep header + capabilities + boundaries, drop learned insights
+                keep = []
+                drop_after = "### What I've Learned"
+                for p in parts:
+                    if p.strip().startswith(drop_after):
+                        break
+                    keep.append(p)
+                result = "\n".join(keep)
+                result += "\nFor full details, use `get_agent_info`."
+            return result
 
     def _get_learned_insight(self, agent_id: str | None, agent_type: str) -> str:
         """Load procedural memory insights, or cold start baseline.
@@ -358,44 +362,46 @@ class PromptAssembler:
         Gracefully handles missing skill_selection_events table (returns baseline).
         The table is created by migration and may not exist in all environments.
         """
-        if agent_id:
-            try:
-                # JSON_EXTRACT is supported by MatrixOne (MySQL-compatible syntax).
-                # Parameterized :aid prevents SQL injection; JSON path is a constant.
-                row = self.db.execute(
-                    text("""
-                        SELECT COUNT(*) as cnt FROM skill_selection_events
-                        WHERE JSON_EXTRACT(metadata, '$.agent_id') = :aid
-                    """),
-                    {"aid": agent_id},
-                ).fetchone()
-                if row and row[0] and row[0] >= 50:
-                    return self._query_procedural_insights(agent_id)
-            except SQLAlchemyError:
-                # Table may not exist yet (pre-migration) — fall through to baseline
-                pass
-        return _BASELINE_INSIGHTS.get(agent_type, _DEFAULT_INSIGHT)
+        with self._db() as db:
+            if agent_id:
+                try:
+                    # JSON_EXTRACT is supported by MatrixOne (MySQL-compatible syntax).
+                    # Parameterized :aid prevents SQL injection; JSON path is a constant.
+                    row = db.execute(
+                        text("""
+                            SELECT COUNT(*) as cnt FROM skill_selection_events
+                            WHERE JSON_EXTRACT(metadata, '$.agent_id') = :aid
+                        """),
+                        {"aid": agent_id},
+                    ).fetchone()
+                    if row and row[0] and row[0] >= 50:
+                        return self._query_procedural_insights(agent_id)
+                except SQLAlchemyError:
+                    # Table may not exist yet (pre-migration) — fall through to baseline
+                    pass
+            return _BASELINE_INSIGHTS.get(agent_type, _DEFAULT_INSIGHT)
 
     def _query_procedural_insights(self, agent_id: str) -> str:
         """Query actual performance data from skill selection history."""
-        try:
-            row = self.db.execute(
-                text("""
-                    SELECT
-                        COUNT(*) as total,
-                        SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as successes
-                    FROM skill_selection_events
-                    WHERE JSON_EXTRACT(metadata, '$.agent_id') = :aid
-                      AND created_at > NOW() - INTERVAL 30 DAY
-                """),
-                {"aid": agent_id},
-            ).fetchone()
-            if row and row[0] and row[0] > 0:
-                rate = (row[1] or 0) / row[0] * 100
-                return f"Based on recent history: {rate:.0f}% skill selection accuracy over {row[0]} interactions."
-        except SQLAlchemyError:
-            pass
-        return _DEFAULT_INSIGHT
+        with self._db() as db:
+            try:
+                row = db.execute(
+                    text("""
+                        SELECT
+                            COUNT(*) as total,
+                            SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as successes
+                        FROM skill_selection_events
+                        WHERE JSON_EXTRACT(metadata, '$.agent_id') = :aid
+                          AND created_at > NOW() - INTERVAL 30 DAY
+                    """),
+                    {"aid": agent_id},
+                ).fetchone()
+                if row and row[0] and row[0] > 0:
+                    rate = (row[1] or 0) / row[0] * 100
+                    return f"Based on recent history: {rate:.0f}% skill selection accuracy over {row[0]} interactions."
+            except SQLAlchemyError:
+                pass
+            return _DEFAULT_INSIGHT
 
     def _build_project_context(self, edge_context: EdgeContext | None) -> str | None:
         """§3: Project rules + edge profile."""
@@ -438,7 +444,7 @@ class PromptAssembler:
         parts = []
         try:
             from core.context.continuity import SessionContinuity
-            cont = SessionContinuity(self.db)
+            cont = SessionContinuity(self._db_factory)
             prior = cont.load_prior_context(user_id=user_id, current_session_id=session_id)
             section = prior.to_prompt_section()
             if section:
@@ -449,7 +455,7 @@ class PromptAssembler:
         try:
             from core.memory.observer import Observer
             from core.llm.client import LLMClient
-            obs = Observer(self.db, llm_client=LLMClient(db=self.db))
+            obs = Observer(self._db_factory, llm_client=LLMClient(db_factory=self._db_factory))
             observations = obs.get_observations(user_id, session_id)
             obs_section = obs.format_for_context(observations)
             if obs_section:
@@ -459,7 +465,7 @@ class PromptAssembler:
 
         try:
             from core.context.few_shot import FewShotRetriever
-            fsr = FewShotRetriever(self.db)
+            fsr = FewShotRetriever(self._db_factory)
             examples = fsr.retrieve(query)
             few_shot = fsr.format_for_prompt(examples)
             if few_shot:
@@ -473,7 +479,7 @@ class PromptAssembler:
         """§5: Scratchpad notes."""
         try:
             from core.context.scratchpad import AgentScratchpad
-            sp = AgentScratchpad(self.db)
+            sp = AgentScratchpad(self._db_factory)
             notes = sp.get_active_notes(session_id)
             if notes:
                 lines = [f"[{n['note_type']}] {n['content']}" for n in notes]
@@ -484,40 +490,41 @@ class PromptAssembler:
 
     def _build_history(self, session_id: str, max_tokens: int) -> str | None:
         """§6: Budget-capped conversation history."""
-        budget_chars = int(max_tokens * _MAX_HISTORY_RATIO) * 4
-        try:
-            rows = self.db.execute(
-                # Why f-string instead of parameterized LIMIT?
-                # MySQL-compatible DBs (including MatrixOne) may quote parameterized
-                # LIMIT values as strings: `LIMIT '20'` → syntax error.
-                # SQLAlchemy's bindparam() has the same issue.
-                # _MAX_HISTORY_EVENTS is a module-level int constant (not user input),
-                # so f-string interpolation is safe from SQL injection.
-                text(f"""
-                    SELECT event_type, content FROM conversation_events
-                    WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response')
-                    ORDER BY created_at DESC LIMIT {_MAX_HISTORY_EVENTS}
-                """),
-                {"sid": session_id},
-            ).fetchall()
-            if not rows:
+        with self._db() as db:
+            budget_chars = int(max_tokens * _MAX_HISTORY_RATIO) * 4
+            try:
+                rows = db.execute(
+                    # Why f-string instead of parameterized LIMIT?
+                    # MySQL-compatible DBs (including MatrixOne) may quote parameterized
+                    # LIMIT values as strings: `LIMIT '20'` → syntax error.
+                    # SQLAlchemy's bindparam() has the same issue.
+                    # _MAX_HISTORY_EVENTS is a module-level int constant (not user input),
+                    # so f-string interpolation is safe from SQL injection.
+                    text(f"""
+                        SELECT event_type, content FROM conversation_events
+                        WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response')
+                        ORDER BY created_at DESC LIMIT {_MAX_HISTORY_EVENTS}
+                    """),
+                    {"sid": session_id},
+                ).fetchall()
+                if not rows:
+                    return None
+                lines = []
+                used = 0
+                for row in reversed(rows):
+                    label = "User" if row[0] == "user_query" else "Agent"
+                    content = row[1] or ""
+                    if len(content) > 300:
+                        content = content[:300] + "..."
+                    line = f"{label}: {content}"
+                    if used + len(line) > budget_chars and lines:
+                        break
+                    lines.append(line)
+                    used += len(line)
+                return "Recent conversation:\n" + "\n".join(lines) if lines else None
+            except SQLAlchemyError as e:
+                logger.debug("History skipped: %s", e)
                 return None
-            lines = []
-            used = 0
-            for row in reversed(rows):
-                label = "User" if row[0] == "user_query" else "Agent"
-                content = row[1] or ""
-                if len(content) > 300:
-                    content = content[:300] + "..."
-                line = f"{label}: {content}"
-                if used + len(line) > budget_chars and lines:
-                    break
-                lines.append(line)
-                used += len(line)
-            return "Recent conversation:\n" + "\n".join(lines) if lines else None
-        except SQLAlchemyError as e:
-            logger.debug("History skipped: %s", e)
-            return None
 
     # ------------------------------------------------------------------
     # Compression
@@ -576,36 +583,37 @@ class PromptAssembler:
         sessions with no outer transaction — the snapshot must be durable before the
         SSE stream starts, since stream errors would lose uncommitted data.
         """
-        try:
-            from uuid_utils import uuid7
-            capture_id = str(uuid7())
-            self.db.execute(
-                text("""
-                    INSERT INTO context_snapshots
-                        (context_capture_id, session_id, event_id, system_prompt, token_budget, created_at)
-                    VALUES (:cid, :sess, :eid, :prompt, :budget, NOW())
-                """),
-                {
-                    "cid": capture_id,
-                    "sess": session_id,
-                    "eid": capture_id,  # placeholder — real event_id set by caller
-                    "prompt": json.dumps({
-                        "sections": {k: v[:SNAPSHOT_SECTION_CHARS] for k, v in sections.items()},
-                        "token_breakdown": breakdown,
-                    }),
-                    "budget": json.dumps(breakdown),
-                },
-            )
-            self.db.commit()
-            return capture_id
-        except IntegrityError:
-            self.db.rollback()
-            logger.debug("Snapshot save skipped (duplicate key)")
-            return None
-        except (SQLAlchemyError, ImportError) as e:
-            self.db.rollback()
-            logger.warning("Snapshot save failed (%s): %s", type(e).__name__, e)
-            return None
+        with self._db() as db:
+            try:
+                from uuid_utils import uuid7
+                capture_id = str(uuid7())
+                db.execute(
+                    text("""
+                        INSERT INTO context_snapshots
+                            (context_capture_id, session_id, event_id, system_prompt, token_budget, created_at)
+                        VALUES (:cid, :sess, :eid, :prompt, :budget, NOW())
+                    """),
+                    {
+                        "cid": capture_id,
+                        "sess": session_id,
+                        "eid": capture_id,  # placeholder — real event_id set by caller
+                        "prompt": json.dumps({
+                            "sections": {k: v[:SNAPSHOT_SECTION_CHARS] for k, v in sections.items()},
+                            "token_breakdown": breakdown,
+                        }),
+                        "budget": json.dumps(breakdown),
+                    },
+                )
+                db.commit()
+                return capture_id
+            except IntegrityError:
+                db.rollback()
+                logger.debug("Snapshot save skipped (duplicate key)")
+                return None
+            except (SQLAlchemyError, ImportError) as e:
+                db.rollback()
+                logger.warning("Snapshot save failed (%s): %s", type(e).__name__, e)
+                return None
 
 
 # ------------------------------------------------------------------

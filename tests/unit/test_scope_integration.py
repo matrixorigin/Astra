@@ -47,14 +47,14 @@ def test_scope_based_token_resolution(db):
 
     # With user scope — should use user token
     chain = ScopeChainBuilder.dev_agent(user_id="alice")
-    resolver = ScopeResolver(db, chain)
+    resolver = ScopeResolver(lambda: db, chain)
     token = resolver.resolve_token("llm", "openai")
     assert token is not None
     assert token["encrypted_value"] == "alice_key"
 
     # Without user token — should fall back to global
     chain = ScopeChainBuilder.dev_agent(user_id="bob")
-    resolver = ScopeResolver(db, chain)
+    resolver = ScopeResolver(lambda: db, chain)
     token = resolver.resolve_token("llm", "openai")
     assert token is not None
     assert token["encrypted_value"] == "global_key"
@@ -83,6 +83,6 @@ def test_scope_resolver_with_real_db_structure(db):
     db.commit()
 
     chain = ScopeChainBuilder.dev_agent(user_id="alice")
-    resolver = ScopeResolver(db, chain)
+    resolver = ScopeResolver(lambda: db, chain)
     token = resolver.resolve_token("llm", "openai")
     assert token is not None

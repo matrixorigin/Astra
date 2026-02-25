@@ -87,7 +87,7 @@ class TestGovernanceStructuredOutputs:
         from api.models import KnowledgeEntry
         from uuid_utils import uuid7
 
-        engine = MemoryGovernanceEngine(db_session)
+        engine = MemoryGovernanceEngine(lambda: db_session)
 
         eid = str(uuid7())
         db_session.add(KnowledgeEntry(
@@ -115,7 +115,7 @@ class TestGovernanceStructuredOutputs:
         from api.models import KnowledgeEntry
         from uuid_utils import uuid7
 
-        engine = MemoryGovernanceEngine(db_session)
+        engine = MemoryGovernanceEngine(lambda: db_session)
         cat = f"cat_{os.urandom(4).hex()}"
 
         for val in ["value_A", "value_B"]:
@@ -146,7 +146,7 @@ class TestGovernanceStructuredOutputs:
         from core.context.lifecycle import MemoryGovernanceEngine
         from uuid_utils import uuid7
 
-        engine = MemoryGovernanceEngine(db_session)
+        engine = MemoryGovernanceEngine(lambda: db_session)
         sid = f"sess_{os.urandom(4).hex()}"
         old_ts = datetime.now() - timedelta(days=100)
 

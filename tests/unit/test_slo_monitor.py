@@ -16,7 +16,7 @@ from core.evaluation.slo_monitor import (
 def _monitor(daily_rows: list[tuple]) -> SLOMonitor:
     db = Mock()
     db.execute.return_value.fetchall.return_value = daily_rows
-    return SLOMonitor(db=db)
+    return SLOMonitor(lambda: db)
 
 
 def _daily(avg_quality: float, hallucination_rate: float = 0.0, n: int = 10):
@@ -76,7 +76,7 @@ class TestBurnRate:
 
     def test_severity_warning_at_1_5x(self):
         slo = SLOTarget("quality", "avg_quality", 4.0, ">=")
-        monitor = SLOMonitor(db=Mock(), slos=[slo])
+        monitor = SLOMonitor(lambda: Mock(), slos=[slo])
         # 3 bad days out of 30 → projected 3 bad days / 1.5 allowed = 2x → WARNING
         status = monitor._evaluate_slo(
             slo,
@@ -88,7 +88,7 @@ class TestBurnRate:
 
     def test_severity_critical_at_3x(self):
         slo = SLOTarget("quality", "avg_quality", 4.0, ">=")
-        monitor = SLOMonitor(db=Mock(), slos=[slo])
+        monitor = SLOMonitor(lambda: Mock(), slos=[slo])
         # 5 bad days out of 30 → projected 5 / 1.5 = 3.3x → CRITICAL
         status = monitor._evaluate_slo(
             slo,
@@ -100,7 +100,7 @@ class TestBurnRate:
 
     def test_breach_when_period_complete_and_not_met(self):
         slo = SLOTarget("quality", "avg_quality", 4.0, ">=")
-        monitor = SLOMonitor(db=Mock(), slos=[slo])
+        monitor = SLOMonitor(lambda: Mock(), slos=[slo])
         status = monitor._evaluate_slo(
             slo,
             [{"avg_quality": 3.0, "hallucination_rate": 0.0, "completion_rate": 0.95}] * 30,

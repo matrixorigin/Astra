@@ -23,13 +23,13 @@ def db():
 @pytest.fixture
 def git(db):
     """Git for Data fixture."""
-    return GitForData(db)
+    return GitForData(lambda: db)
 
 
 @pytest.fixture
 def time_machine(db):
     """Time machine fixture."""
-    return TimeMachine(db)
+    return TimeMachine(lambda: db)
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def sandbox(db):
     from sqlalchemy import text
     result = db.execute(text("SELECT DATABASE()"))
     current_db = result.scalar()
-    return Sandbox(source_db=current_db, db=db)
+    return Sandbox(source_db=current_db, db_factory=lambda: db)
 
 
 def test_snapshot_creation_and_listing(git):

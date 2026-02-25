@@ -67,7 +67,7 @@ class TestEnhancedFirewallIntegration:
 
         # Create firewall
         firewall = HallucinationFirewall(
-            db=db,
+            db_factory=lambda: db,
             context_manager=context_manager,
             llm_client=llm_client,
             threshold=0.7,
@@ -130,7 +130,7 @@ class TestEnhancedFirewallIntegration:
         context_manager.load_snapshot.return_value = snapshot
 
         firewall = HallucinationFirewall(
-            db=db,
+            db_factory=lambda: db,
             context_manager=context_manager,
             llm_client=llm_client,
             threshold=0.7,
@@ -182,7 +182,7 @@ class TestEnhancedFirewallIntegration:
         context_manager.load_snapshot.return_value = snapshot
 
         firewall = HallucinationFirewall(
-            db=db,
+            db_factory=lambda: db,
             context_manager=context_manager,
             llm_client=llm_client,
             use_llm_extraction=True,
@@ -208,7 +208,7 @@ class TestEnhancedFirewallIntegration:
 
         # No LLM client
         firewall = HallucinationFirewall(
-            db=db,
+            db_factory=lambda: db,
             context_manager=context_manager,
             llm_client=None,
             use_llm_extraction=False,
@@ -236,7 +236,7 @@ class TestEnhancedFirewallIntegration:
         context_manager.load_snapshot.return_value = snapshot
 
         firewall = HallucinationFirewall(
-            db=db,
+            db_factory=lambda: db,
             context_manager=context_manager,
             llm_client=llm_client,
             use_llm_extraction=True,
@@ -263,7 +263,7 @@ class TestEnhancedFirewallIntegration:
         context_manager.load_snapshot.side_effect = Exception("Snapshot not found")
 
         firewall = HallucinationFirewall(
-            db=db, context_manager=context_manager, llm_client=llm_client
+            db_factory=lambda: db, context_manager=context_manager, llm_client=llm_client
         )
 
         result = firewall.verify_response("Some text", "snap_123")

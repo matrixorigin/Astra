@@ -290,14 +290,14 @@ class ExecuteCodeSkill(Skill[ExecuteCodeInput, ExecuteCodeOutput]):
 
 
 def register_builtin_skills(
-    registry, db, llm=None, github=None, agent_registry=None, chat_loop_factory=None,
+    registry, db_factory, llm=None, github=None, agent_registry=None, chat_loop_factory=None,
     code_executor=None,
 ):
     """Register all built-in skills.
 
     Args:
         registry: SkillRegistry instance
-        session: Session | None = None instance
+        db_factory: Callable that returns a new Session
         llm: Optional LLMClient instance
         github: Optional GitHubClient instance
         agent_registry: Optional AgentRegistry for multi-agent delegation
@@ -309,14 +309,14 @@ def register_builtin_skills(
 
     # Initialize clients if not provided
     if github is None:
-        github = GitHubClient(db)
+        github = GitHubClient()
     if llm is None:
-        llm = LLMClient(db)
+        llm = LLMClient(db_factory)
 
     # Register skills with metadata
     skills = [
         (
-            SummarizePRSkill(db, llm, github),
+            SummarizePRSkill(db_factory, llm, github),
             "github",
             "pr_management",
             ["summarize", "summary", "pr", "pull request"],
@@ -325,7 +325,7 @@ def register_builtin_skills(
             "medium",
         ),
         (
-            ListPRsSkill(db, github),
+            ListPRsSkill(db_factory, github),
             "github",
             "pr_management",
             ["list", "show", "prs", "pull requests"],
@@ -334,7 +334,7 @@ def register_builtin_skills(
             "low",
         ),
         (
-            CIStatusSkill(db, github),
+            CIStatusSkill(db_factory, github),
             "github",
             "ci_cd",
             ["ci", "build", "workflow", "status"],

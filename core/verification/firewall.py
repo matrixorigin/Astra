@@ -10,6 +10,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
 from core.verification.claim_extractor import ClaimExtractor
 from core.verification.llm_claim_extractor import LLMClaimExtractor, Claim
@@ -37,7 +38,7 @@ class FirewallResult:
     evidence_count: int = 0  # Total evidence pieces found
 
 
-class HallucinationFirewall:
+class HallucinationFirewall(DbConsumer):
     """Verify LLM responses against data snapshots.
 
     Enhanced with:
@@ -48,7 +49,7 @@ class HallucinationFirewall:
 
     def __init__(
         self,
-        db,
+        db_factory: DbFactory,
         context_manager,
         llm_client=None,
         threshold: float = 0.7,
@@ -57,13 +58,13 @@ class HallucinationFirewall:
         """Initialize firewall.
 
         Args:
-            db: SQLAlchemy Session
+            db_factory: Factory for creating DB sessions
             context_manager: ContextManager for loading snapshots
             llm_client: LLM client for enhanced extraction/verification
             threshold: Minimum confidence to pass (default: 0.7)
             use_llm_extraction: Use LLM for claim extraction (default: True)
         """
-        self.db = db
+        super().__init__(db_factory)
         self.context_manager = context_manager
         self.threshold = threshold
         self.use_llm_extraction = use_llm_extraction
@@ -232,10 +233,7 @@ class HallucinationFirewall:
         # Slow path: embedding similarity (if available)
         try:
             from core.context.embeddings import EmbeddingService
-            # Phase 2 bridge: HallucinationFirewall holds a raw session;
-            # EmbeddingService needs a factory.
-            from api.database import SessionLocal
-            svc = EmbeddingService(SessionLocal)
+            svc = EmbeddingService(self._db_factory)
             claim_vec = svc.embed_text(claim.value)
             ctx_vec = svc.embed_text(context_text[:2000])  # cap context length
             dot = sum(a * b for a, b in zip(claim_vec, ctx_vec))
@@ -383,18 +381,19 @@ class HallucinationFirewall:
         score = 0.8  # optimistic prior
         try:
             from sqlalchemy import text
-            row = self.db.execute(
-                text(
-                    "SELECT COUNT(*) AS total, "
-                    "SUM(success) AS wins "
-                    "FROM skill_execution_metrics "
-                    "WHERE skill_name = :name "
-                    "AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
-                ),
-                {"name": skill_name},
-            ).fetchone()
-            if row and row[0] >= 5:
-                score = row[1] / row[0]
+            with self._db() as db:
+                row = db.execute(
+                    text(
+                        "SELECT COUNT(*) AS total, "
+                        "SUM(success) AS wins "
+                        "FROM skill_execution_metrics "
+                        "WHERE skill_name = :name "
+                        "AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)"
+                    ),
+                    {"name": skill_name},
+                ).fetchone()
+                if row and row[0] >= 5:
+                    score = row[1] / row[0]
         except Exception:
             pass
 
@@ -441,9 +440,7 @@ class HallucinationFirewall:
             "evidence": result.evidence_count,
         }
 
-        from api.database import SessionLocal
-        from concurrent.futures import ThreadPoolExecutor
-        _fw_pool.submit(self._write_verification, SessionLocal, check_row, evidence_rows)
+        _fw_pool.submit(self._write_verification, self._db_factory, check_row, evidence_rows)
 
     @staticmethod
     def _write_verification(db_factory, check_row: dict, evidence_rows: list[dict]) -> None:
@@ -494,6 +491,7 @@ class HallucinationFirewall:
         try:
             from core.verification.schema import init_hallucination_tables
 
-            init_hallucination_tables(self.db)
+            with self._db() as db:
+                init_hallucination_tables(db)
         except Exception as e:
             logger.warning(f"Table initialization skipped: {e}")

@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ def _parse_json_array(text: str) -> list[dict[str, Any]]:
     return []
 
 
-class Observer:
+class Observer(DbConsumer):
     """Extract structured observations from conversation events.
 
     Tracks observed message count per (user, session) in the observations
@@ -94,8 +95,8 @@ class Observer:
     across multiple instances.
     """
 
-    def __init__(self, db: Session, llm_client=None):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, llm_client=None):
+        super().__init__(db_factory)
         self.llm = llm_client
 
     def observe(
@@ -154,13 +155,14 @@ class Observer:
         Uses the max observed_msg_index stored in the observations table.
         Falls back to 0 if no observations exist.
         """
-        from api.models import Observation
-        from sqlalchemy import func
+        with self._db() as db:
+            from api.models import Observation
+            from sqlalchemy import func
 
-        result = self.db.query(func.max(Observation.observed_msg_index)).filter(
-            Observation.session_id == session_id,
-        ).scalar()
-        return result or 0
+            result = db.query(func.max(Observation.observed_msg_index)).filter(
+                Observation.session_id == session_id,
+            ).scalar()
+            return result or 0
 
     def _advance_index(self, session_id: str, user_id: str, new_idx: int) -> None:
         """Store a marker observation to advance the observed index.
@@ -168,23 +170,24 @@ class Observer:
         Without this, LLM returning [] would cause the same messages to be
         re-processed on every turn — wasting LLM calls.
         """
-        from api.models import Observation
+        with self._db() as db:
+            from api.models import Observation
 
-        marker = Observation(
-            observation_id=str(uuid.uuid4()),
-            user_id=user_id,
-            session_id=session_id,
-            content="[no observations extracted]",
-            priority="low",
-            observation_type="marker",
-            observed_at=datetime.now(),
-            source_event_ids="[]",
-            is_reflected=1,  # Already "reflected" so it never shows in context
-            observed_msg_index=new_idx,
-            confidence=0.0,
-        )
-        self.db.add(marker)
-        self.db.commit()
+            marker = Observation(
+                observation_id=str(uuid.uuid4()),
+                user_id=user_id,
+                session_id=session_id,
+                content="[no observations extracted]",
+                priority="low",
+                observation_type="marker",
+                observed_at=datetime.now(),
+                source_event_ids="[]",
+                is_reflected=1,  # Already "reflected" so it never shows in context
+                observed_msg_index=new_idx,
+                confidence=0.0,
+            )
+            db.add(marker)
+            db.commit()
 
     def get_observed_index(self, session_id: str) -> int:
         """Public accessor for observed index."""
@@ -233,76 +236,77 @@ class Observer:
         Deduplicates against existing observations in the same session
         (exact content match). Assigns confidence from priority.
         """
-        from api.models import Observation
+        with self._db() as db:
+            from api.models import Observation
 
-        source_ids = [
-            m.get("event_id", "")
-            for m in source_messages
-            if m.get("event_id")
-        ]
+            source_ids = [
+                m.get("event_id", "")
+                for m in source_messages
+                if m.get("event_id")
+            ]
 
-        # Load existing content for dedup
-        try:
-            existing = set(
-                row[0] for row in
-                self.db.query(Observation.content).filter(
-                    Observation.session_id == session_id,
-                    Observation.observation_type != "marker",
-                ).all()
-            )
-        except Exception:
-            existing = set()
+            # Load existing content for dedup
+            try:
+                existing = set(
+                    row[0] for row in
+                    db.query(Observation.content).filter(
+                        Observation.session_id == session_id,
+                        Observation.observation_type != "marker",
+                    ).all()
+                )
+            except Exception:
+                existing = set()
 
-        priority_confidence = {"high": 0.95, "medium": 0.75, "low": 0.5}
-        now = datetime.now()
-        stored = []
+            priority_confidence = {"high": 0.95, "medium": 0.75, "low": 0.5}
+            now = datetime.now()
+            stored = []
 
-        for obs in raw_observations:
-            if not isinstance(obs, dict) or not obs.get("content"):
-                continue
+            for obs in raw_observations:
+                if not isinstance(obs, dict) or not obs.get("content"):
+                    continue
 
-            content = obs["content"]
-            if content in existing:
-                logger.debug("Observer: skipping duplicate observation: %s", content[:80])
-                continue
-            existing.add(content)
+                content = obs["content"]
+                if content in existing:
+                    logger.debug("Observer: skipping duplicate observation: %s", content[:80])
+                    continue
+                existing.add(content)
 
-            ref_at = None
-            if obs.get("referenced_at"):
-                try:
-                    ref_at = datetime.fromisoformat(str(obs["referenced_at"]))
-                except (ValueError, TypeError):
-                    pass
+                ref_at = None
+                if obs.get("referenced_at"):
+                    try:
+                        ref_at = datetime.fromisoformat(str(obs["referenced_at"]))
+                    except (ValueError, TypeError):
+                        pass
 
-            priority = obs.get("priority", "medium")
-            confidence = priority_confidence.get(priority, 0.75)
+                priority = obs.get("priority", "medium")
+                confidence = priority_confidence.get(priority, 0.75)
 
-            entry = Observation(
-                observation_id=str(uuid.uuid4()),
-                user_id=user_id,
-                session_id=session_id,
-                content=content,
-                priority=priority,
-                observation_type=obs.get("type", "fact"),
-                observed_at=now,
-                referenced_at=ref_at,
-                source_event_ids=json.dumps(source_ids),
-                observed_msg_index=observed_msg_index,
-                confidence=confidence,
-            )
-            self.db.add(entry)
-            stored.append({
-                "observation_id": entry.observation_id,
-                "content": entry.content,
-                "priority": entry.priority,
-                "confidence": confidence,
-            })
+                entry = Observation(
+                    observation_id=str(uuid.uuid4()),
+                    user_id=user_id,
+                    session_id=session_id,
+                    content=content,
+                    priority=priority,
+                    observation_type=obs.get("type", "fact"),
+                    observed_at=now,
+                    referenced_at=ref_at,
+                    source_event_ids=json.dumps(source_ids),
+                    observed_msg_index=observed_msg_index,
+                    confidence=confidence,
+                )
+                db.add(entry)
+                stored.append({
+                    "observation_id": entry.observation_id,
+                    "content": entry.content,
+                    "priority": entry.priority,
+                    "confidence": confidence,
+                })
 
-        if stored:
-            self.db.commit()
-            logger.info(f"Observer: created {len(stored)} observations for session {session_id}")
+            if stored:
+                db.commit()
+                logger.info(f"Observer: created {len(stored)} observations for session {session_id}")
 
-        return stored
+            return stored
 
     # ------------------------------------------------------------------
     # Retrieval
@@ -316,32 +320,33 @@ class Observer:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Retrieve active (non-reflected) observations for context assembly."""
-        from api.models import Observation
+        with self._db() as db:
+            from api.models import Observation
 
-        q = self.db.query(Observation).filter(
-            Observation.user_id == user_id,
-            Observation.is_reflected == 0,
-        )
+            q = db.query(Observation).filter(
+                Observation.user_id == user_id,
+                Observation.is_reflected == 0,
+            )
 
-        if session_id and not include_cross_session:
-            q = q.filter(Observation.session_id == session_id)
+            if session_id and not include_cross_session:
+                q = q.filter(Observation.session_id == session_id)
 
-        rows = q.order_by(Observation.observed_at.desc()).limit(limit).all()
+            rows = q.order_by(Observation.observed_at.desc()).limit(limit).all()
 
-        return [
-            {
-                "observation_id": r.observation_id,
-                "content": r.content,
-                "priority": r.priority,
-                "type": r.observation_type,
-                "observed_at": r.observed_at.isoformat() if r.observed_at else None,
-                "referenced_at": r.referenced_at.isoformat() if r.referenced_at else None,
-                "session_id": r.session_id,
-                "is_reflected": bool(r.is_reflected),
-                "confidence": getattr(r, "confidence", 0.75),
-            }
-            for r in reversed(rows)  # chronological order
-        ]
+            return [
+                {
+                    "observation_id": r.observation_id,
+                    "content": r.content,
+                    "priority": r.priority,
+                    "type": r.observation_type,
+                    "observed_at": r.observed_at.isoformat() if r.observed_at else None,
+                    "referenced_at": r.referenced_at.isoformat() if r.referenced_at else None,
+                    "session_id": r.session_id,
+                    "is_reflected": bool(r.is_reflected),
+                    "confidence": getattr(r, "confidence", 0.75),
+                }
+                for r in reversed(rows)  # chronological order
+            ]
 
     # ------------------------------------------------------------------
     # Context assembly

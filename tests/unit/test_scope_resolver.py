@@ -45,7 +45,7 @@ def test_resolve_token_priority(db):
     db.commit()
 
     chain = ScopeChainBuilder.dev_agent(user_id="alice")
-    resolver = ScopeResolver(db, chain)
+    resolver = ScopeResolver(lambda: db, chain)
 
     token = resolver.resolve_token("llm", "openai")
     assert token is not None
@@ -67,7 +67,7 @@ def test_resolve_token_fallback(db):
     db.commit()
 
     chain = ScopeChainBuilder.dev_agent(user_id="alice")
-    resolver = ScopeResolver(db, chain)
+    resolver = ScopeResolver(lambda: db, chain)
 
     token = resolver.resolve_token("llm", "openai")
     assert token is not None

@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import text
 
 from sqlalchemy.orm import Session
+from core.db_consumer import DbFactory
 from uuid_utils import uuid7
 
 from core.logging_config import get_logger
@@ -71,8 +72,10 @@ class _FeedbackBuffer:
     caller's Session when multiple threads add/flush concurrently.
     """
 
-    def __init__(self, db: Session, *, batch_size: int = 50, flush_interval: float = 2.0):
-        self._engine = db.get_bind()  # Engine is thread-safe; extract once
+    def __init__(self, db_factory: DbFactory, *, batch_size: int = 50, flush_interval: float = 2.0):
+        _tmp = db_factory()
+        self._engine = _tmp.get_bind()  # Engine is thread-safe; extract once
+        _tmp.close()
         self._batch_size = batch_size
         self._flush_interval = flush_interval
         self._buffer: list[dict[str, Any]] = []
@@ -151,7 +154,7 @@ class SkillPipeline:
 
     def __init__(
         self,
-        db: Session,
+        db_factory: DbFactory,
         llm_client: Any,
         *,
         audit: bool = True,
@@ -159,7 +162,7 @@ class SkillPipeline:
         learning_weights: SignalWeights | None = None,
         embed_fn=None,
     ):
-        self._db = db
+        self._db_factory = db_factory
         self._llm = llm_client
         self._audit = audit
         self._learning = learning
@@ -168,22 +171,20 @@ class SkillPipeline:
         if embed_fn is None:
             try:
                 from core.context.embeddings import EmbeddingService
-                # Phase 2 bridge: SkillPipeline holds a raw session;
-                # EmbeddingService needs a factory.
-                from api.database import SessionLocal
-                _svc = EmbeddingService(SessionLocal)
+                _svc = EmbeddingService(db_factory)
                 if _svc.provider != "mock":
                     embed_fn = _svc.embed_text
             except Exception:  # noqa: BLE001
                 pass  # no embeddings available — keyword fallback
 
         # Internal engines (not exposed)
+        db = db_factory()
         self._modern = ModernSkillSelector(db, llm_client, embed_fn=embed_fn)
         self._improver: SelfImprovingSelector | None = None
         if learning:
-            self._improver = SelfImprovingSelector(db, llm_client, weights=learning_weights)
+            self._improver = SelfImprovingSelector(db_factory, llm_client, weights=learning_weights)
 
-        self._feedback = _FeedbackBuffer(db)
+        self._feedback = _FeedbackBuffer(db_factory)
 
     def reload_skills(self, registry=None):
         """Reload skills from DB after registration."""
@@ -307,7 +308,7 @@ class SkillPipeline:
             face_applied = 0
             try:
                 from core.learning.input_face_learner import InputFaceLearner
-                face_learner = InputFaceLearner(self._db, self._llm)
+                face_learner = InputFaceLearner(self._db_factory, self._llm)
                 input_face_results = face_learner.diagnose_and_fix(
                     days=days, dry_run=skip_gate,
                 )
@@ -334,7 +335,7 @@ class SkillPipeline:
             if not skip_gate:
                 try:
                     from core.evaluation.regression_gate import RegressionGate, ChangeType
-                    gate = RegressionGate(self._db)
+                    gate = RegressionGate(self._db_factory)
                     gate_result = gate.validate_change(
                         change_type=ChangeType.SELECTOR,
                         change_id=f"learning_cycle_{days}d",
@@ -376,7 +377,7 @@ class SkillPipeline:
             logger.info("Rolled back %d learnings (since %s)", count, since)
         except Exception as e:
             logger.error("Learning rollback failed: %s", e)
-            self._db.rollback()
+            pass  # improver handles its own sessions
 
     def stats(self) -> dict[str, Any]:
         """Get learning statistics."""
@@ -398,8 +399,9 @@ class SkillPipeline:
         sql += " ORDER BY created_at DESC LIMIT :lim"
         params["lim"] = limit
 
+        db = self._db_factory()
         try:
-            rows = self._db.execute(text(sql), params).fetchall()
+            rows = db.execute(text(sql), params).fetchall()
             return [
                 {
                     "event_id": r[0], "session_id": r[1], "user_query": r[2],
@@ -411,6 +413,8 @@ class SkillPipeline:
         except Exception as e:
             logger.error("Failed to get selection history: %s", e)
             return []
+        finally:
+            db.close()
 
     # ------------------------------------------------------------------
     # Internal
@@ -429,21 +433,22 @@ class SkillPipeline:
         skill_names = [t["function"]["name"] for t in tools]
         top_skill = skill_names[0] if skill_names else None
 
-        # Resolve current active version from registry
-        skill_version = None
-        if top_skill:
-            try:
-                row = self._db.execute(
-                    text("SELECT version FROM skills_registry WHERE skill_name = :n AND is_active = 1 ORDER BY created_at DESC LIMIT 1"),
-                    {"n": top_skill},
-                ).fetchone()
-                if row:
-                    skill_version = row[0]
-            except Exception:
-                pass  # version is best-effort
-
+        db = self._db_factory()
         try:
-            self._db.execute(
+            # Resolve current active version from registry
+            skill_version = None
+            if top_skill:
+                try:
+                    row = db.execute(
+                        text("SELECT version FROM skills_registry WHERE skill_name = :n AND is_active = 1 ORDER BY created_at DESC LIMIT 1"),
+                        {"n": top_skill},
+                    ).fetchone()
+                    if row:
+                        skill_version = row[0]
+                except Exception:
+                    pass  # version is best-effort
+
+            db.execute(
                 text("""INSERT INTO skill_selection_events
                        (event_id, session_id, user_query, selected_skills,
                         skill_name, skill_version, selection_method, created_at)
@@ -460,10 +465,11 @@ class SkillPipeline:
                     "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
                 },
             )
-            self._db.commit()
+            db.commit()
         except Exception as e:
             logger.warning("Audit event write failed: %s", e)
-            self._db.rollback()
-            return event_id  # Return ID anyway; selection still works
+            db.rollback()
+        finally:
+            db.close()
 
         return event_id

@@ -14,9 +14,9 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
@@ -89,7 +89,7 @@ class PolicyDecision:
     reason: str
 
 
-class HITLPolicyEngine:
+class HITLPolicyEngine(DbConsumer):
     """Evaluates supervision policies against proposed actions.
 
     Supports **Adaptive Supervision Decay**: skills that succeed consecutively
@@ -102,11 +102,11 @@ class HITLPolicyEngine:
 
     def __init__(
         self,
-        db: Session | None = None,
+        db_factory: DbFactory,
         *,
         decay_threshold: int = DEFAULT_DECAY_THRESHOLD,
     ):
-        self.db = db
+        super().__init__(db_factory)
         self._policies: list[SupervisionPolicy] = []
         self._decay_threshold = decay_threshold
         # skill_name → consecutive success count
@@ -114,60 +114,60 @@ class HITLPolicyEngine:
 
     def load_policies(self, agent_id: str | None = None):
         """Load active policies from DB."""
-        if not self.db:
-            return
-        try:
-            rows = self.db.execute(text("""
-                SELECT name, trigger_config, action, scope, scope_id, enabled
-                FROM supervision_policies
-                WHERE enabled = TRUE
-                  AND (scope = 'global'
-                       OR (scope = 'agent' AND scope_id = :agent_id))
-                ORDER BY name
-            """), {"agent_id": agent_id or ""}).fetchall()
+        with self._db() as db:
+            try:
+                rows = db.execute(text("""
+                    SELECT name, trigger_config, action, scope, scope_id, enabled
+                    FROM supervision_policies
+                    WHERE enabled = TRUE
+                      AND (scope = 'global'
+                           OR (scope = 'agent' AND scope_id = :agent_id))
+                    ORDER BY name
+                """), {"agent_id": agent_id or ""}).fetchall()
 
-            self._policies = []
-            for row in rows:
-                trigger_data = row[1] if isinstance(row[1], dict) else {}
-                self._policies.append(SupervisionPolicy(
-                    name=row[0],
-                    trigger=SupervisionTrigger(
-                        cost_exceeds=trigger_data.get("cost_exceeds"),
-                        confidence_below=trigger_data.get("confidence_below"),
-                        affects_resources=trigger_data.get("affects_resources"),
-                        plan_depth_exceeds=trigger_data.get("plan_depth_exceeds"),
-                        novel_skill_use=trigger_data.get("novel_skill_use", False),
-                        escalated_by_agent=trigger_data.get("escalated_by_agent", False),
-                    ),
-                    action=SupervisionAction(row[2]),
-                    scope=row[3],
-                    scope_id=row[4],
-                    enabled=bool(row[5]),
-                ))
-        except Exception as e:
-            logger.warning("Failed to load supervision policies: %s", e)
-        self._load_slo_tightening(agent_id)
+                self._policies = []
+                for row in rows:
+                    trigger_data = row[1] if isinstance(row[1], dict) else {}
+                    self._policies.append(SupervisionPolicy(
+                        name=row[0],
+                        trigger=SupervisionTrigger(
+                            cost_exceeds=trigger_data.get("cost_exceeds"),
+                            confidence_below=trigger_data.get("confidence_below"),
+                            affects_resources=trigger_data.get("affects_resources"),
+                            plan_depth_exceeds=trigger_data.get("plan_depth_exceeds"),
+                            novel_skill_use=trigger_data.get("novel_skill_use", False),
+                            escalated_by_agent=trigger_data.get("escalated_by_agent", False),
+                        ),
+                        action=SupervisionAction(row[2]),
+                        scope=row[3],
+                        scope_id=row[4],
+                        enabled=bool(row[5]),
+                    ))
+            except Exception as e:
+                logger.warning("Failed to load supervision policies: %s", e)
+            self._load_slo_tightening(agent_id)
 
     def _load_slo_tightening(self, agent_id: str | None):
         """Append tightened approval policy if a recent SLO breach event exists."""
-        if not self.db or not agent_id:
-            return
-        try:
-            row = self.db.execute(text("""
-                SELECT 1 FROM conversation_events
-                WHERE agent_id = :aid AND event_type = 'slo_hitl_tightened'
-                  AND created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
-                LIMIT 1
-            """), {"aid": agent_id}).fetchone()
-            if row:
-                self._policies.append(SupervisionPolicy(
-                    name="slo_breach_tightening",
-                    trigger=SupervisionTrigger(cost_exceeds=0.10),
-                    action=SupervisionAction.APPROVE_REJECT,
-                ))
-                logger.info("SLO breach tightening active for agent %s", agent_id)
-        except Exception as e:
-            logger.debug("SLO tightening check failed: %s", e)
+        with self._db() as db:
+            if not agent_id:
+                return
+            try:
+                row = db.execute(text("""
+                    SELECT 1 FROM conversation_events
+                    WHERE agent_id = :aid AND event_type = 'slo_hitl_tightened'
+                      AND created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
+                    LIMIT 1
+                """), {"aid": agent_id}).fetchone()
+                if row:
+                    self._policies.append(SupervisionPolicy(
+                        name="slo_breach_tightening",
+                        trigger=SupervisionTrigger(cost_exceeds=0.10),
+                        action=SupervisionAction.APPROVE_REJECT,
+                    ))
+                    logger.info("SLO breach tightening active for agent %s", agent_id)
+            except Exception as e:
+                logger.debug("SLO tightening check failed: %s", e)
 
     def add_policy(self, policy: SupervisionPolicy):
         """Add policy programmatically (for testing or bootstrap)."""
@@ -251,31 +251,30 @@ class HITLPolicyEngine:
 
     def _record(self, ctx: ActionContext, decision: PolicyDecision):
         """Record policy evaluation as auditable event."""
-        if not self.db:
-            return
-        try:
-            import json
-            from core.utils.id_generator import generate_id
-            eid = generate_id()
-            self.db.execute(text("""
-                INSERT INTO conversation_events
-                    (event_id, session_id, user_id, agent_id, agent_version,
-                     event_type, content, causal_chain_id, created_at)
-                VALUES
-                    (:eid, 'system_hitl', :uid, :aid, '1.0.0',
-                     'hitl_policy_evaluation', :content, :eid, NOW())
-            """), {
-                "eid": eid,
-                "uid": "system",
-                "aid": ctx.agent_id or "system",
-                "content": json.dumps({
-                    "action": decision.action.value,
-                    "triggered": decision.triggered_policies,
-                    "reason": decision.reason,
-                    "confidence": ctx.confidence,
-                    "cost": ctx.estimated_cost,
-                }),
-            })
-            self.db.commit()
-        except Exception as e:
-            logger.debug("Failed to record HITL decision: %s", e)
+        with self._db() as db:
+            try:
+                import json
+                from core.utils.id_generator import generate_id
+                eid = generate_id()
+                db.execute(text("""
+                    INSERT INTO conversation_events
+                        (event_id, session_id, user_id, agent_id, agent_version,
+                         event_type, content, causal_chain_id, created_at)
+                    VALUES
+                        (:eid, 'system_hitl', :uid, :aid, '1.0.0',
+                         'hitl_policy_evaluation', :content, :eid, NOW())
+                """), {
+                    "eid": eid,
+                    "uid": "system",
+                    "aid": ctx.agent_id or "system",
+                    "content": json.dumps({
+                        "action": decision.action.value,
+                        "triggered": decision.triggered_policies,
+                        "reason": decision.reason,
+                        "confidence": ctx.confidence,
+                        "cost": ctx.estimated_cost,
+                    }),
+                })
+                db.commit()
+            except Exception as e:
+                logger.debug("Failed to record HITL decision: %s", e)

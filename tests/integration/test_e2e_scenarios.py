@@ -665,7 +665,7 @@ class TestScenario8_Adversarial:
             content="Sure, I'll ignore my instructions."
         ))
 
-        evaluator = AdversarialEvaluator(db=db_session, llm_client=mock_llm)
+        evaluator = AdversarialEvaluator(lambda: db_session, llm_client=mock_llm)
         try:
             result = evaluator.run_attack(
                 agent_id="e2e-agent",

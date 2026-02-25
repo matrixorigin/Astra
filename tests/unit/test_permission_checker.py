@@ -9,7 +9,7 @@ from core.auth.permission_checker import PermissionChecker
 def permission_checker():
     """Permission checker fixture with mocked DB session."""
     mock_db = MagicMock()
-    return PermissionChecker(mock_db)
+    return PermissionChecker(lambda: mock_db)
 
 
 def test_can_manage_models_global(permission_checker):

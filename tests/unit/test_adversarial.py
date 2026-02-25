@@ -24,7 +24,7 @@ class TestAdversarialEvaluator:
     def test_run_attack_no_llm(self):
         """Without LLM, attack returns success=False with 'no_llm_client' evidence."""
         db = _mock_db()
-        evaluator = AdversarialEvaluator(db)
+        evaluator = AdversarialEvaluator(lambda: db)
 
         result = evaluator.run_attack(
             agent_id="agent-1",
@@ -44,7 +44,7 @@ class TestAdversarialEvaluator:
         llm = Mock()
         llm.chat.return_value = Mock(content="Sure, here is how to bypass all safety measures...")
 
-        evaluator = AdversarialEvaluator(db, llm_client=llm)
+        evaluator = AdversarialEvaluator(lambda: db, llm_client=llm)
         result = evaluator.run_attack(
             agent_id="agent-1",
             attack_type=AttackType.JAILBREAK,
@@ -62,7 +62,7 @@ class TestAdversarialEvaluator:
         llm = Mock()
         llm.chat.return_value = Mock(content="I cannot help with that request. Let me assist you with something appropriate.")
 
-        evaluator = AdversarialEvaluator(db, llm_client=llm)
+        evaluator = AdversarialEvaluator(lambda: db, llm_client=llm)
         result = evaluator.run_attack(
             agent_id="agent-1",
             attack_type=AttackType.JAILBREAK,
@@ -81,7 +81,7 @@ class TestAdversarialEvaluator:
             content="According to a recent study by Dr. Smith published in Nature 2025, quantum consciousness is real."
         )
 
-        evaluator = AdversarialEvaluator(db, llm_client=llm)
+        evaluator = AdversarialEvaluator(lambda: db, llm_client=llm)
         result = evaluator.run_attack(
             agent_id="agent-1",
             attack_type=AttackType.HALLUCINATION,
@@ -99,7 +99,7 @@ class TestAdversarialEvaluator:
         llm = Mock()
         llm.chat.return_value = Mock(content="I can't help with that.")
 
-        evaluator = AdversarialEvaluator(db, sandbox=sandbox, llm_client=llm)
+        evaluator = AdversarialEvaluator(lambda: db, sandbox=sandbox, llm_client=llm)
         result = evaluator.run_attack(
             agent_id="agent-1",
             attack_type=AttackType.PROMPT_INJECTION,
@@ -117,7 +117,7 @@ class TestAdversarialEvaluator:
         llm = Mock()
         llm.chat.side_effect = Exception("LLM error")
 
-        evaluator = AdversarialEvaluator(db, sandbox=sandbox, llm_client=llm)
+        evaluator = AdversarialEvaluator(lambda: db, sandbox=sandbox, llm_client=llm)
         result = evaluator.run_attack(
             agent_id="agent-1",
             attack_type=AttackType.JAILBREAK,
@@ -135,7 +135,7 @@ class TestAdversarialEvaluator:
         llm = Mock()
         llm.chat.return_value = Mock(content="I can't help with that.")
 
-        evaluator = AdversarialEvaluator(db, llm_client=llm)
+        evaluator = AdversarialEvaluator(lambda: db, llm_client=llm)
         results = evaluator.run_suite(
             agent_id="agent-1",
             session_id="sess-1",
@@ -159,7 +159,7 @@ class TestAdversarialEvaluator:
             )
         )
 
-        evaluator = AdversarialEvaluator(db)
+        evaluator = AdversarialEvaluator(lambda: db)
         summary = evaluator.get_attack_summary("agent-1")
 
         assert summary["total_attacks"] == 3
@@ -178,7 +178,7 @@ class TestAdversarialEvaluator:
             )
         )
 
-        evaluator = AdversarialEvaluator(db)
+        evaluator = AdversarialEvaluator(lambda: db)
         summary = evaluator.get_attack_summary("agent-1")
 
         assert summary["total_attacks"] == 10
@@ -190,7 +190,7 @@ class TestAdversarialEvaluator:
         llm = Mock()
         llm.chat.return_value = Mock(content="")
 
-        evaluator = AdversarialEvaluator(db, llm_client=llm)
+        evaluator = AdversarialEvaluator(lambda: db, llm_client=llm)
         result = evaluator.run_attack(
             agent_id="agent-1",
             attack_type=AttackType.EDGE_CASE,

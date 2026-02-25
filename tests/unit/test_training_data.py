@@ -38,7 +38,7 @@ class TestTrainingDataPipeline:
 
         db.execute.side_effect = [fetch_pairs, fetch_contamination]
 
-        pipeline = TrainingDataPipeline(db)
+        pipeline = TrainingDataPipeline(lambda: db)
         examples = pipeline.extract_examples("sess-1", min_quality=DataQuality.SILVER)
 
         assert len(examples) > 0
@@ -51,7 +51,7 @@ class TestTrainingDataPipeline:
         dedup_check.fetchone.return_value = None  # No duplicate
         db.execute.side_effect = [dedup_check, Mock(), None]  # check, insert, commit
 
-        pipeline = TrainingDataPipeline(db)
+        pipeline = TrainingDataPipeline(lambda: db)
         example = TrainingExample(
             example_id="ex-1",
             session_id="sess-1",
@@ -71,7 +71,7 @@ class TestTrainingDataPipeline:
         dedup_check.fetchone.return_value = ("existing-id",)  # Duplicate found
         db.execute.return_value = dedup_check
 
-        pipeline = TrainingDataPipeline(db)
+        pipeline = TrainingDataPipeline(lambda: db)
         example = TrainingExample(
             example_id="ex-1",
             session_id="sess-1",
@@ -96,7 +96,7 @@ class TestTrainingDataPipeline:
             )
         )
 
-        pipeline = TrainingDataPipeline(db)
+        pipeline = TrainingDataPipeline(lambda: db)
         dataset = pipeline.get_dataset(quality=DataQuality.GOLD, limit=100)
 
         assert len(dataset) == 2
@@ -114,7 +114,7 @@ class TestTrainingDataPipeline:
             )
         )
 
-        pipeline = TrainingDataPipeline(db)
+        pipeline = TrainingDataPipeline(lambda: db)
         stats = pipeline.get_statistics()
 
         assert stats["total"] == 150
@@ -149,7 +149,7 @@ class TestTrainingDataPipeline:
         llm = Mock()
         llm.chat.return_value = Mock(content="4")
 
-        pipeline = TrainingDataPipeline(db, llm_client=llm)
+        pipeline = TrainingDataPipeline(lambda: db, llm_client=llm)
         quality = pipeline._assess_quality("What is X?", "X is a well-known concept...")
         assert quality == DataQuality.GOLD
 
@@ -162,7 +162,7 @@ class TestTrainingDataPipeline:
         ]
         db.execute.return_value = fetch_existing
 
-        pipeline = TrainingDataPipeline(db)
+        pipeline = TrainingDataPipeline(lambda: db)
         # Near-duplicate should have high contamination
         score = pipeline._check_contamination(
             "other-session",
@@ -179,7 +179,7 @@ class TestTrainingDataPipeline:
         ]
         db.execute.return_value = fetch_existing
 
-        pipeline = TrainingDataPipeline(db)
+        pipeline = TrainingDataPipeline(lambda: db)
         # Completely different content should have low contamination
         score = pipeline._check_contamination(
             "other-session",

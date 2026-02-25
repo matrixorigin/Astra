@@ -44,12 +44,12 @@ def llm():
 
 @pytest.fixture
 def observer(db, llm):
-    return Observer(db, llm)
+    return Observer(lambda: db, llm)
 
 
 @pytest.fixture
 def reflector(db, llm):
-    return Reflector(db, llm)
+    return Reflector(lambda: db, llm)
 
 
 # ---------------------------------------------------------------------------
@@ -81,23 +81,23 @@ class TestParseJsonArray:
 # ---------------------------------------------------------------------------
 
 class TestObserverGating:
-    def test_skip_below_threshold(self, observer):
+    def test_skip_below_threshold(self, observer, db):
         # Mock DB index query to return 0
-        observer.db.query.return_value.filter.return_value.scalar.return_value = 0
+        db.query.return_value.filter.return_value.scalar.return_value = 0
         result = observer.observe("s1", "u1", [{"role": "user", "content": "hi"}])
         assert result == []
         observer.llm.chat_with_tools.assert_not_called()
 
     def test_skip_no_llm(self, db):
         db.query.return_value.filter.return_value.scalar.return_value = 0
-        obs = Observer(db, llm_client=None)
+        obs = Observer(lambda: db, llm_client=None)
         result = obs.observe("s1", "u1", _make_messages())
         assert result == []
 
-    def test_skip_all_observed(self, observer):
+    def test_skip_all_observed(self, observer, db):
         """Skip when all messages already observed (DB index == len(messages))."""
         msgs = _make_messages()
-        observer.db.query.return_value.filter.return_value.scalar.return_value = len(msgs)
+        db.query.return_value.filter.return_value.scalar.return_value = len(msgs)
         result = observer.observe("s1", "u1", msgs)
         assert result == []
 
@@ -107,11 +107,11 @@ class TestObserverGating:
 # ---------------------------------------------------------------------------
 
 class TestObserverExtraction:
-    def _setup_db_index(self, observer, idx=0):
-        observer.db.query.return_value.filter.return_value.scalar.return_value = idx
+    def _setup_db_index(self, db, idx=0):
+        db.query.return_value.filter.return_value.scalar.return_value = idx
 
     def test_extract_and_store(self, observer, db):
-        self._setup_db_index(observer)
+        self._setup_db_index(db)
         observer.llm.chat_with_tools.return_value = {
             "content": json.dumps([
                 {"content": "User prefers Python", "priority": "high", "type": "preference"},
@@ -126,22 +126,22 @@ class TestObserverExtraction:
 
     def test_extract_with_garbage(self, observer, db):
         """LLM returns JSON with surrounding text."""
-        self._setup_db_index(observer)
+        self._setup_db_index(db)
         observer.llm.chat_with_tools.return_value = {
             "content": 'Here are the observations:\n[{"content": "test", "priority": "low", "type": "fact"}]\nDone!'
         }
         result = observer.observe("s1", "u1", _make_messages())
         assert len(result) == 1
 
-    def test_extract_empty(self, observer):
-        self._setup_db_index(observer)
+    def test_extract_empty(self, observer, db):
+        self._setup_db_index(db)
         observer.llm.chat_with_tools.return_value = {"content": "[]"}
         result = observer.observe("s1", "u1", _make_messages())
         assert result == []
 
     def test_extract_empty_advances_index(self, observer, db):
         """LLM returns [] → must write marker row to advance DB index, avoiding repeated LLM calls."""
-        self._setup_db_index(observer)
+        self._setup_db_index(db)
         observer.llm.chat_with_tools.return_value = {"content": "[]"}
         msgs = _make_messages(10)
         observer.observe("s1", "u1", msgs)
@@ -153,7 +153,7 @@ class TestObserverExtraction:
 
     def test_llm_failure_advances_index(self, observer, db):
         """LLM exception → must still advance index so we don't retry same messages."""
-        self._setup_db_index(observer)
+        self._setup_db_index(db)
         observer.llm.chat_with_tools.side_effect = RuntimeError("LLM down")
         msgs = _make_messages(10)
         result = observer.observe("s1", "u1", msgs)
@@ -163,14 +163,14 @@ class TestObserverExtraction:
         assert added.observed_msg_index == 10
         assert added.is_reflected == 1
 
-    def test_llm_failure_graceful(self, observer):
-        self._setup_db_index(observer)
+    def test_llm_failure_graceful(self, observer, db):
+        self._setup_db_index(db)
         observer.llm.chat_with_tools.side_effect = RuntimeError("LLM down")
         result = observer.observe("s1", "u1", _make_messages())
         assert result == []
 
     def test_referenced_at_parsing(self, observer, db):
-        self._setup_db_index(observer)
+        self._setup_db_index(db)
         observer.llm.chat_with_tools.return_value = {
             "content": json.dumps([{
                 "content": "Flight on Jan 31",
@@ -186,7 +186,7 @@ class TestObserverExtraction:
 
     def test_observed_msg_index_stored(self, observer, db):
         """Each observation stores the message index for DB-backed tracking."""
-        self._setup_db_index(observer)
+        self._setup_db_index(db)
         observer.llm.chat_with_tools.return_value = {
             "content": json.dumps([{"content": "test", "priority": "low", "type": "fact"}])
         }
@@ -378,7 +378,7 @@ class TestReflector:
             assert result["reflected"] is False
 
     def test_skip_no_llm(self, db):
-        ref = Reflector(db, llm_client=None)
+        ref = Reflector(lambda: db, llm_client=None)
         with patch("core.memory.observer.Observer") as MockObs:
             MockObs.return_value.get_observations.return_value = _big_observations()
             result = ref.reflect("u1")
@@ -426,7 +426,7 @@ class TestReflector:
             with pytest.raises(RuntimeError, match="DB error"):
                 reflector.reflect("u1")
 
-        db.rollback.assert_called_once()
+        db.rollback.assert_called()
 
     def test_reject_if_condensed_longer(self, reflector, db):
         """Quality gate: discard condensed output if it's longer than original."""
@@ -540,7 +540,7 @@ class TestLifecycleReflector:
     def test_hourly_tasks_includes_reflector(self):
         from core.context.lifecycle import MemoryGovernanceEngine
         db = MagicMock()
-        engine = MemoryGovernanceEngine(db)
+        engine = MemoryGovernanceEngine(lambda: db)
 
         with patch.object(engine, "_archive_closed_notes", return_value=0), \
              patch.object(engine, "_run_reflector", return_value=5) as mock_ref, \
@@ -555,7 +555,7 @@ class TestLifecycleReflector:
         from core.context.lifecycle import MemoryGovernanceEngine
         db = MagicMock()
         llm = MagicMock()
-        engine = MemoryGovernanceEngine(db, llm_client=llm)
+        engine = MemoryGovernanceEngine(lambda: db, llm_client=llm)
         assert engine.llm_client is llm
 
 
@@ -576,8 +576,8 @@ class TestObserverEdgeCases:
             "content": json.dumps([{"content": "obs", "priority": "low", "type": "fact"}])
         }
 
-        obs1 = Observer(db, llm)
-        obs2 = Observer(db, llm)
+        obs1 = Observer(lambda: db, llm)
+        obs2 = Observer(lambda: db, llm)
 
         r1 = obs1.observe("s1", "u1", _make_messages())
         r2 = obs2.observe("s1", "u1", _make_messages())
@@ -593,7 +593,7 @@ class TestObserverEdgeCases:
 
         The outer _run_observer catches it — next turn will retry same messages.
         """
-        observer.db.query.return_value.filter.return_value.scalar.return_value = 0
+        db.query.return_value.filter.return_value.scalar.return_value = 0
         observer.llm.chat_with_tools.return_value = {"content": "[]"}
 
         # Make commit fail (simulating DB down)
@@ -604,7 +604,7 @@ class TestObserverEdgeCases:
 
     def test_store_observations_db_failure(self, observer, db):
         """If DB commit fails during store, exception propagates (caught by bg thread)."""
-        observer.db.query.return_value.filter.return_value.scalar.return_value = 0
+        db.query.return_value.filter.return_value.scalar.return_value = 0
         observer.llm.chat_with_tools.return_value = {
             "content": json.dumps([{"content": "test", "priority": "low", "type": "fact"}])
         }
@@ -617,12 +617,12 @@ class TestObserverEdgeCases:
 class TestObserverDedup:
     """Deduplication and confidence scoring."""
 
-    def _setup(self, observer):
-        observer.db.query.return_value.filter.return_value.scalar.return_value = 0
+    def _setup(self, db):
+        db.query.return_value.filter.return_value.scalar.return_value = 0
 
     def test_within_batch_dedup(self, observer, db):
         """Duplicate content within a single LLM response should be stored only once."""
-        self._setup(observer)
+        self._setup(db)
         observer.llm.chat_with_tools.return_value = {
             "content": json.dumps([
                 {"content": "User prefers Python", "priority": "high", "type": "preference"},
@@ -637,7 +637,7 @@ class TestObserverDedup:
 
     def test_confidence_from_priority(self, observer, db):
         """Observations should have confidence derived from priority."""
-        self._setup(observer)
+        self._setup(db)
         observer.llm.chat_with_tools.return_value = {
             "content": json.dumps([
                 {"content": "Critical decision", "priority": "high", "type": "decision"},

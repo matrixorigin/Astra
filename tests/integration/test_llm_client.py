@@ -63,7 +63,7 @@ def db(db_session):
 @pytest.fixture
 def client(db):
     """LLM client fixture."""
-    return LLMClient(db=db)
+    return LLMClient(lambda: db)
 
 
 def test_load_config(client):

@@ -18,6 +18,7 @@ from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +36,11 @@ class OptimizationResult:
     error: str | None = None
 
 
-class PromptOptimizer:
+class PromptOptimizer(DbConsumer):
     """Automatically improve prompts based on feedback + context snapshots."""
 
-    def __init__(self, db: Session, llm_client):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, llm_client):
+        super().__init__(db_factory)
         self.llm = llm_client
 
     def optimize(
@@ -127,45 +128,47 @@ class PromptOptimizer:
     # ── Internal ──────────────────────────────────────────────────
 
     def _get_current_prompt(self, template_id: str) -> tuple[str, str] | None:
-        row = self.db.execute(
-            text(
-                "SELECT version, content FROM prompt_templates "
-                "WHERE template_id = :tid AND is_active = 1 "
-                "ORDER BY created_at DESC LIMIT 1"
-            ),
-            {"tid": template_id},
-        ).first()
-        return (row[0], row[1]) if row else None
+        with self._db() as db:
+            row = db.execute(
+                text(
+                    "SELECT version, content FROM prompt_templates "
+                    "WHERE template_id = :tid AND is_active = 1 "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"tid": template_id},
+            ).first()
+            return (row[0], row[1]) if row else None
 
     def _collect_failure_cases(
         self, template_id: str, threshold: int,
     ) -> list[dict[str, Any]]:
         """Get low-rated cases with their context snapshots."""
-        rows = self.db.execute(
-            text("""
-                SELECT f.rating, f.comment, f.llm_request_id,
-                       cs.system_prompt, cs.task_type,
-                       e.content as user_query
-                FROM llm_feedback f
-                LEFT JOIN context_snapshots cs ON f.llm_request_id = cs.llm_request_id
-                LEFT JOIN conversation_events e ON cs.event_id = e.event_id
-                WHERE f.prompt_template_id = :tid AND f.rating <= :threshold
-                ORDER BY f.created_at DESC
-                LIMIT 20
-            """),
-            {"tid": template_id, "threshold": threshold},
-        ).fetchall()
+        with self._db() as db:
+            rows = db.execute(
+                text("""
+                    SELECT f.rating, f.comment, f.llm_request_id,
+                           cs.system_prompt, cs.task_type,
+                           e.content as user_query
+                    FROM llm_feedback f
+                    LEFT JOIN context_snapshots cs ON f.llm_request_id = cs.llm_request_id
+                    LEFT JOIN conversation_events e ON cs.event_id = e.event_id
+                    WHERE f.prompt_template_id = :tid AND f.rating <= :threshold
+                    ORDER BY f.created_at DESC
+                    LIMIT 20
+                """),
+                {"tid": template_id, "threshold": threshold},
+            ).fetchall()
 
-        return [
-            {
-                "rating": r[0],
-                "comment": r[1],
-                "user_query": r[5] or "(unknown)",
-                "system_prompt_used": r[3] or "(not captured)",
-                "task_type": r[4] or "general",
-            }
-            for r in rows
-        ]
+            return [
+                {
+                    "rating": r[0],
+                    "comment": r[1],
+                    "user_query": r[5] or "(unknown)",
+                    "system_prompt_used": r[3] or "(not captured)",
+                    "task_type": r[4] or "general",
+                }
+                for r in rows
+            ]
 
     def _generate_improvement(
         self, template_id: str, current_prompt: str, cases: list[dict],
@@ -237,7 +240,7 @@ IMPROVED_PROMPT:
         try:
             from core.evaluation.regression_gate import RegressionGate, ChangeType
 
-            gate = RegressionGate(self.db)
+            gate = RegressionGate(self._db_factory)
             result = gate.validate_change(
                 change_type=ChangeType.PROMPT,
                 change_id=f"{template_id}@{new_version}",
@@ -254,10 +257,7 @@ IMPROVED_PROMPT:
     ) -> None:
         """Register and activate the new prompt version."""
         from core.context.prompts import PromptManager
-        # Phase 2 bridge: PromptOptimizer holds a raw session;
-        # PromptManager needs a factory.
-        from api.database import SessionLocal
-        pm = PromptManager(SessionLocal)
+        pm = PromptManager(self._db_factory)
         pm.register_prompt(template_id, version, content, is_active=True)
 
     @staticmethod

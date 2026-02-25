@@ -16,7 +16,7 @@ class TestAgentScratchpad:
     @pytest.fixture
     def scratchpad(self, mock_db):
         """Create scratchpad."""
-        return AgentScratchpad(mock_db)
+        return AgentScratchpad(lambda: mock_db)
     
     def test_create_note(self, scratchpad, mock_db):
         """Test note creation."""

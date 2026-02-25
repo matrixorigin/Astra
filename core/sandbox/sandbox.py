@@ -10,12 +10,13 @@ from sqlalchemy.orm import Session
 
 from core.sandbox.branch import Branch
 from core.validation import validate_identifier
+from core.db_consumer import DbConsumer, DbFactory
 
 if TYPE_CHECKING:
     from datetime import datetime
 
 
-class Sandbox:
+class Sandbox(DbConsumer):
     """Sandbox for isolated experiments with metadata management.
 
     Internal implementation uses `data branch` for zero-copy table branching.
@@ -24,14 +25,12 @@ class Sandbox:
     """
 
     def __init__(
-        self, db: Session, source_db: str = "dev_agent", account: str = "sys"
+        self, db_factory: DbFactory, source_db: str = "dev_agent", account: str = "sys"
     ):
-        if not isinstance(db, Session):
-            raise TypeError("db must be a SQLAlchemy Session")
-        self.db = db
+        super().__init__(db_factory)
         self.source_db = source_db
         self.account = account
-        self.branch = Branch(database=source_db, db=db)
+        self.branch = Branch(self._db_factory, database=source_db)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -56,57 +55,58 @@ class Sandbox:
             pitr_range: PITR retention length (default 1).
             pitr_unit: PITR retention unit: 'h','d','mo','y' (default 'w' = week? MO uses 'd').
         """
-        import json
+        with self._db() as db:
+            import json
 
-        validate_identifier(name)
-        self.db.commit()
+            validate_identifier(name)
+            db.commit()
 
-        # 1. Create empty database
-        self.db.execute(text(f"DROP DATABASE IF EXISTS {name}"))
-        self.db.commit()
-        self.db.execute(text(f"CREATE DATABASE {name}"))
-        self.db.commit()
+            # 1. Create empty database
+            db.execute(text(f"DROP DATABASE IF EXISTS {name}"))
+            db.commit()
+            db.execute(text(f"CREATE DATABASE {name}"))
+            db.commit()
 
-        # 2. Branch tables (zero-copy)
-        if tables:
-            for t in tables:
-                self.branch.create(f"{name}.{t}", f"{self.source_db}.{t}")
+            # 2. Branch tables (zero-copy)
+            if tables:
+                for t in tables:
+                    self.branch.create(f"{name}.{t}", f"{self.source_db}.{t}")
 
-        # 3. Create PITR for sandbox database
-        pitr_name = f"{name}__pitr"
-        try:
-            self.db.execute(text(f"drop pitr if exists {pitr_name}"))
-            self.db.commit()
-            self.db.execute(text(
-                f"create pitr {pitr_name} for database {name} range {pitr_range} '{pitr_unit}'"
-            ))
-            self.db.commit()
-        except Exception:
-            pass  # PITR creation is best-effort
+            # 3. Create PITR for sandbox database
+            pitr_name = f"{name}__pitr"
+            try:
+                db.execute(text(f"drop pitr if exists {pitr_name}"))
+                db.commit()
+                db.execute(text(
+                    f"create pitr {pitr_name} for database {name} range {pitr_range} '{pitr_unit}'"
+                ))
+                db.commit()
+            except Exception:
+                pass  # PITR creation is best-effort
 
-        # 4. Store metadata
-        tags_json = json.dumps(tags) if tags else None
-        self.db.execute(
-            text(f"""
-                INSERT INTO {self.source_db}.sandbox_metadata
-                (sandbox_name, user_id, data_source, description, created_by,
-                 created_at, updated_at, tags, source_database, source_snapshot, status, session_id)
-                VALUES (:name, :created_by, :data_source, :description, :created_by,
-                        CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6),
-                        :tags, :source_db, :snapshot, 'active', :session_id)
-            """),
-            {
-                "name": name,
-                "created_by": created_by,
-                "data_source": json.dumps({"type": "matrixone", "database": name}),
-                "description": description,
-                "tags": tags_json,
-                "source_db": self.source_db,
-                "snapshot": None,
-                "session_id": session_id,
-            },
-        )
-        self.db.commit()
+            # 4. Store metadata
+            tags_json = json.dumps(tags) if tags else None
+            db.execute(
+                text(f"""
+                    INSERT INTO {self.source_db}.sandbox_metadata
+                    (sandbox_name, user_id, data_source, description, created_by,
+                     created_at, updated_at, tags, source_database, source_snapshot, status, session_id)
+                    VALUES (:name, :created_by, :data_source, :description, :created_by,
+                            CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6),
+                            :tags, :source_db, :snapshot, 'active', :session_id)
+                """),
+                {
+                    "name": name,
+                    "created_by": created_by,
+                    "data_source": json.dumps({"type": "matrixone", "database": name}),
+                    "description": description,
+                    "tags": tags_json,
+                    "source_db": self.source_db,
+                    "snapshot": None,
+                    "session_id": session_id,
+                },
+            )
+            db.commit()
 
     def delete(self, name: str, force: bool = False) -> None:
         """Delete sandbox: branch metadata + snapshots + PITR + database.
@@ -115,70 +115,71 @@ class Sandbox:
         so the sandbox can be retried later. With force=True, metadata
         and database are always dropped (may leave orphan snapshots).
         """
-        validate_identifier(name)
-        self.db.commit()
+        with self._db() as db:
+            validate_identifier(name)
+            db.commit()
 
-        failures: list[str] = []
+            failures: list[str] = []
 
-        # 1. Collect resources before any destructive ops
-        tables = self.list_tables(name)
-        snapshots = self._list_snapshots_raw(name)
-        pitr_name = f"{name}__pitr"
+            # 1. Collect resources before any destructive ops
+            tables = self.list_tables(name)
+            snapshots = self._list_snapshots_raw(name)
+            pitr_name = f"{name}__pitr"
 
-        # 2. Delete branch metadata per table
-        for t in tables:
+            # 2. Delete branch metadata per table
+            for t in tables:
+                try:
+                    self.branch.delete(f"{name}.{t}")
+                except Exception as e:
+                    failures.append(f"branch delete {name}.{t}: {e}")
+
+            # 3. Drop all snapshots
+            for sp in snapshots:
+                try:
+                    db.commit()
+                    db.execute(text(f"drop snapshot {sp}"))
+                    db.commit()
+                except Exception as e:
+                    failures.append(f"drop snapshot {sp}: {e}")
+
+            # 4. Drop PITR
             try:
-                self.branch.delete(f"{name}.{t}")
+                db.commit()
+                db.execute(text(f"drop pitr if exists {pitr_name}"))
+                db.commit()
             except Exception as e:
-                failures.append(f"branch delete {name}.{t}: {e}")
+                failures.append(f"drop pitr {pitr_name}: {e}")
 
-        # 3. Drop all snapshots
-        for sp in snapshots:
+            # 5. Verify snapshots actually gone
+            remaining = self._list_snapshots_raw(name)
+            if remaining:
+                failures.append(f"snapshots still exist: {remaining}")
+
+            # 6. Only drop DB + metadata if all clean (or force)
+            if failures and not force:
+                raise RuntimeError(
+                    f"Sandbox {name} partially cleaned, metadata kept for retry. "
+                    f"Failures: {failures}"
+                )
+
+            # Drop database
             try:
-                self.db.commit()
-                self.db.execute(text(f"drop snapshot {sp}"))
-                self.db.commit()
+                db.commit()
+                db.execute(text(f"DROP DATABASE IF EXISTS {name}"))
+                db.commit()
             except Exception as e:
-                failures.append(f"drop snapshot {sp}: {e}")
+                failures.append(f"DROP DATABASE {name}: {e}")
 
-        # 4. Drop PITR
-        try:
-            self.db.commit()
-            self.db.execute(text(f"drop pitr if exists {pitr_name}"))
-            self.db.commit()
-        except Exception as e:
-            failures.append(f"drop pitr {pitr_name}: {e}")
-
-        # 5. Verify snapshots actually gone
-        remaining = self._list_snapshots_raw(name)
-        if remaining:
-            failures.append(f"snapshots still exist: {remaining}")
-
-        # 6. Only drop DB + metadata if all clean (or force)
-        if failures and not force:
-            raise RuntimeError(
-                f"Sandbox {name} partially cleaned, metadata kept for retry. "
-                f"Failures: {failures}"
-            )
-
-        # Drop database
-        try:
-            self.db.commit()
-            self.db.execute(text(f"DROP DATABASE IF EXISTS {name}"))
-            self.db.commit()
-        except Exception as e:
-            failures.append(f"DROP DATABASE {name}: {e}")
-
-        # Delete metadata
-        try:
-            self.db.execute(text(
-                f"DELETE FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :name"
-            ), {"name": name})
-            self.db.commit()
-        except Exception as e:
-            if not force:
-                raise
-            failures.append(f"DELETE metadata {name}: {e}")
+            # Delete metadata
+            try:
+                db.execute(text(
+                    f"DELETE FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :name"
+                ), {"name": name})
+                db.commit()
+            except Exception as e:
+                if not force:
+                    raise
+                failures.append(f"DELETE metadata {name}: {e}")
 
     # ------------------------------------------------------------------
     # Table management
@@ -193,24 +194,26 @@ class Sandbox:
 
     def remove_table(self, sandbox: str, table: str) -> None:
         """Remove table from sandbox."""
-        try:
-            self.branch.delete(f"{sandbox}.{table}")
-        except Exception:
-            pass
-        self.db.execute(text(f"DROP TABLE IF EXISTS {sandbox}.{table}"))
-        self.db.commit()
-        self._touch_metadata(sandbox)
+        with self._db() as db:
+            try:
+                self.branch.delete(f"{sandbox}.{table}")
+            except Exception:
+                pass
+            db.execute(text(f"DROP TABLE IF EXISTS {sandbox}.{table}"))
+            db.commit()
+            self._touch_metadata(sandbox)
 
     def list_tables(self, sandbox: str) -> list[str]:
         """List tables in sandbox."""
-        try:
-            # Validate sandbox name to prevent SQL injection
-            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', sandbox):
-                raise ValueError(f"Invalid sandbox name: {sandbox}")
-            result = self.db.execute(text(f"SHOW TABLES FROM {sandbox}"))
-            return [row._mapping[f"Tables_in_{sandbox}"] for row in result]
-        except Exception:
-            return []
+        with self._db() as db:
+            try:
+                # Validate sandbox name to prevent SQL injection
+                if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', sandbox):
+                    raise ValueError(f"Invalid sandbox name: {sandbox}")
+                result = db.execute(text(f"SHOW TABLES FROM {sandbox}"))
+                return [row._mapping[f"Tables_in_{sandbox}"] for row in result]
+            except Exception:
+                return []
 
     # ------------------------------------------------------------------
     # Snapshot & Restore (on sandbox database)
@@ -218,19 +221,20 @@ class Sandbox:
 
     def snapshot(self, sandbox: str, name: str) -> None:
         """Create snapshot of sandbox database state."""
-        result = self.db.execute(
-            text(f"SELECT 1 FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :s"),
-            {"s": sandbox},
-        )
-        if not result.first():
-            raise ValueError(f"Sandbox {sandbox} not found")
+        with self._db() as db:
+            result = db.execute(
+                text(f"SELECT 1 FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :s"),
+                {"s": sandbox},
+            )
+            if not result.first():
+                raise ValueError(f"Sandbox {sandbox} not found")
 
-        snapshot_name = f"{sandbox}__{name}"
-        validate_identifier(snapshot_name)
-        self.db.commit()
-        self.db.execute(text(f"create snapshot {snapshot_name} for database {sandbox}"))
-        self.db.commit()
-        self._touch_metadata(sandbox)
+            snapshot_name = f"{sandbox}__{name}"
+            validate_identifier(snapshot_name)
+            db.commit()
+            db.execute(text(f"create snapshot {snapshot_name} for database {sandbox}"))
+            db.commit()
+            self._touch_metadata(sandbox)
 
     def list_snapshots(self, sandbox: str) -> list[dict]:
         """List snapshots for a sandbox."""
@@ -244,14 +248,15 @@ class Sandbox:
 
     def restore(self, sandbox: str, snapshot_name: str) -> None:
         """Restore sandbox database from a named snapshot."""
-        full_name = f"{sandbox}__{snapshot_name}"
-        validate_identifier(full_name)
-        self.db.commit()
-        self.db.execute(text(
-            f"restore account {self.account} database {sandbox} from snapshot {full_name}"
-        ))
-        self.db.commit()
-        self._touch_metadata(sandbox)
+        with self._db() as db:
+            full_name = f"{sandbox}__{snapshot_name}"
+            validate_identifier(full_name)
+            db.commit()
+            db.execute(text(
+                f"restore account {self.account} database {sandbox} from snapshot {full_name}"
+            ))
+            db.commit()
+            self._touch_metadata(sandbox)
 
     # ------------------------------------------------------------------
     # Diff & Merge (sandbox vs source)
@@ -290,37 +295,39 @@ class Sandbox:
 
     def use(self, sandbox: str) -> None:
         """Switch to sandbox database."""
-        validate_identifier(sandbox)
-        self.db.execute(text(f"USE {sandbox}"))
+        with self._db() as db:
+            validate_identifier(sandbox)
+            db.execute(text(f"USE {sandbox}"))
 
     def info(self, sandbox: str) -> dict:
         """Get sandbox info with metadata."""
-        result_meta = self.db.execute(
-            text(f"SELECT * FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :s"),
-            {"s": sandbox},
-        )
-        metadata = result_meta.first()
+        with self._db() as db:
+            result_meta = db.execute(
+                text(f"SELECT * FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :s"),
+                {"s": sandbox},
+            )
+            metadata = result_meta.first()
 
-        tables = self.list_tables(sandbox)
-        table_info = []
-        for t in tables:
-            if t.startswith("_") or t == "sandbox_metadata":
-                continue
-            try:
-                cr = self.db.execute(text(f"SELECT COUNT(*) as count FROM {sandbox}.{t}"))
-                count = cr.scalar() or 0
-            except Exception:
-                count = 0
-            table_info.append({"table": t, "rows": count})
+            tables = self.list_tables(sandbox)
+            table_info = []
+            for t in tables:
+                if t.startswith("_") or t == "sandbox_metadata":
+                    continue
+                try:
+                    cr = db.execute(text(f"SELECT COUNT(*) as count FROM {sandbox}.{t}"))
+                    count = cr.scalar() or 0
+                except Exception:
+                    count = 0
+                table_info.append({"table": t, "rows": count})
 
-        result = {
-            "sandbox_name": sandbox,
-            "table_count": len(tables),
-            "table_details": table_info,
-        }
-        if metadata:
-            result.update(dict(metadata._mapping))
-        return result
+            result = {
+                "sandbox_name": sandbox,
+                "table_count": len(tables),
+                "table_details": table_info,
+            }
+            if metadata:
+                result.update(dict(metadata._mapping))
+            return result
 
     def list_sandboxes(
         self,
@@ -333,35 +340,36 @@ class Sandbox:
         tags: list[str] | None = None,
     ) -> list[dict[str, str]]:
         """List sandboxes with filtering."""
-        query = f"SELECT * FROM {self.source_db}.sandbox_metadata WHERE 1=1"
-        params: dict = {}
+        with self._db() as db:
+            query = f"SELECT * FROM {self.source_db}.sandbox_metadata WHERE 1=1"
+            params: dict = {}
 
-        if prefix:
-            query += " AND sandbox_name LIKE :prefix"
-            params["prefix"] = f"{prefix}%"
-        if pattern:
-            query += " AND sandbox_name LIKE :pattern"
-            params["pattern"] = pattern
-        if status:
-            query += " AND status = :status"
-            params["status"] = status
-        if created_by:
-            query += " AND created_by = :created_by"
-            params["created_by"] = created_by
-        if created_after:
-            query += " AND created_at > :created_after"
-            params["created_after"] = created_after.isoformat()
-        if updated_after:
-            query += " AND updated_at > :updated_after"
-            params["updated_after"] = updated_after.isoformat()
-        if tags:
-            for i, tag in enumerate(tags):
-                query += f" AND tags LIKE :tag{i}"
-                params[f"tag{i}"] = f"%{tag}%"
+            if prefix:
+                query += " AND sandbox_name LIKE :prefix"
+                params["prefix"] = f"{prefix}%"
+            if pattern:
+                query += " AND sandbox_name LIKE :pattern"
+                params["pattern"] = pattern
+            if status:
+                query += " AND status = :status"
+                params["status"] = status
+            if created_by:
+                query += " AND created_by = :created_by"
+                params["created_by"] = created_by
+            if created_after:
+                query += " AND created_at > :created_after"
+                params["created_after"] = created_after.isoformat()
+            if updated_after:
+                query += " AND updated_at > :updated_after"
+                params["updated_after"] = updated_after.isoformat()
+            if tags:
+                for i, tag in enumerate(tags):
+                    query += f" AND tags LIKE :tag{i}"
+                    params[f"tag{i}"] = f"%{tag}%"
 
-        query += " ORDER BY created_at DESC"
-        result = self.db.execute(text(query), params)
-        return [dict(row._mapping) for row in result]
+            query += " ORDER BY created_at DESC"
+            result = db.execute(text(query), params)
+            return [dict(row._mapping) for row in result]
 
     def update(
         self,
@@ -371,25 +379,26 @@ class Sandbox:
         status: str | None = None,
     ) -> None:
         """Update sandbox metadata."""
-        updates = []
-        params: dict = {"name": name}
+        with self._db() as db:
+            updates = []
+            params: dict = {"name": name}
 
-        if description is not None:
-            updates.append("description = :description")
-            params["description"] = description
-        if tags is not None:
-            import json
-            updates.append("tags = :tags")
-            params["tags"] = json.dumps(tags)
-        if status is not None:
-            updates.append("status = :status")
-            params["status"] = status
+            if description is not None:
+                updates.append("description = :description")
+                params["description"] = description
+            if tags is not None:
+                import json
+                updates.append("tags = :tags")
+                params["tags"] = json.dumps(tags)
+            if status is not None:
+                updates.append("status = :status")
+                params["status"] = status
 
-        if updates:
-            updates.append("updated_at = CURRENT_TIMESTAMP")
-            q = f"UPDATE {self.source_db}.sandbox_metadata SET " + ", ".join(updates) + " WHERE sandbox_name = :name"
-            self.db.execute(text(q), params)
-            self.db.commit()
+            if updates:
+                updates.append("updated_at = CURRENT_TIMESTAMP")
+                q = f"UPDATE {self.source_db}.sandbox_metadata SET " + ", ".join(updates) + " WHERE sandbox_name = :name"
+                db.execute(text(q), params)
+                db.commit()
 
     # ------------------------------------------------------------------
     # Internal
@@ -397,20 +406,22 @@ class Sandbox:
 
     def _list_snapshots_raw(self, sandbox: str) -> list[str]:
         """Get snapshot names for a sandbox."""
-        prefix = f"{sandbox}__"
-        try:
-            self.db.commit()
-            result = self.db.execute(text(
-                f"show snapshots where snapshot_name like '{prefix}%'"
-            ))
-            return [row._mapping["snapshot_name"] for row in result]
-        except Exception:
-            return []
+        with self._db() as db:
+            prefix = f"{sandbox}__"
+            try:
+                db.commit()
+                result = db.execute(text(
+                    f"show snapshots where snapshot_name like '{prefix}%'"
+                ))
+                return [row._mapping["snapshot_name"] for row in result]
+            except Exception:
+                return []
 
     def _touch_metadata(self, sandbox: str) -> None:
         """Update updated_at timestamp."""
-        self.db.execute(text(
-            f"UPDATE {self.source_db}.sandbox_metadata SET updated_at = CURRENT_TIMESTAMP(6) "
-            f"WHERE sandbox_name = :s"
-        ), {"s": sandbox})
-        self.db.commit()
+        with self._db() as db:
+            db.execute(text(
+                f"UPDATE {self.source_db}.sandbox_metadata SET updated_at = CURRENT_TIMESTAMP(6) "
+                f"WHERE sandbox_name = :s"
+            ), {"s": sandbox})
+            db.commit()

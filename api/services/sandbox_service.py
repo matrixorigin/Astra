@@ -27,9 +27,9 @@ class SandboxService:
         """
         self.db_session = db_session
         from config.settings import get_settings
-        self.sandbox = Sandbox(db=db_session, source_db=get_settings().matrixone_database)
+        self.sandbox = Sandbox(db_factory=lambda: db_session, source_db=get_settings().matrixone_database)
         self.audit = AuditLogger(db_session)
-        self.permission = PermissionChecker(db_session)
+        self.permission = PermissionChecker(lambda: db_session)
 
     def create_sandbox(
         self,

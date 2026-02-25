@@ -10,18 +10,18 @@ import json
 from datetime import datetime, timezone
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
 from api.database import get_db_session
 from core.repos.token_models import Token, TokenType
+from core.db_consumer import DbConsumer, DbFactory
 
 
-class TokenResolver:
+class TokenResolver(DbConsumer):
     """Token resolution service."""
 
-    def __init__(self, db: Session | None = None) -> None:
-        self.db = db or next(get_db_session())
+    def __init__(self, db_factory: DbFactory) -> None:
+        super().__init__(db_factory)
 
     def resolve_repo_token(
         self,
@@ -65,118 +65,125 @@ class TokenResolver:
         metadata: dict | None = None,
     ) -> Token:
         """Create a new token."""
-        from api.models import Token as TokenModel
-        token_id = str(uuid7())
-        now = datetime.now(timezone.utc)
+        with self._db() as db:
+            from api.models import Token as TokenModel
+            token_id = str(uuid7())
+            now = datetime.now(timezone.utc)
 
-        token_model = TokenModel(
-            token_id=token_id,
-            type=token_type.value,
-            provider=provider,
-            scope_user_id=scope_user_id,
-            scope_repo=scope_repo,
-            secret_ref=secret_ref,
-            encrypted_value=encrypted_value,
-            is_active=True,
-            expires_at=expires_at,
-            created_at=now,
-            token_metadata=metadata or {},
-        )
-        self.db.add(token_model)
-        self.db.commit()
-        self.db.refresh(token_model)
+            token_model = TokenModel(
+                token_id=token_id,
+                type=token_type.value,
+                provider=provider,
+                scope_user_id=scope_user_id,
+                scope_repo=scope_repo,
+                secret_ref=secret_ref,
+                encrypted_value=encrypted_value,
+                is_active=True,
+                expires_at=expires_at,
+                created_at=now,
+                token_metadata=metadata or {},
+            )
+            db.add(token_model)
+            db.commit()
+            db.refresh(token_model)
 
-        return Token(
-            token_id=token_id,
-            token_type=token_type,
-            provider=provider,
-            scope_user_id=scope_user_id,
-            scope_repo=scope_repo,
-            secret_ref=secret_ref,
-            encrypted_value=encrypted_value,
-            is_active=True,
-            expires_at=expires_at,
-            created_at=now,
-            metadata=metadata or {},
-        )
+            return Token(
+                token_id=token_id,
+                token_type=token_type,
+                provider=provider,
+                scope_user_id=scope_user_id,
+                scope_repo=scope_repo,
+                secret_ref=secret_ref,
+                encrypted_value=encrypted_value,
+                is_active=True,
+                expires_at=expires_at,
+                created_at=now,
+                metadata=metadata or {},
+            )
 
     def get_token(self, token_id: str) -> Token | None:
         """Get token by ID."""
-        from api.models import Token as TokenModel
-        result = self.db.query(TokenModel).filter(TokenModel.token_id == token_id).first()
-        if not result:
-            return None
-        return self._to_model(result)
+        with self._db() as db:
+            from api.models import Token as TokenModel
+            result = db.query(TokenModel).filter(TokenModel.token_id == token_id).first()
+            if not result:
+                return None
+            return self._to_model(result)
 
     def deactivate_token(self, token_id: str) -> None:
         """Deactivate token (e.g., on 401 error)."""
-        from api.models import Token as TokenModel
-        self.db.query(TokenModel).filter(TokenModel.token_id == token_id).update({"is_active": False})
-        self.db.commit()
-        self.db.expire_all()  # Clear session cache
+        with self._db() as db:
+            from api.models import Token as TokenModel
+            db.query(TokenModel).filter(TokenModel.token_id == token_id).update({"is_active": False})
+            db.commit()
+            db.expire_all()  # Clear session cache
 
     def _get_repo_specific_token(
         self, repo_id: str | None, repo_url: str | None, user_id: str
     ) -> Token | None:
         """Get repo-specific token from repos table."""
-        from api.models import Repo as RepoModel
-        from api.models import Token as TokenModel
+        with self._db() as db:
+            from api.models import Repo as RepoModel
+            from api.models import Token as TokenModel
 
-        query = self.db.query(TokenModel).join(
-            RepoModel, RepoModel.token_id == TokenModel.token_id
-        ).filter(TokenModel.is_active == 1)
+            query = db.query(TokenModel).join(
+                RepoModel, RepoModel.token_id == TokenModel.token_id
+            ).filter(TokenModel.is_active == 1)
 
-        if repo_id:
-            query = query.filter(RepoModel.repo_id == repo_id, RepoModel.user_id == user_id)
-        elif repo_url:
-            query = query.filter(RepoModel.repo_url == repo_url, RepoModel.user_id == user_id)
-        else:
-            return None
+            if repo_id:
+                query = query.filter(RepoModel.repo_id == repo_id, RepoModel.user_id == user_id)
+            elif repo_url:
+                query = query.filter(RepoModel.repo_url == repo_url, RepoModel.user_id == user_id)
+            else:
+                return None
 
-        result = query.first()
-        return self._to_model(result) if result else None
+            result = query.first()
+            return self._to_model(result) if result else None
 
     def _get_user_default_token(self, user_id: str) -> Token | None:
         """Get user default token (no scope_repo)."""
-        from api.models import Token as TokenModel
-        result = self.db.query(TokenModel).filter(
-            TokenModel.type == 'repo',
-            TokenModel.scope_user_id == user_id,
-            TokenModel.scope_repo.is_(None),
-            TokenModel.is_active == 1
-        ).order_by(TokenModel.created_at.desc()).first()
-        return self._to_model(result) if result else None
+        with self._db() as db:
+            from api.models import Token as TokenModel
+            result = db.query(TokenModel).filter(
+                TokenModel.type == 'repo',
+                TokenModel.scope_user_id == user_id,
+                TokenModel.scope_repo.is_(None),
+                TokenModel.is_active == 1
+            ).order_by(TokenModel.created_at.desc()).first()
+            return self._to_model(result) if result else None
 
     def _get_global_token(self) -> Token | None:
         """Get global fallback token."""
-        query = """
-            SELECT * FROM tokens
-            WHERE type = 'repo'
-              AND scope_user_id IS NULL
-              AND scope_repo IS NULL
-              AND is_active = TRUE
-            ORDER BY created_at DESC
-            LIMIT 1
-        """
-        result = self.db.query(Token).filter(
-            Token.token_type == token_type,
-            Token.provider == provider,
-            Token.scope_type == scope_type,
-            Token.is_active == True
-        ).order_by(Token.created_at.desc()).first()
+        with self._db() as db:
+            query = """
+                SELECT * FROM tokens
+                WHERE type = 'repo'
+                  AND scope_user_id IS NULL
+                  AND scope_repo IS NULL
+                  AND is_active = TRUE
+                ORDER BY created_at DESC
+                LIMIT 1
+            """
+            result = db.query(Token).filter(
+                Token.token_type == token_type,
+                Token.provider == provider,
+                Token.scope_type == scope_type,
+                Token.is_active == True
+            ).order_by(Token.created_at.desc()).first()
 
-        return result if result else None
+            return result if result else None
 
     def _allow_global_token(self) -> bool:
         """Check if global token fallback is allowed using ORM."""
 
-        result = self.db.execute(
-            text("SELECT value FROM configs WHERE key_name = 'allow_global_repo_token'")
-        ).first()
+        with self._db() as db:
+            result = db.execute(
+                text("SELECT value FROM configs WHERE key_name = 'allow_global_repo_token'")
+            ).first()
 
-        if not result:
-            return False
-        return result[0].lower() in ("true", "1", "yes")
+            if not result:
+                return False
+            return result[0].lower() in ("true", "1", "yes")
 
     def _to_model(self, row) -> Token:
         """Convert ORM object to Token model.

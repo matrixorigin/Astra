@@ -107,7 +107,7 @@ class TestLearningApplication:
         })()
         from core.skills.self_improving_selector import SelfImprovingSelector
         si = SelfImprovingSelector(
-            clean_skill_learning_db,
+            lambda: clean_skill_learning_db,
             mock_llm_selector,
             weights=SignalWeights(accuracy=1.0, speed=0.0, cost=0.0, satisfaction=0.0),
         )

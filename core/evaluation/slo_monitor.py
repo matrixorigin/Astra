@@ -21,9 +21,9 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = get_logger(__name__)
 
@@ -69,43 +69,44 @@ class AgentSLOReport:
     created_at: datetime
 
 
-class SLOMonitor:
+class SLOMonitor(DbConsumer):
     """Monitors agent-level SLOs with burn-rate alerting."""
 
     MONTHLY_DAYS = 30
     SLO_COMPLIANCE_TARGET = 0.95  # 95% of days must meet SLO
 
-    def __init__(self, db: Session, slos: list[SLOTarget] | None = None,
+    def __init__(self, db_factory: DbFactory, slos: list[SLOTarget] | None = None,
                  gate_trigger=None):
-        self.db = db
+        super().__init__(db_factory)
         self.slos = slos or DEFAULT_SLOS
         self._gate_trigger = gate_trigger  # GateTrigger | None
 
     def check_agent(self, agent_id: str, period_days: int = 30) -> AgentSLOReport:
         """Check all SLOs for an agent over the given period."""
-        metrics = self._query_daily_metrics(agent_id, period_days)
-        statuses = [self._evaluate_slo(slo, metrics, period_days) for slo in self.slos]
+        with self._db() as db:
+            metrics = self._query_daily_metrics(agent_id, period_days)
+            statuses = [self._evaluate_slo(slo, metrics, period_days) for slo in self.slos]
 
-        report = AgentSLOReport(
-            agent_id=agent_id,
-            statuses=statuses,
-            period_days=period_days,
-            created_at=datetime.now(timezone.utc),
-        )
+            report = AgentSLOReport(
+                agent_id=agent_id,
+                statuses=statuses,
+                period_days=period_days,
+                created_at=datetime.now(timezone.utc),
+            )
 
-        # Record any non-OK statuses and trigger auto-response
-        for s in statuses:
-            if s.severity != SLOSeverity.OK:
-                self._record_alert(agent_id, s)
-                self._auto_respond(agent_id, s)
+            # Record any non-OK statuses and trigger auto-response
+            for s in statuses:
+                if s.severity != SLOSeverity.OK:
+                    self._record_alert(agent_id, s)
+                    self._auto_respond(agent_id, s)
 
-        # Batch commit all SLO events
-        try:
-            self.db.commit()
-        except Exception as e:
-            logger.debug("Failed to commit SLO events: %s", e)
+            # Batch commit all SLO events
+            try:
+                db.commit()
+            except Exception as e:
+                logger.debug("Failed to commit SLO events: %s", e)
 
-        return report
+            return report
 
     def get_daily_metrics(
         self, agent_id: str, period_days: int,
@@ -117,36 +118,37 @@ class SLOMonitor:
         self, agent_id: str, period_days: int,
     ) -> list[dict[str, Any]]:
         """Query daily aggregated metrics for an agent."""
-        try:
-            rows = self.db.execute(text("""
-                SELECT
-                    DATE(created_at) AS day,
-                    AVG(quality_score) AS avg_quality,
-                    SUM(CASE WHEN `metadata` IS NOT NULL
-                        AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.hallucination_detected')) = 'true'
-                        THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS hallucination_rate,
-                    COUNT(*) AS total_responses
-                FROM conversation_events
-                WHERE agent_id = :agent_id
-                  AND event_type = 'llm_response'
-                  AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
-                GROUP BY DATE(created_at)
-                ORDER BY day
-            """), {"agent_id": agent_id, "days": period_days}).fetchall()
+        with self._db() as db:
+            try:
+                rows = db.execute(text("""
+                    SELECT
+                        DATE(created_at) AS day,
+                        AVG(quality_score) AS avg_quality,
+                        SUM(CASE WHEN `metadata` IS NOT NULL
+                            AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.hallucination_detected')) = 'true'
+                            THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS hallucination_rate,
+                        COUNT(*) AS total_responses
+                    FROM conversation_events
+                    WHERE agent_id = :agent_id
+                      AND event_type = 'llm_response'
+                      AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
+                    GROUP BY DATE(created_at)
+                    ORDER BY day
+                """), {"agent_id": agent_id, "days": period_days}).fetchall()
 
-            return [
-                {
-                    "day": row[0],
-                    "avg_quality": float(row[1]) if row[1] else 0.0,
-                    "hallucination_rate": float(row[2]) if row[2] else 0.0,
-                    "total_responses": int(row[3]),
-                    "completion_rate": 0.95,  # TODO: derive from PAOR terminal states
-                }
-                for row in rows
-            ]
-        except Exception as e:
-            logger.warning("SLO metrics query failed: %s", e)
-            return []
+                return [
+                    {
+                        "day": row[0],
+                        "avg_quality": float(row[1]) if row[1] else 0.0,
+                        "hallucination_rate": float(row[2]) if row[2] else 0.0,
+                        "total_responses": int(row[3]),
+                        "completion_rate": 0.95,  # TODO: derive from PAOR terminal states
+                    }
+                    for row in rows
+                ]
+            except Exception as e:
+                logger.warning("SLO metrics query failed: %s", e)
+                return []
 
     def _evaluate_slo(
         self, slo: SLOTarget, daily_metrics: list[dict[str, Any]],
@@ -291,73 +293,73 @@ class SLOMonitor:
         Note: skills_registry and prompt_templates are global resources without agent_id,
         so this returns the most recent change across all agents within 7 days.
         """
-        try:
-            # Find most recent skill change
-            skill_row = self.db.execute(text("""
-                SELECT skill_name, version, updated_at
-                FROM skills_registry
-                WHERE updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-                ORDER BY updated_at DESC
-                LIMIT 1
-            """)).fetchone()
+        with self._db() as db:
+            try:
+                # Find most recent skill change
+                skill_row = db.execute(text("""
+                    SELECT skill_name, version, updated_at
+                    FROM skills_registry
+                    WHERE updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                """)).fetchone()
             
-            # Find most recent prompt change
-            prompt_row = self.db.execute(text("""
-                SELECT template_id, version, created_at
-                FROM prompt_templates
-                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-                ORDER BY created_at DESC
-                LIMIT 1
-            """)).fetchone()
+                # Find most recent prompt change
+                prompt_row = db.execute(text("""
+                    SELECT template_id, version, created_at
+                    FROM prompt_templates
+                    WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """)).fetchone()
             
-            # Return the most recent of the two
-            skill_ts = skill_row[2] if skill_row else None
-            prompt_ts = prompt_row[2] if prompt_row else None
+                # Return the most recent of the two
+                skill_ts = skill_row[2] if skill_row else None
+                prompt_ts = prompt_row[2] if prompt_row else None
             
-            if skill_ts and (not prompt_ts or skill_ts > prompt_ts):
-                return {
-                    "change_type": "skill_version_changed",
-                    "change_id": f"{skill_row[0]}@{skill_row[1]}",
-                    "skill_name": skill_row[0],
-                    "version": skill_row[1],
-                    "timestamp": skill_ts.isoformat(),
-                }
-            elif prompt_ts:
-                return {
-                    "change_type": "prompt_template_changed",
-                    "change_id": f"{prompt_row[0]}@{prompt_row[1]}",
-                    "template_id": prompt_row[0],
-                    "version": prompt_row[1],
-                    "timestamp": prompt_ts.isoformat(),
-                }
-            return None
-        except Exception as e:
-            logger.warning("Failed to query recent changes: %s", e)
-            return None
+                if skill_ts and (not prompt_ts or skill_ts > prompt_ts):
+                    return {
+                        "change_type": "skill_version_changed",
+                        "change_id": f"{skill_row[0]}@{skill_row[1]}",
+                        "skill_name": skill_row[0],
+                        "version": skill_row[1],
+                        "timestamp": skill_ts.isoformat(),
+                    }
+                elif prompt_ts:
+                    return {
+                        "change_type": "prompt_template_changed",
+                        "change_id": f"{prompt_row[0]}@{prompt_row[1]}",
+                        "template_id": prompt_row[0],
+                        "version": prompt_row[1],
+                        "timestamp": prompt_ts.isoformat(),
+                    }
+                return None
+            except Exception as e:
+                logger.warning("Failed to query recent changes: %s", e)
+                return None
 
     def _write_event(self, agent_id: str, event_type: str, payload: dict[str, Any]) -> None:
-        """Write an auditable system event for SLO auto-response actions.
-        
-        Note: Does NOT commit — caller is responsible for committing the batch.
-        """
-        try:
-            from core.utils.id_generator import generate_id
-            eid = generate_id()
-            self.db.execute(text("""
-                INSERT INTO conversation_events
-                    (event_id, session_id, user_id, agent_id, agent_version,
-                     event_type, content, causal_chain_id, created_at)
-                VALUES
-                    (:eid, 'system_slo', 'system', :aid, '1.0.0',
-                     :etype, :content, :eid, NOW())
-            """), {
-                "eid": eid,
-                "aid": agent_id,
-                "etype": event_type,
-                "content": json.dumps(payload),
-            })
-        except Exception as e:
-            logger.debug("Failed to write SLO event %s: %s", event_type, e)
+        """Write an auditable system event for SLO auto-response actions."""
+        with self._db() as db:
+            try:
+                from core.utils.id_generator import generate_id
+                eid = generate_id()
+                db.execute(text("""
+                    INSERT INTO conversation_events
+                        (event_id, session_id, user_id, agent_id, agent_version,
+                         event_type, content, causal_chain_id, created_at)
+                    VALUES
+                        (:eid, 'system_slo', 'system', :aid, '1.0.0',
+                         :etype, :content, :eid, NOW())
+                """), {
+                    "eid": eid,
+                    "aid": agent_id,
+                    "etype": event_type,
+                    "content": json.dumps(payload),
+                })
+                db.commit()
+            except Exception as e:
+                logger.debug("Failed to write SLO event %s: %s", event_type, e)
 
     def _record_alert(self, agent_id: str, status: SLOStatus):
         """Record SLO alert as auditable event."""

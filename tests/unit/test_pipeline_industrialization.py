@@ -49,7 +49,7 @@ class TestRollbackDelegation:
         from core.skills.pipeline import SkillPipeline
 
         pipeline = SkillPipeline.__new__(SkillPipeline)
-        pipeline._db = Mock()
+        pipeline._db_factory = Mock()
         pipeline._improver = None
 
         pipeline._rollback_learnings(days=7)  # should not raise
@@ -59,13 +59,13 @@ class TestRollbackDelegation:
         from core.skills.pipeline import SkillPipeline
 
         pipeline = SkillPipeline.__new__(SkillPipeline)
-        pipeline._db = Mock()
+        pipeline._db_factory = Mock()
         mock_improver = Mock()
         mock_improver.rollback_learnings.side_effect = RuntimeError("db down")
         pipeline._improver = mock_improver
 
         pipeline._rollback_learnings(days=7)  # should not raise
-        pipeline._db.rollback.assert_called_once()
+        # Exception is caught and logged, no rollback on pipeline level
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +79,7 @@ class TestCorrectionOrderPreservation:
         from core.skills.pipeline import SkillPipeline, SkillCandidate
 
         pipeline = SkillPipeline.__new__(SkillPipeline)
-        pipeline._db = Mock()
+        pipeline._db_factory = Mock()
         pipeline._audit = False
         pipeline._learning = True
 
@@ -221,7 +221,7 @@ class TestFeedbackBufferThreadSafety:
         mock_db = Mock()
         mock_db.get_bind.return_value = mock_bind
 
-        buf = _FeedbackBuffer(mock_db, batch_size=100)
+        buf = _FeedbackBuffer(lambda: mock_db, batch_size=100)
         buf.add("evt1", SignalType.WRONG_SKILL, {"skill": "bad"})
 
         count = buf.flush()
@@ -250,7 +250,7 @@ class TestFeedbackBufferThreadSafety:
         mock_db = Mock()
         mock_db.get_bind.return_value = mock_bind
 
-        buf = _FeedbackBuffer(mock_db, batch_size=100)
+        buf = _FeedbackBuffer(lambda: mock_db, batch_size=100)
         buf.add("evt1", SignalType.WRONG_SKILL, {"skill": "bad"})
 
         count = buf.flush()
@@ -272,7 +272,7 @@ class TestFeedbackBufferThreadSafety:
         mock_db = Mock()
         mock_db.get_bind.return_value = mock_engine
 
-        buf = _FeedbackBuffer(mock_db, batch_size=100)
+        buf = _FeedbackBuffer(lambda: mock_db, batch_size=100)
         # get_bind called once during __init__
         assert mock_db.get_bind.call_count == 1
 

@@ -71,7 +71,7 @@ class TestJsonSerialization:
         """DriftCorrector._record must produce valid JSON content."""
         from core.evaluation.drift_detector import DriftCorrector, DriftSignal, DriftSeverity
 
-        corrector = DriftCorrector(db=db_session)
+        corrector = DriftCorrector(lambda: db_session)
         signal = DriftSignal(
             model="gpt-4", template_id=None, current_avg=3.8,
             previous_avg=4.5, week_delta=-0.7, severity=DriftSeverity.SIGNIFICANT,
@@ -119,7 +119,7 @@ class TestDriftFallbackPersistence:
         mock_router.get.return_value = mock_cfg
 
         mock_db = MagicMock()
-        corrector = DriftCorrector(db=mock_db, router=mock_router)
+        corrector = DriftCorrector(lambda: mock_db, router=mock_router)
 
         signal = DriftSignal(
             model="gpt-4", template_id=None, current_avg=3.8,
@@ -181,7 +181,7 @@ class TestSLOMultiAgentCheck:
         from core.context.lifecycle import MemoryGovernanceEngine
         from core.evaluation.slo_monitor import AgentSLOReport, SLOStatus, SLOTarget, SLOSeverity
 
-        engine = MemoryGovernanceEngine(db_session)
+        engine = MemoryGovernanceEngine(lambda: db_session)
 
         def make_report(agent_id, **kwargs):
             return AgentSLOReport(
@@ -213,7 +213,7 @@ class TestSLOMultiAgentCheck:
         from core.context.lifecycle import MemoryGovernanceEngine
         from core.evaluation.slo_monitor import AgentSLOReport, SLOStatus, SLOTarget, SLOSeverity
 
-        engine = MemoryGovernanceEngine(db_session)
+        engine = MemoryGovernanceEngine(lambda: db_session)
 
         report = AgentSLOReport(
             agent_id="dev-agent",

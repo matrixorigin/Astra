@@ -7,7 +7,6 @@ import time
 from datetime import datetime, timezone
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
 from api.database import get_db_session
@@ -16,6 +15,7 @@ from core.llm.providers import AnthropicProvider, BaseProvider, GroqProvider, Op
 from core.llm.rate_limiter import RateLimiter
 from core.llm.router import ModelConfig, ModelRouter
 from core.auth.encryption import decrypt_token
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -38,22 +38,22 @@ def _default_model_for_provider(provider: str) -> str:
     return _PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o")
 
 
-class LLMClient:
+class LLMClient(DbConsumer):
     """LLM client with routing, rate limiting, circuit breaker, budget control, and logging."""
 
     def __init__(
         self,
-        db: Session | None = None,
+        db_factory: DbFactory,
         user_id: str | None = None,
         scope_context: dict | None = None,  # kept for backward compat, unused
     ) -> None:
         """Initialize LLM client. Models must be registered in database."""
-        self.db = db or next(get_db_session())
+        super().__init__(db_factory)
         self.user_id = user_id
 
         self._providers: dict[str, BaseProvider] = {}
         self._model_keys: dict[str, str] = {}  # model_name -> decrypted api_key
-        self.router = ModelRouter(db=self.db, user_id=user_id)
+        self.router = ModelRouter(db=self._db_factory(), user_id=user_id)
         self.rate_limiter = RateLimiter()
         self._load_config()
         self._init_providers()
@@ -66,50 +66,51 @@ class LLMClient:
     ):
         """Update user context and reload router."""
         self.user_id = user_id
-        self.router = ModelRouter(db=self.db, user_id=user_id)
+        self.router = ModelRouter(db=self._db_factory(), user_id=user_id)
         self._init_providers()
 
     # ── Config (#4 动态配置) ───────────────────────────────────────
 
     def _load_config(self) -> None:
         """Load config: DB → env → auto-detect from registered tokens."""
-        config = None
-        try:
-            result = self.db.execute(
-                text("SELECT value FROM configs WHERE key_name = 'llm_config' LIMIT 1")
-            )
-            row = result.first()
-            if row:
-                config = json.loads(row.value)
-        except Exception:
-            pass
-        if not config:
-            # Auto-detect from llm_models table (first active model)
-            provider = os.getenv("LLM_PROVIDER", "")
-            model = os.getenv("LLM_MODEL", "")
-            if not provider or not model:
-                try:
-                    row = self.db.execute(
-                        text("SELECT model_name, provider FROM llm_models WHERE is_active=1 ORDER BY created_at LIMIT 1")
-                    ).first()
-                    if row:
-                        model = model or row[0]
-                        provider = provider or row[1]
-                except Exception:
-                    pass
-            provider = provider or "openai"
-            if not model:
-                model = _default_model_for_provider(provider)
-            config = {
-                "provider": provider,
-                "model": model,
-                "temperature": float(os.getenv("LLM_TEMPERATURE", "0.7")),
-                "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2000")),
-                "budget_usd": float(os.getenv("LLM_BUDGET_USD", "0")),
-            }
-        self.config = config
-        self._validate_config()
-        self._total_spend_usd = 0.0
+        with self._db() as db:
+            config = None
+            try:
+                result = db.execute(
+                    text("SELECT value FROM configs WHERE key_name = 'llm_config' LIMIT 1")
+                )
+                row = result.first()
+                if row:
+                    config = json.loads(row.value)
+            except Exception:
+                pass
+            if not config:
+                # Auto-detect from llm_models table (first active model)
+                provider = os.getenv("LLM_PROVIDER", "")
+                model = os.getenv("LLM_MODEL", "")
+                if not provider or not model:
+                    try:
+                        row = db.execute(
+                            text("SELECT model_name, provider FROM llm_models WHERE is_active=1 ORDER BY created_at LIMIT 1")
+                        ).first()
+                        if row:
+                            model = model or row[0]
+                            provider = provider or row[1]
+                    except Exception:
+                        pass
+                provider = provider or "openai"
+                if not model:
+                    model = _default_model_for_provider(provider)
+                config = {
+                    "provider": provider,
+                    "model": model,
+                    "temperature": float(os.getenv("LLM_TEMPERATURE", "0.7")),
+                    "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2000")),
+                    "budget_usd": float(os.getenv("LLM_BUDGET_USD", "0")),
+                }
+            self.config = config
+            self._validate_config()
+            self._total_spend_usd = 0.0
 
     def _validate_config(self) -> None:
         """Validate config values; raise ValueError on invalid."""
@@ -126,7 +127,8 @@ class LLMClient:
     def reload_config(self):
         """Hot reload config + model registry (#4)."""
         self._load_config()
-        self.router.reload(self.db)
+        with self._db() as db:
+            self.router.reload(db)
         self._init_rate_limits()
         logger.info("LLM config reloaded")
 
@@ -135,63 +137,65 @@ class LLMClient:
     def _init_providers(self) -> None:
         """Initialize provider clients from llm_models table (active models only)."""
         # Init built-in mock provider (no key needed, always available)
-        try:
-            from core.llm.providers import MockEchoProvider
-            self._providers["mock"] = MockEchoProvider()
-            self.router.register(ModelConfig(
-                model_name="mock-echo", provider="mock",
-                tags=["test", "builtin"],
-            ))
-        except Exception:
-            pass
-
-        # Load active models and init their providers (per-model keys)
-        try:
-            rows = self.db.execute(
-                text("SELECT model_name, provider, api_key_encrypted, base_url FROM llm_models WHERE is_active = 1")
-            ).fetchall()
-        except Exception as e:
-            logger.debug(f"Failed to load llm_models: {e}")
-            return
-
-        for row in rows:
-            provider_name = row.provider
-            model_name = row.model_name
+        with self._db() as db:
             try:
-                api_key = decrypt_token(row.api_key_encrypted)
-            except Exception as e:
-                logger.warning(f"Failed to decrypt key for {model_name}: {e}")
-                continue
-            self._model_keys[model_name] = api_key
+                from core.llm.providers import MockEchoProvider
+                self._providers["mock"] = MockEchoProvider()
+                self.router.register(ModelConfig(
+                    model_name="mock-echo", provider="mock",
+                    tags=["test", "builtin"],
+                ))
+            except Exception:
+                pass
 
-            if provider_name in self._providers:
-                continue  # provider already initialized with first model's key
+            # Load active models and init their providers (per-model keys)
             try:
-                base_url = row.base_url
-                if provider_name == "groq" and not base_url:
-                    self._providers[provider_name] = GroqProvider(api_key)
-                elif provider_name == "anthropic" and not base_url:
-                    self._providers[provider_name] = AnthropicProvider(api_key)
-                else:
-                    kwargs = {"base_url": base_url} if base_url else {}
-                    self._providers[provider_name] = OpenAIProvider(api_key, **kwargs)
-                logger.debug(f"Initialized {provider_name} provider")
+                rows = db.execute(
+                    text("SELECT model_name, provider, api_key_encrypted, base_url FROM llm_models WHERE is_active = 1")
+                ).fetchall()
             except Exception as e:
-                logger.warning(f"Failed to initialize {provider_name} provider: {e}")
+                logger.debug(f"Failed to load llm_models: {e}")
+                return
+
+            for row in rows:
+                provider_name = row.provider
+                model_name = row.model_name
+                try:
+                    api_key = decrypt_token(row.api_key_encrypted)
+                except Exception as e:
+                    logger.warning(f"Failed to decrypt key for {model_name}: {e}")
+                    continue
+                self._model_keys[model_name] = api_key
+
+                if provider_name in self._providers:
+                    continue  # provider already initialized with first model's key
+                try:
+                    base_url = row.base_url
+                    if provider_name == "groq" and not base_url:
+                        self._providers[provider_name] = GroqProvider(api_key)
+                    elif provider_name == "anthropic" and not base_url:
+                        self._providers[provider_name] = AnthropicProvider(api_key)
+                    else:
+                        kwargs = {"base_url": base_url} if base_url else {}
+                        self._providers[provider_name] = OpenAIProvider(api_key, **kwargs)
+                    logger.debug(f"Initialized {provider_name} provider")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize {provider_name} provider: {e}")
 
     def _get_provider_base_url(self, provider: str) -> str | None:
         """Get base_url from llm_models table."""
-        from core.llm.constants import PROVIDER_BASE_URLS
-        try:
-            row = self.db.execute(
-                text("SELECT base_url FROM llm_models WHERE provider = :provider AND is_active = 1 LIMIT 1"),
-                {"provider": provider},
-            ).first()
-            if row and row.base_url:
-                return row.base_url
-        except Exception:
-            pass
-        return PROVIDER_BASE_URLS.get(provider)
+        with self._db() as db:
+            from core.llm.constants import PROVIDER_BASE_URLS
+            try:
+                row = db.execute(
+                    text("SELECT base_url FROM llm_models WHERE provider = :provider AND is_active = 1 LIMIT 1"),
+                    {"provider": provider},
+                ).first()
+                if row and row.base_url:
+                    return row.base_url
+            except Exception:
+                pass
+            return PROVIDER_BASE_URLS.get(provider)
 
     def _get_api_key(self, provider: str, model_name: str | None = None) -> str | None:
         """Get API key — prefer per-model key, fall back to first key for same provider."""
@@ -551,84 +555,86 @@ class LLMClient:
         latency_ms=0,
         metadata=None,
     ):
-        log_id = str(uuid7())
-        provider_str = provider.value if isinstance(provider, LLMProvider) else str(provider)
-        try:
-            if response:
-                self.db.execute(
-                    text("""INSERT INTO llm_call_logs (
-                        log_id, event_id, user_id, provider, model,
-                        tokens_prompt, tokens_completion, tokens_total,
-                        cost_usd, latency_ms, status, metadata, created_at
-                    ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
-                        :tp, :tc, :tt, :cost, :lat, :status, :meta, :ts)"""),
-                    {
-                        "log_id": log_id, "event_id": event_id, "user_id": user_id,
-                        "provider": provider_str, "model": response.model,
-                        "tp": response.tokens_prompt, "tc": response.tokens_completion,
-                        "tt": response.tokens_total, "cost": response.cost_usd,
-                        "lat": response.latency_ms, "status": status,
-                        "meta": json.dumps(metadata) if metadata else None,
-                        "ts": datetime.now(timezone.utc),
-                    },
-                )
-            else:
-                self.db.execute(
-                    text("""INSERT INTO llm_call_logs (
-                        log_id, event_id, user_id, provider, model,
-                        tokens_prompt, tokens_completion, tokens_total,
-                        cost_usd, latency_ms, status, error_message, metadata, created_at
-                    ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
-                        0, 0, 0, 0.0, :lat, :status, :err, :meta, :ts)"""),
-                    {
-                        "log_id": log_id, "event_id": event_id, "user_id": user_id,
-                        "provider": provider_str, "model": "unknown",
-                        "lat": latency_ms, "status": status, "err": error_message,
-                        "meta": json.dumps(metadata) if metadata else None,
-                        "ts": datetime.now(timezone.utc),
-                    },
-                )
-            self.db.commit()
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Failed to log LLM call: {e}")
+        with self._db() as db:
+            log_id = str(uuid7())
+            provider_str = provider.value if isinstance(provider, LLMProvider) else str(provider)
+            try:
+                if response:
+                    db.execute(
+                        text("""INSERT INTO llm_call_logs (
+                            log_id, event_id, user_id, provider, model,
+                            tokens_prompt, tokens_completion, tokens_total,
+                            cost_usd, latency_ms, status, metadata, created_at
+                        ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
+                            :tp, :tc, :tt, :cost, :lat, :status, :meta, :ts)"""),
+                        {
+                            "log_id": log_id, "event_id": event_id, "user_id": user_id,
+                            "provider": provider_str, "model": response.model,
+                            "tp": response.tokens_prompt, "tc": response.tokens_completion,
+                            "tt": response.tokens_total, "cost": response.cost_usd,
+                            "lat": response.latency_ms, "status": status,
+                            "meta": json.dumps(metadata) if metadata else None,
+                            "ts": datetime.now(timezone.utc),
+                        },
+                    )
+                else:
+                    db.execute(
+                        text("""INSERT INTO llm_call_logs (
+                            log_id, event_id, user_id, provider, model,
+                            tokens_prompt, tokens_completion, tokens_total,
+                            cost_usd, latency_ms, status, error_message, metadata, created_at
+                        ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
+                            0, 0, 0, 0.0, :lat, :status, :err, :meta, :ts)"""),
+                        {
+                            "log_id": log_id, "event_id": event_id, "user_id": user_id,
+                            "provider": provider_str, "model": "unknown",
+                            "lat": latency_ms, "status": status, "err": error_message,
+                            "meta": json.dumps(metadata) if metadata else None,
+                            "ts": datetime.now(timezone.utc),
+                        },
+                    )
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                logger.error(f"Failed to log LLM call: {e}")
 
     def get_call_logs(self, event_id=None, user_id=None) -> list[LLMCallLog]:
-        if event_id:
-            result = self.db.execute(
-                text("SELECT * FROM llm_call_logs WHERE event_id = :event_id ORDER BY created_at DESC"),
-                {"event_id": event_id}
-            )
-            results = result.fetchall()
-        elif user_id:
-            result = self.db.execute(
-                text("SELECT * FROM llm_call_logs WHERE user_id = :user_id ORDER BY created_at DESC LIMIT 100"),
-                {"user_id": user_id}
-            )
-            results = result.fetchall()
-        else:
-            result = self.db.execute(
-                text("SELECT * FROM llm_call_logs ORDER BY created_at DESC LIMIT 100")
-            )
-            results = result.fetchall()
-        return [
-            LLMCallLog(
-                log_id=r.log_id,
-                event_id=r.event_id,
-                user_id=r.user_id,
-                provider=r.provider,
-                model=r.model,
-                tokens_prompt=r.tokens_prompt,
-                tokens_completion=r.tokens_completion,
-                tokens_total=r.tokens_total,
-                cost_usd=float(r.cost_usd),
-                latency_ms=r.latency_ms,
-                status=r.status,
-                error_message=r.error_message if hasattr(r, 'error_message') else None,
-                created_at=r.created_at,
-            )
-            for r in results
-        ]
+        with self._db() as db:
+            if event_id:
+                result = db.execute(
+                    text("SELECT * FROM llm_call_logs WHERE event_id = :event_id ORDER BY created_at DESC"),
+                    {"event_id": event_id}
+                )
+                results = result.fetchall()
+            elif user_id:
+                result = db.execute(
+                    text("SELECT * FROM llm_call_logs WHERE user_id = :user_id ORDER BY created_at DESC LIMIT 100"),
+                    {"user_id": user_id}
+                )
+                results = result.fetchall()
+            else:
+                result = db.execute(
+                    text("SELECT * FROM llm_call_logs ORDER BY created_at DESC LIMIT 100")
+                )
+                results = result.fetchall()
+            return [
+                LLMCallLog(
+                    log_id=r.log_id,
+                    event_id=r.event_id,
+                    user_id=r.user_id,
+                    provider=r.provider,
+                    model=r.model,
+                    tokens_prompt=r.tokens_prompt,
+                    tokens_completion=r.tokens_completion,
+                    tokens_total=r.tokens_total,
+                    cost_usd=float(r.cost_usd),
+                    latency_ms=r.latency_ms,
+                    status=r.status,
+                    error_message=r.error_message if hasattr(r, 'error_message') else None,
+                    created_at=r.created_at,
+                )
+                for r in results
+            ]
 
     @property
     def total_spend(self) -> float:

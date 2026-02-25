@@ -13,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from core.sandbox.branch import Branch
+from core.db_consumer import DbConsumer, DbFactory
 
 
 class DataAccessLevel(Enum):
@@ -33,7 +34,7 @@ class MergeResult:
     tables_failed: list[str]
 
 
-class DataContext:
+class DataContext(DbConsumer):
     """Session-scoped sandbox with table-level zero-copy branch.
 
     - Creates empty sandbox DB on first use
@@ -44,14 +45,14 @@ class DataContext:
 
     def __init__(
         self,
-        db: Session,
+        db_factory: DbFactory,
         branch: Branch,
         sandbox_name: str,
         source_db: str,
         access: DataAccessLevel,
         session_id: str | None = None,
     ):
-        self.db = db
+        super().__init__(db_factory)
         self.branch = branch
         self.sandbox_name = sandbox_name
         self.source_db = source_db
@@ -62,11 +63,12 @@ class DataContext:
 
     @property
     def dsn(self) -> str:
-        url = self.db.get_bind().url
-        return (
-            f"mysql+pymysql://{url.username}:{url.password}"
-            f"@{url.host}:{url.port}/{self.sandbox_name}"
-        )
+        with self._db() as db:
+            url = db.get_bind().url
+            return (
+                f"mysql+pymysql://{url.username}:{url.password}"
+                f"@{url.host}:{url.port}/{self.sandbox_name}"
+            )
 
     @property
     def alive(self) -> bool:
@@ -74,35 +76,36 @@ class DataContext:
 
     def ensure_created(self) -> None:
         """Create empty sandbox DB and register metadata (idempotent)."""
-        if self._created:
-            return
-        self.db.commit()
-        self.db.execute(text(f"CREATE DATABASE IF NOT EXISTS {self.sandbox_name}"))
-        self.db.commit()
-        # Register in sandbox_metadata for cleanup tracking
-        try:
-            import json
-            self.db.execute(
-                text(f"""
-                    INSERT INTO {self.source_db}.sandbox_metadata
-                    (sandbox_name, user_id, data_source, description, created_by,
-                     created_at, updated_at, tags, source_database, status, session_id)
-                    VALUES (:name, 'system', :ds, 'code_executor sandbox', 'system',
-                            CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6),
-                            NULL, :src, 'active', :sid)
-                """),
-                {
-                    "name": self.sandbox_name,
-                    "ds": json.dumps({"type": "matrixone", "database": self.sandbox_name}),
-                    "src": self.source_db,
-                    "sid": self.session_id,
-                },
-            )
-            self.db.commit()
-        except Exception:
-            # Metadata already exists (idempotent) or table missing
-            self.db.rollback()
-        self._created = True
+        with self._db() as db:
+            if self._created:
+                return
+            db.commit()
+            db.execute(text(f"CREATE DATABASE IF NOT EXISTS {self.sandbox_name}"))
+            db.commit()
+            # Register in sandbox_metadata for cleanup tracking
+            try:
+                import json
+                db.execute(
+                    text(f"""
+                        INSERT INTO {self.source_db}.sandbox_metadata
+                        (sandbox_name, user_id, data_source, description, created_by,
+                         created_at, updated_at, tags, source_database, status, session_id)
+                        VALUES (:name, 'system', :ds, 'code_executor sandbox', 'system',
+                                CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6),
+                                NULL, :src, 'active', :sid)
+                    """),
+                    {
+                        "name": self.sandbox_name,
+                        "ds": json.dumps({"type": "matrixone", "database": self.sandbox_name}),
+                        "src": self.source_db,
+                        "sid": self.session_id,
+                    },
+                )
+                db.commit()
+            except Exception:
+                # Metadata already exists (idempotent) or table missing
+                db.rollback()
+            self._created = True
 
     def ensure_tables(self, tables: list[str]) -> None:
         """Branch declared tables into sandbox (zero-copy, idempotent per table).
@@ -160,26 +163,27 @@ class DataContext:
 
     def destroy(self) -> None:
         """Clean up: data branch delete per table, then DROP DATABASE + metadata."""
-        if not self._created:
-            return
-        try:
-            for table in self._branched_tables:
+        with self._db() as db:
+            if not self._created:
+                return
+            try:
+                for table in self._branched_tables:
+                    try:
+                        self.branch.delete(f"{self.sandbox_name}.{table}")
+                    except Exception:
+                        pass
+                db.commit()
+                db.execute(text(f"DROP DATABASE IF EXISTS {self.sandbox_name}"))
+                db.commit()
+                # Clean metadata
                 try:
-                    self.branch.delete(f"{self.sandbox_name}.{table}")
+                    db.execute(text(
+                        f"DELETE FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :n"
+                    ), {"n": self.sandbox_name})
+                    db.commit()
                 except Exception:
                     pass
-            self.db.commit()
-            self.db.execute(text(f"DROP DATABASE IF EXISTS {self.sandbox_name}"))
-            self.db.commit()
-            # Clean metadata
-            try:
-                self.db.execute(text(
-                    f"DELETE FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :n"
-                ), {"n": self.sandbox_name})
-                self.db.commit()
             except Exception:
                 pass
-        except Exception:
-            pass
-        self._created = False
-        self._branched_tables.clear()
+            self._created = False
+            self._branched_tables.clear()

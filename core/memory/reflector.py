@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +41,11 @@ shorter than the input while preserving all important information.
 """
 
 
-class Reflector:
+class Reflector(DbConsumer):
     """Restructure and condense accumulated observations."""
 
-    def __init__(self, db: Session, llm_client=None):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, llm_client=None):
+        super().__init__(db_factory)
         self.llm = llm_client
 
     def reflect(
@@ -62,7 +62,7 @@ class Reflector:
         from core.context.compaction import estimate_tokens
         from core.memory.observer import Observer
 
-        observer = Observer(self.db)
+        observer = Observer(self._db_factory)
         observations = observer.get_observations(user_id, session_id)
 
         if not observations:
@@ -141,58 +141,59 @@ class Reflector:
 
         Runs in a single transaction: if anything fails, nothing changes.
         """
-        from api.models import Observation
+        with self._db() as db:
+            from api.models import Observation
 
-        old_ids = [o["observation_id"] for o in old_observations if o.get("observation_id")]
+            old_ids = [o["observation_id"] for o in old_observations if o.get("observation_id")]
 
-        try:
-            # Mark old as reflected
-            if old_ids:
-                self.db.query(Observation).filter(
-                    Observation.observation_id.in_(old_ids)
-                ).update(
-                    {Observation.is_reflected: 1},
-                    synchronize_session=False,
+            try:
+                # Mark old as reflected
+                if old_ids:
+                    db.query(Observation).filter(
+                        Observation.observation_id.in_(old_ids)
+                    ).update(
+                        {Observation.is_reflected: 1},
+                        synchronize_session=False,
+                    )
+
+                # Insert condensed
+                now = datetime.now()
+                count = 0
+                for obs in condensed:
+                    if not isinstance(obs, dict) or not obs.get("content"):
+                        continue
+
+                    ref_at = None
+                    if obs.get("referenced_at"):
+                        try:
+                            ref_at = datetime.fromisoformat(str(obs["referenced_at"]))
+                        except (ValueError, TypeError):
+                            pass
+
+                    entry = Observation(
+                        observation_id=str(uuid.uuid4()),
+                        user_id=user_id,
+                        session_id=session_id or "",
+                        content=obs["content"],
+                        priority=obs.get("priority", "medium"),
+                        observation_type=obs.get("type", "pattern"),
+                        observed_at=now,
+                        referenced_at=ref_at,
+                        source_event_ids=json.dumps(old_ids),
+                        version=2,
+                    )
+                    db.add(entry)
+                    count += 1
+
+                # Single commit: atomic mark + insert
+                db.commit()
+                logger.info(
+                    f"Reflector: {len(old_observations)} → {count} observations "
+                    f"for user {user_id}"
                 )
+                return count
 
-            # Insert condensed
-            now = datetime.now()
-            count = 0
-            for obs in condensed:
-                if not isinstance(obs, dict) or not obs.get("content"):
-                    continue
-
-                ref_at = None
-                if obs.get("referenced_at"):
-                    try:
-                        ref_at = datetime.fromisoformat(str(obs["referenced_at"]))
-                    except (ValueError, TypeError):
-                        pass
-
-                entry = Observation(
-                    observation_id=str(uuid.uuid4()),
-                    user_id=user_id,
-                    session_id=session_id or "",
-                    content=obs["content"],
-                    priority=obs.get("priority", "medium"),
-                    observation_type=obs.get("type", "pattern"),
-                    observed_at=now,
-                    referenced_at=ref_at,
-                    source_event_ids=json.dumps(old_ids),
-                    version=2,
-                )
-                self.db.add(entry)
-                count += 1
-
-            # Single commit: atomic mark + insert
-            self.db.commit()
-            logger.info(
-                f"Reflector: {len(old_observations)} → {count} observations "
-                f"for user {user_id}"
-            )
-            return count
-
-        except Exception:
-            self.db.rollback()
-            logger.exception("Reflector transaction failed, rolled back")
-            raise
+            except Exception:
+                db.rollback()
+                logger.exception("Reflector transaction failed, rolled back")
+                raise

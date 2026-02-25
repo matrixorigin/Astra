@@ -14,7 +14,7 @@ class TestGitForDataInjection:
 
     @pytest.fixture
     def git_for_data(self, mock_db_session):
-        return GitForData(db=mock_db_session)
+        return GitForData(lambda: mock_db_session)
 
     def test_query_at_snapshot_simple_injection(self, git_for_data, mock_db_session):
         """Test simple injection of snapshot clause."""

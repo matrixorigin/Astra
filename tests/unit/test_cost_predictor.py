@@ -25,7 +25,7 @@ def router():
 
 @pytest.fixture
 def predictor(db, router):
-    return BranchCostPredictor(db, router)
+    return BranchCostPredictor(lambda: db, router)
 
 
 class TestReplayEstimate:
@@ -94,14 +94,14 @@ class TestBranchEstimate:
 
 class TestFallbackPricing:
     def test_no_router_uses_fallback(self, db):
-        predictor = BranchCostPredictor(db, model_router=None)
+        predictor = BranchCostPredictor(lambda: db, model_router=None)
         est = predictor.estimate_replay(
             session_count=1, model="gpt-4o", avg_tokens_override=1000,
         )
         assert est.estimated_cost > 0
 
     def test_unknown_model_fallback(self, db):
-        predictor = BranchCostPredictor(db, model_router=None)
+        predictor = BranchCostPredictor(lambda: db, model_router=None)
         est = predictor.estimate_replay(
             session_count=1, model="unknown-model", avg_tokens_override=1000,
         )
@@ -111,12 +111,12 @@ class TestFallbackPricing:
 class TestHistoricalData:
     def test_db_query_failure_uses_default(self, db):
         db.execute.side_effect = RuntimeError("DB down")
-        predictor = BranchCostPredictor(db)
+        predictor = BranchCostPredictor(lambda: db)
         avg = predictor._get_historical_avg_tokens()
         assert avg == 3000  # default
 
     def test_db_returns_none_uses_default(self, db):
         db.execute.return_value.scalar.return_value = None
-        predictor = BranchCostPredictor(db)
+        predictor = BranchCostPredictor(lambda: db)
         avg = predictor._get_historical_avg_tokens()
         assert avg == 3000

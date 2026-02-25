@@ -3,18 +3,18 @@
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
 from api.database import get_db_session
 from core.repos.models import AccessScope, OwnerType, Repo, RepoType
+from core.db_consumer import DbConsumer, DbFactory
 
 
-class RepoRegistry:
+class RepoRegistry(DbConsumer):
     """Repository registry for multi-repo management."""
 
-    def __init__(self, db: Session | None = None) -> None:
-        self.db = db or next(get_db_session())
+    def __init__(self, db_factory: DbFactory) -> None:
+        super().__init__(db_factory)
 
     def create(
         self,
@@ -28,72 +28,76 @@ class RepoRegistry:
         metadata: dict | None = None,
     ) -> Repo:
         """Create a new repository."""
-        from api.models import Repo as RepoModel
+        with self._db() as db:
+            from api.models import Repo as RepoModel
         
-        repo_id = str(uuid7())
-        now = datetime.now(timezone.utc)
+            repo_id = str(uuid7())
+            now = datetime.now(timezone.utc)
         
-        # Derive repo name from URL
-        repo_name = repo_url.rstrip("/").split("/")[-1]
+            # Derive repo name from URL
+            repo_name = repo_url.rstrip("/").split("/")[-1]
         
-        # Prepare metadata (include repo_group if present)
-        final_metadata = metadata or {}
-        if repo_group:
-            final_metadata["repo_group"] = repo_group
+            # Prepare metadata (include repo_group if present)
+            final_metadata = metadata or {}
+            if repo_group:
+                final_metadata["repo_group"] = repo_group
 
-        repo_model = RepoModel(
-            repo_id=repo_id,
-            user_id=owner_id,  # Map owner_id to user_id
-            repo_url=repo_url,
-            repo_name=repo_name,
-            repo_type=repo_type.value,
-            token_id=token_id,
-            access_scope=access_scope.value,
-            branch=final_metadata.get("default_branch", "main"),
-            status="active",
-            repo_metadata=final_metadata,
-            created_at=now,
-            updated_at=now,
-        )
+            repo_model = RepoModel(
+                repo_id=repo_id,
+                user_id=owner_id,  # Map owner_id to user_id
+                repo_url=repo_url,
+                repo_name=repo_name,
+                repo_type=repo_type.value,
+                token_id=token_id,
+                access_scope=access_scope.value,
+                branch=final_metadata.get("default_branch", "main"),
+                status="active",
+                repo_metadata=final_metadata,
+                created_at=now,
+                updated_at=now,
+            )
         
-        self.db.add(repo_model)
-        self.db.commit()
-        self.db.refresh(repo_model)
+            db.add(repo_model)
+            db.commit()
+            db.refresh(repo_model)
 
-        return self._to_model(repo_model)
+            return self._to_model(repo_model)
 
     def get(self, repo_id: str) -> Repo | None:
         """Get repository by ID."""
-        from api.models import Repo as RepoModel
-        result = self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
-        if not result:
-            return None
-        return self._to_model(result)
+        with self._db() as db:
+            from api.models import Repo as RepoModel
+            result = db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
+            if not result:
+                return None
+            return self._to_model(result)
 
     def get_by_url(self, repo_url: str, owner_id: str) -> Repo | None:
         """Get repository by URL and owner."""
-        from api.models import Repo as RepoModel
-        result = self.db.query(RepoModel).filter(
-            RepoModel.repo_url == repo_url,
-            RepoModel.user_id == owner_id  # Map owner_id to user_id
-        ).first()
-        if not result:
-            return None
-        return self._to_model(result)
+        with self._db() as db:
+            from api.models import Repo as RepoModel
+            result = db.query(RepoModel).filter(
+                RepoModel.repo_url == repo_url,
+                RepoModel.user_id == owner_id  # Map owner_id to user_id
+            ).first()
+            if not result:
+                return None
+            return self._to_model(result)
 
     def list_by_owner(self, owner_id: str, repo_type: RepoType | None = None) -> list[Repo]:
         """List repositories by owner."""
-        from api.models import Repo as RepoModel
-        query = self.db.query(RepoModel).filter(
-            RepoModel.user_id == owner_id,  # Map owner_id to user_id
-            RepoModel.status == "active"
-        )
+        with self._db() as db:
+            from api.models import Repo as RepoModel
+            query = db.query(RepoModel).filter(
+                RepoModel.user_id == owner_id,  # Map owner_id to user_id
+                RepoModel.status == "active"
+            )
         
-        if repo_type:
-            query = query.filter(RepoModel.repo_type == repo_type.value)
+            if repo_type:
+                query = query.filter(RepoModel.repo_type == repo_type.value)
         
-        results = query.order_by(RepoModel.created_at.desc()).all()
-        return [self._to_model(r) for r in results]
+            results = query.order_by(RepoModel.created_at.desc()).all()
+            return [self._to_model(r) for r in results]
 
     def list_by_group(self, repo_group: str) -> list[Repo]:
         """List repositories by group."""
@@ -102,62 +106,67 @@ class RepoRegistry:
         # For now, we'll scan (inefficient) or deprecate this method.
         # Given the user request "fix tests", and likely tests use this, 
         # we will support it via JSON search if possible or just filter in memory for now.
-        from api.models import Repo as RepoModel
-        # Basic implementation: list all active repos and filter
-        # Better: use JSON_EXTRACT or similar if DB supports it.
-        # Safe fallback: filter in python
+        with self._db() as db:
+            from api.models import Repo as RepoModel
+            # Basic implementation: list all active repos and filter
+            # Better: use JSON_EXTRACT or similar if DB supports it.
+            # Safe fallback: filter in python
         
-        results = self.db.query(RepoModel).filter(
-            RepoModel.status == "active"
-        ).all()
+            results = db.query(RepoModel).filter(
+                RepoModel.status == "active"
+            ).all()
         
-        filtered = []
-        for r in results:
-            meta = r.repo_metadata or {}
-            if meta.get("repo_group") == repo_group:
-                filtered.append(r)
+            filtered = []
+            for r in results:
+                meta = r.repo_metadata or {}
+                if meta.get("repo_group") == repo_group:
+                    filtered.append(r)
                 
-        return [self._to_model(r) for r in filtered]
+            return [self._to_model(r) for r in filtered]
 
     def update_token(self, repo_id: str, token_id: str) -> None:
         """Update repository token."""
-        from api.models import Repo as RepoModel
-        repo = self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
-        if repo:
-            repo.token_id = token_id
-            repo.updated_at = datetime.now(timezone.utc)
-            self.db.commit()
+        with self._db() as db:
+            from api.models import Repo as RepoModel
+            repo = db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
+            if repo:
+                repo.token_id = token_id
+                repo.updated_at = datetime.now(timezone.utc)
+                db.commit()
 
     def update_metadata(self, repo_id: str, metadata: dict) -> None:
         """Update repository metadata."""
-        from api.models import Repo as RepoModel
-        from sqlalchemy.orm.attributes import flag_modified
+        with self._db() as db:
+            from api.models import Repo as RepoModel
+            from sqlalchemy.orm.attributes import flag_modified
         
-        repo = self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
-        if repo:
-            # Create a copy to ensure SQLAlchemy detects the change
-            current = dict(repo.repo_metadata or {})
-            current.update(metadata)
-            repo.repo_metadata = current
-            # Explicitly flag as modified to be safe with JSON types
-            flag_modified(repo, "repo_metadata")
-            repo.updated_at = datetime.now(timezone.utc)
-            self.db.commit()
+            repo = db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
+            if repo:
+                # Create a copy to ensure SQLAlchemy detects the change
+                current = dict(repo.repo_metadata or {})
+                current.update(metadata)
+                repo.repo_metadata = current
+                # Explicitly flag as modified to be safe with JSON types
+                flag_modified(repo, "repo_metadata")
+                repo.updated_at = datetime.now(timezone.utc)
+                db.commit()
 
     def deactivate(self, repo_id: str) -> None:
         """Deactivate repository."""
-        from api.models import Repo as RepoModel
-        repo = self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
-        if repo:
-            repo.status = "inactive"
-            repo.updated_at = datetime.now(timezone.utc)
-            self.db.commit()
+        with self._db() as db:
+            from api.models import Repo as RepoModel
+            repo = db.query(RepoModel).filter(RepoModel.repo_id == repo_id).first()
+            if repo:
+                repo.status = "inactive"
+                repo.updated_at = datetime.now(timezone.utc)
+                db.commit()
 
     def delete(self, repo_id: str) -> None:
         """Delete repository."""
-        from api.models import Repo as RepoModel
-        self.db.query(RepoModel).filter(RepoModel.repo_id == repo_id).delete()
-        self.db.commit()
+        with self._db() as db:
+            from api.models import Repo as RepoModel
+            db.query(RepoModel).filter(RepoModel.repo_id == repo_id).delete()
+            db.commit()
 
     def _to_model(self, row) -> Repo:
         """Convert database row to Repo model."""

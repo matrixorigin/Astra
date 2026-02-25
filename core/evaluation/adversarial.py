@@ -22,6 +22,7 @@ from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ _BIAS_PATTERNS = [
 ]
 
 
-class AdversarialEvaluator:
+class AdversarialEvaluator(DbConsumer):
     """Run adversarial attacks in isolated clones.
 
     Requires:
@@ -84,11 +85,11 @@ class AdversarialEvaluator:
 
     def __init__(
         self,
-        db: Session,
+        db_factory: DbFactory,
         sandbox=None,
         llm_client=None,
     ) -> None:
-        self.db = db
+        super().__init__(db_factory)
         self.sandbox = sandbox
         self.llm_client = llm_client
 
@@ -174,38 +175,39 @@ class AdversarialEvaluator:
 
     def get_attack_summary(self, agent_id: str) -> dict[str, Any]:
         """Get summary of attacks on an agent."""
-        rows = self.db.execute(
-            text(
-                "SELECT attack_type, severity, COUNT(*) as count "
-                "FROM adversarial_attacks "
-                "WHERE agent_id = :agent_id "
-                "GROUP BY attack_type, severity"
-            ),
-            {"agent_id": agent_id},
-        ).fetchall()
+        with self._db() as db:
+            rows = db.execute(
+                text(
+                    "SELECT attack_type, severity, COUNT(*) as count "
+                    "FROM adversarial_attacks "
+                    "WHERE agent_id = :agent_id "
+                    "GROUP BY attack_type, severity"
+                ),
+                {"agent_id": agent_id},
+            ).fetchall()
 
-        summary: dict[str, Any] = {
-            "total_attacks": sum(r[2] for r in rows),
-            "by_type": {},
-            "by_severity": {},
-            "vulnerability_score": 0.0,
-        }
+            summary: dict[str, Any] = {
+                "total_attacks": sum(r[2] for r in rows),
+                "by_type": {},
+                "by_severity": {},
+                "vulnerability_score": 0.0,
+            }
 
-        total = 0
-        critical_high = 0
-        for attack_type, severity, count in rows:
-            summary["by_type"].setdefault(attack_type, 0)
-            summary["by_type"][attack_type] += count
-            summary["by_severity"].setdefault(severity, 0)
-            summary["by_severity"][severity] += count
-            total += count
-            if severity in ("critical", "high"):
-                critical_high += count
+            total = 0
+            critical_high = 0
+            for attack_type, severity, count in rows:
+                summary["by_type"].setdefault(attack_type, 0)
+                summary["by_type"][attack_type] += count
+                summary["by_severity"].setdefault(severity, 0)
+                summary["by_severity"][severity] += count
+                total += count
+                if severity in ("critical", "high"):
+                    critical_high += count
 
-        if total > 0:
-            summary["vulnerability_score"] = round(critical_high / total, 3)
+            if total > 0:
+                summary["vulnerability_score"] = round(critical_high / total, 3)
 
-        return summary
+            return summary
 
     def _execute_attack(
         self,
@@ -289,22 +291,23 @@ class AdversarialEvaluator:
         evidence: str | None,
     ) -> None:
         """Record attack result in DB."""
-        self.db.execute(
-            text(
-                "INSERT INTO adversarial_attacks "
-                "(attack_id, agent_id, attack_type, success, severity, evidence, recorded_at) "
-                "VALUES (:id, :agent_id, :type, :success, :severity, :evidence, NOW())"
-            ),
-            {
-                "id": attack_id,
-                "agent_id": agent_id,
-                "type": attack_type.value,
-                "success": success,
-                "severity": severity,
-                "evidence": evidence,
-            },
-        )
-        self.db.commit()
+        with self._db() as db:
+            db.execute(
+                text(
+                    "INSERT INTO adversarial_attacks "
+                    "(attack_id, agent_id, attack_type, success, severity, evidence, recorded_at) "
+                    "VALUES (:id, :agent_id, :type, :success, :severity, :evidence, NOW())"
+                ),
+                {
+                    "id": attack_id,
+                    "agent_id": agent_id,
+                    "type": attack_type.value,
+                    "success": success,
+                    "severity": severity,
+                    "evidence": evidence,
+                },
+            )
+            db.commit()
 
 
 # Default attack prompts for run_suite

@@ -22,7 +22,7 @@ def mock_db_session():
 @pytest.fixture
 def user_manager(mock_db_session):
     """Create user manager with mock database."""
-    return UserManager(mock_db_session)
+    return UserManager(lambda: mock_db_session)
 
 
 class TestCreateUser:

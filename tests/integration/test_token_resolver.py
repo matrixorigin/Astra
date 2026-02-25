@@ -15,13 +15,13 @@ from core.repos import (
 @pytest.fixture
 def resolver(db_session):
     """Token resolver fixture."""
-    return TokenResolver(db=db_session)
+    return TokenResolver(lambda: db_session)
 
 
 @pytest.fixture
 def registry(db_session):
     """Repo registry fixture."""
-    return RepoRegistry(db=db_session)
+    return RepoRegistry(lambda: db_session)
 
 
 @pytest.fixture(autouse=True)

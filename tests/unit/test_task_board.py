@@ -18,7 +18,7 @@ class TestTaskBoard:
         event_logger = Mock()
         event_logger.create_event.return_value = Mock(event_id="evt-123")
 
-        tb = TaskBoard(db, event_logger=event_logger)
+        tb = TaskBoard(lambda: db, event_logger=event_logger)
         task_id = tb.create_task(
             team_id="team-1",
             title="Review auth.py",
@@ -37,7 +37,7 @@ class TestTaskBoard:
 
     def test_create_task_without_event_logger(self):
         db = _mock_db()
-        tb = TaskBoard(db, event_logger=None)
+        tb = TaskBoard(lambda: db, event_logger=None)
         task_id = tb.create_task(
             team_id="team-1",
             title="Review auth.py",
@@ -59,7 +59,7 @@ class TestTaskBoard:
         event_logger = Mock()
         event_logger.create_event.return_value = Mock(event_id="evt-claim")
 
-        tb = TaskBoard(db, event_logger=event_logger)
+        tb = TaskBoard(lambda: db, event_logger=event_logger)
         result = tb.claim_task("task-1", "agent-1", "sess-1")
 
         assert result is True
@@ -72,7 +72,7 @@ class TestTaskBoard:
         db = _mock_db()
         db.execute.return_value = Mock(scalar=Mock(return_value=1))  # Already claimed
 
-        tb = TaskBoard(db, event_logger=None)
+        tb = TaskBoard(lambda: db, event_logger=None)
         result = tb.claim_task("task-1", "agent-1", "sess-1")
 
         assert result is False
@@ -82,7 +82,7 @@ class TestTaskBoard:
         event_logger = Mock()
         event_logger.create_event.return_value = Mock(event_id="evt-done")
 
-        tb = TaskBoard(db, event_logger=event_logger)
+        tb = TaskBoard(lambda: db, event_logger=event_logger)
         tb.complete_task("task-1", "agent-1", "Found 2 issues", "sess-1")
 
         event_logger.create_event.assert_called_once()
@@ -106,7 +106,7 @@ class TestTaskBoard:
             )
         )
 
-        tb = TaskBoard(db)
+        tb = TaskBoard(lambda: db)
         tasks = tb.get_open_tasks("team-1", "sess-1")
 
         assert len(tasks) == 1
@@ -120,7 +120,7 @@ class TestTaskBoard:
         event_logger = Mock()
         event_logger.create_event.return_value = Mock(event_id="msg-1")
 
-        tb = TaskBoard(db, event_logger=event_logger)
+        tb = TaskBoard(lambda: db, event_logger=event_logger)
         msg_id = tb.send_message(
             to_agent="agent-2",
             content="Please review my fix",
@@ -150,7 +150,7 @@ class TestTaskBoard:
             )
         )
 
-        tb = TaskBoard(db)
+        tb = TaskBoard(lambda: db)
         messages = tb.get_messages_for_agent("agent-2", "sess-1")
 
         assert len(messages) == 1
@@ -162,7 +162,7 @@ class TestTaskBoard:
         db = _mock_db()
         db.execute.return_value = Mock(fetchall=Mock(return_value=[]))
 
-        tb = TaskBoard(db)
+        tb = TaskBoard(lambda: db)
         messages = tb.get_messages_for_agent("agent-1", "sess-1")
 
         assert messages == []

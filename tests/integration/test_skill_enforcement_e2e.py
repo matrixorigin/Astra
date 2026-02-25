@@ -137,9 +137,9 @@ class TestExecutorEnforcement:
 
         registry = SkillRegistry(db_session)
         code_executor = CodeExecutor(
-            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db=db_session,
+            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=lambda: db_session,
         )
-        register_builtin_skills(registry, db_session, code_executor=code_executor)
+        register_builtin_skills(registry, lambda: db_session, code_executor=code_executor)
 
         # Register a fake "github" skill in the in-memory registry
         mock_skill = MagicMock()
@@ -169,9 +169,9 @@ class TestExecutorEnforcement:
 
         registry = SkillRegistry(db_session)
         code_executor = CodeExecutor(
-            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db=db_session,
+            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=lambda: db_session,
         )
-        register_builtin_skills(registry, db_session, code_executor=code_executor)
+        register_builtin_skills(registry, lambda: db_session, code_executor=code_executor)
 
         skill_mgr = SkillManager(db_session, cred_mgr)
         executor = AgentExecutor(lambda: db_session, registry, skill_manager=skill_mgr)

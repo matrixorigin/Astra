@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class PromptVariant:
     quality_score: float | None = None
 
 
-class PromptEvolver:
+class PromptEvolver(DbConsumer):
     """Evolve prompts via replay and measurement.
 
     Args:
@@ -40,9 +40,9 @@ class PromptEvolver:
         llm_client: LLMClient for LLM-as-judge scoring (optional)
     """
 
-    def __init__(self, db: Session, replay_service=None, llm_client=None,
+    def __init__(self, db_factory: DbFactory, replay_service=None, llm_client=None,
                  regression_gate=None) -> None:
-        self.db = db
+        super().__init__(db_factory)
         self.replay_service = replay_service
         self.llm_client = llm_client
         self.regression_gate = regression_gate  # RegressionGate | None
@@ -54,43 +54,44 @@ class PromptEvolver:
         description: str = "",
     ) -> PromptVariant:
         """Create a new prompt variant."""
-        from uuid_utils import uuid7
+        with self._db() as db:
+            from uuid_utils import uuid7
 
-        variant_id = str(uuid7())
+            variant_id = str(uuid7())
 
-        row = self.db.execute(
-            text(
-                "SELECT MAX(version) FROM prompt_variants "
-                "WHERE prompt_template_id = :template_id"
-            ),
-            {"template_id": prompt_template_id},
-        ).fetchone()
-        version = (row[0] or 0) + 1
+            row = db.execute(
+                text(
+                    "SELECT MAX(version) FROM prompt_variants "
+                    "WHERE prompt_template_id = :template_id"
+                ),
+                {"template_id": prompt_template_id},
+            ).fetchone()
+            version = (row[0] or 0) + 1
 
-        self.db.execute(
-            text(
-                "INSERT INTO prompt_variants "
-                "(variant_id, prompt_template_id, version, content, description, created_at) "
-                "VALUES (:id, :template_id, :version, :content, :desc, NOW())"
-            ),
-            {
-                "id": variant_id,
-                "template_id": prompt_template_id,
-                "version": version,
-                "content": content,
-                "desc": description,
-            },
-        )
-        self.db.commit()
+            db.execute(
+                text(
+                    "INSERT INTO prompt_variants "
+                    "(variant_id, prompt_template_id, version, content, description, created_at) "
+                    "VALUES (:id, :template_id, :version, :content, :desc, NOW())"
+                ),
+                {
+                    "id": variant_id,
+                    "template_id": prompt_template_id,
+                    "version": version,
+                    "content": content,
+                    "desc": description,
+                },
+            )
+            db.commit()
 
-        logger.info(f"Created prompt variant: {variant_id} (v{version})")
+            logger.info(f"Created prompt variant: {variant_id} (v{version})")
 
-        return PromptVariant(
-            variant_id=variant_id,
-            prompt_template_id=prompt_template_id,
-            version=version,
-            content=content,
-        )
+            return PromptVariant(
+                variant_id=variant_id,
+                prompt_template_id=prompt_template_id,
+                version=version,
+                content=content,
+            )
 
     def evaluate_variant(
         self,
@@ -105,28 +106,29 @@ class PromptEvolver:
         2. self.replay_service (ReplayService integration)
         3. Fail with 0.0 if neither available
         """
-        scores = []
+        with self._db() as db:
+            scores = []
 
-        for session_id in golden_sessions:
-            try:
-                score = self._replay_with_variant(session_id, variant_id, replay_fn)
-                scores.append(score)
-            except Exception as e:
-                logger.warning(f"Replay failed for {session_id}: {e}")
+            for session_id in golden_sessions:
+                try:
+                    score = self._replay_with_variant(session_id, variant_id, replay_fn)
+                    scores.append(score)
+                except Exception as e:
+                    logger.warning(f"Replay failed for {session_id}: {e}")
 
-        avg_score = sum(scores) / len(scores) if scores else 0.0
+            avg_score = sum(scores) / len(scores) if scores else 0.0
 
-        self.db.execute(
-            text(
-                "UPDATE prompt_variants SET quality_score = :score "
-                "WHERE variant_id = :id"
-            ),
-            {"score": avg_score, "id": variant_id},
-        )
-        self.db.commit()
+            db.execute(
+                text(
+                    "UPDATE prompt_variants SET quality_score = :score "
+                    "WHERE variant_id = :id"
+                ),
+                {"score": avg_score, "id": variant_id},
+            )
+            db.commit()
 
-        logger.info(f"Evaluated variant {variant_id}: {avg_score:.2f}")
-        return avg_score
+            logger.info(f"Evaluated variant {variant_id}: {avg_score:.2f}")
+            return avg_score
 
     def promote_variant(self, variant_id: str, prompt_template_id: str) -> dict[str, Any]:
         """Promote a variant to be the active prompt.
@@ -134,69 +136,71 @@ class PromptEvolver:
         If a regression_gate is configured, validates the change first.
         Returns a result dict with 'promoted' bool and optional 'gate_result'.
         """
-        row = self.db.execute(
-            text("SELECT content, version FROM prompt_variants WHERE variant_id = :id"),
-            {"id": variant_id},
-        ).fetchone()
+        with self._db() as db:
+            row = db.execute(
+                text("SELECT content, version FROM prompt_variants WHERE variant_id = :id"),
+                {"id": variant_id},
+            ).fetchone()
 
-        if not row:
-            logger.error(f"Variant {variant_id} not found")
-            return {"promoted": False, "reason": "variant_not_found"}
+            if not row:
+                logger.error(f"Variant {variant_id} not found")
+                return {"promoted": False, "reason": "variant_not_found"}
 
-        content, version = row[0], row[1]
+            content, version = row[0], row[1]
 
-        # Gate check before promotion
-        if self.regression_gate is not None:
-            from core.evaluation.regression_gate import ChangeType
-            gate_result = self.regression_gate.validate_change(
-                change_type=ChangeType.PROMPT,
-                change_id=f"{prompt_template_id}@{variant_id}",
-                change_content={
-                    "template_id": prompt_template_id,
-                    "version": version,
-                    "content": content,
-                },
-            )
-            if gate_result.get("verdict") != "approved":
-                logger.warning(
-                    "Regression gate rejected prompt variant %s: %s",
-                    variant_id, gate_result.get("verdict"),
+            # Gate check before promotion
+            if self.regression_gate is not None:
+                from core.evaluation.regression_gate import ChangeType
+                gate_result = self.regression_gate.validate_change(
+                    change_type=ChangeType.PROMPT,
+                    change_id=f"{prompt_template_id}@{variant_id}",
+                    change_content={
+                        "template_id": prompt_template_id,
+                        "version": version,
+                        "content": content,
+                    },
                 )
-                return {"promoted": False, "reason": "gate_rejected", "gate_result": gate_result}
+                if gate_result.get("verdict") != "approved":
+                    logger.warning(
+                        "Regression gate rejected prompt variant %s: %s",
+                        variant_id, gate_result.get("verdict"),
+                    )
+                    return {"promoted": False, "reason": "gate_rejected", "gate_result": gate_result}
 
-        self.db.execute(
-            text(
-                "UPDATE prompt_templates SET content = :content, updated_at = NOW() "
-                "WHERE template_id = :template_id"
-            ),
-            {"content": content, "template_id": prompt_template_id},
-        )
-        self.db.commit()
-        logger.info(f"Promoted variant {variant_id} to template {prompt_template_id}")
-        return {"promoted": True}
+            db.execute(
+                text(
+                    "UPDATE prompt_templates SET content = :content, updated_at = NOW() "
+                    "WHERE template_id = :template_id"
+                ),
+                {"content": content, "template_id": prompt_template_id},
+            )
+            db.commit()
+            logger.info(f"Promoted variant {variant_id} to template {prompt_template_id}")
+            return {"promoted": True}
 
     def get_best_variant(self, prompt_template_id: str) -> PromptVariant | None:
         """Get the best-performing variant for a template."""
-        row = self.db.execute(
-            text(
-                "SELECT variant_id, version, content, quality_score "
-                "FROM prompt_variants "
-                "WHERE prompt_template_id = :template_id "
-                "ORDER BY quality_score DESC LIMIT 1"
-            ),
-            {"template_id": prompt_template_id},
-        ).fetchone()
+        with self._db() as db:
+            row = db.execute(
+                text(
+                    "SELECT variant_id, version, content, quality_score "
+                    "FROM prompt_variants "
+                    "WHERE prompt_template_id = :template_id "
+                    "ORDER BY quality_score DESC LIMIT 1"
+                ),
+                {"template_id": prompt_template_id},
+            ).fetchone()
 
-        if not row:
-            return None
+            if not row:
+                return None
 
-        return PromptVariant(
-            variant_id=row[0],
-            prompt_template_id=prompt_template_id,
-            version=row[1],
-            content=row[2],
-            quality_score=float(row[3]) if row[3] else None,
-        )
+            return PromptVariant(
+                variant_id=row[0],
+                prompt_template_id=prompt_template_id,
+                version=row[1],
+                content=row[2],
+                quality_score=float(row[3]) if row[3] else None,
+            )
 
     def _replay_with_variant(
         self, session_id: str, variant_id: str, replay_fn=None
@@ -207,27 +211,28 @@ class PromptEvolver:
         outputs against the originals.
         """
         # Get variant content
-        row = self.db.execute(
-            text("SELECT content FROM prompt_variants WHERE variant_id = :id"),
-            {"id": variant_id},
-        ).fetchone()
+        with self._db() as db:
+            row = db.execute(
+                text("SELECT content FROM prompt_variants WHERE variant_id = :id"),
+                {"id": variant_id},
+            ).fetchone()
 
-        if not row:
+            if not row:
+                return 0.0
+
+            variant_content = row[0]
+
+            # Priority 1: injected replay_fn (for testing)
+            if replay_fn:
+                return replay_fn(session_id, variant_content)
+
+            # Priority 2: ReplayService integration
+            if self.replay_service:
+                return self._replay_via_service(session_id, variant_content)
+
+            # No replay mechanism available
+            logger.warning("No replay_fn or replay_service — cannot evaluate variant")
             return 0.0
-
-        variant_content = row[0]
-
-        # Priority 1: injected replay_fn (for testing)
-        if replay_fn:
-            return replay_fn(session_id, variant_content)
-
-        # Priority 2: ReplayService integration
-        if self.replay_service:
-            return self._replay_via_service(session_id, variant_content)
-
-        # No replay mechanism available
-        logger.warning("No replay_fn or replay_service — cannot evaluate variant")
-        return 0.0
 
     def _replay_via_service(self, session_id: str, variant_content: str) -> float:
         """Replay session via ReplayService and score the result."""

@@ -46,7 +46,7 @@ def run_gate(
     # Run gate
     db = next(get_db_session())
     try:
-        gate = RegressionGate(db=db)
+        gate = RegressionGate(lambda: db)
         result = gate.validate_change(
             change_type=ChangeType(change_type),
             change_id=change_id,

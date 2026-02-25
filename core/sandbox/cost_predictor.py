@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
@@ -37,41 +37,43 @@ class CostEstimate:
     alternatives: list[dict[str, Any]] = field(default_factory=list)
 
 
-class BranchCostPredictor:
+class BranchCostPredictor(DbConsumer):
     """Predict costs for branch/replay operations using historical data."""
 
-    def __init__(self, db: Session, model_router=None):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, model_router=None):
+        super().__init__(db_factory)
         self.router = model_router
 
     def _get_historical_avg_tokens(self, model: str | None = None) -> int:
         """Get average tokens per session from historical LLM call data."""
-        try:
-            sql = text("""
-                SELECT AVG(total_tokens) as avg_tokens
-                FROM llm_call_logs
-                WHERE total_tokens > 0
-            """)
-            result = self.db.execute(sql).scalar()
-            return int(result) if result else _DEFAULT_AVG_TOKENS_PER_SESSION
-        except Exception:
-            return _DEFAULT_AVG_TOKENS_PER_SESSION
+        with self._db() as db:
+            try:
+                sql = text("""
+                    SELECT AVG(total_tokens) as avg_tokens
+                    FROM llm_call_logs
+                    WHERE total_tokens > 0
+                """)
+                result = db.execute(sql).scalar()
+                return int(result) if result else _DEFAULT_AVG_TOKENS_PER_SESSION
+            except Exception:
+                return _DEFAULT_AVG_TOKENS_PER_SESSION
 
     def _get_historical_avg_turns(self) -> int:
         """Get average turns per session from historical data."""
-        try:
-            sql = text("""
-                SELECT AVG(cnt) FROM (
-                    SELECT session_id, COUNT(*) as cnt
-                    FROM conversation_events
-                    WHERE event_type IN ('user_query', 'llm_response')
-                    GROUP BY session_id
-                ) sub
-            """)
-            result = self.db.execute(sql).scalar()
-            return int(result) if result else _DEFAULT_AVG_TURNS_PER_SESSION
-        except Exception:
-            return _DEFAULT_AVG_TURNS_PER_SESSION
+        with self._db() as db:
+            try:
+                sql = text("""
+                    SELECT AVG(cnt) FROM (
+                        SELECT session_id, COUNT(*) as cnt
+                        FROM conversation_events
+                        WHERE event_type IN ('user_query', 'llm_response')
+                        GROUP BY session_id
+                    ) sub
+                """)
+                result = db.execute(sql).scalar()
+                return int(result) if result else _DEFAULT_AVG_TURNS_PER_SESSION
+            except Exception:
+                return _DEFAULT_AVG_TURNS_PER_SESSION
 
     def estimate_replay(
         self,

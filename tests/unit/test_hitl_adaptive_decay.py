@@ -1,6 +1,7 @@
 """Tests for Adaptive Supervision Decay in HITLPolicyEngine."""
 
 import pytest
+from unittest.mock import MagicMock
 
 from core.verification.hitl_policy import (
     ActionContext,
@@ -12,7 +13,7 @@ from core.verification.hitl_policy import (
 
 
 def _engine(decay_threshold: int = 5) -> HITLPolicyEngine:
-    engine = HITLPolicyEngine(db=None, decay_threshold=decay_threshold)
+    engine = HITLPolicyEngine(lambda: MagicMock(), decay_threshold=decay_threshold)
     engine.add_policy(SupervisionPolicy(
         name="novel-gate",
         trigger=SupervisionTrigger(novel_skill_use=True),
@@ -54,7 +55,7 @@ class TestDecayBasics:
 
     def test_decay_observe_only_to_none(self):
         """OBSERVE_ONLY decays to NONE."""
-        engine = HITLPolicyEngine(db=None, decay_threshold=2)
+        engine = HITLPolicyEngine(lambda: MagicMock(), decay_threshold=2)
         engine.add_policy(SupervisionPolicy(
             name="obs",
             trigger=SupervisionTrigger(novel_skill_use=True),
