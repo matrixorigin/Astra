@@ -194,78 +194,41 @@ class TestChatLoopFlushOrdering:
 
 
 class TestRunEngineFlushOnTerminal:
-    """Verify RunEngine calls flush_critical after terminal run events."""
+    """Post-refactor: _log_run_event creates bare EventLogger(db) — no pipeline.
 
-    def test_log_run_event_flushes_on_completed(self):
+    Run lifecycle events are always written synchronously via db.add + db.commit.
+    flush_critical is NOT called because there is no pipeline attached.
+    These tests verify the synchronous write path works for all event types.
+    """
+
+    def _make_engine_and_run(self):
         from core.agent.run_engine import RunEngine
-
         mock_session = MagicMock(spec=Session)
-        mock_pipeline = MagicMock(spec=EventPipeline)
-        mock_pipeline.emit.return_value = "evt-id"
-        el = EventLogger(mock_session, pipeline=mock_pipeline)
+        engine = RunEngine(lambda: mock_session)
+        mock_run = MagicMock()
+        mock_run.run_id = "r1"
+        mock_run.user_id = "u1"
+        mock_run.session_id = "s1"
+        mock_run.parent_run_id = None
+        mock_run.waiting_for = None
+        mock_run.context = {}
+        mock_run.to_event_content.return_value = "{}"
+        return engine, mock_session, mock_run
 
-        with patch("core.events.event_logger._PIPELINE_ENABLED", True):
-            engine = RunEngine(mock_session)
-            engine._default_event_logger = el
+    def test_log_run_event_writes_sync_on_completed(self):
+        engine, mock_session, mock_run = self._make_engine_and_run()
+        engine._log_run_event(mock_run, EventType.RUN_COMPLETED)
+        mock_session.add.assert_called_once()
+        mock_session.commit.assert_called_once()
 
-            mock_run = MagicMock()
-            mock_run.run_id = "r1"
-            mock_run.user_id = "u1"
-            mock_run.session_id = "s1"
-            mock_run.parent_run_id = None
-            mock_run.waiting_for = None
-            mock_run.context = {}
-            mock_run.to_event_content.return_value = "{}"
+    def test_log_run_event_writes_sync_on_failed(self):
+        engine, mock_session, mock_run = self._make_engine_and_run()
+        engine._log_run_event(mock_run, EventType.RUN_FAILED)
+        mock_session.add.assert_called_once()
+        mock_session.commit.assert_called_once()
 
-            # RUN_COMPLETED should trigger flush
-            engine._log_run_event(mock_run, EventType.RUN_COMPLETED)
-            mock_pipeline.flush_critical.assert_called_once()
-
-    def test_log_run_event_flushes_on_failed(self):
-        from core.agent.run_engine import RunEngine
-
-        mock_session = MagicMock(spec=Session)
-        mock_pipeline = MagicMock(spec=EventPipeline)
-        mock_pipeline.emit.return_value = "evt-id"
-        el = EventLogger(mock_session, pipeline=mock_pipeline)
-
-        with patch("core.events.event_logger._PIPELINE_ENABLED", True):
-            engine = RunEngine(mock_session)
-            engine._default_event_logger = el
-
-            mock_run = MagicMock()
-            mock_run.run_id = "r1"
-            mock_run.user_id = "u1"
-            mock_run.session_id = "s1"
-            mock_run.parent_run_id = None
-            mock_run.waiting_for = None
-            mock_run.context = {}
-            mock_run.to_event_content.return_value = "{}"
-
-            engine._log_run_event(mock_run, EventType.RUN_FAILED)
-            mock_pipeline.flush_critical.assert_called_once()
-
-    def test_log_run_event_no_flush_on_started(self):
-        from core.agent.run_engine import RunEngine
-
-        mock_session = MagicMock(spec=Session)
-        mock_pipeline = MagicMock(spec=EventPipeline)
-        mock_pipeline.emit.return_value = "evt-id"
-        el = EventLogger(mock_session, pipeline=mock_pipeline)
-
-        with patch("core.events.event_logger._PIPELINE_ENABLED", True):
-            engine = RunEngine(mock_session)
-            engine._default_event_logger = el
-
-            mock_run = MagicMock()
-            mock_run.run_id = "r1"
-            mock_run.user_id = "u1"
-            mock_run.session_id = "s1"
-            mock_run.parent_run_id = None
-            mock_run.waiting_for = None
-            mock_run.context = {}
-            mock_run.to_event_content.return_value = "{}"
-
-            # RUN_STARTED is NOT terminal — should NOT flush
-            engine._log_run_event(mock_run, EventType.RUN_STARTED)
-            mock_pipeline.flush_critical.assert_not_called()
+    def test_log_run_event_writes_sync_on_started(self):
+        engine, mock_session, mock_run = self._make_engine_and_run()
+        engine._log_run_event(mock_run, EventType.RUN_STARTED)
+        mock_session.add.assert_called_once()
+        mock_session.commit.assert_called_once()

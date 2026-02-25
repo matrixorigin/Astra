@@ -10,6 +10,7 @@ These tests verify the fixes at the integration level.
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
+from sqlalchemy.orm import Session
 
 import pytest
 from fastapi.testclient import TestClient
@@ -142,9 +143,10 @@ class TestEventFieldConsistency:
     @pytest.fixture
     def engine(self):
         from core.agent.run_engine import RunEngine
-        mock_db = MagicMock()
-        with patch.object(RunEngine, '__init__', lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
-            e = RunEngine(mock_db)
+        from tests.conftest import make_run_engine_mock_init
+        mock_db = MagicMock(spec=Session)
+        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+            e = RunEngine(lambda: mock_db)
             e._try_claim_resume = MagicMock(return_value=True)
             return e
 

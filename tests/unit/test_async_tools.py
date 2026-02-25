@@ -3,7 +3,9 @@
 import asyncio
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
+from sqlalchemy.orm import Session
 
+from tests.conftest import make_run_engine_mock_init
 from core.agent.async_tools import (
     AsyncToolRegistry,
     get_async_tool_registry,
@@ -165,7 +167,7 @@ class TestSpawnRuns:
         from core.agent.async_tools import _execute_spawn_runs
         from core.agent.run_engine import RunEngine, _active_runs, _child_runs, _run_tasks
 
-        mock_db = MagicMock()
+        mock_db = MagicMock(spec=Session)
         mock_db.execute.return_value.fetchone.return_value = None
         mock_db.execute.return_value.fetchall.return_value = []
 
@@ -177,8 +179,8 @@ class TestSpawnRuns:
         mock_loop.run_step_stream = stream
 
         # Create parent run with patched init
-        with patch.object(RunEngine, '__init__', lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
-            engine = RunEngine(mock_db)
+        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+            engine = RunEngine(lambda: mock_db)
             parent = engine.create_run(session_id="s1", user_id="u1", user_input="multi")
             parent.status = RunStatus.RUNNING
 
@@ -224,7 +226,7 @@ class TestSpawnRuns:
         from core.agent.async_tools import _execute_spawn_runs
         from core.agent.run_engine import RunEngine, _active_runs, _run_tasks
 
-        mock_db = MagicMock()
+        mock_db = MagicMock(spec=Session)
         mock_db.execute.return_value.fetchone.return_value = None
         mock_db.execute.return_value.fetchall.return_value = []
 
@@ -235,8 +237,8 @@ class TestSpawnRuns:
             yield StreamEvent(event_type="text_delta", data={"chunk": "done"})
         mock_loop.run_step_stream = stream
 
-        with patch.object(RunEngine, '__init__', lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
-            engine = RunEngine(mock_db)
+        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+            engine = RunEngine(lambda: mock_db)
             parent = engine.create_run(session_id="s1", user_id="u1", user_input="multi")
             parent.status = RunStatus.RUNNING
 

@@ -127,7 +127,8 @@ def fire_trigger(db: Session, trigger_id: str, payload: dict | None = None) -> d
 
     trigger_type = RunTrigger.WEBHOOK if trig["trigger_type"] == "webhook" else RunTrigger.SCHEDULE
 
-    engine = RunEngine(db)
+    from api.database import SessionLocal
+    engine = RunEngine(SessionLocal)
     run = engine.create_run(
         session_id=trig.get("session_id") or _auto_session(db, trig["user_id"]),
         user_id=trig["user_id"],

@@ -141,7 +141,7 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
     is real — only the LLM is mocked. Skips heavyweight skill registration
     since these tests don't depend on specific builtin skills.
     """
-    def patched(db):
+    def patched(db_factory):
         from core.agent.chat_loop import ChatLoop
         from core.agent.executor import AgentExecutor
         from core.context.manager import ContextManager
@@ -150,6 +150,7 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
         from core.skills.pipeline import SkillPipeline
         from core.skills.registry import SkillRegistry
 
+        db = db_factory()
         event_logger = EventLogger(db)
         skill_registry = SkillRegistry(db)
         # Skip register_builtin_skills — saves ~200ms per call.
@@ -175,7 +176,7 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
 
 def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
     """Same as _build_patched_chat_loop but registers builtin skills (for tool-use tests)."""
-    def patched(db):
+    def patched(db_factory):
         from core.agent.chat_loop import ChatLoop
         from core.agent.executor import AgentExecutor
         from core.context.manager import ContextManager
@@ -187,6 +188,7 @@ def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
         from core.runtime import create_runtime, IsolationLevel
         from core.code_executor import CodeExecutor
 
+        db = db_factory()
         event_logger = EventLogger(db)
         skill_registry = SkillRegistry(db)
         code_executor = CodeExecutor(

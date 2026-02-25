@@ -220,17 +220,12 @@ def make_run_engine_mock_init():
     """Return a mock __init__ for RunEngine that initialises all required attributes.
 
     Used by tests that patch RunEngine.__init__ to avoid real DB/event setup.
-    Kept in conftest so every test file shares the same definition and stays
-    in sync when RunEngine.__init__ gains new attributes.
     """
-    from unittest.mock import MagicMock
+    from core.db_consumer import DbConsumer
 
-    def mock_init(self, db, chat_loop_factory=None):
-        self.db = db
-        self._default_db = db
-        self.event_logger = MagicMock()
-        self._default_event_logger = self.event_logger
+    def mock_init(self, db_factory, chat_loop_factory=None):
+        DbConsumer.__init__(self, db_factory)
         self._chat_loop_factory = chat_loop_factory
-        self._pending_event_count = 0
+        self._pending_inserts = []
 
     return mock_init

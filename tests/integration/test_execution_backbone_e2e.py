@@ -223,7 +223,7 @@ class TestRunRestore:
     @pytest.mark.asyncio
     async def test_restore_waiting_run_from_db(self, session_id, db):
         """Run parks → clear memory → restore from DB shows WAITING."""
-        engine = RunEngine(db)
+        engine = RunEngine(lambda: db)
         run = engine.create_run(
             session_id=session_id, user_id="test-user", user_input="Restore test",
         )
@@ -244,7 +244,7 @@ class TestRunRestore:
     @pytest.mark.asyncio
     async def test_restore_completed_run(self, session_id, db):
         """Run completes → clear memory → restore shows COMPLETED."""
-        engine = RunEngine(db)
+        engine = RunEngine(lambda: db)
         run = engine.create_run(
             session_id=session_id, user_id="test-user", user_input="Complete test",
         )
@@ -268,7 +268,7 @@ class TestWaitResume:
     @pytest.mark.asyncio
     async def test_wait_then_resume(self, session_id, db):
         """Run parks → resume → completes. Full event trail in DB."""
-        engine = RunEngine(db)
+        engine = RunEngine(lambda: db)
         run = engine.create_run(
             session_id=session_id, user_id="test-user", user_input="Wait test",
         )
@@ -300,7 +300,7 @@ class TestCrossWorkerResume:
     @pytest.mark.asyncio
     async def test_crash_recovery_resume(self, session_id, db):
         """Worker A parks → crash → Worker B restores and resumes."""
-        engine = RunEngine(db)
+        engine = RunEngine(lambda: db)
         run = engine.create_run(
             session_id=session_id, user_id="test-user", user_input="Crash test",
         )
@@ -322,7 +322,7 @@ class TestCrossWorkerResume:
         from api.database import SessionLocal
         db2 = SessionLocal()
         try:
-            engine2 = RunEngine(db2)
+            engine2 = RunEngine(lambda: db2)
             with patch("api.routers.chat._build_chat_loop",
                         return_value=_mock_chat_loop(["Recovered!"])):
                 await engine2.resume_run(run_id, {"data": "ok"})
@@ -339,7 +339,7 @@ class TestFanOutFanIn:
     @pytest.mark.asyncio
     async def test_child_runs_tracked_in_db(self, session_id, db):
         """Parent creates children → children tracked with parent_run_id in DB."""
-        engine = RunEngine(db)
+        engine = RunEngine(lambda: db)
         parent = engine.create_run(
             session_id=session_id, user_id="test-user", user_input="Review code",
         )
@@ -420,7 +420,7 @@ class TestSSEPersistence:
     @pytest.mark.asyncio
     async def test_events_in_run_events_and_cross_worker_load(self, session_id, db):
         """SSE events in DB; loadable after clearing local buffer."""
-        engine = RunEngine(db)
+        engine = RunEngine(lambda: db)
         run = engine.create_run(
             session_id=session_id, user_id="test-user", user_input="SSE test",
         )
@@ -449,7 +449,7 @@ class TestOptimisticLock:
     @pytest.mark.asyncio
     async def test_second_resume_noop(self, session_id, db):
         """First resume completes run; second resume is no-op."""
-        engine = RunEngine(db)
+        engine = RunEngine(lambda: db)
         run = engine.create_run(
             session_id=session_id, user_id="test-user", user_input="Lock test",
         )

@@ -80,7 +80,7 @@ class TestGateTriggerProductionWiring:
             mock_gt_instance = Mock()
             MockGT.return_value = mock_gt_instance
 
-            loop = _build_chat_loop(db_session)
+            loop = _build_chat_loop(lambda: db_session)
 
             # GateTrigger was instantiated
             MockGT.assert_called_once()
@@ -104,7 +104,7 @@ class TestGateTriggerProductionWiring:
             original_init(self_gt, db_factory, **kwargs)
 
         with patch.object(GateTrigger, "__init__", spy_init):
-            _build_chat_loop(db_session)
+            _build_chat_loop(lambda: db_session)
 
         # Must be SessionLocal itself, not a lambda wrapping get_db_session
         assert captured_factory["db_factory"] is SessionLocal, \
@@ -858,7 +858,7 @@ class TestChatAPIGateTriggerE2E:
         # Intercept _build_chat_loop to capture wiring and inject mock LLM
         captured = {}
 
-        def spy_build(db):
+        def spy_build(db_factory):
             from core.agent.chat_loop import ChatLoop
             from core.agent.executor import AgentExecutor
             from core.context.manager import ContextManager
@@ -866,6 +866,8 @@ class TestChatAPIGateTriggerE2E:
             from core.verification.firewall import HallucinationFirewall
             from core.skills.pipeline import SkillPipeline
             from core.skills.registry import SkillRegistry
+
+            db = db_factory()
 
             gt = GateTrigger(db_factory=SessionLocal)
             captured["gate_trigger"] = gt

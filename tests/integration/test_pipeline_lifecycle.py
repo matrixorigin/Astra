@@ -35,7 +35,7 @@ class TestPipelineLifecycleInBuildChatLoop:
         from api.routers.chat import _build_chat_loop
 
         with patch("core.events.event_logger._PIPELINE_ENABLED", True):
-            loop = _build_chat_loop(db_session)
+            loop = _build_chat_loop(lambda: db_session)
 
         pipeline = loop.event_logger._pipeline
         assert pipeline is not None, "Pipeline should be created when enabled"
@@ -49,7 +49,7 @@ class TestPipelineLifecycleInBuildChatLoop:
         from api.routers.chat import _build_chat_loop
 
         with patch("core.events.event_logger._PIPELINE_ENABLED", False):
-            loop = _build_chat_loop(db_session)
+            loop = _build_chat_loop(lambda: db_session)
 
         assert loop.event_logger._pipeline is None
 
@@ -59,7 +59,7 @@ class TestPipelineLifecycleInBuildChatLoop:
         from api.routers.chat import _build_chat_loop
 
         with patch("core.events.event_logger._PIPELINE_ENABLED", True):
-            loop = _build_chat_loop(db_session)
+            loop = _build_chat_loop(lambda: db_session)
 
         pipeline = loop.event_logger._pipeline
         assert pipeline is not None
@@ -89,7 +89,7 @@ class TestPipelineLifecycleInBuildChatLoop:
         from api.routers.chat import _build_chat_loop
 
         with patch("core.events.event_logger._PIPELINE_ENABLED", True):
-            loop = _build_chat_loop(db_session)
+            loop = _build_chat_loop(lambda: db_session)
 
         pipeline = loop.event_logger._pipeline
         flush_task = pipeline._flush_task
@@ -112,10 +112,11 @@ class TestPipelineLifecycleInBuildChatLoop:
     async def test_run_engine_shuts_down_pipeline(self, db_session):
         """start_run's finally block shuts down the pipeline it created."""
         from unittest.mock import MagicMock, AsyncMock
+        from sqlalchemy.orm import Session
         from core.agent.run_engine import RunEngine, _active_runs
         from core.events.models import StreamEvent
 
-        mock_db = MagicMock()
+        mock_db = MagicMock(spec=Session)
         mock_db.execute.return_value.fetchone.return_value = None
         mock_db.execute.return_value.fetchall.return_value = []
 
@@ -151,7 +152,7 @@ class TestPipelineLifecycleInBuildChatLoop:
 
         from tests.conftest import make_run_engine_mock_init
         with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
-            engine = RunEngine(mock_db)
+            engine = RunEngine(lambda: mock_db)
             run = engine.create_run(session_id="s1", user_id="u1", user_input="test")
             run.status = __import__('core.agent.run_engine', fromlist=['RunStatus']).RunStatus.RUNNING
 

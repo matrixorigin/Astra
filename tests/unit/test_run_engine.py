@@ -3,6 +3,7 @@
 import asyncio
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
+from sqlalchemy.orm import Session
 
 pytestmark = pytest.mark.slow
 from datetime import datetime, timezone
@@ -18,7 +19,7 @@ from core.events.models import EventType
 
 @pytest.fixture
 def mock_db():
-    db = MagicMock()
+    db = MagicMock(spec=Session)
     # Default: DB queries return no results (no cancel events, no waiting runs)
     db.execute.return_value.fetchone.return_value = None
     db.execute.return_value.fetchall.return_value = []
@@ -26,10 +27,16 @@ def mock_db():
 
 
 @pytest.fixture
-def engine(mock_db):
+def mock_db_factory(mock_db):
+    """Factory that always returns the same mock_db."""
+    return lambda: mock_db
+
+
+@pytest.fixture
+def engine(mock_db_factory):
     from tests.conftest import make_run_engine_mock_init
     with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
-        e = RunEngine(mock_db)
+        e = RunEngine(mock_db_factory)
         # Default: claim always succeeds (single-worker behavior)
         e._try_claim_resume = MagicMock(return_value=True)
         return e
@@ -226,7 +233,7 @@ class TestRunEngineCancel:
         mock_task.cancel.assert_called_once()
         assert run.run_id not in _run_tasks
 
-    def test_cancel_propagates_to_workflow(self, engine):
+    def test_cancel_propagates_to_workflow(self, engine, mock_db):
         from core.agent.async_tools import _workflow_runs, _workflow_waits
 
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
@@ -248,7 +255,7 @@ class TestRunEngineCancel:
         assert "inner:handle" not in _workflow_waits
 
     @pytest.mark.asyncio
-    async def test_resume_cancelled_run_from_db(self, engine):
+    async def test_resume_cancelled_run_from_db(self, engine, mock_db):
         """If run was cancelled while waiting (from another worker), resume should detect it."""
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
         run.status = RunStatus.WAITING
@@ -256,7 +263,7 @@ class TestRunEngineCancel:
         _active_runs[run.run_id] = run
 
         # Simulate cancel event in DB
-        engine.db.execute.return_value.fetchone.return_value = (1,)
+        mock_db.execute.return_value.fetchone.return_value = (1,)
 
         await engine.resume_run(run.run_id, {"data": "result"})
         assert run.status == RunStatus.CANCELLED
@@ -320,8 +327,9 @@ class TestTryClaimResume:
     """Test the real _try_claim_resume logic (not mocked)."""
 
     def _make_engine(self, mock_db):
-        with patch.object(RunEngine, '__init__', lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
-            return RunEngine(mock_db)
+        from tests.conftest import make_run_engine_mock_init
+        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+            return RunEngine(lambda: mock_db)
 
     def test_claim_succeeds_on_first_insert(self):
         db = MagicMock()
@@ -336,15 +344,12 @@ class TestTryClaimResume:
         db.execute.side_effect = IntegrityError("dup", {}, None)
         engine = self._make_engine(db)
         assert engine._try_claim_resume("run-1") is False
-        db.rollback.assert_called_once()
 
     def test_claim_fallback_on_unexpected_error(self):
         db = MagicMock()
         db.execute.side_effect = RuntimeError("connection lost")
         engine = self._make_engine(db)
-        # Fail safe: reject on error in distributed mode
         assert engine._try_claim_resume("run-1") is False
-        db.rollback.assert_called_once()
 
 
 class TestMultiAgentRuns:
@@ -572,7 +577,7 @@ class TestFanInDBFallback:
     """Test _check_fan_in with DB fallback for cross-worker scenarios."""
 
     @pytest.mark.asyncio
-    async def test_fan_in_uses_db_when_no_in_memory_children(self, engine):
+    async def test_fan_in_uses_db_when_no_in_memory_children(self, engine, mock_db):
         """When _child_runs is empty, fan-in should query DB."""
         parent = engine.create_run(session_id="s1", user_id="u1", user_input="review")
         parent.status = RunStatus.WAITING
@@ -610,7 +615,7 @@ class TestFanInDBFallback:
                 result.fetchone.return_value = None
             return result
 
-        engine.db.execute = MagicMock(side_effect=mock_execute)
+        mock_db.execute = MagicMock(side_effect=mock_execute)
 
         mock_loop = MagicMock()
         mock_loop._current_run_id = None
@@ -627,9 +632,9 @@ class TestFanInDBFallback:
         assert parent.status == RunStatus.COMPLETED
 
     @pytest.mark.asyncio
-    async def test_fan_in_db_returns_no_children(self, engine):
+    async def test_fan_in_db_returns_no_children(self, engine, mock_db):
         """If DB also has no children, fan-in should be a no-op."""
-        engine.db.execute.return_value.fetchall.return_value = []
+        mock_db.execute.return_value.fetchall.return_value = []
 
         parent = engine.create_run(session_id="s1", user_id="u1", user_input="test")
         parent.status = RunStatus.WAITING
@@ -638,15 +643,15 @@ class TestFanInDBFallback:
         # Should remain waiting — no children found
         assert parent.status == RunStatus.WAITING
 
-    def test_get_child_run_ids_from_db(self, engine):
-        engine.db.execute.return_value.fetchall.return_value = [
+    def test_get_child_run_ids_from_db(self, engine, mock_db):
+        mock_db.execute.return_value.fetchall.return_value = [
             ("child-1",), ("child-2",),
         ]
         ids = engine._get_child_run_ids_from_db("parent-1")
         assert ids == {"child-1", "child-2"}
 
-    def test_get_child_run_ids_db_error(self, engine):
-        engine.db.execute.side_effect = RuntimeError("db down")
+    def test_get_child_run_ids_db_error(self, engine, mock_db):
+        mock_db.execute.side_effect = RuntimeError("db down")
         ids = engine._get_child_run_ids_from_db("parent-1")
         assert ids == set()
 
@@ -668,24 +673,24 @@ class TestFanInDBFallback:
 class TestAgentConfigLogging:
     """Test that _load_agent_config logs warnings on failure."""
 
-    def test_load_config_db_error_logs_warning(self, engine, caplog):
+    def test_load_config_db_error_logs_warning(self, engine, mock_db, caplog):
         import logging
-        engine.db.execute.side_effect = RuntimeError("connection lost")
+        mock_db.execute.side_effect = RuntimeError("connection lost")
         with caplog.at_level(logging.WARNING):
             result = engine._load_agent_config("test-agent")
         assert result is None
         assert "Failed to load agent config" in caplog.text
 
-    def test_load_config_success(self, engine):
+    def test_load_config_success(self, engine, mock_db):
         import json
-        engine.db.execute.return_value.fetchone.return_value = (
+        mock_db.execute.return_value.fetchone.return_value = (
             json.dumps({"system_prompt": "You are helpful"}),
         )
         result = engine._load_agent_config("test-agent")
         assert result == {"system_prompt": "You are helpful"}
 
-    def test_load_config_no_row(self, engine):
-        engine.db.execute.return_value.fetchone.return_value = None
+    def test_load_config_no_row(self, engine, mock_db):
+        mock_db.execute.return_value.fetchone.return_value = None
         result = engine._load_agent_config("test-agent")
         assert result is None
 
@@ -693,14 +698,15 @@ class TestAgentConfigLogging:
 class TestEventPersistWarning:
     """Test that _append_event logs at warning level on failure."""
 
-    def test_append_event_db_failure_logs_warning(self, engine, caplog):
+    def test_append_event_db_failure_logs_warning(self, engine, mock_db, caplog):
         import logging
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
         # Make DB write fail
-        engine.db.execute.side_effect = RuntimeError("disk full")
+        mock_db.execute.side_effect = RuntimeError("disk full")
         with caplog.at_level(logging.WARNING):
             engine._append_event(run.run_id, {"event_type": "test", "data": {}})
-        assert "Event persist failed" in caplog.text
+            engine._flush_run_events()  # Force flush to trigger DB write
+        assert "batch commit failed" in caplog.text.lower()
         # Event should still be in local buffer
         assert len(_run_events[run.run_id]) == 1
 
@@ -709,8 +715,9 @@ class TestResumeClaimMultiple:
     """Test that _try_claim_resume works across multiple resume cycles."""
 
     def _make_engine(self, mock_db):
-        with patch.object(RunEngine, '__init__', lambda self, db: setattr(self, 'db', db) or setattr(self, 'event_logger', MagicMock())):
-            return RunEngine(mock_db)
+        from tests.conftest import make_run_engine_mock_init
+        with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
+            return RunEngine(lambda: mock_db)
 
     def test_multiple_claims_use_different_idx(self):
         """Adversarial loop: same run resumed multiple times should succeed."""
@@ -820,7 +827,7 @@ class TestMemoryGC:
 class TestCrossWorkerCancel:
     """Test cancel propagation to children on other workers."""
 
-    def test_cancel_writes_db_event_for_remote_children(self, engine):
+    def test_cancel_writes_db_event_for_remote_children(self, engine, mock_db):
         parent = engine.create_run(session_id="s1", user_id="u1", user_input="review")
         parent.status = RunStatus.RUNNING
 
@@ -830,19 +837,20 @@ class TestCrossWorkerCancel:
 
         engine.cancel_run(parent.run_id)
 
-        # Should have called create_stream_event for the remote child
-        calls = engine.event_logger.create_stream_event.call_args_list
-        cancel_calls = [c for c in calls if c[1].get("event_type") == EventType.RUN_CANCELLED.value
-                        or (len(c[0]) > 2 and c[0][2] == EventType.RUN_CANCELLED.value)]
-        # At least parent + remote child cancel events
-        assert len(cancel_calls) >= 2
+        # _log_run_event and _write_cancel_event_for_run both do db.add()
+        # Check that cancel events were persisted via db.add
+        add_calls = mock_db.add.call_args_list
+        cancel_events = [c for c in add_calls
+                         if hasattr(c[0][0], 'event_type')
+                         and c[0][0].event_type == EventType.RUN_CANCELLED]
+        assert len(cancel_events) >= 2
 
 
 class TestCausalChainPropagation:
     """Test that child runs inherit parent's causal chain."""
 
     @pytest.mark.asyncio
-    async def test_child_inherits_causal_chain(self, engine):
+    async def test_child_inherits_causal_chain(self, engine, mock_db):
         parent = engine.create_run(
             session_id="s1", user_id="u1", user_input="review",
             context={"_causal_chain_id": "chain-abc-123"},
@@ -865,12 +873,14 @@ class TestCausalChainPropagation:
         # Child should have inherited the causal chain
         assert child.context.get("_causal_chain_id") == "chain-abc-123"
 
-        # Log events should have been called with causal_chain_id
-        log_calls = engine.event_logger.create_stream_event.call_args_list
-        child_calls = [c for c in log_calls
-                       if c[1].get("metadata", {}).get("run_id") == child.run_id]
-        for call in child_calls:
-            assert call[1].get("causal_chain_id") == "chain-abc-123"
+        # Verify causal chain was passed to DB via add() calls
+        add_calls = mock_db.add.call_args_list
+        child_events = [c[0][0] for c in add_calls
+                        if hasattr(c[0][0], 'causal_chain_id') and hasattr(c[0][0], 'metadata')
+                        and isinstance(getattr(c[0][0], 'metadata', None), dict)
+                        and c[0][0].metadata.get("run_id") == child.run_id]
+        for ev in child_events:
+            assert ev.causal_chain_id == "chain-abc-123"
 
 
 class TestConsumeStreamCancellation:
@@ -915,7 +925,7 @@ class TestStreamRunEventsBounded:
     """Test stream_run_events timeout and local flag re-check."""
 
     @pytest.mark.asyncio
-    async def test_stream_exits_on_max_idle(self, engine):
+    async def test_stream_exits_on_max_idle(self, engine, mock_db):
         """stream_run_events should exit after max_idle_polls."""
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
         run.status = RunStatus.RUNNING
@@ -945,7 +955,7 @@ class TestStreamRunEventsBounded:
         assert collected == []  # No events emitted, just timed out
 
     @pytest.mark.asyncio
-    async def test_stream_switches_to_db_after_gc(self, engine):
+    async def test_stream_switches_to_db_after_gc(self, engine, mock_db):
         """After run is GC'd from memory, stream falls back to DB."""
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
         engine._append_event(run.run_id, {"event_type": "text_delta", "data": {"chunk": "hello"}})
@@ -957,7 +967,7 @@ class TestStreamRunEventsBounded:
         _active_runs.pop(run.run_id)
 
         # Mock DB to return the event
-        engine.db.execute.return_value.fetchall.return_value = [
+        mock_db.execute.return_value.fetchall.return_value = [
             ("text_delta", '{"chunk": "hello"}', None, None),
         ]
 

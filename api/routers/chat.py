@@ -95,12 +95,17 @@ def _ensure_session(db: Session, user_id: str, session_id: str | None, agent_id:
     return session.session_id
 
 
-def _build_chat_loop(db: Session):
+def _build_chat_loop(db_factory):
     """Build ChatLoop with all dependencies.
 
-    Per-request objects (EventLogger, DB session, SkillPipeline) are always fresh.
-    SkillPipeline cannot be cached because it holds DB session reference for
-    audit/learning writes - caching would cause stale session across requests.
+    Accepts a db_factory (Callable → Session). Creates a fresh session for
+    components that still require one.
+
+    NOTE (Phase 2 limitation): ChatLoop components (EventLogger, LLMClient,
+    SkillRegistry, etc.) still receive a raw Session.  This session lives as
+    long as the ChatLoop — up to 30 min.  Migrating these components to
+    db_factory is Phase 3/4 work.  RunEngine itself no longer holds a long
+    session; only the ChatLoop internals do.
     """
     from core.agent.chat_loop import ChatLoop
     from core.agent.executor import AgentExecutor
@@ -113,6 +118,8 @@ def _build_chat_loop(db: Session):
     from core.skills.pipeline import SkillPipeline
     from core.skills.registry import SkillRegistry
     from core.verification.firewall import HallucinationFirewall
+
+    db = db_factory()
 
     # Create EventPipeline for async writes (feature-flagged)
     pipeline = None
@@ -174,9 +181,10 @@ def _build_chat_loop(db: Session):
     return loop
 
 
-def _get_engine(db: Session):
+def _get_engine():
+    from api.database import SessionLocal
     from core.agent.run_engine import RunEngine
-    return RunEngine(db, chat_loop_factory=_build_chat_loop)
+    return RunEngine(SessionLocal, chat_loop_factory=_build_chat_loop)
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +204,7 @@ async def chat(
     user_id = current_user["user_id"]
     session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
 
-    engine = _get_engine(db)
+    engine = _get_engine()
     
     # Pass model to context if specified
     context = request.context or {}
@@ -229,7 +237,7 @@ async def chat_stream(
     user_id = current_user["user_id"]
     session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
 
-    engine = _get_engine(db)
+    engine = _get_engine()
     
     # Pass model to context if specified
     context = request.context or {}
@@ -273,7 +281,7 @@ async def get_run_status(
     db: Annotated[Session, Depends(get_db_session)],
 ):
     """Get run status and progress."""
-    engine = _get_engine(db)
+    engine = _get_engine()
     run = engine.get_run(run_id)
     if not run:
         run = engine.restore_run(run_id)
@@ -300,7 +308,7 @@ async def stream_run(
     last_index: int = Query(default=0, description="Resume from event index (for reconnection)"),
 ):
     """Stream run events as SSE. Supports reconnection via last_index."""
-    engine = _get_engine(db)
+    engine = _get_engine()
     run = engine.get_run(run_id) or engine.restore_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -325,7 +333,7 @@ async def cancel_run(
     db: Annotated[Session, Depends(get_db_session)],
 ):
     """Cancel a running or waiting run."""
-    engine = _get_engine(db)
+    engine = _get_engine()
     # Verify ownership
     run = engine.get_run(run_id) or engine.restore_run(run_id)
     if not run:

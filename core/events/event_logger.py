@@ -32,7 +32,7 @@ class EventLogger:
             pipeline: Optional EventPipeline for async writes.
         """
         if not isinstance(session, Session):
-            raise TypeError("session must be a SQLAlchemy Session")
+            raise TypeError(f"session must be a SQLAlchemy Session, got {type(session).__name__}")
         self.session = session
         self._pipeline = pipeline
 

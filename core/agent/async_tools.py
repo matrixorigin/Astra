@@ -292,12 +292,8 @@ def _resolve_workflow(wf_id: str, result: dict) -> None:
     if waiting_run_id:
         async def _do_resume():
             from core.agent.run_engine import RunEngine
-            from api.database import get_db_session
-            db = next(get_db_session())
-            try:
-                await RunEngine(db).resume_run(waiting_run_id, result)
-            finally:
-                db.close()
+            from api.database import SessionLocal
+            await RunEngine(SessionLocal).resume_run(waiting_run_id, result)
         _aio.create_task(_do_resume())
     _workflow_runs.pop(wf_id, None)
 
@@ -466,10 +462,10 @@ async def _execute_spawn_runs(params: dict[str, Any], run_id: str | None = None)
     if not parent:
         return {"error": f"Parent run {run_id} not found in active runs"}
 
-    db = next(get_db_session())
-    try:
-        engine = RunEngine(db)
+    from api.database import SessionLocal
+    engine = RunEngine(SessionLocal)
 
+    try:
         agents = params.get("agents")
         if not agents or not isinstance(agents, list):
             return {"error": "spawn_runs requires a non-empty 'agents' list"}
@@ -493,11 +489,6 @@ async def _execute_spawn_runs(params: dict[str, Any], run_id: str | None = None)
         }
     except Exception as e:
         return {"error": str(e)}
-    finally:
-        try:
-            db.close()
-        except Exception:
-            pass
 
 
 _SPAWN_RUNS_SCHEMA = {

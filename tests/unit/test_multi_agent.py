@@ -8,6 +8,7 @@ import asyncio
 import json
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
+from sqlalchemy.orm import Session
 
 from core.agent.run import RunStatus
 from core.agent.run_engine import (
@@ -36,7 +37,7 @@ def clean_state():
 
 @pytest.fixture
 def mock_db():
-    db = MagicMock()
+    db = MagicMock(spec=Session)
     db.execute.return_value.fetchone.return_value = None
     db.execute.return_value.fetchall.return_value = []
     return db
@@ -46,7 +47,7 @@ def mock_db():
 def engine(mock_db):
     from tests.conftest import make_run_engine_mock_init
     with patch.object(RunEngine, '__init__', make_run_engine_mock_init()):
-        e = RunEngine(mock_db)
+        e = RunEngine(lambda: mock_db)
         e._try_claim_resume = MagicMock(return_value=True)
         return e
 
@@ -256,10 +257,10 @@ class TestMultiAgentE2E:
         assert parent.status == RunStatus.COMPLETED
 
     @pytest.mark.asyncio
-    async def test_agent_config_injection(self, engine):
+    async def test_agent_config_injection(self, engine, mock_db):
         """Child run should receive system_prompt from agent config."""
         # Mock DB to return agent config
-        engine.db.execute.return_value.fetchone.return_value = (
+        mock_db.execute.return_value.fetchone.return_value = (
             json.dumps({
                 "system_prompt": "You are a security expert.",
                 "allowed_tools": ["read_file"],
@@ -268,7 +269,7 @@ class TestMultiAgentE2E:
 
         received_context = {}
 
-        def build_loop(db):
+        def build_loop(db_factory):
             loop = MagicMock()
             loop._current_run_id = None
 

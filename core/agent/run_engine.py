@@ -4,7 +4,6 @@ Distributed-safe: all coordination through DB, no cross-worker in-memory deps.
 """
 
 import asyncio
-import contextvars
 import gc
 import json
 from collections.abc import AsyncIterator
@@ -12,16 +11,12 @@ from datetime import datetime, timezone
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 
 from core.agent.run import AgentRun, RunStatus, RunTrigger
+from core.db_consumer import DbConsumer
 from core.events.event_logger import EventLogger
 from core.events.models import EventType, StreamEvent, StreamEventType
 from core.logging_config import get_logger
-
-# Per-task DB session override (set by start_run, used by internal methods)
-_task_db: contextvars.ContextVar[Session | None] = contextvars.ContextVar("_task_db", default=None)
-_task_event_logger: contextvars.ContextVar[EventLogger | None] = contextvars.ContextVar("_task_event_logger", default=None)
 
 logger = get_logger(__name__)
 
@@ -83,48 +78,23 @@ def _start_gc_task() -> None:
             logger.warning("Cannot start GC task: no running event loop")
 
 
-class RunEngine:
-    """Drives AgentRun execution. Not bound to HTTP request lifecycle."""
+class RunEngine(DbConsumer):
+    """Drives AgentRun execution. Not bound to HTTP request lifecycle.
 
-    def __init__(self, db: Session, chat_loop_factory=None):
+    Accepts a db_factory (Callable → Session) instead of a long-lived session.
+    Each DB operation acquires a short-lived session via ``with self._db()``.
+    """
+
+    def __init__(self, db_factory, chat_loop_factory=None):
         """
         Args:
-            db: Default DB session.
-            chat_loop_factory: Callable(Session) -> ChatLoop.  Injected by
-                the API layer to avoid core → API circular dependency.
+            db_factory: Callable that returns a new SQLAlchemy Session.
+            chat_loop_factory: Callable(db_factory) -> ChatLoop.
         """
-        self._default_db = db
-        self._default_event_logger = EventLogger(db)
+        super().__init__(db_factory)
         self._chat_loop_factory = chat_loop_factory
-        # Per-instance counter for batched event commits.
-        # Must be instance-level to avoid race conditions when multiple
-        # RunEngine instances operate concurrently with different DB sessions.
-        self._pending_event_count = 0
-        # Start GC task on first engine instantiation
+        self._pending_inserts: list[dict] = []
         _start_gc_task()
-
-    @property
-    def db(self) -> Session:
-        """Return per-task DB session if set, otherwise the default."""
-        return _task_db.get() or self._default_db
-
-    @db.setter
-    def db(self, value: Session) -> None:
-        self._default_db = value
-
-    @property
-    def event_logger(self) -> EventLogger:
-        """Return per-task event logger if set, otherwise the default."""
-        return _task_event_logger.get() or self._default_event_logger
-
-    @event_logger.setter
-    def event_logger(self, value: EventLogger) -> None:
-        self._default_event_logger = value
-
-    def _new_db(self) -> Session:
-        """Create a fresh DB session for background tasks."""
-        from api.database import SessionLocal
-        return SessionLocal()
 
     # ── Public API ────────────────────────────────────────────
 
@@ -199,12 +169,13 @@ class RunEngine:
     def _load_agent_config(self, agent_id: str) -> dict | None:
         """Load agent_config from agents table."""
         try:
-            row = self.db.execute(
-                text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
-                {"aid": agent_id},
-            ).fetchone()
-            if row and row[0]:
-                return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            with self._db() as db:
+                row = db.execute(
+                    text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
+                    {"aid": agent_id},
+                ).fetchone()
+                if row and row[0]:
+                    return row[0] if isinstance(row[0], dict) else json.loads(row[0])
         except Exception as e:
             logger.warning(f"Failed to load agent config for {agent_id}: {e}")
         return None
@@ -227,29 +198,25 @@ class RunEngine:
 
     async def start_run(self, run: AgentRun) -> None:
         """Execute an AgentRun using ChatLoop. Streams events to buffer.
-        
-        Uses a dedicated DB session via contextvars so concurrent runs
-        each get their own session without overwriting shared state.
+
+        No long-lived DB session is held. Each DB operation acquires a
+        short-lived session from the factory and releases it immediately.
         """
         run.status = RunStatus.RUNNING
-        bg_db = self._new_db()
-        bg_event_logger = EventLogger(bg_db)
-        tok_db = _task_db.set(bg_db)
-        tok_el = _task_event_logger.set(bg_event_logger)
         loop = None
         try:
             # Load agent config and inject model if not already set
             if run.agent_id:
                 run.context = run.context or {}
                 self._apply_agent_config(run.agent_id, run.context)
-            
-            # Build ChatLoop via injected factory (preferred) or lazy import (backward compat)
+
+            # Build ChatLoop — pass db_factory so it also uses short-lived sessions
             factory = getattr(self, '_chat_loop_factory', None)
             if factory:
-                loop = factory(bg_db)
+                loop = factory(self._db_factory)
             else:
                 from api.routers.chat import _build_chat_loop
-                loop = _build_chat_loop(bg_db)
+                loop = _build_chat_loop(self._db_factory)
             loop._current_run_id = run.run_id
 
             coro = self._consume_stream(loop, run)
@@ -266,12 +233,12 @@ class RunEngine:
                 "event_type": "run_error", "data": {"error": f"Run timed out after {timeout}s"},
                 "run_id": run.run_id,
             })
-            raise  # Re-raise to ensure proper cleanup
+            raise
         except asyncio.CancelledError:
             run.status = RunStatus.CANCELLED
-            run._cancelled_externally = True  # Skip fan-in; parent handles it
+            run._cancelled_externally = True
             self._log_run_event(run, EventType.RUN_CANCELLED)
-            raise  # Re-raise to ensure proper cleanup
+            raise
         except Exception as e:
             logger.error(f"Run {run.run_id} failed: {e}", exc_info=True)
             run.status = RunStatus.FAILED
@@ -280,11 +247,10 @@ class RunEngine:
                 "event_type": "run_error", "data": {"error": str(e)},
                 "run_id": run.run_id,
             })
-            raise  # Re-raise to ensure proper cleanup
+            raise
         finally:
-            # Flush any remaining buffered run_events before cleanup
             self._flush_run_events()
-            # Shutdown EventPipeline to release its DB session and background task
+            # Shutdown EventPipeline
             try:
                 _pipeline = getattr(getattr(loop, 'event_logger', None), '_pipeline', None) if loop else None
                 if _pipeline:
@@ -296,26 +262,23 @@ class RunEngine:
                             pass
             except Exception:
                 pass
+            # Wait for GateTrigger daemon threads
+            try:
+                gt = getattr(loop, '_gate_trigger', None) if loop else None
+                if gt and hasattr(gt, 'wait_all'):
+                    gt.wait_all(timeout=5.0)
+            except Exception:
+                pass
             _run_tasks.pop(run.run_id, None)
             _run_waiters.get(run.run_id, asyncio.Event()).set()
-            # Fan-in: if this is a child run that ended, check parent
-            # Skip if externally cancelled — parent's cancel_run already handles children
             if run.parent_run_id and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED) \
                     and not getattr(run, '_cancelled_externally', False):
                 try:
                     await self._check_fan_in(run.parent_run_id)
                 except Exception:
-                    pass  # Best-effort; don't let fan-in failure break cleanup
-            # Cleanup completed runs to prevent memory leak
+                    pass
             if run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                 self._maybe_gc()
-            # Close background DB session and restore contextvars
-            try:
-                bg_db.close()
-            except Exception:
-                pass
-            _task_db.reset(tok_db)
-            _task_event_logger.reset(tok_el)
 
     async def _consume_stream(self, loop, run: AgentRun) -> None:
         """Consume ChatLoop stream, parking on wait_for signals.
@@ -461,16 +424,15 @@ class RunEngine:
         to_remove = [h for h, wid in _workflow_waits.items() if wid == wf_id]
         for h in to_remove:
             _workflow_waits.pop(h, None)
-        # Also mark in DB so other workers see it
         try:
-            self.db.execute(
-                text("UPDATE workflow_runs SET status='cancelled', error='Cancelled by user' "
-                     "WHERE run_id = :wf_id AND status IN ('running','waiting')"),
-                {"wf_id": wf_id},
-            )
-            self.db.commit()
+            with self._db() as db:
+                db.execute(
+                    text("UPDATE workflow_runs SET status='cancelled', error='Cancelled by user' "
+                         "WHERE run_id = :wf_id AND status IN ('running','waiting')"),
+                    {"wf_id": wf_id},
+                )
+                db.commit()
         except Exception as e:
-            self.db.rollback()
             logger.error(f"Failed to cancel workflow {wf_id} in DB: {e}")
 
     async def on_job_completed(self, job_id: str, result: dict) -> bool:
@@ -558,75 +520,73 @@ class RunEngine:
     # ── Event persistence ─────────────────────────────────────
 
     def _append_event(self, run_id: str, sse: dict) -> None:
-        """Append event to local buffer AND persist to DB.
+        """Append event to local buffer AND queue for DB persistence.
 
-        Individual INSERTs are issued immediately but COMMITs are deferred
-        and batched — _flush_run_events() commits all pending writes at once.
-        This is called automatically every _RUN_EVENT_FLUSH_SIZE events and
-        in _complete_run / finally to ensure nothing is lost.
+        Events are buffered in memory. Every _RUN_EVENT_FLUSH_SIZE events,
+        a short-lived session is acquired, all pending INSERTs are executed,
+        committed, and the session is released.
         """
         events = _run_events.setdefault(run_id, [])
         idx = len(events)
         events.append(sse)
-        try:
-            self.db.execute(
-                text(
-                    "INSERT INTO run_events (run_id, idx, event_type, data, event_id, agent_id) "
-                    "VALUES (:run_id, :idx, :event_type, :data, :event_id, :agent_id)"
-                ),
-                {
-                    "run_id": run_id,
-                    "idx": idx,
-                    "event_type": sse.get("event_type", ""),
-                    "data": json.dumps(sse.get("data", {})),
-                    "event_id": sse.get("event_id"),
-                    "agent_id": sse.get("agent_id"),
-                },
-            )
-            self._pending_event_count += 1
-            if self._pending_event_count >= _RUN_EVENT_FLUSH_SIZE:
-                self._flush_run_events()
-        except Exception as e:
-            self.db.rollback()
-            # Reset counter: rollback discarded all pending INSERTs
-            self._pending_event_count = 0
-            logger.warning(f"Event persist failed for run {run_id} idx {idx}: {e}")
+        self._pending_inserts.append({
+            "run_id": run_id,
+            "idx": idx,
+            "event_type": sse.get("event_type", ""),
+            "data": json.dumps(sse.get("data", {})),
+            "event_id": sse.get("event_id"),
+            "agent_id": sse.get("agent_id"),
+        })
+        if len(self._pending_inserts) >= _RUN_EVENT_FLUSH_SIZE:
+            self._flush_run_events()
 
     def _flush_run_events(self) -> None:
-        """Commit all pending run_event INSERTs in a single batch."""
-        if self._pending_event_count <= 0:
+        """Commit all pending run_event INSERTs using a short-lived session."""
+        if not self._pending_inserts:
             return
+        batch = self._pending_inserts
+        self._pending_inserts = []
         try:
-            self.db.commit()
+            with self._db() as db:
+                for row in batch:
+                    db.execute(
+                        text(
+                            "INSERT INTO run_events (run_id, idx, event_type, data, event_id, agent_id) "
+                            "VALUES (:run_id, :idx, :event_type, :data, :event_id, :agent_id)"
+                        ),
+                        row,
+                    )
+                db.commit()
         except Exception as e:
-            self.db.rollback()
-            logger.warning("Event batch commit failed: %s", e)
-        self._pending_event_count = 0
+            # Put batch back so next flush retries. Prepend to preserve ordering.
+            self._pending_inserts = batch + self._pending_inserts
+            logger.warning("Event batch commit failed (will retry): %s", e)
 
     def _load_events_from_db(self, run_id: str, after_index: int = 0) -> list[dict]:
         """Load events from DB for cross-worker streaming."""
         try:
-            rows = self.db.execute(
-                text(
-                    "SELECT event_type, data, event_id, agent_id FROM run_events "
-                    "WHERE run_id = :run_id AND idx >= :after "
-                    "ORDER BY idx"
-                ),
-                {"run_id": run_id, "after": after_index},
-            ).fetchall()
-            result = []
-            for row in rows:
-                data = row[1]
-                if isinstance(data, str):
-                    data = json.loads(data)
-                result.append({
-                    "event_type": row[0],
-                    "data": data,
-                    "event_id": row[2],
-                    "agent_id": row[3],
-                    "run_id": run_id,
-                })
-            return result
+            with self._db() as db:
+                rows = db.execute(
+                    text(
+                        "SELECT event_type, data, event_id, agent_id FROM run_events "
+                        "WHERE run_id = :run_id AND idx >= :after "
+                        "ORDER BY idx"
+                    ),
+                    {"run_id": run_id, "after": after_index},
+                ).fetchall()
+                result = []
+                for row in rows:
+                    data = row[1]
+                    if isinstance(data, str):
+                        data = json.loads(data)
+                    result.append({
+                        "event_type": row[0],
+                        "data": data,
+                        "event_id": row[2],
+                        "agent_id": row[3],
+                        "run_id": run_id,
+                    })
+                return result
         except Exception as e:
             logger.error(f"Failed to load events from DB for {run_id}: {e}")
             return []
@@ -636,66 +596,66 @@ class RunEngine:
     def _try_claim_resume(self, run_id: str) -> bool:
         """Optimistic lock: INSERT a unique claim row per resume attempt.
 
-        Uses DB-derived counter so cross-worker resume cycles get unique idx
-        values: -1, -2, -3, ... even when workers have no shared memory.
-        UNIQUE(run_id, idx) ensures only one worker wins each cycle.
+        Uses a single session for the SELECT + INSERT to preserve CAS semantics.
         """
-        try:
-            # Get next claim idx from DB (works across workers)
-            row = self.db.execute(
-                text("SELECT MIN(idx) FROM run_events "
-                     "WHERE run_id = :run_id AND event_type = 'resume_claim'"),
-                {"run_id": run_id},
-            ).fetchone()
-            prev_min = row[0] if row and row[0] is not None else 0
-            claim_idx = prev_min - 1  # -1, -2, -3, ...
+        with self._db() as db:
+            try:
+                row = db.execute(
+                    text("SELECT MIN(idx) FROM run_events "
+                         "WHERE run_id = :run_id AND event_type = 'resume_claim'"),
+                    {"run_id": run_id},
+                ).fetchone()
+                prev_min = row[0] if row and row[0] is not None else 0
+                claim_idx = prev_min - 1
 
-            self.db.execute(
-                text(
-                    "INSERT INTO run_events (run_id, idx, event_type, data) "
-                    "VALUES (:run_id, :idx, 'resume_claim', :data)"
-                ),
-                {
-                    "run_id": run_id,
-                    "idx": claim_idx,
-                    "data": json.dumps({"claimed_at": datetime.now(timezone.utc).isoformat()}),
-                },
-            )
-            self.db.commit()
-            return True
-        except IntegrityError:
-            self.db.rollback()
-            return False
-        except Exception as e:
-            self.db.rollback()
-            logger.error(f"Claim resume failed for {run_id}: {e}")
-            return False  # Fail safe: reject on error in distributed mode
+                db.execute(
+                    text(
+                        "INSERT INTO run_events (run_id, idx, event_type, data) "
+                        "VALUES (:run_id, :idx, 'resume_claim', :data)"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "idx": claim_idx,
+                        "data": json.dumps({"claimed_at": datetime.now(timezone.utc).isoformat()}),
+                    },
+                )
+                db.commit()
+                return True
+            except IntegrityError:
+                db.rollback()
+                return False
+            except Exception as e:
+                db.rollback()
+                logger.error(f"Claim resume failed for {run_id}: {e}")
+                return False
 
     def _is_cancelled_in_db(self, run_id: str) -> bool:
         try:
-            row = self.db.execute(
-                text(
-                    "SELECT 1 FROM conversation_events "
-                    "WHERE event_type = :et AND run_id = :run_id "
-                    "LIMIT 1"
-                ),
-                {"et": EventType.RUN_CANCELLED.value, "run_id": run_id},
-            ).fetchone()
-            return row is not None
+            with self._db() as db:
+                row = db.execute(
+                    text(
+                        "SELECT 1 FROM conversation_events "
+                        "WHERE event_type = :et AND run_id = :run_id "
+                        "LIMIT 1"
+                    ),
+                    {"et": EventType.RUN_CANCELLED.value, "run_id": run_id},
+                ).fetchone()
+                return row is not None
         except Exception:
             return False
 
     def _find_waiting_run_by_handle(self, handle: str) -> str | None:
         try:
-            row = self.db.execute(
-                text(
-                    "SELECT run_id FROM conversation_events "
-                    "WHERE event_type = :et AND waiting_for = :handle "
-                    "ORDER BY created_at DESC LIMIT 1"
-                ),
-                {"et": EventType.RUN_WAITING.value, "handle": handle},
-            ).fetchone()
-            return row[0] if row else None
+            with self._db() as db:
+                row = db.execute(
+                    text(
+                        "SELECT run_id FROM conversation_events "
+                        "WHERE event_type = :et AND waiting_for = :handle "
+                        "ORDER BY created_at DESC LIMIT 1"
+                    ),
+                    {"et": EventType.RUN_WAITING.value, "handle": handle},
+                ).fetchone()
+                return row[0] if row else None
         except Exception as e:
             logger.error(f"DB lookup for handle {handle} failed: {e}")
             return None
@@ -772,15 +732,16 @@ class RunEngine:
     def _get_child_run_ids_from_db(self, parent_run_id: str) -> set[str]:
         """Query DB for child run IDs of a parent."""
         try:
-            rows = self.db.execute(
-                text(
-                    "SELECT DISTINCT run_id FROM conversation_events "
-                    "WHERE event_type = :et "
-                    "AND parent_run_id = :pid"
-                ),
-                {"et": EventType.RUN_STARTED.value, "pid": parent_run_id},
-            ).fetchall()
-            return {row[0] for row in rows if row[0]}
+            with self._db() as db:
+                rows = db.execute(
+                    text(
+                        "SELECT DISTINCT run_id FROM conversation_events "
+                        "WHERE event_type = :et "
+                        "AND parent_run_id = :pid"
+                    ),
+                    {"et": EventType.RUN_STARTED.value, "pid": parent_run_id},
+                ).fetchall()
+                return {row[0] for row in rows if row[0]}
         except Exception as e:
             logger.warning(f"Failed to query child runs for {parent_run_id}: {e}")
             return set()
@@ -806,35 +767,36 @@ class RunEngine:
         if extra_meta:
             meta.update(extra_meta)
 
-        # Propagate causal chain from parent for audit traceability
         causal_chain_id = (run.context or {}).get("_causal_chain_id")
 
-        self.event_logger.create_stream_event(
-            user_id=run.user_id,
-            session_id=run.session_id,
-            event_type=event_type.value,
-            content=run.to_event_content(),
-            causal_chain_id=causal_chain_id,
-            metadata=meta,
-        )
-
-        # Terminal states must be visible for cross-worker polling
-        if event_type in self._TERMINAL_EVENT_TYPES:
-            self.event_logger.flush_critical()
+        # EventLogger without pipeline: run lifecycle events (RUN_STARTED,
+        # RUN_COMPLETED, etc.) are always written synchronously via db.add +
+        # db.commit.  The ChatLoop's EventLogger (which has a pipeline) is
+        # separate and handles user/LLM conversation events.  This is the
+        # same behavior as before the factory migration.
+        with self._db() as db:
+            el = EventLogger(db)
+            el.create_stream_event(
+                user_id=run.user_id,
+                session_id=run.session_id,
+                event_type=event_type.value,
+                content=run.to_event_content(),
+                causal_chain_id=causal_chain_id,
+                metadata=meta,
+            )
 
     def _write_cancel_event_for_run(self, run_id: str, session_id: str, user_id: str) -> bool:
-        """Write a cancel event to DB for a run on another worker.
-
-        Returns True if event was written successfully, False otherwise.
-        """
+        """Write a cancel event to DB for a run on another worker."""
         try:
-            self.event_logger.create_stream_event(
-                user_id=user_id,
-                session_id=session_id,
-                event_type=EventType.RUN_CANCELLED.value,
-                content="{}",
-                metadata={"run_id": run_id},
-            )
+            with self._db() as db:
+                el = EventLogger(db)
+                el.create_stream_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type=EventType.RUN_CANCELLED.value,
+                    content="{}",
+                    metadata={"run_id": run_id},
+                )
             return True
         except Exception as e:
             logger.warning(f"Failed to write cross-worker cancel for {run_id}: {e}")
@@ -873,14 +835,19 @@ class RunEngine:
 
     def restore_run(self, run_id: str) -> AgentRun | None:
         """Restore run state from conversation_events."""
-        rows = self.db.execute(
-            text(
-                "SELECT event_type, content, `metadata` FROM conversation_events "
-                "WHERE JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :run_id "
-                "ORDER BY created_at"
-            ),
-            {"run_id": run_id},
-        ).fetchall()
+        try:
+            with self._db() as db:
+                rows = db.execute(
+                    text(
+                        "SELECT event_type, content, `metadata` FROM conversation_events "
+                        "WHERE JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :run_id "
+                        "ORDER BY created_at"
+                    ),
+                    {"run_id": run_id},
+                ).fetchall()
+        except Exception as e:
+            logger.error(f"Failed to restore run {run_id}: {e}")
+            return None
 
         if not rows:
             return None

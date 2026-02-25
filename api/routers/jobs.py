@@ -96,8 +96,9 @@ async def job_completion_webhook(
     db=Depends(get_db_session),
 ):
     """Webhook called when a job completes. Resumes the waiting agent run."""
+    from api.database import SessionLocal
     from core.agent.run_engine import RunEngine
-    engine = RunEngine(db)
+    engine = RunEngine(SessionLocal)
     result = payload.result or {}
     if payload.error:
         result["error"] = payload.error
