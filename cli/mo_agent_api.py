@@ -159,11 +159,13 @@ async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, a
     # Introspection tool — session info populated with what we know at startup
     from cli.tools.introspection import GetAgentInfoTool
     session_info = {"session_id": session_id, "agent_id": agent_id, "model": model, "turn": 0}
-    router.register(GetAgentInfoTool(tool_router=router, session_info=session_info))
 
     perms = PermissionManager(auto_approve=auto_approve)
 
     async with APIClient(base_url=sync_client.base_url, profile=sync_client.profile) as api:
+        # Register introspection tool with api_client for cloud memory enrichment
+        router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api))
+
         await edge_chat_loop(
             user_input, api, router, perms,
             session_id=session_id, project_root=project_root,

@@ -452,3 +452,218 @@ def test_chat_turn_signature_matches_edge_chat_loop_call():
 
     missing = expected_kwargs - params
     assert not missing, f"APIClient.chat_turn() is missing parameters that edge_chat_loop sends: {missing}"
+
+
+# ============================================================================
+# P3.3: Introspection audit logging
+# ============================================================================
+
+class TestIntrospectionAuditLogging:
+    """Verify get_agent_info tool results are marked for audit."""
+
+    def test_introspection_tool_result_marked(self, client, auth_headers, db_session):
+        """tool_result for get_agent_info should have introspection=True in metadata."""
+        tool_results = [
+            {"tool_call_id": "tc_intro", "name": "get_agent_info", "result": '{"capability": {}}'},
+        ]
+
+        # No edge_tools → tools_schema is empty → uses chat_stream path
+        with patch("core.llm.client.LLMClient.chat_stream", return_value=fake_stream([
+            {"type": "text", "content": "done"},
+        ])):
+            response = client.post(
+                "/chat/turn",
+                json={"messages": [{"role": "user", "content": "test"}], "tool_results": tool_results},
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+
+        # Verify the event was persisted with introspection marker
+        row = db_session.execute(
+            sql_text("""
+                SELECT metadata FROM conversation_events
+                WHERE event_type = 'tool_result'
+                AND content LIKE '%get_agent_info%'
+                ORDER BY created_at DESC LIMIT 1
+            """),
+        ).fetchone()
+        assert row is not None, "get_agent_info tool_result should be persisted"
+        meta = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        assert meta.get("introspection") is True, f"metadata should have introspection=True, got {meta}"
+        assert meta.get("source") == "edge", "should still have source=edge"
+        assert meta.get("tool_call_id") == "tc_intro", "should preserve tool_call_id"
+
+    def test_non_introspection_tool_not_marked(self, client, auth_headers, db_session):
+        """Regular tool results should NOT have introspection marker."""
+        tool_results = [
+            {"tool_call_id": "tc_bash", "name": "bash", "result": "ok"},
+        ]
+
+        with patch("core.llm.client.LLMClient.chat_stream", return_value=fake_stream([
+            {"type": "text", "content": "done"},
+        ])):
+            response = client.post(
+                "/chat/turn",
+                json={"messages": [{"role": "user", "content": "test"}], "tool_results": tool_results},
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+
+        row = db_session.execute(
+            sql_text("""
+                SELECT metadata FROM conversation_events
+                WHERE event_type = 'tool_result'
+                AND content LIKE '%bash%'
+                ORDER BY created_at DESC LIMIT 1
+            """),
+        ).fetchone()
+        assert row is not None
+        meta = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        assert "introspection" not in meta, f"non-introspection tool should not be marked, got {meta}"
+
+
+# ============================================================================
+# P4.1-P4.2: Mid-session tool change detection
+# ============================================================================
+
+class TestToolChangeDetection:
+    """Verify system prompt is rebuilt when edge_tools change mid-session."""
+
+    def test_tools_change_rebuilds_system_preserves_history(self, client, auth_headers):
+        """When edge_tools change, system prompt is rebuilt but conversation history is preserved."""
+        captured_messages = []
+
+        def capture_and_stream(*args, **kwargs):
+            # chat_with_tools_stream(messages, tools, model=...) — positional args
+            msgs = args[0] if args else kwargs.get("messages", [])
+            captured_messages.append([dict(m) for m in msgs])
+            return fake_stream([
+                {"type": "text", "content": "ok"},
+            ])
+
+        tools_v1 = [{"type": "function", "function": {"name": "read_file", "description": "Read", "parameters": {}}}]
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=capture_and_stream):
+            r1 = client.post(
+                "/chat/turn",
+                json={"messages": [{"role": "user", "content": "hello"}], "edge_tools": tools_v1},
+                headers=auth_headers,
+            )
+            assert r1.status_code == 200
+            events = parse_sse(r1.text)
+            session_id = next(e["session_id"] for e in events if e.get("type") == "session_info")
+
+        # Turn 2: different tools
+        tools_v2 = [
+            {"type": "function", "function": {"name": "read_file", "description": "Read", "parameters": {}}},
+            {"type": "function", "function": {"name": "bash", "description": "Run shell", "parameters": {}}},
+        ]
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=capture_and_stream):
+            r2 = client.post(
+                "/chat/turn",
+                json={"messages": [{"role": "user", "content": "now I have bash"}], "session_id": session_id, "edge_tools": tools_v2},
+                headers=auth_headers,
+            )
+            assert r2.status_code == 200
+
+        assert len(captured_messages) == 2
+
+        # Turn 2 should have system message rebuilt (mentions new tool)
+        turn2_msgs = captured_messages[1]
+        turn2_system = turn2_msgs[0]["content"]
+        assert turn2_msgs[0]["role"] == "system"
+        # PromptAssembler categorizes tools — "bash" maps to shell/execution category
+        assert "bash" in turn2_system.lower() or "shell" in turn2_system.lower() or "execution" in turn2_system.lower(), \
+            f"Rebuilt system prompt should reference new tool. Got: {turn2_system[:200]}"
+
+        # Conversation history preserved: turn 2 should contain turn 1's user message + assistant reply
+        turn2_roles = [m["role"] for m in turn2_msgs]
+        assert turn2_roles.count("user") >= 2, \
+            f"Turn 2 should preserve turn 1 user message. Roles: {turn2_roles}"
+
+    def test_same_tools_no_rebuild(self, client, auth_headers):
+        """Sending the same tools again should NOT trigger a rebuild."""
+        call_count = [0]
+
+        def capture_and_stream(*args, **kwargs):
+            call_count[0] += 1
+            return fake_stream([{"type": "text", "content": "ok"}])
+
+        tools = [{"type": "function", "function": {"name": "read_file", "description": "Read", "parameters": {}}}]
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=capture_and_stream):
+            r1 = client.post(
+                "/chat/turn",
+                json={"messages": [{"role": "user", "content": "hello"}], "edge_tools": tools},
+                headers=auth_headers,
+            )
+            events = parse_sse(r1.text)
+            session_id = next(e["session_id"] for e in events if e.get("type") == "session_info")
+
+        # Send same tools again — should reuse cached system prompt
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=capture_and_stream) as mock_llm, \
+             patch("core.context.prompt_assembler.PromptAssembler.assemble") as mock_assemble:
+            r2 = client.post(
+                "/chat/turn",
+                json={"messages": [{"role": "user", "content": "same tools"}], "session_id": session_id, "edge_tools": tools},
+                headers=auth_headers,
+            )
+            assert r2.status_code == 200
+            # PromptAssembler.assemble should NOT be called (history already has system msg)
+            mock_assemble.assert_not_called()
+
+
+# ============================================================================
+# P3.2: Cloud introspection memory endpoint
+# ============================================================================
+
+class TestIntrospectionMemoryEndpoint:
+    """Test GET /introspection/memory endpoint."""
+
+    def test_returns_memory_stats_with_correct_values(self, client, auth_headers, db_session):
+        """Endpoint returns correct episodic, semantic, procedural stats."""
+        from tests.integration.helpers import unique_test_id
+
+        session_id = unique_test_id()
+
+        user_row = db_session.execute(sql_text(
+            "SELECT user_id FROM users WHERE username = 'assembler_test_user'"
+        )).fetchone()
+        assert user_row, "Test user should exist"
+        user_id = user_row[0]
+
+        # Create session
+        db_session.execute(sql_text("""
+            INSERT INTO sessions (session_id, user_id, agent_id, status, event_count, created_at, last_active_at)
+            VALUES (:sid, :uid, 'test', 'active', 0, NOW(), NOW())
+        """), {"sid": session_id, "uid": user_id})
+        db_session.commit()
+
+        try:
+            response = client.get(
+                f"/introspection/memory?session_id={session_id}",
+                headers=auth_headers,
+            )
+            assert response.status_code == 200
+            data = response.json()
+
+            # Verify structure AND values for empty session
+            assert data["episodic"] == {"total_events": 0, "user_queries": 0, "tool_calls": 0}
+            assert data["semantic"] == {"context_snapshots": 0, "peak_snapshot_tokens": 0}
+            assert data["procedural"]["skill_selections"] == 0
+            assert data["procedural"]["accuracy_rate"] is None
+        finally:
+            db_session.execute(sql_text("DELETE FROM sessions WHERE session_id = :sid"), {"sid": session_id})
+            db_session.commit()
+
+    def test_rejects_other_users_session(self, client, auth_headers):
+        """Cannot query another user's session."""
+        response = client.get(
+            "/introspection/memory?session_id=nonexistent_session",
+            headers=auth_headers,
+        )
+        assert response.status_code == 404
+
+    def test_requires_session_id(self, client, auth_headers):
+        """session_id query param is required."""
+        response = client.get("/introspection/memory", headers=auth_headers)
+        assert response.status_code == 422

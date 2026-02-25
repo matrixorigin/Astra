@@ -198,6 +198,11 @@ from api.routers import chat
 
 app.include_router(chat.router, tags=["chat"])
 
+# Introspection API — cloud-side data for get_agent_info tool
+from api.routers import introspection
+
+app.include_router(introspection.router, tags=["introspection"])
+
 from api.routers import jobs
 
 app.include_router(jobs.router, tags=["jobs"])

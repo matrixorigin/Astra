@@ -756,3 +756,12 @@ class APIClient:
             json={"username": username, "role_name": role_name},
         )
         return response.json()
+
+    async def get_introspection_memory(self, session_id: str) -> dict[str, Any]:
+        """Get memory stats from cloud for introspection tool."""
+        response = await self._request(
+            "GET",
+            "/introspection/memory",
+            params={"session_id": session_id},
+        )
+        return response.json()

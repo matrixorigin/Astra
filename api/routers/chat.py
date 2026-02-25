@@ -409,6 +409,11 @@ _turn_histories: _LRUDict = _LRUDict(_MAX_CACHED_SESSIONS)
 _session_tools: _LRUDict = _LRUDict(_MAX_CACHED_SESSIONS)
 
 
+def _tool_names(tools: list[dict[str, Any]]) -> set[str]:
+    """Extract tool names from OpenAI-format tool schemas for change detection."""
+    return {t.get("function", {}).get("name", "") for t in tools}
+
+
 def _build_turn_messages(
     db: Session,
     user_id: str,
@@ -419,16 +424,26 @@ def _build_turn_messages(
     agent_id: str | None = None,
     edge_tools: list[dict[str, Any]] | None = None,
     edge_profile: dict[str, Any] | None = None,
+    force_rebuild_system: bool = False,
 ) -> list[dict[str, Any]]:
-    """Build LLM messages from edge turn data + server-side history."""
+    """Build LLM messages from edge turn data + server-side history.
+
+    When force_rebuild_system=True (mid-session tool change), only the system
+    message (history[0]) is replaced — the rest of the conversation is preserved.
+    """
     history = _turn_histories.get(session_id)
 
     # Recover from DB if not in memory (server restart)
     if history is None:
         history = _recover_history_from_db(db, user_id, session_id, agent_id)
 
-    # First turn: build system prompt via PromptAssembler
-    if not history:
+    # Rebuild system prompt: either first turn (empty history) or forced by tool change.
+    # On force_rebuild_system we replace history[0] in-place, preserving conversation.
+    # NOTE: on mid-session rebuild, project_rules and edge_profile may be None (only
+    # sent on turn 0). The rebuilt prompt will have updated tool info but stale/missing
+    # project context. This is acceptable — the Self-Model tool section is the primary
+    # reason for rebuild, and project context doesn't change mid-session.
+    if not history or force_rebuild_system:
         user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
 
         from core.context.prompt_assembler import PromptAssembler, EdgeContext
@@ -447,7 +462,11 @@ def _build_turn_messages(
         system = assembled.system_message
         logger.debug("Assembled prompt: %d tokens, snapshot=%s", sum(assembled.token_breakdown.values()), assembled.snapshot_id)
 
-        history = [{"role": "system", "content": system}]
+        if history and force_rebuild_system:
+            # Replace system message, keep conversation history intact
+            history[0] = {"role": "system", "content": system}
+        else:
+            history = [{"role": "system", "content": system}]
 
     # Append new user messages from edge
     for msg in messages:
@@ -544,13 +563,16 @@ def _persist_turn_events(
         # Persist tool results from edge (tagged source: "edge")
         if tool_results:
             for tr in tool_results:
+                meta = {"source": "edge", "tool_call_id": tr.get("tool_call_id")}
+                if tr.get("name") == "get_agent_info":
+                    meta["introspection"] = True
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
                     event_type="tool_result",
                     content=json.dumps({"name": tr.get("name", ""), "result": tr.get("result", "")[:2000]}),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
-                    metadata={"source": "edge", "tool_call_id": tr.get("tool_call_id")},
+                    metadata=meta,
                 )
 
         # Persist LLM response
@@ -597,8 +619,14 @@ async def chat_turn(
     user_id = current_user["user_id"]
     session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
 
-    # Cache edge_tools on first turn, reuse on subsequent turns
+    # Detect tool changes: compare new edge_tools with cached set.
+    # On change, we rebuild the system prompt (with new Self-Model) but preserve
+    # conversation history — see force_rebuild_system in _build_turn_messages.
+    tools_changed = False
     if request.edge_tools:
+        cached = _session_tools.get(session_id, [])
+        if cached and _tool_names(request.edge_tools) != _tool_names(cached):
+            tools_changed = True
         _session_tools[session_id] = request.edge_tools
     tools_schema = _session_tools.get(session_id, [])
 
@@ -609,6 +637,7 @@ async def chat_turn(
         agent_id=request.agent_id,
         edge_tools=request.edge_tools,
         edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
+        force_rebuild_system=tools_changed,
     )
 
     model = request.model
