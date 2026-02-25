@@ -201,7 +201,7 @@ class PromptAssembler:
             "- Think step-by-step before acting\n"
             "- Verify changes before presenting\n"
             "- If uncertain, say so rather than guess\n"
-            "- Prefer using tools over generating untested answers"
+            "- For questions about YOUR capabilities, answer from Self-Model — don't explore files"
         )
         sections["constraints"] = constraints
         breakdown["constraints"] = _estimate_tokens(constraints)
@@ -286,14 +286,17 @@ class PromptAssembler:
     ) -> str:
         """§2: Agent self-awareness — capabilities, boundaries, learned insights."""
         parts = ["## Self-Model"]
+        parts.append("When users ask about YOUR skills, capabilities, or what you can do, answer from this section — do not explore the filesystem.")
 
-        # Capabilities
-        parts.append("\n### Capabilities")
+        # Capabilities — list actual tool names so LLM knows exactly what it has
+        parts.append("\n### My Skills & Tools")
         if edge_context and edge_context.edge_tools:
             tool_names = [t.get("function", {}).get("name", "unknown") for t in edge_context.edge_tools]
-            # Group by category instead of listing all names
+            parts.append(f"- Available tools: {', '.join(tool_names)}")
+            # Also show categories for context
             categories = _categorize_tools(tool_names)
-            parts.append(f"- Local tools (via edge): {', '.join(categories)}")
+            if categories:
+                parts.append(f"- Categories: {', '.join(categories)}")
         else:
             parts.append("- Local tools: file operations, shell commands, git, search")
 
