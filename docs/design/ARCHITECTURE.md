@@ -113,6 +113,8 @@ This is the index. Each document is the **single source of truth** for its domai
 | Document | Scope |
 |----------|-------|
 | [Edge-Cloud Execution](edge-cloud-execution.md) | Edge-cloud split execution: `/chat/turn` protocol, skill classification (edge/cloud/hybrid), edge state model, security model, sync protocol |
+| [Agent Introspection](agent-introspection.md) | Agent self-awareness: metacognition model, static/dynamic introspection, intent classification, cross-agent capability query, system prompt enrichment |
+| [Prompt Lifecycle](prompt-lifecycle.md) | Prompt assembly pipeline, unified prompt path, edge-cloud tool merging, prompt versioning via time travel, prompt A/B testing via branching, self-model section |
 
 ### Supporting Documents (Implementation)
 
