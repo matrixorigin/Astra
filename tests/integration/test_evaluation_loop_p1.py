@@ -41,7 +41,7 @@ def session_manager(db_session):
 @pytest.fixture
 def event_logger(db_session):
     """Create event logger."""
-    return EventLogger(db_session)
+    return EventLogger.from_session(db_session)
 
 
 @pytest.fixture

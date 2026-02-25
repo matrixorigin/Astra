@@ -51,7 +51,7 @@ def llm(db_session):
 @pytest.fixture
 def logger(db_session):
     """Event logger fixture"""
-    return EventLogger(db_session)
+    return EventLogger.from_session(db_session)
 
 
 @pytest.fixture

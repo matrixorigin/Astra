@@ -7,34 +7,65 @@ for async batched ingestion. Otherwise falls back to synchronous DB writes.
 
 import json
 import os
+from typing import Callable
 
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
 from api.models import Event as EventModel
+from core.db_consumer import DbConsumer
 from core.events.models import ConversationEvent, EventType
 
 _PIPELINE_ENABLED = os.environ.get("EVENT_PIPELINE_ENABLED", "true").lower() in ("true", "1", "yes")
 
 
-class EventLogger:
+class EventLogger(DbConsumer):
     """Logger for conversation events.
 
     Provides methods to create and persist events following the event-centric design.
     When a pipeline is attached, log_event() delegates to pipeline.emit() (async).
     """
 
-    def __init__(self, session: Session, pipeline=None) -> None:
+    def __init__(self, db_factory: Callable[[], Session], pipeline=None) -> None:
         """Initialize event logger.
 
         Args:
-            session: SQLAlchemy session (required).
+            db_factory: Callable that returns a new SQLAlchemy Session.
+                        For legacy callers that still hold a raw Session,
+                        use ``EventLogger.from_session(db)`` instead.
             pipeline: Optional EventPipeline for async writes.
+        """
+        super().__init__(db_factory)
+        self._pipeline = pipeline
+
+    @classmethod
+    def from_session(cls, session: Session, pipeline=None) -> "EventLogger":
+        """Create an EventLogger backed by an existing session.
+
+        The session will NOT be closed by ``_db()`` — ownership stays with
+        the caller.  Use this for request-scoped sessions that outlive the
+        EventLogger.
+
+        Raises TypeError if *session* is not a SQLAlchemy Session.
         """
         if not isinstance(session, Session):
             raise TypeError(f"session must be a SQLAlchemy Session, got {type(session).__name__}")
-        self.session = session
-        self._pipeline = pipeline
+        inst = cls(lambda: session, pipeline=pipeline)
+
+        # Override _db to yield the borrowed session without closing it.
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _borrowed_db():
+            try:
+                yield session
+            except Exception:
+                session.rollback()
+                raise
+
+        inst._db = _borrowed_db  # type: ignore[assignment]
+        inst._borrowed_session = session  # expose for introspection/tests
+        return inst
 
     def log_event(self, event: ConversationEvent) -> str:
         """Log a conversation event to the database.
@@ -90,8 +121,9 @@ class EventLogger:
             waiting_for=waiting_for,
         )
         
-        self.session.add(db_event)
-        self.session.commit()
+        with self._db() as db:
+            db.add(db_event)
+            db.commit()
         return event.event_id
 
     def flush_critical(self) -> None:
@@ -310,9 +342,10 @@ class EventLogger:
         self, event_id: str, quality_score: float, training_eligible: bool,
     ) -> None:
         """Update quality_score and training_eligible on an existing event."""
-        self.session.query(EventModel).filter(
-            EventModel.event_id == event_id,
-        ).update(
-            {"quality_score": quality_score, "training_eligible": training_eligible},
-        )
-        self.session.commit()
+        with self._db() as db:
+            db.query(EventModel).filter(
+                EventModel.event_id == event_id,
+            ).update(
+                {"quality_score": quality_score, "training_eligible": training_eligible},
+            )
+            db.commit()

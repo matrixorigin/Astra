@@ -25,7 +25,7 @@ def db():
 @pytest.fixture
 def event_logger(db):
     """Event logger fixture."""
-    return EventLogger(db)
+    return EventLogger.from_session(db)
 
 
 def test_scoring_weights_validation():

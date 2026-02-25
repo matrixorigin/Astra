@@ -873,7 +873,7 @@ class TestChatAPIGateTriggerE2E:
             captured["gate_trigger"] = gt
             captured["db_factory_is_session_local"] = True
 
-            event_logger = EventLogger(db)
+            event_logger = EventLogger.from_session(db)
             mock_llm = Mock()
             mock_llm.config = {"model": "test", "temperature": 0}
             mock_llm.chat.return_value = Mock(

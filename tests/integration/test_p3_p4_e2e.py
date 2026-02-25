@@ -93,7 +93,7 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
         from core.skills.pipeline import SkillPipeline
         from core.skills.registry import SkillRegistry
 
-        event_logger = EventLogger(db)
+        event_logger = EventLogger.from_session(db)
         skill_registry = SkillRegistry(db)
         context_manager = ContextManager(db)
         selector = SkillPipeline(db, llm, audit=True, learning=True)

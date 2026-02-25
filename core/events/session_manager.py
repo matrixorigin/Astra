@@ -146,7 +146,7 @@ class SessionManager:
                 from core.events.event_logger import EventLogger
                 from api.models import Event
                 
-                event_logger = EventLogger(db)
+                event_logger = EventLogger.from_session(db)
                 extractor = KnowledgeExtractor(db, event_logger=event_logger)
                 
                 # Get all unique causal chains in this session

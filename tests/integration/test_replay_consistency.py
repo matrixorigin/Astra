@@ -20,7 +20,7 @@ def test_retrieval_storage_and_replay():
     
     # Create session and events
     session_mgr = SessionManager(db)
-    logger = EventLogger(db)
+    logger = EventLogger.from_session(db)
     
     session = session_mgr.create_session(user_id="test_user")
     session_id = session.session_id

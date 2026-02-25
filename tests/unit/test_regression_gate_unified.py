@@ -71,7 +71,7 @@ class TestGoldenSessionSelection:
         from core.events.event_logger import EventLogger
         
         uid = setup_tables._test_uid
-        logger = EventLogger(setup_tables)
+        logger = EventLogger.from_session(setup_tables)
         
         # Insert high-quality session
         for i in range(3):
@@ -114,7 +114,7 @@ class TestGoldenSessionSelection:
         from core.events.event_logger import EventLogger
         
         uid = setup_tables._test_uid
-        logger = EventLogger(setup_tables)
+        logger = EventLogger.from_session(setup_tables)
         
         # Session with 2 events (should not be selected)
         for i in range(2):
@@ -155,7 +155,7 @@ class TestGoldenSessionSelection:
         from core.events.event_logger import EventLogger
         
         uid = setup_tables._test_uid
-        logger = EventLogger(setup_tables)
+        logger = EventLogger.from_session(setup_tables)
         
         # Session s1 with score 4.0
         for i in range(3):
@@ -420,7 +420,7 @@ class TestSelectorChangeValidation:
         from core.events.event_logger import EventLogger
         
         uid = setup_tables._test_uid
-        logger = EventLogger(setup_tables)
+        logger = EventLogger.from_session(setup_tables)
         
         # Create a golden session
         for i in range(3):
@@ -513,7 +513,7 @@ class TestSandboxCleanup:
         from core.events.event_logger import EventLogger
         
         uid = setup_tables._test_uid
-        logger = EventLogger(setup_tables)
+        logger = EventLogger.from_session(setup_tables)
         
         # Create a golden session
         for i in range(3):
@@ -573,7 +573,7 @@ class TestSandboxCleanup:
         from core.events.event_logger import EventLogger
         
         uid = setup_tables._test_uid
-        logger = EventLogger(setup_tables)
+        logger = EventLogger.from_session(setup_tables)
         
         # Create a golden session
         for i in range(3):

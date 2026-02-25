@@ -387,11 +387,12 @@ Post-migration, monitor these metrics to validate the design:
 | Component | Phase | Status | Notes |
 |-----------|-------|--------|-------|
 | `EventPipeline._flush_loop` | 1 | ✅ Done | Session-per-flush applied |
-| `RunEngine` (bg_db) | 2 | TODO | Highest priority — 30min hold |
-| `RunEngine._cancel_workflow` | 2 | TODO | Uses `self.db` contextvar, needs independent session |
-| `EventLogger` | 2 | TODO | Used everywhere |
-| `ChatLoop` | 2 | TODO | |
-| `_trigger_loop` | 2 | TODO | Change to session-per-trigger |
+| `DbConsumer` base class | 1 | ✅ Done | `core/db_consumer.py` — contextmanager with caller-commit |
+| `RunEngine` (bg_db) | 2 | ✅ Done | bg_db eliminated, contextvars removed, session-per-operation |
+| `RunEngine._cancel_workflow` | 2 | ✅ Done | Uses `with self._db()` independent session |
+| `_trigger_loop` | 2 | ✅ Done | Session-per-trigger; `fire_trigger` takes `db_factory` |
+| `EventLogger` | 2 | ✅ Done | Extends DbConsumer; `from_session()` for legacy callers |
+| `ChatLoop` | 2 | TODO | `_build_chat_loop` still receives raw Session |
 | `_run_eval_daily` Phase 2-4 | 2 | TODO | Give independent sessions |
 | `SkillPipeline` | 3 | TODO | |
 | `ContextManager` | 3 | TODO | `save_snapshot` already uses factory |

@@ -17,7 +17,7 @@ def main():
     
     # Initialize components
     session_mgr = SessionManager(db)
-    event_logger = EventLogger(db)
+    event_logger = EventLogger.from_session(db)
     extractor = KnowledgeExtractor(db)
     context_mgr = ContextManager(db, embedding_provider="mock")
     

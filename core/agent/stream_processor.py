@@ -30,7 +30,7 @@ class StreamProcessor:
             db: Database session
         """
         self.db = db
-        self.event_logger = EventLogger(db)
+        self.event_logger = EventLogger.from_session(db)
         self.validator = StreamValidator()
         self.persistence = StreamPersistence(self.event_logger)
         self.replay = StreamReplay(db)

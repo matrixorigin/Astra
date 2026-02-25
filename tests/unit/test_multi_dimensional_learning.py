@@ -131,6 +131,10 @@ class TestMultiDimensionalLearning:
             )
         )
         from api.models import SkillSelectionLearning
+        # Clean up any leftover from interrupted previous runs.
+        db_session.query(SkillSelectionLearning).filter(
+            SkillSelectionLearning.learning_id == "per_signal_weight_test",
+        ).delete()
         learning = SkillSelectionLearning(
             learning_id="per_signal_weight_test",
             query_pattern="review",
@@ -151,6 +155,9 @@ class TestMultiDimensionalLearning:
             SkillSelectionLearning.learning_id == learning.learning_id
         ).first()
         assert learning_after.applied_count == 0
+        db_session.query(SkillSelectionLearning).filter(
+            SkillSelectionLearning.learning_id == "per_signal_weight_test",
+        ).delete()
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_weights"
         ).delete()

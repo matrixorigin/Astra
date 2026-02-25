@@ -16,6 +16,87 @@ from core.events.models import ConversationEvent, EventType
 from core.events.pipeline import EventPipeline
 
 
+# ── EventLogger session lifecycle tests ──
+
+
+class TestEventLoggerSessionLifecycle:
+    """Core correctness: factory mode creates/closes sessions; borrowed mode doesn't close."""
+
+    _counter = 0
+
+    def _make_event(self):
+        TestEventLoggerSessionLifecycle._counter += 1
+        return ConversationEvent(
+            event_id=f"e{self._counter}", user_id="u1", session_id="s1",
+            agent_id="a", agent_version="1", event_type=EventType.USER_QUERY,
+            content="hello", causal_chain_id="c1",
+        )
+
+    def test_factory_mode_creates_and_closes_session_per_log_event(self):
+        """Each log_event() call must acquire a fresh session and close it."""
+        sessions = []
+
+        def factory():
+            s = MagicMock(spec=Session)
+            sessions.append(s)
+            return s
+
+        el = EventLogger(factory)
+        el.log_event(self._make_event())
+        el.log_event(self._make_event())
+
+        assert len(sessions) == 2
+        for s in sessions:
+            s.add.assert_called_once()
+            s.commit.assert_called_once()
+            s.close.assert_called_once()
+
+    def test_borrowed_mode_never_closes_session(self):
+        """from_session must not close the caller's session."""
+        mock_session = MagicMock(spec=Session)
+        el = EventLogger.from_session(mock_session)
+        el.log_event(self._make_event())
+        el.log_event(self._make_event())
+
+        assert mock_session.add.call_count == 2
+        assert mock_session.commit.call_count == 2
+        mock_session.close.assert_not_called()
+
+    def test_borrowed_mode_rolls_back_on_error(self):
+        """from_session must rollback (not close) on exception."""
+        mock_session = MagicMock(spec=Session)
+        mock_session.commit.side_effect = RuntimeError("db error")
+        el = EventLogger.from_session(mock_session)
+
+        with pytest.raises(RuntimeError, match="db error"):
+            el.log_event(self._make_event())
+
+        mock_session.rollback.assert_called_once()
+        mock_session.close.assert_not_called()
+
+    def test_factory_mode_rolls_back_and_closes_on_error(self):
+        """Factory mode must rollback AND close on exception."""
+        mock_session = MagicMock(spec=Session)
+        mock_session.commit.side_effect = RuntimeError("db error")
+        el = EventLogger(lambda: mock_session)
+
+        with pytest.raises(RuntimeError, match="db error"):
+            el.log_event(self._make_event())
+
+        mock_session.rollback.assert_called_once()
+        mock_session.close.assert_called_once()
+
+    def test_from_session_rejects_non_session(self):
+        """from_session must raise TypeError for non-Session input."""
+        with pytest.raises(TypeError, match="SQLAlchemy Session"):
+            EventLogger.from_session("not a session")
+
+    def test_constructor_rejects_non_callable(self):
+        """EventLogger() must raise TypeError for non-callable input."""
+        with pytest.raises(TypeError, match="callable"):
+            EventLogger("not callable")
+
+
 # ── EventLogger delegation tests ──
 
 
@@ -26,7 +107,7 @@ class TestEventLoggerDelegation:
         mock_session = MagicMock(spec=Session)
         mock_pipeline = MagicMock(spec=EventPipeline)
         mock_pipeline.emit.return_value = "evt-123"
-        el = EventLogger(mock_session, pipeline=mock_pipeline)
+        el = EventLogger.from_session(mock_session, pipeline=mock_pipeline)
         return el, mock_session, mock_pipeline
 
     @patch("core.events.event_logger._PIPELINE_ENABLED", True)
@@ -77,7 +158,7 @@ class TestEventLoggerDelegation:
     def test_no_pipeline_falls_back_to_sync(self):
         """EventLogger without pipeline should still do sync writes."""
         mock_session = MagicMock(spec=Session)
-        el = EventLogger(mock_session, pipeline=None)
+        el = EventLogger.from_session(mock_session, pipeline=None)
         ev = ConversationEvent(
             event_id="e1", user_id="u1", session_id="s1",
             agent_id="a", agent_version="1", event_type=EventType.USER_QUERY,
@@ -134,7 +215,7 @@ class TestChatLoopFlushOrdering:
         mock_pipeline = MagicMock(spec=EventPipeline)
         mock_pipeline.emit.return_value = "evt-id"
 
-        el = EventLogger(mock_session, pipeline=mock_pipeline)
+        el = EventLogger.from_session(mock_session, pipeline=mock_pipeline)
 
         # Track call order
         call_order = []
@@ -194,7 +275,7 @@ class TestChatLoopFlushOrdering:
 
 
 class TestRunEngineFlushOnTerminal:
-    """_log_run_event creates a bare EventLogger(db) — no pipeline.
+    """RunEngine caches a single EventLogger(db_factory) with no pipeline.
 
     This is the key design guarantee: run lifecycle events are ALWAYS written
     synchronously via db.add + db.commit, never deferred through a pipeline.
@@ -226,7 +307,7 @@ class TestRunEngineFlushOnTerminal:
     def test_log_run_event_never_uses_pipeline(self):
         """Even when _PIPELINE_ENABLED is True, _log_run_event bypasses it.
 
-        RunEngine creates EventLogger(db) without a pipeline argument, so
+        RunEngine creates EventLogger(db_factory) without a pipeline argument, so
         log_event() always takes the synchronous path.  This is critical:
         terminal events must be committed before start_run returns, otherwise
         cross-worker polling may miss them.

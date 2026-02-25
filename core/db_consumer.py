@@ -9,10 +9,8 @@ from sqlalchemy.orm import Session
 class DbConsumer:
     """Base for components that acquire DB sessions on demand.
 
-    Instead of holding a long-lived session, each operation acquires a session
-    from the factory, uses it, and returns it to the pool immediately.
-
-    Usage::
+    Each ``_db()`` call creates a fresh session from the factory and closes
+    it when the block exits::
 
         class MyComponent(DbConsumer):
             def do_work(self):
@@ -22,6 +20,8 @@ class DbConsumer:
     """
 
     def __init__(self, db_factory: Callable[[], Session]):
+        if not callable(db_factory):
+            raise TypeError(f"db_factory must be callable, got {type(db_factory).__name__}")
         self._db_factory = db_factory
 
     @contextmanager

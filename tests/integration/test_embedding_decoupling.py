@@ -74,7 +74,7 @@ class TestEventLoggerNoInlineEmbedding:
 
     def test_log_event_writes_null_embedding(self, db_session, session_id, cleanup_events):
         """EventLogger sync path must write embedding=NULL."""
-        logger = EventLogger(db_session)
+        logger = EventLogger.from_session(db_session)
         ev = _make_event(session_id)
         logger.log_event(ev)
 
@@ -92,7 +92,7 @@ class TestEmbeddingWorker:
 
     def test_worker_embeds_eligible_events(self, db_session, session_id, cleanup_events):
         """Worker should embed user_query and llm_response, skip others."""
-        logger = EventLogger(db_session)
+        logger = EventLogger.from_session(db_session)
 
         # Write events of different types
         ev_query = _make_event(session_id, EventType.USER_QUERY, "What is HTAP?")
@@ -126,7 +126,7 @@ class TestEmbeddingWorker:
 
     def test_worker_idempotent(self, db_session, session_id, cleanup_events):
         """Running worker twice should not duplicate embeddings."""
-        logger = EventLogger(db_session)
+        logger = EventLogger.from_session(db_session)
         ev = _make_event(session_id, EventType.USER_QUERY, "test idempotency")
         logger.log_event(ev)
 
@@ -143,7 +143,7 @@ class TestEmbeddingWorker:
     @pytest.mark.asyncio
     async def test_worker_async_lifecycle(self, db_session, session_id, cleanup_events):
         """Worker start/stop lifecycle with async polling."""
-        logger = EventLogger(db_session)
+        logger = EventLogger.from_session(db_session)
         ev = _make_event(session_id, EventType.USER_QUERY, "async test")
         logger.log_event(ev)
 
@@ -181,7 +181,7 @@ class TestHybridRetrieverJoinPath:
         from core.context.hybrid_retrieval import HybridRetriever
         from core.context.embeddings import EmbeddingService
 
-        logger = EventLogger(db_session)
+        logger = EventLogger.from_session(db_session)
         ev = _make_event(session_id, EventType.USER_QUERY, "What is event sourcing?")
         logger.log_event(ev)
 
@@ -206,7 +206,7 @@ class TestHybridRetrieverJoinPath:
         from core.context.hybrid_retrieval import HybridRetriever
         from core.context.embeddings import EmbeddingService
 
-        logger = EventLogger(db_session)
+        logger = EventLogger.from_session(db_session)
         ev = _make_event(session_id, EventType.USER_QUERY, "MatrixOne HTAP database")
         logger.log_event(ev)
 
@@ -230,7 +230,7 @@ class TestHybridRetrieverJoinPath:
         from core.context.hybrid_retrieval import HybridRetriever
         from core.context.embeddings import EmbeddingService
 
-        logger = EventLogger(db_session)
+        logger = EventLogger.from_session(db_session)
 
         # Two events, only one gets an embedding
         ev_with = _make_event(session_id, EventType.USER_QUERY, "embedded event about databases")
@@ -264,7 +264,7 @@ class TestEndToEndDecoupled:
         from api.database import SessionLocal
 
         # 1. Write event (no inline embedding)
-        logger = EventLogger(db_session)
+        logger = EventLogger.from_session(db_session)
         ev = _make_event(session_id, EventType.USER_QUERY, "How does MVCC work in MatrixOne?")
         logger.log_event(ev)
 

@@ -94,6 +94,9 @@ class RunEngine(DbConsumer):
         super().__init__(db_factory)
         self._chat_loop_factory = chat_loop_factory
         self._pending_inserts: list[dict] = []
+        # Run lifecycle EventLogger — no pipeline, always synchronous writes.
+        # Shared across _log_run_event / _write_cancel_event_for_run calls.
+        self._run_event_logger = EventLogger(db_factory)
         _start_gc_task()
 
     # ── Public API ────────────────────────────────────────────
@@ -777,34 +780,28 @@ class RunEngine(DbConsumer):
 
         causal_chain_id = (run.context or {}).get("_causal_chain_id")
 
-        # EventLogger without pipeline: run lifecycle events (RUN_STARTED,
-        # RUN_COMPLETED, etc.) are always written synchronously via db.add +
-        # db.commit.  The ChatLoop's EventLogger (which has a pipeline) is
-        # separate and handles user/LLM conversation events.  This is the
-        # same behavior as before the factory migration.
-        with self._db() as db:
-            el = EventLogger(db)
-            el.create_stream_event(
-                user_id=run.user_id,
-                session_id=run.session_id,
-                event_type=event_type.value,
-                content=run.to_event_content(),
-                causal_chain_id=causal_chain_id,
-                metadata=meta,
-            )
+        # Run lifecycle events are always written synchronously (no pipeline).
+        # Uses the cached self._run_event_logger which acquires a short-lived
+        # session per log_event() call via DbConsumer._db().
+        self._run_event_logger.create_stream_event(
+            user_id=run.user_id,
+            session_id=run.session_id,
+            event_type=event_type.value,
+            content=run.to_event_content(),
+            causal_chain_id=causal_chain_id,
+            metadata=meta,
+        )
 
     def _write_cancel_event_for_run(self, run_id: str, session_id: str, user_id: str) -> bool:
         """Write a cancel event to DB for a run on another worker."""
         try:
-            with self._db() as db:
-                el = EventLogger(db)
-                el.create_stream_event(
-                    user_id=user_id,
-                    session_id=session_id,
-                    event_type=EventType.RUN_CANCELLED.value,
-                    content="{}",
-                    metadata={"run_id": run_id},
-                )
+            self._run_event_logger.create_stream_event(
+                user_id=user_id,
+                session_id=session_id,
+                event_type=EventType.RUN_CANCELLED.value,
+                content="{}",
+                metadata={"run_id": run_id},
+            )
             return True
         except Exception as e:
             logger.warning(f"Failed to write cross-worker cancel for {run_id}: {e}")

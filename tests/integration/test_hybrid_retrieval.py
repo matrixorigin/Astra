@@ -18,7 +18,7 @@ def test_hybrid_retrieval():
     
     # Create session and events
     session_mgr = SessionManager(db)
-    logger = EventLogger(db)
+    logger = EventLogger.from_session(db)
     
     session = session_mgr.create_session(user_id="test_user")
     session_id = session.session_id
@@ -77,7 +77,7 @@ def test_replay_consistency():
     
     # Create session and events
     session_mgr = SessionManager(db)
-    logger = EventLogger(db)
+    logger = EventLogger.from_session(db)
     
     session = session_mgr.create_session(user_id="test_user_replay")
     session_id = session.session_id
@@ -133,7 +133,7 @@ def test_fallback_retrieval():
     init_db()
     
     session_mgr = SessionManager(db)
-    logger = EventLogger(db)
+    logger = EventLogger.from_session(db)
     
     session = session_mgr.create_session(user_id="test_user_fallback")
     session_id = session.session_id

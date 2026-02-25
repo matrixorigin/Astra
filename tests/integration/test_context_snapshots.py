@@ -15,7 +15,7 @@ def context_manager(db_session):
 @pytest.fixture
 def event_logger(db_session):
     """Event logger fixture."""
-    return EventLogger(db_session)
+    return EventLogger.from_session(db_session)
 
 
 def test_context_snapshot_save_and_load(db_session, context_manager, event_logger):

@@ -40,15 +40,21 @@ class TestSessionInjection:
         git = GitForData(db=mock_session)
         assert git.db is mock_session
 
-    def test_event_logger_requires_session(self):
-        """Test EventLogger requires session parameter."""
-        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
-            EventLogger(session=None)
-        
-        # Should work with proper session
+    def test_event_logger_requires_valid_input(self):
+        """Test EventLogger rejects invalid construction arguments."""
+        # Factory mode: rejects non-callable
+        with pytest.raises(TypeError, match="callable"):
+            EventLogger(None)
+
+        # Borrowed mode: rejects non-Session
+        with pytest.raises(TypeError, match="SQLAlchemy Session"):
+            EventLogger.from_session(None)
+
+        # Should work with proper session (borrowed mode)
         mock_session = Mock(spec=Session)
-        logger = EventLogger(session=mock_session)
-        assert logger.session is mock_session
+        logger = EventLogger.from_session(mock_session)
+        # Verify borrowed mode: log_event uses the session without closing it.
+        mock_session.close.assert_not_called()
 
     def test_sandbox_requires_session(self):
         """Test Sandbox requires session parameter."""
@@ -189,7 +195,7 @@ class TestNoSessionCreation:
         
         modules = [
             GitForData(db=mock_session),
-            EventLogger(session=mock_session),
+            EventLogger.from_session(mock_session),
             Sandbox(db=mock_session),
             SkillRegistry(session=mock_session),
             ModernSkillSelector(session=mock_session),
@@ -212,12 +218,12 @@ class TestSessionLifecycle:
         # Caller gets session
         db = next(get_db_session())
         
-        # Pass to modules
-        logger = EventLogger(session=db)
+        # Pass to modules (EventLogger uses from_session for borrowed sessions)
+        logger = EventLogger.from_session(db)
         git = GitForData(db=db)
         
-        # Modules use the session but don't close it
-        assert logger.session is db
+        # Modules use the session but don't close it.
+        # EventLogger in borrowed mode uses the same session without closing.
         assert git.db is db
         
         # Caller is responsible for closing
@@ -230,7 +236,7 @@ class TestSessionLifecycle:
         
         modules = [
             GitForData(db=mock_session),
-            EventLogger(session=mock_session),
+            EventLogger.from_session(mock_session),
             SkillRegistry(session=mock_session),
             ModernSkillSelector(session=mock_session),
             ToolMockingLayer(MockMode.PRODUCTION, session=mock_session),

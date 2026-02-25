@@ -28,7 +28,7 @@ def db():
 @pytest.fixture
 def event_logger(db):
     """EventLogger with real database session."""
-    return EventLogger(db)
+    return EventLogger.from_session(db)
 
 
 @pytest.fixture

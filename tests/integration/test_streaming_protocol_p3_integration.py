@@ -28,7 +28,7 @@ class TestStreamingProtocolIntegration:
         """
         # Setup
         session_mgr = SessionManager(db)
-        logger = EventLogger(db)
+        logger = EventLogger.from_session(db)
         
         session = session_mgr.create_session(user_id="alice")
         
@@ -64,7 +64,7 @@ class TestStreamingProtocolIntegration:
         """
         # Setup
         session_mgr = SessionManager(db)
-        logger = EventLogger(db)
+        logger = EventLogger.from_session(db)
         
         session = session_mgr.create_session(user_id="bob")
         
@@ -117,7 +117,7 @@ class TestStreamingProtocolIntegration:
         """
         # Setup
         session_mgr = SessionManager(db)
-        logger = EventLogger(db)
+        logger = EventLogger.from_session(db)
         
         session1 = session_mgr.create_session(user_id="charlie")
         session2 = session_mgr.create_session(user_id="charlie")
@@ -168,7 +168,7 @@ class TestStreamingProtocolIntegration:
         """
         # Setup
         session_mgr = SessionManager(db)
-        logger = EventLogger(db)
+        logger = EventLogger.from_session(db)
         
         session = session_mgr.create_session(user_id="diana")
         
@@ -203,7 +203,7 @@ class TestStreamingProtocolIntegration:
         """
         # Setup
         session_mgr = SessionManager(db)
-        logger = EventLogger(db)
+        logger = EventLogger.from_session(db)
         
         session = session_mgr.create_session(user_id="eve")
         
@@ -245,7 +245,7 @@ class TestStreamingProtocolRealWorldIntegration:
         """
         # Setup
         session_mgr = SessionManager(db)
-        logger = EventLogger(db)
+        logger = EventLogger.from_session(db)
         
         session = session_mgr.create_session(user_id="frank")
         
@@ -299,7 +299,7 @@ class TestStreamingProtocolRealWorldIntegration:
         """
         # Setup
         session_mgr = SessionManager(db)
-        logger = EventLogger(db)
+        logger = EventLogger.from_session(db)
         
         session = session_mgr.create_session(user_id="grace")
         
@@ -332,7 +332,7 @@ class TestStreamingProtocolRealWorldIntegration:
         """
         # Setup
         session_mgr = SessionManager(db)
-        logger = EventLogger(db)
+        logger = EventLogger.from_session(db)
         
         session = session_mgr.create_session(user_id="henry")
         

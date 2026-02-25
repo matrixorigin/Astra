@@ -59,7 +59,7 @@ class TestEventLoggerStream(unittest.TestCase):
         self.db = Mock(spec=Session)
         self.db.add = MagicMock()
         self.db.commit = MagicMock()
-        self.logger = EventLogger(self.db)
+        self.logger = EventLogger.from_session(self.db)
 
     def test_create_stream_event(self):
         """Test creating a stream event."""

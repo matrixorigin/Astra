@@ -222,10 +222,12 @@ def make_run_engine_mock_init():
     Used by tests that patch RunEngine.__init__ to avoid real DB/event setup.
     """
     from core.db_consumer import DbConsumer
+    from core.events.event_logger import EventLogger
 
     def mock_init(self, db_factory, chat_loop_factory=None):
         DbConsumer.__init__(self, db_factory)
         self._chat_loop_factory = chat_loop_factory
         self._pending_inserts = []
+        self._run_event_logger = EventLogger(db_factory)
 
     return mock_init

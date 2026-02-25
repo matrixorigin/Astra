@@ -133,7 +133,7 @@ def _build_chat_loop(db_factory):
     except Exception:
         pass
 
-    event_logger = EventLogger(db, pipeline=pipeline)
+    event_logger = EventLogger(db_factory, pipeline=pipeline)
     llm_client = LLMClient(db=db)
 
     # Wire GateTrigger so skill/prompt changes auto-trigger regression gate
@@ -561,7 +561,7 @@ def _persist_turn_events(
     try:
         from core.events.event_logger import EventLogger
         from uuid_utils import uuid7
-        el = EventLogger(db)
+        el = EventLogger.from_session(db)
 
         # Persist user query (first user message only)
         user_content = next((m["content"] for m in messages if m.get("role") == "user"), None)

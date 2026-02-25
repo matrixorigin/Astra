@@ -109,7 +109,7 @@ def test_extraction_logs_event(db_session):
     db_session.commit()
 
     from core.events.event_logger import EventLogger
-    event_logger = EventLogger(db_session)
+    event_logger = EventLogger.from_session(db_session)
     extractor = KnowledgeExtractor(db_session, event_logger=event_logger)
     stored = extractor.extract_from_chain(chain_id, user_id)
 
