@@ -101,7 +101,11 @@ class GovernanceTaskRunner:
             hb.start()
 
             try:
-                result = self._dispatch(task_name, db)
+                # SessionLocal (raw factory → Session) rather than self._db_ctx
+                # (context-manager factory) because phases need db_factory() → Session
+                # with caller-managed close(), not `with db_ctx() as db:`.
+                from api.database import SessionLocal
+                result = self._dispatch(task_name, db, SessionLocal)
                 self._persist_run(db, task_name, result)
                 logger.info(f"Governance [{task_name}]: {result}")
                 return result
@@ -117,24 +121,33 @@ class GovernanceTaskRunner:
     # ── Task dispatch ──────────────────────────────────────────
 
     @staticmethod
-    def _dispatch(task_name: str, db: Session) -> dict[str, int]:
-        """Route task_name to the appropriate executor."""
+    def _dispatch(task_name: str, db: Session, db_factory: Callable) -> dict[str, int]:
+        """Route task_name to the appropriate executor.
+
+        Args:
+            db: Lock-holding session (for MemoryGovernanceEngine tasks).
+            db_factory: Factory for independent sessions (for eval_daily phases).
+        """
         if task_name == "eval_daily":
-            return GovernanceTaskRunner._run_eval_daily(db)
+            return GovernanceTaskRunner._run_eval_daily(db_factory)
         from core.context.lifecycle import MemoryGovernanceEngine
         engine = MemoryGovernanceEngine(db)
         return getattr(engine, f"run_{task_name}_tasks")()
 
     @staticmethod
-    def _run_eval_daily(db: Session) -> dict[str, int]:
-        """Run daily evaluation closed-loop: drift → calibration → learning."""
+    def _run_eval_daily(db_factory: Callable) -> dict[str, int]:
+        """Run daily evaluation closed-loop: drift → calibration → learning.
+
+        Each phase gets its own short-lived session from *db_factory* so that
+        a failure in one phase cannot rollback or corrupt another's work.
+        The caller's lock-holding session is never touched.
+        """
         results: dict[str, int] = {}
 
         # Phase 1: Drift detection + auto-correction
         try:
             from core.evaluation.drift_pipeline import run_drift_pipeline
-            from api.database import SessionLocal
-            drift = run_drift_pipeline(db_factory=SessionLocal)
+            drift = run_drift_pipeline(db_factory=db_factory)
             results["drift_signals"] = drift.signals_detected
             results["drift_corrections"] = drift.corrections_applied
         except Exception as e:
@@ -144,9 +157,13 @@ class GovernanceTaskRunner:
         # Phase 2: Confidence calibration
         try:
             from core.evaluation.confidence_calibrator import ConfidenceCalibrator
-            cal = ConfidenceCalibrator(db)
-            cal_result = cal.measure(days=7)
-            results["calibration_error"] = round(cal_result.calibration_error * 100)
+            db = db_factory()
+            try:
+                cal = ConfidenceCalibrator(db)
+                cal_result = cal.measure(days=7)
+                results["calibration_error"] = round(cal_result.calibration_error * 100)
+            finally:
+                db.close()
         except Exception as e:
             logger.error("eval_daily calibration failed: %s", e)
 
@@ -154,19 +171,27 @@ class GovernanceTaskRunner:
         try:
             from core.learning.input_face_learner import InputFaceLearner
             from core.llm.client import LLMClient
-            llm = LLMClient(db)
-            learner = InputFaceLearner(db, llm)
-            face_results = learner.diagnose_and_fix(days=7)
-            results["faces_fixed"] = sum(1 for r in face_results if r.applied)
+            db = db_factory()
+            try:
+                llm = LLMClient(db)
+                learner = InputFaceLearner(db, llm)
+                face_results = learner.diagnose_and_fix(days=7)
+                results["faces_fixed"] = sum(1 for r in face_results if r.applied)
+            finally:
+                db.close()
         except Exception as e:
             logger.error("eval_daily learning failed: %s", e)
 
         # Phase 4: Skill selection learning
         try:
             from core.skills.self_improving_selector import SelfImprovingSelector
-            selector = SelfImprovingSelector(session=db)
-            skill_result = selector.learn_from_failures(days=7)
-            results["skills_learned"] = skill_result.get("learned", 0)
+            db = db_factory()
+            try:
+                selector = SelfImprovingSelector(session=db)
+                skill_result = selector.learn_from_failures(days=7)
+                results["skills_learned"] = skill_result.get("learned", 0)
+            finally:
+                db.close()
         except Exception as e:
             logger.error("eval_daily skill learning failed: %s", e)
 

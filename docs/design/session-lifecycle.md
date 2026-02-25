@@ -393,7 +393,7 @@ Post-migration, monitor these metrics to validate the design:
 | `_trigger_loop` | 2 | ✅ Done | Session-per-trigger; `fire_trigger` takes `db_factory` |
 | `EventLogger` | 2 | ✅ Done | Extends DbConsumer; `from_session()` for legacy callers |
 | `ChatLoop` | 2 | TODO | `_build_chat_loop` still receives raw Session |
-| `_run_eval_daily` Phase 2-4 | 2 | TODO | Give independent sessions |
+| `_run_eval_daily` Phase 2-4 | 2 | ✅ Done | Each phase gets independent session from db_factory |
 | `SkillPipeline` | 3 | TODO | |
 | `ContextManager` | 3 | TODO | `save_snapshot` already uses factory |
 | `AgentExecutor` | 3 | TODO | |

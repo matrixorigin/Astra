@@ -232,14 +232,15 @@ class TestEvalDailyGovernance:
         assert cfg["lock_name"] == "governance_eval_daily"
 
     def test_dispatch_routes_eval_daily(self, db_session):
-        """_dispatch('eval_daily', db) must call _run_eval_daily, not
-        MemoryGovernanceEngine."""
+        """_dispatch('eval_daily', db, factory) must call _run_eval_daily
+        with the factory, not the lock session."""
+        factory = lambda: db_session
         with patch.object(
             GovernanceTaskRunner, "_run_eval_daily", return_value={"drift_signals": 0}
         ) as mock_eval:
-            result = GovernanceTaskRunner._dispatch("eval_daily", db_session)
+            result = GovernanceTaskRunner._dispatch("eval_daily", db_session, factory)
 
-        mock_eval.assert_called_once_with(db_session)
+        mock_eval.assert_called_once_with(factory)
         assert result == {"drift_signals": 0}
 
     def test_dispatch_routes_hourly_to_lifecycle(self, db_session):
@@ -250,7 +251,7 @@ class TestEvalDailyGovernance:
         with patch(
             "core.context.lifecycle.MemoryGovernanceEngine", return_value=mock_engine
         ):
-            result = GovernanceTaskRunner._dispatch("hourly", db_session)
+            result = GovernanceTaskRunner._dispatch("hourly", db_session, lambda: db_session)
 
         mock_engine.run_hourly_tasks.assert_called_once()
         assert result["archived"] == 5
@@ -272,14 +273,14 @@ class TestEvalDailyGovernance:
         )
         mock_skill = {"learned": 2, "total_failures": 5}
 
+        factory = lambda: db_session
         with patch("core.evaluation.drift_pipeline.run_drift_pipeline", return_value=mock_drift), \
-             patch("api.database.SessionLocal"), \
              patch("core.evaluation.confidence_calibrator.ConfidenceCalibrator.measure", return_value=mock_cal), \
              patch("core.learning.input_face_learner.InputFaceLearner.diagnose_and_fix", return_value=[mock_face]), \
              patch("core.llm.client.LLMClient.__init__", return_value=None), \
              patch("core.skills.self_improving_selector.SelfImprovingSelector.learn_from_failures", return_value=mock_skill):
 
-            result = GovernanceTaskRunner._run_eval_daily(db_session)
+            result = GovernanceTaskRunner._run_eval_daily(factory)
 
         assert result["drift_signals"] == 3
         assert result["drift_corrections"] == 1
@@ -291,8 +292,8 @@ class TestEvalDailyGovernance:
         """If one phase fails, others must still execute."""
         from core.evaluation.confidence_calibrator import CalibrationResult
 
+        factory = lambda: db_session
         with patch("core.evaluation.drift_pipeline.run_drift_pipeline", side_effect=RuntimeError("boom")), \
-             patch("api.database.SessionLocal"), \
              patch("core.evaluation.confidence_calibrator.ConfidenceCalibrator.measure",
                    return_value=CalibrationResult(
                        mean_confidence=0.0, mean_quality=0.0,
@@ -304,7 +305,7 @@ class TestEvalDailyGovernance:
              patch("core.skills.self_improving_selector.SelfImprovingSelector.learn_from_failures",
                    return_value={"learned": 0}):
 
-            result = GovernanceTaskRunner._run_eval_daily(db_session)
+            result = GovernanceTaskRunner._run_eval_daily(factory)
 
         # Phase 1 failed → drift_signals = 0
         assert result["drift_signals"] == 0
@@ -315,13 +316,13 @@ class TestEvalDailyGovernance:
 
     def test_eval_daily_all_phases_fail_gracefully(self, db_session):
         """If ALL phases fail, result should still be a valid dict."""
+        factory = lambda: db_session
         with patch("core.evaluation.drift_pipeline.run_drift_pipeline", side_effect=Exception("1")), \
-             patch("api.database.SessionLocal"), \
              patch("core.evaluation.confidence_calibrator.ConfidenceCalibrator.__init__", side_effect=Exception("2")), \
              patch("core.llm.client.LLMClient.__init__", side_effect=Exception("3")), \
              patch("core.skills.self_improving_selector.SelfImprovingSelector.__init__", side_effect=Exception("4")):
 
-            result = GovernanceTaskRunner._run_eval_daily(db_session)
+            result = GovernanceTaskRunner._run_eval_daily(factory)
 
         assert isinstance(result, dict)
         assert result.get("drift_signals") == 0
@@ -650,7 +651,6 @@ class TestFullClosedLoopScenario:
 
         with patch("core.evaluation.drift_pipeline.run_drift_pipeline",
                    return_value=PipelineResult(signals_detected=1, corrections_applied=1)), \
-             patch("api.database.SessionLocal"), \
              patch("core.evaluation.confidence_calibrator.ConfidenceCalibrator.measure",
                    return_value=CalibrationResult(
                        mean_confidence=0.8, mean_quality=0.78,
@@ -662,7 +662,7 @@ class TestFullClosedLoopScenario:
              patch("core.skills.self_improving_selector.SelfImprovingSelector.learn_from_failures",
                    return_value={"learned": 1}):
 
-            eval_result = GovernanceTaskRunner._run_eval_daily(db_session)
+            eval_result = GovernanceTaskRunner._run_eval_daily(lambda: db_session)
 
         assert eval_result["drift_signals"] == 1
         assert eval_result["drift_corrections"] == 1
