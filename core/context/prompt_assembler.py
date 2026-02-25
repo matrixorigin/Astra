@@ -71,8 +71,12 @@ _FIXED_SELF_MODEL = 400
 _MAX_HISTORY_RATIO = 0.50
 
 # Edge content limits (public — tests verify truncation behavior).
-# These are structural invariants, not deployment config — changing them
-# requires code review, not a config reload.
+# These are structural invariants, NOT deployment config:
+#   - MAX_PROJECT_RULES_CHARS bounds the injection-defense scan surface
+#   - MAX_PROFILE_FIELD_CHARS prevents edge fields from dominating the prompt
+#   - _MAX_HISTORY_EVENTS caps DB query cost and prompt history size
+# Changing these affects token budgets, security boundaries, and prompt structure.
+# They require code review + test updates, not a config reload or env var override.
 MAX_PROJECT_RULES_CHARS = 4000
 MAX_PROFILE_FIELD_CHARS = 200
 SNAPSHOT_SECTION_CHARS = 2000
@@ -81,6 +85,12 @@ _MAX_HISTORY_EVENTS = 20
 
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate. ASCII ≈ 4 chars/token, CJK ≈ 1 char/token.
+
+    Why not tiktoken? tiktoken adds ~100MB of tokenizer data as a dependency,
+    and exact counts aren't needed here — this is for budget enforcement, not
+    billing. The only requirement is: never underestimate (which would cause
+    budget overruns). This formula is conservative (overestimates), so the
+    worst case is slightly more aggressive compression, which is safe.
 
     CJK characters typically tokenize to 1-2 tokens each in GPT/Claude models.
     Using divisor 1.0 (1 token per CJK char) is conservative — it slightly
@@ -412,8 +422,15 @@ class PromptAssembler:
     def _build_memory(self, user_id: str, session_id: str, query: str) -> str | None:
         """§4: Cross-session continuity + observations + few-shot.
 
-        Imports are deferred to method body to avoid circular imports:
-        continuity/observer/few_shot depend on core.llm which depends on core.context.
+        Imports are deferred to method body to break circular imports:
+        core.context.continuity → core.llm → core.context. This is standard
+        Python practice for circular dependency resolution.
+
+        Uses `except Exception` (not `except ImportError`) because these modules
+        may execute initialization code at import time (DB connections, config
+        loading) that can raise arbitrary exceptions beyond ImportError.
+        Each subsystem is independently optional — failure in one (e.g. Observer
+        DB table missing) must not block the others from contributing.
         """
         parts = []
         try:
@@ -467,7 +484,12 @@ class PromptAssembler:
         budget_chars = int(max_tokens * _MAX_HISTORY_RATIO) * 4
         try:
             rows = self.db.execute(
-                # safe: _MAX_HISTORY_EVENTS is a module-level int constant, not user input
+                # Why f-string instead of parameterized LIMIT?
+                # MySQL-compatible DBs (including MatrixOne) may quote parameterized
+                # LIMIT values as strings: `LIMIT '20'` → syntax error.
+                # SQLAlchemy's bindparam() has the same issue.
+                # _MAX_HISTORY_EVENTS is a module-level int constant (not user input),
+                # so f-string interpolation is safe from SQL injection.
                 text(f"""
                     SELECT event_type, content FROM conversation_events
                     WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response')

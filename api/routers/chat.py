@@ -336,6 +336,9 @@ async def cancel_run(
 
 # In-memory conversation history per session (production: persist in MatrixOne).
 # Uses LRU eviction to prevent unbounded growth on long-running servers.
+# 1000 sessions ≈ 50-100MB RAM (each session is a list of message dicts).
+# This is a structural limit, not deployment config — changing it affects
+# memory footprint and eviction behavior, requiring load-test validation.
 _MAX_CACHED_SESSIONS = 1000
 
 
@@ -465,8 +468,10 @@ def _build_turn_messages(
 
 
 # Max conversation events to recover on server restart.
-# Inlined into SQL as a constant (not parameterized) because some MySQL-compatible
-# databases quote LIMIT parameters as strings, causing syntax errors.
+# Inlined into SQL via f-string (not parameterized) because MySQL-compatible DBs
+# (including MatrixOne) may quote parameterized LIMIT values as strings:
+# `LIMIT '50'` → syntax error. SQLAlchemy bindparam() has the same issue.
+# Safe: this is a module-level int constant, not user input.
 _MAX_RECOVERY_EVENTS = 50
 
 
