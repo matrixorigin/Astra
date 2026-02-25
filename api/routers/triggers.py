@@ -87,6 +87,7 @@ async def fire_webhook(
     if not trig.get("secret") or not verify_secret(request.secret, trig["secret"]):
         raise HTTPException(status_code=403, detail="Invalid secret")
     try:
-        return fire_trigger(db, trigger_id, payload=request.payload)
+        from api.database import SessionLocal
+        return fire_trigger(SessionLocal, trigger_id, payload=request.payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

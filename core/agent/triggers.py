@@ -9,11 +9,11 @@ Triggers are persisted in the `triggers` table. Each trigger defines:
 import hmac
 import json
 from datetime import datetime, timezone
+from typing import Callable
 from uuid import uuid4
 
 from croniter import croniter
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from core.logging_config import get_logger
@@ -109,13 +109,28 @@ def delete_trigger(db: Session, trigger_id: str) -> bool:
     return result.rowcount > 0
 
 
-def fire_trigger(db: Session, trigger_id: str, payload: dict | None = None) -> dict:
-    """Fire a trigger → create an AgentRun. Returns run info."""
+def fire_trigger(
+    db_factory: Callable[[], Session],
+    trigger_id: str,
+    payload: dict | None = None,
+) -> dict:
+    """Fire a trigger → create an AgentRun. Returns run info.
+
+    Uses *db_factory* (not a raw session) so that each internal operation
+    gets its own short-lived session.  This prevents a failure here from
+    corrupting the caller's session state (e.g. the trigger-loop's claim).
+    """
     from core.agent.run import RunTrigger
     from core.agent.run_engine import RunEngine, _run_tasks
     import asyncio
 
-    trig = get_trigger(db, trigger_id)
+    # Read trigger metadata with a short-lived session.
+    db = db_factory()
+    try:
+        trig = get_trigger(db, trigger_id)
+    finally:
+        db.close()
+
     if not trig:
         raise ValueError(f"Trigger {trigger_id} not found")
     if not trig["is_active"]:
@@ -127,10 +142,9 @@ def fire_trigger(db: Session, trigger_id: str, payload: dict | None = None) -> d
 
     trigger_type = RunTrigger.WEBHOOK if trig["trigger_type"] == "webhook" else RunTrigger.SCHEDULE
 
-    from api.database import SessionLocal
-    engine = RunEngine(SessionLocal)
+    engine = RunEngine(db_factory)
     run = engine.create_run(
-        session_id=trig.get("session_id") or _auto_session(db, trig["user_id"]),
+        session_id=trig.get("session_id") or _auto_session(db_factory, trig["user_id"]),
         user_id=trig["user_id"],
         user_input=trig["user_input"],
         agent_id=trig["agent_id"],
@@ -198,9 +212,13 @@ def get_due_triggers(db: Session) -> list[str]:
     return [row[0] for row in rows]
 
 
-def _auto_session(db: Session, user_id: str) -> str:
-    """Create a session for trigger-fired runs."""
+def _auto_session(db_factory: Callable[[], Session], user_id: str) -> str:
+    """Create a session for trigger-fired runs using a short-lived DB session."""
     from core.events.session_manager import SessionManager
-    mgr = SessionManager(db)
-    session = mgr.create_session(user_id=user_id, metadata={"source": "trigger"})
-    return session.session_id
+    db = db_factory()
+    try:
+        mgr = SessionManager(db)
+        session = mgr.create_session(user_id=user_id, metadata={"source": "trigger"})
+        return session.session_id
+    finally:
+        db.close()

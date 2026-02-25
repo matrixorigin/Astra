@@ -83,6 +83,11 @@ class TestFireTrigger:
         }
         mock_db.execute.return_value.mappings.return_value.first.return_value = trig
 
+        def factory():
+            m = MagicMock()
+            m.execute.return_value.mappings.return_value.first.return_value = trig
+            return m
+
         with patch("core.agent.run_engine.RunEngine") as MockEngine, \
              patch("core.agent.triggers._auto_session", return_value="sess-1"), \
              patch("asyncio.create_task"):
@@ -91,7 +96,7 @@ class TestFireTrigger:
             mock_run.status.value = "pending"
             MockEngine.return_value.create_run.return_value = mock_run
 
-            result = fire_trigger(mock_db, "t1", payload={"branch": "main"})
+            result = fire_trigger(factory, "t1", payload={"branch": "main"})
 
         assert result["run_id"] == "run-1"
         assert result["trigger_id"] == "t1"
@@ -100,13 +105,24 @@ class TestFireTrigger:
         trig = {"trigger_id": "t1", "is_active": 0, "trigger_type": "webhook"}
         mock_db.execute.return_value.mappings.return_value.first.return_value = trig
 
+        def factory():
+            m = MagicMock()
+            m.execute.return_value.mappings.return_value.first.return_value = trig
+            return m
+
         with pytest.raises(ValueError, match="disabled"):
-            fire_trigger(mock_db, "t1")
+            fire_trigger(factory, "t1")
 
     def test_fire_nonexistent_trigger(self, mock_db):
         mock_db.execute.return_value.mappings.return_value.first.return_value = None
+
+        def factory():
+            m = MagicMock()
+            m.execute.return_value.mappings.return_value.first.return_value = None
+            return m
+
         with pytest.raises(ValueError, match="not found"):
-            fire_trigger(mock_db, "nope")
+            fire_trigger(factory, "nope")
 
 
 class TestGetDueTriggers:

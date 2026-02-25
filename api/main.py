@@ -82,26 +82,34 @@ async def lifespan(app: FastAPI):
             await cleanup_stale_workflows(max_age_hours=24)
     cleanup_task = asyncio.create_task(_cleanup_loop())
 
-    # Cron trigger scheduler (check every 30s)
+    # Cron trigger scheduler (check every 30s, session-per-trigger)
     async def _trigger_loop():
         while True:
             await asyncio.sleep(30)
             try:
-                from api.database import get_db_session as _get_db
+                from api.database import SessionLocal
                 from core.agent.triggers import claim_and_advance, fire_trigger, get_due_triggers
-                db = next(_get_db())
+
+                # Short-lived session just for the query.
+                db_query = SessionLocal()
                 try:
-                    due = get_due_triggers(db)
-                    for tid in due:
-                        try:
-                            if claim_and_advance(db, tid):
-                                fire_trigger(db, tid)
-                        except Exception as e:
-                            logger.warning(f"Trigger {tid} fire failed: {e}")
+                    due = get_due_triggers(db_query)
                 finally:
-                    db.close()
+                    db_query.close()
+
+                for tid in due:
+                    # Each trigger gets its own session so a failure in one
+                    # cannot rollback the claim state of another.
+                    db_claim = SessionLocal()
+                    try:
+                        if claim_and_advance(db_claim, tid):
+                            fire_trigger(SessionLocal, tid)
+                    except Exception as e:
+                        logger.warning(f"Trigger {tid} fire failed: {e}")
+                    finally:
+                        db_claim.close()
             except Exception as e:
-                logger.debug(f"Trigger loop error: {e}")
+                logger.warning(f"Trigger loop error: {e}")
     trigger_task = asyncio.create_task(_trigger_loop())
 
     yield
