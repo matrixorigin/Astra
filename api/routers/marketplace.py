@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
 from config.settings import get_settings
 from core.skills.credential_manager import CredentialManager
@@ -178,12 +178,12 @@ async def delete_credential(
 @router.post("/skills/{skill_name}/publish", status_code=status.HTTP_200_OK)
 def publish_skill(
     skill_name: str,
-    db: Session = Depends(get_db_session),
     _user: dict = Depends(get_current_user),
 ):
     """Publish a skill: draft → active. Triggers regression gate if configured."""
     from core.skills.registry import SkillRegistry
-    registry = SkillRegistry(db)
+    # Use SessionLocal as factory so the registry owns its own session lifecycle.
+    registry = SkillRegistry(SessionLocal)
     try:
         registry.publish(skill_name)
     except ValueError as e:
@@ -194,12 +194,12 @@ def publish_skill(
 @router.post("/skills/{skill_name}/deprecate", status_code=status.HTTP_200_OK)
 def deprecate_skill(
     skill_name: str,
-    db: Session = Depends(get_db_session),
     _user: dict = Depends(get_current_user),
 ):
     """Deprecate a skill: active → deprecated."""
     from core.skills.registry import SkillRegistry
-    registry = SkillRegistry(db)
+    # Use SessionLocal as factory so the registry owns its own session lifecycle.
+    registry = SkillRegistry(SessionLocal)
     try:
         registry.deprecate(skill_name)
     except ValueError as e:

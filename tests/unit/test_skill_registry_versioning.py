@@ -48,7 +48,7 @@ def mock_db():
 @pytest.fixture
 def registry(mock_db):
     """Create SkillRegistry with real database session."""
-    return SkillRegistry(mock_db)
+    return SkillRegistry(lambda: mock_db)
 
 
 class TestSkillRegistryInit:
@@ -56,12 +56,12 @@ class TestSkillRegistryInit:
 
     def test_init_creates_empty_skills_dict(self, mock_db):
         """Test initialization creates empty skills dictionary."""
-        registry = SkillRegistry(mock_db)
+        registry = SkillRegistry(lambda: mock_db)
         assert registry._skills == {}
 
     def test_init_sets_cache_size(self, mock_db):
         """Test initialization sets LRU cache size."""
-        registry = SkillRegistry(mock_db)
+        registry = SkillRegistry(lambda: mock_db)
         assert registry._cache_size == 100
 
 

@@ -152,7 +152,7 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
 
         db = db_factory()
         event_logger = EventLogger(db_factory)
-        skill_registry = SkillRegistry(db)
+        skill_registry = SkillRegistry(lambda: db)
         # Skip register_builtin_skills — saves ~200ms per call.
         # Tests that need specific skills (B, E) register execute_code explicitly.
         context_manager = ContextManager(db_factory)
@@ -190,7 +190,7 @@ def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
 
         db = db_factory()
         event_logger = EventLogger(db_factory)
-        skill_registry = SkillRegistry(db)
+        skill_registry = SkillRegistry(lambda: db)
         code_executor = CodeExecutor(
             runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=db_factory,
         )

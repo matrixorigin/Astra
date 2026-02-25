@@ -111,7 +111,7 @@ class TestSkillLifecycle:
         name = f"sk_pub_{os.urandom(4).hex()}"
         self._create_skill(db_session, name, status="draft")
 
-        registry = SkillRegistry(db_session)
+        registry = SkillRegistry(lambda: db_session)
         registry.publish(name)
 
         row = db_session.query(SkillDefinition).filter_by(name=name).first()
@@ -124,7 +124,7 @@ class TestSkillLifecycle:
         name = f"sk_dep_{os.urandom(4).hex()}"
         self._create_skill(db_session, name, status="active")
 
-        registry = SkillRegistry(db_session)
+        registry = SkillRegistry(lambda: db_session)
         registry.deprecate(name)
 
         row = db_session.query(SkillDefinition).filter_by(name=name).first()

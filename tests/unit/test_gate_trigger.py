@@ -185,7 +185,7 @@ class TestSkillRegistryIntegration:
         session.query.return_value.filter.return_value.first.return_value = None
 
         gate_trigger = Mock()
-        registry = SkillRegistry(session=session, gate_trigger=gate_trigger)
+        registry = SkillRegistry(db_factory=lambda: session, gate_trigger=gate_trigger)
 
         skill = Mock()
         skill.name = "test_skill"
@@ -212,7 +212,7 @@ class TestSkillRegistryIntegration:
         session.query.return_value.filter.return_value.first.return_value = None
 
         gate_trigger = Mock()
-        registry = SkillRegistry(session=session, gate_trigger=gate_trigger)
+        registry = SkillRegistry(db_factory=lambda: session, gate_trigger=gate_trigger)
 
         skill = Mock()
         skill.name = "test_skill"

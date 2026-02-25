@@ -116,7 +116,7 @@ class TestGateTriggerProductionWiring:
         from core.skills.registry import SkillRegistry
 
         gate_trigger = Mock()
-        registry = SkillRegistry(session=db_session, gate_trigger=gate_trigger)
+        registry = SkillRegistry(db_factory=lambda: db_session, gate_trigger=gate_trigger)
 
         skill = Mock()
         skill.name = "e2e_test_skill"
@@ -185,7 +185,7 @@ class TestGateTriggerProductionWiring:
         from core.skills.registry import SkillRegistry
 
         gate_trigger = Mock()
-        registry = SkillRegistry(session=db_session, gate_trigger=gate_trigger)
+        registry = SkillRegistry(db_factory=lambda: db_session, gate_trigger=gate_trigger)
 
         skill = Mock()
         skill.name = "inactive_skill"
@@ -203,7 +203,7 @@ class TestGateTriggerProductionWiring:
         """SkillRegistry(gate_trigger=None) must work without errors."""
         from core.skills.registry import SkillRegistry
 
-        registry = SkillRegistry(session=db_session, gate_trigger=None)
+        registry = SkillRegistry(db_factory=lambda: db_session, gate_trigger=None)
 
         skill = Mock()
         skill.name = "safe_skill"
@@ -629,7 +629,7 @@ class TestFullClosedLoopScenario:
         gt = _make_gate_trigger(db_session)
 
         with patch.object(gt, "_run_gate", side_effect=capture_run_gate):
-            registry = SkillRegistry(session=db_session, gate_trigger=gt)
+            registry = SkillRegistry(db_factory=lambda: db_session, gate_trigger=gt)
 
             skill = Mock()
             skill.name = "deploy_test"
@@ -883,7 +883,7 @@ class TestChatAPIGateTriggerE2E:
             )
             mock_llm.chat_with_tools.return_value = {"content": "test"}
 
-            registry = SkillRegistry(db, gate_trigger=gt)
+            registry = SkillRegistry(lambda: db, gate_trigger=gt)
             context_manager = ContextManager(lambda: db, gate_trigger=gt)
             captured["registry_has_gate"] = registry.gate_trigger is gt
             captured["prompts_has_gate"] = context_manager.prompts.gate_trigger is gt

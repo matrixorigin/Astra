@@ -135,7 +135,7 @@ class TestExecutorEnforcement:
         from core.runtime import create_runtime, IsolationLevel
         from core.code_executor import CodeExecutor
 
-        registry = SkillRegistry(db_session)
+        registry = SkillRegistry(lambda: db_session)
         code_executor = CodeExecutor(
             runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=lambda: db_session,
         )
@@ -167,7 +167,7 @@ class TestExecutorEnforcement:
         from core.runtime import create_runtime, IsolationLevel
         from core.code_executor import CodeExecutor
 
-        registry = SkillRegistry(db_session)
+        registry = SkillRegistry(lambda: db_session)
         code_executor = CodeExecutor(
             runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=lambda: db_session,
         )

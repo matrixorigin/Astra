@@ -37,7 +37,7 @@ class ModernSkillSelector:
 
         # Cache registry for schema lookups (avoid re-instantiation per skill)
         from core.skills.registry import SkillRegistry
-        self._registry = SkillRegistry(session)
+        self._registry = SkillRegistry(lambda: session)
 
         # Semantic index — primary retrieval path when available
         from core.skills.skill_index import SkillIndex

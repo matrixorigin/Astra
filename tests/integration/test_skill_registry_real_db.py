@@ -35,34 +35,26 @@ class DummySkill(Skill):
 
 
 @pytest.fixture
-def db():
-    """Real database session."""
-    from api.database import get_db_session
-    session = next(get_db_session())
-    yield session
-    session.close()
-
-
-@pytest.fixture
-def registry(db):
+def registry(db_factory):
     """SkillRegistry with real database."""
-    return SkillRegistry(db)
+    return SkillRegistry(db_factory)
 
 
 @pytest.fixture(autouse=True)
-def cleanup(db):
+def cleanup(db_session):
     """Clean up test data after each test."""
     yield
     # Clean up test skills
     from sqlalchemy import text
-    db.execute(text("DELETE FROM skills_registry WHERE skill_name LIKE 'test_skill_%'"))
-    db.commit()
+    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name LIKE 'test_skill_%'"))
+    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name LIKE 'replay_skill%'"))
+    db_session.commit()
 
 
 class TestSkillRegistryRealDB:
     """Integration tests with real database."""
 
-    def test_register_and_retrieve_skill(self, registry, db):
+    def test_register_and_retrieve_skill(self, registry, db_session):
         """Test registering and retrieving skill from real DB."""
         skill = DummySkill("test_skill_basic", "1.0.0")
 
@@ -70,16 +62,16 @@ class TestSkillRegistryRealDB:
 
         # Verify in database using ORM
         from api.models import SkillRegistry as SkillModel
-        row = db.query(SkillModel).filter(
+        row = db_session.query(SkillModel).filter(
             SkillModel.skill_name == "test_skill_basic"
         ).first()
-        
+
         assert row is not None
         assert row.version == "1.0.0"
         assert row.git_commit_hash == "abc123"
         assert row.is_active == 1
 
-    def test_register_multiple_versions(self, registry, db):
+    def test_register_multiple_versions(self, registry, db_session):
         """Test registering multiple versions of same skill."""
         skill_v1 = DummySkill("test_skill_multi", "1.0.0")
         skill_v2 = DummySkill("test_skill_multi", "2.0.0")
@@ -89,17 +81,17 @@ class TestSkillRegistryRealDB:
 
         # Verify both versions in database using ORM
         from api.models import SkillRegistry as SkillModel
-        rows = db.query(SkillModel).filter(
+        rows = db_session.query(SkillModel).filter(
             SkillModel.skill_name == "test_skill_multi"
         ).order_by(SkillModel.version).all()
-        
+
         assert len(rows) == 2
         assert rows[0].version == "1.0.0"
         assert rows[0].is_active == 0
         assert rows[1].version == "2.0.0"
         assert rows[1].is_active == 1
 
-    def test_get_as_of_by_commit_hash(self, registry, db):
+    def test_get_as_of_by_commit_hash(self, registry):
         """Test as_of query by git commit hash."""
         skill_v1 = DummySkill("test_skill_commit", "1.0.0")
         skill_v2 = DummySkill("test_skill_commit", "2.0.0")
@@ -114,20 +106,19 @@ class TestSkillRegistryRealDB:
         assert result["version"] == "1.0.0"
         assert result["git_commit_hash"] == "commit_v1"
 
-    def test_get_as_of_by_timestamp(self, registry, db):
-        """Test as_of query by timestamp."""
+    def test_get_as_of_by_timestamp(self, registry):
+        """Test as_of query by timestamp returns skill registered before that time."""
         skill_v1 = DummySkill("test_skill_time", "1.0.0")
-
-        # Register with specific timestamp
         registry.register(skill_v1, is_active=True, git_commit_hash="abc123")
 
-        # Get current version
-        result = registry.get_as_of("test_skill_time")
+        # Query with a future timestamp — should find the skill
+        future = datetime.now() + timedelta(seconds=10)
+        result = registry.get_as_of("test_skill_time", as_of_timestamp=future)
 
         assert result is not None
         assert result["version"] == "1.0.0"
 
-    def test_get_as_of_current_active_version(self, registry, db):
+    def test_get_as_of_current_active_version(self, registry):
         """Test getting current active version."""
         skill_v1 = DummySkill("test_skill_active", "1.0.0")
         skill_v2 = DummySkill("test_skill_active", "2.0.0")
@@ -142,7 +133,7 @@ class TestSkillRegistryRealDB:
         assert result["version"] == "2.0.0"
         assert result["is_active"] == 1
 
-    def test_cache_hit_on_repeated_query(self, registry, db):
+    def test_cache_hit_on_repeated_query(self, registry):
         """Test LRU cache hit on repeated queries."""
         skill = DummySkill("test_skill_cache", "1.0.0")
         registry.register(skill, is_active=True, git_commit_hash="abc123")
@@ -160,7 +151,7 @@ class TestSkillRegistryRealDB:
         # Cache should have 1 hit
         assert cache_info_after.hits > cache_info_before.hits
 
-    def test_cache_cleared_on_new_registration(self, registry, db):
+    def test_cache_cleared_on_new_registration(self, registry):
         """Test cache is cleared when new skill is registered."""
         skill_v1 = DummySkill("test_skill_clear", "1.0.0")
         registry.register(skill_v1, is_active=True, git_commit_hash="abc111")
@@ -178,7 +169,7 @@ class TestSkillRegistryRealDB:
         cache_info_after = registry._get_cached.cache_info()
         assert cache_info_after.currsize == 0
 
-    def test_git_commit_hash_persisted(self, registry, db):
+    def test_git_commit_hash_persisted(self, registry, db_session):
         """Test git_commit_hash is persisted correctly."""
         skill = DummySkill("test_skill_persist", "1.0.0")
         git_hash = "abc123def456"
@@ -187,30 +178,29 @@ class TestSkillRegistryRealDB:
 
         # Query directly from database using ORM
         from api.models import SkillRegistry as SkillModel
-        row = db.query(SkillModel).filter(
+        row = db_session.query(SkillModel).filter(
             SkillModel.skill_name == "test_skill_persist"
         ).first()
 
         assert row is not None
         assert row.git_commit_hash == git_hash
 
-    def test_code_hash_computed_and_stored(self, registry, db):
+    def test_code_hash_computed_and_stored(self, registry, db_session):
         """Test code_hash is computed and stored."""
         skill = DummySkill("test_skill_hash", "1.0.0")
 
         registry.register(skill, is_active=True)
 
-        # Query from database using ORM
         from api.models import SkillRegistry as SkillModel
-        row = db.query(SkillModel).filter(
+        row = db_session.query(SkillModel).filter(
             SkillModel.skill_name == "test_skill_hash"
         ).first()
 
         assert row is not None
-        # Just verify skill was registered successfully
-        assert row.skill_name == "test_skill_hash"
+        assert row.code_hash is not None
+        assert len(row.code_hash) == 64  # SHA256 hex digest
 
-    def test_multiple_commits_same_skill(self, registry, db):
+    def test_multiple_commits_same_skill(self, registry):
         """Test querying different commits of same skill."""
         commits = ["commit_a", "commit_b", "commit_c"]
 
@@ -225,7 +215,7 @@ class TestSkillRegistryRealDB:
             assert result["version"] == f"1.{i}.0"
             assert result["git_commit_hash"] == commit
 
-    def test_skill_metadata_complete(self, registry, db):
+    def test_skill_metadata_complete(self, registry):
         """Test all skill metadata is stored and retrieved."""
         skill = DummySkill("test_skill_metadata", "1.0.0")
 
@@ -245,14 +235,13 @@ class TestSkillRegistryRealDB:
         result = registry.get_as_of("test_skill_metadata")
 
         assert result is not None
-        # Metadata fields are not stored in current implementation
         assert result["skill_name"] == "test_skill_metadata"
         assert result["version"] == "1.0.0"
         assert result["cost_estimate"] == "high"
         assert "review" in result["triggers"]
         assert "auth_skill" in result["dependencies"]
 
-    def test_replay_scenario_exact_version(self, registry, db):
+    def test_replay_scenario_exact_version(self, registry):
         """Test replay scenario: get exact version used at specific time."""
         # Simulate: v1.0.0 used on 2024-01-01
         skill_v1 = DummySkill("test_skill_replay", "1.0.0")
@@ -272,7 +261,7 @@ class TestSkillRegistryRealDB:
         assert replayed_skill["version"] == "1.0.0"
         assert replayed_skill["git_commit_hash"] == "abc111"
 
-    def test_cache_different_queries_separately(self, registry, db):
+    def test_cache_different_queries_separately(self, registry):
         """Test cache stores different queries separately."""
         skill_v1 = DummySkill("test_skill_diff", "1.0.0")
         skill_v2 = DummySkill("test_skill_diff", "2.0.0")
@@ -297,7 +286,7 @@ class TestSkillRegistryRealDB:
 class TestReplayScenario:
     """Test complete replay scenario with real database."""
 
-    def test_complete_replay_workflow(self, registry, db):
+    def test_complete_replay_workflow(self, registry):
         """Test complete workflow: register -> record event -> replay."""
         # Step 1: Register skill v1.0.0
         skill_v1 = DummySkill("replay_skill", "1.0.0")

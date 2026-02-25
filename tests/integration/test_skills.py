@@ -13,7 +13,7 @@ from core.skills.github_client import GitHubClient
 @pytest.fixture
 def registry(db_session):
     """Skill registry fixture"""
-    return SkillRegistry(db_session)
+    return SkillRegistry(lambda: db_session)
 
 
 @pytest.fixture

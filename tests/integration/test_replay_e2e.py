@@ -31,7 +31,7 @@ def cleanup(db_session):
 @pytest.fixture
 def registry(db_session):
     """Skill registry fixture with cleanup"""
-    registry = SkillRegistry(db_session)
+    registry = SkillRegistry(lambda: db_session)
     registry._skills.clear()  # Clear in-memory cache
     return registry
 

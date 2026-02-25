@@ -23,40 +23,36 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        from api.database import get_db_session
-        from core.skills.registry import SkillRegistry
-        from core.skills.builtin import register_builtin_skills
+        from api.database import SessionLocal
         from core.code_executor import CodeExecutor
-        from core.runtime import create_runtime, IsolationLevel
+        from core.runtime import IsolationLevel, create_runtime
+        from core.skills.builtin import register_builtin_skills
+        from core.skills.registry import SkillRegistry
 
-        db_gen = get_db_session()
-        db = next(db_gen)
-        try:
-            registry = SkillRegistry(db)
-            code_executor = CodeExecutor(
-                runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=db_factory,
-            )
-            register_builtin_skills(registry, db_factory, code_executor=code_executor)
+        registry = SkillRegistry(SessionLocal)
+        code_executor = CodeExecutor(
+            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
+            db_factory=SessionLocal,
+        )
+        register_builtin_skills(registry, SessionLocal, code_executor=code_executor)
 
-            skill = registry.get(args.skill)
-            if not skill:
-                print(json.dumps({"error": f"Skill '{args.skill}' not found"}), file=sys.stderr)
-                sys.exit(1)
+        skill = registry.get(args.skill)
+        if not skill:
+            print(json.dumps({"error": f"Skill '{args.skill}' not found"}), file=sys.stderr)
+            sys.exit(1)
 
-            import asyncio
-            validated = skill.validate_input(inputs)
-            result = asyncio.run(skill.execute(validated))
+        import asyncio
+        validated = skill.validate_input(inputs)
+        result = asyncio.run(skill.execute(validated))
 
-            if hasattr(result, "model_dump"):
-                output = result.model_dump()
-            elif isinstance(result, dict):
-                output = result
-            else:
-                output = {"output": str(result)}
+        if hasattr(result, "model_dump"):
+            output = result.model_dump()
+        elif isinstance(result, dict):
+            output = result
+        else:
+            output = {"output": str(result)}
 
-            json.dump(output, sys.stdout)
-        finally:
-            db_gen.close()
+        json.dump(output, sys.stdout)
     except Exception as e:
         print(json.dumps({"error": str(e)}), file=sys.stderr)
         sys.exit(1)

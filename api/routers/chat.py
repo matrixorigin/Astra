@@ -138,7 +138,7 @@ def _build_chat_loop(db_factory):
         from core.evaluation.gate_trigger import GateTrigger
         gate_trigger = GateTrigger(db_factory=db_factory)
 
-    skill_registry = SkillRegistry(db, gate_trigger=gate_trigger)
+    skill_registry = SkillRegistry(db_factory, gate_trigger=gate_trigger)
     code_executor = CodeExecutor(
         runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
         db_factory=db_factory,

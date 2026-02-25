@@ -119,7 +119,7 @@ class TestNoSessionCreation:
             GitForData(lambda: mock_session),
             EventLogger.from_session(mock_session),
             Sandbox(lambda: mock_session),
-            SkillRegistry(session=mock_session),
+            SkillRegistry(db_factory=lambda: mock_session),
             ModernSkillSelector(session=mock_session),
             ToolMockingLayer(MockMode.PRODUCTION, db_factory=lambda: mock_session),
             SemanticDiff(lambda: mock_session),

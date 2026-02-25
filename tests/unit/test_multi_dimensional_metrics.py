@@ -28,7 +28,7 @@ class TestMetricRecording:
         from core.skills.mocking import MockMode
         
         # Setup
-        registry = SkillRegistry(db)
+        registry = SkillRegistry(lambda: db)
         executor = AgentExecutor(lambda: db, registry, mode=MockMode.PRODUCTION)
         
         # Record metrics directly

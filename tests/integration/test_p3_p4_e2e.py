@@ -94,7 +94,7 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
         from core.skills.registry import SkillRegistry
 
         event_logger = EventLogger.from_session(db)
-        skill_registry = SkillRegistry(db)
+        skill_registry = SkillRegistry(lambda: db)
         context_manager = ContextManager(lambda: db)
         selector = SkillPipeline(lambda: db, llm, audit=True, learning=True)
         executor = AgentExecutor(lambda: db, skill_registry)
