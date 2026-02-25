@@ -205,44 +205,47 @@ class EventPipeline:
             db.close()
 
     async def _flush_loop(self) -> None:
-        """Background loop: drain → classify → batch INSERT → commit."""
+        """Background loop: drain → classify → batch INSERT → commit.
+
+        Each flush acquires a session from the pool and releases it immediately
+        after commit. This avoids holding a connection for the process lifetime
+        and tolerates transient DB disconnects between flushes.
+        """
+        while not self._closed:
+            batch = await self._drain()
+            if batch:
+                self._flush_batch(batch)
+
+        # _closed is True — drain any remaining events before exiting
+        remaining: list[ConversationEvent] = []
+        while not self._queue.empty():
+            try:
+                item = self._queue.get_nowait()
+                if item is not self._SENTINEL and isinstance(item, ConversationEvent):
+                    remaining.append(item)
+            except asyncio.QueueEmpty:
+                break
+        if remaining:
+            self._flush_batch(remaining)
+
+    def _flush_batch(self, batch: list[ConversationEvent]) -> None:
+        """Flush a batch using a short-lived session."""
         db = self._db_factory()
         try:
-            while not self._closed:
-                batch = await self._drain()
-                if batch:
-                    try:
-                        self._do_flush(db, batch)
-                        self.stats["flushed"] += len(batch)
-                    except Exception:
-                        db.rollback()
-                        logger.warning("Background flush failed (%d events), retrying once", len(batch))
-                        try:
-                            self._do_flush(db, batch)
-                            self.stats["flushed"] += len(batch)
-                        except Exception:
-                            db.rollback()
-                            logger.exception("Background flush retry failed (%d events dropped)", len(batch))
-                            self.stats["dropped"] += len(batch)
-
-            # _closed is True — drain any remaining events before exiting
-            remaining: list[ConversationEvent] = []
-            while not self._queue.empty():
-                try:
-                    item = self._queue.get_nowait()
-                    if item is not self._SENTINEL and isinstance(item, ConversationEvent):
-                        remaining.append(item)
-                except asyncio.QueueEmpty:
-                    break
-            if remaining:
-                try:
-                    self._do_flush(db, remaining)
-                    self.stats["flushed"] += len(remaining)
-                except Exception:
-                    db.rollback()
-                    self.stats["dropped"] += len(remaining)
-        except asyncio.CancelledError:
-            pass  # Shutdown requested — exit cleanly
+            self._do_flush(db, batch)
+            self.stats["flushed"] += len(batch)
+        except Exception:
+            db.rollback()
+            db.close()
+            logger.warning("Background flush failed (%d events), retrying with new session", len(batch))
+            db = self._db_factory()
+            try:
+                self._do_flush(db, batch)
+                self.stats["flushed"] += len(batch)
+            except Exception:
+                db.rollback()
+                logger.exception("Background flush retry failed (%d events dropped)", len(batch))
+                self.stats["dropped"] += len(batch)
         finally:
             db.close()
 
