@@ -1,12 +1,15 @@
 """Chat API endpoints — unified conversation entry point with durable AgentRun."""
 
 import json
+import threading
+from collections import OrderedDict
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.database import get_db_session
@@ -31,6 +34,19 @@ class ChatRequest(BaseModel):
     max_candidates: int = Field(default=5, description="Max skill candidates")
 
 
+class EdgeProfileModel(BaseModel):
+    """Validated edge profile schema."""
+    # extra="ignore" for forward compatibility: older servers accept newer edge fields.
+    # Trade-off: typos like "git_brach" are silently ignored. Mitigated by edge-side
+    # validation in detect_edge_profile() which constructs the dict programmatically.
+    model_config = ConfigDict(extra="ignore")
+
+    cwd: str | None = None
+    git_branch: str | None = None
+    project_type: str | None = None
+    languages: list[str] | None = None
+
+
 class ChatTurnRequest(BaseModel):
     """Edge-cloud /chat/turn request — one LLM turn in the agentic loop."""
     messages: list[dict[str, Any]] = Field(description="Conversation messages from edge")
@@ -40,6 +56,7 @@ class ChatTurnRequest(BaseModel):
     agent_id: str | None = Field(default=None, description="Agent ID")
     model: str | None = Field(default=None, description="Model override")
     edge_tools: list[dict[str, Any]] | None = Field(default=None, description="Edge tool schemas (OpenAI format)")
+    edge_profile: EdgeProfileModel | None = Field(default=None, description="Edge project profile (cwd, git_branch, languages, project_type)")
 
 
 class ChatResponse(BaseModel):
@@ -317,65 +334,76 @@ async def cancel_run(
 # /chat/turn — Edge-Cloud agentic loop endpoint
 # ---------------------------------------------------------------------------
 
-# In-memory conversation history per session (production: persist in MatrixOne)
-_turn_histories: dict[str, list[dict[str, Any]]] = {}
+# In-memory conversation history per session (production: persist in MatrixOne).
+# Uses LRU eviction to prevent unbounded growth on long-running servers.
+_MAX_CACHED_SESSIONS = 1000
+
+
+class _LRUDict(OrderedDict):
+    """Thread-safe OrderedDict with LRU eviction at a fixed capacity.
+
+    FastAPI dispatches sync endpoints to a thread pool, so concurrent access
+    to module-level dicts is possible.  All public operations are serialized
+    under a reentrant lock.  We use RLock (not Lock) because __setitem__
+    calls __contains__ internally while already holding the lock.
+    """
+
+    def __init__(self, maxsize: int):
+        super().__init__()
+        self._maxsize = maxsize
+        self._lock = threading.RLock()
+
+    def __contains__(self, key):
+        # Intentionally does NOT call move_to_end(): existence checks should not
+        # count as "access" for LRU purposes.  __setitem__ relies on this —
+        # checking `if key in self` before overwrite must not refresh the entry.
+        with self._lock:
+            return super().__contains__(key)
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            if key in self:
+                self.move_to_end(key)
+            super().__setitem__(key, value)
+            if len(self) > self._maxsize:
+                self.popitem(last=False)
+
+    def __getitem__(self, key):
+        with self._lock:
+            self.move_to_end(key)
+            return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        with self._lock:
+            if key in self:
+                self.move_to_end(key)
+                return super().__getitem__(key)
+            return default
+
+    def setdefault(self, key, default=None):
+        with self._lock:
+            if key in self:
+                self.move_to_end(key)
+                return super().__getitem__(key)
+            self[key] = default
+            return default
+
+    def pop(self, key, *args):
+        with self._lock:
+            return super().pop(key, *args)
+
+    def __delitem__(self, key):
+        with self._lock:
+            super().__delitem__(key)
+
+    def clear(self):
+        with self._lock:
+            super().clear()
+
+
+_turn_histories: _LRUDict = _LRUDict(_MAX_CACHED_SESSIONS)
 # Cache edge_tools per session so subsequent turns reuse them
-_session_tools: dict[str, list[dict[str, Any]]] = {}
-
-
-def _enrich_system_prompt(
-    db: Session,
-    user_id: str,
-    session_id: str,
-    user_query: str,
-    project_rules: str | None,
-) -> str:
-    """Build enriched system prompt with context from cloud services."""
-    sections = ["You are a development assistant. Use the available tools to help the user."]
-
-    if project_rules:
-        sections.append(f"# Project Rules\n{project_rules}")
-
-    # Context enrichment: memory search + few-shot + observations
-    try:
-        from core.context.manager import ContextManager
-        ctx_mgr = ContextManager(db)
-        ctx = ctx_mgr.build_context(session_id=session_id, query=user_query)
-        if ctx.selected_events:
-            history_lines = []
-            for ev in ctx.selected_events[:10]:
-                role = "User" if ev.get("event_type") == "user_query" else "Agent"
-                content = ev.get("content", "")
-                if len(content) > 300:
-                    content = content[:300] + "..."
-                history_lines.append(f"{role}: {content}")
-            if history_lines:
-                sections.append("## Relevant Context\n" + "\n".join(history_lines))
-    except Exception as e:
-        logger.debug(f"Context enrichment skipped: {e}")
-
-    try:
-        from core.context.few_shot import FewShotRetriever
-        fsr = FewShotRetriever(db)
-        examples = fsr.retrieve(user_query)
-        few_shot = fsr.format_for_prompt(examples)
-        if few_shot:
-            sections.append(few_shot)
-    except Exception as e:
-        logger.debug(f"Few-shot retrieval skipped: {e}")
-
-    try:
-        from core.memory.observer import Observer
-        from core.llm.client import LLMClient
-        obs = Observer(db, llm_client=LLMClient(db=db))
-        observations = obs.get_observations(user_id, session_id)
-        obs_section = obs.format_for_context(observations)
-        if obs_section:
-            sections.append(obs_section)
-    except Exception as e:
-        logger.debug(f"Observer skipped: {e}")
-
-    return "\n\n".join(sections)
+_session_tools: _LRUDict = _LRUDict(_MAX_CACHED_SESSIONS)
 
 
 def _build_turn_messages(
@@ -385,18 +413,37 @@ def _build_turn_messages(
     messages: list[dict[str, Any]],
     tool_results: list[dict[str, Any]] | None,
     project_rules: str | None,
+    agent_id: str | None = None,
+    edge_tools: list[dict[str, Any]] | None = None,
+    edge_profile: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build LLM messages from edge turn data + server-side history."""
     history = _turn_histories.get(session_id)
 
     # Recover from DB if not in memory (server restart)
     if history is None:
-        history = _recover_history_from_db(db, session_id)
+        history = _recover_history_from_db(db, user_id, session_id, agent_id)
 
-    # First turn: build enriched system prompt
+    # First turn: build system prompt via PromptAssembler
     if not history:
         user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
-        system = _enrich_system_prompt(db, user_id, session_id, user_query, project_rules)
+
+        from core.context.prompt_assembler import PromptAssembler, EdgeContext
+        edge_ctx = EdgeContext(
+            project_rules=project_rules,
+            edge_tools=edge_tools or [],
+            edge_profile=edge_profile or {},
+        )
+        assembled = PromptAssembler(db).assemble(
+            agent_id=agent_id,
+            user_query=user_query,
+            session_id=session_id,
+            user_id=user_id,
+            edge_context=edge_ctx,
+        )
+        system = assembled.system_message
+        logger.debug("Assembled prompt: %d tokens, snapshot=%s", sum(assembled.token_breakdown.values()), assembled.snapshot_id)
+
         history = [{"role": "system", "content": system}]
 
     # Append new user messages from edge
@@ -417,21 +464,40 @@ def _build_turn_messages(
     return history
 
 
-def _recover_history_from_db(db: Session, session_id: str) -> list[dict[str, Any]]:
+# Max conversation events to recover on server restart.
+# Inlined into SQL as a constant (not parameterized) because some MySQL-compatible
+# databases quote LIMIT parameters as strings, causing syntax errors.
+_MAX_RECOVERY_EVENTS = 50
+
+
+def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_id: str | None = None) -> list[dict[str, Any]]:
     """Rebuild conversation history from persisted events (for server restart recovery)."""
     try:
         rows = db.execute(
-            text("""
+            # safe: _MAX_RECOVERY_EVENTS is a module-level int constant, not user input
+            text(f"""
                 SELECT event_type, content FROM conversation_events
                 WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response')
-                ORDER BY created_at ASC LIMIT 50
+                ORDER BY created_at ASC LIMIT {_MAX_RECOVERY_EVENTS}
             """),
             {"sid": session_id},
         ).fetchall()
         if not rows:
             return []
+
+        # Rebuild system prompt via assembler.
+        # NOTE: edge_context is not available on recovery (project_rules, edge_profile
+        # are transient and not persisted). The recovered prompt will lack Self-Model
+        # edge tool info and project context. This is an accepted limitation — the
+        # edge will re-send these on the next fresh session.
+        first_query = next((r[1] for r in rows if r[0] == "user_query"), "")
+        from core.context.prompt_assembler import PromptAssembler
+        assembled = PromptAssembler(db).assemble(
+            agent_id=agent_id, user_query=first_query,
+            session_id=session_id, user_id=user_id,
+        )
         history: list[dict[str, Any]] = [
-            {"role": "system", "content": "You are a development assistant. Use the available tools to help the user."}
+            {"role": "system", "content": assembled.system_message}
         ]
         for row in rows:
             etype, content = row[0], row[1] or ""
@@ -440,8 +506,8 @@ def _recover_history_from_db(db: Session, session_id: str) -> list[dict[str, Any
             elif etype == "llm_response":
                 history.append({"role": "assistant", "content": content})
         return history
-    except Exception as e:
-        logger.debug(f"History recovery failed: {e}")
+    except SQLAlchemyError as e:
+        logger.debug("History recovery failed: %s", e)
         return []
 
 
@@ -504,10 +570,10 @@ def _persist_turn_events(
                 ctx = ctx_mgr.build_context(session_id=session_id, query=user_content or "")
                 context_capture_id = ctx_mgr.save_snapshot(ctx, session_id, parent_event_id)
             except Exception as e:
-                logger.debug(f"Context snapshot skipped: {e}")
+                logger.debug("Context snapshot skipped: %s", e)
 
     except Exception as e:
-        logger.warning(f"Event persistence failed (non-fatal): {e}")
+        logger.warning("Event persistence failed (non-fatal): %s", e)
 
     return context_capture_id
 
@@ -535,6 +601,9 @@ async def chat_turn(
     llm_messages = _build_turn_messages(
         db, user_id, session_id,
         request.messages, request.tool_results, request.project_rules,
+        agent_id=request.agent_id,
+        edge_tools=request.edge_tools,
+        edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
     )
 
     model = request.model

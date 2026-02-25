@@ -664,14 +664,40 @@ class ContextManager:
 
     @staticmethod
     def _update_snapshot(db_factory, context_capture_id: str, update_dict: dict) -> None:
-        """Update snapshot in background thread."""
+        """Update snapshot in background thread.
+
+        Retries briefly if the row doesn't exist yet — the INSERT from
+        save_snapshot may still be in-flight on another thread-pool worker.
+
+        time.sleep() is acceptable here: this runs in a background thread
+        (not the async event loop), and the total worst-case delay (750 ms)
+        is bounded.  If the INSERT truly failed, the warning log after
+        retries is the correct outcome — the snapshot row simply won't
+        have LLM IDs, which is non-critical metadata.
+        """
+        import time
         db = db_factory()
         try:
             from api.models import ContextSnapshot as SnapshotModel
-            db.query(SnapshotModel).filter(
-                SnapshotModel.context_capture_id == context_capture_id
-            ).update(update_dict)
-            db.commit()
+            for attempt in range(5):
+                rows_updated = db.query(SnapshotModel).filter(
+                    SnapshotModel.context_capture_id == context_capture_id
+                ).update(update_dict)
+                db.commit()
+                if rows_updated > 0:
+                    return
+                # Row not yet visible — INSERT may still be in-flight
+                delay = 0.05 * (attempt + 1)
+                _logging.getLogger(__name__).debug(
+                    "Snapshot %s not found (attempt %d/5), retrying in %.0fms",
+                    context_capture_id, attempt + 1, delay * 1000,
+                )
+                time.sleep(delay)
+            _logging.getLogger(__name__).warning(
+                "Snapshot %s not found after 5 retries — INSERT may have failed; "
+                "LLM IDs will not be recorded for this snapshot",
+                context_capture_id,
+            )
         except Exception:
             db.rollback()
             _logging.getLogger(__name__).exception(

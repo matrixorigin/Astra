@@ -359,6 +359,26 @@ def model_check(ctx, model_name):
         click.echo(f"❌ Failed: {e}")
 
 
+@model.command("remove")
+@click.argument("model_name")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@click.pass_context
+def model_remove(ctx, model_name, yes):
+    """Remove a model."""
+    client = ctx.obj["client"]
+    require_auth(client)
+
+    if not yes:
+        click.confirm(f"Remove model '{model_name}'?", abort=True)
+
+    try:
+        client.admin_delete_model(model_name)
+        click.echo(f"✅ Model removed: {model_name}")
+    except Exception as e:
+        click.echo(f"❌ Failed: {e}")
+        sys.exit(1)
+
+
 @cli.command()
 @click.option("--username", prompt=True)
 @click.option("--password", prompt=True, hide_input=True)

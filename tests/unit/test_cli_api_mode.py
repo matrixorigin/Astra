@@ -392,6 +392,7 @@ class TestCLIEdgeMode:
         expected_tools = {
             "read_file", "write_file", "str_replace", "list_dir",
             "bash", "git_status", "git_diff", "git_log", "grep", "glob",
+            "get_agent_info",
         }
         assert set(captured["tools"]) == expected_tools
         assert captured["auto_approve"] is True

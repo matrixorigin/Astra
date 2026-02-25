@@ -316,6 +316,7 @@ class APIClient:
         agent_id: str | None = None,
         model: str | None = None,
         edge_tools: list[dict[str, Any]] | None = None,
+        edge_profile: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Call /chat/turn — one LLM turn in the edge-cloud loop.
 
@@ -341,6 +342,8 @@ class APIClient:
             payload["model"] = model
         if edge_tools:
             payload["edge_tools"] = edge_tools
+        if edge_profile:
+            payload["edge_profile"] = edge_profile
 
         url = f"{self.base_url}/chat/turn"
         async with aconnect_sse(
@@ -723,6 +726,10 @@ class APIClient:
         """Re-check model connectivity."""
         response = await self._request("POST", f"/models/{model_name}/check")
         return response.json()
+
+    async def admin_delete_model(self, model_name: str) -> None:
+        """Delete a model."""
+        await self._request("DELETE", f"/models/{model_name}")
 
     async def admin_grant_role(
         self,

@@ -156,6 +156,11 @@ async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, a
     register_git_tools(router, project_root)
     register_search_tools(router, project_root)
 
+    # Introspection tool — session info populated with what we know at startup
+    from cli.tools.introspection import GetAgentInfoTool
+    session_info = {"session_id": session_id, "agent_id": agent_id, "model": model, "turn": 0}
+    router.register(GetAgentInfoTool(tool_router=router, session_info=session_info))
+
     perms = PermissionManager(auto_approve=auto_approve)
 
     async with APIClient(base_url=sync_client.base_url, profile=sync_client.profile) as api:
@@ -163,6 +168,7 @@ async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, a
             user_input, api, router, perms,
             session_id=session_id, project_root=project_root,
             model=model, agent_id=agent_id,
+            session_info=session_info,
         )
 
 
@@ -247,20 +253,27 @@ def chat(ctx, user_id, session_id, model, auto_approve, debug):
                 elif cmd == "/model":
                     try:
                         models = client.admin_list_models()
+                        active_models = [m for m in models if m.get("is_active", True)]
                         if cmd_arg:
-                            if cmd_arg in [m["name"] for m in models]:
+                            if cmd_arg in [m["name"] for m in active_models]:
                                 selected_model = cmd_arg
                                 click.echo(f"\n✅ Model: {selected_model}\n")
                             else:
                                 click.echo(f"\n❌ Unknown model '{cmd_arg}'")
-                                for m in models:
-                                    click.echo(f"  • {m['name']} ({m['provider']})")
+                                if active_models:
+                                    for m in active_models:
+                                        click.echo(f"  • {m['name']} ({m['provider']})")
+                                else:
+                                    click.echo("  No active models. Run: mo-admin model add <name> <provider>")
                                 click.echo()
                         else:
-                            for m in models:
-                                marker = "→" if selected_model == m["name"] else " "
-                                click.echo(f"  {marker} {m['name']} ({m['provider']})")
-                            click.echo()
+                            if not active_models:
+                                click.echo("\n  No active models. Run: mo-admin model add <name> <provider>\n")
+                            else:
+                                for m in active_models:
+                                    marker = "→" if selected_model == m["name"] else " "
+                                    click.echo(f"  {marker} {m['name']} ({m['provider']})")
+                                click.echo()
                     except Exception as e:
                         click.echo(f"\n❌ {e}\n")
                 elif cmd == "/session":

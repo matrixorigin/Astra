@@ -5,6 +5,7 @@ Edge sends user message + tool results → cloud returns text + tool_calls → e
 
 import sys
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -83,6 +84,51 @@ def load_project_rules(project_root: str) -> str | None:
     return "\n\n---\n\n".join(parts) if parts else None
 
 
+def detect_edge_profile(project_root: str) -> dict[str, Any]:
+    """Detect project profile from local filesystem for cloud context enrichment."""
+    import subprocess
+    root = Path(project_root).resolve()
+    profile: dict[str, Any] = {"cwd": str(root)}
+
+    # Git branch — use symbolic-ref (faster than rev-parse on large repos)
+    try:
+        branch = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=root, capture_output=True, text=True, timeout=5,
+        )
+        if branch.returncode == 0:
+            profile["git_branch"] = branch.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        # OSError covers FileNotFoundError (git not installed) since Python 3.3
+        pass
+
+    # Project type from marker files
+    markers = {
+        "go.mod": "go", "Cargo.toml": "rust", "package.json": "node",
+        "pyproject.toml": "python", "pom.xml": "java", "build.gradle": "java",
+    }
+    for marker, ptype in markers.items():
+        if (root / marker).exists():
+            profile["project_type"] = ptype
+            break
+
+    # Languages from file extensions (sample top-level + common subdirs)
+    exts: set[str] = set()
+    for d in [root, root / "src", root / "pkg", root / "lib",
+              root / "cmd", root / "internal", root / "app"]:
+        if d.is_dir():
+            for f in islice(d.iterdir(), 50):
+                if f.is_file() and f.suffix:
+                    exts.add(f.suffix.lstrip("."))
+    lang_map = {"go": "Go", "rs": "Rust", "py": "Python", "ts": "TypeScript",
+                "js": "JavaScript", "java": "Java", "rb": "Ruby", "c": "C", "cpp": "C++"}
+    langs = sorted({lang_map[e] for e in exts if e in lang_map})
+    if langs:
+        profile["languages"] = langs
+
+    return profile
+
+
 async def _consume_turn(sse_stream, renderer: Renderer) -> TurnResult:
     """Consume one /chat/turn SSE stream, render text, collect tool_calls."""
     result = TurnResult()
@@ -117,6 +163,7 @@ async def edge_chat_loop(
     renderer: Renderer | None = None,
     agent_id: str | None = None,
     model: str | None = None,
+    session_info: dict[str, Any] | None = None,
 ) -> str:
     """Run the edge-cloud agentic loop until final answer or MAX_TURNS.
 
@@ -126,9 +173,19 @@ async def edge_chat_loop(
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_input}]
     tool_results: list[dict[str, Any]] = []
     project_rules = load_project_rules(project_root)
+    edge_profile = detect_edge_profile(project_root)
+    if session_info is not None:
+        session_info["has_project_rules"] = project_rules is not None
+        session_info["has_edge_profile"] = bool(edge_profile)
     final_text = ""
 
     for turn in range(MAX_TURNS):
+        # Update turn counter for introspection tool.
+        # Safe without locking: edge_chat_loop is single-threaded async —
+        # only one turn executes at a time, so session_info is never
+        # written concurrently by multiple coroutines.
+        if session_info is not None:
+            session_info["turn"] = turn
         # Call cloud
         try:
             sse_stream = api_client.chat_turn(
@@ -139,6 +196,7 @@ async def edge_chat_loop(
                 agent_id=agent_id,
                 model=model,
                 edge_tools=tool_router.get_schemas() if turn == 0 else None,
+                edge_profile=edge_profile if turn == 0 else None,
             )
             result = await _consume_turn(sse_stream, renderer)
         except KeyboardInterrupt:

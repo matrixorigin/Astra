@@ -37,6 +37,10 @@ class ToolRouter:
     def get_tool(self, name: str) -> EdgeTool | None:
         return self._tools.get(name)
 
+    def list_tools(self) -> list[EdgeTool]:
+        """Return all registered tools (public API for introspection)."""
+        return list(self._tools.values())
+
     def get_schemas(self) -> list[dict[str, Any]]:
         """Return OpenAI-compatible tool schemas for all registered tools."""
         return [t.to_openai_schema() for t in self._tools.values()]

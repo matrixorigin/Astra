@@ -35,6 +35,17 @@ def _make_event(session_id, event_type=EventType.USER_QUERY, content="What is ev
     )
 
 
+def _drain_worker(worker, db) -> int:
+    """Run worker until all pending events are embedded. Returns total count."""
+    total = 0
+    for _ in range(100):  # safety cap to prevent infinite loop
+        count = worker.process_batch_sync(db)
+        total += count
+        if count == 0:
+            return total
+    raise RuntimeError(f"_drain_worker: still processing after 100 iterations ({total} events embedded)")
+
+
 @pytest.fixture
 def session_id():
     return str(uuid7())[:36]
@@ -92,11 +103,12 @@ class TestEmbeddingWorker:
         for ev in [ev_query, ev_response, ev_tool, ev_stream]:
             logger.log_event(ev)
 
-        # Run worker synchronously (may embed events from other tests too)
+        # Run worker synchronously — drain all pending batches so our events
+        # are reached even when a backlog of unembedded events exists.
         from api.database import SessionLocal
         worker = EmbeddingWorker(SessionLocal, embedding_provider="mock")
-        count = worker.process_batch_sync(db_session)
-        assert count >= 2, f"Should embed at least 2 eligible events, got {count}"
+        total = _drain_worker(worker, db_session)
+        assert total >= 2, f"Should embed at least 2 eligible events, got {total}"
 
         # Verify our eligible events got embedded
         embedded = db_session.execute(
@@ -121,10 +133,11 @@ class TestEmbeddingWorker:
         from api.database import SessionLocal
         worker = EmbeddingWorker(SessionLocal, embedding_provider="mock")
 
-        count1 = worker.process_batch_sync(db_session)
+        # Drain all pending events (including any backlog from other tests)
+        count1 = _drain_worker(worker, db_session)
         count2 = worker.process_batch_sync(db_session)
 
-        assert count1 == 1
+        assert count1 >= 1, f"First run should embed at least 1 event, got {count1}"
         assert count2 == 0, "Second run should find nothing to embed"
 
     @pytest.mark.asyncio
@@ -264,7 +277,7 @@ class TestEndToEndDecoupled:
 
         # 2. Worker generates embedding into event_embeddings
         worker = EmbeddingWorker(SessionLocal, embedding_provider="mock")
-        count = worker.process_batch_sync(db_session)
+        count = _drain_worker(worker, db_session)
         assert count >= 1
 
         # Verify embedding in event_embeddings
