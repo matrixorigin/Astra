@@ -29,7 +29,7 @@ class TestMetricRecording:
         
         # Setup
         registry = SkillRegistry(db)
-        executor = AgentExecutor(db, registry, mode=MockMode.PRODUCTION)
+        executor = AgentExecutor(lambda: db, registry, mode=MockMode.PRODUCTION)
         
         # Record metrics directly
         executor._record_execution_metrics(

@@ -254,8 +254,10 @@ IMPROVED_PROMPT:
     ) -> None:
         """Register and activate the new prompt version."""
         from core.context.prompts import PromptManager
-
-        pm = PromptManager(self.db)
+        # Phase 2 bridge: PromptOptimizer holds a raw session;
+        # PromptManager needs a factory.
+        from api.database import SessionLocal
+        pm = PromptManager(SessionLocal)
         pm.register_prompt(template_id, version, content, is_active=True)
 
     @staticmethod

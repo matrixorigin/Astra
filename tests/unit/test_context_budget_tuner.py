@@ -122,7 +122,7 @@ class TestContextManagerBudgetOverride:
         with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
              patch("core.context.prompts.PromptManager.__init__", return_value=None), \
              patch("core.context.scorer.RelevanceScorer.__init__", return_value=None):
-            mgr = ContextManager(db)
+            mgr = ContextManager(lambda: db)
             ratios = mgr._load_budget_ratios(TaskType.DEBUGGING)
 
         assert ratios["logs"] == 0.50
@@ -136,7 +136,7 @@ class TestContextManagerBudgetOverride:
         with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
              patch("core.context.prompts.PromptManager.__init__", return_value=None), \
              patch("core.context.scorer.RelevanceScorer.__init__", return_value=None):
-            mgr = ContextManager(db)
+            mgr = ContextManager(lambda: db)
             ratios = mgr._load_budget_ratios(TaskType.DEBUGGING)
 
         assert ratios == _BUDGET_RATIOS[TaskType.DEBUGGING]
@@ -153,7 +153,7 @@ class TestContextManagerBudgetOverride:
         with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
              patch("core.context.prompts.PromptManager.__init__", return_value=None), \
              patch("core.context.scorer.RelevanceScorer.__init__", return_value=None):
-            mgr = ContextManager(db)
+            mgr = ContextManager(lambda: db)
             mgr._load_budget_ratios(TaskType.DEBUGGING)
             mgr._load_budget_ratios(TaskType.DEBUGGING)  # second call should use cache
 
@@ -170,7 +170,7 @@ class TestContextManagerBudgetOverride:
              patch("core.context.prompts.PromptManager.__init__", return_value=None), \
              patch("core.context.scorer.RelevanceScorer.__init__", return_value=None), \
              patch("core.context.manager.logger") as mock_logger:
-            mgr = ContextManager(db)
+            mgr = ContextManager(lambda: db)
             ratios = mgr._load_budget_ratios(TaskType.DEBUGGING)
             mock_logger.debug.assert_called_once()
 

@@ -7,27 +7,28 @@ import json
 import os
 from typing import Any
 
+from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
-class EmbeddingService:
+class EmbeddingService(DbConsumer):
     """Generate and manage text embeddings."""
 
     DIMENSION = 1536  # OpenAI text-embedding-3-small dimension
 
     def __init__(
-        self, db, provider: str = "openai", model: str = "text-embedding-3-small"
+        self, db_factory: DbFactory, provider: str = "openai", model: str = "text-embedding-3-small"
     ):
         """Initialize embedding service.
 
         Args:
-            db: SQLAlchemy Session
+            db_factory: Callable returning a new SQLAlchemy Session
             provider: Embedding provider (openai, mock)
             model: Model name
         """
-        self.db = db
+        super().__init__(db_factory)
         self.provider = provider
         self.model = model
         self._init_provider()
@@ -46,35 +47,36 @@ class EmbeddingService:
                 api_key = None
                 base_url = None
                 actual_provider = None
-                if self.db:
+                if self._db_factory:
                     try:
                         from sqlalchemy import text
-                        # Try openai first, then any available provider
-                        for prov in ("openai", None):
-                            if prov:
-                                row = self.db.execute(
-                                    text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE AND provider=:provider ORDER BY created_at DESC LIMIT 1"),
-                                    {"provider": prov}
-                                ).first()
-                            else:
-                                row = self.db.execute(
-                                    text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
-                                ).first()
-                            if row:
-                                # Decrypt encrypted_value
-                                encrypted_value = row[0]
-                                api_key = decrypt_token(encrypted_value) if encrypted_value else None
-                                actual_provider = row[1]
-                                # Extract base_url from metadata
-                                meta = row[2]
-                                if meta:
-                                    import json as _json
-                                    try:
-                                        meta_dict = _json.loads(meta) if isinstance(meta, str) else meta
-                                        base_url = meta_dict.get("base_url")
-                                    except Exception:
-                                        pass
-                                break
+                        with self._db() as db:
+                            # Try openai first, then any available provider
+                            for prov in ("openai", None):
+                                if prov:
+                                    row = db.execute(
+                                        text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE AND provider=:provider ORDER BY created_at DESC LIMIT 1"),
+                                        {"provider": prov}
+                                    ).first()
+                                else:
+                                    row = db.execute(
+                                        text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
+                                    ).first()
+                                if row:
+                                    # Decrypt encrypted_value
+                                    encrypted_value = row[0]
+                                    api_key = decrypt_token(encrypted_value) if encrypted_value else None
+                                    actual_provider = row[1]
+                                    # Extract base_url from metadata
+                                    meta = row[2]
+                                    if meta:
+                                        import json as _json
+                                        try:
+                                            meta_dict = _json.loads(meta) if isinstance(meta, str) else meta
+                                            base_url = meta_dict.get("base_url")
+                                        except Exception:
+                                            pass
+                                    break
                     except Exception:
                         pass
                 # Providers that don't support OpenAI-compatible embeddings
@@ -164,19 +166,20 @@ class EmbeddingService:
         metadata_json = json.dumps(metadata or {})
 
         from sqlalchemy import text
-        self.db.execute(
-            text("""
-            INSERT INTO event_embeddings
-            (event_id, embedding, model_name, model_version, metadata, created_at, updated_at)
-            VALUES (:event_id, :embedding, :model_name, :model_version, :metadata, NOW(), NOW())
-            ON DUPLICATE KEY UPDATE
-            embedding = VALUES(embedding),
-            metadata = VALUES(metadata),
-            updated_at = NOW()
-        """),
-            {"event_id": event_id, "embedding": vec_str, "model_name": self.model, "model_version": "1.0", "metadata": metadata_json},
-        )
-        self.db.commit()
+        with self._db() as db:
+            db.execute(
+                text("""
+                INSERT INTO event_embeddings
+                (event_id, embedding, model_name, model_version, metadata, created_at, updated_at)
+                VALUES (:event_id, :embedding, :model_name, :model_version, :metadata, NOW(), NOW())
+                ON DUPLICATE KEY UPDATE
+                embedding = VALUES(embedding),
+                metadata = VALUES(metadata),
+                updated_at = NOW()
+            """),
+                {"event_id": event_id, "embedding": vec_str, "model_name": self.model, "model_version": "1.0", "metadata": metadata_json},
+            )
+            db.commit()
 
     def search_similar(
         self,
@@ -251,5 +254,6 @@ class EmbeddingService:
                 param_name = f"filter_{i}"
                 params_dict[param_name] = value
 
-        result = self.db.execute(text(query), params_dict)
-        return [dict(row._mapping) for row in result.fetchall()]
+        with self._db() as db:
+            result = db.execute(text(query), params_dict)
+            return [dict(row._mapping) for row in result.fetchall()]

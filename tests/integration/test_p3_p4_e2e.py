@@ -95,9 +95,9 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
 
         event_logger = EventLogger.from_session(db)
         skill_registry = SkillRegistry(db)
-        context_manager = ContextManager(db)
+        context_manager = ContextManager(lambda: db)
         selector = SkillPipeline(db, llm, audit=True, learning=True)
-        executor = AgentExecutor(db, skill_registry)
+        executor = AgentExecutor(lambda: db, skill_registry)
         firewall = HallucinationFirewall(db, context_manager)
 
         loop = ChatLoop(

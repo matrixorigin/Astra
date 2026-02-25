@@ -16,7 +16,7 @@ def db():
 @pytest.fixture
 def feedback(db):
     """PromptFeedback fixture with cleanup."""
-    feedback_instance = PromptFeedback(db)
+    feedback_instance = PromptFeedback(lambda: db)
 
     yield feedback_instance
 

@@ -43,7 +43,7 @@ class TestToolMockingLayer:
         """Test production mode executes real skills"""
         mocker = ToolMockingLayer(
             mode=ExecutionMode.PRODUCTION,
-            session=db
+            db_factory=lambda: db
         )
         
         # Production mode should execute real skills
@@ -80,7 +80,7 @@ class TestToolMockingLayer:
         
         mocker = ToolMockingLayer(
             mode=ExecutionMode.REPLAY,
-            session=db,
+            db_factory=lambda: db,
             session_id="sess_123"
         )
         
@@ -92,7 +92,7 @@ class TestToolMockingLayer:
         """Test replay mode raises error when no recorded result"""
         mocker = ToolMockingLayer(
             mode=ExecutionMode.REPLAY,
-            session=db,
+            db_factory=lambda: db,
             session_id="sess_123"
         )
         
@@ -106,7 +106,7 @@ class TestToolMockingLayer:
         """Test dry-run mode validates without execution"""
         mocker = ToolMockingLayer(
             mode=ExecutionMode.DRY_RUN,
-            session=db
+            db_factory=lambda: db
         )
         
         result = mocker.invoke_skill("test_skill", {"param": "value"})
@@ -140,7 +140,7 @@ class TestToolMockingLayer:
         
         mocker = ToolMockingLayer(
             mode=ExecutionMode.PRODUCTION,
-            session=db
+            db_factory=lambda: db
         )
         
         # Record result
@@ -163,7 +163,7 @@ class TestToolMockingLayer:
         with pytest.raises(ValueError) as exc_info:
             ToolMockingLayer(
                 mode=ExecutionMode.REPLAY,
-                session=db,
+                db_factory=lambda: db,
                 session_id=None
             )
         
@@ -173,7 +173,7 @@ class TestToolMockingLayer:
         """Test key generation is consistent regardless of param order"""
         mocker = ToolMockingLayer(
             mode=ExecutionMode.PRODUCTION,
-            session=db
+            db_factory=lambda: db
         )
         
         key1 = mocker._make_key("skill", {"a": 1, "b": 2})
@@ -231,7 +231,7 @@ class TestToolMockingLayer:
         
         mocker = ToolMockingLayer(
             mode=ExecutionMode.REPLAY,
-            session=db,
+            db_factory=lambda: db,
             session_id="sess_123"
         )
         

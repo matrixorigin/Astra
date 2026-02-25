@@ -11,7 +11,7 @@ def test_auto_extraction():
     
     session_mgr = SessionManager(db)
     event_logger = EventLogger.from_session(db)
-    context_mgr = ContextManager(db, embedding_provider="mock")
+    context_mgr = ContextManager(lambda: db, embedding_provider="mock")
     
     user_id = "test_auto_user"
     

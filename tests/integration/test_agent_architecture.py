@@ -89,7 +89,7 @@ class TestAgentArchitecture(unittest.TestCase):
             "keyword"
         ))
 
-        self.executor = AgentExecutor(self.db, self.registry, MockMode.PRODUCTION)
+        self.executor = AgentExecutor(lambda: self.db, self.registry, MockMode.PRODUCTION)
         self.chat_loop = ChatLoop(
             selector=self.pipeline,
             executor=self.executor,
@@ -102,7 +102,7 @@ class TestAgentArchitecture(unittest.TestCase):
     def test_executor_execution(self):
         """Test that executor uses ToolMockingLayer."""
         with patch("core.agent.executor.ToolMockingLayer") as mock_layer:
-            executor = AgentExecutor(self.db, self.registry, MockMode.PRODUCTION)
+            executor = AgentExecutor(lambda: self.db, self.registry, MockMode.PRODUCTION)
             executor.execute_skill("test_skill", {"param": "value"}, "session_1", "parent_1")
             mock_layer.return_value.execute.assert_called()
 

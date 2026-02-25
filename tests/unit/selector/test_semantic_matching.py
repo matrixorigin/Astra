@@ -38,7 +38,7 @@ class TestSemanticMatching:
         """Test applying learnings using semantic matching."""
         from core.context.embeddings import EmbeddingService
 
-        service = EmbeddingService(db, provider="mock")
+        service = EmbeddingService(lambda: db, provider="mock")
         embedding = service.embed_text("Review PR #123")
         embedding_vec_str = embedding_to_vec_str(embedding)
 
@@ -129,7 +129,7 @@ class TestSemanticMatching:
         db.commit()
 
         from core.context.embeddings import EmbeddingService
-        service = EmbeddingService(db, provider="mock")
+        service = EmbeddingService(lambda: db, provider="mock")
         embedding = service.embed_text("Review PR #123")
         embedding_vec_str = embedding_to_vec_str(embedding)
 
@@ -189,7 +189,7 @@ class TestSemanticMatching:
         db.commit()
 
         from core.context.embeddings import EmbeddingService
-        service = EmbeddingService(db, provider="mock")
+        service = EmbeddingService(lambda: db, provider="mock")
         query_text = "Review PR #123"
         embedding = service.embed_text(query_text)
         embedding_vec_str = embedding_to_vec_str(embedding)

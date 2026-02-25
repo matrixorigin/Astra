@@ -7,18 +7,18 @@ Supports versioning and feedback collection for prompt optimization.
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
+from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
-class PromptManager:
+class PromptManager(DbConsumer):
     """Manage prompt templates and versions."""
 
-    def __init__(self, db: Session, gate_trigger=None):
-        self.db = db
+    def __init__(self, db_factory: DbFactory, gate_trigger=None):
+        super().__init__(db_factory)
         self.gate_trigger = gate_trigger
         self._cache: dict[str, str] = {}
 
@@ -51,7 +51,8 @@ class PromptManager:
                 """)
                 params = {"template_id": template_id}
 
-            result = self.db.execute(query, params).first()
+            with self._db() as db:
+                result = db.execute(query, params).first()
 
             if result:
                 content = result.content
@@ -79,31 +80,32 @@ class PromptManager:
             is_active: Whether to make this the active version
         """
         try:
-            # If active, deactivate others
-            if is_active:
-                self.db.execute(
-                    text("UPDATE prompt_templates SET is_active = 0 WHERE template_id = :template_id"),
-                    {"template_id": template_id}
-                )
+            with self._db() as db:
+                # If active, deactivate others
+                if is_active:
+                    db.execute(
+                        text("UPDATE prompt_templates SET is_active = 0 WHERE template_id = :template_id"),
+                        {"template_id": template_id}
+                    )
 
-            self.db.execute(
-                text("""
-                INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
-                VALUES (:template_id, :version, :content, :is_active, NOW(), NOW())
-                ON DUPLICATE KEY UPDATE
-                    version = VALUES(version),
-                    content = VALUES(content),
-                    is_active = VALUES(is_active),
-                    updated_at = NOW()
-                """),
-                {
-                    "template_id": template_id,
-                    "content": content,
-                    "version": version,
-                    "is_active": 1 if is_active else 0
-                }
-            )
-            self.db.commit()
+                db.execute(
+                    text("""
+                    INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+                    VALUES (:template_id, :version, :content, :is_active, NOW(), NOW())
+                    ON DUPLICATE KEY UPDATE
+                        version = VALUES(version),
+                        content = VALUES(content),
+                        is_active = VALUES(is_active),
+                        updated_at = NOW()
+                    """),
+                    {
+                        "template_id": template_id,
+                        "content": content,
+                        "version": version,
+                        "is_active": 1 if is_active else 0
+                    }
+                )
+                db.commit()
             
             # Update cache
             if is_active:
@@ -121,7 +123,6 @@ class PromptManager:
 
         except Exception as e:
             logger.error(f"Failed to register prompt: {e}")
-            self.db.rollback()
             raise
 
     def _get_fallback_prompt(self, template_id: str) -> str:
@@ -149,44 +150,45 @@ class PromptManager:
             The version string that was reactivated, or None if no prior version exists.
         """
         try:
-            # Find current active version
-            current = self.db.execute(
-                text("""
-                    SELECT version, created_at FROM prompt_templates
-                    WHERE template_id = :tid AND is_active = 1
-                    ORDER BY created_at DESC LIMIT 1
-                """),
-                {"tid": template_id},
-            ).first()
+            with self._db() as db:
+                # Find current active version
+                current = db.execute(
+                    text("""
+                        SELECT version, created_at FROM prompt_templates
+                        WHERE template_id = :tid AND is_active = 1
+                        ORDER BY created_at DESC LIMIT 1
+                    """),
+                    {"tid": template_id},
+                ).first()
 
-            if not current:
-                logger.warning("No active version to rollback for %s", template_id)
-                return None
+                if not current:
+                    logger.warning("No active version to rollback for %s", template_id)
+                    return None
 
-            # Find previous version
-            previous = self.db.execute(
-                text("""
-                    SELECT version FROM prompt_templates
-                    WHERE template_id = :tid AND is_active = 0
-                    ORDER BY created_at DESC LIMIT 1
-                """),
-                {"tid": template_id},
-            ).first()
+                # Find previous version
+                previous = db.execute(
+                    text("""
+                        SELECT version FROM prompt_templates
+                        WHERE template_id = :tid AND is_active = 0
+                        ORDER BY created_at DESC LIMIT 1
+                    """),
+                    {"tid": template_id},
+                ).first()
 
-            if not previous:
-                logger.warning("No prior version to rollback to for %s", template_id)
-                return None
+                if not previous:
+                    logger.warning("No prior version to rollback to for %s", template_id)
+                    return None
 
-            # Deactivate current, activate previous
-            self.db.execute(
-                text("UPDATE prompt_templates SET is_active = 0 WHERE template_id = :tid AND version = :ver"),
-                {"tid": template_id, "ver": current.version},
-            )
-            self.db.execute(
-                text("UPDATE prompt_templates SET is_active = 1 WHERE template_id = :tid AND version = :ver"),
-                {"tid": template_id, "ver": previous.version},
-            )
-            self.db.commit()
+                # Deactivate current, activate previous
+                db.execute(
+                    text("UPDATE prompt_templates SET is_active = 0 WHERE template_id = :tid AND version = :ver"),
+                    {"tid": template_id, "ver": current.version},
+                )
+                db.execute(
+                    text("UPDATE prompt_templates SET is_active = 1 WHERE template_id = :tid AND version = :ver"),
+                    {"tid": template_id, "ver": previous.version},
+                )
+                db.commit()
 
             # Invalidate cache
             self._cache.pop(template_id, None)
@@ -196,13 +198,12 @@ class PromptManager:
 
         except Exception as e:
             logger.error("Failed to rollback prompt %s: %s", template_id, e)
-            self.db.rollback()
             raise
 
 
-def init_default_prompts(db: Session):
+def init_default_prompts(db_factory: DbFactory):
     """Initialize default prompt templates."""
-    manager = PromptManager(db)
+    manager = PromptManager(db_factory)
 
     prompts = [
         (
@@ -280,11 +281,11 @@ Always:
 # =============================================================================
 
 
-class PromptFeedback:
+class PromptFeedback(DbConsumer):
     """Collect and analyze user feedback on LLM responses."""
 
-    def __init__(self, db: Session):
-        self.db = db
+    def __init__(self, db_factory: DbFactory):
+        super().__init__(db_factory)
 
     def record_feedback(
         self,
@@ -317,23 +318,25 @@ class PromptFeedback:
 
         feedback_id = str(uuid7())
 
-        self.db.execute(
-            text("""
-            INSERT INTO llm_feedback
-            (feedback_id, prompt_template_id, prompt_version, llm_request_id,
-             rating, comment, metadata, created_at)
-            VALUES (:feedback_id, :template_id, :version, :request_id, :rating, :comment, :metadata, NOW())
-            """),
-            {
-                "feedback_id": feedback_id,
-                "template_id": prompt_template_id,
-                "version": prompt_version,
-                "request_id": llm_request_id,
-                "rating": user_rating,
-                "comment": user_comment,
-                "metadata": json.dumps(metadata or {}),
-            }
-        )
+        with self._db() as db:
+            db.execute(
+                text("""
+                INSERT INTO llm_feedback
+                (feedback_id, prompt_template_id, prompt_version, llm_request_id,
+                 rating, comment, metadata, created_at)
+                VALUES (:feedback_id, :template_id, :version, :request_id, :rating, :comment, :metadata, NOW())
+                """),
+                {
+                    "feedback_id": feedback_id,
+                    "template_id": prompt_template_id,
+                    "version": prompt_version,
+                    "request_id": llm_request_id,
+                    "rating": user_rating,
+                    "comment": user_comment,
+                    "metadata": json.dumps(metadata or {}),
+                }
+            )
+            db.commit()
 
         logger.info(
             f"Recorded feedback: {prompt_template_id}@{prompt_version} rating={user_rating}"
@@ -351,31 +354,32 @@ class PromptFeedback:
             where_clause = "WHERE prompt_template_id = :template_id"
             params = {"template_id": prompt_template_id}
 
-        result = self.db.execute(
-            text(f"""
-            SELECT
-                COUNT(*) as total_count,
-                AVG(rating) as avg_rating,
-                MIN(rating) as min_rating,
-                MAX(rating) as max_rating
-            FROM llm_feedback
-            {where_clause}
-            """),
-            params
-        )
-        stats_row = result.first()
+        with self._db() as db:
+            result = db.execute(
+                text(f"""
+                SELECT
+                    COUNT(*) as total_count,
+                    AVG(rating) as avg_rating,
+                    MIN(rating) as min_rating,
+                    MAX(rating) as max_rating
+                FROM llm_feedback
+                {where_clause}
+                """),
+                params
+            )
+            stats_row = result.first()
 
-        result = self.db.execute(
-            text(f"""
-            SELECT rating, COUNT(*) as count
-            FROM llm_feedback
-            {where_clause}
-            GROUP BY rating
-            ORDER BY rating
-            """),
-            params
-        )
-        distribution = result.fetchall()
+            result = db.execute(
+                text(f"""
+                SELECT rating, COUNT(*) as count
+                FROM llm_feedback
+                {where_clause}
+                GROUP BY rating
+                ORDER BY rating
+                """),
+                params
+            )
+            distribution = result.fetchall()
 
         return {
             "total_count": stats_row.total_count if stats_row else 0,
@@ -389,25 +393,25 @@ class PromptFeedback:
         self, prompt_template_id: str, threshold: int = 2, limit: int = 100
     ) -> list[dict[str, Any]]:
         """Get low-scoring feedback cases for analysis."""
-        result = self.db.execute(
-            text("""
-            SELECT
-                feedback_id,
-                prompt_version,
-                llm_request_id,
-                rating,
-                comment,
-                metadata,
-                created_at
-            FROM llm_feedback
-            WHERE prompt_template_id = :template_id AND rating <= :threshold
-            ORDER BY created_at DESC
-            LIMIT :limit
-            """),
-            {"template_id": prompt_template_id, "threshold": threshold, "limit": limit}
-        )
-
-        rows = result.fetchall()
+        with self._db() as db:
+            result = db.execute(
+                text("""
+                SELECT
+                    feedback_id,
+                    prompt_version,
+                    llm_request_id,
+                    rating,
+                    comment,
+                    metadata,
+                    created_at
+                FROM llm_feedback
+                WHERE prompt_template_id = :template_id AND rating <= :threshold
+                ORDER BY created_at DESC
+                LIMIT :limit
+                """),
+                {"template_id": prompt_template_id, "threshold": threshold, "limit": limit}
+            )
+            rows = result.fetchall()
 
         return [dict(row._mapping) for row in rows]
 

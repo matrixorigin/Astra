@@ -43,7 +43,7 @@ class TestSelectorFeedbackClosedloop:
         """), {"eid": event_id})
         db_session.commit()
 
-        executor = AgentExecutor(db_session, SkillRegistry(db_session))
+        executor = AgentExecutor(lambda: db_session, SkillRegistry(db_session))
         executor._backfill_selection_event(event_id, 150, 0.005, True)
 
         row = db_session.execute(text(
@@ -66,7 +66,7 @@ class TestSelectorFeedbackClosedloop:
         """), {"eid": event_id})
         db_session.commit()
 
-        executor = AgentExecutor(db_session, SkillRegistry(db_session))
+        executor = AgentExecutor(lambda: db_session, SkillRegistry(db_session))
         executor._backfill_selection_event(event_id, 5000, 0.0, False)
 
         row = db_session.execute(text(

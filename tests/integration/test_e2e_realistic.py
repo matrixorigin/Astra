@@ -155,9 +155,9 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
         skill_registry = SkillRegistry(db)
         # Skip register_builtin_skills — saves ~200ms per call.
         # Tests that need specific skills (B, E) register execute_code explicitly.
-        context_manager = ContextManager(db)
+        context_manager = ContextManager(lambda: db)
         selector = SkillPipeline(db, llm, audit=True, learning=True)
-        executor = AgentExecutor(db, skill_registry)
+        executor = AgentExecutor(lambda: db, skill_registry)
         firewall = HallucinationFirewall(db, context_manager)
 
         loop = ChatLoop(
@@ -195,10 +195,10 @@ def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
             runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db=db,
         )
         register_builtin_skills(skill_registry, db, code_executor=code_executor)
-        context_manager = ContextManager(db)
+        context_manager = ContextManager(lambda: db)
         selector = SkillPipeline(db, llm, audit=True, learning=True)
         selector.reload_skills(registry=skill_registry)
-        executor = AgentExecutor(db, skill_registry)
+        executor = AgentExecutor(lambda: db, skill_registry)
         firewall = HallucinationFirewall(db, context_manager)
 
         loop = ChatLoop(

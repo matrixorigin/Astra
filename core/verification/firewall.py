@@ -232,7 +232,10 @@ class HallucinationFirewall:
         # Slow path: embedding similarity (if available)
         try:
             from core.context.embeddings import EmbeddingService
-            svc = EmbeddingService(self.db)
+            # Phase 2 bridge: HallucinationFirewall holds a raw session;
+            # EmbeddingService needs a factory.
+            from api.database import SessionLocal
+            svc = EmbeddingService(SessionLocal)
             claim_vec = svc.embed_text(claim.value)
             ctx_vec = svc.embed_text(context_text[:2000])  # cap context length
             dot = sum(a * b for a, b in zip(claim_vec, ctx_vec))

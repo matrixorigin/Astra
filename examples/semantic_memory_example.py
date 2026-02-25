@@ -8,7 +8,7 @@ Demonstrates:
 
 from core.context import KnowledgeExtractor, ContextManager
 from core.events import EventLogger, SessionManager
-from api.database import get_db_session
+from api.database import get_db_session, SessionLocal
 
 
 def main():
@@ -19,7 +19,7 @@ def main():
     session_mgr = SessionManager(db)
     event_logger = EventLogger.from_session(db)
     extractor = KnowledgeExtractor(db)
-    context_mgr = ContextManager(db, embedding_provider="mock")
+    context_mgr = ContextManager(SessionLocal, embedding_provider="mock")
     
     user_id = "alice"
     

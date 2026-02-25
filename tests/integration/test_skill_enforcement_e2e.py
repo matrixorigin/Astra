@@ -150,7 +150,7 @@ class TestExecutorEnforcement:
         registry._skills["github"] = mock_skill
 
         skill_mgr = SkillManager(db_session, cred_mgr)
-        executor = AgentExecutor(db_session, registry, skill_manager=skill_mgr)
+        executor = AgentExecutor(lambda: db_session, registry, skill_manager=skill_mgr)
 
         with pytest.raises(SkillNotInstalledError):
             executor.execute_skill(
@@ -174,7 +174,7 @@ class TestExecutorEnforcement:
         register_builtin_skills(registry, db_session, code_executor=code_executor)
 
         skill_mgr = SkillManager(db_session, cred_mgr)
-        executor = AgentExecutor(db_session, registry, skill_manager=skill_mgr)
+        executor = AgentExecutor(lambda: db_session, registry, skill_manager=skill_mgr)
 
         # execute_code is a builtin skill — should not raise SkillNotInstalledError
         # It may raise other errors (sandbox, runtime, etc.) which are fine

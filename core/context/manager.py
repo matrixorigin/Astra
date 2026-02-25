@@ -14,12 +14,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from core.db_consumer import DbConsumer, DbFactory
 from core.exceptions import ContextError
 from core.logging_config import get_logger
 from skills.knowledge.api import update_access_tracking as _update_access_tracking
 from sqlalchemy import text
-from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 logger = get_logger(__name__)
 
@@ -108,35 +107,35 @@ class Context:
         return "\n".join(parts)
 
 
-class ContextManager:
+class ContextManager(DbConsumer):
     """Orchestrate context selection and assembly."""
 
     def __init__(
-        self, db: Session, embedding_provider: str = "mock", gate_trigger=None,
+        self, db_factory: DbFactory, embedding_provider: str = "mock", gate_trigger=None,
     ):
         """Initialize context manager.
 
         Args:
-            db: Session connection
+            db_factory: Callable returning a new SQLAlchemy Session
             embedding_provider: Embedding provider (openai, mock)
             gate_trigger: GateTrigger for auto-firing regression gate on prompt changes
         """
-        self.db = db
+        super().__init__(db_factory)
 
         # Initialize embedding service
         from core.context.embeddings import EmbeddingService
 
-        self.embeddings = EmbeddingService(db, provider=embedding_provider)
+        self.embeddings = EmbeddingService(db_factory, provider=embedding_provider)
 
         # Initialize prompt manager
         from core.context.prompts import PromptManager
 
-        self.prompts = PromptManager(db, gate_trigger=gate_trigger)
+        self.prompts = PromptManager(db_factory, gate_trigger=gate_trigger)
 
         # Initialize relevance scorer
         from core.context.scorer import RelevanceScorer
 
-        self.scorer = RelevanceScorer(db, self.embeddings)
+        self.scorer = RelevanceScorer(db_factory, self.embeddings)
 
         logger.info(f"ContextManager initialized (embeddings={embedding_provider})")
 
@@ -263,9 +262,10 @@ class ContextManager:
 
         try:
             import json
-            row = self.db.execute(
-                text("SELECT value FROM configs WHERE key_name = 'context_budget_ratios' LIMIT 1"),
-            ).first()
+            with self._db() as db:
+                row = db.execute(
+                    text("SELECT value FROM configs WHERE key_name = 'context_budget_ratios' LIMIT 1"),
+                ).first()
             if row:
                 overrides = json.loads(row[0]) if isinstance(row[0], str) else row[0]
                 self._budget_cache = overrides
@@ -282,12 +282,13 @@ class ContextManager:
 
     def _retrieve_candidates(self, session_id: str, query: str) -> list[dict[str, Any]]:
         """Retrieve candidate events for context (fallback method)."""
-        # Get recent events from current session
         from api.models import Event
-        events = self.db.query(Event).filter(
-            Event.session_id == session_id
-        ).order_by(Event.created_at.desc()).limit(100).all()
+        with self._db() as db:
+            events = db.query(Event).filter(
+                Event.session_id == session_id
+            ).order_by(Event.created_at.desc()).limit(100).all()
 
+        # Safe after session close: Event has only Column() attrs, no lazy relationships.
         return [
             {
                 "event_id": e.event_id,
@@ -317,14 +318,15 @@ class ContextManager:
         query_embedding = self.embeddings.embed_text(query)
         
         # Use hybrid retriever
-        retriever = HybridRetriever(self.db)
-        events = retriever.retrieve_events(
-            query_text=query,
-            query_embedding=query_embedding,
-            session_id=session_id,
-            current_chain_id=current_chain_id,
-            limit=50,  # Get more candidates for scoring
-        )
+        with self._db() as db:
+            retriever = HybridRetriever(db)
+            events = retriever.retrieve_events(
+                query_text=query,
+                query_embedding=query_embedding,
+                session_id=session_id,
+                current_chain_id=current_chain_id,
+                limit=50,  # Get more candidates for scoring
+            )
         
         return events
 
@@ -349,14 +351,15 @@ class ContextManager:
         try:
             from core.context.hybrid_retrieval import HybridRetriever
             query_embedding = self.embeddings.embed_text(query)
-            retriever = HybridRetriever(self.db)
-            results = retriever.retrieve_knowledge(
-                query_text=query,
-                query_embedding=query_embedding,
-                user_id=user_id,
-                limit=limit,
-                confidence_threshold=min_confidence,
-            )
+            with self._db() as db:
+                retriever = HybridRetriever(db)
+                results = retriever.retrieve_knowledge(
+                    query_text=query,
+                    query_embedding=query_embedding,
+                    user_id=user_id,
+                    limit=limit,
+                    confidence_threshold=min_confidence,
+                )
             if results:
                 logger.debug("Hybrid knowledge retrieval: %d entries for: %s", len(results), query[:50])
                 return results
@@ -373,10 +376,11 @@ class ContextManager:
         from api.models import KnowledgeEntry
 
         try:
-            entries = self.db.query(KnowledgeEntry).filter(
-                KnowledgeEntry.user_id == user_id,
-                KnowledgeEntry.confidence >= min_confidence,
-            ).order_by(KnowledgeEntry.confidence.desc()).limit(limit * 2).all()
+            with self._db() as db:
+                entries = db.query(KnowledgeEntry).filter(
+                    KnowledgeEntry.user_id == user_id,
+                    KnowledgeEntry.confidence >= min_confidence,
+                ).order_by(KnowledgeEntry.confidence.desc()).limit(limit * 2).all()
         except Exception as e:
             logger.warning("Keyword knowledge fallback failed: %s", e)
             return []
@@ -408,7 +412,8 @@ class ContextManager:
         top = results[:limit]
 
         if top:
-            _update_access_tracking(self.db, [r["entry_id"] for r in top])
+            with self._db() as db:
+                _update_access_tracking(db, [r["entry_id"] for r in top])
 
         logger.debug("Keyword knowledge fallback: %d entries for: %s", len(top), query[:50])
         return top
@@ -533,9 +538,10 @@ class ContextManager:
         from api.models import SkillRegistry as SkillModel
 
         try:
-            skills = self.db.query(SkillModel).filter(
-                SkillModel.is_active == 1
-            ).all()
+            with self._db() as db:
+                skills = db.query(SkillModel).filter(
+                    SkillModel.is_active == 1
+                ).all()
         except Exception as e:
             logger.warning("Failed to load skill definitions: %s", e)
             return []
@@ -744,14 +750,15 @@ class ContextManager:
         """
         from api.models import ContextSnapshot as SnapshotModel
 
-        row = self.db.query(SnapshotModel).filter(
-            SnapshotModel.context_capture_id == context_capture_id
-        ).first()
+        with self._db() as db:
+            row = db.query(SnapshotModel).filter(
+                SnapshotModel.context_capture_id == context_capture_id
+            ).first()
 
         if not row:
             raise ContextError(f"Context capture not found: {context_capture_id}")
 
-        # JSON fields are already parsed by SQLAlchemy
+        # Safe after session close: ContextSnapshot has only Column() attrs, no lazy relationships.
         skill_definitions = row.skill_definitions or []
         selected_events = row.selected_events or []
         retrieved_events = row.retrieved_events or []

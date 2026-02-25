@@ -216,6 +216,35 @@ def db(db_session):
     return db_session
 
 
+@pytest.fixture
+def db_factory(db_session):
+    """Factory that always returns the same test session.
+
+    close() is no-op'd to prevent DbConsumer._db() from closing the shared
+    test session. A counter tracks factory vs close calls to detect leaks.
+    """
+    original_close = db_session.close
+    call_count = 0
+    close_count = 0
+
+    def _counted_close():
+        nonlocal close_count
+        close_count += 1
+
+    def factory():
+        nonlocal call_count
+        call_count += 1
+        db_session.close = _counted_close
+        return db_session
+
+    yield factory
+
+    db_session.close = original_close
+    assert call_count == close_count, (
+        f"Session leak: factory called {call_count}x but close called {close_count}x"
+    )
+
+
 def make_run_engine_mock_init():
     """Return a mock __init__ for RunEngine that initialises all required attributes.
 

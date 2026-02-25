@@ -191,9 +191,10 @@ class ReplayService:
         """
         # Initialize ToolMockingLayer
         execution_mode = MockMode.REPLAY if mock_mode else MockMode.PRODUCTION
+        from api.database import SessionLocal
         mocker = ToolMockingLayer(
             mode=execution_mode,
-            session=self.db_session,
+            db_factory=SessionLocal,
             session_id=event.session_id if mock_mode else None
         )
 

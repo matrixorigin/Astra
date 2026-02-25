@@ -168,7 +168,10 @@ class SkillPipeline:
         if embed_fn is None:
             try:
                 from core.context.embeddings import EmbeddingService
-                _svc = EmbeddingService(db)
+                # Phase 2 bridge: SkillPipeline holds a raw session;
+                # EmbeddingService needs a factory.
+                from api.database import SessionLocal
+                _svc = EmbeddingService(SessionLocal)
                 if _svc.provider != "mock":
                     embed_fn = _svc.embed_text
             except Exception:  # noqa: BLE001

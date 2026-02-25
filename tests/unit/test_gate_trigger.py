@@ -233,7 +233,7 @@ class TestPromptManagerIntegration:
 
         db = Mock()
         gate_trigger = Mock()
-        pm = PromptManager(db=db, gate_trigger=gate_trigger)
+        pm = PromptManager(lambda: db, gate_trigger=gate_trigger)
 
         pm.register_prompt("system_prompt", "v2", "You are helpful.", is_active=True)
 
@@ -248,7 +248,7 @@ class TestPromptManagerIntegration:
 
         db = Mock()
         gate_trigger = Mock()
-        pm = PromptManager(db=db, gate_trigger=gate_trigger)
+        pm = PromptManager(lambda: db, gate_trigger=gate_trigger)
 
         pm.register_prompt("system_prompt", "v2", "You are helpful.", is_active=False)
 
@@ -258,7 +258,7 @@ class TestPromptManagerIntegration:
         from core.context.prompts import PromptManager
 
         db = Mock()
-        pm = PromptManager(db=db)  # no gate_trigger
+        pm = PromptManager(lambda: db)  # no gate_trigger
 
         pm.register_prompt("system_prompt", "v2", "content", is_active=True)
         # must not raise
@@ -268,7 +268,7 @@ class TestPromptManagerIntegration:
         from unittest.mock import call
 
         db = Mock()
-        pm = PromptManager(db=db)
+        pm = PromptManager(lambda: db)
 
         # Current active version
         current = Mock()
@@ -293,7 +293,7 @@ class TestPromptManagerIntegration:
         from core.context.prompts import PromptManager
 
         db = Mock()
-        pm = PromptManager(db=db)
+        pm = PromptManager(lambda: db)
 
         current = Mock()
         current.version = "v1"

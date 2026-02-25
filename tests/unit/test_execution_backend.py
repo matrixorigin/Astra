@@ -247,7 +247,7 @@ class TestExecuteHeavyweightSync:
         db = MagicMock()
         registry = MagicMock()
         with patch("core.skills.mocking.ToolMockingLayer.__init__", return_value=None):
-            executor = AgentExecutor(db=db, registry=registry, mode=MockMode.PRODUCTION)
+            executor = AgentExecutor(db_factory=lambda: db, registry=registry, mode=MockMode.PRODUCTION)
         executor._record_execution_metrics = MagicMock()
         return executor
 

@@ -152,7 +152,7 @@ def _build_chat_loop(db_factory):
         db=db,
     )
     register_builtin_skills(skill_registry, db, code_executor=code_executor)
-    context_manager = ContextManager(db, gate_trigger=gate_trigger)
+    context_manager = ContextManager(db_factory, gate_trigger=gate_trigger)
     # SkillPipeline holds DB session reference internally for audit/learning writes.
     # Must create fresh instance per-request to avoid stale session issues.
     selector = SkillPipeline(db, llm_client, audit=True, learning=True)
@@ -162,7 +162,7 @@ def _build_chat_loop(db_factory):
     from core.skills.credential_manager import CredentialManager
     from core.skills.skill_manager import SkillManager
     skill_mgr = SkillManager(db, CredentialManager(get_settings().secret_key))
-    executor = AgentExecutor(db, skill_registry, skill_manager=skill_mgr)
+    executor = AgentExecutor(db_factory, skill_registry, skill_manager=skill_mgr)
 
     firewall = HallucinationFirewall(db, context_manager)
 
@@ -604,8 +604,9 @@ def _persist_turn_events(
         # Context snapshot + decision audit
         if parent_event_id:
             try:
+                from api.database import SessionLocal
                 from core.context.manager import ContextManager
-                ctx_mgr = ContextManager(db)
+                ctx_mgr = ContextManager(SessionLocal)
                 ctx = ctx_mgr.build_context(session_id=session_id, query=user_content or "")
                 context_capture_id = ctx_mgr.save_snapshot(ctx, session_id, parent_event_id)
             except Exception as e:

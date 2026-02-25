@@ -170,7 +170,7 @@ def setup_recorded_result(db, session_id):
 
 def test_production_mode_executes_skill(db, session_id):
     """Production mode executes skill normally"""
-    mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db)
+    mock_layer = ToolMockingLayer(MockMode.PRODUCTION, lambda: db)
     skill = ReadSkill()
 
     params = {"user_id": "test", "session_id": session_id, "query": "test"}
@@ -188,7 +188,7 @@ def test_replay_mode_uses_recorded_result(db, session_id, setup_recorded_result)
     setup_recorded_result("test_write_skill", params, recorded_result)
 
     # Create mock layer in replay mode
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, lambda: db, session_id=session_id)
     skill = WriteSkill()
 
     # Mock the execute method to track if it's called
@@ -204,7 +204,7 @@ def test_replay_mode_uses_recorded_result(db, session_id, setup_recorded_result)
 
 def test_replay_mode_blocks_destructive_operations(db, session_id):
     """Replay mode blocks destructive operations"""
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, lambda: db, session_id=session_id)
     skill = DestructiveSkill()
 
     params = {"user_id": "test", "session_id": session_id}
@@ -215,7 +215,7 @@ def test_replay_mode_blocks_destructive_operations(db, session_id):
 
 def test_replay_mode_fallback_for_read_operations(db, session_id):
     """Replay mode allows READ operations to execute (fallback)"""
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, lambda: db, session_id=session_id)
     skill = ReadSkill()
 
     params = {"user_id": "test", "session_id": session_id, "query": "test"}
@@ -228,7 +228,7 @@ def test_replay_mode_fallback_for_read_operations(db, session_id):
 
 def test_replay_mode_fallback_when_no_recorded_result(db, session_id):
     """Replay mode falls back to execution when no recorded result found"""
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, lambda: db, session_id=session_id)
     skill = WriteSkill()
 
     params = {"user_id": "test", "session_id": session_id}
@@ -247,7 +247,7 @@ def test_params_hash_matching(db, session_id, setup_recorded_result):
     recorded_result = {"success": True, "result": "Recorded", "error": None}
     setup_recorded_result("test_write_skill", params1, recorded_result)
 
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, lambda: db, session_id=session_id)
     skill = WriteSkill()
 
     # Same params should match
@@ -268,7 +268,7 @@ def test_dangerous_fallback_warning(db, session_id, caplog):
 
     caplog.set_level(logging.WARNING)
 
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, lambda: db, session_id=session_id)
     skill = WriteSkill()
 
     params = {"user_id": "test", "session_id": session_id}
@@ -287,7 +287,7 @@ def test_concurrency_warning_without_parent_event_id(db, session_id, caplog):
 
     caplog.set_level(logging.WARNING)
 
-    mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
+    mock_layer = ToolMockingLayer(MockMode.REPLAY, lambda: db, session_id=session_id)
     skill = WriteSkill()
 
     params = {"user_id": "test", "session_id": session_id}
@@ -304,7 +304,7 @@ def test_params_hash_consistency(db):
     """Params hash is consistent across different dict orderings"""
     from core.skills.mocking import ToolMockingLayer
 
-    mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db)
+    mock_layer = ToolMockingLayer(MockMode.PRODUCTION, lambda: db)
 
     # Same params, different order
     params1 = {"a": 1, "b": 2, "c": 3}
@@ -328,7 +328,7 @@ def test_params_hash_consistency(db):
     assert hash_nested1 == hash_nested2
 
 
-def test_record_result_uses_parent_event_id(db, session_id):
+def test_record_result_uses_parent_event_id(db, db_factory, session_id):
     """_record_result should prefer parent_event_id over session-wide desc() lookup."""
     import logging
     from api.models import Event
@@ -352,7 +352,7 @@ def test_record_result_uses_parent_event_id(db, session_id):
     db.commit()
 
     try:
-        mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db)
+        mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db_factory)
         mock_layer._record_result(
             "test_read_skill", {"q": "x"}, {"data": "ok"},
             session_id, parent_event_id=parent_id,
@@ -369,14 +369,14 @@ def test_record_result_warns_without_parent_event_id(db, session_id, caplog):
     import logging
     caplog.set_level(logging.WARNING)
 
-    mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db)
+    mock_layer = ToolMockingLayer(MockMode.PRODUCTION, lambda: db)
     mock_layer._record_result(
         "nonexistent_skill", {}, {}, session_id, parent_event_id=None,
     )
     assert any("not concurrency-safe" in r.message for r in caplog.records)
 
 
-def test_record_result_stores_skill_version(db, session_id):
+def test_record_result_stores_skill_version(db, db_factory, session_id):
     """_record_result should persist skill_version in metadata."""
     from api.models import Event
     from datetime import datetime, timezone
@@ -398,7 +398,7 @@ def test_record_result_stores_skill_version(db, session_id):
     db.commit()
 
     try:
-        mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db)
+        mock_layer = ToolMockingLayer(MockMode.PRODUCTION, db_factory)
         mock_layer._record_result(
             "test_read_skill", {}, {"data": "v"}, session_id,
             parent_event_id=None, event_id_override=eid, skill_version="2.1.0",
@@ -445,7 +445,7 @@ def test_get_recorded_result_warns_version_mismatch(db, session_id, caplog):
     db.commit()
 
     try:
-        mock_layer = ToolMockingLayer(MockMode.REPLAY, db, session_id=session_id)
+        mock_layer = ToolMockingLayer(MockMode.REPLAY, lambda: db, session_id=session_id)
         result = mock_layer._get_recorded_result(
             "test_read_skill", params, session_id,
             parent_event_id=None, expected_version="2.0.0",

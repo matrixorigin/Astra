@@ -27,7 +27,7 @@ def firewall(db_session):
     """Hallucination firewall fixture."""
     from core.context.manager import ContextManager
     
-    context_manager = ContextManager(db_session)
+    context_manager = ContextManager(lambda: db_session)
     return HallucinationFirewall(db_session, context_manager)
 
 

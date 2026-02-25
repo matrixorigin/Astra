@@ -72,7 +72,7 @@ def test_update_access_tracking_increments(db_session):
     assert entry.access_count == 2
 
 
-def test_context_manager_retrieval_updates_access(db_session):
+def test_context_manager_retrieval_updates_access(db_session, db_factory):
     """ContextManager.retrieve_semantic_knowledge updates access tracking."""
     uid = f"cm_access_{uuid7()}"
     entry = _make_entry(db_session, user_id=uid, key_name="language", value="python")
@@ -80,7 +80,7 @@ def test_context_manager_retrieval_updates_access(db_session):
 
     from core.context.manager import ContextManager
     mgr = ContextManager.__new__(ContextManager)
-    mgr.db = db_session
+    mgr._db_factory = db_factory
 
     results = mgr.retrieve_semantic_knowledge(uid, "python")
     assert len(results) >= 1

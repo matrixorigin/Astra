@@ -140,7 +140,7 @@ class TestGateTriggerProductionWiring:
         from core.context.manager import ContextManager
 
         gate_trigger = Mock()
-        cm = ContextManager(db=db_session, gate_trigger=gate_trigger)
+        cm = ContextManager(lambda: db_session, gate_trigger=gate_trigger)
 
         # register_prompt on the inner PromptManager
         cm.prompts.register_prompt(
@@ -572,7 +572,7 @@ class TestContextManagerGateTriggerPassthrough:
         from core.context.manager import ContextManager
 
         sentinel = object()
-        cm = ContextManager(db=db_session, gate_trigger=sentinel)
+        cm = ContextManager(lambda: db_session, gate_trigger=sentinel)
 
         assert cm.prompts.gate_trigger is sentinel
 
@@ -580,7 +580,7 @@ class TestContextManagerGateTriggerPassthrough:
         """ContextManager() → PromptManager.gate_trigger is None."""
         from core.context.manager import ContextManager
 
-        cm = ContextManager(db=db_session)
+        cm = ContextManager(lambda: db_session)
         assert cm.prompts.gate_trigger is None
 
     def test_prompt_change_through_context_manager_fires_gate(self, db_session):
@@ -588,7 +588,7 @@ class TestContextManagerGateTriggerPassthrough:
         from core.context.manager import ContextManager
 
         gate_trigger = Mock()
-        cm = ContextManager(db=db_session, gate_trigger=gate_trigger)
+        cm = ContextManager(lambda: db_session, gate_trigger=gate_trigger)
 
         cm.prompts.register_prompt("chain_test", "v1", "Hello", is_active=True)
         cm.prompts.register_prompt("chain_test", "v2", "Hello v2", is_active=True)
@@ -884,12 +884,12 @@ class TestChatAPIGateTriggerE2E:
             mock_llm.chat_with_tools.return_value = {"content": "test"}
 
             registry = SkillRegistry(db, gate_trigger=gt)
-            context_manager = ContextManager(db, gate_trigger=gt)
+            context_manager = ContextManager(lambda: db, gate_trigger=gt)
             captured["registry_has_gate"] = registry.gate_trigger is gt
             captured["prompts_has_gate"] = context_manager.prompts.gate_trigger is gt
 
             selector = SkillPipeline(db, mock_llm, audit=True, learning=True)
-            executor = AgentExecutor(db, registry)
+            executor = AgentExecutor(lambda: db, registry)
             firewall = HallucinationFirewall(db, context_manager)
 
             return ChatLoop(

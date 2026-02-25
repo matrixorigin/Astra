@@ -110,15 +110,16 @@ class TestSessionInjection:
         selector = SelfImprovingSelector(session=mock_session)
         assert selector.session is mock_session
 
-    def test_tool_mocking_layer_requires_session(self):
-        """Test ToolMockingLayer requires session parameter."""
-        with pytest.raises(TypeError, match="session must be a SQLAlchemy Session"):
-            ToolMockingLayer(MockMode.PRODUCTION, session=None)
-        
-        # Should work with proper session
-        mock_session = Mock(spec=Session)
-        layer = ToolMockingLayer(MockMode.PRODUCTION, session=mock_session)
-        assert layer.session is mock_session
+    def test_tool_mocking_layer_accepts_factory(self):
+        """Test ToolMockingLayer validates db_factory is callable."""
+        mock_factory = Mock()
+        layer = ToolMockingLayer(MockMode.PRODUCTION, db_factory=mock_factory)
+        assert layer._db_factory is mock_factory
+
+    def test_tool_mocking_layer_rejects_non_callable(self):
+        """Test ToolMockingLayer rejects non-callable db_factory."""
+        with pytest.raises(TypeError, match="db_factory must be callable"):
+            ToolMockingLayer(MockMode.PRODUCTION, db_factory="not_callable")
 
     def test_semantic_diff_requires_session(self):
         """Test SemanticDiff requires session parameter."""
@@ -199,7 +200,7 @@ class TestNoSessionCreation:
             Sandbox(db=mock_session),
             SkillRegistry(session=mock_session),
             ModernSkillSelector(session=mock_session),
-            ToolMockingLayer(MockMode.PRODUCTION, session=mock_session),
+            ToolMockingLayer(MockMode.PRODUCTION, db_factory=lambda: mock_session),
             SemanticDiff(db=mock_session),
         ]
         
@@ -239,7 +240,7 @@ class TestSessionLifecycle:
             EventLogger.from_session(mock_session),
             SkillRegistry(session=mock_session),
             ModernSkillSelector(session=mock_session),
-            ToolMockingLayer(MockMode.PRODUCTION, session=mock_session),
+            ToolMockingLayer(MockMode.PRODUCTION, db_factory=lambda: mock_session),
             SemanticDiff(db=mock_session),
         ]
         

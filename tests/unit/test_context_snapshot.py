@@ -20,7 +20,7 @@ def context_manager(mock_db):
     with patch("core.context.embeddings.EmbeddingService"):
         with patch("core.context.prompts.PromptManager"):
             with patch("core.context.scorer.RelevanceScorer"):
-                cm = ContextManager(db=mock_db)
+                cm = ContextManager(lambda: mock_db)
                 yield cm
 
 

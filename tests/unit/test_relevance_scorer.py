@@ -50,10 +50,10 @@ def test_scorer_initialization(db):
     """Test scorer initialization."""
     from core.context.embeddings import EmbeddingService
 
-    embeddings = EmbeddingService(db, provider="mock")
-    scorer = RelevanceScorer(db, embeddings)
+    embeddings = EmbeddingService(lambda: db, provider="mock")
+    scorer = RelevanceScorer(lambda: db, embeddings)
 
-    assert scorer.db is not None
+    assert scorer._db_factory is not None
     assert scorer.embeddings is not None
     assert scorer.weights is not None
 
@@ -62,11 +62,11 @@ def test_scorer_with_custom_weights(db):
     """Test scorer with custom weights."""
     from core.context.embeddings import EmbeddingService
 
-    embeddings = EmbeddingService(db, provider="mock")
+    embeddings = EmbeddingService(lambda: db, provider="mock")
 
     custom_weights = ScoringWeights(semantic=0.5, temporal=0.1, causal=0.3, keyword=0.1)
 
-    scorer = RelevanceScorer(db, embeddings, weights=custom_weights)
+    scorer = RelevanceScorer(lambda: db, embeddings, weights=custom_weights)
     assert scorer.weights.semantic == 0.5
     assert scorer.weights.temporal == 0.1
 
@@ -115,8 +115,8 @@ def test_score_candidates_basic(db, event_logger):
     ]
 
     # Score candidates
-    embeddings = EmbeddingService(db, provider="mock")
-    scorer = RelevanceScorer(db, embeddings)
+    embeddings = EmbeddingService(lambda: db, provider="mock")
+    scorer = RelevanceScorer(lambda: db, embeddings)
 
     scored = scorer.score_candidates("Python", candidates, session_id, TaskType.GENERAL)
 
@@ -162,8 +162,8 @@ def test_task_specific_scoring(db, event_logger):
         for e in events
     ]
 
-    embeddings = EmbeddingService(db, provider="mock")
-    scorer = RelevanceScorer(db, embeddings)
+    embeddings = EmbeddingService(lambda: db, provider="mock")
+    scorer = RelevanceScorer(lambda: db, embeddings)
 
     # Score with different task types
     general_scored = scorer.score_candidates("code", candidates, session_id, TaskType.GENERAL)
@@ -185,11 +185,11 @@ def test_create_scorer_for_task(db):
     """Test factory function for task-specific scorers."""
     from core.context.embeddings import EmbeddingService
 
-    embeddings = EmbeddingService(db, provider="mock")
+    embeddings = EmbeddingService(lambda: db, provider="mock")
 
     # Create scorers for different tasks
-    code_scorer = create_scorer_for_task(db, embeddings, TaskType.CODE_REVIEW)
-    planning_scorer = create_scorer_for_task(db, embeddings, TaskType.PLANNING)
+    code_scorer = create_scorer_for_task(lambda: db, embeddings, TaskType.CODE_REVIEW)
+    planning_scorer = create_scorer_for_task(lambda: db, embeddings, TaskType.PLANNING)
 
     # Verify they have different weights
     assert code_scorer.weights.semantic != planning_scorer.weights.semantic
@@ -222,8 +222,8 @@ def test_scorer_empty_query(db, event_logger):
         for e in events
     ]
 
-    embeddings = EmbeddingService(db, provider="mock")
-    scorer = RelevanceScorer(db, embeddings)
+    embeddings = EmbeddingService(lambda: db, provider="mock")
+    scorer = RelevanceScorer(lambda: db, embeddings)
 
     # Empty query
     scored = scorer.score_candidates("", candidates, session_id, TaskType.GENERAL)
@@ -237,8 +237,8 @@ def test_scorer_empty_candidates(db):
     """Test scorer with no candidates."""
     from core.context.embeddings import EmbeddingService
 
-    embeddings = EmbeddingService(db, provider="mock")
-    scorer = RelevanceScorer(db, embeddings)
+    embeddings = EmbeddingService(lambda: db, provider="mock")
+    scorer = RelevanceScorer(lambda: db, embeddings)
 
     scored = scorer.score_candidates("test query", [], "session_123", TaskType.GENERAL)
 
@@ -272,8 +272,8 @@ def test_scorer_empty_session_id(db, event_logger):
         for e in events
     ]
 
-    embeddings = EmbeddingService(db, provider="mock")
-    scorer = RelevanceScorer(db, embeddings)
+    embeddings = EmbeddingService(lambda: db, provider="mock")
+    scorer = RelevanceScorer(lambda: db, embeddings)
 
     # Empty session_id
     scored = scorer.score_candidates("test", candidates, "", TaskType.GENERAL)
@@ -310,8 +310,8 @@ def test_signal_breakdown(db, event_logger):
         for e in events
     ]
 
-    embeddings = EmbeddingService(db, provider="mock")
-    scorer = RelevanceScorer(db, embeddings)
+    embeddings = EmbeddingService(lambda: db, provider="mock")
+    scorer = RelevanceScorer(lambda: db, embeddings)
 
     scored = scorer.score_candidates("keyword", candidates, session_id, TaskType.GENERAL)
 

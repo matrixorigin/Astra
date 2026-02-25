@@ -5,6 +5,9 @@ from typing import Callable, Iterator
 
 from sqlalchemy.orm import Session
 
+# Canonical type alias — use everywhere instead of bare ``Callable``.
+DbFactory = Callable[[], Session]
+
 
 class DbConsumer:
     """Base for components that acquire DB sessions on demand.

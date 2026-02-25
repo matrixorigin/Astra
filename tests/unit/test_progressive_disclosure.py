@@ -437,7 +437,7 @@ class TestEmbeddingQuality:
         from core.context.embeddings import EmbeddingService
         
         # Use mock embedding service (simple bag-of-words)
-        embed_service = EmbeddingService(db=db, provider="mock")
+        embed_service = EmbeddingService(lambda: db, provider="mock")
         embed_fn = lambda text: embed_service.embed_text(text)
         
         # Create skills with distinct semantic content
@@ -497,7 +497,7 @@ class TestEmbeddingQuality:
         """Verify semantic retrieval finds skills even with different wording."""
         from core.context.embeddings import EmbeddingService
         
-        embed_service = EmbeddingService(db=db, provider="mock")
+        embed_service = EmbeddingService(lambda: db, provider="mock")
         embed_fn = lambda text: embed_service.embed_text(text)
         
         code_review = _make_skill(

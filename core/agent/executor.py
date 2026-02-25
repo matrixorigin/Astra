@@ -3,11 +3,10 @@
 import time
 from typing import Any, TYPE_CHECKING
 
+from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
 from core.skills.mocking import MockMode, ToolMockingLayer
 from core.skills.registry import SkillRegistry
-from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 if TYPE_CHECKING:
     from core.skills.pipeline import SkillPipeline
@@ -16,21 +15,21 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-class AgentExecutor:
+class AgentExecutor(DbConsumer):
     """Executes skills safely using the ToolMockingLayer."""
 
     def __init__(
         self,
-        db: Session,
+        db_factory: DbFactory,
         registry: SkillRegistry,
         mode: MockMode = MockMode.PRODUCTION,
         pipeline: "SkillPipeline | None" = None,
         skill_manager: "SkillManager | None" = None,
     ):
-        self.db = db
+        super().__init__(db_factory)
         self.registry = registry
         self.mode = mode
-        self.mock_layer = ToolMockingLayer(mode, db)
+        self.mock_layer = ToolMockingLayer(mode, db_factory)
         self._pipeline = pipeline
         self._skill_manager = skill_manager
 
@@ -193,16 +192,16 @@ class AgentExecutor:
         """Update skill_selection_events with post-execution metrics."""
         try:
             from sqlalchemy import text
-            self.db.execute(
-                text("""UPDATE skill_selection_events
-                        SET execution_time_ms = :t, execution_cost = :c, execution_success = :s
-                        WHERE event_id = :eid"""),
-                {"t": time_ms, "c": cost, "s": 1 if success else 0, "eid": event_id},
-            )
-            self.db.commit()
+            with self._db() as db:
+                db.execute(
+                    text("""UPDATE skill_selection_events
+                            SET execution_time_ms = :t, execution_cost = :c, execution_success = :s
+                            WHERE event_id = :eid"""),
+                    {"t": time_ms, "c": cost, "s": 1 if success else 0, "eid": event_id},
+                )
+                db.commit()
         except Exception as e:
             logger.debug("backfill selection event failed: %s", e)
-            self.db.rollback()
 
     def _record_execution_metrics(
         self,
@@ -232,8 +231,9 @@ class AgentExecutor:
                 error_message=error_msg,
                 created_at=datetime.now(timezone.utc),
             )
-            self.db.add(metric)
-            self.db.commit()
+            with self._db() as db:
+                db.add(metric)
+                db.commit()
             
             logger.debug(
                 f"Recorded metrics for {skill_name}: "
@@ -241,8 +241,6 @@ class AgentExecutor:
             )
         except Exception as e:
             logger.error(f"Failed to record execution metrics: {e}")
-            # Don't fail the execution if metrics recording fails
-            self.db.rollback()
     
     async def execute_skill_stream(
         self,

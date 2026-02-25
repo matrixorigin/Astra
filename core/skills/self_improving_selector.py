@@ -516,7 +516,10 @@ class SelfImprovingSelector:
         try:
             if self.embedding_service is None:
                 try:
-                    self.embedding_service = EmbeddingService(self.session)
+                    # Phase 2 bridge: SelfImprovingSelector holds a raw session;
+                    # EmbeddingService needs a factory.
+                    from api.database import SessionLocal
+                    self.embedding_service = EmbeddingService(SessionLocal)
                 except Exception as exc:
                     logger.warning(f"Embedding service init failed: {exc}")
                     return None

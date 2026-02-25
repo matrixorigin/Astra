@@ -56,7 +56,7 @@ def test_retrieval_storage_and_replay():
     print(f"✓ Created 3 events in session {session_id[:8]}")
     
     # Build context (will retrieve and store results)
-    ctx_mgr = ContextManager(db, embedding_provider="mock")
+    ctx_mgr = ContextManager(lambda: db, embedding_provider="mock")
     
     # Manually create retrieved_events (simulating retrieval)
     retrieved_events = [

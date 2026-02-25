@@ -74,7 +74,7 @@ def test_confidence_decay(db_session):
 
 def test_semantic_retrieval(db_session):
     """Test semantic knowledge retrieval."""
-    context_mgr = ContextManager(db_session, embedding_provider="mock")
+    context_mgr = ContextManager(lambda: db_session, embedding_provider="mock")
     user_id = "test_user"
     
     # Create knowledge entries

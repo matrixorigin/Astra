@@ -11,8 +11,8 @@ import logging
 from enum import Enum
 from typing import Any, Protocol
 
-from sqlalchemy.orm import Session
 
+from core.db_consumer import DbConsumer, DbFactory
 from core.skills.base import SideEffectCategory, Skill
 
 logger = logging.getLogger(__name__)
@@ -56,13 +56,13 @@ class ResultStorage(Protocol):
         ...
 
 
-class ToolMockingLayer:
+class ToolMockingLayer(DbConsumer):
     """Intercepts skill executions for safe replay"""
 
     def __init__(
         self,
         mode: MockMode,
-        session: Session,
+        db_factory: DbFactory,
         result_storage: ResultStorage | None = None,
         session_id: str | None = None,
     ):
@@ -70,15 +70,12 @@ class ToolMockingLayer:
 
         Args:
             mode: Execution mode
-            session: SQLAlchemy session (required)
+            db_factory: Callable returning a new SQLAlchemy Session
             result_storage: Optional result storage
             session_id: Session ID (required for replay)
         """
-        if not isinstance(session, Session):
-            raise TypeError("session must be a SQLAlchemy Session")
-        
+        super().__init__(db_factory)
         self.mode = mode
-        self.session = session
         self.result_storage = result_storage
         self.session_id = session_id
             
@@ -250,53 +247,43 @@ class ToolMockingLayer:
             
             # Compute params hash for matching
             params_hash = self._hash_params(params)
-            session = self.session
-
-            if parent_event_id:
-                # Exact lookup by parent event ID (concurrency-safe)
-                # Assumes tool_result event has parent_event_id pointing to invocation event
-                event = session.query(EventModel).filter(
-                    EventModel.parent_event_id == parent_event_id,
-                    EventModel.skill_name == skill_name,
-                    EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
-                ).first()
-            else:
-                # Fuzzy lookup: most recent matching event in session
-                logger.warning(
-                    f"Using fuzzy lookup for {skill_name} without parent_event_id. "
-                    f"This is not concurrency-safe. "
-                    f"Pass parent_event_id from the tool_call event for deterministic lookups."
-                )
-                event = session.query(EventModel).filter(
-                    EventModel.session_id == session_id,
-                    EventModel.skill_name == skill_name,
-                    EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
-                ).order_by(EventModel.created_at.desc()).first()
-
-            if event and event.event_metadata:
-                metadata = event.event_metadata
-
-                # Verify params match (optional, for safety)
-                recorded_hash = metadata.get("skill_params_hash")
-                if recorded_hash and recorded_hash != params_hash:
+            with self._db() as session:
+                if parent_event_id:
+                    event = session.query(EventModel).filter(
+                        EventModel.parent_event_id == parent_event_id,
+                        EventModel.skill_name == skill_name,
+                        EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
+                    ).first()
+                else:
                     logger.warning(
-                        f"Params hash mismatch for {skill_name}: "
-                        f"expected {params_hash}, got {recorded_hash}"
+                        f"Using fuzzy lookup for {skill_name} without parent_event_id. "
+                        f"This is not concurrency-safe. "
+                        f"Pass parent_event_id from the tool_call event for deterministic lookups."
                     )
-                    return None
+                    event = session.query(EventModel).filter(
+                        EventModel.session_id == session_id,
+                        EventModel.skill_name == skill_name,
+                        EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
+                    ).order_by(EventModel.created_at.desc()).first()
 
-                # Warn on version mismatch (result may be stale)
-                recorded_version = metadata.get("skill_version")
-                if expected_version and recorded_version and recorded_version != expected_version:
-                    logger.warning(
-                        f"Skill version mismatch for {skill_name}: "
-                        f"recorded={recorded_version}, current={expected_version}. "
-                        f"Result may be stale."
-                    )
-
-                return metadata.get("skill_result")
-
-            return None
+                if event and event.event_metadata:
+                    metadata = event.event_metadata
+                    recorded_hash = metadata.get("skill_params_hash")
+                    if recorded_hash and recorded_hash != params_hash:
+                        logger.warning(
+                            f"Params hash mismatch for {skill_name}: "
+                            f"expected {params_hash}, got {recorded_hash}"
+                        )
+                        return None
+                    recorded_version = metadata.get("skill_version")
+                    if expected_version and recorded_version and recorded_version != expected_version:
+                        logger.warning(
+                            f"Skill version mismatch for {skill_name}: "
+                            f"recorded={recorded_version}, current={expected_version}. "
+                            f"Result may be stale."
+                        )
+                    return metadata.get("skill_result")
+                return None
 
         except Exception as e:
             logger.error(f"Failed to get recorded result for {skill_name}: {e}")
@@ -327,16 +314,16 @@ class ToolMockingLayer:
             return {}
         
         from api.models import Event as EventModel
-        session = self.session
-        events = session.query(EventModel).filter(
-            EventModel.session_id == self.session_id,
-            EventModel.skill_result.isnot(None)
-        ).all()
-        
-        results = {}
-        for event in events:
-            key = self._make_key(event.skill_name, event.event_metadata.get("skill_params", {}))
-            results[key] = event.skill_result
+        with self._db() as session:
+            events = session.query(EventModel).filter(
+                EventModel.session_id == self.session_id,
+                EventModel.skill_result.isnot(None)
+            ).all()
+            
+            results = {}
+            for event in events:
+                key = self._make_key(event.skill_name, event.event_metadata.get("skill_params", {}))
+                results[key] = event.skill_result
         return results
 
     def _make_key(self, skill_name: str, params: dict) -> str:
@@ -404,43 +391,37 @@ class ToolMockingLayer:
             # Update event
             from api.models import Event as EventModel
             
-            session = self.session
-            query = session.query(EventModel)
-            
-            if event_id_override:
-                query = query.filter(EventModel.event_id == event_id_override)
-            elif parent_event_id:
-                # Concurrency-safe: locate by parent event chain
-                query = query.filter(
-                    EventModel.parent_event_id == parent_event_id,
-                    EventModel.skill_name == skill_name,
-                    EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
-                )
-            else:
-                # Fallback: most recent matching event in session (not concurrency-safe)
-                logger.warning(
-                    f"Recording result for {skill_name} without event_id_override or "
-                    f"parent_event_id — not concurrency-safe. "
-                    f"Pass parent_event_id from the tool_call event for safe lookups."
-                )
-                query = query.filter(
-                    EventModel.session_id == session_id,
-                    EventModel.skill_name == skill_name,
-                    EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
-                ).order_by(EventModel.created_at.desc())
-            
-            event = query.first()
-            
-            if event:
-                # Merge with existing metadata if present
-                existing_metadata = event.event_metadata or {}
-                existing_metadata.update(metadata)
-                event.event_metadata = existing_metadata
+            with self._db() as session:
+                query = session.query(EventModel)
                 
-                # Also update columns for easier access
-                event.skill_result = result_data
+                if event_id_override:
+                    query = query.filter(EventModel.event_id == event_id_override)
+                elif parent_event_id:
+                    query = query.filter(
+                        EventModel.parent_event_id == parent_event_id,
+                        EventModel.skill_name == skill_name,
+                        EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
+                    )
+                else:
+                    logger.warning(
+                        f"Recording result for {skill_name} without event_id_override or "
+                        f"parent_event_id — not concurrency-safe. "
+                        f"Pass parent_event_id from the tool_call event for safe lookups."
+                    )
+                    query = query.filter(
+                        EventModel.session_id == session_id,
+                        EventModel.skill_name == skill_name,
+                        EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
+                    ).order_by(EventModel.created_at.desc())
                 
-                session.commit()
+                event = query.first()
+                
+                if event:
+                    existing_metadata = event.event_metadata or {}
+                    existing_metadata.update(metadata)
+                    event.event_metadata = existing_metadata
+                    event.skill_result = result_data
+                    session.commit()
 
             logger.debug(f"Recorded result for {skill_name} in session {session_id}")
 

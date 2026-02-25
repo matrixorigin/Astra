@@ -182,7 +182,11 @@ class ImplicitFeedbackMiner:
         results = self.analyze_batch(session_id=session_id)
         count = 0
         from core.context.prompts import PromptFeedback
-        pf = PromptFeedback(self.db)
+        # Phase 2 bridge: ImplicitFeedbackMiner holds a raw session;
+        # PromptFeedback needs a factory.  Import the real factory so
+        # _db() can safely close its own sessions.
+        from api.database import SessionLocal
+        pf = PromptFeedback(SessionLocal)
         for r in results:
             try:
                 pf.record_feedback(

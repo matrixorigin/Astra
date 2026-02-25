@@ -22,7 +22,7 @@ def db(request):
 
 def test_mock_embedding_deterministic(db):
     """Test mock embeddings are deterministic."""
-    service = EmbeddingService(db, provider="mock")
+    service = EmbeddingService(lambda: db, provider="mock")
 
     text = "Hello world"
     emb1 = service.embed_text(text)
@@ -34,7 +34,7 @@ def test_mock_embedding_deterministic(db):
 
 def test_mock_embedding_different_texts(db):
     """Test different texts produce different embeddings."""
-    service = EmbeddingService(db, provider="mock")
+    service = EmbeddingService(lambda: db, provider="mock")
 
     emb1 = service.embed_text("Hello world")
     emb2 = service.embed_text("Goodbye world")
@@ -42,9 +42,9 @@ def test_mock_embedding_different_texts(db):
     assert emb1 != emb2
 
 
-def test_store_and_retrieve_embedding(db):
+def test_store_and_retrieve_embedding(db, db_factory):
     """Test storing and retrieving embeddings."""
-    service = EmbeddingService(db, provider="mock")
+    service = EmbeddingService(db_factory, provider="mock")
 
     event_id = "test_event_001"
     text = "Test content"
@@ -69,18 +69,16 @@ def test_store_and_retrieve_embedding(db):
     assert metadata["test"] is True
 
 
-def test_cosine_similarity(db):
+def test_cosine_similarity(db, db_factory):
     """Test L2 distance calculation."""
-    service = EmbeddingService(db, provider="mock")
+    service = EmbeddingService(db_factory, provider="mock")
 
     from uuid import uuid4
-    from api.database import get_db_session
     from api.repositories.session_repository import SessionRepository
     from api.repositories.event_repository import EventRepository
 
-    db_session = next(get_db_session())
-    session_repo = SessionRepository(db_session)
-    event_repo = EventRepository(db_session)
+    session_repo = SessionRepository(db)
+    event_repo = EventRepository(db)
 
     user_id = str(uuid4())
     session_id = str(uuid4())
@@ -128,18 +126,16 @@ def test_cosine_similarity(db):
     assert results[0]["distance"] < 0.001  # Nearly identical
 
 
-def test_search_similar(db):
+def test_search_similar(db, db_factory):
     """Test semantic search using L2_DISTANCE."""
-    service = EmbeddingService(db, provider="mock")
+    service = EmbeddingService(db_factory, provider="mock")
 
     from uuid import uuid4
-    from api.database import get_db_session
     from api.repositories.session_repository import SessionRepository
     from api.repositories.event_repository import EventRepository
 
-    db_session = next(get_db_session())
-    session_repo = SessionRepository(db_session)
-    event_repo = EventRepository(db_session)
+    session_repo = SessionRepository(db)
+    event_repo = EventRepository(db)
 
     user_id = str(uuid4())
     session_id = str(uuid4())
@@ -187,18 +183,16 @@ def test_search_similar(db):
     assert results[1]["distance"] <= results[2]["distance"]
 
 
-def test_search_with_json_extract_filter(db):
+def test_search_with_json_extract_filter(db, db_factory):
     """Test semantic search with JSON_EXTRACT metadata filtering."""
-    service = EmbeddingService(db, provider="mock")
+    service = EmbeddingService(db_factory, provider="mock")
 
     from uuid import uuid4
-    from api.database import get_db_session
     from api.repositories.session_repository import SessionRepository
     from api.repositories.event_repository import EventRepository
 
-    db_session = next(get_db_session())
-    session_repo = SessionRepository(db_session)
-    event_repo = EventRepository(db_session)
+    session_repo = SessionRepository(db)
+    event_repo = EventRepository(db)
 
     user_id = str(uuid4())
     session_id = str(uuid4())

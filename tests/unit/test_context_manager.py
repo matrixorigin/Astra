@@ -21,7 +21,7 @@ def context_manager(mock_db):
     with patch("core.context.embeddings.EmbeddingService"):
         with patch("core.context.prompts.PromptManager"):
             with patch("core.context.scorer.RelevanceScorer"):
-                cm = ContextManager(db=mock_db, embedding_provider="mock")
+                cm = ContextManager(lambda: mock_db, embedding_provider="mock")
                 yield cm
 
 
@@ -33,8 +33,8 @@ class TestContextManagerInit:
         with patch("core.context.embeddings.EmbeddingService"):
             with patch("core.context.prompts.PromptManager"):
                 with patch("core.context.scorer.RelevanceScorer"):
-                    cm = ContextManager(db=mock_db)
-                    assert cm.db == mock_db
+                    cm = ContextManager(lambda: mock_db)
+                    assert cm._db_factory() is mock_db
 
 
 class TestTaskType:

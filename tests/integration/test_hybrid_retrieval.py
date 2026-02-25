@@ -56,7 +56,7 @@ def test_hybrid_retrieval():
         parent_id = event.event_id
     
     # Build context with fallback retrieval
-    ctx_mgr = ContextManager(db, embedding_provider="mock")
+    ctx_mgr = ContextManager(lambda: db, embedding_provider="mock")
     context = ctx_mgr.build_context(
         session_id=session_id,
         query="Tell me about event sourcing implementation",
@@ -91,7 +91,7 @@ def test_replay_consistency():
     )
     
     # Build context
-    ctx_mgr = ContextManager(db, embedding_provider="mock")
+    ctx_mgr = ContextManager(lambda: db, embedding_provider="mock")
     original_context = ctx_mgr.build_context(
         session_id=session_id,
         query="Test",
@@ -148,7 +148,7 @@ def test_fallback_retrieval():
     )
     
     # Build context with fallback
-    ctx_mgr = ContextManager(db, embedding_provider="mock")
+    ctx_mgr = ContextManager(lambda: db, embedding_provider="mock")
     context = ctx_mgr.build_context(
         session_id=session_id,
         query="Another query",

@@ -498,7 +498,7 @@ async def test_execute_skill_with_feedback_no_pipeline():
         
         # Create executor WITHOUT pipeline
         executor = AgentExecutor(
-            db=mock_db,
+            db_factory=lambda: mock_db,
             registry=mock_registry,
             mode=MockMode.PRODUCTION,
             pipeline=None,  # No pipeline

@@ -9,7 +9,7 @@ from core.events.event_logger import EventLogger
 @pytest.fixture
 def context_manager(db_session):
     """Context manager fixture."""
-    return ContextManager(db_session, embedding_provider="mock")
+    return ContextManager(lambda: db_session, embedding_provider="mock")
 
 
 @pytest.fixture

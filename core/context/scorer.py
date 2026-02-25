@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from core.context.manager import TaskType
+from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -58,18 +59,18 @@ TASK_WEIGHTS = {
 }
 
 
-class RelevanceScorer:
+class RelevanceScorer(DbConsumer):
     """Multi-signal relevance scorer with configurable weights."""
 
-    def __init__(self, db, embeddings, weights: ScoringWeights | None = None):
+    def __init__(self, db_factory: DbFactory, embeddings, weights: ScoringWeights | None = None):
         """Initialize scorer.
 
         Args:
-            db: SQLAlchemy Session
+            db_factory: Callable returning a new SQLAlchemy Session
             embeddings: Embedding service
             weights: Custom weights (default: GENERAL task weights)
         """
-        self.db = db
+        super().__init__(db_factory)
         self.embeddings = embeddings
         self.weights = weights or TASK_WEIGHTS[TaskType.GENERAL]
 
@@ -155,14 +156,15 @@ class RelevanceScorer:
         from api.models import Event
         from sqlalchemy import func
         
-        chains = self.db.query(
-            Event.causal_chain_id,
-            func.max(Event.created_at).label('last_time')
-        ).filter(
-            Event.session_id == session_id
-        ).group_by(Event.causal_chain_id).order_by(
-            func.max(Event.created_at).desc()
-        ).limit(limit).all()
+        with self._db() as db:
+            chains = db.query(
+                Event.causal_chain_id,
+                func.max(Event.created_at).label('last_time')
+            ).filter(
+                Event.session_id == session_id
+            ).group_by(Event.causal_chain_id).order_by(
+                func.max(Event.created_at).desc()
+            ).limit(limit).all()
         
         return {row.causal_chain_id for row in chains}
 
@@ -216,7 +218,7 @@ class RelevanceScorer:
         }
 
 
-def create_scorer_for_task(db, embeddings, task_type: TaskType) -> RelevanceScorer:
+def create_scorer_for_task(db_factory: DbFactory, embeddings, task_type: TaskType) -> RelevanceScorer:
     """Factory function to create task-specific scorer."""
     weights = TASK_WEIGHTS[task_type]
-    return RelevanceScorer(db, embeddings, weights)
+    return RelevanceScorer(db_factory, embeddings, weights)
