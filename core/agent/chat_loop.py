@@ -294,6 +294,8 @@ class ChatLoop:
 
         # 6. Multi-turn tool use loop
         last_skill_name: str | None = None
+        # Reset turn budget tracker for this turn
+        self._turn_budget = None
         for _round in range(MAX_TOOL_ROUNDS):
 
             # Compact if approaching context limit
@@ -498,15 +500,18 @@ class ChatLoop:
                 # Process tool output: large results → store in mo-trustmem + return summary
                 from core.agent.tool_output_handler import process_tool_output
                 if getattr(self, '_memory_store', None):
-                    # Use budget manager for dynamic threshold
+                    # Use turn budget tracker for cumulative control
                     remaining = None
-                    if getattr(self, '_budget_manager', None):
-                        from core.context.budget_manager import classify_stage
-                        stage = classify_stage(user_input, _round)
-                        remaining = self._budget_manager.get_tool_output_budget(stage) // 4  # bytes to tokens
-                    else:
-                        msg_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
-                        remaining = max_tokens - msg_tokens if isinstance(max_tokens, int) else None
+                    force_summarize = False
+                    if not hasattr(self, '_turn_budget') or self._turn_budget is None:
+                        from core.context.budget_manager import TurnBudgetTracker
+                        # Allow max 30K tokens for all tool outputs in a turn
+                        self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
+                    
+                    # Check if should force summarize due to cumulative budget
+                    force_summarize = self._turn_budget.should_force_summarize(len(result_str))
+                    remaining = self._turn_budget.remaining
+                    
                     result_str = process_tool_output(
                         output=result_str,
                         tool_name=fn_name,
@@ -515,7 +520,11 @@ class ChatLoop:
                         memory_store=self._memory_store,
                         turn_event_id=user_event.event_id,
                         remaining_tokens=remaining,
+                        force_full=False,  # Let budget tracker decide
                     )
+                    
+                    # Record usage after processing (use processed size)
+                    self._turn_budget.record(len(result_str))
                 
                 messages.append(
                     {
@@ -700,10 +709,12 @@ class ChatLoop:
         # Process tool output: large results → store in mo-trustmem + return summary
         from core.agent.tool_output_handler import process_tool_output
         if getattr(self, '_memory_store', None):
-            # Estimate remaining tokens for dynamic threshold
-            msg_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
-            max_ctx = self.llm.config.get("max_context_tokens", 128000) if hasattr(self.llm, 'config') else 128000
-            remaining = max_ctx - msg_tokens if isinstance(max_ctx, int) else None
+            # Use turn budget tracker for cumulative control
+            if not hasattr(self, '_turn_budget') or self._turn_budget is None:
+                from core.context.budget_manager import TurnBudgetTracker
+                self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
+            
+            remaining = self._turn_budget.remaining
             result_str = process_tool_output(
                 output=result_str,
                 tool_name=fn_name,
@@ -713,6 +724,7 @@ class ChatLoop:
                 turn_event_id=user_event.event_id,
                 remaining_tokens=remaining,
             )
+            self._turn_budget.record(len(result_str))
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 
     async def run_step_stream(
@@ -934,6 +946,8 @@ class ChatLoop:
 
         # Multi-turn tool use loop with streaming
         last_skill_name: str | None = None
+        # Reset turn budget tracker for this turn
+        self._turn_budget = None
         for _round in range(MAX_TOOL_ROUNDS):
 
             # Compact if approaching context limit
