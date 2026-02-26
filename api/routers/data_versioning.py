@@ -2,7 +2,6 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
 from api.database import SessionLocal
 from api.dependencies import get_current_user

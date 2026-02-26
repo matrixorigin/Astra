@@ -4,7 +4,6 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
 
 from api.database import SessionLocal
 from api.dependencies import get_current_user

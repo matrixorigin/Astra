@@ -8,7 +8,6 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import text
-from sqlalchemy.orm import Session
 
 from api.database import SessionLocal
 from api.dependencies import get_current_user

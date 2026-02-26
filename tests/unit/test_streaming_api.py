@@ -68,8 +68,9 @@ class TestChatStream:
     async def test_stream_chat_session_not_found(self, mock_auth):
         from api.routers.chat import chat_stream, ChatRequest
         from fastapi import HTTPException
+        from sqlalchemy.orm import Session
 
-        mock_db = MagicMock()
+        mock_db = MagicMock(spec=Session)
         mock_db.execute.return_value.first.return_value = None
 
         request = ChatRequest(session_id="nonexistent", message="Hello")
@@ -77,6 +78,7 @@ class TestChatStream:
             with pytest.raises(HTTPException) as exc_info:
                 await chat_stream(request, mock_auth)
         assert exc_info.value.status_code == 404
+        mock_db.close.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("api.routers.chat._ensure_session", return_value="sess_123")
