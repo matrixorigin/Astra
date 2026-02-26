@@ -990,53 +990,53 @@ async def chat_turn(
 
         try:
             llm = _get_shared_llm_client()
-            llm.set_user_context(user_id=user_id)
+            with llm.request_context(user_id=user_id):
 
-            full_text = ""
-            tool_calls: list[dict[str, Any]] = []
+                full_text = ""
+                tool_calls: list[dict[str, Any]] = []
 
-            if tools_schema:
-                async for chunk in llm.chat_with_tools_stream(
-                    llm_messages, tools_schema, model=model, task_hint=task_hint,
-                ):
-                    if chunk["type"] == "text":
-                        full_text += chunk["content"]
-                        yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
-                    elif chunk["type"] == "tool_call":
-                        tool_calls.append(chunk["data"])
-                    elif chunk["type"] == "usage":
-                        yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
-            else:
-                async for chunk in llm.chat_stream(
-                    llm_messages, user_id, session_id, model=model,
-                ):
-                    if chunk["type"] == "text":
-                        full_text += chunk["content"]
-                        yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
+                if tools_schema:
+                    async for chunk in llm.chat_with_tools_stream(
+                        llm_messages, tools_schema, model=model, task_hint=task_hint,
+                    ):
+                        if chunk["type"] == "text":
+                            full_text += chunk["content"]
+                            yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
+                        elif chunk["type"] == "tool_call":
+                            tool_calls.append(chunk["data"])
+                        elif chunk["type"] == "usage":
+                            yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
+                else:
+                    async for chunk in llm.chat_stream(
+                        llm_messages, user_id, session_id, model=model,
+                    ):
+                        if chunk["type"] == "text":
+                            full_text += chunk["content"]
+                            yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
 
-            # Emit accumulated tool calls
-            for tc in tool_calls:
-                args = tc.get("function", {}).get("arguments", "{}")
-                try:
-                    parsed_args = json.loads(args) if isinstance(args, str) else args
-                except json.JSONDecodeError:
-                    parsed_args = {}
-                yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc.get('function', {}).get('name', ''), 'arguments': parsed_args})}\n\n"
+                # Emit accumulated tool calls
+                for tc in tool_calls:
+                    args = tc.get("function", {}).get("arguments", "{}")
+                    try:
+                        parsed_args = json.loads(args) if isinstance(args, str) else args
+                    except json.JSONDecodeError:
+                        parsed_args = {}
+                    yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc.get('function', {}).get('name', ''), 'arguments': parsed_args})}\n\n"
 
-            # Update session cache: append assistant message, increment turn_count
-            _entry = _get_or_create_session_entry(session_id)
-            assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text}
-            if tool_calls:
-                assistant_msg["tool_calls"] = tool_calls
-            _entry.setdefault("history", []).append(assistant_msg)
-            _entry["turn_count"] = _entry.get("turn_count", 0) + 1
-            _session_cache[session_id] = _entry
-            current_turn_count = _entry["turn_count"]
-            current_history = list(_entry.get("history", []))
+                # Update session cache: append assistant message, increment turn_count
+                _entry = _get_or_create_session_entry(session_id)
+                assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text}
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
+                _entry.setdefault("history", []).append(assistant_msg)
+                _entry["turn_count"] = _entry.get("turn_count", 0) + 1
+                _session_cache[session_id] = _entry
+                current_turn_count = _entry["turn_count"]
+                current_history = list(_entry.get("history", []))
 
-            # Resolve actual model name for audit (not the user's request, but
-            # what the router selected — may differ due to fallback chain).
-            resolved_model = llm.resolve_model_name(model)
+                # Resolve actual model name for audit (not the user's request, but
+                # what the router selected — may differ due to fallback chain).
+                resolved_model = llm.resolve_model_name(model)
 
             # Persist events in background thread (non-blocking, best-effort).
             # Deep-copy mutable dicts to avoid sharing state with the main thread.

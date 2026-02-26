@@ -31,13 +31,12 @@ client = LLMClient(
 ### 2. Dynamic Context Updates
 
 ```python
-client = LLMClient(db=db, user_id='alice')
+client = LLMClient(db_factory, user_id='alice')
 
-# Update context when user switches project
-client.set_user_context(
-    user_id='alice',
-    scope_context={'project': 'frontend'}
-)
+# Bind per-request context (concurrency-safe)
+with client.request_context(user_id='alice'):
+    # all calls inside use alice's model routing
+    response = await client.chat_stream(...)
 ```
 
 ### 3. Direct Use of ScopeResolver

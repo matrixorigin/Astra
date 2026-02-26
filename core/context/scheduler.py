@@ -322,10 +322,10 @@ class MemoryGovernanceScheduler:
     Usage (custom backend):
         scheduler = MemoryGovernanceScheduler(backend=my_celery_backend)
         await scheduler.start()
-
-    .. todo:: future-arch: Replace direct DB access in GovernanceTaskRunner
-       with internal API calls when moving to distributed deployment.
     """
+
+    # TODO(future-arch): Replace direct DB access in GovernanceTaskRunner
+    # with internal API calls when moving to distributed deployment.
 
     def __init__(self, backend: SchedulerBackend | None = None):
         self._enabled = os.environ.get("GOVERNANCE_ENABLED", "true").lower() == "true"

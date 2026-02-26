@@ -244,12 +244,15 @@ class TestChatTurnMultiTurnE2E:
         assert turn1_system != turn2_system
 
     def test_model_routing_uses_user_id(self, client, db):
-        """Shared LLMClient in /chat/turn receives set_user_context with correct user_id."""
+        """Shared LLMClient in /chat/turn uses request_context with correct user_id."""
         headers, user_id = self._auth(client, db)
 
-        with patch("core.llm.client.LLMClient.set_user_context") as mock_ctx, \
+        with patch("core.llm.client.LLMClient.request_context") as mock_ctx, \
              patch("core.llm.client.LLMClient.chat_stream",
                    return_value=fake_llm_stream([{"type": "text", "content": "hi"}])):
+            # request_context is used as a context manager; make it a no-op CM
+            from contextlib import nullcontext
+            mock_ctx.return_value = nullcontext()
             client.post("/chat/turn", json={
                 "messages": [{"role": "user", "content": "hello"}],
             }, headers=headers)
@@ -259,7 +262,7 @@ class TestChatTurnMultiTurnE2E:
             if c.kwargs.get("user_id") == user_id
         ]
         assert len(calls_with_user_id) == 1, \
-            f"Expected set_user_context(user_id='{user_id}'), got {mock_ctx.call_args_list}"
+            f"Expected request_context(user_id='{user_id}'), got {mock_ctx.call_args_list}"
 
     def test_recovery_then_refresh_corrects_stale_memory(self, client, db):
         """After server restart recovery (stale first_query memory), the next
@@ -879,9 +882,11 @@ class TestCostTrackingFix:
         llm._get_provider = MagicMock(return_value=provider_mock)
         llm.router = MagicMock()
         llm.router.calculate_cost.return_value = 0.001
+        llm._active_router = llm.router  # property fallback won't work on MagicMock
         llm._record_spend = MagicMock()
         llm._log_call = MagicMock()
         llm.user_id = "test"
+        llm._active_user_id = "test"
 
         chunks = asyncio.get_event_loop().run_until_complete(
             _collect_async(llm.chat_with_tools_stream([], [], model="gpt-4o"))

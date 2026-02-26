@@ -15,27 +15,21 @@ def db_session():
     session.close()
 
 
-class TestSetUserContext:
-    """Test LLMClient.set_user_context updates internal state."""
+class TestRequestContext:
+    """Test LLMClient.request_context binds per-request state."""
 
-    def test_updates_user_id(self, db_session):
-        """set_user_context should update user_id and rebuild router."""
+    def test_binds_user_id(self, db_session):
+        """request_context should expose user_id via _active_user_id."""
         client = LLMClient(lambda: db_session, user_id="alice")
-        client.set_user_context(user_id="bob")
-        assert client.user_id == "bob"
+        with client.request_context(user_id="bob"):
+            assert client._active_user_id == "bob"
+        assert client._active_user_id == "alice"  # restored
 
-    def test_updates_scope_resolver(self, db_session):
-        """set_user_context should update user_id."""
+    def test_binds_router(self, db_session):
+        """request_context should create a separate router."""
         client = LLMClient(lambda: db_session, user_id="alice")
-        client.set_user_context(user_id="bob", scope_context={"repo": "test"})
-        assert client.user_id == "bob"
-
-    def test_rebuilds_router(self, db_session):
-        """set_user_context should create a new ModelRouter."""
-        client = LLMClient(lambda: db_session, user_id="alice")
-        old_router = client.router
-        client.set_user_context(user_id="bob")
-        assert client.router is not old_router
+        with client.request_context(user_id="bob"):
+            assert client._active_router is not client.router
 
 
 class TestCheckModelPermission:

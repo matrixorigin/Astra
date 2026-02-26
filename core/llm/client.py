@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 
 from sqlalchemy import text
@@ -39,7 +41,17 @@ def _default_model_for_provider(provider: str) -> str:
 
 
 class LLMClient(DbConsumer):
-    """LLM client with routing, rate limiting, circuit breaker, budget control, and logging."""
+    """LLM client with routing, rate limiting, circuit breaker, budget control, and logging.
+
+    Thread/async-safety: expensive state (providers, rate_limiter, config) is
+    shared.  Per-request user context (user_id, router) lives in a ContextVar
+    so concurrent async generators in the same event loop never interfere.
+    Use ``request_context(user_id)`` to bind per-request state.
+    """
+
+    # Per-request overrides — invisible across coroutines / threads.
+    _ctx_user_id: ContextVar[str | None] = ContextVar("_ctx_user_id", default=None)
+    _ctx_router: ContextVar[ModelRouter | None] = ContextVar("_ctx_router", default=None)
 
     def __init__(
         self,
@@ -60,16 +72,35 @@ class LLMClient(DbConsumer):
         self._init_providers()
         self._init_rate_limits()
 
-    def set_user_context(
-        self,
-        user_id: str | None = None,
-        scope_context: dict | None = None,
-    ):
-        """Update user context and reload router."""
-        self.user_id = user_id
+    # ── Per-request context (concurrency-safe) ─────────────────────
+
+    @contextmanager
+    def request_context(self, user_id: str | None = None):
+        """Bind user_id + router for the current execution context.
+
+        Safe for concurrent use: each coroutine / thread sees its own
+        values via ContextVar, so two parallel SSE generators never
+        overwrite each other's user context.
+        """
         with self._db() as db:
-            self.router = ModelRouter(db=db, user_id=user_id)
-        self._init_providers()
+            router = ModelRouter(db=db, user_id=user_id)
+        tok_uid = self._ctx_user_id.set(user_id)
+        tok_rtr = self._ctx_router.set(router)
+        try:
+            yield
+        finally:
+            self._ctx_user_id.reset(tok_uid)
+            self._ctx_router.reset(tok_rtr)
+
+    @property
+    def _active_user_id(self) -> str | None:
+        """Return per-request user_id if set, else fall back to instance default."""
+        return self._ctx_user_id.get() or self.user_id
+
+    @property
+    def _active_router(self) -> ModelRouter:
+        """Return per-request router if set, else fall back to instance default."""
+        return self._ctx_router.get() or self.router
 
     # ── Config (#4 动态配置) ───────────────────────────────────────
 
@@ -247,7 +278,7 @@ class LLMClient(DbConsumer):
             # ~4 chars per token, rough but better than fixed 1000
             char_count = sum(len(m.get("content", "") or "") for m in messages if isinstance(m, dict))
             estimated_tokens = max(char_count // 4, 200)
-        estimated_cost = self.router.estimate_cost(model, estimated_tokens)
+        estimated_cost = self._active_router.estimate_cost(model, estimated_tokens)
         if self._total_spend_usd + estimated_cost > budget:
             raise BudgetExceededError(
                 f"Estimated cost ${estimated_cost:.4f} would exceed budget "
@@ -261,14 +292,14 @@ class LLMClient(DbConsumer):
 
     def _check_model_permission(self, model: str):
         """Check if current user has permission to use the model."""
-        available_models = self.router.list_models()
+        available_models = self._active_router.list_models()
         model_names = [m.model_name for m in available_models]
 
         if model not in model_names:
             # Build detailed error message
             scope_info = []
-            if self.user_id:
-                scope_info.append(f"user '{self.user_id}'")
+            if self._active_user_id:
+                scope_info.append(f"user '{self._active_user_id}'")
 
             scope_str = " and ".join(scope_info) if scope_info else "current scope"
 
@@ -296,7 +327,7 @@ class LLMClient(DbConsumer):
     def _resolve_chain(self, model: str, task_hint: str | None = None) -> list[ModelConfig]:
         """Permission check + route to model chain. Used by _dispatch and streaming methods."""
         self._check_model_permission(model)
-        chain = self.router.route(model, task_hint=task_hint)
+        chain = self._active_router.route(model, task_hint=task_hint)
         if not chain:
             chain = [
                 ModelConfig(
@@ -375,7 +406,7 @@ class LLMClient(DbConsumer):
                 max_tokens=max_tok,
             )
             response.latency_ms = int((time.time() - start) * 1000)
-            response.cost_usd = self.router.calculate_cost(
+            response.cost_usd = self._active_router.calculate_cost(
                 model_cfg.model_name,
                 response.tokens_prompt,
                 response.tokens_completion,
@@ -475,7 +506,7 @@ class LLMClient(DbConsumer):
 
                 breaker.record_success()
                 latency = int((time.time() - start) * 1000)
-                cost = self.router.calculate_cost(
+                cost = self._active_router.calculate_cost(
                     model_cfg.model_name,
                     usage["prompt"],
                     usage["completion"],
@@ -554,7 +585,7 @@ class LLMClient(DbConsumer):
                         yield chunk
                 breaker.record_success()
                 latency = int((time.time() - start) * 1000)
-                cost = self.router.calculate_cost(
+                cost = self._active_router.calculate_cost(
                     model_cfg.model_name,
                     usage["prompt"],
                     usage["completion"],
@@ -563,7 +594,7 @@ class LLMClient(DbConsumer):
                 )
                 self._record_spend(cost)
                 self._log_call(
-                    trace_id, self.user_id, model_cfg.provider,
+                    trace_id, self._active_user_id, model_cfg.provider,
                     LLMResponse(
                         content="[streamed+tools]",
                         model=model_cfg.model_name, provider=model_cfg.provider,
