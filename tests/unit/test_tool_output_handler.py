@@ -342,3 +342,52 @@ class TestStalenessCheck:
         )
         assert result is not None
         assert "mem_fresh" in result
+
+
+class TestSummarizability:
+    """Tests for summarizability detection."""
+
+    def test_grep_is_summarizable(self):
+        """Grep output is summarizable."""
+        from core.agent.tool_output_handler import is_summarizable
+        output = "file.py:10:match\nfile.py:20:match"
+        assert is_summarizable("grep", output) is True
+
+    def test_fs_read_not_summarizable(self):
+        """fs_read is in non-summarizable list."""
+        from core.agent.tool_output_handler import is_summarizable
+        output = "some content"
+        assert is_summarizable("fs_read", output) is False
+
+    def test_code_content_not_summarizable(self):
+        """Code content detected and not summarized."""
+        from core.agent.tool_output_handler import is_summarizable
+        output = "import os\n\ndef main():\n    pass"
+        assert is_summarizable("shell", output) is False
+
+    def test_large_code_is_summarizable(self):
+        """Large code files (>200 lines) can be summarized."""
+        from core.agent.tool_output_handler import is_summarizable
+        output = "import os\n" + "\n".join([f"line{i}" for i in range(300)])
+        assert is_summarizable("shell", output) is True
+
+
+class TestFailureModes:
+    """Tests for failure mode handling."""
+
+    def test_mo_trustmem_failure_fallback(self):
+        """Falls back to truncation when mo-trustmem fails."""
+        from core.agent.tool_output_handler import process_tool_output
+        from unittest.mock import MagicMock
+        
+        mock_store = MagicMock()
+        mock_store.create.side_effect = Exception("DB connection failed")
+        
+        output = "x" * 50000
+        result = process_tool_output(
+            output, "grep", "sess1", "user1", mock_store
+        )
+        
+        assert "truncated" in result
+        assert "mo-trustmem unavailable" in result
+        assert len(result) < len(output)

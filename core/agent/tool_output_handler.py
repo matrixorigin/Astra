@@ -110,6 +110,39 @@ SUMMARY_GENERATORS: dict[str, Callable[[str], str]] = {
     "git": _summarize_shell,
 }
 
+# Tools that should NOT be summarized (need full content for LLM)
+NON_SUMMARIZABLE_TOOLS: set[str] = {
+    "fs_read",      # Code files need full structure
+    "read_file",    # Same
+    "cat",          # Same
+    "base64",       # Binary content
+}
+
+
+def is_summarizable(tool_name: str, output: str) -> bool:
+    """Check if tool output can be safely summarized.
+    
+    Args:
+        tool_name: Name of the tool
+        output: Tool output content
+    
+    Returns:
+        True if output can be summarized, False if full content needed
+    """
+    # Explicit non-summarizable tools
+    if tool_name in NON_SUMMARIZABLE_TOOLS:
+        return False
+    
+    # Heuristics for code content (need full structure)
+    code_indicators = ["def ", "class ", "import ", "function ", "const ", "let ", "var "]
+    if any(ind in output[:2000] for ind in code_indicators):
+        # Looks like code - check if it's a single file read
+        lines = output.split('\n')
+        if len(lines) < 200:  # Small code file, keep full
+            return False
+    
+    return True
+
 
 def register_summary_strategy(tool_name: str, strategy: Callable[[str], str]) -> None:
     """Register a custom summary strategy for a tool.
@@ -173,6 +206,7 @@ def process_tool_output(
     memory_store: MemoryStore,
     turn_event_id: str | None = None,
     remaining_tokens: int | None = None,
+    force_full: bool = False,  # Force return full content (no summarization)
 ) -> str:
     """Process tool output: small returns directly, large stores + summarizes.
     
@@ -184,6 +218,7 @@ def process_tool_output(
         memory_store: mo-trustmem MemoryStore instance
         turn_event_id: Optional event ID for provenance tracking
         remaining_tokens: Optional remaining context budget for dynamic threshold
+        force_full: Force return full content (skip summarization check)
     
     Returns:
         Original output (if small) or summary + memory reference (if large)
@@ -191,27 +226,47 @@ def process_tool_output(
     from core.agent.tool_context_metrics import record_tool_output
     
     threshold = compute_dynamic_threshold(remaining_tokens)
-    if len(output) <= threshold:
+    
+    # Check if should skip summarization
+    skip_summary = force_full or not is_summarizable(tool_name, output)
+    
+    if len(output) <= threshold or (skip_summary and len(output) <= threshold * 3):
         record_tool_output(tool_name, len(output), len(output), was_summarized=False)
         return output
     
     # 1. Store full output in mo-trustmem
     source_events = [turn_event_id] if turn_event_id else []
-    memory = memory_store.create(
-        user_id=user_id,
-        content=output,
-        memory_type=MemoryType.TOOL_RESULT,
-        session_id=session_id,
-        source=f"tool:{tool_name}",
-        source_event_ids=source_events,
-        metadata={"tool": tool_name, "size": len(output)},
-    )
+    try:
+        memory = memory_store.create(
+            user_id=user_id,
+            content=output,
+            memory_type=MemoryType.TOOL_RESULT,
+            session_id=session_id,
+            source=f"tool:{tool_name}",
+            source_event_ids=source_events,
+            metadata={"tool": tool_name, "size": len(output)},
+        )
+    except Exception as e:
+        # Fallback: truncate if mo-trustmem write fails
+        record_tool_output(tool_name, len(output), threshold, was_summarized=True)
+        return output[:threshold] + f"\n... [truncated, mo-trustmem unavailable: {e}]"
     
     # 2. Generate rule-based summary
     summary = generate_structured_summary(output, tool_name)
     
-    # 3. Record metrics
+    # 3. Store summary text for replay determinism (摘要也需要持久化)
     result = f"{summary}\n\n[Full output ({len(output)} bytes): memory:{memory.memory_id}]"
+    
+    # Update memory metadata with summary for replay
+    try:
+        memory_store.update_metadata(
+            memory.memory_id,
+            {"summary": summary, "summary_version": "v1.3"}
+        )
+    except Exception:
+        pass  # Non-critical for replay
+    
+    # 4. Record metrics
     record_tool_output(tool_name, len(output), len(result), was_summarized=True)
     
     return result
