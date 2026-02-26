@@ -177,6 +177,29 @@ def override_db_dependency(db_session, monkeypatch):
         pass
 
 
+@pytest.fixture(autouse=True)
+def _clear_chat_module_state():
+    """Clear module-level global state in chat router for test isolation.
+
+    _session_cache and _shared_llm_client are process-global singletons.
+    Without clearing, test A's session data leaks into test B when running
+    with pytest -n auto (same process, different tests).
+    """
+    try:
+        from api.routers import chat
+        chat._session_cache.clear()
+        chat._shared_llm_client = None
+    except (ImportError, AttributeError):
+        pass
+    yield
+    try:
+        from api.routers import chat
+        chat._session_cache.clear()
+        chat._shared_llm_client = None
+    except (ImportError, AttributeError):
+        pass
+
+
 
 # ============================================================================
 # Shared Fixtures for Selector Tests

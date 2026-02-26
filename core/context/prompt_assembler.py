@@ -241,6 +241,59 @@ class PromptAssembler(DbConsumer):
         )
 
     # ------------------------------------------------------------------
+    # Incremental refresh (turn 2+)
+    # ------------------------------------------------------------------
+
+    def refresh_memory(
+        self,
+        session_id: str,
+        user_id: str,
+        user_query: str,
+        current_sections: dict[str, str],
+    ) -> AssembledPrompt:
+        """Refresh §4 (memory) for subsequent turns, keeping stable sections.
+
+        Re-runs _build_memory() with the latest query, replaces the memory
+        section, rebuilds the system message, and saves a new snapshot.
+        """
+        sections = dict(current_sections)
+        breakdown: dict[str, int] = {}
+
+        # Refresh memory
+        memory = self._build_memory(user_id, session_id, user_query)
+        if memory:
+            sections["memory"] = memory
+        else:
+            sections.pop("memory", None)
+
+        # Refresh working memory (scratchpad may have changed)
+        working = self._build_working_memory(session_id)
+        if working:
+            sections["working_memory"] = working
+        else:
+            sections.pop("working_memory", None)
+
+        # Recompute breakdown
+        for k, v in sections.items():
+            breakdown[k] = _estimate_tokens(v)
+
+        # Reassemble
+        ordered_keys = ["identity", "self_model", "project_context", "memory",
+                        "working_memory", "history", "constraints"]
+        parts = [sections[k] for k in ordered_keys if k in sections]
+        system_message = "\n\n".join(parts)
+
+        snapshot_id = self._save_snapshot(session_id, sections, breakdown)
+
+        return AssembledPrompt(
+            system_message=system_message,
+            tools_schema=[],
+            snapshot_id=snapshot_id,
+            token_breakdown=breakdown,
+            sections=sections,
+        )
+
+    # ------------------------------------------------------------------
     # Section builders
     # ------------------------------------------------------------------
 

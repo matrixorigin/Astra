@@ -91,7 +91,6 @@ class TestPersistTurnEvents:
 
     def test_writes_tool_call_events(self):
         """Each tool_call in the response should produce a tool_call event."""
-        db = MagicMock()
         tool_calls = [
             {"id": "tc1", "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'}},
             {"id": "tc2", "function": {"name": "list_dir", "arguments": '{"path":"."}'}},
@@ -109,7 +108,7 @@ class TestPersistTurnEvents:
 
             from api.routers.chat import _persist_turn_events
             _persist_turn_events(
-                db, "u1", "s1",
+                "u1", "s1",
                 [{"role": "user", "content": "Read files"}], None,
                 "Here are the files", tool_calls,
             )
@@ -123,7 +122,6 @@ class TestPersistTurnEvents:
 
     def test_llm_response_has_no_tool_calls_suffix(self):
         """llm_response content should NOT have [tool_calls: ...] appended."""
-        db = MagicMock()
         tool_calls = [{"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}]
         llm_content = None
 
@@ -143,7 +141,7 @@ class TestPersistTurnEvents:
 
             from api.routers.chat import _persist_turn_events
             _persist_turn_events(
-                db, "u1", "s1",
+                "u1", "s1",
                 [{"role": "user", "content": "hi"}], None,
                 "response text", tool_calls,
             )

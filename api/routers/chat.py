@@ -473,10 +473,12 @@ def _build_turn_messages(
     """Build LLM messages from edge turn data + server-side history.
 
     Returns (messages, context_capture_id).  context_capture_id is the snapshot
-    saved by PromptAssembler BEFORE the LLM call (only on first turn or system
-    rebuild); None on subsequent turns that reuse the cached system prompt.
+    saved by PromptAssembler BEFORE the LLM call; on turn 2+ it comes from
+    incremental memory refresh.
     """
-    history = (_session_cache.get(session_id) or {}).get("history")
+    cached = _session_cache.get(session_id) or {}
+    history = cached.get("history")
+    cached_sections = cached.get("sections")
     context_capture_id: str | None = None
 
     # Recover from DB if not in memory (server restart)
@@ -485,10 +487,6 @@ def _build_turn_messages(
 
     # Rebuild system prompt: either first turn (empty history) or forced by tool change.
     # On force_rebuild_system we replace history[0] in-place, preserving conversation.
-    # NOTE: on mid-session rebuild, project_rules and edge_profile may be None (only
-    # sent on turn 0). The rebuilt prompt will have updated tool info but stale/missing
-    # project context. This is acceptable — the Self-Model tool section is the primary
-    # reason for rebuild, and project context doesn't change mid-session.
     if not history or force_rebuild_system:
         user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
 
@@ -508,6 +506,7 @@ def _build_turn_messages(
         )
         system = assembled.system_message
         context_capture_id = assembled.snapshot_id
+        cached_sections = assembled.sections
         logger.debug("Assembled prompt: %d tokens, snapshot=%s", sum(assembled.token_breakdown.values()), assembled.snapshot_id)
 
         if history and force_rebuild_system:
@@ -515,6 +514,23 @@ def _build_turn_messages(
             history[0] = {"role": "system", "content": system}
         else:
             history = [{"role": "system", "content": system}]
+    elif cached_sections:
+        # Turn 2+: incremental memory refresh
+        user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+        if user_query:
+            from core.context.prompt_assembler import PromptAssembler
+            try:
+                refreshed = PromptAssembler(SessionLocal).refresh_memory(
+                    session_id=session_id,
+                    user_id=user_id,
+                    user_query=user_query,
+                    current_sections=cached_sections,
+                )
+                history[0] = {"role": "system", "content": refreshed.system_message}
+                context_capture_id = refreshed.snapshot_id
+                cached_sections = refreshed.sections
+            except Exception as e:
+                logger.debug("Memory refresh failed (non-fatal): %s", e)
 
     # Append new user messages from edge
     for msg in messages:
@@ -532,6 +548,8 @@ def _build_turn_messages(
 
     entry = _session_cache.get(session_id) or {}
     entry["history"] = history
+    if cached_sections:
+        entry["sections"] = cached_sections
     _session_cache[session_id] = entry
     return history, context_capture_id
 
@@ -656,7 +674,6 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
 
 
 def _persist_turn_events(
-    db: Session,
     user_id: str,
     session_id: str,
     messages: list[dict[str, Any]],
@@ -815,7 +832,7 @@ async def chat_turn(
 
         try:
             from core.llm.client import LLMClient
-            llm = LLMClient(SessionLocal)
+            llm = LLMClient(SessionLocal, user_id=user_id)
 
             full_text = ""
             tool_calls: list[dict[str, Any]] = []
@@ -858,13 +875,24 @@ async def chat_turn(
 
             # Persist events (non-blocking, best-effort)
             _persist_turn_events(
-                db, user_id, session_id,
+                user_id, session_id,
                 request.messages, request.tool_results,
                 full_text, tool_calls,
                 context_capture_id=snapshot_id,
             )
 
             yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"
+
+            # Post-turn firewall verification (non-blocking, best-effort)
+            if full_text and snapshot_id:
+                try:
+                    from core.verification.firewall import HallucinationFirewall
+                    fw = HallucinationFirewall(SessionLocal, context_manager=None)
+                    result = fw.verify_response(full_text, snapshot_id)
+                    if not result.safe_to_deliver:
+                        yield f"data: {json.dumps({'type': 'warning', 'message': 'Response may contain unverified claims', 'claims_failed': result.claims_failed})}\n\n"
+                except Exception as e:
+                    logger.debug("Firewall verification skipped: %s", e)
 
         except Exception as e:
             logger.error(f"chat_turn error: {e}", exc_info=True)
