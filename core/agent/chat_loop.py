@@ -143,6 +143,7 @@ class ChatLoop:
         self._few_shot = None  # Initialized lazily on first use
         self._escalated_model: str | None | object = _UNSET  # SLO escalation cache
         self._memory_store = None  # For tool output storage
+        self._budget_manager = None  # Global context budget manager
         try:
             from core.context.few_shot import FewShotRetriever
             if hasattr(llm_client, '_db_factory'):
@@ -154,6 +155,13 @@ class ChatLoop:
             from core.memory.store import MemoryStore
             if hasattr(event_logger, '_db_factory'):
                 self._memory_store = MemoryStore(event_logger._db_factory)
+        except Exception:
+            pass
+        # Initialize global context budget manager
+        try:
+            from core.context.budget_manager import ContextBudgetManager
+            max_tokens = llm_client.config.get("max_context_tokens", 128000) if hasattr(llm_client, 'config') else 128000
+            self._budget_manager = ContextBudgetManager(max_context_tokens=max_tokens)
         except Exception:
             pass
 
@@ -490,9 +498,15 @@ class ChatLoop:
                 # Process tool output: large results → store in mo-trustmem + return summary
                 from core.agent.tool_output_handler import process_tool_output
                 if getattr(self, '_memory_store', None):
-                    # Estimate remaining tokens for dynamic threshold
-                    msg_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
-                    remaining = max_tokens - msg_tokens if isinstance(max_tokens, int) else None
+                    # Use budget manager for dynamic threshold
+                    remaining = None
+                    if getattr(self, '_budget_manager', None):
+                        from core.context.budget_manager import classify_stage
+                        stage = classify_stage(user_input, _round)
+                        remaining = self._budget_manager.get_tool_output_budget(stage) // 4  # bytes to tokens
+                    else:
+                        msg_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
+                        remaining = max_tokens - msg_tokens if isinstance(max_tokens, int) else None
                     result_str = process_tool_output(
                         output=result_str,
                         tool_name=fn_name,
