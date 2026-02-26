@@ -1,0 +1,123 @@
+"""MemoryHealth — pollution detection, stats, cleanup."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timedelta
+from typing import Optional
+
+from sqlalchemy import text
+
+from core.db_consumer import DbConsumer, DbFactory
+
+logger = logging.getLogger(__name__)
+
+
+class MemoryHealth(DbConsumer):
+    """Memory health analytics and pollution detection."""
+
+    def __init__(
+        self,
+        db_factory: DbFactory,
+        db_name: str = "mo_agent",
+        pollution_threshold: float = 0.3,
+    ):
+        super().__init__(db_factory)
+        self.db_name = db_name
+        self.pollution_threshold = pollution_threshold
+
+    def analyze(self, user_id: str) -> dict:
+        """Get per-type stats: count, avg_confidence, contradiction_rate, staleness."""
+        with self._db() as db:
+            rows = db.execute(text("""
+                SELECT
+                    memory_type,
+                    COUNT(*) as total,
+                    AVG(confidence) as avg_confidence,
+                    COUNT(CASE WHEN superseded_by IS NOT NULL THEN 1 END) as superseded,
+                    AVG(TIMESTAMPDIFF(HOUR, observed_at, NOW())) as avg_staleness_hours
+                FROM memories
+                WHERE user_id = :uid
+                GROUP BY memory_type
+            """), {"uid": user_id}).fetchall()
+
+        stats = {}
+        for r in rows:
+            contradiction_rate = r.superseded / r.total if r.total > 0 else 0
+            stats[r.memory_type] = {
+                "total": r.total,
+                "avg_confidence": float(r.avg_confidence or 0),
+                "contradiction_rate": contradiction_rate,
+                "avg_staleness_hours": float(r.avg_staleness_hours or 0),
+            }
+        return stats
+
+    def detect_pollution(self, user_id: str, since_timestamp: datetime) -> dict:
+        """Detect pollution by checking supersede/delete ratio since timestamp."""
+        ts_str = since_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self._db() as db:
+                # Count changes since timestamp
+                result = db.execute(text("""
+                    SELECT
+                        COUNT(*) as total_changes,
+                        COUNT(CASE WHEN superseded_by IS NOT NULL THEN 1 END) as supersedes
+                    FROM memories
+                    WHERE user_id = :uid AND updated_at >= :ts
+                """), {"uid": user_id, "ts": since_timestamp}).fetchone()
+
+            total = result.total_changes or 0
+            supersedes = result.supersedes or 0
+            ratio = supersedes / total if total > 0 else 0
+            is_polluted = ratio > self.pollution_threshold
+
+            return {
+                "is_polluted": is_polluted,
+                "total_changes": total,
+                "supersedes": supersedes,
+                "ratio": ratio,
+                "threshold": self.pollution_threshold,
+            }
+        except Exception as e:
+            logger.warning("Pollution detection failed: %s", e)
+            return {"is_polluted": False, "error": str(e)}
+
+    def suggest_rollback_target(self, user_id: str) -> Optional[str]:
+        """Find the most likely bad memory (low confidence, recent, caused supersedes)."""
+        with self._db() as db:
+            row = db.execute(text("""
+                SELECT memory_id
+                FROM memories
+                WHERE user_id = :uid
+                  AND is_active = 1
+                  AND confidence < 0.5
+                ORDER BY observed_at DESC
+                LIMIT 1
+            """), {"uid": user_id}).fetchone()
+        return row.memory_id if row else None
+
+    def cleanup_snapshots(self, keep_last_n: int = 5) -> int:
+        """Drop old milestone snapshots, keep last N."""
+        with self._db() as db:
+            rows = db.execute(text("""
+                SELECT sname FROM mo_catalog.mo_snapshots
+                WHERE sname LIKE 'mem_milestone_%'
+                ORDER BY create_time DESC
+            """)).fetchall()
+
+        if len(rows) <= keep_last_n:
+            return 0
+
+        to_drop = [r.sname for r in rows[keep_last_n:]]
+        dropped = 0
+        with self._db() as db:
+            for name in to_drop:
+                try:
+                    db.execute(text(f"drop snapshot {name}"))
+                    dropped += 1
+                except Exception as e:
+                    logger.warning("Failed to drop snapshot %s: %s", name, e)
+            db.commit()
+
+        logger.info("Cleaned up %d old snapshots", dropped)
+        return dropped
