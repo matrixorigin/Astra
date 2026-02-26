@@ -3,7 +3,6 @@
 import pytest
 from fastapi.testclient import TestClient
 from uuid import uuid4
-from sqlalchemy import text
 
 from api.main import app
 from api.database import get_db_session
@@ -29,24 +28,29 @@ def db_session():
 @pytest.fixture(autouse=True)
 def seed_skill_definition(db_session, test_user):
     """Insert a public skill in skills_registry so install works."""
-    db_session.execute(text(
-        "DELETE FROM skill_installations WHERE skill_name = 'github'"
+    from api.models import SkillRegistry, SkillInstallation, UserCredential
+
+    # Clean up
+    db_session.query(SkillInstallation).filter(SkillInstallation.skill_name == "github").delete()
+    db_session.query(UserCredential).filter(UserCredential.skill_name == "github").delete()
+    db_session.query(SkillRegistry).filter(SkillRegistry.skill_name == "github").delete()
+
+    db_session.add(SkillRegistry(
+        skill_id=str(uuid4()),
+        skill_name="github",
+        version="1.0.0",
+        description="GitHub integration",
+        manifest={},
+        is_active=True,
+        is_public=True,
+        source="marketplace",
+        created_by=test_user.user_id,
     ))
-    db_session.execute(text(
-        "DELETE FROM user_credentials WHERE skill_name = 'github'"
-    ))
-    db_session.execute(text(
-        "DELETE FROM skills_registry WHERE skill_name = 'github'"
-    ))
-    db_session.execute(text(
-        "INSERT INTO skills_registry (skill_id, skill_name, version, description, manifest, is_active, is_public, source, created_by, created_at) "
-        "VALUES (:sid, 'github', '1.0.0', 'GitHub integration', '{}', 1, 1, 'marketplace', :uid, NOW())"
-    ), {"sid": str(uuid4()), "uid": test_user.user_id})
     db_session.commit()
     yield
-    db_session.execute(text("DELETE FROM skill_installations WHERE skill_name = 'github'"))
-    db_session.execute(text("DELETE FROM user_credentials WHERE skill_name = 'github'"))
-    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'github'"))
+    db_session.query(SkillInstallation).filter(SkillInstallation.skill_name == "github").delete()
+    db_session.query(UserCredential).filter(UserCredential.skill_name == "github").delete()
+    db_session.query(SkillRegistry).filter(SkillRegistry.skill_name == "github").delete()
     db_session.commit()
 
 
@@ -100,7 +104,8 @@ def test_upgrade_skill(client, auth_headers, db_session):
     client.post("/marketplace/install", headers=auth_headers, json={"skill_name": "github"})
 
     # Bump definition version
-    db_session.execute(text("UPDATE skills_registry SET version = '2.0.0' WHERE skill_name = 'github'"))
+    from api.models import SkillRegistry
+    db_session.query(SkillRegistry).filter(SkillRegistry.skill_name == "github").update({"version": "2.0.0"})
     db_session.commit()
 
     resp = client.post("/marketplace/upgrade", headers=auth_headers, json={"skill_name": "github"})
@@ -170,16 +175,24 @@ def test_credential_update_overwrites(client, auth_headers):
 
 def test_install_permission_denied(client, auth_headers, db_session):
     """Non-public skill without explicit permission should 403."""
-    # Insert a private skill
-    db_session.execute(text(
-        "INSERT INTO skills_registry (skill_id, skill_name, version, description, manifest, is_active, is_public, source, created_by, created_at) "
-        "VALUES (:sid, 'private_skill', '1.0.0', 'Private', '{}', 1, 0, 'marketplace', 'admin', NOW())"
-    ), {"sid": str(uuid4())})
+    from api.models import SkillRegistry
+
+    db_session.add(SkillRegistry(
+        skill_id=str(uuid4()),
+        skill_name="private_skill",
+        version="1.0.0",
+        description="Private",
+        manifest={},
+        is_active=True,
+        is_public=False,
+        source="marketplace",
+        created_by="admin",
+    ))
     db_session.commit()
 
     resp = client.post("/marketplace/install", headers=auth_headers, json={"skill_name": "private_skill"})
     assert resp.status_code == 403
 
     # Cleanup
-    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'private_skill'"))
+    db_session.query(SkillRegistry).filter(SkillRegistry.skill_name == "private_skill").delete()
     db_session.commit()

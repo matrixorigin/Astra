@@ -485,38 +485,24 @@ class TestChatLoopObserverIntegration:
         loop.set_observer(mock_observer)
         assert loop.observer is mock_observer
 
-    def test_run_observer_background_thread(self):
+    def test_log_response_runs_observer_via_turn_hooks(self):
+        """_log_response delegates observer to TurnHooks.run_observer."""
         loop = self._make_loop()
         mock_observer = MagicMock()
         mock_observer.llm = MagicMock()
         loop.set_observer(mock_observer)
 
-        with patch("threading.Thread") as MockThread:
-            loop._run_observer("s1", "u1", [{"role": "user", "content": "hi"}])
-            MockThread.assert_called_once()
-            assert MockThread.call_args.kwargs.get("daemon") is True
-            MockThread.return_value.start.assert_called_once()
+        with patch("core.agent.turn_hooks.TurnHooks.run_observer") as mock_run:
+            loop._log_response("u1", "s1", "response", "evt1", "c1",
+                               messages=[{"role": "user", "content": "hi"}])
+            mock_run.assert_called_once_with("s1", "u1", [{"role": "user", "content": "hi"}])
 
-    def test_run_observer_noop_without_observer(self):
+    def test_log_response_skips_observer_without_messages(self):
+        """_log_response does not call observer when messages is None."""
         loop = self._make_loop()
-        with patch("threading.Thread") as MockThread:
-            loop._run_observer("s1", "u1", [])
-            MockThread.assert_not_called()
-
-    def test_run_observer_no_shared_mutable_state(self):
-        """Background thread creates its own Observer — no shared dict."""
-        loop = self._make_loop()
-        mock_observer = MagicMock()
-        mock_observer.llm = MagicMock()
-        loop.set_observer(mock_observer)
-
-        with patch("threading.Thread") as MockThread:
-            loop._run_observer("s1", "u1", [{"role": "user", "content": "hi"}])
-            # Get the target function
-            bg_fn = MockThread.call_args.kwargs.get("target") or MockThread.call_args[1].get("target")
-            assert bg_fn is not None
-            # The function should NOT reference observer._observed_index
-            # (it creates a fresh Observer with DB-backed index)
+        with patch("core.agent.turn_hooks.TurnHooks.run_observer") as mock_run:
+            loop._log_response("u1", "s1", "response", "evt1", "c1", messages=None)
+            mock_run.assert_not_called()
 
     def test_build_messages_injects_observations(self):
         loop = self._make_loop()

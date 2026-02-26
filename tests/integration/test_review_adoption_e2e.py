@@ -354,12 +354,17 @@ class TestSLODashboard:
         router.register(ModelConfig(model_name="gpt-4o", provider="openai", pricing={"prompt": 0.0025, "completion": 0.01}, fallback_to="gpt-4o-mini"))
         router.register(ModelConfig(model_name="gpt-4o-mini", provider="openai", pricing={"prompt": 0.00015, "completion": 0.0006}))
         mock_llm.router = router
+        from contextlib import contextmanager
+        mock_el = MagicMock()
+        @contextmanager
+        def _mock_db():
+            yield db_session
+        mock_el._db = _mock_db
         chat_loop = ChatLoop(
             selector=MagicMock(), executor=MagicMock(), llm_client=mock_llm,
-            event_logger=MagicMock(), context_manager=MagicMock(),
+            event_logger=mock_el, context_manager=MagicMock(),
             firewall=MagicMock(), agent_id=agent_id,
         )
-        chat_loop.event_logger.session = db_session
 
         escalated = chat_loop._check_slo_escalation("s1")
         assert escalated == "gpt-4o"  # gpt-4o.fallback_to == "gpt-4o-mini"

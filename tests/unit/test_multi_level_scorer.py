@@ -153,9 +153,9 @@ class TestChatLoopChainScoring:
                 user_id="u1", session_id="s1", content="hello",
                 parent_event_id="p1", causal_chain_id="chain1",
             )
-            mock_sc.assert_called_once_with(
-                loop.event_logger.session, "chain1", "s1",
-            )
+            mock_sc.assert_called_once()
+            assert mock_sc.call_args[0][1] == "chain1"
+            assert mock_sc.call_args[0][2] == "s1"
 
     def test_chain_scoring_skipped_when_no_chain_id(self):
         from core.agent.chat_loop import ChatLoop

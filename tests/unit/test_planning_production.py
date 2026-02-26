@@ -315,7 +315,7 @@ async def test_planner_receives_event_logger_and_db():
     # Verify Planner() was called with event_logger and db
     _, kwargs = MockPlanner.call_args
     assert kwargs["event_logger"] is loop.event_logger
-    assert kwargs["db"] is loop.event_logger.session
+    assert kwargs["db"] is not None  # db from _db_factory()
 
 
 @pytest.mark.asyncio

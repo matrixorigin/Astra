@@ -1263,7 +1263,7 @@ class ChatLoop:
             agent_id=self.agent_id,
         )
 
-        _db = self.event_logger.session
+        _db = self.event_logger._db_factory()
         planner = Planner(
             self.llm,
             event_logger=self.event_logger,
@@ -1749,36 +1749,6 @@ class ChatLoop:
                 cost_estimate="unknown",
             )
 
-    def _run_observer(
-        self, session_id: str, user_id: str, messages: list[dict[str, Any]]
-    ) -> None:
-        """Post-turn hook: run Observer on conversation messages.
-
-        Runs in a background thread with its own DB session.
-        No shared mutable state — observed index is DB-backed.
-        """
-        if not self.observer:
-            return
-        import threading
-
-        # Capture LLM reference (immutable) — no shared mutable state
-        llm_client = self.observer.llm
-
-        def _bg():
-            try:
-                from api.database import get_db_session
-                bg_db = next(get_db_session())
-                try:
-                    from core.memory.observer import Observer
-                    bg_observer = Observer(bg_db, llm_client=llm_client)
-                    bg_observer.observe(session_id=session_id, user_id=user_id, messages=messages)
-                finally:
-                    bg_db.close()
-            except Exception as e:
-                logger.warning(f"Observer failed (non-fatal): {e}")
-
-        threading.Thread(target=_bg, daemon=True).start()
-
     def _evaluate_hitl(self, fn_name: str, params: dict, **ctx_overrides) -> tuple[bool, str | None]:
         """Check HITL policy before tool execution.
 
@@ -1850,12 +1820,16 @@ class ChatLoop:
         if causal_chain_id:
             try:
                 from core.evaluation.multi_level_scorer import score_chain
-                score_chain(self.event_logger.session, causal_chain_id, session_id)
+                with self.event_logger._db() as _score_db:
+                    score_chain(_score_db, causal_chain_id, session_id)
             except Exception as e:
                 logger.warning("Chain-level scoring failed (non-fatal): %s", e)
-        # Post-turn: run Observer on the conversation messages
+        # Post-turn: run Observer via TurnHooks (shared with /chat/turn)
         if messages:
-            self._run_observer(session_id, user_id, messages)
+            from api.database import SessionLocal
+            from core.agent.turn_hooks import TurnHooks
+            hooks = TurnHooks(SessionLocal, llm_client=self.llm)
+            hooks.run_observer(session_id, user_id, messages)
 
     def _check_slo_escalation(self, session_id: str) -> str | None:
         """Return escalated model name if a recent SLO escalation event exists."""
@@ -1863,12 +1837,13 @@ class ChatLoop:
             return self._escalated_model
         try:
             from sqlalchemy import text
-            row = self.event_logger.session.execute(text("""
-                SELECT 1 FROM conversation_events
-                WHERE agent_id = :aid AND event_type = 'slo_model_escalation'
-                  AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
-                LIMIT 1
-            """), {"aid": self.agent_id}).fetchone()
+            with self.event_logger._db() as _slo_db:
+                row = _slo_db.execute(text("""
+                    SELECT 1 FROM conversation_events
+                    WHERE agent_id = :aid AND event_type = 'slo_model_escalation'
+                      AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                    LIMIT 1
+                """), {"aid": self.agent_id}).fetchone()
             if row and hasattr(self.llm, 'router'):
                 current = self.llm.config.get("model", "gpt-4o-mini")
                 escalated = self.llm.router.escalate(current)
