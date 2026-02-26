@@ -58,6 +58,7 @@ export NO_PROXY="${NO_PROXY:+$NO_PROXY,}localhost,127.0.0.1"
 # ── State detection helpers ─────────────────────────────────────
 
 CREDS_FILE="$HOME/.mo-agent/credentials.json"
+ADMIN_PROFILE=""  # set by step_admin, used by step_models
 
 db_reachable() {
     python3 -c "
@@ -211,6 +212,8 @@ step_admin() {
     if [ "$admin_count" -gt 0 ]; then
         ok "Admin user already exists — skipping"
         dim "  (To manage admins: mo-admin user grant-role <user> mo_agent_admin)"
+        # Try to detect admin profile from saved credentials
+        ADMIN_PROFILE=${ADMIN_PROFILE:-admin}
         return 0
     fi
 
@@ -220,6 +223,7 @@ step_admin() {
     local username password email
     ask "Admin username" "admin"
     username=$REPLY
+    ADMIN_PROFILE="$username"  # remember for step_models
 
     ask_secret "Password (min 8 chars)" "admin123"
     password=$REPLY
@@ -427,11 +431,11 @@ for r in rows:
     fi
 
     # Ensure mo-admin is authenticated before registering
-    if ! mo-admin model list >/dev/null 2>&1; then
+    if ! mo-admin --profile "$ADMIN_PROFILE" model list >/dev/null 2>&1; then
         warn "Admin session expired or not logged in"
         info "Please login as admin to register models:"
         local admin_user admin_pass
-        ask "Admin username" "admin"
+        ask "Admin username" "${ADMIN_PROFILE:-admin}"
         admin_user=$REPLY
         ask_secret "Admin password"
         admin_pass=$REPLY
@@ -439,13 +443,14 @@ for r in rows:
             err "Admin login failed — register models later with: mo-admin login && mo-admin model add"
             return 1
         fi
+        ADMIN_PROFILE="$admin_user"
         ok "Logged in as admin"
     fi
 
     info "Registering $model_name ($provider) and validating connectivity..."
     local output base_url_args=()
     [[ -n "$base_url" ]] && base_url_args=(--base-url "$base_url")
-    output=$(mo-admin model add "$model_name" "$provider" --api-key "$api_key" "${base_url_args[@]}" 2>&1) || true
+    output=$(mo-admin --profile "$ADMIN_PROFILE" model add "$model_name" "$provider" --api-key "$api_key" "${base_url_args[@]}" 2>&1) || true
     echo "$output"
 
     if echo "$output" | grep -q "INACTIVE"; then

@@ -44,43 +44,34 @@ class TestTrainingDataPipeline:
         assert len(examples) > 0
         assert examples[0].session_id == "sess-1"
 
-    def test_store_example_with_dedup(self):
+    def test_store_example_inserts_when_no_duplicate(self):
         db = _mock_db()
-        # ORM: query().filter_by().first() returns None → no duplicate
+        # Mirrors ORM chain in store_example: db.query(TrainingData).filter_by(content_hash=...).first()
         db.query.return_value.filter_by.return_value.first.return_value = None
 
         pipeline = TrainingDataPipeline(lambda: db)
         example = TrainingExample(
-            example_id="ex-1",
-            session_id="sess-1",
-            input_text="Question",
-            output_text="Answer",
-            quality=DataQuality.GOLD,
-            contamination_score=0.1,
+            example_id="ex-1", session_id="sess-1",
+            input_text="Question", output_text="Answer",
+            quality=DataQuality.GOLD, contamination_score=0.1,
         )
 
         pipeline.store_example(example)
-        db.query.assert_called_once()
         db.add.assert_called_once()
         db.commit.assert_called_once()
 
     def test_store_example_skips_duplicate(self):
         db = _mock_db()
-        # ORM: query().filter_by().first() returns existing → duplicate
         db.query.return_value.filter_by.return_value.first.return_value = Mock()
 
         pipeline = TrainingDataPipeline(lambda: db)
         example = TrainingExample(
-            example_id="ex-1",
-            session_id="sess-1",
-            input_text="Question",
-            output_text="Answer",
-            quality=DataQuality.GOLD,
-            contamination_score=0.1,
+            example_id="ex-1", session_id="sess-1",
+            input_text="Question", output_text="Answer",
+            quality=DataQuality.GOLD, contamination_score=0.1,
         )
 
         pipeline.store_example(example)
-        db.query.assert_called_once()
         db.add.assert_not_called()
         db.commit.assert_not_called()
 

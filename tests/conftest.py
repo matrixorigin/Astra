@@ -51,14 +51,23 @@ def test_engine():
     from api.database import init_db
 
     engine = database.engine
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             init_db()
+            # Verify critical tables exist — catch cases where CREATE TABLE
+            # silently failed under concurrent DDL pressure from 24 xdist workers.
+            from sqlalchemy import inspect as sa_inspect
+            tables = set(sa_inspect(engine).get_table_names(schema=engine.url.database))
+            required = {"conversation_events", "gate_results", "skill_selection_events",
+                        "skill_selection_learning", "configs"}
+            missing = required - tables
+            if missing:
+                raise RuntimeError(f"Tables missing after init_db: {missing}")
             break
         except Exception:
-            if attempt == 2:
+            if attempt == 4:
                 raise
-            time.sleep(0.5)
+            time.sleep(1.0 + attempt * 0.5)
 
     yield engine
     

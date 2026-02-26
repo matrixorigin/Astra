@@ -19,6 +19,10 @@ from core.logging_config import get_logger
 logger = get_logger(__name__)
 router = APIRouter()
 
+# Implicit-feedback signal → numeric rating for PromptFeedback
+_RATING_MAP = {"correction": 1, "frustration": 1, "rephrasing": 2,
+               "clarification": 3, "positive": 5}
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -431,6 +435,7 @@ def _build_turn_messages(
     edge_tools: list[dict[str, Any]] | None = None,
     edge_profile: dict[str, Any] | None = None,
     force_rebuild_system: bool = False,
+    username: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build LLM messages from edge turn data + server-side history.
 
@@ -464,6 +469,7 @@ def _build_turn_messages(
             session_id=session_id,
             user_id=user_id,
             edge_context=edge_ctx,
+            username=username,
         )
         system = assembled.system_message
         logger.debug("Assembled prompt: %d tokens, snapshot=%s", sum(assembled.token_breakdown.values()), assembled.snapshot_id)
@@ -550,17 +556,30 @@ def _persist_turn_events(
     full_text: str,
     tool_calls: list[dict[str, Any]],
 ) -> str | None:
-    """Persist events for this turn: user query, tool results, LLM response."""
+    """Persist events for this turn: user query, tool results, LLM response.
+
+    Also writes decision audit, skill selection, observations, and implicit feedback.
+    All writes are best-effort — failures are logged but never block the response.
+
+    NOTE: The ``db`` parameter is unused. Each write creates its own session via
+    SessionLocal because this function runs inside an async SSE generator where
+    the caller's session may already be closed. Keeping the parameter for API
+    stability with the existing call site.
+    """
+    from api.models import DecisionAudit, SkillSelectionEvent
+    from uuid_utils import uuid7
+
     context_capture_id = None
+    user_content = next((m["content"] for m in messages if m.get("role") == "user"), None)
+    tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+
     try:
         from core.events.event_logger import EventLogger
-        from uuid_utils import uuid7
         el = EventLogger(SessionLocal)
 
         # Persist user query (first user message only)
-        user_content = next((m["content"] for m in messages if m.get("role") == "user"), None)
         parent_event_id = None
-        causal_chain_id = str(uuid7())  # always generate a chain ID
+        causal_chain_id = str(uuid7())
         if user_content:
             user_ev = el.create_user_query(user_id=user_id, session_id=session_id, content=user_content)
             parent_event_id = user_ev.event_id
@@ -583,7 +602,6 @@ def _persist_turn_events(
 
         # Persist LLM response
         if full_text or tool_calls:
-            tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
             response_content = full_text
             if tc_names:
                 response_content += f"\n[tool_calls: {', '.join(tc_names)}]"
@@ -595,7 +613,8 @@ def _persist_turn_events(
                 causal_chain_id=causal_chain_id,
             )
 
-        # Context snapshot + decision audit (Task 6)
+        # Context snapshot + decision audit + skill selection event
+        # Written in a single session to keep them consistent.
         if parent_event_id:
             try:
                 from core.context.manager import ContextManager
@@ -603,74 +622,40 @@ def _persist_turn_events(
                 ctx = ctx_mgr.build_context(session_id=session_id, query=user_content or "")
                 context_capture_id = ctx_mgr.save_snapshot(ctx, session_id, parent_event_id)
 
-                # Write DecisionAudit record linking decision to snapshot
-                from api.models import DecisionAudit
-                from uuid_utils import uuid7 as _uuid7
-                tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
                 db_w = SessionLocal()
                 try:
                     db_w.add(DecisionAudit(
-                        decision_id=str(_uuid7()),
+                        decision_id=str(uuid7()),
                         session_id=session_id,
                         event_id=parent_event_id,
                         decision_type="tool_selection" if tc_names else "response_generation",
                         decision_output={"text": full_text[:500], "tool_calls": tc_names},
                         context_capture_id=context_capture_id,
                     ))
+                    if tc_names:
+                        db_w.add(SkillSelectionEvent(
+                            event_id=str(uuid7()),
+                            session_id=session_id,
+                            user_query=(user_content or "")[:2000],
+                            selected_skills=tc_names,
+                            skill_name=tc_names[0],
+                            selection_method="llm_tool_choice",
+                        ))
                     db_w.commit()
                 finally:
                     db_w.close()
             except Exception as e:
                 logger.debug("Context snapshot / decision audit skipped: %s", e)
 
-        # Skill selection event (Task 7) — record when LLM chose tool calls
-        if tool_calls and parent_event_id:
-            try:
-                from api.models import SkillSelectionEvent
-                from uuid_utils import uuid7 as _uuid7
-                tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls]
-                db_w = SessionLocal()
-                try:
-                    db_w.add(SkillSelectionEvent(
-                        event_id=str(_uuid7()),
-                        session_id=session_id,
-                        user_query=(user_content or "")[:2000],
-                        selected_skills=tc_names,
-                        skill_name=tc_names[0] if tc_names else None,
-                        selection_method="llm_tool_choice",
-                    ))
-                    db_w.commit()
-                finally:
-                    db_w.close()
-            except Exception as e:
-                logger.debug("Skill selection event skipped: %s", e)
-
-        # Observations via Observer (Task 8) — background thread
+        # Observations via Observer (background thread).
+        # Observer.observe() already guards against redundant work via
+        # observed_msg_index and a token threshold, so calling it every turn
+        # is safe — it will no-op when there's nothing new to process.
         if user_content:
-            try:
-                from core.memory.observer import Observer
-                from core.llm.client import LLMClient
-                import threading
+            _spawn_observer(session_id, user_id, messages)
 
-                llm_ref = LLMClient(SessionLocal)
-
-                def _bg_observe():
-                    try:
-                        bg_db = SessionLocal()
-                        try:
-                            Observer(bg_db, llm_client=llm_ref).observe(
-                                session_id=session_id, user_id=user_id, messages=messages,
-                            )
-                        finally:
-                            bg_db.close()
-                    except Exception as e:
-                        logger.debug("Observer failed (non-fatal): %s", e)
-
-                threading.Thread(target=_bg_observe, daemon=True).start()
-            except Exception as e:
-                logger.debug("Observer setup skipped: %s", e)
-
-        # Implicit feedback detection (Task 9) — lightweight heuristic, no LLM cost
+        # Implicit feedback detection — lightweight heuristic, zero LLM cost.
+        # Only fires when there's a prior assistant message to evaluate against.
         if user_content and len(messages) >= 2:
             try:
                 from core.context.implicit_feedback import ImplicitFeedbackDetector
@@ -680,14 +665,14 @@ def _persist_turn_events(
                 )
                 signal = ImplicitFeedbackDetector.detect(user_content, prev_assistant)
                 if signal.signal_type != "neutral":
+                    # TODO: PromptFeedback.record_feedback still uses raw SQL internally.
+                    # Convert to ORM when prompts.py is refactored.
                     from core.context.prompts import PromptFeedback
-                    rating_map = {"correction": 1, "frustration": 1, "rephrasing": 2,
-                                  "clarification": 3, "positive": 5}
                     PromptFeedback(SessionLocal).record_feedback(
                         prompt_template_id="chat_turn",
                         prompt_version="auto",
                         llm_request_id=parent_event_id or "",
-                        user_rating=rating_map.get(signal.signal_type, 3),
+                        user_rating=_RATING_MAP.get(signal.signal_type, 3),
                         user_comment=f"[implicit:{signal.signal_type}] {signal.evidence}",
                         metadata={"source": "implicit_heuristic", "confidence": str(signal.confidence)},
                     )
@@ -698,6 +683,50 @@ def _persist_turn_events(
         logger.warning("Event persistence failed (non-fatal): %s", e)
 
     return context_capture_id
+
+
+def _spawn_observer(session_id: str, user_id: str, messages: list[dict[str, Any]]) -> None:
+    """Run Observer in a background thread with its own DB session and LLM client."""
+    try:
+        from core.memory.observer import Observer
+
+        # Reuse the module-level LLM client that chat_turn already created,
+        # rather than constructing a new LLMClient (which does DB queries,
+        # config loading, and provider init on every call).
+        llm_ref = _get_shared_llm_client()
+
+        def _bg():
+            try:
+                bg_db = SessionLocal()
+                try:
+                    Observer(bg_db, llm_client=llm_ref).observe(
+                        session_id=session_id, user_id=user_id, messages=messages,
+                    )
+                finally:
+                    bg_db.close()
+            except Exception as e:
+                logger.debug("Observer failed (non-fatal): %s", e)
+
+        threading.Thread(target=_bg, daemon=True).start()
+    except Exception as e:
+        logger.debug("Observer setup skipped: %s", e)
+
+
+# Lazy-initialized shared LLM client for background tasks (Observer).
+# Avoids constructing a new LLMClient per turn (expensive: DB queries + provider init).
+_shared_llm_client = None
+_shared_llm_lock = threading.Lock()
+
+
+def _get_shared_llm_client():
+    """Get or create a shared LLMClient for background tasks."""
+    global _shared_llm_client
+    if _shared_llm_client is None:
+        with _shared_llm_lock:
+            if _shared_llm_client is None:
+                from core.llm.client import LLMClient
+                _shared_llm_client = LLMClient(SessionLocal)
+    return _shared_llm_client
 
 
 @router.post("/chat/turn")
@@ -738,6 +767,7 @@ async def chat_turn(
             edge_tools=request.edge_tools,
             edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
             force_rebuild_system=tools_changed,
+            username=current_user.get("username"),
         )
     finally:
         db.close()

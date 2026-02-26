@@ -157,12 +157,15 @@ class PromptAssembler(DbConsumer):
         user_id: str,
         edge_context: EdgeContext | None = None,
         max_tokens: int = 8000,
+        username: str | None = None,
     ) -> AssembledPrompt:
         sections: dict[str, str] = {}
         breakdown: dict[str, int] = {}
 
         # §1 Identity
         identity = self._build_identity(agent_id)
+        if username:
+            identity += f"\n\nCurrent user: {username}"
         sections["identity"] = identity
         breakdown["identity"] = _estimate_tokens(identity)
 

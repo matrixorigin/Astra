@@ -14,12 +14,15 @@ from sqlalchemy.orm import Session
 
 os.environ.setdefault("MATRIXONE_DATABASE", "test_dev_agent_v3")
 
-from api.database import SessionLocal
+
+def _session_local():
+    from api import database
+    return database.SessionLocal
 
 
 @pytest.fixture
 def db_session():
-    db = SessionLocal()
+    db = _session_local()()
     yield db
     db.rollback()
     db.close()

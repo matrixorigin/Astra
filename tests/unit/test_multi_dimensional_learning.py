@@ -6,7 +6,12 @@ from datetime import datetime, timezone, timedelta
 from core.skills.learning_signals import LearningSignal, SignalType, SignalWeights
 from core.skills.self_improving_selector import SelfImprovingSelector
 from api.models import SkillSelectionEvent as EventModel, Config
-from api.database import SessionLocal
+
+
+def _session_local():
+    """Get SessionLocal at call time (after conftest patches database.engine)."""
+    from api import database
+    return database.SessionLocal
 
 
 class TestLearningSignals:
@@ -73,7 +78,7 @@ class TestMultiDimensionalLearning:
     def selector(self, db_session):
         """Create selector with custom weights."""
         weights = SignalWeights(accuracy=0.5, speed=0.2, cost=0.2, satisfaction=0.1)
-        return SelfImprovingSelector(SessionLocal, llm_client=None, weights=weights)
+        return SelfImprovingSelector(_session_local(), llm_client=None, weights=weights)
     
 
     
@@ -89,7 +94,7 @@ class TestMultiDimensionalLearning:
         assert signal is None
 
     def test_runtime_weights_override(self, db_session):
-        selector = SelfImprovingSelector(SessionLocal, llm_client=None)
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_weights"
         ).delete()
@@ -118,7 +123,7 @@ class TestMultiDimensionalLearning:
         db_session.commit()
 
     def test_per_signal_weights_override(self, db_session):
-        selector = SelfImprovingSelector(SessionLocal, llm_client=None)
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_weights"
         ).delete()
@@ -165,7 +170,7 @@ class TestMultiDimensionalLearning:
         db_session.commit()
 
     def test_per_signal_weights_override_positive(self, db_session):
-        selector = SelfImprovingSelector(SessionLocal, llm_client=None)
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_weights"
         ).delete()
@@ -207,7 +212,7 @@ class TestMultiDimensionalLearning:
         db_session.commit()
 
     def test_per_signal_weights_partial_override(self, db_session):
-        selector = SelfImprovingSelector(SessionLocal, llm_client=None)
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_weights"
         ).delete()
@@ -249,7 +254,7 @@ class TestMultiDimensionalLearning:
         db_session.commit()
 
     def test_per_signal_weights_invalid_override(self, db_session):
-        selector = SelfImprovingSelector(SessionLocal, llm_client=None)
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_weights"
         ).delete()
@@ -291,7 +296,7 @@ class TestMultiDimensionalLearning:
         db_session.commit()
 
     def test_confidence_time_decay_blocks_match(self, db_session):
-        selector = SelfImprovingSelector(SessionLocal, llm_client=None)
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_decay"
         ).delete()
@@ -331,7 +336,7 @@ class TestMultiDimensionalLearning:
         db_session.commit()
 
     def test_per_signal_decay_blocks_match(self, db_session):
-        selector = SelfImprovingSelector(SessionLocal, llm_client=None)
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_decay"
         ).delete()
@@ -446,7 +451,7 @@ class TestMultiFactorScoring:
     @pytest.fixture
     def selector(self, db_session):
         """Create selector with default weights."""
-        return SelfImprovingSelector(SessionLocal, llm_client=None)
+        return SelfImprovingSelector(_session_local(), llm_client=None)
     
     def test_calculate_perfect_score(self, selector):
         """Test perfect score calculation."""
@@ -509,7 +514,7 @@ class TestLearningStats:
     @pytest.fixture
     def selector(self, db_session):
         """Create selector."""
-        return SelfImprovingSelector(SessionLocal, llm_client=None)
+        return SelfImprovingSelector(_session_local(), llm_client=None)
     
     def test_get_learning_stats_breakdown(self, selector, db_session):
         """Test learning stats with signal type breakdown."""
@@ -596,7 +601,7 @@ class TestSignalThresholds:
             low_satisfaction=2,  # < 2 stars
         )
         
-        selector = SelfImprovingSelector(SessionLocal, llm_client=None, thresholds=thresholds)
+        selector = SelfImprovingSelector(_session_local(), llm_client=None, thresholds=thresholds)
         
         # Test slow execution with custom threshold
         failure = {

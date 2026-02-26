@@ -31,6 +31,7 @@ docker = "^7.0.0"
 croniter = "^2.0.0"
 mcp = "^1.26.0"
 cryptography = "^42.0.0"
+openai = "^1.0.0"
 
 [tool.poetry.scripts]
 mo-agent = "cli.mo_agent_api:cli"

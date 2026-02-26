@@ -757,10 +757,11 @@ class AdversarialAttack(Base):
 class HallucinationCheck(Base):
     """Hallucination firewall verification results."""
     __tablename__ = "hallucination_checks"
-    check_id = Column(String(255), primary_key=True)
-    session_id = Column(String(255), nullable=False, index=True)
-    event_id = Column(String(255), nullable=False, index=True)
-    context_capture_id = Column(String(255), nullable=False, index=True)
+    # check_id format: "check_{event_id}" → max 42 chars; use 64 for headroom
+    check_id = Column(String(64), primary_key=True)
+    session_id = Column(String(36), nullable=False, index=True)
+    event_id = Column(String(36), nullable=False, index=True)
+    context_capture_id = Column(String(36), nullable=False, index=True)
     claims_total = Column(Integer, nullable=False, default=0)
     claims_verified = Column(Integer, nullable=False, default=0)
     claims_contradicted = Column(Integer, nullable=False, default=0)
@@ -774,13 +775,13 @@ class ClaimEvidence(Base):
     """Hallucination firewall claim evidence."""
     __tablename__ = "claim_evidence"
     evidence_id = Column(Integer, primary_key=True, autoincrement=True)
-    check_id = Column(String(255), nullable=False, index=True)
+    check_id = Column(String(64), nullable=False, index=True)
     claim_type = Column(String(50), nullable=False)
     claim_value = Column(Text, nullable=False)
     source_type = Column(String(50), nullable=False)
-    source_id = Column(String(255), nullable=False)
+    source_id = Column(String(255), nullable=False)  # file paths can be long
     content = Column(Text, nullable=False)
-    location = Column(String(500), nullable=False)
+    location = Column(String(500), nullable=False)  # "file:line" or "event:uuid"
     confidence = Column(Float, nullable=False, default=0.0)
     created_at = Column(DateTime, default=func.now())
 

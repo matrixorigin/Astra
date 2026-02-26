@@ -11,13 +11,10 @@ from sqlalchemy import text
 from core.skills.pipeline import _FeedbackBuffer, SkillPipeline, SignalType
 from core.skills.learning_signals import SignalWeights
 from api.models import SkillLearningSignal, SkillSelectionEvent, SkillSelectionLearning
-from api.database import get_db_session
 
 
-@pytest.fixture
-def db():
-    """Database session fixture."""
-    return next(get_db_session())
+# Removed local db fixture — uses conftest.db (which depends on test_engine → init_db)
+# to ensure tables exist before any test runs.
 
 
 @pytest.fixture

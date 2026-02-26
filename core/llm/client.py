@@ -182,7 +182,11 @@ class LLMClient(DbConsumer):
                         self._providers[provider_name] = OpenAIProvider(api_key, **kwargs)
                     logger.debug(f"Initialized {provider_name} provider")
                 except Exception as e:
-                    logger.warning(f"Failed to initialize {provider_name} provider: {e}")
+                    hint = ""
+                    if "No module named" in str(e):
+                        mod = str(e).split("'")[1] if "'" in str(e) else "unknown"
+                        hint = f" — fix: pip install {mod}"
+                    logger.warning(f"Failed to initialize {provider_name} provider: {e}{hint}")
 
     def _get_provider_base_url(self, provider: str) -> str | None:
         """Get base_url from llm_models table."""
@@ -441,6 +445,7 @@ class LLMClient(DbConsumer):
 
         chain = self._resolve_chain(model, task_hint=task_hint)
 
+        last_error = None
         for model_cfg in chain:
             provider_name = model_cfg.provider.value if isinstance(model_cfg.provider, LLMProvider) else str(model_cfg.provider)
             breaker = self.rate_limiter.get_breaker(provider_name)
@@ -497,10 +502,11 @@ class LLMClient(DbConsumer):
                 raise
             except Exception as e:
                 breaker.record_failure()
+                last_error = e
                 logger.warning(f"Stream {model_cfg.model_name} failed: {e}")
                 continue
 
-        raise ValueError(f"All models failed for streaming: {model}")
+        raise ValueError(f"All models failed for streaming: {model} (last error: {last_error})")
 
     async def chat_with_tools_stream(
         self,
@@ -518,6 +524,7 @@ class LLMClient(DbConsumer):
 
         chain = self._resolve_chain(model, task_hint=task_hint)
 
+        last_error = None
         for model_cfg in chain:
             provider_name = model_cfg.provider.value if isinstance(model_cfg.provider, LLMProvider) else str(model_cfg.provider)
             breaker = self.rate_limiter.get_breaker(provider_name)
@@ -539,10 +546,11 @@ class LLMClient(DbConsumer):
                 raise
             except Exception as e:
                 breaker.record_failure()
+                last_error = e
                 logger.warning(f"Stream+tools {model_cfg.model_name} failed: {e}")
                 continue
 
-        raise ValueError(f"All models failed for tools streaming: {model}")
+        raise ValueError(f"All models failed for tools streaming: {model} (last error: {last_error})")
 
     # ── Logging (#5 可观测性 & 回溯) ──────────────────────────────
 
