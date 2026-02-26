@@ -7,7 +7,7 @@ from api.database import get_db_session
 
 def test_log(db_session):
     """Test basic logging."""
-    logger = AuditLogger(db_session)
+    logger = AuditLogger(lambda: db_session)
 
     logger.log(
         user_id="admin",
@@ -26,7 +26,7 @@ def test_log(db_session):
 
 def test_log_model_add(db_session):
     """Test model addition logging."""
-    logger = AuditLogger(db_session)
+    logger = AuditLogger(lambda: db_session)
 
     logger.log_model_add("admin", "gpt-4", "global")
 
@@ -36,7 +36,7 @@ def test_log_model_add(db_session):
 
 def test_log_model_remove(db_session):
     """Test model removal logging."""
-    logger = AuditLogger(db_session)
+    logger = AuditLogger(lambda: db_session)
 
     logger.log_model_remove("admin", "gpt-4", "global")
 
@@ -46,7 +46,7 @@ def test_log_model_remove(db_session):
 
 def test_log_model_update(db_session):
     """Test model update logging."""
-    logger = AuditLogger(db_session)
+    logger = AuditLogger(lambda: db_session)
 
     logger.log_model_update("admin", "gpt-4", {"price": 0.01})
 
@@ -56,7 +56,7 @@ def test_log_model_update(db_session):
 
 def test_log_skill_register(db_session):
     """Test skill registration logging."""
-    logger = AuditLogger(db_session)
+    logger = AuditLogger(lambda: db_session)
 
     logger.log_skill_register("alice", "my_skill", "user")
 
@@ -66,7 +66,7 @@ def test_log_skill_register(db_session):
 
 def test_log_token_create(db_session):
     """Test token creation logging."""
-    logger = AuditLogger(db_session)
+    logger = AuditLogger(lambda: db_session)
 
     logger.log_token_create("admin", "llm", "openai", "global")
 
@@ -76,7 +76,7 @@ def test_log_token_create(db_session):
 
 def test_get_logs(db_session):
     """Test log retrieval."""
-    logger = AuditLogger(db_session)
+    logger = AuditLogger(lambda: db_session)
 
     # Add some logs
     logger.log_model_add("admin", "gpt-4", "global")

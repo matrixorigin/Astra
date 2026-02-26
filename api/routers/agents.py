@@ -63,7 +63,7 @@ async def create_agent(
 ):
     """创建 Agent"""
     try:
-        service = AgentService(db)
+        service = AgentService(lambda: db)
         result = service.create_agent(
             user_id=current_user["user_id"],
             name=request.name,
@@ -95,7 +95,7 @@ async def list_agents(
 ):
     """列出 Agents"""
     try:
-        service = AgentService(db)
+        service = AgentService(lambda: db)
         agents = service.list_agents(user_id=current_user["user_id"])
         return {
             "agents": agents,
@@ -121,7 +121,7 @@ async def get_agent(
 ):
     """获取 Agent"""
     try:
-        service = AgentService(db)
+        service = AgentService(lambda: db)
         result = service.get_agent(agent_id=agent_id, user_id=current_user["user_id"])
         return result
     except ValueError as e:
@@ -150,7 +150,7 @@ async def update_agent(
 ):
     """更新 Agent"""
     try:
-        service = AgentService(db)
+        service = AgentService(lambda: db)
         result = service.update_agent(
             agent_id=agent_id,
             user_id=current_user["user_id"],
@@ -185,7 +185,7 @@ async def delete_agent(
 ):
     """删除 Agent"""
     try:
-        service = AgentService(db)
+        service = AgentService(lambda: db)
         service.delete_agent(agent_id=agent_id, user_id=current_user["user_id"])
     except ValueError as e:
         raise HTTPException(

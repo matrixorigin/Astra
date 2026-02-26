@@ -6,14 +6,26 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from core.db_consumer import DbFactory
 from core.utils.id_generator import generate_log_id
 
 
 class AuditLogger:
-    """Log admin operations to audit_logs table."""
+    """Log admin operations to audit_logs table.
 
-    def __init__(self, db: Session):
-        self.db = db
+    Accepts a ``db_factory`` that returns the *current* request-scoped session.
+    The logger does NOT own the session lifecycle — the caller (FastAPI
+    dependency, background task runner, etc.) is responsible for closing it.
+    """
+
+    def __init__(self, db_factory: DbFactory):
+        if not callable(db_factory):
+            raise TypeError(f"db_factory must be callable, got {type(db_factory).__name__}")
+        self._db_factory = db_factory
+
+    @property
+    def db(self) -> Session:
+        return self._db_factory()
 
     def log(
         self,
@@ -25,14 +37,14 @@ class AuditLogger:
         status: str = "success",
     ):
         """Log an admin operation."""
-        # Generate log_id
         log_id = f"log_{generate_log_id()}"
 
         from sqlalchemy import insert
 
         from api.models import AuditLog
 
-        self.db.execute(
+        db = self.db
+        db.execute(
             insert(AuditLog).values(
                 log_id=log_id,
                 user_id=user_id,
@@ -43,7 +55,7 @@ class AuditLogger:
                 created_at=datetime.now(),
             )
         )
-        self.db.commit()
+        db.commit()
 
     def log_model_add(self, user_id: str, model_name: str, scope: str, scope_id: str | None = None):
         """Log model addition."""
@@ -106,7 +118,6 @@ class AuditLogger:
         limit: int = 100,
     ):
         """Query audit logs."""
-
         conditions = []
         params = {}
 

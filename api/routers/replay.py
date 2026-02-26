@@ -57,7 +57,7 @@ async def replay_session(
 ):
     """重放会话"""
     try:
-        service = ReplayService(db)
+        service = ReplayService(lambda: db)
         result = service.replay_session(
             session_id=session_id,
             user_id=current_user["user_id"],
@@ -98,7 +98,7 @@ async def compare_replay(
     注意：这是简化版本，实际需要先执行重放再对比
     """
     try:
-        service = ReplayService(db)
+        service = ReplayService(lambda: db)
 
         # 先执行重放
         replay_result = service.replay_session(

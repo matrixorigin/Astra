@@ -27,7 +27,7 @@ def db_session():
 @pytest.fixture(autouse=True)
 def cleanup_test_users(db_session):
     """Clean up test users before and after each test."""
-    repo = UserRepository(db_session)
+    repo = UserRepository(lambda: db_session)
     
     # Clean before
     test_usernames = ["testuser", "existing", "loginuser", "refreshuser", "logoutuser"]

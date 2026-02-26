@@ -17,7 +17,7 @@ def _get_worker_suffix():
 @pytest.fixture
 def test_user(db_session):
     """Create a test user for API tests (worker-isolated)."""
-    repo = UserRepository(db_session)
+    repo = UserRepository(lambda: db_session)
     
     # Use worker-specific username/email to avoid conflicts
     worker_suffix = _get_worker_suffix()
@@ -110,7 +110,7 @@ def test_session(db_session, test_user):
     from api.repositories.session_repository import SessionRepository
     from uuid import uuid4
     
-    repo = SessionRepository(db_session)
+    repo = SessionRepository(lambda: db_session)
     session_data = {
         "session_id": str(uuid4()),
         "user_id": test_user.user_id,

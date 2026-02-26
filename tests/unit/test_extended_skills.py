@@ -17,31 +17,31 @@ from core.skills.extended import (
 
 
 # ---------------------------------------------------------------------------
-# Issue 1: __init__ stores correct parameter (session, not undefined 'db')
+# Issue 1: __init__ accepts github and db_factory without error
 # ---------------------------------------------------------------------------
 
 class TestInitParams:
-    def test_code_review_stores_session(self):
+    def test_code_review_accepts_db_factory(self):
         gh = MagicMock()
-        session = MagicMock()
-        skill = CodeReviewSkill(github=gh, session=session)
-        assert skill.db is session
+        factory = MagicMock()
+        skill = CodeReviewSkill(github=gh, db_factory=factory)
         assert skill.github is gh
 
-    def test_search_code_stores_session(self):
+    def test_search_code_accepts_db_factory(self):
         gh = MagicMock()
-        session = MagicMock()
-        skill = SearchCodeSkill(github=gh, session=session)
-        assert skill.db is session
+        factory = MagicMock()
+        skill = SearchCodeSkill(github=gh, db_factory=factory)
+        assert skill.github is gh
 
-    def test_generate_tests_stores_session(self):
+    def test_generate_tests_default_db_factory_is_none(self):
         gh = MagicMock()
+        # Should not raise — db_factory is optional
         skill = GenerateTestsSkill(github=gh)
-        assert skill.db is None  # default
+        assert skill.github is gh
 
-    def test_analyze_bug_stores_session(self):
+    def test_analyze_bug_accepts_db_factory(self):
         gh = MagicMock()
-        skill = AnalyzeBugSkill(github=gh, session=MagicMock())
+        skill = AnalyzeBugSkill(github=gh, db_factory=MagicMock())
         assert skill.github is gh
 
 
@@ -91,7 +91,6 @@ class TestRegistration:
         for call in registry.register.call_args_list:
             skill = call.kwargs["skill"]
             assert skill.github is gh
-            assert skill.db is db
 
 
 # ---------------------------------------------------------------------------

@@ -65,7 +65,7 @@ async def create_session(
 ):
     """创建 Session"""
     try:
-        service = SessionService(db)
+        service = SessionService(lambda: db)
         result = service.create_session(
             user_id=current_user["user_id"],
             agent_id=request.agent_id,
@@ -101,7 +101,7 @@ async def list_sessions(
 ):
     """列出 Sessions"""
     try:
-        service = SessionService(db)
+        service = SessionService(lambda: db)
         result = service.list_sessions(
             user_id=current_user["user_id"],
             agent_id=agent_id,
@@ -130,7 +130,7 @@ async def get_session(
 ):
     """获取 Session"""
     try:
-        service = SessionService(db)
+        service = SessionService(lambda: db)
         result = service.get_session(session_id=session_id, user_id=current_user["user_id"])
         return result
     except ValueError as e:
@@ -159,7 +159,7 @@ async def update_session(
 ):
     """更新 Session"""
     try:
-        service = SessionService(db)
+        service = SessionService(lambda: db)
         result = service.update_session(
             session_id=session_id,
             user_id=current_user["user_id"],
@@ -193,7 +193,7 @@ async def delete_session(
 ):
     """删除 Session"""
     try:
-        service = SessionService(db)
+        service = SessionService(lambda: db)
         service.delete_session(session_id=session_id, user_id=current_user["user_id"])
     except ValueError as e:
         raise HTTPException(
@@ -220,7 +220,7 @@ async def close_session(
 ):
     """关闭 Session"""
     try:
-        service = SessionService(db)
+        service = SessionService(lambda: db)
         result = service.update_session(
             session_id=session_id,
             user_id=current_user["user_id"],

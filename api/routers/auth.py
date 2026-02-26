@@ -20,7 +20,7 @@ router = APIRouter(tags=["authentication"])
 def register(request: RegisterRequest, db: Session = Depends(get_db_session)):
     """Register a new user. First user automatically becomes admin."""
     from sqlalchemy import text
-    repo = UserRepository(db)
+    repo = UserRepository(lambda: db)
 
     # Check if username exists
     if repo.get_by_username(request.username):
@@ -68,7 +68,7 @@ def register(request: RegisterRequest, db: Session = Depends(get_db_session)):
 @router.post("/login", response_model=TokenResponse)
 def login(request: LoginRequest, db: Session = Depends(get_db_session)):
     """Login and get tokens."""
-    repo = UserRepository(db)
+    repo = UserRepository(lambda: db)
 
     # Get user
     user = repo.get_by_username(request.username)
@@ -107,7 +107,7 @@ def login(request: LoginRequest, db: Session = Depends(get_db_session)):
 @router.post("/refresh", response_model=TokenResponse)
 def refresh(request: RefreshRequest, db: Session = Depends(get_db_session)):
     """Refresh access token."""
-    repo = UserRepository(db)
+    repo = UserRepository(lambda: db)
 
     # Verify refresh token
     try:
@@ -168,7 +168,7 @@ def refresh(request: RefreshRequest, db: Session = Depends(get_db_session)):
 @router.post("/logout")
 def logout(request: RefreshRequest, db: Session = Depends(get_db_session)):
     """Logout and revoke refresh token."""
-    repo = UserRepository(db)
+    repo = UserRepository(lambda: db)
 
     import hashlib
     token_hash = hashlib.sha256(request.refresh_token.encode()).hexdigest()
@@ -183,7 +183,7 @@ def get_current_user_info(
     current_user: dict = Depends(get_current_user),
 ):
     """Get current user information."""
-    repo = UserRepository(db)
+    repo = UserRepository(lambda: db)
     user = repo.get_by_id(current_user["user_id"])
     
     if not user:

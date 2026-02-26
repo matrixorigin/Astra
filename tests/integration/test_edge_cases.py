@@ -12,12 +12,12 @@ from api.repositories.event_repository import EventRepository
 
 @pytest.fixture
 def session_repo(db_session):
-    return SessionRepository(db_session)
+    return SessionRepository(lambda: db_session)
 
 
 @pytest.fixture
 def event_repo(db_session):
-    return EventRepository(db_session)
+    return EventRepository(lambda: db_session)
 
 
 def test_event_with_full_metadata(session_repo, event_repo):

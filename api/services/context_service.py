@@ -8,21 +8,24 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
-# from sqlalchemy.orm import Session
 from api.repositories import EventRepository, SessionRepository
 from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
+from core.db_consumer import DbFactory
 
 
 class ContextService:
     """Context 业务服务"""
 
-    def __init__(self, db_session: Session):
-        self.db_session = db_session
-        self.session_repo = SessionRepository(db_session)
-        self.event_repo = EventRepository(db_session)
-        # self.db = next(get_db_session())
-        self.audit = AuditLogger(db_session)
+    def __init__(self, db_factory: DbFactory):
+        self._db_factory = db_factory
+        self.session_repo = SessionRepository(db_factory)
+        self.event_repo = EventRepository(db_factory)
+        self.audit = AuditLogger(db_factory)
+
+    @property
+    def db_session(self) -> Session:
+        return self._db_factory()
 
     def create_snapshot(
         self,
@@ -39,9 +42,10 @@ class ContextService:
 
         try:
             context_capture_id = str(uuid7())
+            db = self.db_session
 
             # 插入快照 - 使用实际的表字段
-            self.db_session.execute(
+            db.execute(
                 text("""
                 INSERT INTO context_snapshots
                 (context_capture_id, session_id, event_id, system_prompt, skill_definitions,
@@ -68,7 +72,7 @@ class ContextService:
                     "created_at": datetime.now(timezone.utc)
                 }
             )
-            self.db_session.commit()
+            db.commit()
 
             # 审计日志
             self.audit.log(
@@ -162,13 +166,14 @@ class ContextService:
     ) -> dict[str, Any]:
         """列出上下文快照"""
         try:
+            db = self.db_session
             if session_id:
                 # 验证权限
                 session = self.session_repo.get_by_id(session_id)
                 if not session or session.user_id != user_id:
                     raise PermissionDeniedError(f"无权限访问 Session {session_id}")
 
-                result = self.db_session.execute(
+                result = db.execute(
                     text("""
                         SELECT context_capture_id, session_id, event_id, created_at
                         FROM context_snapshots
@@ -180,13 +185,13 @@ class ContextService:
                 )
                 snapshots = [dict(row._mapping) for row in result]
 
-                count_result = self.db_session.execute(
+                count_result = db.execute(
                     text("SELECT COUNT(*) as total FROM context_snapshots WHERE session_id = :session_id"),
                     {"session_id": session_id}
                 )
                 total = count_result.first()._mapping["total"]
             else:
-                result = self.db_session.execute(
+                result = db.execute(
                     text("""
                         SELECT cs.context_capture_id, cs.session_id, cs.event_id, cs.created_at
                         FROM context_snapshots cs
@@ -199,7 +204,7 @@ class ContextService:
                 )
                 snapshots = [dict(row._mapping) for row in result]
 
-                count_result = self.db_session.execute(
+                count_result = db.execute(
                     text("""
                         SELECT COUNT(*) as total
                         FROM context_snapshots cs

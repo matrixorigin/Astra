@@ -54,7 +54,7 @@ async def create_sandbox(
     需要权限: mo_agent_user
     """
     try:
-        service = SandboxService(db)
+        service = SandboxService(lambda: db)
         result = service.create_sandbox(
             name=request.name,
             user_id=current_user["user_id"],
@@ -98,7 +98,7 @@ async def list_sandboxes(
         pattern: 过滤模式 (SQL LIKE pattern)
     """
     try:
-        service = SandboxService(db)
+        service = SandboxService(lambda: db)
         sandboxes = service.list_sandboxes(
             user_id=current_user["user_id"],
             pattern=pattern
@@ -135,7 +135,7 @@ async def get_sandbox(
     需要权限: mo_agent_user (且是创建者或 admin)
     """
     try:
-        service = SandboxService(db)
+        service = SandboxService(lambda: db)
         return service.get_sandbox_info(name, current_user["user_id"])
     except PermissionError as e:
         raise HTTPException(
@@ -170,7 +170,7 @@ async def delete_sandbox(
     需要权限: mo_agent_user (且是创建者或 admin)
     """
     try:
-        service = SandboxService(db)
+        service = SandboxService(lambda: db)
         service.delete_sandbox(name, current_user["user_id"])
         return None
     except PermissionError as e:

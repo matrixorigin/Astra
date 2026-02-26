@@ -8,20 +8,18 @@ from api.repositories import EventRepository, SessionRepository
 from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
-
-# from sqlalchemy.orm import Session
+from core.db_consumer import DbFactory
 
 
 class EventService:
     """Event 业务服务"""
 
-    def __init__(self, db_session: Session):
-        self.db_session = db_session
-        self.event_repo = EventRepository(db_session)
-        self.session_repo = SessionRepository(db_session)
-        # self.db = next(get_db_session())  # For audit and permission
-        self.audit = AuditLogger(db_session)
-        self.permission = PermissionChecker(lambda: db_session)
+    def __init__(self, db_factory: DbFactory):
+        self._db_factory = db_factory
+        self.event_repo = EventRepository(db_factory)
+        self.session_repo = SessionRepository(db_factory)
+        self.audit = AuditLogger(db_factory)
+        self.permission = PermissionChecker(db_factory)
 
     def create_event(
         self,

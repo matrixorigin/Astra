@@ -1,5 +1,6 @@
 """User repository with SQLAlchemy."""
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -10,21 +11,28 @@ from api.models import UserRole as UserRoleModel
 
 
 class UserRepository:
-    """Repository for user operations."""
+    """Repository for user operations.
 
-    def __init__(self, db: Session):
-        self.db = db
+    Accepts a ``db_factory`` that returns the *current* request-scoped session.
+    See ``AgentRepository`` for the db_factory contract.
+    """
+
+    def __init__(self, db_factory: Callable[[], Session]):
+        self._db_factory = db_factory
+
+    @property
+    def db(self) -> Session:
+        return self._db_factory()
 
     def create(self, user_data: dict) -> UserModel:
         """Create user."""
-        # Set default values for required fields
         if 'is_active' not in user_data:
             user_data['is_active'] = True
-
+        db = self.db
         user = UserModel(**user_data)
-        self.db.add(user)
-        self.db.commit()
-        self.db.refresh(user)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
         return user
 
     def get_by_id(self, user_id: str) -> UserModel | None:
@@ -41,16 +49,18 @@ class UserRepository:
 
     def update_last_login(self, user_id: str) -> None:
         """Update last login time."""
-        self.db.query(UserModel).filter(UserModel.user_id == user_id).update({
+        db = self.db
+        db.query(UserModel).filter(UserModel.user_id == user_id).update({
             "last_login_at": datetime.now(timezone.utc)
         })
-        self.db.commit()
+        db.commit()
 
     def store_refresh_token(self, token_data: dict) -> RefreshTokenModel:
         """Store refresh token."""
+        db = self.db
         token = RefreshTokenModel(**token_data)
-        self.db.add(token)
-        self.db.commit()
+        db.add(token)
+        db.commit()
         return token
 
     def get_refresh_token(self, token_hash: str) -> RefreshTokenModel | None:
@@ -62,28 +72,18 @@ class UserRepository:
 
     def revoke_refresh_token(self, token_hash: str) -> bool:
         """Revoke refresh token."""
-        result = self.db.query(RefreshTokenModel).filter(
+        db = self.db
+        result = db.query(RefreshTokenModel).filter(
             RefreshTokenModel.token_hash == token_hash
         ).update({"is_revoked": 1})
-        self.db.commit()
+        db.commit()
         return result > 0
 
     def delete(self, user_id: str) -> bool:
         """Delete user and all related tokens."""
-        # Delete refresh tokens first
-        self.db.query(RefreshTokenModel).filter(
-            RefreshTokenModel.user_id == user_id
-        ).delete()
-
-        # Delete role assignments
-        self.db.query(UserRoleModel).filter(
-            UserRoleModel.user_id == user_id
-        ).delete()
-
-        # Delete user
-        result = self.db.query(UserModel).filter(
-            UserModel.user_id == user_id
-        ).delete()
-
-        self.db.commit()
+        db = self.db
+        db.query(RefreshTokenModel).filter(RefreshTokenModel.user_id == user_id).delete()
+        db.query(UserRoleModel).filter(UserRoleModel.user_id == user_id).delete()
+        result = db.query(UserModel).filter(UserModel.user_id == user_id).delete()
+        db.commit()
         return result > 0

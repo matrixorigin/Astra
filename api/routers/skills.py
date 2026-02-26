@@ -62,7 +62,7 @@ async def register_skill(
 ):
     """注册技能"""
     try:
-        service = SkillService(db)
+        service = SkillService(lambda: db)
         result = service.register_skill(
             user_id=current_user["user_id"],
             skill_id=request.skill_id,
@@ -92,7 +92,7 @@ async def list_skills(
     current_user: dict = Depends(get_current_user)
 ):
     """列出技能"""
-    service = SkillService(db)
+    service = SkillService(lambda: db)
     return service.list_skills(limit=limit, offset=offset)
 
 
@@ -109,7 +109,7 @@ async def get_skill(
 ):
     """获取技能"""
     try:
-        service = SkillService(db)
+        service = SkillService(lambda: db)
         return service.get_skill(skill_id=skill_id, version=version)
     except ResourceNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -126,5 +126,5 @@ async def list_skill_versions(
     current_user: dict = Depends(get_current_user)
 ):
     """列出技能版本"""
-    service = SkillService(db)
+    service = SkillService(lambda: db)
     return service.list_skill_versions(skill_id=skill_id)

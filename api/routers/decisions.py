@@ -70,7 +70,7 @@ async def record_decision(
 ):
     """记录决策"""
     try:
-        service = DecisionService(db)
+        service = DecisionService(lambda: db)
         result = service.record_decision(
             user_id=current_user["user_id"],
             session_id=request.session_id,
@@ -104,7 +104,7 @@ async def list_decisions(
     current_user: dict = Depends(get_current_user)
 ):
     """列出决策"""
-    service = DecisionService(db)
+    service = DecisionService(lambda: db)
     return service.list_decisions(
         user_id=current_user["user_id"],
         session_id=session_id,
@@ -126,7 +126,7 @@ async def get_decision(
 ):
     """获取决策"""
     try:
-        service = DecisionService(db)
+        service = DecisionService(lambda: db)
         return service.get_decision(
             decision_id=decision_id,
             user_id=current_user["user_id"]
@@ -147,7 +147,7 @@ async def audit_decision(
 ):
     """获取决策及其完整上下文，用于审计"""
     try:
-        service = DecisionService(db)
+        service = DecisionService(lambda: db)
         return service.get_decision_with_context(
             decision_id=decision_id,
             user_id=current_user["user_id"]

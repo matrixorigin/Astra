@@ -78,7 +78,7 @@ class TestCreateEvent:
         from core.auth.password import hash_password
         from uuid import uuid4
         
-        repo = UserRepository(db_session)
+        repo = UserRepository(lambda: db_session)
         
         # Clean up first
         existing = repo.get_by_username("otheruser")

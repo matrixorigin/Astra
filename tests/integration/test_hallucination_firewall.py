@@ -13,13 +13,13 @@ from core.verification.claim_extractor import ClaimExtractor
 @pytest.fixture
 def session_repo(db_session):
     """Session repository fixture."""
-    return SessionRepository(db_session)
+    return SessionRepository(lambda: db_session)
 
 
 @pytest.fixture
 def event_repo(db_session):
     """Event repository fixture."""
-    return EventRepository(db_session)
+    return EventRepository(lambda: db_session)
 
 
 @pytest.fixture

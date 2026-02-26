@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from api.repositories import AgentRepository
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
+from core.db_consumer import DbFactory
 
 
 class CreateAgentRequest(BaseModel):
@@ -80,11 +81,11 @@ class UpdateAgentRequest(BaseModel):
 class AgentService:
     """Agent 业务服务"""
 
-    def __init__(self, db_session: Session):
-        self.db_session = db_session
-        self.agent_repo = AgentRepository(db_session)
-        self.audit = AuditLogger(db_session)
-        self.permission = PermissionChecker(lambda: db_session)
+    def __init__(self, db_factory: DbFactory):
+        self._db_factory = db_factory
+        self.agent_repo = AgentRepository(db_factory)
+        self.audit = AuditLogger(db_factory)
+        self.permission = PermissionChecker(db_factory)
 
     def create_agent(
         self,

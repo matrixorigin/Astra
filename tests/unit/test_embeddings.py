@@ -77,8 +77,8 @@ def test_cosine_similarity(db, db_factory):
     from api.repositories.session_repository import SessionRepository
     from api.repositories.event_repository import EventRepository
 
-    session_repo = SessionRepository(db)
-    event_repo = EventRepository(db)
+    session_repo = SessionRepository(lambda: db)
+    event_repo = EventRepository(lambda: db)
 
     user_id = str(uuid4())
     session_id = str(uuid4())
@@ -134,8 +134,8 @@ def test_search_similar(db, db_factory):
     from api.repositories.session_repository import SessionRepository
     from api.repositories.event_repository import EventRepository
 
-    session_repo = SessionRepository(db)
-    event_repo = EventRepository(db)
+    session_repo = SessionRepository(lambda: db)
+    event_repo = EventRepository(lambda: db)
 
     user_id = str(uuid4())
     session_id = str(uuid4())
@@ -191,8 +191,8 @@ def test_search_with_json_extract_filter(db, db_factory):
     from api.repositories.session_repository import SessionRepository
     from api.repositories.event_repository import EventRepository
 
-    session_repo = SessionRepository(db)
-    event_repo = EventRepository(db)
+    session_repo = SessionRepository(lambda: db)
+    event_repo = EventRepository(lambda: db)
 
     user_id = str(uuid4())
     session_id = str(uuid4())

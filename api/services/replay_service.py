@@ -19,6 +19,7 @@ from uuid_utils import uuid7
 from api.repositories import EventRepository, SessionRepository
 from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
+from core.db_consumer import DbFactory
 from core.skills.mocking import MockMode, ToolMockingLayer
 
 
@@ -31,16 +32,16 @@ class ReplayService:
     - _replay_event: Replay single event (internal method)
     """
 
-    def __init__(self, db_session: Session):
-        """Initialize Replay service
-        
+    def __init__(self, db_factory: DbFactory):
+        """Initialize Replay service.
+
         Args:
-            db_session: SQLAlchemy database session
+            db_factory: Callable that returns the current request-scoped Session.
         """
-        self.db_session = db_session
-        self.session_repo = SessionRepository(db_session)
-        self.event_repo = EventRepository(db_session)
-        self.audit = AuditLogger(db_session)
+        self._db_factory = db_factory
+        self.session_repo = SessionRepository(db_factory)
+        self.event_repo = EventRepository(db_factory)
+        self.audit = AuditLogger(db_factory)
 
     def replay_session(
         self,

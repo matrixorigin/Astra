@@ -1,5 +1,7 @@
 """Decision repository for ORM-based data access."""
 
+from collections.abc import Callable
+
 from sqlalchemy.orm import Session as DBSession
 
 from api.models import DecisionAudit as DecisionModel
@@ -8,15 +10,20 @@ from api.models import DecisionAudit as DecisionModel
 class DecisionRepository:
     """Repository for decision audit operations."""
 
-    def __init__(self, db: DBSession):
-        self.db = db
+    def __init__(self, db_factory: Callable[[], DBSession]):
+        self._db_factory = db_factory
+
+    @property
+    def db(self) -> DBSession:
+        return self._db_factory()
 
     def create(self, decision_data: dict) -> DecisionModel:
         """Create decision record."""
+        db = self.db
         decision = DecisionModel(**decision_data)
-        self.db.add(decision)
-        self.db.commit()
-        self.db.refresh(decision)
+        db.add(decision)
+        db.commit()
+        db.refresh(decision)
         return decision
 
     def get_by_id(self, decision_id: str) -> DecisionModel | None:
@@ -28,7 +35,6 @@ class DecisionRepository:
     def get_by_id_with_user(self, decision_id: str, user_id: str) -> DecisionModel | None:
         """Get decision with user ownership check via session join."""
         from api.models import Session as SessionModel
-
         return self.db.query(DecisionModel).join(
             SessionModel,
             DecisionModel.session_id == SessionModel.session_id
@@ -47,13 +53,8 @@ class DecisionRepository:
         query = self.db.query(DecisionModel).filter(
             DecisionModel.session_id == session_id
         )
-
         total = query.count()
-
-        query = query.order_by(DecisionModel.created_at.desc())
-        query = query.offset(offset).limit(limit)
-
-        return query.all(), total
+        return query.order_by(DecisionModel.created_at.desc()).offset(offset).limit(limit).all(), total
 
     def list_by_user(
         self,
@@ -64,20 +65,11 @@ class DecisionRepository:
     ) -> tuple[list[DecisionModel], int]:
         """List decisions by user with optional type filter."""
         from api.models import Session as SessionModel
-
         query = self.db.query(DecisionModel).join(
             SessionModel,
             DecisionModel.session_id == SessionModel.session_id
-        ).filter(
-            SessionModel.user_id == user_id
-        )
-
+        ).filter(SessionModel.user_id == user_id)
         if decision_type:
             query = query.filter(DecisionModel.decision_type == decision_type)
-
         total = query.count()
-
-        query = query.order_by(DecisionModel.created_at.desc())
-        query = query.offset(offset).limit(limit)
-
-        return query.all(), total
+        return query.order_by(DecisionModel.created_at.desc()).offset(offset).limit(limit).all(), total

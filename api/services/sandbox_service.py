@@ -13,23 +13,24 @@ from sqlalchemy.orm import Session
 
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
+from core.db_consumer import DbFactory
 from core.sandbox import Sandbox
 
 
 class SandboxService:
     """Sandbox 业务服务"""
 
-    def __init__(self, db_session: Session):
-        """初始化服务
-        
+    def __init__(self, db_factory: DbFactory):
+        """Initialize service.
+
         Args:
-            db_session: SQLAlchemy session
+            db_factory: Callable that returns the current request-scoped Session.
         """
-        self.db_session = db_session
+        self._db_factory = db_factory
         from config.settings import get_settings
-        self.sandbox = Sandbox(db_factory=lambda: db_session, source_db=get_settings().matrixone_database)
-        self.audit = AuditLogger(db_session)
-        self.permission = PermissionChecker(lambda: db_session)
+        self.sandbox = Sandbox(db_factory=db_factory, source_db=get_settings().matrixone_database)
+        self.audit = AuditLogger(db_factory)
+        self.permission = PermissionChecker(db_factory)
 
     def create_sandbox(
         self,

@@ -9,14 +9,26 @@ from sqlalchemy.orm import Session
 from api.models import SkillRegistry
 from api.services.exceptions import ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
+from core.db_consumer import DbFactory
 
 
 class SkillService:
     """Skill 业务服务"""
 
-    def __init__(self, db_session: Session):
-        self.db_session = db_session
-        self.audit = AuditLogger(db_session)
+    def __init__(self, db_factory: DbFactory):
+        self._db_factory = db_factory
+        self.audit = AuditLogger(db_factory)
+
+    @property
+    def db_session(self) -> Session:
+        """Return the current request-scoped session.
+
+        The factory always returns the same Session within a single HTTP
+        request, so multiple accesses per method are safe.  Methods that
+        perform multi-step mutations still capture the session in a local
+        variable to make the single-session assumption explicit.
+        """
+        return self._db_factory()
 
     def register_skill(
         self,
@@ -29,16 +41,15 @@ class SkillService:
         metadata: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """注册技能"""
+        db = self.db_session
         try:
             code_hash = hashlib.sha256(skill_code.encode()).hexdigest()
 
             # 停用旧版本
-            self.db_session.query(SkillRegistry).filter(
+            db.query(SkillRegistry).filter(
                 SkillRegistry.skill_name == skill_name
             ).update({"is_active": 0})
 
-            # 插入新版本
-            # Map requirements/metadata to skill_definition
             skill_definition = metadata or {}
 
             new_skill = SkillRegistry(
@@ -49,7 +60,6 @@ class SkillService:
                 skill_definition=skill_definition,
                 code_hash=code_hash,
                 is_active=1,
-                # status field does not exist in model
                 category=skill_definition.get("category", "general"),
                 subcategory="default",
                 triggers=[],
@@ -59,9 +69,9 @@ class SkillService:
                 side_effect_profile={"category": "read"}
             )
 
-            self.db_session.add(new_skill)
-            self.db_session.commit()
-            self.db_session.refresh(new_skill)
+            db.add(new_skill)
+            db.commit()
+            db.refresh(new_skill)
 
             self.audit.log(
                 user_id=user_id,
@@ -82,7 +92,7 @@ class SkillService:
             }
 
         except Exception as e:
-            self.db_session.rollback()
+            db.rollback()
             self.audit.log(
                 user_id=user_id,
                 action="skill_register",

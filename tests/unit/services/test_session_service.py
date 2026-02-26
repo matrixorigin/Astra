@@ -11,7 +11,7 @@ def service():
     with patch("api.services.session_service.SessionRepository"), \
          patch("api.services.session_service.AuditLogger"), \
          patch("api.services.session_service.PermissionChecker"):
-        return SessionService(db)
+        return SessionService(lambda: db)
 
 
 class TestCleanupSandbox:

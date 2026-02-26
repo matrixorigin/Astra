@@ -29,7 +29,7 @@ def get_current_user(
             raise HTTPException(status_code=401, detail="Invalid token")
 
         # Verify user exists
-        repo = UserRepository(db)
+        repo = UserRepository(lambda: db)
         user = repo.get_by_id(user_id)
 
         if not user:

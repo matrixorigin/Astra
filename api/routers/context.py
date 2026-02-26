@@ -51,7 +51,7 @@ async def create_snapshot(
 ):
     """创建上下文快照"""
     try:
-        service = ContextService(db)
+        service = ContextService(lambda: db)
         result = service.create_snapshot(
             user_id=current_user["user_id"],
             session_id=request.session_id,
@@ -82,7 +82,7 @@ async def list_snapshots(
 ):
     """列出上下文快照"""
     try:
-        service = ContextService(db)
+        service = ContextService(lambda: db)
         return service.list_snapshots(
             user_id=current_user["user_id"],
             session_id=session_id,
@@ -105,7 +105,7 @@ async def get_snapshot(
 ):
     """获取上下文快照"""
     try:
-        service = ContextService(db)
+        service = ContextService(lambda: db)
         return service.get_snapshot(
             context_capture_id=context_capture_id,
             user_id=current_user["user_id"]

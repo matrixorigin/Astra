@@ -4,7 +4,6 @@ from typing import Any
 
 from core.skills.base import AccessScope, RepoType, Skill, SkillInput, SkillOutput, SkillRequirement
 from core.skills.github_client import GitHubClient
-from sqlalchemy.orm import Session
 
 # ============================================================================
 # Code Review Skill
@@ -30,8 +29,8 @@ class CodeReviewSkill(Skill):
     input_schema = CodeReviewInput
     output_schema = CodeReviewOutput
 
-    def __init__(self, github: GitHubClient, session: Session | None = None):
-        self.db = session
+    def __init__(self, github: GitHubClient, db_factory=None):
+        self._db_factory = db_factory
         self.github = github
 
     async def execute(self, input: CodeReviewInput) -> CodeReviewOutput:  # type: ignore[override]
@@ -73,8 +72,8 @@ class SearchCodeSkill(Skill):
     input_schema = SearchCodeInput
     output_schema = SearchCodeOutput
 
-    def __init__(self, github: GitHubClient, session: Session | None = None):
-        self.db = session
+    def __init__(self, github: GitHubClient, db_factory=None):
+        self._db_factory = db_factory
         self.github = github
 
     async def execute(self, input: SearchCodeInput) -> SearchCodeOutput:
@@ -106,8 +105,8 @@ class GenerateTestsSkill(Skill):
     input_schema = GenerateTestsInput
     output_schema = GenerateTestsOutput
 
-    def __init__(self, github: GitHubClient, session: Session | None = None):
-        self.db = session
+    def __init__(self, github: GitHubClient, db_factory=None):
+        self._db_factory = db_factory
         self.github = github
 
     async def execute(self, input: GenerateTestsInput) -> GenerateTestsOutput:
@@ -138,8 +137,8 @@ class AnalyzeBugSkill(Skill):
     input_schema = AnalyzeBugInput
     output_schema = AnalyzeBugOutput
 
-    def __init__(self, github: GitHubClient, session: Session | None = None):
-        self.db = session
+    def __init__(self, github: GitHubClient, db_factory=None):
+        self._db_factory = db_factory
         self.github = github
 
     async def execute(self, input: AnalyzeBugInput) -> AnalyzeBugOutput:

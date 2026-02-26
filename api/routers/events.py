@@ -65,7 +65,7 @@ async def create_event(
 ):
     """创建 Event"""
     try:
-        service = EventService(db)
+        service = EventService(lambda: db)
         result = service.create_event(
             user_id=current_user["user_id"],
             session_id=request.session_id,
@@ -128,7 +128,7 @@ async def list_events(
 ):
     """列出 Events"""
     try:
-        service = EventService(db)
+        service = EventService(lambda: db)
         result = service.list_events(
             user_id=current_user["user_id"],
             session_id=session_id,
@@ -159,7 +159,7 @@ async def get_event(
 ):
     """获取 Event"""
     try:
-        service = EventService(db)
+        service = EventService(lambda: db)
         result = service.get_event(event_id=event_id, user_id=current_user["user_id"])
         return result
     except ResourceNotFoundError as e:
@@ -197,7 +197,7 @@ async def get_causal_chain(
 ):
     """获取因果链"""
     try:
-        service = EventService(db)
+        service = EventService(lambda: db)
         result = service.get_causal_chain(
             causal_chain_id=causal_chain_id,
             user_id=current_user["user_id"]
@@ -225,7 +225,7 @@ async def get_session_events(
 ):
     """获取Session事件"""
     try:
-        service = EventService(db)
+        service = EventService(lambda: db)
         result = service.get_session_events(
             session_id=session_id,
             user_id=current_user["user_id"],
@@ -268,7 +268,7 @@ async def delete_event(
 ):
     """删除 Event"""
     try:
-        service = EventService(db)
+        service = EventService(lambda: db)
         service.delete_event(event_id=event_id, user_id=current_user["user_id"])
     except ResourceNotFoundError as e:
         raise HTTPException(

@@ -21,7 +21,7 @@ def db_session():
 @pytest.fixture
 def event_repo(db_session: Session):
     """Create EventRepository with real database session."""
-    return EventRepository(db_session)
+    return EventRepository(lambda: db_session)
 
 
 class TestEventRepositoryIntegration:

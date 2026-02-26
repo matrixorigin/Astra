@@ -5,21 +5,24 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-# from sqlalchemy.orm import Session
 from api.repositories import SessionRepository
 from core.auth.audit_logger import AuditLogger
 from core.auth.permission_checker import PermissionChecker
+from core.db_consumer import DbFactory
 
 
 class SessionService:
     """Session 业务服务"""
 
-    def __init__(self, db_session: Session):
-        self.db_session = db_session
-        self.session_repo = SessionRepository(db_session)
-        # self.db = next(get_db_session())  # For audit and permission
-        self.audit = AuditLogger(db_session)
-        self.permission = PermissionChecker(lambda: db_session)
+    def __init__(self, db_factory: DbFactory):
+        self._db_factory = db_factory
+        self.session_repo = SessionRepository(db_factory)
+        self.audit = AuditLogger(db_factory)
+        self.permission = PermissionChecker(db_factory)
+
+    @property
+    def db_session(self) -> Session:
+        return self._db_factory()
 
     def create_session(
         self,
@@ -350,7 +353,7 @@ class SessionService:
             )
             names = [row._mapping["sandbox_name"] for row in result]
             if names:
-                sandbox = Sandbox(db=self.db_session)
+                sandbox = Sandbox(self._db_factory)
                 for name in names:
                     try:
                         sandbox.delete(name, force=True)

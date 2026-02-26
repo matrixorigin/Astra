@@ -25,7 +25,7 @@ from api.repositories.user_repository import UserRepository
 @pytest.fixture
 def test_user(db_session):
     """测试用户 fixture"""
-    repo = UserRepository(db_session)
+    repo = UserRepository(lambda: db_session)
     
     # 清理
     user = repo.get_by_username("replaytest")
@@ -55,7 +55,7 @@ def test_user(db_session):
 @pytest.fixture
 def replay_service(db_session):
     """ReplayService fixture"""
-    return ReplayService(db_session)
+    return ReplayService(lambda: db_session)
 
 
 @pytest.fixture
@@ -63,8 +63,8 @@ def test_session_with_events(db_session, test_user):
     """创建包含事件的测试会话"""
     from api.repositories import SessionRepository, EventRepository
     
-    session_repo = SessionRepository(db_session)
-    event_repo = EventRepository(db_session)
+    session_repo = SessionRepository(lambda: db_session)
+    event_repo = EventRepository(lambda: db_session)
     
     # 创建会话
     session_data = {
@@ -201,7 +201,7 @@ class TestReplaySession:
         """
         from api.repositories import SessionRepository
         
-        session_repo = SessionRepository(db_session)
+        session_repo = SessionRepository(lambda: db_session)
         session_data = {
             "session_id": str(uuid4()),
             "user_id": test_user.user_id,

@@ -238,7 +238,7 @@ class TestSandboxPermissions:
         
         # Create a second user using consistent pattern
         db_session = next(get_db_session())
-        user_repo = UserRepository(db_session)
+        user_repo = UserRepository(lambda: db_session)
         
         # Clean up any existing user
         existing = user_repo.get_by_username("testuser2")

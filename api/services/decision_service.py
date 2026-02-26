@@ -8,20 +8,22 @@ from uuid_utils import uuid7
 from api.repositories import DecisionRepository, EventRepository, SessionRepository
 from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
-
-# from sqlalchemy.orm import Session
+from core.db_consumer import DbFactory
 
 
 class DecisionService:
     """Decision 业务服务"""
 
-    def __init__(self, db_session: Session):
-        self.db_session = db_session
-        self.decision_repo = DecisionRepository(db_session)
-        self.session_repo = SessionRepository(db_session)
-        self.event_repo = EventRepository(db_session)
-        # self.db = next(get_db_session())
-        self.audit = AuditLogger(db_session)
+    def __init__(self, db_factory: DbFactory):
+        self._db_factory = db_factory
+        self.decision_repo = DecisionRepository(db_factory)
+        self.session_repo = SessionRepository(db_factory)
+        self.event_repo = EventRepository(db_factory)
+        self.audit = AuditLogger(db_factory)
+
+    @property
+    def db_session(self) -> Session:
+        return self._db_factory()
 
     def record_decision(
         self,

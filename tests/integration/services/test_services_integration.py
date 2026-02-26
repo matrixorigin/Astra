@@ -21,17 +21,17 @@ def db_session():
 
 @pytest.fixture
 def agent_service(db_session: Session):
-    return AgentService(db_session)
+    return AgentService(lambda: db_session)
 
 
 @pytest.fixture
 def session_service(db_session: Session):
-    return SessionService(db_session)
+    return SessionService(lambda: db_session)
 
 
 @pytest.fixture
 def event_service(db_session: Session):
-    return EventService(db_session)
+    return EventService(lambda: db_session)
 
 
 class TestAgentService:

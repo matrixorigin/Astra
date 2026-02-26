@@ -19,12 +19,12 @@ def db_session():
 
 @pytest.fixture
 def session_repo(db_session):
-    return SessionRepository(db_session)
+    return SessionRepository(lambda: db_session)
 
 
 @pytest.fixture
 def event_repo(db_session):
-    return EventRepository(db_session)
+    return EventRepository(lambda: db_session)
 
 
 @pytest.fixture
