@@ -410,6 +410,26 @@ class ChatLoop:
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": hitl_msg})
                     continue
 
+                # Check for similar historical result (reuse from mo-trustmem)
+                if getattr(self, '_memory_store', None) and fn_name in ("grep", "shell", "execute_bash", "git"):
+                    from core.agent.tool_output_handler import find_similar_result
+                    from core.memory.retriever import MemoryRetriever
+                    try:
+                        retriever = MemoryRetriever(self.event_logger._db_factory)
+                        reuse_ref = find_similar_result(
+                            tool_name=fn_name,
+                            params=params,
+                            session_id=session_id,
+                            user_id=user_id,
+                            retriever=retriever,
+                        )
+                        if reuse_ref:
+                            logger.info(f"Reusing historical {fn_name} result")
+                            messages.append({"role": "tool", "tool_call_id": tc_id, "content": reuse_ref})
+                            continue
+                    except Exception as e:
+                        logger.debug(f"Historical reuse check failed: {e}")
+
                 # Execute skill with automatic feedback recording
                 try:
                     from core.agent.async_tools import get_async_tool_registry as _get_atr

@@ -117,6 +117,13 @@ class TestUpdateSnapshotLlmIds:
             )
             _flush_pool()
 
+        # Wait for async pool to complete
+        import time
+        for _ in range(10):
+            if mock_filter.update.called:
+                break
+            time.sleep(0.01)
+
         assert mock_session.query.called
         mock_filter.update.assert_called_once()
         update_dict = mock_filter.update.call_args[0][0]
