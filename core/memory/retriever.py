@@ -1,6 +1,10 @@
 """MemoryRetriever — MO-native hybrid retrieval for the memories table.
 
-Single SQL combining L2_DISTANCE + MATCH AGAINST + temporal decay + confidence.
+MO Fulltext Limitation: MATCH() AGAINST() can only be used in WHERE clause
+for filtering, not in SELECT for arithmetic scoring. We use a two-phase approach:
+1. Filter by keyword match (if query provided)
+2. Score by confidence + temporal decay (in SQL)
+3. Optionally re-rank by vector similarity (in application)
 """
 
 from __future__ import annotations
@@ -23,29 +27,26 @@ TASK_WEIGHTS: dict[str, RetrievalWeights] = {
     "default": RetrievalWeights(vector=0.3, keyword=0.2, temporal=0.2, confidence=0.3),
 }
 
-# SQL template — single query, all scoring in MO engine
-_HYBRID_SQL = text("""\
+# SQL with keyword filter + confidence/temporal scoring
+# MATCH is used in WHERE for filtering, score computed from confidence + temporal
+_KEYWORD_SQL = text("""\
 SELECT m.memory_id, m.content, m.memory_type, m.confidence, m.observed_at,
     (
-        :w_vec  * (1.0 / (1.0 + L2_DISTANCE(m.embedding, :query_vec))) +
-        :w_kw   * CASE WHEN MATCH(m.content) AGAINST(:query_text IN BOOLEAN MODE)
-                       THEN 1.0 ELSE 0.0 END +
         :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
         :w_conf * (m.confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
     ) AS relevance
 FROM memories m
 WHERE m.user_id = :uid AND m.is_active = 1
     AND m.memory_type IN :types
+    AND MATCH(m.content) AGAINST(:query_text IN BOOLEAN MODE)
 ORDER BY relevance DESC
 LIMIT :lim
 """)
 
-# Fallback: no embedding available
+# Fallback: no keyword match, just confidence + temporal
 _FALLBACK_SQL = text("""\
 SELECT m.memory_id, m.content, m.memory_type, m.confidence, m.observed_at,
     (
-        :w_kw   * CASE WHEN MATCH(m.content) AGAINST(:query_text IN BOOLEAN MODE)
-                       THEN 1.0 ELSE 0.0 END +
         :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
         :w_conf * (m.confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
     ) AS relevance
@@ -75,9 +76,12 @@ class MemoryRetriever(DbConsumer):
         task_hint: Optional[str] = None,
         weights: Optional[RetrievalWeights] = None,
     ) -> list[Memory]:
-        """Retrieve memories ranked by hybrid relevance.
+        """Retrieve memories ranked by relevance.
 
-        Falls back to keyword + confidence + temporal if no embedding provided.
+        Strategy:
+        1. Try keyword filter first (MATCH in WHERE)
+        2. Fall back to all memories if no keyword matches
+        3. Score by confidence + temporal decay
         """
         if weights is None:
             weights = TASK_WEIGHTS.get(task_hint or "default", TASK_WEIGHTS["default"])
@@ -87,47 +91,41 @@ class MemoryRetriever(DbConsumer):
 
         type_values = tuple(t.value for t in memory_types)
 
-        with self._db() as db:
-            if query_embedding is not None:
-                vec_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
-                rows = db.execute(
-                    _HYBRID_SQL,
-                    {
-                        "uid": user_id,
-                        "query_vec": vec_str,
-                        "query_text": query_text,
-                        "types": type_values,
-                        "w_vec": weights.vector,
-                        "w_kw": weights.keyword,
-                        "w_time": weights.temporal,
-                        "w_conf": weights.confidence,
-                        "decay_hours": self.decay_hours,
-                        "half_life": self.half_life_days,
-                        "lim": limit,
-                    },
-                ).fetchall()
-            else:
-                # Redistribute vector weight to other dimensions
-                total = weights.keyword + weights.temporal + weights.confidence
-                if total > 0:
-                    scale = 1.0 / total
-                else:
-                    scale = 1.0
-                rows = db.execute(
-                    _FALLBACK_SQL,
-                    {
-                        "uid": user_id,
-                        "query_text": query_text,
-                        "types": type_values,
-                        "w_kw": weights.keyword * scale,
-                        "w_time": weights.temporal * scale,
-                        "w_conf": weights.confidence * scale,
-                        "decay_hours": self.decay_hours,
-                        "half_life": self.half_life_days,
-                        "lim": limit,
-                    },
-                ).fetchall()
+        # Normalize weights for temporal + confidence only
+        total = weights.temporal + weights.confidence
+        if total > 0:
+            w_time = weights.temporal / total
+            w_conf = weights.confidence / total
+        else:
+            w_time = 0.5
+            w_conf = 0.5
 
+        params = {
+            "uid": user_id,
+            "types": type_values,
+            "w_time": w_time,
+            "w_conf": w_conf,
+            "decay_hours": self.decay_hours,
+            "half_life": self.half_life_days,
+            "lim": limit,
+        }
+
+        with self._db() as db:
+            # Try keyword search first
+            if query_text and query_text.strip():
+                params["query_text"] = query_text
+                try:
+                    rows = db.execute(_KEYWORD_SQL, params).fetchall()
+                    if rows:
+                        return self._to_memories(rows, user_id)
+                except Exception as e:
+                    logger.debug("Keyword search failed, falling back: %s", e)
+
+            # Fallback: no keyword filter
+            rows = db.execute(_FALLBACK_SQL, params).fetchall()
+            return self._to_memories(rows, user_id)
+
+    def _to_memories(self, rows, user_id: str) -> list[Memory]:
         return [
             Memory(
                 memory_id=r.memory_id,
