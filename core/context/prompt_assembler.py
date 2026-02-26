@@ -84,6 +84,10 @@ SNAPSHOT_SECTION_CHARS = 2000
 _MAX_HISTORY_EVENTS = 20
 
 
+# Default token budget for system prompt assembly and refresh.
+# Shared by assemble() and refresh_memory() to ensure consistent budget enforcement.
+_DEFAULT_MAX_TOKENS = 8000
+
 # Canonical section ordering — shared by assemble() and refresh_memory().
 # Cache-friendly: stable sections first (identity, self_model, project_context)
 # so LLM providers can cache the prefix across turns.
@@ -165,7 +169,7 @@ class PromptAssembler(DbConsumer):
         session_id: str,
         user_id: str,
         edge_context: EdgeContext | None = None,
-        max_tokens: int = 8000,
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
         username: str | None = None,
     ) -> AssembledPrompt:
         sections: dict[str, str] = {}
@@ -257,7 +261,7 @@ class PromptAssembler(DbConsumer):
         user_id: str,
         user_query: str,
         current_sections: dict[str, str],
-        max_tokens: int = 8000,
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
     ) -> AssembledPrompt:
         """Refresh §4 (memory) and §5 (working memory) for turn 2+.
 
@@ -526,8 +530,11 @@ class PromptAssembler(DbConsumer):
 
         try:
             from core.memory.observer import Observer
-            from core.llm.client import LLMClient
-            obs = Observer(self._db_factory, llm_client=LLMClient(db_factory=self._db_factory))
+            # Observer.get_observations() is a pure DB read — llm_client is only
+            # needed for observe() (writing new observations).  Passing None avoids
+            # creating a full LLMClient (3 DB sessions for router/config/providers)
+            # on every call, which matters for refresh_memory (called every turn).
+            obs = Observer(self._db_factory, llm_client=None)
             observations = obs.get_observations(user_id, session_id)
             obs_section = obs.format_for_context(observations)
             if obs_section:

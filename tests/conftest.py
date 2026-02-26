@@ -184,20 +184,21 @@ def _clear_chat_module_state():
     _session_cache and _shared_llm_client are process-global singletons.
     Without clearing, test A's session data leaks into test B when running
     with pytest -n auto (same process, different tests).
+
+    Only clears if the chat module is already imported — avoids triggering
+    a heavy import chain (LLMClient, PromptAssembler, etc.) for tests that
+    don't use the chat router at all.
     """
-    try:
-        from api.routers import chat
-        chat._session_cache.clear()
-        chat._shared_llm_client = None
-    except (ImportError, AttributeError):
-        pass
+    import sys
+    mod = sys.modules.get("api.routers.chat")
+    if mod is not None:
+        mod._session_cache.clear()
+        mod._shared_llm_client = None
     yield
-    try:
-        from api.routers import chat
-        chat._session_cache.clear()
-        chat._shared_llm_client = None
-    except (ImportError, AttributeError):
-        pass
+    mod = sys.modules.get("api.routers.chat")
+    if mod is not None:
+        mod._session_cache.clear()
+        mod._shared_llm_client = None
 
 
 # ============================================================================

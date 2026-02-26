@@ -899,8 +899,10 @@ async def chat_turn(
             if full_text and snapshot_id:
                 try:
                     import asyncio
+                    from core.context.manager import ContextManager
                     from core.verification.firewall import HallucinationFirewall
-                    fw = HallucinationFirewall(SessionLocal, context_manager=None)
+                    ctx_mgr = ContextManager(SessionLocal)
+                    fw = HallucinationFirewall(SessionLocal, context_manager=ctx_mgr)
                     result = await asyncio.to_thread(fw.verify_response, full_text, snapshot_id)
                     if not result.safe_to_deliver:
                         firewall_warning = {'type': 'warning', 'message': 'Response may contain unverified claims', 'claims_failed': result.claims_failed}

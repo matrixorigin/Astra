@@ -2,6 +2,7 @@
 
 Covers the full lifecycle: session create → multi-turn with tool calls →
 context refresh → event persistence → session close with hooks.
+Also covers: model routing integration, recovery + refresh correction.
 """
 
 import json
@@ -10,7 +11,7 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text as sql_text
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, ANY
 
 os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
 os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
@@ -162,3 +163,136 @@ class TestChatTurnMultiTurnE2E:
         types = [r[0] for r in rows]
         assert "tool_call" in types
         assert "tool_result" in types
+
+    def test_refresh_memory_changes_system_prompt(self, client, db):
+        """Turn 3 refresh_memory produces a different system prompt than turn 1.
+
+        Mocks _build_memory to return query-dependent content, then verifies
+        the system message in the LLM call actually contains the refreshed memory.
+        """
+        headers = self._auth(client, db)
+
+        captured_messages: list[list] = []
+
+        # Wrap chat_stream to capture the messages (system prompt) sent to LLM
+        original_chat_stream = None
+
+        async def _capturing_stream(messages, *args, **kwargs):
+            captured_messages.append(list(messages))
+            async for chunk in fake_llm_stream([{"type": "text", "content": "ok"}]):
+                yield chunk
+
+        # ── Turn 1: initial assemble ──
+        with patch("core.llm.client.LLMClient.chat_stream", side_effect=_capturing_stream):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "hello"}],
+            }, headers=headers)
+        session_id = parse_sse_events(r1.text)[0]["session_id"]
+        assert len(captured_messages) == 1
+        turn1_system = captured_messages[0][0]["content"]
+
+        # ── Turn 2: new query triggers refresh_memory with different memory ──
+        # Mock _build_memory to return distinctive content for the new query
+        def _mock_build_memory(self_pa, user_id, session_id, query):
+            if "explain" in query:
+                return "## Refreshed Memory\nUser previously asked about main.py and got tool results."
+            return None
+
+        with patch("core.llm.client.LLMClient.chat_stream", side_effect=_capturing_stream), \
+             patch("core.context.prompt_assembler.PromptAssembler._build_memory", _mock_build_memory):
+            r2 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "explain the code"}],
+                "session_id": session_id,
+            }, headers=headers)
+
+        assert len(captured_messages) == 2
+        turn2_system = captured_messages[1][0]["content"]
+
+        # Turn 2 system prompt must contain the refreshed memory
+        assert "Refreshed Memory" in turn2_system, \
+            f"Expected refreshed memory in system prompt, got: {turn2_system[:500]}"
+        # And it must differ from turn 1 (which had no memory mock)
+        assert turn1_system != turn2_system
+
+    def test_model_routing_uses_user_id(self, client, db):
+        """LLMClient in /chat/turn is created with user_id for model routing."""
+        headers = self._auth(client, db)
+
+        with patch("core.llm.client.LLMClient.__init__", return_value=None) as mock_init, \
+             patch("core.llm.client.LLMClient.chat_stream",
+                   return_value=fake_llm_stream([{"type": "text", "content": "hi"}])):
+            client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "hello"}],
+            }, headers=headers)
+
+        # LLMClient is constructed multiple times (assembler internals, shared client, etc.)
+        # but the one in event_generator() must pass user_id for model routing.
+        calls_with_user_id = [
+            c for c in mock_init.call_args_list
+            if c.kwargs.get("user_id") == "lifecycle_uid"
+               or (len(c.args) > 1 and c.args[1] == "lifecycle_uid")
+        ]
+        assert len(calls_with_user_id) == 1, \
+            f"Expected exactly 1 LLMClient(user_id='lifecycle_uid'), got {mock_init.call_args_list}"
+
+    def test_recovery_then_refresh_corrects_stale_memory(self, client, db):
+        """After server restart recovery (stale first_query memory), the next
+        user turn triggers refresh_memory with the current query, correcting
+        the memory section.
+
+        Scenario: Turn 1 ("read main.py") → server restart → Turn 2 ("write tests")
+        Recovery uses first_query="read main.py" for memory search (stale).
+        Turn 2's refresh_memory should re-search with "write tests" (current).
+        """
+        headers = self._auth(client, db)
+
+        # ── Turn 1: establish session with events in DB ──
+        with patch("core.llm.client.LLMClient.chat_stream",
+                   return_value=fake_llm_stream([{"type": "text", "content": "Here's main.py"}])):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "read main.py"}],
+            }, headers=headers)
+        session_id = parse_sse_events(r1.text)[0]["session_id"]
+
+        # ── Simulate server restart: clear in-memory cache ──
+        from api.routers import chat
+        chat._session_cache.clear()
+
+        # ── Turn 2: new query after restart ──
+        # Track what query _build_memory receives during refresh
+        memory_queries: list[str] = []
+        original_build_memory = None
+
+        def _tracking_build_memory(self_pa, user_id, session_id, query):
+            memory_queries.append(query)
+            return f"## Memory for: {query}"
+
+        captured_messages: list[list] = []
+
+        async def _capturing_stream(messages, *args, **kwargs):
+            captured_messages.append(list(messages))
+            async for chunk in fake_llm_stream([{"type": "text", "content": "ok"}]):
+                yield chunk
+
+        with patch("core.llm.client.LLMClient.chat_stream", side_effect=_capturing_stream), \
+             patch("core.context.prompt_assembler.PromptAssembler._build_memory", _tracking_build_memory):
+            r2 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "write tests for it"}],
+                "session_id": session_id,
+            }, headers=headers)
+
+        assert r2.status_code == 200
+
+        # _build_memory is called twice:
+        # 1. During recovery's assemble() with first_query="read main.py"
+        # 2. During refresh_memory() with current query="write tests for it"
+        assert len(memory_queries) >= 2, f"Expected ≥2 _build_memory calls, got {memory_queries}"
+        # Recovery call uses first_query (stale)
+        assert memory_queries[0] == "read main.py"
+        # Refresh call uses current query (corrected)
+        assert memory_queries[-1] == "write tests for it"
+
+        # The system prompt sent to LLM should contain the refreshed memory
+        system_msg = captured_messages[0][0]["content"]
+        assert "Memory for: write tests for it" in system_msg, \
+            f"System prompt should contain refreshed memory, got: {system_msg[:500]}"
