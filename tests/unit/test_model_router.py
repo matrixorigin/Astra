@@ -63,11 +63,10 @@ class TestModelRouter:
 
     def test_route_critical(self):
         db = _mock_db()
-        # Create proper mock chain
-        mock_execute = Mock()
-        mock_execute.fetchall.side_effect = [[], []]  # efficiency, quality
-        mock_execute.fetchone.return_value = (0.03,)  # cost
-        db.execute.return_value = mock_execute
+        # _get_efficiency_ranking uses ORM query chain → returns empty
+        db.query.return_value.filter.return_value.group_by.return_value.order_by.return_value.all.return_value = []
+        # _estimate_cost uses raw SQL db.execute
+        db.execute.return_value = Mock(fetchone=Mock(return_value=(0.03,)))
 
         router = ModelRouter(lambda: db)
         decision = router.route(
@@ -83,10 +82,8 @@ class TestModelRouter:
 
     def test_route_simple(self):
         db = _mock_db()
-        mock_execute = Mock()
-        mock_execute.fetchall.side_effect = [[], []]
-        mock_execute.fetchone.return_value = (0.001,)
-        db.execute.return_value = mock_execute
+        db.query.return_value.filter.return_value.group_by.return_value.order_by.return_value.all.return_value = []
+        db.execute.return_value = Mock(fetchone=Mock(return_value=(0.001,)))
 
         router = ModelRouter(lambda: db)
         decision = router.route(
@@ -111,19 +108,15 @@ class TestModelRouter:
             cost=0.03,
         )
 
-        db.execute.assert_called_once()
+        db.add.assert_called_once()
         db.commit.assert_called_once()
 
     def test_get_efficiency_ranking(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchall=Mock(
-                return_value=[
-                    ("gpt-4", 4.5, 0.03, 150.0),
-                    ("gpt-3.5", 4.0, 0.001, 4000.0),
-                ]
-            )
-        )
+        # ORM: query(...).filter(...).group_by(...).order_by(...).all()
+        row1 = ("gpt-4", 4.5, 0.03, 150.0)
+        row2 = ("gpt-3.5", 4.0, 0.001, 4000.0)
+        db.query.return_value.filter.return_value.group_by.return_value.order_by.return_value.all.return_value = [row1, row2]
 
         router = ModelRouter(lambda: db)
         efficiency = router._get_efficiency_ranking("code_review")

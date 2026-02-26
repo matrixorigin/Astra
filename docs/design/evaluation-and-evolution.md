@@ -378,6 +378,14 @@ When `training_eligible` events accumulate beyond a threshold per user:
 
 This enables "agent evolves with user interaction" while keeping risk bounded by sandbox validation.
 
+### Data Tables (ORM)
+
+| Table | ORM Model | Purpose |
+|---|---|---|
+| `training_data` | `TrainingData` | Versioned SFT examples with lineage and contamination flags |
+| `model_quality_metrics` | `ModelQualityMetric` | Per-model accuracy, latency, cost tracking for routing decisions |
+| `adversarial_attacks` | `AdversarialAttack` | Recorded multi-turn attack sequences and outcomes |
+
 ---
 
 ## 7. CI/CD Integration

@@ -218,6 +218,10 @@ class GetPRChecksAction:
 
 ### 6.1 skill_definitions — marketplace catalog
 
+> **Note**: `skill_definitions` is the marketplace catalog (what skills exist, their manifests).
+> `skills_registry` (see `memory-and-context.md`) is the runtime registry tracking active versions
+> and selection history. Both tables are needed — different purposes.
+
 ```python
 class SkillDefinition(Base):
     __tablename__ = "skill_definitions"

@@ -447,33 +447,32 @@ class HallucinationFirewall(DbConsumer):
         """Write verification in background thread."""
         db = db_factory()
         try:
-            from sqlalchemy import text
+            from api.models import HallucinationCheck, ClaimEvidence
 
-            db.execute(
-                text(
-                    "INSERT INTO hallucination_checks "
-                    "(check_id, session_id, event_id, context_capture_id, "
-                    "claims_total, claims_verified, claims_contradicted, "
-                    "confidence_score, safe_to_deliver, evidence_count, created_at) "
-                    "VALUES (:check_id, :session_id, :event_id, :ctx_id, "
-                    ":total, :verified, :contradicted, :confidence, :safe, :evidence, NOW())"
-                ),
-                check_row,
-            )
+            db.add(HallucinationCheck(
+                check_id=check_row["check_id"],
+                session_id=check_row["session_id"],
+                event_id=check_row["event_id"],
+                context_capture_id=check_row["ctx_id"],
+                claims_total=check_row["total"],
+                claims_verified=check_row["verified"],
+                claims_contradicted=check_row["contradicted"],
+                confidence_score=check_row["confidence"],
+                safe_to_deliver=1 if check_row["safe"] else 0,
+                evidence_count=check_row["evidence"],
+            ))
 
             for row in evidence_rows:
-                db.execute(
-                    text(
-                        "INSERT INTO claim_evidence "
-                        "(check_id, claim_type, claim_value, "
-                        "source_type, source_id, content, location, "
-                        "confidence, created_at) "
-                        "VALUES (:check_id, :claim_type, :claim_value, "
-                        ":source_type, :source_id, :content, :location, "
-                        ":confidence, NOW())"
-                    ),
-                    row,
-                )
+                db.add(ClaimEvidence(
+                    check_id=row["check_id"],
+                    claim_type=row["claim_type"],
+                    claim_value=row["claim_value"],
+                    source_type=row["source_type"],
+                    source_id=row["source_id"],
+                    content=row["content"],
+                    location=row["location"],
+                    confidence=row["confidence"],
+                ))
 
             db.commit()
             logger.info(
@@ -487,11 +486,5 @@ class HallucinationFirewall(DbConsumer):
             db.close()
 
     def _init_tables(self):
-        """Initialize database tables (auto-create if not exist)."""
-        try:
-            from core.verification.schema import init_hallucination_tables
-
-            with self._db() as db:
-                init_hallucination_tables(db)
-        except Exception as e:
-            logger.warning(f"Table initialization skipped: {e}")
+        """No-op: tables are now created by ORM via init_db()."""
+        pass

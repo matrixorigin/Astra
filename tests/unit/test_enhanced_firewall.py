@@ -268,10 +268,14 @@ class TestEnhancedFirewall:
             evidence_count=1,
         )
 
-        firewall.log_verification("sess_1", "evt_1", result, "snap_1")
+        # Patch thread pool to run synchronously so we can assert
+        from unittest.mock import patch
+        with patch("core.verification.firewall._fw_pool") as mock_pool:
+            mock_pool.submit.side_effect = lambda fn, *a, **kw: fn(*a, **kw)
+            firewall.log_verification("sess_1", "evt_1", result, "snap_1")
 
-        # Verify database calls (at least 2: init tables + log verification)
-        assert db.execute.call_count >= 2
+        # ORM path: db.add() for HallucinationCheck + ClaimEvidence, then commit
+        assert db.add.call_count >= 2
         assert db.commit.call_count >= 1
 
 

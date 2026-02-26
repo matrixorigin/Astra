@@ -4,7 +4,7 @@ import uuid
 import pytest
 from uuid_utils import uuid7
 
-from api.models import Config, SkillSelectionLearning, SelectorGateResult
+from api.models import Config, SkillSelectionLearning, GateResult
 
 
 class TestConfiguration:
@@ -27,13 +27,13 @@ class TestConfiguration:
             Config.key_name == "selector_semantic_similarity_threshold"
         ).delete()
         db.query(SkillSelectionLearning).delete()
-        db.query(SelectorGateResult).delete()
+        db.query(GateResult).filter(GateResult.change_type == "selector").delete()
         db.commit()
         
         for i in range(3):
             uuid_str = str(uuid7()).replace("-", "")
             learning = SkillSelectionLearning(
-                learning_id=f"l{i}-{uuid_str}",  # Shorter prefix: l0-, l1-, l2-
+                learning_id=f"l{i}-{uuid_str}",
                 query_pattern=f"pattern {i}",
                 wrong_skills=["wrong"],
                 correct_skills=["correct"],
@@ -43,26 +43,22 @@ class TestConfiguration:
             db.add(learning)
         
         uuid_str = str(uuid7()).replace("-", "")
-        db.add(SelectorGateResult(
-            gate_id=f"g1-{uuid_str}",  # Shorter prefix
-            selector_version="v1",
-            test_queries=[],
-            test_count=10,
-            verdict="PASS",
-            new_avg_score=0.85,
-            old_avg_score=0.80,
-            improvement_pct=6.25,
+        db.add(GateResult(
+            gate_id=f"g1-{uuid_str}",
+            change_type="selector",
+            change_id="v1",
+            sessions_tested=10,
+            score_delta=6.25,
+            passed=1,
         ))
         uuid_str2 = str(uuid7()).replace("-", "")
-        db.add(SelectorGateResult(
-            gate_id=f"g2-{uuid_str2}",  # Shorter prefix
-            selector_version="v2",
-            test_queries=[],
-            test_count=10,
-            verdict="FAIL",
-            new_avg_score=0.75,
-            old_avg_score=0.80,
-            improvement_pct=-6.25,
+        db.add(GateResult(
+            gate_id=f"g2-{uuid_str2}",
+            change_type="selector",
+            change_id="v2",
+            sessions_tested=10,
+            score_delta=-6.25,
+            passed=0,
         ))
         db.commit()
         
@@ -80,19 +76,17 @@ class TestConfiguration:
     def test_get_learning_stats_with_null_improvement(self, self_improving, db):
         """Test stats with NULL improvement_pct."""
         db.query(SkillSelectionLearning).delete()
-        db.query(SelectorGateResult).delete()
+        db.query(GateResult).filter(GateResult.change_type == "selector").delete()
         db.commit()
         
         uuid_str3 = str(uuid7()).replace("-", "")
-        db.add(SelectorGateResult(
-            gate_id=f"gn-{uuid_str3}",  # Shorter prefix
-            selector_version="v1",
-            test_queries=[],
-            test_count=10,
-            verdict="PASS",
-            new_avg_score=0.85,
-            old_avg_score=0.80,
-            improvement_pct=None,
+        db.add(GateResult(
+            gate_id=f"gn-{uuid_str3}",
+            change_type="selector",
+            change_id="v1",
+            sessions_tested=10,
+            score_delta=None,
+            passed=1,
         ))
         db.commit()
         
@@ -105,20 +99,18 @@ class TestConfiguration:
     def test_get_learning_stats_all_gates_passing(self, self_improving, db):
         """Test stats with all gates passing."""
         db.query(SkillSelectionLearning).delete()
-        db.query(SelectorGateResult).delete()
+        db.query(GateResult).filter(GateResult.change_type == "selector").delete()
         db.commit()
         
         for i in range(3):
             uuid_str = str(uuid7()).replace("-", "")
-            db.add(SelectorGateResult(
-                gate_id=f"g{i}-{uuid_str}",  # Shorter prefix: g0-, g1-, g2-
-                selector_version=f"v{i}",
-                test_queries=[],
-                test_count=10,
-                verdict="PASS",
-                new_avg_score=0.85 + i * 0.01,
-                old_avg_score=0.80,
-                improvement_pct=5.0 + i,
+            db.add(GateResult(
+                gate_id=f"g{i}-{uuid_str}",
+                change_type="selector",
+                change_id=f"v{i}",
+                sessions_tested=10,
+                score_delta=5.0 + i,
+                passed=1,
             ))
         db.commit()
         

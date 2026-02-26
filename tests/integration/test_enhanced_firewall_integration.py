@@ -88,11 +88,13 @@ class TestEnhancedFirewallIntegration:
         assert result.evidence_count > 0
 
         # Log verification
-        firewall.log_verification("sess_1", "evt_1", result, "snap_123")
+        from unittest.mock import patch
+        with patch("core.verification.firewall._fw_pool") as mock_pool:
+            mock_pool.submit.side_effect = lambda fn, *a, **kw: fn(*a, **kw)
+            firewall.log_verification("sess_1", "evt_1", result, "snap_123")
 
-        # Verify database interactions
-        # Note: Only 1 insert for hallucination_checks (no contradictions with evidence)
-        assert db.execute.call_count >= 1
+        # ORM path: db.add() for HallucinationCheck + ClaimEvidence, then commit
+        assert db.add.call_count >= 1
         db.commit.assert_called()
 
     def test_block_mode_with_low_confidence(self):

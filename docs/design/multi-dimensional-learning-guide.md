@@ -369,11 +369,12 @@ learnings = db.query(SkillSelectionLearning).filter(
 
 **Solution**:
 ```python
-# Review failed gate
-from api.models import SelectorGateResult
-failed_gates = db.query(SelectorGateResult).filter(
-    SelectorGateResult.verdict == "FAIL"
-).order_by(SelectorGateResult.created_at.desc()).limit(5).all()
+# Review failed gates (unified GateResult with change_type='selector')
+from api.models import GateResult
+failed_gates = db.query(GateResult).filter(
+    GateResult.change_type == "selector",
+    GateResult.passed == 0,
+).order_by(GateResult.created_at.desc()).limit(5).all()
 
 # Rollback if needed
 # (Manual intervention required)

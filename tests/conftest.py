@@ -188,13 +188,13 @@ def mock_llm_selector():
 @pytest.fixture
 def clean_skill_learning_db(db_session):
     """Clean skill learning tables before test."""
-    from api.models import SkillSelectionLearning, SelectorGateResult
+    from api.models import SkillSelectionLearning, GateResult
     db_session.query(SkillSelectionLearning).delete()
-    db_session.query(SelectorGateResult).delete()
+    db_session.query(GateResult).filter(GateResult.change_type == "selector").delete()
     db_session.commit()
     yield db_session
     db_session.query(SkillSelectionLearning).delete()
-    db_session.query(SelectorGateResult).delete()
+    db_session.query(GateResult).filter(GateResult.change_type == "selector").delete()
     db_session.commit()
 
 

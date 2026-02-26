@@ -292,21 +292,16 @@ class AdversarialEvaluator(DbConsumer):
     ) -> None:
         """Record attack result in DB."""
         with self._db() as db:
-            db.execute(
-                text(
-                    "INSERT INTO adversarial_attacks "
-                    "(attack_id, agent_id, attack_type, success, severity, evidence, recorded_at) "
-                    "VALUES (:id, :agent_id, :type, :success, :severity, :evidence, NOW())"
-                ),
-                {
-                    "id": attack_id,
-                    "agent_id": agent_id,
-                    "type": attack_type.value,
-                    "success": success,
-                    "severity": severity,
-                    "evidence": evidence,
-                },
-            )
+            from api.models import AdversarialAttack
+
+            db.add(AdversarialAttack(
+                attack_id=attack_id,
+                agent_id=agent_id,
+                attack_type=attack_type.value,
+                success=1 if success else 0,
+                severity=severity,
+                evidence=evidence,
+            ))
             db.commit()
 
 

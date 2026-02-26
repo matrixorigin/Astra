@@ -45,21 +45,6 @@ class Agent(Base):
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
-class SelectorGateResult(Base):
-    __tablename__ = "selector_gate_results"
-    gate_id = Column(String(36), primary_key=True)
-    selector_version = Column(String(32))
-    test_queries = Column(JSON)  # Store test queries used
-    test_count = Column(Integer)  # Number of test queries
-    verdict = Column(String(20), nullable=False)  # PASS/FAIL
-    new_avg_score = Column(Float)
-    old_avg_score = Column(Float)
-    improvement_pct = Column(Float)
-    learnings_applied = Column(Integer, default=0)  # Number of learnings applied
-    details = Column(JSON)
-    created_at = Column(DateTime, default=func.now())
-
-
 class GateResult(Base):
     """Unified gate validation results for all change types."""
     __tablename__ = "gate_results"
@@ -728,6 +713,76 @@ class SkillPermission(Base):
     grantee_id = Column(String(36), nullable=False)
     granted_by = Column(String(36), nullable=False)
     granted_at = Column(DateTime, default=func.now(), nullable=False)
+
+
+# ── Evaluation & Safety tables (previously raw SQL, now ORM) ──────────────────
+
+
+class TrainingData(Base):
+    """Training data extracted from sessions with quality filtering."""
+    __tablename__ = "training_data"
+    data_id = Column(String(36), primary_key=True)
+    session_id = Column(String(36), nullable=False, index=True)
+    input_text = Column(Text, nullable=False)
+    output_text = Column(Text, nullable=False)
+    quality = Column(String(20), nullable=False)  # gold/silver/bronze/rejected
+    contamination_score = Column(Float, nullable=False, default=0.0)
+    content_hash = Column(String(64), unique=True, nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+
+class ModelQualityMetric(Base):
+    """Model routing quality and cost tracking."""
+    __tablename__ = "model_quality_metrics"
+    metric_id = Column(String(36), primary_key=True)
+    task_type = Column(String(50), nullable=False, index=True)
+    model = Column(String(100), nullable=False, index=True)
+    quality_score = Column(Float, nullable=False)
+    cost = Column(Float, nullable=False)
+    recorded_at = Column(DateTime, default=func.now())
+
+
+class AdversarialAttack(Base):
+    """Adversarial attack evaluation results."""
+    __tablename__ = "adversarial_attacks"
+    attack_id = Column(String(36), primary_key=True)
+    agent_id = Column(String(36), nullable=False, index=True)
+    attack_type = Column(String(50), nullable=False)
+    success = Column(SmallInteger, nullable=False)
+    severity = Column(String(20), nullable=False)
+    evidence = Column(Text)
+    recorded_at = Column(DateTime, default=func.now())
+
+
+class HallucinationCheck(Base):
+    """Hallucination firewall verification results."""
+    __tablename__ = "hallucination_checks"
+    check_id = Column(String(255), primary_key=True)
+    session_id = Column(String(255), nullable=False, index=True)
+    event_id = Column(String(255), nullable=False, index=True)
+    context_capture_id = Column(String(255), nullable=False, index=True)
+    claims_total = Column(Integer, nullable=False, default=0)
+    claims_verified = Column(Integer, nullable=False, default=0)
+    claims_contradicted = Column(Integer, nullable=False, default=0)
+    confidence_score = Column(Float, nullable=False, default=0.0)
+    safe_to_deliver = Column(SmallInteger, nullable=False, default=1)
+    evidence_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=func.now())
+
+
+class ClaimEvidence(Base):
+    """Hallucination firewall claim evidence."""
+    __tablename__ = "claim_evidence"
+    evidence_id = Column(Integer, primary_key=True, autoincrement=True)
+    check_id = Column(String(255), nullable=False, index=True)
+    claim_type = Column(String(50), nullable=False)
+    claim_value = Column(Text, nullable=False)
+    source_type = Column(String(50), nullable=False)
+    source_id = Column(String(255), nullable=False)
+    content = Column(Text, nullable=False)
+    location = Column(String(500), nullable=False)
+    confidence = Column(Float, nullable=False, default=0.0)
+    created_at = Column(DateTime, default=func.now())
 
 
 # ── Re-exports from skill models ─────────────────────────────────────────────

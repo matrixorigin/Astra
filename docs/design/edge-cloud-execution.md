@@ -71,7 +71,11 @@ Cloud receives                      ▼
      ├── Firewall verification (claims vs context snapshot)
      ├── Confidence scoring
      ├── Cost tracking
-     └── Decision + snapshot persistence
+     └── Persistence:
+         ├── Context snapshot + DecisionAudit (links decision to snapshot)
+         ├── SkillSelectionEvent (when tool_calls present)
+         ├── Observations via Observer (background thread, LLM extraction)
+         └── Implicit feedback detection (heuristic, zero LLM cost)
   10. Return SSE stream: {text_deltas, tool_calls, usage}
 ```
 

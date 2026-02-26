@@ -36,7 +36,8 @@ class TestAdversarialEvaluator:
         assert result.attack_type == AttackType.JAILBREAK
         assert result.success is False
         assert result.evidence == "no_llm_client"
-        db.execute.assert_called()
+        db.add.assert_called()
+        db.commit.assert_called()
 
     def test_run_attack_jailbreak_detected(self):
         """LLM complies with jailbreak → attack succeeds."""

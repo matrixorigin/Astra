@@ -46,10 +46,8 @@ class TestTrainingDataPipeline:
 
     def test_store_example_with_dedup(self):
         db = _mock_db()
-        # First execute: dedup check (no existing); Second: insert
-        dedup_check = Mock()
-        dedup_check.fetchone.return_value = None  # No duplicate
-        db.execute.side_effect = [dedup_check, Mock(), None]  # check, insert, commit
+        # ORM: query().filter_by().first() returns None → no duplicate
+        db.query.return_value.filter_by.return_value.first.return_value = None
 
         pipeline = TrainingDataPipeline(lambda: db)
         example = TrainingExample(
@@ -62,14 +60,14 @@ class TestTrainingDataPipeline:
         )
 
         pipeline.store_example(example)
-        assert db.execute.call_count == 2  # dedup check + insert
+        db.query.assert_called_once()
+        db.add.assert_called_once()
         db.commit.assert_called_once()
 
     def test_store_example_skips_duplicate(self):
         db = _mock_db()
-        dedup_check = Mock()
-        dedup_check.fetchone.return_value = ("existing-id",)  # Duplicate found
-        db.execute.return_value = dedup_check
+        # ORM: query().filter_by().first() returns existing → duplicate
+        db.query.return_value.filter_by.return_value.first.return_value = Mock()
 
         pipeline = TrainingDataPipeline(lambda: db)
         example = TrainingExample(
@@ -82,19 +80,15 @@ class TestTrainingDataPipeline:
         )
 
         pipeline.store_example(example)
-        assert db.execute.call_count == 1  # Only dedup check, no insert
+        db.query.assert_called_once()
+        db.add.assert_not_called()
         db.commit.assert_not_called()
 
     def test_get_dataset(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchall=Mock(
-                return_value=[
-                    ("Input 1", "Output 1", 0.05),
-                    ("Input 2", "Output 2", 0.1),
-                ]
-            )
-        )
+        row1 = Mock(input_text="Input 1", output_text="Output 1", contamination_score=0.05)
+        row2 = Mock(input_text="Input 2", output_text="Output 2", contamination_score=0.1)
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [row1, row2]
 
         pipeline = TrainingDataPipeline(lambda: db)
         dataset = pipeline.get_dataset(quality=DataQuality.GOLD, limit=100)
@@ -105,14 +99,10 @@ class TestTrainingDataPipeline:
 
     def test_get_statistics(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchall=Mock(
-                return_value=[
-                    ("gold", 100, 0.05),
-                    ("silver", 50, 0.15),
-                ]
-            )
-        )
+        # ORM query returns named-tuple-like rows: (quality, count, avg_contamination)
+        row1 = ("gold", 100, 0.05)
+        row2 = ("silver", 50, 0.15)
+        db.query.return_value.group_by.return_value.all.return_value = [row1, row2]
 
         pipeline = TrainingDataPipeline(lambda: db)
         stats = pipeline.get_statistics()

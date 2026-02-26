@@ -103,35 +103,25 @@ class TrainingDataPipeline(DbConsumer):
     def store_example(self, example: TrainingExample) -> None:
         """Store a training example (with dedup by content hash)."""
         with self._db() as db:
+            from api.models import TrainingData
             from uuid_utils import uuid7
 
             content_hash = self._content_hash(example.input_text, example.output_text)
 
-            # Dedup: skip if identical content already stored
-            existing = db.execute(
-                text("SELECT data_id FROM training_data WHERE content_hash = :h LIMIT 1"),
-                {"h": content_hash},
-            ).fetchone()
+            existing = db.query(TrainingData).filter_by(content_hash=content_hash).first()
             if existing:
                 logger.debug(f"Skipping duplicate: {content_hash[:16]}")
                 return
 
-            db.execute(
-                text(
-                    "INSERT INTO training_data "
-                    "(data_id, session_id, input_text, output_text, quality, contamination_score, content_hash, created_at) "
-                    "VALUES (:id, :session_id, :input, :output, :quality, :contamination, :hash, NOW())"
-                ),
-                {
-                    "id": str(uuid7()),
-                    "session_id": example.session_id,
-                    "input": example.input_text,
-                    "output": example.output_text,
-                    "quality": example.quality.value,
-                    "contamination": example.contamination_score,
-                    "hash": content_hash,
-                },
-            )
+            db.add(TrainingData(
+                data_id=str(uuid7()),
+                session_id=example.session_id,
+                input_text=example.input_text,
+                output_text=example.output_text,
+                quality=example.quality.value,
+                contamination_score=example.contamination_score,
+                content_hash=content_hash,
+            ))
             db.commit()
 
     def get_dataset(
@@ -141,32 +131,29 @@ class TrainingDataPipeline(DbConsumer):
     ) -> list[dict[str, Any]]:
         """Get training dataset filtered by quality."""
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT input_text, output_text, contamination_score "
-                    "FROM training_data "
-                    "WHERE quality = :quality "
-                    "AND contamination_score < 0.3 "
-                    "ORDER BY contamination_score ASC "
-                    "LIMIT :limit"
-                ),
-                {"quality": quality.value, "limit": limit},
-            ).fetchall()
+            from api.models import TrainingData
+
+            rows = db.query(TrainingData).filter(
+                TrainingData.quality == quality.value,
+                TrainingData.contamination_score < 0.3,
+            ).order_by(TrainingData.contamination_score.asc()).limit(limit).all()
 
             return [
-                {"input": row[0], "output": row[1], "contamination": float(row[2])}
-                for row in rows
+                {"input": r.input_text, "output": r.output_text, "contamination": float(r.contamination_score)}
+                for r in rows
             ]
 
     def get_statistics(self) -> dict[str, Any]:
         """Get statistics on training data."""
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT quality, COUNT(*) as count, AVG(contamination_score) as avg_contamination "
-                    "FROM training_data GROUP BY quality"
-                )
-            ).fetchall()
+            from sqlalchemy import func as sa_func
+            from api.models import TrainingData
+
+            rows = db.query(
+                TrainingData.quality,
+                sa_func.count().label("count"),
+                sa_func.avg(TrainingData.contamination_score).label("avg_contamination"),
+            ).group_by(TrainingData.quality).all()
 
             stats: dict[str, Any] = {"total": sum(r[1] for r in rows), "by_quality": {}}
             for quality, count, avg_contamination in rows:

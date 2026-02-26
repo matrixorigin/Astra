@@ -151,57 +151,35 @@ class ModelRouter(DbConsumer):
         quality_score: float,
         cost: float,
     ) -> None:
-        """Record quality and cost for a task.
-
-        Args:
-            task_type: Type of task
-            model: Model used
-            quality_score: Quality score (0-5)
-            cost: Cost in dollars
-        """
+        """Record quality and cost for a task."""
         with self._db() as db:
+            from api.models import ModelQualityMetric
             from uuid_utils import uuid7
 
-            db.execute(
-                text(
-                    "INSERT INTO model_quality_metrics "
-                    "(metric_id, task_type, model, quality_score, cost, recorded_at) "
-                    "VALUES (:id, :task_type, :model, :quality, :cost, NOW())"
-                ),
-                {
-                    "id": str(uuid7()),
-                    "task_type": task_type,
-                    "model": model,
-                    "quality": quality_score,
-                    "cost": cost,
-                },
-            )
+            db.add(ModelQualityMetric(
+                metric_id=str(uuid7()),
+                task_type=task_type,
+                model=model,
+                quality_score=quality_score,
+                cost=cost,
+            ))
             db.commit()
             logger.info(f"Quality recorded: {model} on {task_type}: {quality_score}/5 @ ${cost}")
 
     def _get_efficiency_ranking(self, task_type: str) -> dict[str, float]:
-        """Get efficiency ranking (quality/cost) for models on a task type.
-
-        Args:
-            task_type: Type of task
-
-        Returns:
-            Dict of model → efficiency score
-        """
+        """Get efficiency ranking (quality/cost) for models on a task type."""
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT model, "
-                    "  AVG(quality_score) as avg_quality, "
-                    "  AVG(cost) as avg_cost, "
-                    "  AVG(quality_score) / AVG(cost) as efficiency "
-                    "FROM model_quality_metrics "
-                    "WHERE task_type = :task_type "
-                    "GROUP BY model "
-                    "ORDER BY efficiency DESC"
-                ),
-                {"task_type": task_type},
-            ).fetchall()
+            from sqlalchemy import func as sa_func
+            from api.models import ModelQualityMetric as MQM
+
+            rows = db.query(
+                MQM.model,
+                sa_func.avg(MQM.quality_score).label("avg_quality"),
+                sa_func.avg(MQM.cost).label("avg_cost"),
+                (sa_func.avg(MQM.quality_score) / sa_func.avg(MQM.cost)).label("efficiency"),
+            ).filter(MQM.task_type == task_type).group_by(MQM.model).order_by(
+                (sa_func.avg(MQM.quality_score) / sa_func.avg(MQM.cost)).desc()
+            ).all()
 
             return {row[0]: float(row[3]) for row in rows}
 

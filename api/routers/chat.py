@@ -595,15 +595,104 @@ def _persist_turn_events(
                 causal_chain_id=causal_chain_id,
             )
 
-        # Context snapshot + decision audit
+        # Context snapshot + decision audit (Task 6)
         if parent_event_id:
             try:
                 from core.context.manager import ContextManager
                 ctx_mgr = ContextManager(SessionLocal)
                 ctx = ctx_mgr.build_context(session_id=session_id, query=user_content or "")
                 context_capture_id = ctx_mgr.save_snapshot(ctx, session_id, parent_event_id)
+
+                # Write DecisionAudit record linking decision to snapshot
+                from api.models import DecisionAudit
+                from uuid_utils import uuid7 as _uuid7
+                tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+                db_w = SessionLocal()
+                try:
+                    db_w.add(DecisionAudit(
+                        decision_id=str(_uuid7()),
+                        session_id=session_id,
+                        event_id=parent_event_id,
+                        decision_type="tool_selection" if tc_names else "response_generation",
+                        decision_output={"text": full_text[:500], "tool_calls": tc_names},
+                        context_capture_id=context_capture_id,
+                    ))
+                    db_w.commit()
+                finally:
+                    db_w.close()
             except Exception as e:
-                logger.debug("Context snapshot skipped: %s", e)
+                logger.debug("Context snapshot / decision audit skipped: %s", e)
+
+        # Skill selection event (Task 7) — record when LLM chose tool calls
+        if tool_calls and parent_event_id:
+            try:
+                from api.models import SkillSelectionEvent
+                from uuid_utils import uuid7 as _uuid7
+                tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls]
+                db_w = SessionLocal()
+                try:
+                    db_w.add(SkillSelectionEvent(
+                        event_id=str(_uuid7()),
+                        session_id=session_id,
+                        user_query=(user_content or "")[:2000],
+                        selected_skills=tc_names,
+                        skill_name=tc_names[0] if tc_names else None,
+                        selection_method="llm_tool_choice",
+                    ))
+                    db_w.commit()
+                finally:
+                    db_w.close()
+            except Exception as e:
+                logger.debug("Skill selection event skipped: %s", e)
+
+        # Observations via Observer (Task 8) — background thread
+        if user_content:
+            try:
+                from core.memory.observer import Observer
+                from core.llm.client import LLMClient
+                import threading
+
+                llm_ref = LLMClient(SessionLocal)
+
+                def _bg_observe():
+                    try:
+                        bg_db = SessionLocal()
+                        try:
+                            Observer(bg_db, llm_client=llm_ref).observe(
+                                session_id=session_id, user_id=user_id, messages=messages,
+                            )
+                        finally:
+                            bg_db.close()
+                    except Exception as e:
+                        logger.debug("Observer failed (non-fatal): %s", e)
+
+                threading.Thread(target=_bg_observe, daemon=True).start()
+            except Exception as e:
+                logger.debug("Observer setup skipped: %s", e)
+
+        # Implicit feedback detection (Task 9) — lightweight heuristic, no LLM cost
+        if user_content and len(messages) >= 2:
+            try:
+                from core.context.implicit_feedback import ImplicitFeedbackDetector
+                prev_assistant = next(
+                    (m["content"] for m in reversed(messages) if m.get("role") == "assistant"),
+                    None,
+                )
+                signal = ImplicitFeedbackDetector.detect(user_content, prev_assistant)
+                if signal.signal_type != "neutral":
+                    from core.context.prompts import PromptFeedback
+                    rating_map = {"correction": 1, "frustration": 1, "rephrasing": 2,
+                                  "clarification": 3, "positive": 5}
+                    PromptFeedback(SessionLocal).record_feedback(
+                        prompt_template_id="chat_turn",
+                        prompt_version="auto",
+                        llm_request_id=parent_event_id or "",
+                        user_rating=rating_map.get(signal.signal_type, 3),
+                        user_comment=f"[implicit:{signal.signal_type}] {signal.evidence}",
+                        metadata={"source": "implicit_heuristic", "confidence": str(signal.confidence)},
+                    )
+            except Exception as e:
+                logger.debug("Implicit feedback skipped: %s", e)
 
     except Exception as e:
         logger.warning("Event persistence failed (non-fatal): %s", e)

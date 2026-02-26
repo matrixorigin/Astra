@@ -648,14 +648,13 @@ class SelfImprovingSelector(DbConsumer):
                 signal_breakdown[signal_type.value] = count
         
             # Query regression gate results (validates selector changes before deployment)
-            # Key metrics: pass_rate (safety), avg_improvement_pct (effectiveness)
-            from api.models import SelectorGateResult
-            gate_results = db.query(SelectorGateResult).all()
+            from api.models import GateResult
+            gate_results = db.query(GateResult).filter(GateResult.change_type == "selector").all()
             total_gates = len(gate_results)
-            passed = sum(1 for g in gate_results if g.verdict == "PASS")
+            passed = sum(1 for g in gate_results if g.passed)
             failed = total_gates - passed
             pass_rate = passed / total_gates if total_gates > 0 else 0.0
-            improvements = [g.improvement_pct for g in gate_results if g.improvement_pct is not None]
+            improvements = [g.score_delta for g in gate_results if g.score_delta is not None]
             avg_improvement_pct = sum(improvements) / len(improvements) if improvements else 0.0
         
             return {
