@@ -28,18 +28,22 @@ class EventReader(DbConsumer):
         Returns:
             ConversationEvent: Event object
         """
-        # Parse JSON fields
-        metadata = json.loads(row["metadata"]) if row.get("metadata") else None
-        context_snapshot = (
-            ContextSnapshot.model_validate_json(row["context_snapshot"])
-            if row.get("context_snapshot")
-            else None
-        )
-        token_usage = (
-            TokenUsage.model_validate_json(row["token_usage"]) if row.get("token_usage") else None
-        )
-        skills_snapshot = json.loads(row["skills_snapshot"]) if row.get("skills_snapshot") else None
-        llm_params = json.loads(row["llm_params"]) if row.get("llm_params") else None
+        # Parse JSON fields — MatrixOne stores NULL as JSON string "null"
+        def _parse_json(val):
+            if not val or val == "null":
+                return None
+            return json.loads(val) if isinstance(val, str) else val
+
+        def _parse_model(val, cls):
+            if not val or val == "null":
+                return None
+            return cls.model_validate_json(val) if isinstance(val, str) else cls.model_validate(val)
+
+        metadata = _parse_json(row.get("metadata"))
+        context_snapshot = _parse_model(row.get("context_snapshot"), ContextSnapshot)
+        token_usage = _parse_model(row.get("token_usage"), TokenUsage)
+        skills_snapshot = _parse_json(row.get("skills_snapshot"))
+        llm_params = _parse_json(row.get("llm_params"))
 
         return ConversationEvent(
             event_id=row["event_id"],
