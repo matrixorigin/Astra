@@ -37,6 +37,18 @@ def cleanup_fan_in_tasks() -> None:
     _fan_in_tasks.clear()
 
 
+def cleanup_run_tasks() -> None:
+    """Cancel all pending run tasks. Call during test teardown."""
+    for t in list(_run_tasks.values()):
+        if not t.done():
+            t.cancel()
+    _run_tasks.clear()
+    _active_runs.clear()
+    _run_events.clear()
+    _run_waiters.clear()
+    _child_runs.clear()
+
+
 # Max size for resume user_input to prevent token explosion on adversarial loops
 _MAX_RESUME_INPUT_CHARS = 4000
 # Max completed runs to keep in memory before cleanup

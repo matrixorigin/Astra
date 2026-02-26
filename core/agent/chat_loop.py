@@ -110,7 +110,6 @@ class ChatLoop:
         firewall,
         agent_id: str = "dev-agent",
         scratchpad=None,
-        continuity=None,
         firewall_mode: str = "warn",
         hitl_policy=None,
     ):
@@ -125,7 +124,6 @@ class ChatLoop:
             firewall: Hallucination firewall (required for verification)
             agent_id: ID of the agent running this loop (for multi-agent)
             scratchpad: AgentScratchpad instance for working memory (optional)
-            continuity: SessionContinuity instance for cross-session context (optional)
             firewall_mode: 'warn' (annotate) or 'block' (fail-closed). Default: 'warn'.
             hitl_policy: HITLPolicyEngine instance for human-in-the-loop supervision (optional)
         """
@@ -139,7 +137,6 @@ class ChatLoop:
         self.firewall_mode = firewall_mode if firewall_mode in ("warn", "block") else "warn"
         self.agent_id = agent_id
         self.scratchpad = scratchpad
-        self.continuity = continuity
         self.hitl_policy = hitl_policy
         self.observer = None  # Set via set_observer()
         self.mcp_bridge = None  # Set via set_mcp_bridge()
@@ -1584,16 +1581,7 @@ class ChatLoop:
             if few_shot_section:
                 sections.append(few_shot_section)
 
-        # §3 Prior context (semi-stable, changes across sessions)
-        if self.continuity and session_id and user_id:
-            prior = self.continuity.load_prior_context(
-                user_id=user_id, current_session_id=session_id,
-            )
-            section = prior.to_prompt_section()
-            if section:
-                sections.append(section)
-
-        # §4 Working memory (changes within session)
+        # §3 Working memory (changes within session)
         if self.scratchpad and session_id:
             notes = self.scratchpad.get_active_notes(session_id)
             if notes:

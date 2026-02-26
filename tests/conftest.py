@@ -201,6 +201,11 @@ def _clear_chat_module_state():
         mod._flush_persist_threads()
         mod._session_cache.clear()
         mod._shared_llm_client = None
+    # Clean up run_engine tasks to avoid "Task was destroyed but pending" warnings
+    engine_mod = sys.modules.get("core.agent.run_engine")
+    if engine_mod is not None:
+        engine_mod.cleanup_run_tasks()
+        engine_mod.cleanup_fan_in_tasks()
 
 
 # ============================================================================
