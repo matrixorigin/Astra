@@ -14,6 +14,9 @@ from api.models.agent import (  # noqa: F401
     Session,
 )
 
+# memory (new)
+from api.models.memory import MemoryRecord  # noqa: F401
+
 # skills
 from api.models.skill import (  # noqa: F401
     SkillExecutionMetric,
