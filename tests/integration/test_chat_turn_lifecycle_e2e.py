@@ -564,3 +564,207 @@ class TestChatTurnExpanded:
             "SELECT COUNT(*) FROM context_snapshots WHERE session_id = :sid"
         ), {"sid": session_id}).scalar()
         assert count >= 2, f"Expected >=2 context snapshots after 3 turns, got {count}"
+
+
+# ============================================================================
+# Coverage gap tests: verify review fixes have real behavioral tests
+# ============================================================================
+
+class TestClassifyTask:
+    """Unit tests for _classify_task heuristic (Review #1)."""
+
+    def test_last_user_message_used(self):
+        """Should classify based on the LAST user message, not the first."""
+        from api.routers.chat import _classify_task
+        msgs = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "explain the algorithm"},
+        ]
+        assert _classify_task(msgs) == "reasoning"
+
+    def test_word_boundary_no_false_positive(self):
+        """'definitely' should NOT trigger 'code' (no word boundary on 'def')."""
+        from api.routers.chat import _classify_task
+        assert _classify_task([{"role": "user", "content": "I definitely agree"}]) is None
+
+    def test_code_fenced_block(self):
+        from api.routers.chat import _classify_task
+        assert _classify_task([{"role": "user", "content": "fix this ```python\nprint()```"}]) == "code"
+
+    def test_file_extension_not_false_positive(self):
+        """'read main.py' is NOT code generation — should return None (Review #1 fix)."""
+        from api.routers.chat import _classify_task
+        assert _classify_task([{"role": "user", "content": "read main.py"}]) is None
+
+    def test_no_simple_category(self):
+        """Short messages should return None, not 'simple'."""
+        from api.routers.chat import _classify_task
+        assert _classify_task([{"role": "user", "content": "hi"}]) is None
+
+    def test_empty_messages(self):
+        from api.routers.chat import _classify_task
+        assert _classify_task([]) is None
+
+
+class TestSnapshotRecoveryFastPath:
+    """Verify snapshot recovery loads snapshot + post-snapshot events (Review #4)."""
+
+    def test_recovery_via_snapshot_after_3_turns(self, client, db):
+        """3 turns → snapshot written → evict cache → turn 4 recovers via snapshot."""
+        headers, _ = _unique_auth(client, db, "snaprec")
+
+        session_id = None
+        for i in range(3):
+            with patch("core.llm.client.LLMClient.chat_stream",
+                       return_value=fake_llm_stream([{"type": "text", "content": f"reply {i}"}])):
+                r = client.post("/chat/turn", json={
+                    "messages": [{"role": "user", "content": f"turn {i}"}],
+                    **({"session_id": session_id} if session_id else {}),
+                }, headers=headers)
+            if session_id is None:
+                session_id = parse_sse_events(r.text)[0]["session_id"]
+
+        flush_persist_threads()
+
+        # Verify snapshot was written
+        snap = db.execute(sql_text(
+            "SELECT COUNT(*) FROM conversation_events WHERE session_id = :sid AND event_type = 'session_history_snapshot'"
+        ), {"sid": session_id}).scalar()
+        assert snap >= 1, "Snapshot should exist after 3 turns"
+
+        # Evict cache
+        from api.routers.chat import _session_cache
+        _session_cache.clear()
+
+        # Turn 4 — should recover via snapshot fast-path
+        with patch("core.llm.client.LLMClient.chat_stream",
+                   return_value=fake_llm_stream([{"type": "text", "content": "recovered"}])):
+            r4 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "turn 3 after restart"}],
+                "session_id": session_id,
+            }, headers=headers)
+
+        e4 = parse_sse_events(r4.text)
+        assert any(e["type"] == "text_delta" and e["content"] == "recovered" for e in e4)
+
+    def test_post_snapshot_events_recovered(self, client, db):
+        """Turn 4 after snapshot at turn 3 → evict → turn 5 sees turn 4 content."""
+        headers, _ = _unique_auth(client, db, "postsnap")
+
+        session_id = None
+        # 4 turns: snapshot at turn 3, turn 4 is post-snapshot
+        for i in range(4):
+            with patch("core.llm.client.LLMClient.chat_stream",
+                       return_value=fake_llm_stream([{"type": "text", "content": f"reply {i}"}])):
+                r = client.post("/chat/turn", json={
+                    "messages": [{"role": "user", "content": f"msg {i}"}],
+                    **({"session_id": session_id} if session_id else {}),
+                }, headers=headers)
+            if session_id is None:
+                session_id = parse_sse_events(r.text)[0]["session_id"]
+
+        flush_persist_threads()
+
+        # Evict and recover
+        from api.routers.chat import _session_cache
+        _session_cache.clear()
+
+        # Capture what messages are sent to LLM on turn 5
+        captured: list[list] = []
+
+        async def _capture(messages, *a, **kw):
+            captured.append(list(messages))
+            async for c in fake_llm_stream([{"type": "text", "content": "ok"}]):
+                yield c
+
+        with patch("core.llm.client.LLMClient.chat_stream", side_effect=_capture):
+            client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "turn 4 query"}],
+                "session_id": session_id,
+            }, headers=headers)
+
+        # The recovered history should contain turn 4's message ("msg 3")
+        # which was AFTER the snapshot at turn 3
+        all_content = " ".join(m.get("content", "") for m in captured[0])
+        assert "msg 3" in all_content, \
+            f"Post-snapshot turn 4 content should be recovered, got: {[m.get('content','')[:50] for m in captured[0]]}"
+
+
+class TestToolResultRefreshQuery:
+    """Verify tool-result-only turns use previous user query for refresh (Review #7)."""
+
+    def test_tool_result_refresh_uses_previous_query(self, client, db):
+        """On a tool-result-only turn, refresh_memory should receive the
+        previous user query, not a placeholder string."""
+        headers, _ = _unique_auth(client, db, "trquery")
+
+        # Turn 1: user query + tool call
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
+                   return_value=fake_llm_stream([
+                       {"type": "tool_call", "data": {
+                           "id": "tc_1", "type": "function",
+                           "function": {"name": "read_file", "arguments": '{"path": "x.py"}'},
+                       }},
+                   ])):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "read x.py for me"}],
+                "edge_tools": list(_TOOLS),
+            }, headers=headers)
+        session_id = parse_sse_events(r1.text)[0]["session_id"]
+
+        # Turn 2: tool results only (no new user message)
+        refresh_queries: list[str] = []
+        original_refresh = None
+
+        def _track_refresh(self_pa, session_id, user_id, user_query, current_sections, **kw):
+            refresh_queries.append(user_query)
+            # Return a minimal valid result
+            from core.context.prompt_assembler import AssembledPrompt
+            return AssembledPrompt(
+                system_message="refreshed",
+                tools_schema=[],
+                sections=current_sections,
+                token_breakdown={},
+                snapshot_id=None,
+            )
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream",
+                   return_value=fake_llm_stream([{"type": "text", "content": "done"}])), \
+             patch("core.context.prompt_assembler.PromptAssembler.refresh_memory", _track_refresh):
+            client.post("/chat/turn", json={
+                "messages": [],
+                "session_id": session_id,
+                "tool_results": [{"tool_call_id": "tc_1", "name": "read_file", "result": "content"}],
+            }, headers=headers)
+
+        assert len(refresh_queries) >= 1, f"refresh_memory should be called, got {refresh_queries}"
+        # Should use the previous user query, NOT a placeholder
+        assert refresh_queries[-1] == "read x.py for me", \
+            f"Expected previous user query, got: '{refresh_queries[-1]}'"
+
+
+class TestResolvedModelInAudit:
+    """Verify audit records the actual resolved model, not 'default' (Review #6)."""
+
+    def test_audit_records_resolved_model(self, client, db):
+        headers, _ = _unique_auth(client, db, "modelaudit")
+
+        with patch("core.llm.client.LLMClient.chat_stream",
+                   return_value=fake_llm_stream([{"type": "text", "content": "hi"}])), \
+             patch("core.llm.client.LLMClient.resolve_model_name", return_value="gpt-4o-mini"):
+            r = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "hello"}],
+            }, headers=headers)
+        session_id = parse_sse_events(r.text)[0]["session_id"]
+
+        flush_persist_threads()
+
+        row = db.execute(sql_text(
+            "SELECT decision_output FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"
+        ), {"sid": session_id}).fetchone()
+        assert row is not None, "decision_audit row should exist"
+        import json as _json
+        output = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        assert output.get("model_used") == "gpt-4o-mini", \
+            f"Audit should record resolved model 'gpt-4o-mini', got: {output}"

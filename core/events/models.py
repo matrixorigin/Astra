@@ -19,6 +19,7 @@ class EventType(str, Enum):
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     SYSTEM_MESSAGE = "system_message"
+    SESSION_HISTORY_SNAPSHOT = "session_history_snapshot"
     MULTI_AGENT_MESSAGE = "multi_agent_message"
 
     # Planning events
