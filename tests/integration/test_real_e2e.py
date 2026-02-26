@@ -735,6 +735,8 @@ class TestChatTurnRealE2E:
                 "messages": [{"role": "user", "content": "test persist"}],
             }, headers=headers)
 
+        from api.routers.chat import _flush_persist_threads
+        _flush_persist_threads()
         after = db.execute(sql_text(
             "SELECT COUNT(*) FROM conversation_events WHERE user_id = 'edge_user'"
         )).scalar()

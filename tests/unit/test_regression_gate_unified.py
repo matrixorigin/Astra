@@ -12,41 +12,26 @@ from core.evaluation.regression_gate import RegressionGate, ChangeType
 
 @pytest.fixture
 def setup_tables(db_session):
-    """Setup gate_results table (conversation_events already exists from Base.metadata)."""
+    """Ensure gate_results table exists and clean test data."""
     from core.utils.id_generator import generate_id
-    # Use unique user_id to avoid cross-worker contamination in parallel tests
+    from api.database import init_db
     uid = f"gate_test_{generate_id()[:8]}"
 
-    # Cleanup any leftover test data from previous runs
-    db_session.execute(text("DROP TABLE IF EXISTS gate_results"))
+    # Ensure table exists (init_db is idempotent)
+    init_db()
+
+    # Start with a clean gate_results table
+    db_session.execute(text("DELETE FROM gate_results"))
     db_session.commit()
-    
-    # Create gate_results table
-    db_session.execute(text("""
-        CREATE TABLE IF NOT EXISTS gate_results (
-            gate_id VARCHAR(36) PRIMARY KEY,
-            change_type VARCHAR(20) NOT NULL,
-            change_id VARCHAR(128) NOT NULL,
-            snapshot_used VARCHAR(64),
-            sessions_tested INT DEFAULT 0,
-            error_rate DOUBLE DEFAULT 0.0,
-            score_delta DOUBLE DEFAULT 0.0,
-            passed TINYINT(1) NOT NULL,
-            metrics TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """))
-    
-    db_session.commit()
-    # Stash unique user_id for tests to use
+
     db_session._test_uid = uid
     yield db_session
-    
-    # Cleanup: delete only our test data
+
+    # Cleanup
     db_session.execute(text(
         "DELETE FROM conversation_events WHERE user_id = :uid"
     ), {"uid": uid})
-    db_session.execute(text("DROP TABLE IF EXISTS gate_results"))
+    db_session.execute(text("DELETE FROM gate_results"))
     db_session.commit()
 
 

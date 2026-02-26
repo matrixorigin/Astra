@@ -32,6 +32,7 @@ from core.auth.password import hash_password
 # ============================================================================
 
 from tests.integration.helpers import fake_stream_gen, fake_stream, parse_sse, NullRenderer
+from tests.conftest import flush_persist_threads
 
 
 # ============================================================================
@@ -477,6 +478,7 @@ class TestIntrospectionAuditLogging:
             assert response.status_code == 200
 
         # Verify the event was persisted with introspection marker
+        flush_persist_threads()
         row = db_session.execute(
             sql_text("""
                 SELECT metadata FROM conversation_events
@@ -507,6 +509,7 @@ class TestIntrospectionAuditLogging:
             )
             assert response.status_code == 200
 
+        flush_persist_threads()
         row = db_session.execute(
             sql_text("""
                 SELECT metadata FROM conversation_events
@@ -674,11 +677,8 @@ class TestIntrospectionMemoryEndpoint:
 class TestTurnHooksE2E:
     """Verify /chat/turn writes decision_audit and skill_selection_events rows.
 
-    All hook writes (decision_audit, skill_selection) are synchronous inside
-    _persist_turn_events, which completes before the SSE stream ends.
-    TestClient consumes the full stream before returning, so rows are visible
-    without any sleep.  Only run_observer is async (daemon thread) and is not
-    asserted here.
+    Hook writes happen inside _persist_turn_events which runs in a background
+    thread (Task 5).  A short sleep is needed before DB assertions.
     """
 
     def test_tool_call_turn_writes_audit_and_selection(self, client, auth_headers, db_session):
@@ -700,6 +700,8 @@ class TestTurnHooksE2E:
         events = parse_sse(resp.text)
         sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
         assert sid, "SSE should contain session_id"
+
+        flush_persist_threads()
 
         # decision_audit: tool_selection
         audit_row = db_session.execute(
@@ -734,6 +736,7 @@ class TestTurnHooksE2E:
         sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
         assert sid
 
+        flush_persist_threads()
         row = db_session.execute(
             sql_text("SELECT decision_type FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
             {"sid": sid},
@@ -769,6 +772,7 @@ class TestToolCallStartPersistence:
         sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
         assert sid
 
+        flush_persist_threads()
         row = db_session.execute(
             sql_text("""
                 SELECT content, metadata FROM conversation_events
@@ -805,6 +809,7 @@ class TestToolCallStartPersistence:
         sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
         assert sid
 
+        flush_persist_threads()
         row = db_session.execute(
             sql_text("""
                 SELECT metadata FROM conversation_events

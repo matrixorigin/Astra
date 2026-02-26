@@ -42,6 +42,7 @@ class TurnHooks(DbConsumer):
         tool_calls: list[dict[str, Any]],
         response_text: str,
         context_capture_id: str | None,
+        model_used: str | None = None,
     ) -> None:
         """Record a decision audit entry."""
         from api.models import DecisionAudit
@@ -55,7 +56,7 @@ class TurnHooks(DbConsumer):
                     session_id=session_id,
                     event_id=event_id,
                     decision_type="tool_selection" if tc_names else "response_generation",
-                    decision_output={"text": response_text[:500], "tool_calls": tc_names},
+                    decision_output={"text": response_text[:500], "tool_calls": tc_names, "model_used": model_used},
                     context_capture_id=context_capture_id,
                 ))
                 db.commit()

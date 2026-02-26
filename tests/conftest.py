@@ -194,9 +194,11 @@ def _clear_chat_module_state():
     if mod is not None:
         mod._session_cache.clear()
         mod._shared_llm_client = None
+        mod._flush_persist_threads()
     yield
     mod = sys.modules.get("api.routers.chat")
     if mod is not None:
+        mod._flush_persist_threads()
         mod._session_cache.clear()
         mod._shared_llm_client = None
 
@@ -242,6 +244,14 @@ def get_auth_headers(client, db, *, username="testuser", user_id="test_uid",
         db.commit()
     resp = client.post("/auth/login", json={"username": username, "password": password})
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+def flush_persist_threads():
+    """Join all background persistence threads. Call before DB assertions."""
+    import sys
+    mod = sys.modules.get("api.routers.chat")
+    if mod is not None:
+        mod._flush_persist_threads()
 
 
 # ============================================================================
