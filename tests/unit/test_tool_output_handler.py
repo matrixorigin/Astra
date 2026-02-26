@@ -123,10 +123,12 @@ class TestFindSimilarResult:
 
     def test_matching_result_returns_reference(self, mock_retriever):
         """Matching result returns memory reference."""
+        from datetime import datetime, timedelta
         mock_memory = MagicMock()
         mock_memory.memory_id = "mem_old"
         mock_memory.metadata = {"tool": "grep"}
         mock_memory.content = "test pattern found in file.py"
+        mock_memory.created_at = datetime.now() - timedelta(seconds=60)
         mock_retriever.retrieve.return_value = [mock_memory]
         
         result = find_similar_result(
@@ -201,3 +203,142 @@ class TestDynamicThreshold:
         # 1000 tokens * 4 * 0.2 = 800 bytes, but min is 2KB
         threshold = compute_dynamic_threshold(1000)
         assert threshold == MIN_THRESHOLD
+
+
+class TestSummaryRegistry:
+    """Tests for summary strategy registry."""
+
+    def test_register_custom_strategy(self):
+        """Can register custom summary strategy."""
+        from core.agent.tool_output_handler import register_summary_strategy, generate_structured_summary
+        
+        def custom_summary(output: str) -> str:
+            return f"CUSTOM: {len(output)} bytes"
+        
+        register_summary_strategy("my_tool", custom_summary)
+        result = generate_structured_summary("test content", "my_tool")
+        assert result == "CUSTOM: 12 bytes"
+
+    def test_json_summary(self):
+        """JSON summary extracts keys."""
+        from core.agent.tool_output_handler import generate_structured_summary
+        import json
+        
+        data = {"key1": "value1", "key2": "value2", "key3": "value3"}
+        result = generate_structured_summary(json.dumps(data), "api_call")
+        assert "3 keys" in result
+        assert "key1" in result
+
+    def test_file_content_summary(self):
+        """File content summary shows head and tail."""
+        from core.agent.tool_output_handler import generate_structured_summary
+        
+        lines = [f"line{i}" for i in range(100)]
+        output = '\n'.join(lines)
+        result = generate_structured_summary(output, "fs_read")
+        assert "100 lines" in result
+        assert "line0" in result
+        assert "line99" in result
+
+
+class TestMemoryExpand:
+    """Tests for memory expand functionality."""
+
+    def test_expand_full_content(self):
+        """Expand returns full content."""
+        from core.agent.tool_output_handler import expand_memory_reference
+        from unittest.mock import MagicMock
+        
+        mock_store = MagicMock()
+        mock_memory = MagicMock()
+        mock_memory.content = "line1\nline2\nline3"
+        mock_store.get.return_value = mock_memory
+        
+        result = expand_memory_reference("mem_123", mock_store)
+        assert result == "line1\nline2\nline3"
+
+    def test_expand_with_line_range(self):
+        """Expand with line range returns subset."""
+        from core.agent.tool_output_handler import expand_memory_reference
+        from unittest.mock import MagicMock
+        
+        mock_store = MagicMock()
+        mock_memory = MagicMock()
+        mock_memory.content = "line1\nline2\nline3\nline4\nline5"
+        mock_store.get.return_value = mock_memory
+        
+        result = expand_memory_reference("mem_123", mock_store, start_line=2, end_line=4)
+        assert "line2" in result
+        assert "line3" in result
+        assert "line4" in result
+        assert "line1" not in result
+
+    def test_expand_with_query_filter(self):
+        """Expand with query filters matching lines."""
+        from core.agent.tool_output_handler import expand_memory_reference
+        from unittest.mock import MagicMock
+        
+        mock_store = MagicMock()
+        mock_memory = MagicMock()
+        mock_memory.content = "error: something\ninfo: ok\nerror: another"
+        mock_store.get.return_value = mock_memory
+        
+        result = expand_memory_reference("mem_123", mock_store, query="error")
+        assert "2 lines matching" in result
+        assert "error: something" in result
+        assert "info: ok" not in result
+
+    def test_expand_not_found(self):
+        """Expand returns error for missing memory."""
+        from core.agent.tool_output_handler import expand_memory_reference
+        from unittest.mock import MagicMock
+        
+        mock_store = MagicMock()
+        mock_store.get.return_value = None
+        
+        result = expand_memory_reference("mem_missing", mock_store)
+        assert "not found" in result
+
+
+class TestStalenessCheck:
+    """Tests for historical result staleness."""
+
+    def test_old_result_rejected(self):
+        """Results older than max_age are rejected."""
+        from core.agent.tool_output_handler import find_similar_result
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta
+        
+        mock_retriever = MagicMock()
+        mock_memory = MagicMock()
+        mock_memory.metadata = {"tool": "grep"}
+        mock_memory.content = "test pattern"
+        mock_memory.created_at = datetime.now() - timedelta(seconds=600)  # 10 min old
+        mock_retriever.retrieve.return_value = [mock_memory]
+        
+        result = find_similar_result(
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,
+            max_age_seconds=300  # 5 min max
+        )
+        assert result is None  # Rejected due to staleness
+
+    def test_fresh_result_accepted(self):
+        """Fresh results are accepted."""
+        from core.agent.tool_output_handler import find_similar_result
+        from unittest.mock import MagicMock
+        from datetime import datetime, timedelta
+        
+        mock_retriever = MagicMock()
+        mock_memory = MagicMock()
+        mock_memory.memory_id = "mem_fresh"
+        mock_memory.metadata = {"tool": "grep"}
+        mock_memory.content = "test pattern found"
+        mock_memory.created_at = datetime.now() - timedelta(seconds=60)  # 1 min old
+        mock_retriever.retrieve.return_value = [mock_memory]
+        
+        result = find_similar_result(
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,
+            max_age_seconds=300
+        )
+        assert result is not None
+        assert "mem_fresh" in result

@@ -94,6 +94,52 @@ SUMMARY_GENERATORS: dict[str, Callable[[str], str]] = {
 }
 
 
+def register_summary_strategy(tool_name: str, strategy: Callable[[str], str]) -> None:
+    """Register a custom summary strategy for a tool.
+    
+    Args:
+        tool_name: Name of the tool
+        strategy: Function that takes output string and returns summary
+    """
+    SUMMARY_GENERATORS[tool_name] = strategy
+
+
+def _summarize_json(output: str) -> str:
+    """Summarize JSON output: keys + sample values."""
+    try:
+        import json
+        data = json.loads(output)
+        if isinstance(data, dict):
+            keys = list(data.keys())[:20]
+            return f"JSON object with {len(data)} keys: {', '.join(keys)}{'...' if len(data) > 20 else ''}"
+        elif isinstance(data, list):
+            return f"JSON array with {len(data)} items. First item keys: {list(data[0].keys()) if data and isinstance(data[0], dict) else 'N/A'}"
+    except Exception:
+        pass
+    return _summarize_default(output)
+
+
+def _summarize_file_content(output: str) -> str:
+    """Summarize file content: line count + head + tail."""
+    lines = output.strip().split('\n')
+    if len(lines) <= 30:
+        return output
+    return (
+        f"File content: {len(lines)} lines, {len(output)} bytes\n"
+        f"First 15 lines:\n" + '\n'.join(lines[:15]) + "\n...\n"
+        f"Last 10 lines:\n" + '\n'.join(lines[-10:])
+    )
+
+
+# Register additional strategies
+SUMMARY_GENERATORS.update({
+    "fs_read": _summarize_file_content,
+    "read_file": _summarize_file_content,
+    "web_fetch": _summarize_default,  # HTML too varied for rules
+    "api_call": _summarize_json,
+})
+
+
 def generate_structured_summary(output: str, tool_name: str) -> str:
     """Generate rule-based structured summary (zero LLM cost)."""
     generator = SUMMARY_GENERATORS.get(tool_name, _summarize_default)
@@ -155,6 +201,7 @@ def find_similar_result(
     user_id: str,
     retriever: MemoryRetriever,
     cross_session: bool = False,
+    max_age_seconds: int = 300,  # 5 minutes default
 ) -> str | None:
     """Find similar historical tool result via mo-trustmem Retriever.
     
@@ -165,10 +212,13 @@ def find_similar_result(
         user_id: Current user ID
         retriever: mo-trustmem MemoryRetriever instance
         cross_session: If True, search across all sessions
+        max_age_seconds: Maximum age of result to consider (staleness check)
     
     Returns:
         Memory reference if similar result found, None otherwise
     """
+    from datetime import datetime, timedelta
+    
     # Build query from tool name + key params
     query_parts = [tool_name]
     for key in ("pattern", "path", "command", "query"):
@@ -188,9 +238,16 @@ def find_similar_result(
         return None
     
     result = results[0]
-    # Verify same tool and similar params
+    
+    # Verify same tool
     if result.metadata.get("tool") != tool_name:
         return None
+    
+    # Staleness check: reject if too old
+    if result.created_at:
+        age = datetime.now() - result.created_at
+        if age > timedelta(seconds=max_age_seconds):
+            return None
     
     # Check key param match (e.g., same grep pattern)
     if "pattern" in params:
@@ -199,3 +256,81 @@ def find_similar_result(
             return None
     
     return f"[Reusing previous {tool_name} result: memory:{result.memory_id}]"
+
+
+# --- Memory Expand Tool (for LLM to expand [memory:xxx] references) ---
+
+def expand_memory_reference(
+    memory_id: str,
+    memory_store: MemoryStore,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    query: str | None = None,
+) -> str:
+    """Expand a memory reference, optionally with range or query filter.
+    
+    Args:
+        memory_id: The memory ID to expand (from [memory:xxx] reference)
+        memory_store: mo-trustmem MemoryStore instance
+        start_line: Optional start line for partial expansion
+        end_line: Optional end line for partial expansion
+        query: Optional query to filter content (grep-like)
+    
+    Returns:
+        Expanded content (full or filtered)
+    """
+    memory = memory_store.get(memory_id)
+    if not memory:
+        return f"Error: Memory {memory_id} not found"
+    
+    content = memory.content
+    lines = content.split('\n')
+    
+    # Apply line range filter
+    if start_line is not None or end_line is not None:
+        start = (start_line or 1) - 1
+        end = end_line or len(lines)
+        lines = lines[start:end]
+        content = '\n'.join(lines)
+    
+    # Apply query filter
+    if query:
+        matching = [l for l in lines if query.lower() in l.lower()]
+        if matching:
+            content = f"Filtered {len(matching)} lines matching '{query}':\n" + '\n'.join(matching[:50])
+        else:
+            content = f"No lines matching '{query}'"
+    
+    return content
+
+
+# Tool schema for LLM
+MEMORY_EXPAND_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "memory_expand",
+        "description": "Expand a [memory:xxx] reference to see full content. Use when you need details from a summarized tool output.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "The memory ID from [memory:xxx] reference"
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "Optional: start line for partial view"
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Optional: end line for partial view"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional: filter lines containing this text"
+                },
+            },
+            "required": ["memory_id"],
+        },
+    },
+}
