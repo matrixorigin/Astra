@@ -665,3 +665,95 @@ class TestIntrospectionMemoryEndpoint:
         """session_id query param is required."""
         response = client.get("/introspection/memory", headers=auth_headers)
         assert response.status_code == 422
+
+
+# ============================================================================
+# 11. TurnHooks e2e — decision audit + skill selection via /chat/turn
+# ============================================================================
+
+class TestTurnHooksE2E:
+    """Verify /chat/turn writes decision_audit and skill_selection_events rows."""
+
+    def test_decision_audit_written_on_tool_call(self, client, auth_headers, db_session):
+        """A turn with tool_calls should produce a decision_audit row."""
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=fake_stream([
+            {"type": "text", "content": "Let me check."},
+            {"type": "tool_call", "data": {"id": "tc_1", "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}},
+        ])):
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "list files"}],
+                    "edge_tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+                },
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+
+        events = parse_sse(resp.text)
+        sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
+        assert sid, "SSE should contain session_id"
+
+        import time; time.sleep(0.3)  # hooks run in background threads
+
+        row = db_session.execute(
+            sql_text("SELECT decision_type, decision_output FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
+            {"sid": sid},
+        ).fetchone()
+        assert row is not None, "decision_audit row should exist after /chat/turn with tool_calls"
+        assert row[0] == "tool_selection"
+
+    def test_skill_selection_event_written(self, client, auth_headers, db_session):
+        """A turn with tool_calls should produce a skill_selection_events row."""
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=fake_stream([
+            {"type": "text", "content": "Running."},
+            {"type": "tool_call", "data": {"id": "tc_2", "function": {"name": "read_file", "arguments": '{"path":"/tmp/x"}'}}},
+        ])):
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "read the file"}],
+                    "edge_tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+                },
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+
+        events = parse_sse(resp.text)
+        sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
+        assert sid
+
+        import time; time.sleep(0.3)
+
+        row = db_session.execute(
+            sql_text("SELECT skill_name, selection_method FROM skill_selection_events WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
+            {"sid": sid},
+        ).fetchone()
+        assert row is not None, "skill_selection_events row should exist"
+        assert row[0] == "read_file"
+        assert row[1] == "llm_tool_choice"
+
+    def test_no_audit_on_plain_text_response(self, client, auth_headers, db_session):
+        """A turn without tool_calls should still write decision_audit (response_generation type)."""
+        with patch("core.llm.client.LLMClient.chat_stream", return_value=fake_stream([
+            {"type": "text", "content": "Hello!"},
+        ])):
+            resp = client.post(
+                "/chat/turn",
+                json={"messages": [{"role": "user", "content": "hi"}]},
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+
+        events = parse_sse(resp.text)
+        sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
+        assert sid
+
+        import time; time.sleep(0.3)
+
+        row = db_session.execute(
+            sql_text("SELECT decision_type FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
+            {"sid": sid},
+        ).fetchone()
+        assert row is not None, "decision_audit should exist even for plain text responses"
+        assert row[0] == "response_generation"

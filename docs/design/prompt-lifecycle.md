@@ -470,7 +470,7 @@ This already exists in your design (evaluation-and-evolution.md). The new contri
 | Project rules | Edge filesystem | Session (loaded once) | Edge → cloud on first turn |
 | Edge tools | Edge `ToolRouter` | Process lifetime | Edge → cloud on first turn, cached |
 | Edge profile | Edge (detected) | Session | Edge → cloud on first turn |
-| Conversation history | Cloud `_turn_histories` + DB | Session (memory) + permanent (DB) | Cloud-only |
+| Conversation history | Cloud `_session_cache` + DB | Session (memory) + permanent (DB) | Cloud-only |
 | Context snapshots | Cloud DB `context_snapshots` | Permanent | Cloud-only |
 | Scratchpad | Cloud DB (session-scoped) | Session | Cloud-only |
 | Memory (episodic) | Cloud DB `conversation_events` | 90 days active, then compressed | Cloud-only |

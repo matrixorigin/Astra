@@ -421,7 +421,7 @@ core/
     scheduler.py                    #   GovernanceTaskRunner (distributed lock + heartbeat)
 api/
   services/
-    session_service.py              #   _cleanup_sandbox() on session close (Tier 0)
+    session_service.py              #   _cleanup_sandbox() + _run_close_hooks() on session close (Tier 0)
   routers/
     streaming.py                    #   ChatLoop + CodeExecutor wiring
 ```
