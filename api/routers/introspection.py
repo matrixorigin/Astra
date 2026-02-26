@@ -31,7 +31,7 @@ def get_introspection_memory(
         return {
             "episodic": _get_episodic_stats(db, session_id),
             "semantic": _get_semantic_stats(db, session_id),
-            "procedural": _get_procedural_stats(db, user_id),
+            "procedural": _get_procedural_stats(db, session_id),
         }
     finally:
         db.close()
@@ -85,10 +85,10 @@ def _get_semantic_stats(db: Session, session_id: str) -> dict:
         return {"context_snapshots": 0, "peak_snapshot_tokens": 0}
 
 
-def _get_procedural_stats(db: Session, user_id: str) -> dict:
-    """Get skill selection accuracy for this user.
+def _get_procedural_stats(db: Session, session_id: str) -> dict:
+    """Get skill selection accuracy for this session.
 
-    skill_selection_events has no user_id column, so we join through sessions.
+    Scoped to session_id (consistent with episodic/semantic stats).
     Uses user_feedback_score (Integer, positive = good) from
     skill_selection_events (see api/models.py SkillSelectionEvent).
     """
@@ -96,12 +96,11 @@ def _get_procedural_stats(db: Session, user_id: str) -> dict:
         row = db.execute(
             text("""
                 SELECT COUNT(*),
-                       SUM(CASE WHEN sse.user_feedback_score > 0 THEN 1 ELSE 0 END)
-                FROM skill_selection_events sse
-                JOIN sessions s ON sse.session_id = s.session_id
-                WHERE s.user_id = :uid
+                       SUM(CASE WHEN user_feedback_score > 0 THEN 1 ELSE 0 END)
+                FROM skill_selection_events
+                WHERE session_id = :sid
             """),
-            {"uid": user_id},
+            {"sid": session_id},
         ).fetchone()
         total = row[0] or 0
         positive = row[1] or 0

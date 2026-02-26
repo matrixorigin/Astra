@@ -672,10 +672,17 @@ class TestIntrospectionMemoryEndpoint:
 # ============================================================================
 
 class TestTurnHooksE2E:
-    """Verify /chat/turn writes decision_audit and skill_selection_events rows."""
+    """Verify /chat/turn writes decision_audit and skill_selection_events rows.
 
-    def test_decision_audit_written_on_tool_call(self, client, auth_headers, db_session):
-        """A turn with tool_calls should produce a decision_audit row."""
+    All hook writes (decision_audit, skill_selection) are synchronous inside
+    _persist_turn_events, which completes before the SSE stream ends.
+    TestClient consumes the full stream before returning, so rows are visible
+    without any sleep.  Only run_observer is async (daemon thread) and is not
+    asserted here.
+    """
+
+    def test_tool_call_turn_writes_audit_and_selection(self, client, auth_headers, db_session):
+        """A turn with tool_calls should produce both decision_audit and skill_selection_events rows."""
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=fake_stream([
             {"type": "text", "content": "Let me check."},
             {"type": "tool_call", "data": {"id": "tc_1", "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}},
@@ -694,47 +701,25 @@ class TestTurnHooksE2E:
         sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
         assert sid, "SSE should contain session_id"
 
-        import time; time.sleep(0.3)  # hooks run in background threads
-
-        row = db_session.execute(
-            sql_text("SELECT decision_type, decision_output FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
+        # decision_audit: tool_selection
+        audit_row = db_session.execute(
+            sql_text("SELECT decision_type FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
             {"sid": sid},
         ).fetchone()
-        assert row is not None, "decision_audit row should exist after /chat/turn with tool_calls"
-        assert row[0] == "tool_selection"
+        assert audit_row is not None, "decision_audit row should exist"
+        assert audit_row[0] == "tool_selection"
 
-    def test_skill_selection_event_written(self, client, auth_headers, db_session):
-        """A turn with tool_calls should produce a skill_selection_events row."""
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=fake_stream([
-            {"type": "text", "content": "Running."},
-            {"type": "tool_call", "data": {"id": "tc_2", "function": {"name": "read_file", "arguments": '{"path":"/tmp/x"}'}}},
-        ])):
-            resp = client.post(
-                "/chat/turn",
-                json={
-                    "messages": [{"role": "user", "content": "read the file"}],
-                    "edge_tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
-                },
-                headers=auth_headers,
-            )
-            assert resp.status_code == 200
-
-        events = parse_sse(resp.text)
-        sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
-        assert sid
-
-        import time; time.sleep(0.3)
-
-        row = db_session.execute(
+        # skill_selection_events
+        sse_row = db_session.execute(
             sql_text("SELECT skill_name, selection_method FROM skill_selection_events WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
             {"sid": sid},
         ).fetchone()
-        assert row is not None, "skill_selection_events row should exist"
-        assert row[0] == "read_file"
-        assert row[1] == "llm_tool_choice"
+        assert sse_row is not None, "skill_selection_events row should exist"
+        assert sse_row[0] == "bash"
+        assert sse_row[1] == "llm_tool_choice"
 
-    def test_no_audit_on_plain_text_response(self, client, auth_headers, db_session):
-        """A turn without tool_calls should still write decision_audit (response_generation type)."""
+    def test_plain_text_turn_writes_response_generation_audit(self, client, auth_headers, db_session):
+        """A turn without tool_calls should write decision_audit with type=response_generation."""
         with patch("core.llm.client.LLMClient.chat_stream", return_value=fake_stream([
             {"type": "text", "content": "Hello!"},
         ])):
@@ -749,11 +734,9 @@ class TestTurnHooksE2E:
         sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
         assert sid
 
-        import time; time.sleep(0.3)
-
         row = db_session.execute(
             sql_text("SELECT decision_type FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
             {"sid": sid},
         ).fetchone()
-        assert row is not None, "decision_audit should exist even for plain text responses"
+        assert row is not None, "decision_audit should exist for plain text responses"
         assert row[0] == "response_generation"

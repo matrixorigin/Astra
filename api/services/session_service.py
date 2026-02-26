@@ -228,8 +228,10 @@ class SessionService:
             if status == "ended":
                 update_data["ended_at"] = datetime.now(timezone.utc)
             if status in ("closed", "ended"):
-                self._cleanup_sandbox(session_id)
+                # Hooks first: quality scoring and knowledge extraction may
+                # read session data.  Sandbox cleanup is destructive — run last.
                 self._run_close_hooks(session_id, session.user_id)
+                self._cleanup_sandbox(session_id)
 
         if not update_data:
             # 没有更新内容，直接返回当前信息

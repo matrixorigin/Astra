@@ -538,9 +538,10 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
         ]
 
         # Accumulate tool_calls for the current assistant message.
-        # When we see an llm_response after tool_call_start events, we emit
-        # the assistant message with tool_calls attached, then the tool results,
-        # then the final assistant text.
+        # State machine: tool_call_start events accumulate in pending_tool_calls.
+        # The first tool_result flushes them as one assistant message, then each
+        # tool_result appends a tool message.  If tool_call_start events were
+        # lost (truncated by _MAX_RECOVERY_EVENTS), we synthesize from metadata.
         pending_tool_calls: list[dict[str, Any]] = []
 
         for row in rows:
@@ -556,7 +557,6 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
             if etype == "user_query":
                 history.append({"role": "user", "content": content})
             elif etype == "tool_call_start":
-                # Accumulate tool call info for the next assistant message.
                 try:
                     tc_data = json.loads(content) if isinstance(content, str) else {}
                 except (json.JSONDecodeError, TypeError):
@@ -570,11 +570,24 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
                     },
                 })
             elif etype == "tool_result":
-                # Emit pending assistant+tool_calls before the tool result.
+                tool_call_id = meta.get("tool_call_id", "")
+                tool_name = meta.get("name", "")
+                # Flush pending tool_calls as one assistant message (first
+                # tool_result in a batch triggers this).
                 if pending_tool_calls:
                     history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
                     pending_tool_calls = []
-                tool_call_id = meta.get("tool_call_id", "")
+                elif not (history and history[-1].get("role") == "assistant" and history[-1].get("tool_calls")):
+                    # No pending AND no preceding assistant+tool_calls: the
+                    # tool_call_start was lost.  Synthesize from metadata.
+                    if not tool_call_id:
+                        continue  # Cannot construct valid pair — skip.
+                    history.append({"role": "assistant", "content": "", "tool_calls": [{
+                        "id": tool_call_id, "type": "function",
+                        "function": {"name": tool_name, "arguments": "{}"},
+                    }]})
+                # else: preceding assistant+tool_calls already emitted by an
+                # earlier tool_result in this batch — just append tool message.
                 try:
                     result_data = json.loads(content) if isinstance(content, str) else {}
                 except (json.JSONDecodeError, TypeError):
@@ -585,12 +598,14 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
                     "content": result_data.get("result", content)[:4000] if isinstance(result_data, dict) else str(content)[:4000],
                 })
             elif etype == "llm_response":
-                # Flush any remaining pending tool_calls (shouldn't happen normally).
                 if pending_tool_calls:
                     history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
                     pending_tool_calls = []
                 history.append({"role": "assistant", "content": content})
 
+        # Intentionally discard trailing pending_tool_calls: incomplete tool
+        # call sequences (e.g. run cancelled mid-tool) should not be sent to
+        # the LLM — they would produce an invalid message sequence.
         return history
     except SQLAlchemyError as e:
         logger.debug("History recovery failed: %s", e)
@@ -635,7 +650,7 @@ def _persist_turn_events(
         # Persist tool results from edge
         if tool_results:
             for tr in tool_results:
-                meta = {"source": "edge", "tool_call_id": tr.get("tool_call_id")}
+                meta = {"source": "edge", "tool_call_id": tr.get("tool_call_id"), "name": tr.get("name", "")}
                 if tr.get("name") == "get_agent_info":
                     meta["introspection"] = True
                 el.create_stream_event(
@@ -645,6 +660,21 @@ def _persist_turn_events(
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
                     metadata=meta,
+                )
+
+        # Persist LLM tool calls so _recover_history_from_db can reconstruct
+        # the full assistant(tool_calls) → tool(result) message sequence.
+        if tool_calls:
+            for tc in tool_calls:
+                tc_id = tc.get("id", "")
+                tc_func = tc.get("function", {})
+                el.create_stream_event(
+                    user_id=user_id, session_id=session_id,
+                    event_type="tool_call_start",
+                    content=json.dumps({"tool_call_id": tc_id, "name": tc_func.get("name", ""), "arguments": tc_func.get("arguments", "{}")}),
+                    parent_event_id=parent_event_id,
+                    causal_chain_id=causal_chain_id,
+                    metadata={"tool_call_id": tc_id, "name": tc_func.get("name", "")},
                 )
 
         # Persist LLM response
@@ -722,7 +752,7 @@ async def chat_turn(
             tools_changed = True
         entry["tools"] = request.edge_tools
         _session_cache[session_id] = entry
-    tools_schema = (_session_cache.get(session_id) or {}).get("tools", [])
+    tools_schema = entry.get("tools", [])
 
     # Build conversation messages with context enrichment
     db = SessionLocal()

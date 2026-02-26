@@ -271,7 +271,7 @@ class RunEngine(DbConsumer):
             try:
                 gt = getattr(loop, '_gate_trigger', None) if loop else None
                 if gt and hasattr(gt, 'wait_all'):
-                    await asyncio.get_event_loop().run_in_executor(None, gt.wait_all, 5.0)
+                    await asyncio.get_running_loop().run_in_executor(None, gt.wait_all, 5.0)
             except Exception:
                 pass
             _run_tasks.pop(run.run_id, None)
