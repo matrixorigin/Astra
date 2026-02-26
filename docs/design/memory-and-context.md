@@ -857,7 +857,75 @@ CREATE TABLE observations (
 
 ---
 
-## 9. Open Research Directions
+## 9. Tool Context Engine (Context Overflow Prevention)
+
+Large tool outputs (grep, shell) are the primary cause of context overflow. The Tool Context Engine integrates with mo-trustmem to solve this:
+
+### Architecture
+
+```
+Tool Output → Size Check → [>10KB] → Store mo-trustmem (TOOL_RESULT)
+                                          ↓
+                                   Rule-based Summary (zero LLM cost)
+                                          ↓
+                              Return: Summary + [memory:xxx]
+                                          ↓
+                              LLM can request full via memory_read
+```
+
+### Key Components
+
+| Component | Location | Function |
+|-----------|----------|----------|
+| `MemoryType.TOOL_RESULT` | `core/memory/types.py` | Dedicated type for tool outputs |
+| `process_tool_output()` | `core/agent/tool_output_handler.py` | Store + summarize large outputs |
+| `find_similar_result()` | `core/agent/tool_output_handler.py` | Reuse historical results via Retriever |
+| `SUMMARY_GENERATORS` | `core/agent/tool_output_handler.py` | Rule-based summarizers per tool |
+
+### Structured Summary Examples
+
+```python
+# grep: file stats + sample
+"Found 500 matches in 23 files.
+Top files: file1.py(120), file2.py(80)...
+Sample:
+file1.py:10:match1
+file1.py:20:match2"
+
+# shell: head + tail + stats
+"Output: 1000 lines, 50000 bytes
+First 10:
+line1...
+Last 5:
+line996..."
+```
+
+### mo-trustmem Integration
+
+| mo-trustmem Capability | Usage in Tool Context Engine |
+|------------------------|------------------------------|
+| `MemoryType.TOOL_RESULT` | Dedicated type with 7-day decay |
+| `session_id` isolation | Tool results scoped to session |
+| `MemoryRetriever` | Find similar historical results |
+| `GovernanceScheduler` | Auto-cleanup expired results |
+| `source_event_ids` | Provenance tracking to turn events |
+| PITR | Time-travel query: "last grep result" |
+
+### Effect
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Single tool output | 30KB | ~500B (summary) |
+| 3x grep accumulated | 90KB | ~1.5KB |
+| Info retention | ~30% | 100% (stored in Memory) |
+| Summary cost | $0 | $0 (rule-based) |
+| Historical reuse | None | Automatic via Retriever |
+
+See [context-overflow-optimization.md](context-overflow-optimization.md) for full design.
+
+---
+
+## 10. Open Research Directions
 
 ### Knowledge Graphs for Semantic Memory
 

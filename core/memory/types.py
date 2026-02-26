@@ -14,6 +14,7 @@ class MemoryType(str, enum.Enum):
     SEMANTIC = "semantic"
     PROCEDURAL = "procedural"
     WORKING = "working"
+    TOOL_RESULT = "tool_result"  # Tool output storage, session-scoped, 7-day decay
 
 
 @dataclass
