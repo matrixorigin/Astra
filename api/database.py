@@ -140,7 +140,10 @@ def init_db():
                 ("created_by", "VARCHAR(36)"),
             ]:
                 if col not in cols:
-                    conn.execute(text(f"ALTER TABLE skills_registry ADD COLUMN {col} {ddl}"))
+                    try:
+                        conn.execute(text(f"ALTER TABLE skills_registry ADD COLUMN {col} {ddl}"))
+                    except Exception as e:
+                        logger.warning("Migration: failed to add column %s: %s", col, e)
 
 
 def _import_skill_models():

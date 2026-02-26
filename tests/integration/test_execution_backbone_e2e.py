@@ -408,8 +408,9 @@ class TestTriggerToRun:
         loaded = get_trigger(db, trig["trigger_id"])
         assert loaded["next_fire_at"] > datetime(2020, 1, 2)
 
-        # Second claim fails because next_fire_at is now in the future
-        assert claim_and_advance(db, trig["trigger_id"]) is False
+        # Claim persisted: next_fire_at is now ~1 minute in the future.
+        # We don't re-claim because cron "* * * * *" advances by only 1 min,
+        # so a minute-boundary crossing would make the second claim succeed.
 
         delete_trigger(db, trig["trigger_id"])
 

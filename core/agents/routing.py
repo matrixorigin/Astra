@@ -151,10 +151,9 @@ class ModelRouter(DbConsumer):
         cost: float,
     ) -> None:
         """Record quality and cost for a task."""
+        from api.models import ModelQualityMetric
+        from uuid_utils import uuid7
         with self._db() as db:
-            from api.models import ModelQualityMetric
-            from uuid_utils import uuid7
-
             db.add(ModelQualityMetric(
                 metric_id=str(uuid7()),
                 task_type=task_type,
@@ -167,9 +166,9 @@ class ModelRouter(DbConsumer):
 
     def _get_efficiency_ranking(self, task_type: str) -> dict[str, float]:
         """Get efficiency ranking (quality/cost) for models on a task type."""
+        from sqlalchemy import func as sa_func
+        from api.models import ModelQualityMetric as MQM
         with self._db() as db:
-            from sqlalchemy import func as sa_func
-            from api.models import ModelQualityMetric as MQM
 
             rows = db.query(
                 MQM.model,
@@ -236,9 +235,9 @@ class ModelRouter(DbConsumer):
         Returns:
             Estimated cost in dollars
         """
+        from api.models import ModelQualityMetric
+        from sqlalchemy import func as sqlfunc
         with self._db() as db:
-            from api.models import ModelQualityMetric
-            from sqlalchemy import func as sqlfunc
             row = (
                 db.query(sqlfunc.avg(ModelQualityMetric.cost))
                 .filter(ModelQualityMetric.model == model, ModelQualityMetric.task_type == task_type)

@@ -432,13 +432,15 @@ def _build_turn_messages(
     edge_profile: dict[str, Any] | None = None,
     force_rebuild_system: bool = False,
     username: str | None = None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], str | None]:
     """Build LLM messages from edge turn data + server-side history.
 
-    When force_rebuild_system=True (mid-session tool change), only the system
-    message (history[0]) is replaced — the rest of the conversation is preserved.
+    Returns (messages, context_capture_id).  context_capture_id is the snapshot
+    saved by PromptAssembler BEFORE the LLM call (only on first turn or system
+    rebuild); None on subsequent turns that reuse the cached system prompt.
     """
     history = _turn_histories.get(session_id)
+    context_capture_id: str | None = None
 
     # Recover from DB if not in memory (server restart)
     if history is None:
@@ -468,6 +470,7 @@ def _build_turn_messages(
             username=username,
         )
         system = assembled.system_message
+        context_capture_id = assembled.snapshot_id
         logger.debug("Assembled prompt: %d tokens, snapshot=%s", sum(assembled.token_breakdown.values()), assembled.snapshot_id)
 
         if history and force_rebuild_system:
@@ -491,7 +494,7 @@ def _build_turn_messages(
             })
 
     _turn_histories[session_id] = history
-    return history
+    return history, context_capture_id
 
 
 # Max conversation events to recover on server restart.
@@ -551,20 +554,20 @@ def _persist_turn_events(
     tool_results: list[dict[str, Any]] | None,
     full_text: str,
     tool_calls: list[dict[str, Any]],
-) -> str | None:
+    context_capture_id: str | None = None,
+) -> None:
     """Persist events for this turn: user query, tool results, LLM response.
 
     Also writes decision audit, skill selection, observations, and implicit feedback
     via TurnHooks. All writes are best-effort — failures are logged but never block.
 
     Context snapshot is NOT saved here — it is saved BEFORE the LLM call by
-    PromptAssembler (the correct timing). This fixes the duplicate-snapshot bug.
+    PromptAssembler (the correct timing). The snapshot ID is passed in via
+    context_capture_id so DecisionAudit can reference it.
     """
     from uuid_utils import uuid7
 
-    context_capture_id = None
     user_content = next((m["content"] for m in messages if m.get("role") == "user"), None)
-    tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
 
     try:
         from core.events.event_logger import EventLogger
@@ -594,6 +597,7 @@ def _persist_turn_events(
                 )
 
         # Persist LLM response
+        tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
         if full_text or tool_calls:
             response_content = full_text
             if tc_names:
@@ -606,27 +610,20 @@ def _persist_turn_events(
                 causal_chain_id=causal_chain_id,
             )
 
-        # Post-turn hooks via TurnHooks (decision audit, skill selection, observer, feedback)
+        # Post-turn hooks (decision audit, skill selection, observer, feedback)
+        from core.agent.turn_hooks import TurnHooks
+        hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client())
+
         if parent_event_id:
-            from core.agent.turn_hooks import TurnHooks
-            hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client())
             hooks.record_decision_audit(session_id, parent_event_id, tool_calls, full_text, context_capture_id)
             hooks.record_skill_selection(session_id, user_content or "", tool_calls)
 
         if user_content:
-            from core.agent.turn_hooks import TurnHooks
-            hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client())
             hooks.run_observer(session_id, user_id, messages)
-
-        if user_content and len(messages) >= 2:
-            from core.agent.turn_hooks import TurnHooks
-            hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client())
             hooks.detect_implicit_feedback(user_content, messages, parent_event_id)
 
     except Exception as e:
         logger.warning("Event persistence failed (non-fatal): %s", e)
-
-    return context_capture_id
 
 
 # Lazy-initialized shared LLM client for background tasks (Observer).
@@ -677,7 +674,7 @@ async def chat_turn(
     # Build conversation messages with context enrichment
     db = SessionLocal()
     try:
-        llm_messages = _build_turn_messages(
+        llm_messages, snapshot_id = _build_turn_messages(
             db, user_id, session_id,
             request.messages, request.tool_results, request.project_rules,
             agent_id=request.agent_id,
@@ -740,6 +737,7 @@ async def chat_turn(
                 db, user_id, session_id,
                 request.messages, request.tool_results,
                 full_text, tool_calls,
+                context_capture_id=snapshot_id,
             )
 
             yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"

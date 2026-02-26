@@ -6,24 +6,31 @@ observer, implicit feedback) so both code paths stay in sync.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
-from typing import Any, Callable
+from typing import Any
 
-from core.db_consumer import DbFactory
+from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
 
-# Implicit-feedback rating map (signal_type → 1-5 rating)
-_RATING_MAP = {"positive": 5, "correction": 2, "negative": 1, "neutral": 3}
+# Implicit-feedback rating map (signal_type → 1-5 rating).
+# Keys must cover all non-neutral signal types from ImplicitFeedbackDetector.
+_RATING_MAP = {
+    "positive": 5,
+    "correction": 1,
+    "frustration": 1,
+    "rephrasing": 2,
+    "clarification": 3,
+    "negative": 1,
+}
 
 
-class TurnHooks:
+class TurnHooks(DbConsumer):
     """Post-turn persistence hooks shared by ChatLoop and /chat/turn."""
 
     def __init__(self, db_factory: DbFactory, llm_client: Any = None):
-        self._db_factory = db_factory
+        super().__init__(db_factory)
         self._llm_client = llm_client
 
     # ── Decision audit ────────────────────────────────────────────────
@@ -37,13 +44,12 @@ class TurnHooks:
         context_capture_id: str | None,
     ) -> None:
         """Record a decision audit entry."""
-        try:
-            from api.models import DecisionAudit
-            from uuid_utils import uuid7
+        from api.models import DecisionAudit
+        from uuid_utils import uuid7
 
-            tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
-            db = self._db_factory()
-            try:
+        tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+        try:
+            with self._db() as db:
                 db.add(DecisionAudit(
                     decision_id=str(uuid7()),
                     session_id=session_id,
@@ -53,8 +59,6 @@ class TurnHooks:
                     context_capture_id=context_capture_id,
                 ))
                 db.commit()
-            finally:
-                db.close()
         except Exception as e:
             logger.debug("Decision audit skipped: %s", e)
 
@@ -70,12 +74,12 @@ class TurnHooks:
         tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
         if not tc_names:
             return
-        try:
-            from api.models import SkillSelectionEvent
-            from uuid_utils import uuid7
 
-            db = self._db_factory()
-            try:
+        from api.models import SkillSelectionEvent
+        from uuid_utils import uuid7
+
+        try:
+            with self._db() as db:
                 db.add(SkillSelectionEvent(
                     event_id=str(uuid7()),
                     session_id=session_id,
@@ -85,8 +89,6 @@ class TurnHooks:
                     selection_method="llm_tool_choice",
                 ))
                 db.commit()
-            finally:
-                db.close()
         except Exception as e:
             logger.debug("Skill selection event skipped: %s", e)
 
@@ -99,23 +101,24 @@ class TurnHooks:
         messages: list[dict[str, Any]],
     ) -> None:
         """Run Observer in a background thread."""
-        try:
-            from core.memory.observer import Observer
+        from core.memory.observer import Observer
 
-            llm = self._llm_client
+        llm = self._llm_client
+        db_factory = self._db_factory
 
-            def _bg():
+        def _bg():
+            try:
+                db = db_factory()
                 try:
-                    db = self._db_factory()
-                    try:
-                        Observer(db, llm_client=llm).observe(
-                            session_id=session_id, user_id=user_id, messages=messages,
-                        )
-                    finally:
-                        db.close()
-                except Exception as e:
-                    logger.debug("Observer failed (non-fatal): %s", e)
+                    Observer(db, llm_client=llm).observe(
+                        session_id=session_id, user_id=user_id, messages=messages,
+                    )
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.debug("Observer failed (non-fatal): %s", e)
 
+        try:
             threading.Thread(target=_bg, daemon=True).start()
         except Exception as e:
             logger.debug("Observer setup skipped: %s", e)

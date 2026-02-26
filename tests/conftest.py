@@ -69,6 +69,12 @@ def test_engine():
                 raise
             time.sleep(1.0 + attempt * 0.5)
 
+    # MatrixOne has session-level consistency: DDL executed on connection B is
+    # not guaranteed to be visible on connection A that was established before
+    # the DDL.  Dispose the pool so every subsequent session gets a fresh
+    # connection that can see the newly-created tables.
+    engine.dispose()
+
     yield engine
     
     # Cleanup worker databases on session end
