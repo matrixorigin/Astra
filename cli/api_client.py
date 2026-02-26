@@ -39,6 +39,8 @@ class APIClient:
         self._access_token: str | None = None
         self._refresh_token: str | None = None
         self._current_username: str | None = None
+        self._default_model: str | None = None
+        self._last_session_id: str | None = None
 
     async def __aenter__(self) -> "APIClient":
         """Async context manager entry."""
@@ -82,6 +84,8 @@ class APIClient:
             self._access_token = profile_data.get("access_token")
             self._refresh_token = profile_data.get("refresh_token")
             self._current_username = profile_data.get("username")
+            self._default_model = profile_data.get("default_model")
+            self._last_session_id = profile_data.get("last_session_id")
         except Exception:
             pass
 
@@ -98,17 +102,23 @@ class APIClient:
         else:
             data = {"current_profile": "default", "profiles": {}}
         
-        # Determine profile name
-        profile_name = self.profile or username or "default"
+        # Determine profile name — use explicit profile, then username, then current
+        profile_name = self.profile or username or data.get("current_profile", "default")
         
-        # Save to profile
-        data["profiles"][profile_name] = {
-            "username": username or self._current_username,
+        # Merge into existing profile to preserve settings not being updated
+        existing = data.get("profiles", {}).get(profile_name, {})
+        existing.update({
+            "username": username or self._current_username or existing.get("username"),
             "access_token": self._access_token,
             "refresh_token": self._refresh_token,
-        }
+        })
+        if self._default_model is not None:
+            existing["default_model"] = self._default_model
+        if self._last_session_id is not None:
+            existing["last_session_id"] = self._last_session_id
+        data.setdefault("profiles", {})[profile_name] = existing
         
-        # Update current_profile if not using explicit profile
+        # Update current_profile
         if not self.profile:
             data["current_profile"] = profile_name
         
@@ -149,9 +159,10 @@ class APIClient:
             try:
                 await self._refresh_access_token()
             except Exception:
-                # Refresh failed — session expired, clear tokens
+                # Refresh failed — session expired, clear tokens in memory AND file
                 self._access_token = None
                 self._refresh_token = None
+                await self._save_credentials()
                 raise RuntimeError(
                     "Session expired — please login again: mo-agent login"
                 )
@@ -187,6 +198,19 @@ class APIClient:
         # Update refresh token if server returns a new one
         if "refresh_token" in data:
             self._refresh_token = data["refresh_token"]
+        await self._save_credentials()
+
+    async def save_profile_setting(self, **kwargs: Any) -> None:
+        """Update profile settings (default_model, last_session_id, etc.)."""
+        for key in ("default_model", "last_session_id"):
+            if key in kwargs:
+                setattr(self, f"_{key}", kwargs[key])
+        await self._save_credentials()
+
+    async def logout(self) -> None:
+        """Clear tokens from memory and file, preserving other profile settings."""
+        self._access_token = None
+        self._refresh_token = None
         await self._save_credentials()
 
     # ============================================================================

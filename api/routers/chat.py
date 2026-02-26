@@ -410,9 +410,39 @@ class _LRUDict(OrderedDict):
             super().clear()
 
 
-# Unified per-session cache: {"history": list[dict], "tools": list[dict]}
+# Unified per-session cache: {"history": list[dict], "tools": list[dict], "ts": float}
 # Single LRU ensures history and tools are evicted together.
-_session_cache: _LRUDict = _LRUDict(_MAX_CACHED_SESSIONS)
+# TTL (24h) evicts idle sessions even if LRU capacity is not reached.
+_SESSION_TTL = 86400  # 24 hours in seconds
+
+
+class _SessionCache(_LRUDict):
+    """LRU dict with per-entry TTL for session data."""
+
+    def __init__(self, maxsize: int, ttl: int = _SESSION_TTL):
+        super().__init__(maxsize)
+        self._ttl = ttl
+
+    def get(self, key, default=None):
+        with self._lock:
+            if key not in self:
+                return default
+            import time
+            entry = super().__getitem__(key)
+            if time.monotonic() - entry.get("ts", 0) > self._ttl:
+                super().pop(key, None)
+                return default
+            entry["ts"] = time.monotonic()
+            self.move_to_end(key)
+            return entry
+
+    def __setitem__(self, key, value):
+        import time
+        value.setdefault("ts", time.monotonic())
+        super().__setitem__(key, value)
+
+
+_session_cache: _SessionCache = _SessionCache(_MAX_CACHED_SESSIONS)
 
 
 def _tool_names(tools: list[dict[str, Any]]) -> set[str]:
@@ -683,15 +713,11 @@ def _persist_turn_events(
                     metadata={"tool_call_id": tc_id, "name": tc_func.get("name", "")},
                 )
 
-        # Persist LLM response
-        tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+        # Persist LLM response (tool_call names are already in tool_call events)
         if full_text or tool_calls:
-            response_content = full_text
-            if tc_names:
-                response_content += f"\n[tool_calls: {', '.join(tc_names)}]"
             el.create_llm_response(
                 user_id=user_id, session_id=session_id,
-                content=response_content,
+                content=full_text,
                 agent_id="dev-agent", agent_version="0.1.0",
                 parent_event_id=parent_event_id,
                 causal_chain_id=causal_chain_id,

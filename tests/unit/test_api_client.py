@@ -367,3 +367,124 @@ async def test_request_non_401_error(mock_credentials_path: Path):
             client._access_token = "tok"
             with pytest.raises(httpx.HTTPStatusError, match="500"):
                 await client._request("GET", "/test")
+
+
+# ============================================================================
+# Task 2: Refresh failure clears file tokens
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_refresh_failure_clears_file_tokens(tmp_path: Path):
+    """When refresh fails, tokens in credentials file should be cleared."""
+    creds_path = tmp_path / "credentials.json"
+    # Pre-populate with tokens
+    creds_path.write_text(json.dumps({
+        "current_profile": "alice",
+        "profiles": {"alice": {
+            "username": "alice",
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+        }}
+    }))
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_401 = MagicMock()
+        mock_401.status_code = 401
+        mock_refresh_fail = MagicMock()
+        mock_refresh_fail.status_code = 401
+        mock_refresh_fail.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "401", request=MagicMock(), response=mock_refresh_fail
+        )
+        mock_client.request.return_value = mock_401
+        mock_client.post.return_value = mock_refresh_fail
+        mock_client_class.return_value = mock_client
+
+        async with APIClient(credentials_path=creds_path) as client:
+            with pytest.raises(RuntimeError, match="Session expired"):
+                await client._request("GET", "/test")
+
+    # File should have None tokens
+    data = json.loads(creds_path.read_text())
+    assert data["profiles"]["alice"]["access_token"] is None
+    assert data["profiles"]["alice"]["refresh_token"] is None
+
+
+# ============================================================================
+# Task 4: Profile settings persistence
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_save_and_load_default_model(tmp_path: Path):
+    """default_model persists across save/load cycles."""
+    creds_path = tmp_path / "credentials.json"
+    async with APIClient(credentials_path=creds_path) as client:
+        client._access_token = "tok"
+        client._refresh_token = "ref"
+        client._default_model = "gpt-4"
+        await client._save_credentials(username="alice")
+
+    async with APIClient(credentials_path=creds_path) as client2:
+        assert client2._default_model == "gpt-4"
+
+
+@pytest.mark.asyncio
+async def test_save_and_load_last_session_id(tmp_path: Path):
+    """last_session_id persists across save/load cycles."""
+    creds_path = tmp_path / "credentials.json"
+    async with APIClient(credentials_path=creds_path) as client:
+        client._access_token = "tok"
+        client._refresh_token = "ref"
+        client._last_session_id = "sess_123"
+        await client._save_credentials(username="bob")
+
+    async with APIClient(credentials_path=creds_path) as client2:
+        assert client2._last_session_id == "sess_123"
+
+
+@pytest.mark.asyncio
+async def test_save_profile_setting(tmp_path: Path):
+    """save_profile_setting updates specific fields without clobbering others."""
+    creds_path = tmp_path / "credentials.json"
+    async with APIClient(credentials_path=creds_path) as client:
+        client._access_token = "tok"
+        client._refresh_token = "ref"
+        await client._save_credentials(username="alice")
+        await client.save_profile_setting(default_model="claude-3")
+
+    data = json.loads(creds_path.read_text())
+    assert data["profiles"]["alice"]["default_model"] == "claude-3"
+    assert data["profiles"]["alice"]["access_token"] == "tok"
+
+
+@pytest.mark.asyncio
+async def test_logout_clears_tokens_keeps_settings(tmp_path: Path):
+    """logout clears tokens but preserves default_model and other settings."""
+    creds_path = tmp_path / "credentials.json"
+    async with APIClient(credentials_path=creds_path) as client:
+        client._access_token = "tok"
+        client._refresh_token = "ref"
+        client._default_model = "gpt-4"
+        await client._save_credentials(username="alice")
+        await client.logout()
+
+    data = json.loads(creds_path.read_text())
+    assert data["profiles"]["alice"]["access_token"] is None
+    assert data["profiles"]["alice"]["refresh_token"] is None
+    assert data["profiles"]["alice"]["default_model"] == "gpt-4"
+
+
+@pytest.mark.asyncio
+async def test_profile_name_consistency(tmp_path: Path):
+    """save and load use the same profile key."""
+    creds_path = tmp_path / "credentials.json"
+    # Save with username "alice" (no explicit profile)
+    async with APIClient(credentials_path=creds_path) as client:
+        client._access_token = "tok"
+        client._refresh_token = "ref"
+        await client._save_credentials(username="alice")
+
+    # Load without explicit profile — should find "alice" via current_profile
+    async with APIClient(credentials_path=creds_path) as client2:
+        assert client2._access_token == "tok"
+        assert client2._current_username == "alice"

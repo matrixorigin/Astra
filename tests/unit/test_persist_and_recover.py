@@ -1,0 +1,188 @@
+"""Tests for _persist_turn_events, _recover_history_from_db, and _SessionCache."""
+
+import json
+import time
+from unittest.mock import MagicMock, patch, call
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# _recover_history_from_db
+# ---------------------------------------------------------------------------
+
+class TestRecoverHistory:
+    """Verify _recover_history_from_db reconstructs valid OpenAI message sequences."""
+
+    def _make_row(self, event_type, content, metadata=None):
+        return (event_type, content, json.dumps(metadata or {}))
+
+    def test_text_only_conversation(self, db_session):
+        """Pure text conversation recovers correctly."""
+        rows = [
+            self._make_row("user_query", "Hello"),
+            self._make_row("llm_response", "Hi there!"),
+            self._make_row("user_query", "How are you?"),
+            self._make_row("llm_response", "I'm good."),
+        ]
+        with patch("api.routers.chat.SessionLocal"), \
+             patch.object(db_session, "execute") as mock_exec, \
+             patch("core.context.prompt_assembler.PromptAssembler") as mock_pa:
+            mock_exec.return_value.fetchall.return_value = rows
+            mock_pa.return_value.assemble.return_value = MagicMock(
+                system_message="system", snapshot_id=None, token_breakdown={}
+            )
+            from api.routers.chat import _recover_history_from_db
+            history = _recover_history_from_db(db_session, "u1", "s1")
+
+        assert history[0] == {"role": "system", "content": "system"}
+        assert history[1] == {"role": "user", "content": "Hello"}
+        assert history[2] == {"role": "assistant", "content": "Hi there!"}
+        assert history[3] == {"role": "user", "content": "How are you?"}
+        assert history[4] == {"role": "assistant", "content": "I'm good."}
+
+    def test_tool_call_roundtrip(self, db_session):
+        """user → tool_call → tool_result → llm_response recovers correctly."""
+        rows = [
+            self._make_row("user_query", "Read file.txt"),
+            self._make_row("tool_call",
+                           json.dumps({"tool_call_id": "tc1", "name": "read_file", "arguments": '{"path":"f.txt"}'}),
+                           {"tool_call_id": "tc1", "name": "read_file"}),
+            self._make_row("tool_result",
+                           json.dumps({"result": "file contents"}),
+                           {"tool_call_id": "tc1", "name": "read_file"}),
+            self._make_row("llm_response", "The file says: file contents"),
+        ]
+        with patch("api.routers.chat.SessionLocal"), \
+             patch.object(db_session, "execute") as mock_exec, \
+             patch("core.context.prompt_assembler.PromptAssembler") as mock_pa:
+            mock_exec.return_value.fetchall.return_value = rows
+            mock_pa.return_value.assemble.return_value = MagicMock(
+                system_message="sys", snapshot_id=None, token_breakdown={}
+            )
+            from api.routers.chat import _recover_history_from_db
+            history = _recover_history_from_db(db_session, "u1", "s1")
+
+        # system, user, assistant(tool_calls), tool, assistant
+        assert len(history) == 5
+        assert history[2]["role"] == "assistant"
+        assert len(history[2]["tool_calls"]) == 1
+        assert history[2]["tool_calls"][0]["id"] == "tc1"
+        assert history[3]["role"] == "tool"
+        assert history[3]["tool_call_id"] == "tc1"
+        assert history[4] == {"role": "assistant", "content": "The file says: file contents"}
+
+    def test_empty_session_returns_empty(self, db_session):
+        with patch("api.routers.chat.SessionLocal"), \
+             patch.object(db_session, "execute") as mock_exec:
+            mock_exec.return_value.fetchall.return_value = []
+            from api.routers.chat import _recover_history_from_db
+            assert _recover_history_from_db(db_session, "u1", "s1") == []
+
+
+# ---------------------------------------------------------------------------
+# _persist_turn_events
+# ---------------------------------------------------------------------------
+
+class TestPersistTurnEvents:
+    """Verify _persist_turn_events writes tool_call events and clean llm_response."""
+
+    def test_writes_tool_call_events(self, db_session):
+        """Each tool_call in the response should produce a tool_call event."""
+        tool_calls = [
+            {"id": "tc1", "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'}},
+            {"id": "tc2", "function": {"name": "list_dir", "arguments": '{"path":"."}'}},
+        ]
+        created_events = []
+
+        with patch("api.routers.chat.SessionLocal") as mock_sl, \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks"):
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_stream_event.side_effect = lambda **kw: created_events.append(kw) or MagicMock()
+            mock_el.create_llm_response.return_value = MagicMock()
+            mock_el_cls.return_value = mock_el
+
+            from api.routers.chat import _persist_turn_events
+            _persist_turn_events(
+                db_session, "u1", "s1",
+                [{"role": "user", "content": "Read files"}], None,
+                "Here are the files", tool_calls,
+            )
+
+        # Should have tool_call events for each tool call
+        tc_events = [e for e in created_events if e.get("event_type") == "tool_call"]
+        assert len(tc_events) == 2
+        tc1_content = json.loads(tc_events[0]["content"])
+        assert tc1_content["tool_call_id"] == "tc1"
+        assert tc1_content["name"] == "read_file"
+
+    def test_llm_response_has_no_tool_calls_suffix(self, db_session):
+        """llm_response content should NOT have [tool_calls: ...] appended."""
+        tool_calls = [{"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}]
+        llm_content = None
+
+        with patch("api.routers.chat.SessionLocal"), \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks"):
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_stream_event.return_value = MagicMock()
+
+            def capture_llm(**kw):
+                nonlocal llm_content
+                llm_content = kw.get("content")
+                return MagicMock()
+            mock_el.create_llm_response.side_effect = capture_llm
+            mock_el_cls.return_value = mock_el
+
+            from api.routers.chat import _persist_turn_events
+            _persist_turn_events(
+                db_session, "u1", "s1",
+                [{"role": "user", "content": "hi"}], None,
+                "response text", tool_calls,
+            )
+
+        assert llm_content == "response text"
+        assert "[tool_calls:" not in (llm_content or "")
+
+
+# ---------------------------------------------------------------------------
+# _SessionCache
+# ---------------------------------------------------------------------------
+
+class TestSessionCache:
+    def test_history_and_tools_evict_together(self):
+        from api.routers.chat import _SessionCache
+        cache = _SessionCache(maxsize=2, ttl=9999)
+        cache["s1"] = {"history": [{"role": "system"}], "tools": [{"t": 1}]}
+        cache["s2"] = {"history": [{"role": "system"}], "tools": [{"t": 2}]}
+        cache["s3"] = {"history": [{"role": "system"}], "tools": [{"t": 3}]}
+        # s1 should be evicted
+        assert cache.get("s1") is None
+        s2 = cache.get("s2")
+        assert s2 is not None
+        assert s2["tools"] == [{"t": 2}]
+
+    def test_ttl_expiry(self):
+        from api.routers.chat import _SessionCache
+        cache = _SessionCache(maxsize=100, ttl=1)
+        cache["s1"] = {"history": ["h"], "tools": ["t"]}
+        assert cache.get("s1") is not None
+        time.sleep(1.1)
+        assert cache.get("s1") is None
+
+    def test_access_refreshes_ttl(self):
+        from api.routers.chat import _SessionCache
+        cache = _SessionCache(maxsize=100, ttl=2)
+        cache["s1"] = {"history": ["h"], "tools": ["t"]}
+        time.sleep(1.0)
+        # Access refreshes ts
+        assert cache.get("s1") is not None
+        time.sleep(1.0)
+        # Should still be alive because we refreshed 1s ago
+        assert cache.get("s1") is not None
+        time.sleep(2.1)
+        # Now expired
+        assert cache.get("s1") is None

@@ -138,6 +138,17 @@ def register(ctx, email, password, username):
         sys.exit(1)
 
 
+@cli.command()
+@click.pass_context
+def logout(ctx):
+    """Logout — clear local tokens."""
+    try:
+        ctx.obj["client"].logout()
+        click.echo("✅ Logged out")
+    except Exception as e:
+        click.echo(f"❌ {e}")
+
+
 async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, auto_approve):
     """Run one edge chat loop turn using the async APIClient."""
     import os
@@ -178,10 +189,11 @@ async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, a
 @click.option("--user-id", default="cli_user")
 @click.option("--session-id", default=None)
 @click.option("--model", default=None, help="Model to use for chat")
+@click.option("--resume", is_flag=True, help="Resume last session")
 @click.option("--auto-approve", is_flag=True, help="Auto-approve tool execution (dangerous commands still blocked)")
 @click.option("--debug", is_flag=True, help="Print full traceback on errors")
 @click.pass_context
-def chat(ctx, user_id, session_id, model, auto_approve, debug):
+def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
     """Start interactive chat with edge tool execution."""
     client = ctx.obj["client"]
 
@@ -226,6 +238,22 @@ def chat(ctx, user_id, session_id, model, auto_approve, debug):
 
     selected_model = model
 
+    # Load persisted defaults from profile
+    try:
+        from cli.api_client import APIClient as _AC
+        import asyncio as _aio
+        async def _load():
+            async with _AC(base_url=client.base_url, profile=client.profile) as ac:
+                return ac._default_model, ac._last_session_id
+        _dm, _ls = _aio.run(_load())
+        if not selected_model and _dm:
+            selected_model = _dm
+        if resume and not session_id and _ls:
+            session_id = _ls
+            click.echo(f"🔄 Resuming session: {session_id}")
+    except Exception:
+        pass
+
     try:
         if not session_id:
             result = client.create_session(agent_id=user_id or "default-agent")
@@ -234,6 +262,12 @@ def chat(ctx, user_id, session_id, model, auto_approve, debug):
             if selected_model:
                 click.echo(f"🤖 Model: {selected_model}")
             click.echo()
+
+        # Persist last_session_id
+        try:
+            client.save_profile_setting(last_session_id=session_id)
+        except Exception:
+            pass
 
         while True:
             user_input = click.prompt(username, type=str, prompt_suffix="> ")
@@ -260,6 +294,10 @@ def chat(ctx, user_id, session_id, model, auto_approve, debug):
                             if cmd_arg in [m["name"] for m in active_models]:
                                 selected_model = cmd_arg
                                 click.echo(f"\n✅ Model: {selected_model}\n")
+                                try:
+                                    client.save_profile_setting(default_model=selected_model)
+                                except Exception:
+                                    pass
                             else:
                                 click.echo(f"\n❌ Unknown model '{cmd_arg}'")
                                 if active_models:

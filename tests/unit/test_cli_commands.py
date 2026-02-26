@@ -272,3 +272,18 @@ class TestEdgeChatE2E:
             )
             assert "Traceback" in result.output
             assert "boom" in result.output
+
+
+class TestLogoutCommand:
+    """Test logout CLI command."""
+
+    def test_logout_calls_api_client(self, runner, mock_api_client):
+        mock_api_client.logout.return_value = None
+        result = runner.invoke(agent_cli, ["logout"])
+        assert "Logged out" in result.output
+        mock_api_client.logout.assert_called_once()
+
+    def test_logout_handles_error(self, runner, mock_api_client):
+        mock_api_client.logout.side_effect = Exception("no file")
+        result = runner.invoke(agent_cli, ["logout"])
+        assert "no file" in result.output
