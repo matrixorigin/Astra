@@ -537,12 +537,15 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
             {"role": "system", "content": assembled.system_message}
         ]
 
-        # Accumulate tool_calls for the current assistant message.
-        # State machine: tool_call_start events accumulate in pending_tool_calls.
-        # The first tool_result flushes them as one assistant message, then each
-        # tool_result appends a tool message.  If tool_call_start events were
-        # lost (truncated by _MAX_RECOVERY_EVENTS), we synthesize from metadata.
+        # State machine for reconstructing OpenAI message sequences:
+        #   tool_call_start events accumulate in pending_tool_calls.
+        #   The first tool_result flushes them as one assistant message.
+        #   Subsequent tool_results in the same batch just append tool messages.
+        #   If tool_call_start was lost, we synthesize from tool_result metadata.
         pending_tool_calls: list[dict[str, Any]] = []
+        # True after we've emitted the assistant+tool_calls for the current
+        # batch — subsequent tool_results just append tool messages.
+        in_tool_batch = False
 
         for row in rows:
             etype, content = row[0], row[1] or ""
@@ -555,6 +558,7 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
             meta = meta or {}
 
             if etype == "user_query":
+                in_tool_batch = False
                 history.append({"role": "user", "content": content})
             elif etype == "tool_call_start":
                 try:
@@ -572,22 +576,23 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
             elif etype == "tool_result":
                 tool_call_id = meta.get("tool_call_id", "")
                 tool_name = meta.get("name", "")
-                # Flush pending tool_calls as one assistant message (first
-                # tool_result in a batch triggers this).
                 if pending_tool_calls:
+                    # First tool_result: flush all accumulated tool_calls as
+                    # one assistant message.
                     history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
                     pending_tool_calls = []
-                elif not (history and history[-1].get("role") == "assistant" and history[-1].get("tool_calls")):
-                    # No pending AND no preceding assistant+tool_calls: the
-                    # tool_call_start was lost.  Synthesize from metadata.
+                    in_tool_batch = True
+                elif not in_tool_batch:
+                    # tool_call_start was lost (truncated by _MAX_RECOVERY_EVENTS).
+                    # Synthesize from metadata to keep the sequence valid.
                     if not tool_call_id:
                         continue  # Cannot construct valid pair — skip.
                     history.append({"role": "assistant", "content": "", "tool_calls": [{
                         "id": tool_call_id, "type": "function",
                         "function": {"name": tool_name, "arguments": "{}"},
                     }]})
-                # else: preceding assistant+tool_calls already emitted by an
-                # earlier tool_result in this batch — just append tool message.
+                    in_tool_batch = True
+                # Append tool result message.
                 try:
                     result_data = json.loads(content) if isinstance(content, str) else {}
                 except (json.JSONDecodeError, TypeError):
@@ -598,6 +603,7 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
                     "content": result_data.get("result", content)[:4000] if isinstance(result_data, dict) else str(content)[:4000],
                 })
             elif etype == "llm_response":
+                in_tool_batch = False
                 if pending_tool_calls:
                     history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
                     pending_tool_calls = []

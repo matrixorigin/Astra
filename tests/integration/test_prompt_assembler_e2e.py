@@ -801,6 +801,180 @@ class TestRecoverHistoryUsesAssembler:
 
 
 # ============================================================================
+# 9b. _recover_history_from_db — tool call recovery
+# ============================================================================
+
+def _insert_event(db, sid, uid, cid, etype, content, metadata=None, seq=0):
+    """Helper: insert a conversation_event with controlled ordering.
+
+    Uses explicit timestamps with second-level offsets to guarantee ordering
+    across DB engines (MatrixOne NOW() may return the same value within a txn).
+    """
+    from sqlalchemy import text as _t
+    eid = unique_test_id()
+    meta_json = json.dumps(metadata) if metadata else None
+    db.execute(_t("""
+        INSERT INTO conversation_events
+            (event_id, session_id, user_id, agent_id, agent_version,
+             event_type, content, causal_chain_id, metadata, created_at)
+        VALUES (:eid, :sid, :uid, 'system', '1.0.0',
+                :etype, :content, :cid, :meta,
+                DATE_ADD('2026-01-01 00:00:00', INTERVAL :seq SECOND))
+    """), {"eid": eid, "sid": sid, "uid": uid, "cid": cid,
+           "etype": etype, "content": content, "meta": meta_json, "seq": seq})
+    return eid
+
+
+class TestRecoverHistoryToolCalls:
+    """Verify _recover_history_from_db reconstructs valid OpenAI message
+    sequences for tool_call_start + tool_result events.
+
+    Each test writes events directly to DB, calls recovery, and asserts
+    the exact message structure.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, db_session):
+        self.db = db_session
+        self.sid = unique_test_id()
+        self.uid = unique_test_id()
+        self.cid = unique_test_id()
+        yield
+        from sqlalchemy import text as _t
+        db_session.execute(_t("DELETE FROM context_snapshots WHERE session_id = :sid"), {"sid": self.sid})
+        db_session.execute(_t("DELETE FROM conversation_events WHERE session_id = :sid"), {"sid": self.sid})
+        db_session.commit()
+
+    def _recover(self):
+        from api.routers.chat import _recover_history_from_db
+        return _recover_history_from_db(self.db, self.uid, self.sid)
+
+    def test_single_tool_call_round_trip(self):
+        """user → tool_call_start → tool_result → llm_response produces valid sequence."""
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "user_query", "list files", seq=0)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "tool_call_start",
+                      json.dumps({"tool_call_id": "tc1", "name": "bash", "arguments": '{"cmd":"ls"}'}),
+                      metadata={"tool_call_id": "tc1", "name": "bash"}, seq=1000)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "tool_result",
+                      json.dumps({"name": "bash", "result": "file1.py"}),
+                      metadata={"tool_call_id": "tc1", "name": "bash"}, seq=2000)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "llm_response", "Here are your files.", seq=3000)
+        self.db.commit()
+
+        history = self._recover()
+        roles = [m["role"] for m in history]
+        # system, user, assistant(tool_calls), tool, assistant
+        assert roles == ["system", "user", "assistant", "tool", "assistant"]
+        # assistant with tool_calls
+        tc_msg = history[2]
+        assert tc_msg["tool_calls"][0]["id"] == "tc1"
+        assert tc_msg["tool_calls"][0]["function"]["name"] == "bash"
+        # tool result
+        assert history[3]["tool_call_id"] == "tc1"
+        assert "file1.py" in history[3]["content"]
+        # final assistant
+        assert history[4]["content"] == "Here are your files."
+
+    def test_multi_tool_call_single_batch(self):
+        """Two tool_call_starts produce ONE assistant message with two tool_calls,
+        followed by two tool messages."""
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "user_query", "check both", seq=0)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "tool_call_start",
+                      json.dumps({"tool_call_id": "tc_a", "name": "read_file", "arguments": "{}"}),
+                      metadata={"tool_call_id": "tc_a", "name": "read_file"}, seq=1000)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "tool_call_start",
+                      json.dumps({"tool_call_id": "tc_b", "name": "bash", "arguments": "{}"}),
+                      metadata={"tool_call_id": "tc_b", "name": "bash"}, seq=2000)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "tool_result",
+                      json.dumps({"name": "read_file", "result": "content"}),
+                      metadata={"tool_call_id": "tc_a", "name": "read_file"}, seq=3000)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "tool_result",
+                      json.dumps({"name": "bash", "result": "ok"}),
+                      metadata={"tool_call_id": "tc_b", "name": "bash"}, seq=4000)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "llm_response", "Done.", seq=5000)
+        self.db.commit()
+
+        history = self._recover()
+        roles = [m["role"] for m in history]
+        # system, user, assistant(2 tool_calls), tool, tool, assistant
+        assert roles == ["system", "user", "assistant", "tool", "tool", "assistant"]
+        # Single assistant message with both tool_calls
+        tc_msg = history[2]
+        assert len(tc_msg["tool_calls"]) == 2
+        tc_ids = {tc["id"] for tc in tc_msg["tool_calls"]}
+        assert tc_ids == {"tc_a", "tc_b"}
+        # Two tool messages
+        assert history[3]["tool_call_id"] == "tc_a"
+        assert history[4]["tool_call_id"] == "tc_b"
+
+    def test_missing_tool_call_start_synthesizes_from_metadata(self):
+        """When tool_call_start is lost (e.g. truncated), recovery synthesizes
+        from tool_result metadata to avoid OpenAI 400."""
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "user_query", "do it", seq=0)
+        # No tool_call_start — simulates truncation by _MAX_RECOVERY_EVENTS
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "tool_result",
+                      json.dumps({"name": "bash", "result": "done"}),
+                      metadata={"tool_call_id": "tc_orphan", "name": "bash"}, seq=1000)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "llm_response", "Finished.", seq=2000)
+        self.db.commit()
+
+        history = self._recover()
+        roles = [m["role"] for m in history]
+        # system, user, assistant(synthesized), tool, assistant
+        assert roles == ["system", "user", "assistant", "tool", "assistant"]
+        tc_msg = history[2]
+        assert tc_msg["tool_calls"][0]["id"] == "tc_orphan"
+        assert tc_msg["tool_calls"][0]["function"]["name"] == "bash"
+
+    def test_tool_result_without_tool_call_id_is_skipped(self):
+        """tool_result with no tool_call_id in metadata is skipped entirely."""
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "user_query", "test", seq=0)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "tool_result",
+                      json.dumps({"result": "orphan"}),
+                      metadata={"source": "edge"}, seq=1000)  # no tool_call_id
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "llm_response", "ok", seq=2000)
+        self.db.commit()
+
+        history = self._recover()
+        roles = [m["role"] for m in history]
+        # tool_result skipped — no tool message in output
+        assert roles == ["system", "user", "assistant"]
+        assert "tool" not in roles
+
+    def test_trailing_tool_call_start_discarded(self):
+        """tool_call_start with no following tool_result (cancelled run) is discarded."""
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "user_query", "start", seq=0)
+        _insert_event(self.db, self.sid, self.uid, self.cid,
+                      "tool_call_start",
+                      json.dumps({"tool_call_id": "tc_dangling", "name": "bash", "arguments": "{}"}),
+                      metadata={"tool_call_id": "tc_dangling", "name": "bash"}, seq=1000)
+        # No tool_result, no llm_response — run was cancelled
+        self.db.commit()
+
+        history = self._recover()
+        roles = [m["role"] for m in history]
+        # system, user — dangling tool_call_start discarded
+        assert roles == ["system", "user"]
+
+
+# ============================================================================
 # 10. LRU Cache Eviction
 # ============================================================================
 
