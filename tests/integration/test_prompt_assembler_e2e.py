@@ -854,7 +854,7 @@ class TestRecoverHistoryToolCalls:
         _insert_event(self.db, self.sid, self.uid, self.cid,
                       "user_query", "list files", seq=0)
         _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_call_start",
+                      "tool_call",
                       json.dumps({"tool_call_id": "tc1", "name": "bash", "arguments": '{"cmd":"ls"}'}),
                       metadata={"tool_call_id": "tc1", "name": "bash"}, seq=1000)
         _insert_event(self.db, self.sid, self.uid, self.cid,
@@ -885,11 +885,11 @@ class TestRecoverHistoryToolCalls:
         _insert_event(self.db, self.sid, self.uid, self.cid,
                       "user_query", "check both", seq=0)
         _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_call_start",
+                      "tool_call",
                       json.dumps({"tool_call_id": "tc_a", "name": "read_file", "arguments": "{}"}),
                       metadata={"tool_call_id": "tc_a", "name": "read_file"}, seq=1000)
         _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_call_start",
+                      "tool_call",
                       json.dumps({"tool_call_id": "tc_b", "name": "bash", "arguments": "{}"}),
                       metadata={"tool_call_id": "tc_b", "name": "bash"}, seq=2000)
         _insert_event(self.db, self.sid, self.uid, self.cid,
@@ -962,7 +962,7 @@ class TestRecoverHistoryToolCalls:
         _insert_event(self.db, self.sid, self.uid, self.cid,
                       "user_query", "start", seq=0)
         _insert_event(self.db, self.sid, self.uid, self.cid,
-                      "tool_call_start",
+                      "tool_call",
                       json.dumps({"tool_call_id": "tc_dangling", "name": "bash", "arguments": "{}"}),
                       metadata={"tool_call_id": "tc_dangling", "name": "bash"}, seq=1000)
         # No tool_result, no llm_response — run was cancelled
@@ -972,6 +972,67 @@ class TestRecoverHistoryToolCalls:
         roles = [m["role"] for m in history]
         # system, user — dangling tool_call_start discarded
         assert roles == ["system", "user"]
+
+    def test_two_rounds_of_tool_use(self):
+        """user → tools → response → user → tools → response: two independent tool batches."""
+        s = 0
+        # Round 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "round 1", seq=s); s += 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_call",
+                      json.dumps({"tool_call_id": "r1_tc", "name": "bash", "arguments": "{}"}),
+                      metadata={"tool_call_id": "r1_tc", "name": "bash"}, seq=s); s += 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_result",
+                      json.dumps({"name": "bash", "result": "r1_out"}),
+                      metadata={"tool_call_id": "r1_tc", "name": "bash"}, seq=s); s += 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "round 1 done", seq=s); s += 1
+        # Round 2
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "round 2", seq=s); s += 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_call",
+                      json.dumps({"tool_call_id": "r2_tc", "name": "read_file", "arguments": "{}"}),
+                      metadata={"tool_call_id": "r2_tc", "name": "read_file"}, seq=s); s += 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_result",
+                      json.dumps({"name": "read_file", "result": "r2_out"}),
+                      metadata={"tool_call_id": "r2_tc", "name": "read_file"}, seq=s); s += 1
+        _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "round 2 done", seq=s)
+        self.db.commit()
+
+        history = self._recover()
+        roles = [m["role"] for m in history]
+        assert roles == [
+            "system",
+            "user", "assistant", "tool", "assistant",   # round 1
+            "user", "assistant", "tool", "assistant",    # round 2
+        ]
+        # Each round has its own assistant+tool_calls
+        assert history[2]["tool_calls"][0]["function"]["name"] == "bash"
+        assert history[6]["tool_calls"][0]["function"]["name"] == "read_file"
+        # in_tool_batch resets between rounds
+        assert history[3]["tool_call_id"] == "r1_tc"
+        assert history[7]["tool_call_id"] == "r2_tc"
+
+    def test_multiple_orphan_tool_results_synthesize_individually(self):
+        """Multiple tool_results with no tool_call_start: each gets its own
+        synthesized assistant message (cannot batch without knowing they belong together)."""
+        _insert_event(self.db, self.sid, self.uid, self.cid, "user_query", "go", seq=0)
+        # Two orphan tool_results — no tool_call_start at all
+        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_result",
+                      json.dumps({"name": "bash", "result": "a"}),
+                      metadata={"tool_call_id": "orphan_a", "name": "bash"}, seq=1)
+        _insert_event(self.db, self.sid, self.uid, self.cid, "tool_result",
+                      json.dumps({"name": "read_file", "result": "b"}),
+                      metadata={"tool_call_id": "orphan_b", "name": "read_file"}, seq=2)
+        _insert_event(self.db, self.sid, self.uid, self.cid, "llm_response", "done", seq=3)
+        self.db.commit()
+
+        history = self._recover()
+        roles = [m["role"] for m in history]
+        # First orphan synthesizes assistant, second is in same batch (in_tool_batch=True)
+        assert roles == ["system", "user", "assistant", "tool", "tool", "assistant"]
+        # First orphan's synthesized assistant has its tool_call_id
+        assert history[2]["tool_calls"][0]["id"] == "orphan_a"
+        # Both tool messages present
+        assert history[3]["tool_call_id"] == "orphan_a"
+        assert history[4]["tool_call_id"] == "orphan_b"
 
 
 # ============================================================================
@@ -1025,3 +1086,17 @@ class TestLRUDictEviction:
         assert d.pop("missing", 42) == 42
         del d["b"]
         assert len(d) == 0
+
+    def test_unified_cache_evicts_history_and_tools_together(self):
+        """_session_cache evicts both history and tools atomically."""
+        from api.routers.chat import _LRUDict
+        cache = _LRUDict(maxsize=2)
+        cache["s1"] = {"history": [{"role": "system"}], "tools": [{"name": "bash"}]}
+        cache["s2"] = {"history": [{"role": "system"}], "tools": [{"name": "read"}]}
+        # s3 evicts s1
+        cache["s3"] = {"history": [{"role": "system"}], "tools": [{"name": "write"}]}
+        assert "s1" not in cache, "s1 should be evicted"
+        # s1's history AND tools are both gone — no orphan tools
+        assert "s2" in cache
+        assert cache["s2"]["tools"] == [{"name": "read"}]
+        assert cache["s2"]["history"] == [{"role": "system"}]

@@ -510,7 +510,7 @@ _MAX_RECOVERY_EVENTS = 50
 def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_id: str | None = None) -> list[dict[str, Any]]:
     """Rebuild conversation history from persisted events (for server restart recovery).
 
-    Recovers user_query, llm_response, tool_call_start, and tool_result events
+    Recovers user_query, llm_response, tool_call, and tool_result events
     to produce a valid OpenAI message sequence:
         user → assistant(tool_calls) → tool(result) → assistant → ...
     """
@@ -519,7 +519,7 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
             text(f"""
                 SELECT event_type, content, metadata FROM conversation_events
                 WHERE session_id = :sid
-                  AND event_type IN ('user_query', 'llm_response', 'tool_call_start', 'tool_result')
+                  AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result')
                 ORDER BY created_at ASC LIMIT {_MAX_RECOVERY_EVENTS}
             """),
             {"sid": session_id},
@@ -538,10 +538,10 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
         ]
 
         # State machine for reconstructing OpenAI message sequences:
-        #   tool_call_start events accumulate in pending_tool_calls.
+        #   tool_call events accumulate in pending_tool_calls.
         #   The first tool_result flushes them as one assistant message.
         #   Subsequent tool_results in the same batch just append tool messages.
-        #   If tool_call_start was lost, we synthesize from tool_result metadata.
+        #   If tool_call was lost, we synthesize from tool_result metadata.
         pending_tool_calls: list[dict[str, Any]] = []
         # True after we've emitted the assistant+tool_calls for the current
         # batch — subsequent tool_results just append tool messages.
@@ -560,7 +560,7 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
             if etype == "user_query":
                 in_tool_batch = False
                 history.append({"role": "user", "content": content})
-            elif etype == "tool_call_start":
+            elif etype == "tool_call":
                 try:
                     tc_data = json.loads(content) if isinstance(content, str) else {}
                 except (json.JSONDecodeError, TypeError):
@@ -583,7 +583,7 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
                     pending_tool_calls = []
                     in_tool_batch = True
                 elif not in_tool_batch:
-                    # tool_call_start was lost (truncated by _MAX_RECOVERY_EVENTS).
+                    # tool_call was lost (truncated by _MAX_RECOVERY_EVENTS).
                     # Synthesize from metadata to keep the sequence valid.
                     if not tool_call_id:
                         continue  # Cannot construct valid pair — skip.
@@ -676,7 +676,7 @@ def _persist_turn_events(
                 tc_func = tc.get("function", {})
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
-                    event_type="tool_call_start",
+                    event_type="tool_call",
                     content=json.dumps({"tool_call_id": tc_id, "name": tc_func.get("name", ""), "arguments": tc_func.get("arguments", "{}")}),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,

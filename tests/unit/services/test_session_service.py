@@ -73,3 +73,47 @@ class TestCleanupSandbox:
         with patch.object(service, "_cleanup_sandbox") as mock_clean:
             service.update_session("s1", "u1", status="active")
             mock_clean.assert_not_called()
+
+
+class TestCloseHooksOrdering:
+    """Verify lifecycle hooks run before destructive sandbox cleanup."""
+
+    def _make_session_mock(self, session_id="s1", user_id="u1", status="active"):
+        s = Mock()
+        s.session_id = session_id
+        s.user_id = user_id
+        s.agent_id = "a1"
+        s.title = "t"
+        s.session_metadata = {}
+        s.status = status
+        s.event_count = 0
+        s.created_at = Mock(isoformat=Mock(return_value=""))
+        s.updated_at = Mock(isoformat=Mock(return_value=""))
+        s.ended_at = None
+        return s
+
+    def test_hooks_run_before_cleanup(self, service):
+        """_run_close_hooks must execute before _cleanup_sandbox."""
+        session_mock = self._make_session_mock()
+        service.session_repo.get_by_id = Mock(return_value=session_mock)
+        updated = self._make_session_mock(status="closed")
+        service.session_repo.update = Mock(return_value=updated)
+
+        call_order = []
+        with patch.object(service, "_run_close_hooks", side_effect=lambda *a: call_order.append("hooks")), \
+             patch.object(service, "_cleanup_sandbox", side_effect=lambda *a: call_order.append("cleanup")):
+            service.update_session("s1", "u1", status="closed")
+
+        assert call_order == ["hooks", "cleanup"], f"Expected hooks before cleanup, got {call_order}"
+
+    def test_cleanup_runs_even_if_hooks_fail(self, service):
+        """Sandbox cleanup must still run if hooks raise."""
+        session_mock = self._make_session_mock()
+        service.session_repo.get_by_id = Mock(return_value=session_mock)
+        updated = self._make_session_mock(status="closed")
+        service.session_repo.update = Mock(return_value=updated)
+
+        with patch.object(service, "_run_close_hooks", side_effect=RuntimeError("scoring failed")), \
+             patch.object(service, "_cleanup_sandbox") as mock_clean:
+            service.update_session("s1", "u1", status="closed")
+            mock_clean.assert_called_once_with("s1")

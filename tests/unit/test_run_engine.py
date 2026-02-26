@@ -714,6 +714,21 @@ class TestEventPersistWarning:
         # Pending inserts should be empty — dropped after retry exhausted
         assert len(engine._pending_inserts) == 0
 
+    def test_pending_buffer_capped_on_retry(self, engine, mock_db, caplog):
+        """When DB is persistently down, pending buffer is capped at _MAX_PENDING_EVENTS."""
+        import logging
+        from core.agent.run_engine import _MAX_PENDING_EVENTS
+        run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
+        # Pre-fill buffer beyond cap
+        engine._pending_inserts = [{"run_id": run.run_id, "idx": i, "event_type": "t", "data": "{}", "event_id": None, "agent_id": None}
+                                   for i in range(_MAX_PENDING_EVENTS + 100)]
+        mock_db.execute.side_effect = RuntimeError("db down")
+        with caplog.at_level(logging.WARNING):
+            engine._flush_run_events()
+        # After retry failure, buffer is dropped (retry also fails)
+        # But during the retry merge, it was capped
+        assert "capped" in caplog.text.lower()
+
 
 class TestResumeClaimMultiple:
     """Test that _try_claim_resume works across multiple resume cycles."""

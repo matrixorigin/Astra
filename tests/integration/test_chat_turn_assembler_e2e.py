@@ -740,3 +740,80 @@ class TestTurnHooksE2E:
         ).fetchone()
         assert row is not None, "decision_audit should exist for plain text responses"
         assert row[0] == "response_generation"
+
+
+# ============================================================================
+# 12. Persist tool_call events via /chat/turn
+# ============================================================================
+
+class TestToolCallStartPersistence:
+    """Verify /chat/turn persists tool_call events to DB for recovery."""
+
+    def test_tool_call_persisted(self, client, auth_headers, db_session):
+        """After a turn with tool_calls, tool_call events exist in conversation_events."""
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=fake_stream([
+            {"type": "text", "content": "Running."},
+            {"type": "tool_call", "data": {"id": "tc_persist", "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}},
+        ])):
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "list files"}],
+                    "edge_tools": [{"type": "function", "function": {"name": "bash", "parameters": {}}}],
+                },
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+
+        events = parse_sse(resp.text)
+        sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
+        assert sid
+
+        row = db_session.execute(
+            sql_text("""
+                SELECT content, metadata FROM conversation_events
+                WHERE session_id = :sid AND event_type = 'tool_call'
+                ORDER BY created_at DESC LIMIT 1
+            """),
+            {"sid": sid},
+        ).fetchone()
+        assert row is not None, "tool_call_start event should be persisted"
+        content = json.loads(row[0])
+        assert content["tool_call_id"] == "tc_persist"
+        assert content["name"] == "bash"
+        meta = json.loads(row[1]) if isinstance(row[1], str) else row[1]
+        assert meta["tool_call_id"] == "tc_persist"
+        assert meta["name"] == "bash"
+
+    def test_tool_result_metadata_includes_name(self, client, auth_headers, db_session):
+        """tool_result metadata should include name field for recovery synthesis."""
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=fake_stream([
+            {"type": "text", "content": "ok"},
+        ])):
+            resp = client.post(
+                "/chat/turn",
+                json={
+                    "messages": [{"role": "user", "content": "test"}],
+                    "tool_results": [{"tool_call_id": "tc_meta", "name": "read_file", "result": "content"}],
+                    "edge_tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+                },
+                headers=auth_headers,
+            )
+            assert resp.status_code == 200
+
+        events = parse_sse(resp.text)
+        sid = next((e.get("session_id") for e in events if e.get("session_id")), None)
+        assert sid
+
+        row = db_session.execute(
+            sql_text("""
+                SELECT metadata FROM conversation_events
+                WHERE session_id = :sid AND event_type = 'tool_result'
+                ORDER BY created_at DESC LIMIT 1
+            """),
+            {"sid": sid},
+        ).fetchone()
+        assert row is not None
+        meta = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        assert meta["name"] == "read_file", "tool_result metadata must include name for recovery"
+        assert meta["tool_call_id"] == "tc_meta"

@@ -230,7 +230,11 @@ class SessionService:
             if status in ("closed", "ended"):
                 # Hooks first: quality scoring and knowledge extraction may
                 # read session data.  Sandbox cleanup is destructive — run last.
-                self._run_close_hooks(session_id, session.user_id)
+                # Both are best-effort — failures must not block session close.
+                try:
+                    self._run_close_hooks(session_id, session.user_id)
+                except Exception as e:
+                    self._logger.warning("Close hooks failed (non-fatal): %s", e)
                 self._cleanup_sandbox(session_id)
 
         if not update_data:
