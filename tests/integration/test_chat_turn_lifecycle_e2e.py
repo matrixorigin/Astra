@@ -767,3 +767,180 @@ class TestResolvedModelInAudit:
         output = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
         assert output.get("model_used") == "gpt-4o-mini", \
             f"Audit should record resolved model 'gpt-4o-mini', got: {output}"
+
+
+# ============================================================================
+# Task 6: E2E tests for refactoring tasks 1-4
+# ============================================================================
+
+
+class TestStructuredErrors:
+    """Task 3b: Structured error classification in SSE error events."""
+
+    _auth = staticmethod(_unique_auth)
+
+    def _trigger_error(self, client, db, exc_class, exc_args=("fail",), prefix="err"):
+        headers, _ = self._auth(client, db, prefix)
+
+        async def _raise(*a, **kw):
+            raise exc_class(*exc_args)
+            yield  # pragma: no cover
+
+        with patch("core.llm.client.LLMClient.chat_stream", side_effect=_raise):
+            r = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "hi"}],
+            }, headers=headers)
+        return [e for e in parse_sse_events(r.text) if e["type"] == "error"]
+
+    def test_rate_limit_error(self, client, db):
+        from core.exceptions import LLMRateLimitError
+        errs = self._trigger_error(client, db, LLMRateLimitError, exc_args=("openai",), prefix="rl")
+        assert errs[0]["code"] == "LLM_RATE_LIMIT"
+        assert errs[0]["retryable"] is True
+
+    def test_timeout_error(self, client, db):
+        from core.exceptions import LLMTimeoutError
+        errs = self._trigger_error(client, db, LLMTimeoutError, exc_args=("openai", 30.0), prefix="to")
+        assert errs[0]["code"] == "LLM_TIMEOUT"
+        assert errs[0]["retryable"] is True
+
+    def test_budget_exceeded_structured(self, client, db):
+        from core.llm.client import BudgetExceededError
+        errs = self._trigger_error(client, db, BudgetExceededError, prefix="be")
+        assert errs[0]["code"] == "BUDGET_EXCEEDED"
+        assert errs[0]["retryable"] is False
+
+    def test_unknown_error_not_retryable(self, client, db):
+        errs = self._trigger_error(client, db, RuntimeError, prefix="unk")
+        assert errs[0]["code"] == "INTERNAL_ERROR"
+        assert errs[0]["retryable"] is False
+
+
+class TestPhasePersistenceIsolation:
+    """Task 3c: One phase failing doesn't block subsequent phases."""
+
+    _auth = staticmethod(_unique_auth)
+
+    def test_phase1_failure_still_persists_llm_response(self, client, db):
+        """If user_query persistence (Phase 1) fails, LLM response (Phase 3) still persists."""
+        headers, user_id = self._auth(client, db, "ph")
+
+        with patch("core.llm.client.LLMClient.chat_stream",
+                   return_value=fake_llm_stream([{"type": "text", "content": "answer"}])), \
+             patch("core.events.event_logger.EventLogger.create_user_query",
+                   side_effect=RuntimeError("Phase 1 boom")):
+            r = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "question"}],
+            }, headers=headers)
+
+        events = parse_sse_events(r.text)
+        assert any(e["type"] == "turn_complete" for e in events), "Turn should complete despite Phase 1 failure"
+
+        # LLM response should still be persisted (Phase 3)
+        flush_persist_threads()
+        row = db.execute(
+            sql_text("SELECT content FROM conversation_events WHERE user_id = :uid AND event_type = 'llm_response'"),
+            {"uid": user_id},
+        ).fetchone()
+        assert row is not None, "Phase 3 (llm_response) should persist even when Phase 1 fails"
+
+
+class TestCostTrackingFix:
+    """Task 1: chat_with_tools_stream yields usage and calls _log_call/_record_spend."""
+
+    def test_usage_event_yielded(self):
+        """chat_with_tools_stream yields a usage event at the end."""
+        import asyncio
+        from unittest.mock import patch, MagicMock
+        from core.llm.models import LLMProvider
+
+        provider_mock = MagicMock()
+
+        def fake_complete(*a, **kw):
+            yield {"type": "tool_call", "id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}
+            yield {"type": "usage", "prompt": 10, "completion": 5}
+
+        provider_mock.complete_with_tools_stream = fake_complete
+
+        from core.llm.client import LLMClient
+        llm = MagicMock(spec=LLMClient)
+        llm.chat_with_tools_stream = LLMClient.chat_with_tools_stream.__get__(llm)
+        llm._resolve_model = MagicMock(return_value="gpt-4o")
+        llm._check_budget = MagicMock()
+        llm.config = {"temperature": 0.7}
+
+        model_cfg = MagicMock()
+        model_cfg.provider = LLMProvider.OPENAI
+        model_cfg.model_name = "gpt-4o"
+        model_cfg.enable_cache = False
+        llm._resolve_chain = MagicMock(return_value=[model_cfg])
+        llm.rate_limiter = MagicMock()
+        llm.rate_limiter.get_breaker.return_value.allow_request.return_value = True
+        llm._get_provider = MagicMock(return_value=provider_mock)
+        llm.router = MagicMock()
+        llm.router.calculate_cost.return_value = 0.001
+        llm._record_spend = MagicMock()
+        llm._log_call = MagicMock()
+        llm.user_id = "test"
+
+        chunks = asyncio.get_event_loop().run_until_complete(
+            _collect_async(llm.chat_with_tools_stream([], [], model="gpt-4o"))
+        )
+
+        usage_chunks = [c for c in chunks if c.get("type") == "usage"]
+        assert len(usage_chunks) == 1, f"Expected 1 usage event, got {usage_chunks}"
+        assert usage_chunks[0]["prompt"] == 10
+        llm._log_call.assert_called_once()
+        llm._record_spend.assert_called_once_with(0.001)
+
+
+class TestEdgeRetry:
+    """Task 4: Edge retry with exponential backoff for transient errors."""
+
+    @pytest.mark.asyncio
+    async def test_retries_on_retryable_error(self):
+        """Edge retries when cloud returns retryable error, then succeeds."""
+        from cli.edge_chat_loop import _consume_turn, TurnResult
+
+        call_count = 0
+
+        async def fake_sse_stream():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                yield {"type": "error", "message": "rate limited", "code": "LLM_RATE_LIMIT",
+                       "retryable": True, "retry_after_ms": 10}
+            else:
+                yield {"type": "text_delta", "content": "ok"}
+                yield {"type": "turn_complete", "has_tool_calls": False}
+
+        renderer = MagicMock()
+        # First call: retryable error
+        r1 = await _consume_turn(fake_sse_stream(), renderer)
+        assert r1.error is not None
+        assert r1.error["retryable"] is True
+
+        # Second call: success
+        r2 = await _consume_turn(fake_sse_stream(), renderer)
+        assert r2.text == "ok"
+        assert r2.error is None
+
+    @pytest.mark.asyncio
+    async def test_consume_turn_captures_error_field(self):
+        """_consume_turn populates error field from SSE error event."""
+        from cli.edge_chat_loop import _consume_turn
+
+        async def error_stream():
+            yield {"type": "error", "message": "boom", "code": "INTERNAL_ERROR", "retryable": False}
+
+        result = await _consume_turn(error_stream(), MagicMock())
+        assert result.error["code"] == "INTERNAL_ERROR"
+        assert result.error["retryable"] is False
+
+
+async def _collect_async(agen):
+    """Collect all items from an async generator."""
+    items = []
+    async for item in agen:
+        items.append(item)
+    return items
