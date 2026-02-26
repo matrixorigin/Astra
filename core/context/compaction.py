@@ -89,7 +89,12 @@ def compact(
 def _clear_old_tool_results(
     messages: list[dict[str, Any]], preserve_recent: int,
 ) -> list[dict[str, Any]]:
-    """Replace old tool result contents with placeholder."""
+    """Replace old tool result contents with placeholder.
+    
+    Preserves [memory:xxx] references so LLM can still expand them.
+    """
+    import re
+    
     if len(messages) <= preserve_recent:
         return messages
 
@@ -97,7 +102,15 @@ def _clear_old_tool_results(
     for i in range(cutoff):
         m = messages[i]
         if m.get("role") == "tool" and m.get("content") and len(m["content"]) > 200:
-            messages[i] = {**m, "content": _TOOL_CLEARED}
+            content = m["content"]
+            # Extract and preserve memory references
+            memory_refs = re.findall(r'\[(?:Full output.*?)?memory:[^\]]+\]', content)
+            if memory_refs:
+                # Keep the reference, clear the rest
+                preserved = "\n".join(memory_refs)
+                messages[i] = {**m, "content": f"{_TOOL_CLEARED}\n{preserved}"}
+            else:
+                messages[i] = {**m, "content": _TOOL_CLEARED}
     return messages
 
 
