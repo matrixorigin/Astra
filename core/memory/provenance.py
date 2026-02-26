@@ -17,18 +17,28 @@ logger = logging.getLogger(__name__)
 class MemoryProvenance(DbConsumer):
     """Historical memory queries and rollback using MO PITR + snapshot."""
 
-    def __init__(self, db_factory: DbFactory, db_name: str = "mo_agent"):
+    def __init__(self, db_factory: DbFactory, db_name: str = "dev_agent"):
         super().__init__(db_factory)
         self.db_name = db_name
 
+    def _exec_ddl(self, sql: str) -> None:
+        """Execute DDL that requires autocommit (PITR/snapshot/restore)."""
+        with self._db() as db:
+            raw_conn = db.connection().connection
+            raw_conn.autocommit(True)
+            cursor = raw_conn.cursor()
+            try:
+                cursor.execute(sql)
+            finally:
+                cursor.close()
+                raw_conn.autocommit(False)
+
     def setup_pitr(self, range_value: int = 14, range_unit: str = "d") -> None:
         """One-time setup: create PITR for memories table."""
-        with self._db() as db:
-            db.execute(text(
-                f"create pitr if not exists memory_pitr for table {self.db_name} memories "
-                f"range {range_value} '{range_unit}'"
-            ))
-            db.commit()
+        self._exec_ddl(
+            f"create pitr if not exists memory_pitr for table {self.db_name} memories "
+            f"range {range_value} '{range_unit}'"
+        )
 
     def memory_state_at(
         self, user_id: str, timestamp: datetime, limit: int = 100,
@@ -84,12 +94,10 @@ class MemoryProvenance(DbConsumer):
         """Restore memories table to a timestamp via PITR."""
         ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
         try:
-            with self._db() as db:
-                db.execute(text(
-                    f"restore database {self.db_name} table memories "
-                    f"from pitr memory_pitr '{ts_str}'"
-                ))
-                db.commit()
+            self._exec_ddl(
+                f"restore database {self.db_name} table memories "
+                f"from pitr memory_pitr '{ts_str}'"
+            )
             logger.info("Rolled back memories to %s", ts_str)
             return True
         except Exception as e:
@@ -99,12 +107,10 @@ class MemoryProvenance(DbConsumer):
     def rollback_to_snapshot(self, snapshot_name: str) -> bool:
         """Restore memories table from a named snapshot."""
         try:
-            with self._db() as db:
-                db.execute(text(
-                    f"restore account sys database {self.db_name} table memories "
-                    f"from snapshot {snapshot_name}"
-                ))
-                db.commit()
+            self._exec_ddl(
+                f"restore account sys database {self.db_name} table memories "
+                f"from snapshot {snapshot_name}"
+            )
             logger.info("Rolled back memories to snapshot %s", snapshot_name)
             return True
         except Exception as e:
@@ -128,11 +134,7 @@ class MemoryProvenance(DbConsumer):
         """Create a named snapshot for long-term anchor."""
         if not name:
             name = f"mem_milestone_{uuid.uuid4().hex[:8]}"
-        with self._db() as db:
-            db.execute(text(
-                f"create snapshot {name} for table {self.db_name} memories"
-            ))
-            db.commit()
+        self._exec_ddl(f"create snapshot {name} for account sys")
         return name
 
     def trace_source(self, memory_id: str) -> list[str]:

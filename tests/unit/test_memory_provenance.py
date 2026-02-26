@@ -80,10 +80,15 @@ class TestTraceSource:
 
 class TestCreateMilestone:
     def test_creates_snapshot(self, provenance, mock_db_prov):
+        # Mock the raw connection for DDL
+        mock_raw = MagicMock()
+        mock_db_prov.connection.return_value.connection = mock_raw
+        mock_raw.cursor.return_value = MagicMock()
+
         name = provenance.create_milestone("test_snap")
         assert name == "test_snap"
-        mock_db_prov.execute.assert_called()
-        mock_db_prov.commit.assert_called()
+        mock_raw.autocommit.assert_called()
+        mock_raw.cursor.return_value.execute.assert_called()
 
 
 # ---------------------------------------------------------------------------

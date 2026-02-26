@@ -110,14 +110,22 @@ class MemoryHealth(DbConsumer):
 
         to_drop = [r.sname for r in rows[keep_last_n:]]
         dropped = 0
+
+        # Use autocommit for DDL
         with self._db() as db:
-            for name in to_drop:
-                try:
-                    db.execute(text(f"drop snapshot {name}"))
-                    dropped += 1
-                except Exception as e:
-                    logger.warning("Failed to drop snapshot %s: %s", name, e)
-            db.commit()
+            raw_conn = db.connection().connection
+            raw_conn.autocommit(True)
+            cursor = raw_conn.cursor()
+            try:
+                for name in to_drop:
+                    try:
+                        cursor.execute(f"drop snapshot {name}")
+                        dropped += 1
+                    except Exception as e:
+                        logger.warning("Failed to drop snapshot %s: %s", name, e)
+            finally:
+                cursor.close()
+                raw_conn.autocommit(False)
 
         logger.info("Cleaned up %d old snapshots", dropped)
         return dropped

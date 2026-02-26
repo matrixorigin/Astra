@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class MemorySandbox(DbConsumer):
     """Validate memories in a branch before committing."""
 
-    def __init__(self, db_factory: DbFactory, db_name: str = "mo_agent"):
+    def __init__(self, db_factory: DbFactory, db_name: str = "dev_agent"):
         super().__init__(db_factory)
         self.db_name = db_name
 
