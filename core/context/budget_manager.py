@@ -42,6 +42,35 @@ class BudgetAllocation:
         )
 
 
+@dataclass
+class TurnBudgetTracker:
+    """Track cumulative tool output budget within a single turn."""
+    max_tool_output_tokens: int
+    used_tokens: int = 0
+    tool_count: int = 0
+    
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_tool_output_tokens - self.used_tokens)
+    
+    def should_force_summarize(self, output_size: int) -> bool:
+        """Check if output should be force-summarized due to cumulative budget."""
+        output_tokens = output_size // 4
+        # Force summarize if:
+        # 1. Would exceed remaining budget
+        # 2. Already used >50% of budget and this is a large output
+        if output_tokens > self.remaining:
+            return True
+        if self.used_tokens > self.max_tool_output_tokens * 0.5 and output_tokens > 2000:
+            return True
+        return False
+    
+    def record(self, output_size: int) -> None:
+        """Record tool output usage."""
+        self.used_tokens += output_size // 4
+        self.tool_count += 1
+
+
 # Default budget ratios by stage (must sum to 1.0)
 STAGE_BUDGETS: dict[ConversationStage, dict[str, float]] = {
     ConversationStage.QUERY: {

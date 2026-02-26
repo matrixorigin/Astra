@@ -48,24 +48,41 @@ def compute_dynamic_threshold(remaining_tokens: int | None) -> int:
 # --- Structured Summary Generators (rule-based, zero LLM cost) ---
 
 def _summarize_grep(output: str) -> str:
-    """Summarize grep output: file stats + sample matches."""
+    """Summarize grep output: per-file stats + samples with line numbers."""
     lines = output.strip().split('\n')
-    files: dict[str, int] = {}
-    for line in lines[:500]:
+    
+    # Group by file with line numbers
+    file_matches: dict[str, list[tuple[int, str]]] = {}
+    for line in lines[:1000]:
         if ':' in line:
-            f = line.split(':')[0]
-            files[f] = files.get(f, 0) + 1
+            parts = line.split(':', 2)
+            if len(parts) >= 3:
+                file, lineno, content = parts[0], parts[1], parts[2]
+                if file not in file_matches:
+                    file_matches[file] = []
+                try:
+                    file_matches[file].append((int(lineno), content.strip()[:80]))
+                except ValueError:
+                    pass
     
-    top_files = sorted(files.items(), key=lambda x: -x[1])[:10]
-    file_list = ', '.join(f"{f}({n})" for f, n in top_files)
-    if len(files) > 10:
-        file_list += f"... (+{len(files) - 10} more)"
+    # Sort files by match count (descending)
+    sorted_files = sorted(file_matches.items(), key=lambda x: -len(x[1]))
     
-    return (
-        f"Found {len(lines)} matches in {len(files)} files.\n"
-        f"Top files: {file_list}\n"
-        f"Sample:\n" + '\n'.join(lines[:5])
-    )
+    # Build summary with per-file breakdown
+    summary_parts = [f"Found {len(lines)} matches in {len(file_matches)} files."]
+    summary_parts.append("\nPer-file breakdown:")
+    
+    for file, matches in sorted_files[:10]:
+        line_nums = [m[0] for m in matches[:5]]
+        summary_parts.append(f"  {file}: {len(matches)} matches (lines: {line_nums})")
+        # Show 1-2 samples per file with line numbers
+        for lineno, content in matches[:2]:
+            summary_parts.append(f"    L{lineno}: {content}")
+    
+    if len(sorted_files) > 10:
+        summary_parts.append(f"  ... and {len(sorted_files) - 10} more files")
+    
+    return '\n'.join(summary_parts)
 
 
 def _summarize_shell(output: str) -> str:
@@ -171,8 +188,11 @@ def process_tool_output(
     Returns:
         Original output (if small) or summary + memory reference (if large)
     """
+    from core.agent.tool_context_metrics import record_tool_output
+    
     threshold = compute_dynamic_threshold(remaining_tokens)
     if len(output) <= threshold:
+        record_tool_output(tool_name, len(output), len(output), was_summarized=False)
         return output
     
     # 1. Store full output in mo-trustmem
@@ -190,8 +210,11 @@ def process_tool_output(
     # 2. Generate rule-based summary
     summary = generate_structured_summary(output, tool_name)
     
-    # 3. Return summary + reference
-    return f"{summary}\n\n[Full output ({len(output)} bytes): memory:{memory.memory_id}]"
+    # 3. Record metrics
+    result = f"{summary}\n\n[Full output ({len(output)} bytes): memory:{memory.memory_id}]"
+    record_tool_output(tool_name, len(output), len(result), was_summarized=True)
+    
+    return result
 
 
 def find_similar_result(
@@ -266,6 +289,7 @@ def expand_memory_reference(
     start_line: int | None = None,
     end_line: int | None = None,
     query: str | None = None,
+    max_chars: int = 10000,  # Prevent re-explosion
 ) -> str:
     """Expand a memory reference, optionally with range or query filter.
     
@@ -275,9 +299,10 @@ def expand_memory_reference(
         start_line: Optional start line for partial expansion
         end_line: Optional end line for partial expansion
         query: Optional query to filter content (grep-like)
+        max_chars: Maximum characters to return (prevents context re-explosion)
     
     Returns:
-        Expanded content (full or filtered)
+        Expanded content (full or filtered), truncated if exceeds max_chars
     """
     memory = memory_store.get(memory_id)
     if not memory:
@@ -285,6 +310,7 @@ def expand_memory_reference(
     
     content = memory.content
     lines = content.split('\n')
+    total_lines = len(lines)
     
     # Apply line range filter
     if start_line is not None or end_line is not None:
@@ -297,9 +323,13 @@ def expand_memory_reference(
     if query:
         matching = [l for l in lines if query.lower() in l.lower()]
         if matching:
-            content = f"Filtered {len(matching)} lines matching '{query}':\n" + '\n'.join(matching[:50])
+            content = f"Filtered {len(matching)} of {total_lines} lines matching '{query}':\n" + '\n'.join(matching[:100])
         else:
-            content = f"No lines matching '{query}'"
+            content = f"No lines matching '{query}' in {total_lines} lines"
+    
+    # Truncate to prevent context re-explosion
+    if len(content) > max_chars:
+        content = content[:max_chars] + f"\n... [truncated, use start_line/end_line for pagination, total {len(memory.content)} chars]"
     
     return content
 

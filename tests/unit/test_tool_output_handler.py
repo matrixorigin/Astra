@@ -16,7 +16,7 @@ class TestStructuredSummary:
     """Tests for rule-based structured summary generation."""
 
     def test_grep_summary_format(self):
-        """Grep summary includes file stats and sample."""
+        """Grep summary includes per-file breakdown and line numbers."""
         output = "\n".join([
             "file1.py:10:match1",
             "file1.py:20:match2",
@@ -28,7 +28,7 @@ class TestStructuredSummary:
         assert "4 matches" in summary
         assert "3 files" in summary
         assert "file1.py" in summary
-        assert "Sample:" in summary
+        assert "Per-file breakdown" in summary
 
     def test_shell_summary_head_tail(self):
         """Shell summary includes head, tail, and stats."""
@@ -284,7 +284,7 @@ class TestMemoryExpand:
         mock_store.get.return_value = mock_memory
         
         result = expand_memory_reference("mem_123", mock_store, query="error")
-        assert "2 lines matching" in result
+        assert "2 of 3 lines matching" in result
         assert "error: something" in result
         assert "info: ok" not in result
 
