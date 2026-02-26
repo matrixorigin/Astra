@@ -89,7 +89,7 @@ def test_first_user_gets_admin_role(db_session):
     )
     
     # Mock the dependency injection
-    user = register(request, db_session)
+    user = register(request)
     
     # Verify user has admin role
     result = db_session.execute(
@@ -124,7 +124,7 @@ def test_second_user_no_admin_role(db_session):
         password="password123",
         display_name="First User"
     )
-    register(request1, db_session)
+    register(request1)
 
     # Register second user
     request2 = RegisterRequest(
@@ -133,7 +133,7 @@ def test_second_user_no_admin_role(db_session):
         password="password123",
         display_name="Second User"
     )
-    user2 = register(request2, db_session)
+    user2 = register(request2)
 
     # Verify second user has no roles
     result = db_session.execute(

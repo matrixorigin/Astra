@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.services.sandbox_service import SandboxService
 
@@ -46,7 +46,6 @@ class SandboxListResponse(BaseModel):
 )
 async def create_sandbox(
     request: CreateSandboxRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """创建 Sandbox
@@ -54,7 +53,7 @@ async def create_sandbox(
     需要权限: mo_agent_user
     """
     try:
-        service = SandboxService(lambda: db)
+        service = SandboxService(SessionLocal)
         result = service.create_sandbox(
             name=request.name,
             user_id=current_user["user_id"],
@@ -87,7 +86,6 @@ async def create_sandbox(
 )
 async def list_sandboxes(
     pattern: str | None = "%",
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """列出 Sandboxes
@@ -98,7 +96,7 @@ async def list_sandboxes(
         pattern: 过滤模式 (SQL LIKE pattern)
     """
     try:
-        service = SandboxService(lambda: db)
+        service = SandboxService(SessionLocal)
         sandboxes = service.list_sandboxes(
             user_id=current_user["user_id"],
             pattern=pattern
@@ -127,7 +125,6 @@ async def list_sandboxes(
 )
 async def get_sandbox(
     name: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """获取 Sandbox 信息
@@ -135,7 +132,7 @@ async def get_sandbox(
     需要权限: mo_agent_user (且是创建者或 admin)
     """
     try:
-        service = SandboxService(lambda: db)
+        service = SandboxService(SessionLocal)
         return service.get_sandbox_info(name, current_user["user_id"])
     except PermissionError as e:
         raise HTTPException(
@@ -162,7 +159,6 @@ async def get_sandbox(
 )
 async def delete_sandbox(
     name: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """删除 Sandbox
@@ -170,7 +166,7 @@ async def delete_sandbox(
     需要权限: mo_agent_user (且是创建者或 admin)
     """
     try:
-        service = SandboxService(lambda: db)
+        service = SandboxService(SessionLocal)
         service.delete_sandbox(name, current_user["user_id"])
         return None
     except PermissionError as e:

@@ -1,12 +1,9 @@
 """Workflow API endpoints."""
 
-from typing import Annotated
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.models import WorkflowDefinition, WorkflowRun
 
@@ -35,50 +32,59 @@ class WorkflowRunResponse(BaseModel):
 
 @router.get("/workflows", response_model=list[WorkflowDefResponse])
 def list_workflows(
-    current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
+    current_user: dict = Depends(get_current_user),
 ):
-    rows = db.query(WorkflowDefinition).filter(WorkflowDefinition.is_active == 1).all()
-    return [WorkflowDefResponse(
-        workflow_id=r.workflow_id, name=r.name, version=r.version,
-        description=r.description, definition=r.definition, is_active=bool(r.is_active),
-    ) for r in rows]
+    db = SessionLocal()
+    try:
+        rows = db.query(WorkflowDefinition).filter(WorkflowDefinition.is_active == 1).all()
+        return [WorkflowDefResponse(
+            workflow_id=r.workflow_id, name=r.name, version=r.version,
+            description=r.description, definition=r.definition, is_active=bool(r.is_active),
+        ) for r in rows]
+    finally:
+        db.close()
 
 
 @router.get("/workflows/runs/{run_id}", response_model=WorkflowRunResponse)
 def get_workflow_run(
     run_id: str,
-    current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
+    current_user: dict = Depends(get_current_user),
 ):
-    row = db.query(WorkflowRun).filter(WorkflowRun.run_id == run_id).first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Workflow run not found")
-    return WorkflowRunResponse(
-        run_id=row.run_id, workflow_id=row.workflow_id,
-        agent_run_id=row.agent_run_id, status=row.status,
-        waiting_for=row.waiting_for, current_step_idx=row.current_step_idx,
-        step_results=row.step_results or {}, error=row.error,
-    )
+    db = SessionLocal()
+    try:
+        row = db.query(WorkflowRun).filter(WorkflowRun.run_id == run_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Workflow run not found")
+        return WorkflowRunResponse(
+            run_id=row.run_id, workflow_id=row.workflow_id,
+            agent_run_id=row.agent_run_id, status=row.status,
+            waiting_for=row.waiting_for, current_step_idx=row.current_step_idx,
+            step_results=row.step_results or {}, error=row.error,
+        )
+    finally:
+        db.close()
 
 
 @router.post("/workflows/runs/{run_id}/resolve")
 async def resolve_workflow_wait(
     run_id: str,
     result: dict,
-    current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
+    current_user: dict = Depends(get_current_user),
 ):
     """Resolve a workflow's wait step (e.g. human approval)."""
-    row = db.query(WorkflowRun).filter(WorkflowRun.run_id == run_id).first()
-    if not row or row.status != "waiting":
-        raise HTTPException(status_code=404, detail="Workflow run not found or not waiting")
+    db = SessionLocal()
+    try:
+        row = db.query(WorkflowRun).filter(WorkflowRun.run_id == run_id).first()
+        if not row or row.status != "waiting":
+            raise HTTPException(status_code=404, detail="Workflow run not found or not waiting")
+        handle = row.waiting_for
+    finally:
+        db.close()
 
-    from core.agent.async_tools import resume_workflow
-    handle = row.waiting_for
     if not handle:
         raise HTTPException(status_code=400, detail="No wait handle")
 
+    from core.agent.async_tools import resume_workflow
     resumed = await resume_workflow(handle, result)
     if not resumed:
         raise HTTPException(status_code=409, detail="Could not resume workflow")

@@ -4,19 +4,8 @@ import json
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
-from sqlalchemy.orm import Session
 
 from core.events.models import StreamEvent, StreamEventType
-
-
-@pytest.fixture
-def mock_db():
-    """Mock database - SQLAlchemy style."""
-    db = Mock(spec=Session)
-    mock_result = MagicMock()
-    mock_result.first.return_value = MagicMock(session_id="sess_123")
-    db.execute.return_value = mock_result
-    return db
 
 
 @pytest.fixture
@@ -46,8 +35,9 @@ class TestChatStream:
     """Test /chat/stream endpoint."""
 
     @pytest.mark.asyncio
+    @patch("api.routers.chat._ensure_session", return_value="sess_123")
     @patch("api.routers.chat._build_chat_loop")
-    async def test_stream_chat_success(self, mock_build, mock_db, mock_auth):
+    async def test_stream_chat_success(self, mock_build, mock_ensure, mock_auth):
         from api.routers.chat import chat_stream, ChatRequest
 
         events = [
@@ -58,7 +48,7 @@ class TestChatStream:
         mock_build.return_value = _make_mock_loop(stream_events=events)
 
         request = ChatRequest(session_id="sess_123", message="Hello")
-        response = await chat_stream(request, mock_auth, mock_db)
+        response = await chat_stream(request, mock_auth)
 
         assert response.media_type == "text/event-stream"
 
@@ -83,13 +73,15 @@ class TestChatStream:
         mock_db.execute.return_value.first.return_value = None
 
         request = ChatRequest(session_id="nonexistent", message="Hello")
-        with pytest.raises(HTTPException) as exc_info:
-            await chat_stream(request, mock_auth, mock_db)
+        with patch("api.routers.chat.SessionLocal", return_value=mock_db):
+            with pytest.raises(HTTPException) as exc_info:
+                await chat_stream(request, mock_auth)
         assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
+    @patch("api.routers.chat._ensure_session", return_value="sess_123")
     @patch("api.routers.chat._build_chat_loop")
-    async def test_stream_chat_error_handling(self, mock_build, mock_db, mock_auth):
+    async def test_stream_chat_error_handling(self, mock_build, mock_ensure, mock_auth):
         from api.routers.chat import chat_stream, ChatRequest
 
         async def error_stream(*a, **kw):
@@ -102,7 +94,7 @@ class TestChatStream:
         mock_build.return_value = loop
 
         request = ChatRequest(session_id="sess_123", message="Test")
-        response = await chat_stream(request, mock_auth, mock_db)
+        response = await chat_stream(request, mock_auth)
 
         collected = []
         async for chunk in response.body_iterator:
@@ -113,8 +105,9 @@ class TestChatStream:
         assert collected[-1]["event_type"] == "run_error"
 
     @pytest.mark.asyncio
+    @patch("api.routers.chat._ensure_session", return_value="sess_123")
     @patch("api.routers.chat._build_chat_loop")
-    async def test_stream_chat_tool_calls(self, mock_build, mock_db, mock_auth):
+    async def test_stream_chat_tool_calls(self, mock_build, mock_ensure, mock_auth):
         from api.routers.chat import chat_stream, ChatRequest
 
         events = [
@@ -127,7 +120,7 @@ class TestChatStream:
         mock_build.return_value = _make_mock_loop(stream_events=events)
 
         request = ChatRequest(session_id="sess_123", message="Run tests")
-        response = await chat_stream(request, mock_auth, mock_db)
+        response = await chat_stream(request, mock_auth)
 
         collected = []
         async for chunk in response.body_iterator:
@@ -140,8 +133,9 @@ class TestChatStream:
         assert "tool_result" in types
 
     @pytest.mark.asyncio
+    @patch("api.routers.chat._ensure_session", return_value="sess_123")
     @patch("api.routers.chat._build_chat_loop")
-    async def test_stream_chat_planning_events(self, mock_build, mock_db, mock_auth):
+    async def test_stream_chat_planning_events(self, mock_build, mock_ensure, mock_auth):
         from api.routers.chat import chat_stream, ChatRequest
 
         events = [
@@ -154,7 +148,7 @@ class TestChatStream:
         mock_build.return_value = _make_mock_loop(stream_events=events)
 
         request = ChatRequest(session_id="sess_123", message="Deploy")
-        response = await chat_stream(request, mock_auth, mock_db)
+        response = await chat_stream(request, mock_auth)
 
         collected = []
         async for chunk in response.body_iterator:
@@ -167,8 +161,9 @@ class TestChatStream:
         assert "plan_step_start" in types
 
     @pytest.mark.asyncio
+    @patch("api.routers.chat._ensure_session", return_value="sess_123")
     @patch("api.routers.chat._build_chat_loop")
-    async def test_stream_chat_reasoning_events(self, mock_build, mock_db, mock_auth):
+    async def test_stream_chat_reasoning_events(self, mock_build, mock_ensure, mock_auth):
         """Reasoning (CoT) events are forwarded through the SSE stream."""
         from api.routers.chat import chat_stream, ChatRequest
 
@@ -181,7 +176,7 @@ class TestChatStream:
         mock_build.return_value = _make_mock_loop(stream_events=events)
 
         request = ChatRequest(session_id="sess_123", message="Think about this")
-        response = await chat_stream(request, mock_auth, mock_db)
+        response = await chat_stream(request, mock_auth)
 
         collected = []
         async for chunk in response.body_iterator:
@@ -199,8 +194,9 @@ class TestChat:
     """Test /chat (non-streaming) endpoint."""
 
     @pytest.mark.asyncio
+    @patch("api.routers.chat._ensure_session", return_value="sess_123")
     @patch("api.routers.chat._get_engine")
-    async def test_chat_success(self, mock_get_engine, mock_db, mock_auth):
+    async def test_chat_success(self, mock_get_engine, mock_ensure, mock_auth):
         from api.routers.chat import chat, ChatRequest
         from core.agent.run import AgentRun, RunStatus
 
@@ -211,7 +207,7 @@ class TestChat:
         mock_get_engine.return_value = mock_engine
 
         request = ChatRequest(session_id="sess_123", message="Hello")
-        response = await chat(request, mock_auth, mock_db)
+        response = await chat(request, mock_auth)
 
         assert response.session_id == "sess_123"
         assert response.run_id == mock_run.run_id
@@ -220,7 +216,7 @@ class TestChat:
     @pytest.mark.asyncio
     @patch("api.routers.chat._get_engine")
     @patch("api.routers.chat._ensure_session")
-    async def test_chat_auto_create_session(self, mock_ensure, mock_get_engine, mock_db, mock_auth):
+    async def test_chat_auto_create_session(self, mock_ensure, mock_get_engine, mock_auth):
         from api.routers.chat import chat, ChatRequest
         from core.agent.run import AgentRun
 
@@ -232,7 +228,7 @@ class TestChat:
         mock_get_engine.return_value = mock_engine
 
         request = ChatRequest(message="Hello")
-        response = await chat(request, mock_auth, mock_db)
+        response = await chat(request, mock_auth)
 
         assert response.session_id == "new_sess_456"
         mock_ensure.assert_called_once()

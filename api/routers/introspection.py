@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from core.logging_config import get_logger
 
@@ -15,29 +15,26 @@ router = APIRouter()
 @router.get("/introspection/memory")
 def get_introspection_memory(
     session_id: str = Query(..., description="Session ID to query"),
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    """Return memory stats for introspection tool.
-
-    Provides episodic, semantic, and procedural memory statistics
-    that the edge introspection tool can merge with local data.
-    """
+    """Return memory stats for introspection tool."""
     user_id = current_user["user_id"]
+    db = SessionLocal()
+    try:
+        session_row = db.execute(
+            text("SELECT user_id FROM sessions WHERE session_id = :sid"),
+            {"sid": session_id},
+        ).fetchone()
+        if not session_row or session_row[0] != user_id:
+            raise HTTPException(status_code=404, detail="Session not found")
 
-    # Verify session belongs to user
-    session_row = db.execute(
-        text("SELECT user_id FROM sessions WHERE session_id = :sid"),
-        {"sid": session_id},
-    ).fetchone()
-    if not session_row or session_row[0] != user_id:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    return {
-        "episodic": _get_episodic_stats(db, session_id),
-        "semantic": _get_semantic_stats(db, session_id),
-        "procedural": _get_procedural_stats(db, user_id),
-    }
+        return {
+            "episodic": _get_episodic_stats(db, session_id),
+            "semantic": _get_semantic_stats(db, session_id),
+            "procedural": _get_procedural_stats(db, user_id),
+        }
+    finally:
+        db.close()
 
 
 def _get_episodic_stats(db: Session, session_id: str) -> dict:
@@ -65,7 +62,7 @@ def _get_episodic_stats(db: Session, session_id: str) -> dict:
 
 
 def _get_semantic_stats(db: Session, session_id: str) -> dict:
-    """Count context snapshots and latest token total.
+    """Count context snapshots and peak token total.
 
     Uses total_tokens column from context_snapshots table
     (see api/models.py ContextSnapshot).
@@ -81,7 +78,6 @@ def _get_semantic_stats(db: Session, session_id: str) -> dict:
         ).fetchone()
         return {
             "context_snapshots": row[0] or 0,
-            # MAX(total_tokens) returns the peak token count across all snapshots.
             "peak_snapshot_tokens": row[1] or 0,
         }
     except Exception as exc:

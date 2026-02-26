@@ -7,9 +7,8 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import AfterValidator, BaseModel, Field
-from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from core.logging_config import get_logger
 
@@ -85,10 +84,10 @@ class CostEstimateResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_branch(db: Session):
+def _get_branch():
     from api.database import settings
     from core.sandbox.branch import Branch
-    return Branch(database=settings.matrixone_database, db_factory=lambda: db)
+    return Branch(database=settings.matrixone_database, db_factory=SessionLocal)
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +97,11 @@ def _get_branch(db: Session):
 @router.post("", status_code=status.HTTP_201_CREATED)
 def create_branch(
     request: CreateBranchRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Create a zero-copy branch from source."""
     try:
-        _get_branch(db).create(
+        _get_branch().create(
             name=request.name, source=request.source,
             snapshot=request.snapshot, is_database=request.is_database,
         )
@@ -115,12 +113,11 @@ def create_branch(
 @router.post("/diff", response_model=DiffResponse)
 def diff_branch(
     request: DiffRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Three-way diff between two tables/snapshots."""
     try:
-        rows = _get_branch(db).diff(
+        rows = _get_branch().diff(
             target=request.target, source=request.source,
             output=request.output,
             target_snapshot=request.target_snapshot,
@@ -134,12 +131,11 @@ def diff_branch(
 @router.post("/merge")
 def merge_branch(
     request: MergeRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Merge source into target with conflict strategy."""
     try:
-        _get_branch(db).merge(
+        _get_branch().merge(
             source=request.source, target=request.target,
             on_conflict=request.on_conflict,
         )
@@ -151,12 +147,11 @@ def merge_branch(
 @router.delete("")
 def delete_branch(
     request: DeleteBranchRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Delete a branch."""
     try:
-        _get_branch(db).delete(name=request.name, is_database=request.is_database)
+        _get_branch().delete(name=request.name, is_database=request.is_database)
         return {"status": "deleted", "name": request.name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -165,13 +160,12 @@ def delete_branch(
 @router.post("/cost-estimate", response_model=CostEstimateResponse)
 def estimate_cost(
     request: CostEstimateRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
     """Estimate cost before running a branch operation."""
     from core.sandbox.cost_predictor import BranchCostPredictor
 
-    est = BranchCostPredictor(lambda: db).estimate_branch(
+    est = BranchCostPredictor(SessionLocal).estimate_branch(
         operation=request.operation, model=request.model,
         session_count=request.session_count,
         budget_remaining=request.budget_remaining,

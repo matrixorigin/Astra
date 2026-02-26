@@ -392,15 +392,15 @@ Post-migration, monitor these metrics to validate the design:
 | `RunEngine._cancel_workflow` | 2 | ✅ Done | Uses `with self._db()` independent session |
 | `_trigger_loop` | 2 | ✅ Done | Session-per-trigger; `fire_trigger` takes `db_factory` |
 | `EventLogger` | 2 | ✅ Done | Extends DbConsumer; `from_session()` for legacy callers |
-| `ChatLoop` | 2 | TODO | `_build_chat_loop` still receives raw Session |
+| `ChatLoop` | 2 | ✅ Done | `_build_chat_loop` already receives db_factory; fixed `streaming.py` raw-Session caller |
 | `_run_eval_daily` Phase 2-4 | 2 | ✅ Done | Each phase gets independent session from db_factory |
-| `SkillPipeline` | 3 | TODO | |
-| `ContextManager` | 3 | TODO | `save_snapshot` already uses factory |
-| `AgentExecutor` | 3 | TODO | |
-| `HallucinationFirewall` | 3 | TODO | |
-| `LLMClient` | 3 | TODO | |
-| `SkillRegistry` | 3 | TODO | |
-| Remaining ~75 classes | 4 | TODO | Low urgency, request-scoped |
+| `SkillPipeline` | 3 | ✅ Done | Uses `db_factory()` with manual close |
+| `ContextManager` | 3 | ✅ Done | Extends DbConsumer; uses `_db()` context manager |
+| `AgentExecutor` | 3 | ✅ Done | Extends DbConsumer; uses `_db()` context manager |
+| `HallucinationFirewall` | 3 | ✅ Done | Extends DbConsumer; uses `_db()` context manager |
+| `LLMClient` | 3 | ✅ Done | Extends DbConsumer; uses `_db()` context manager |
+| `SkillRegistry` | 3 | ✅ Done | Uses `db_factory()` with manual close |
+| Remaining ~75 classes | 4 | ✅ Done | All DbConsumer subclasses use `_db()` ctx mgr; all endpoints use `SessionLocal` directly |
 
 ## Non-Goals
 

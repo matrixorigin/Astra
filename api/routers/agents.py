@@ -4,9 +4,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.services.agent_service import AgentService
 
@@ -58,12 +57,11 @@ class AgentListResponse(BaseModel):
 )
 async def create_agent(
     request: CreateAgentRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """创建 Agent"""
     try:
-        service = AgentService(lambda: db)
+        service = AgentService(SessionLocal)
         result = service.create_agent(
             user_id=current_user["user_id"],
             name=request.name,
@@ -90,12 +88,11 @@ async def create_agent(
     description="列出当前用户的所有 Agents"
 )
 async def list_agents(
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """列出 Agents"""
     try:
-        service = AgentService(lambda: db)
+        service = AgentService(SessionLocal)
         agents = service.list_agents(user_id=current_user["user_id"])
         return {
             "agents": agents,
@@ -116,12 +113,11 @@ async def list_agents(
 )
 async def get_agent(
     agent_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """获取 Agent"""
     try:
-        service = AgentService(lambda: db)
+        service = AgentService(SessionLocal)
         result = service.get_agent(agent_id=agent_id, user_id=current_user["user_id"])
         return result
     except ValueError as e:
@@ -145,12 +141,11 @@ async def get_agent(
 async def update_agent(
     agent_id: str,
     request: UpdateAgentRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """更新 Agent"""
     try:
-        service = AgentService(lambda: db)
+        service = AgentService(SessionLocal)
         result = service.update_agent(
             agent_id=agent_id,
             user_id=current_user["user_id"],
@@ -180,12 +175,11 @@ async def update_agent(
 )
 async def delete_agent(
     agent_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """删除 Agent"""
     try:
-        service = AgentService(lambda: db)
+        service = AgentService(SessionLocal)
         service.delete_agent(agent_id=agent_id, user_id=current_user["user_id"])
     except ValueError as e:
         raise HTTPException(

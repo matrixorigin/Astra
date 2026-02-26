@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 
 router = APIRouter(prefix="/data-versioning", tags=["data-versioning"])
@@ -49,12 +49,11 @@ class SandboxCheckpointRequest(BaseModel):
 @router.post("/checkpoints", response_model=CheckpointResponse, status_code=201)
 def create_checkpoint(
     req: CreateCheckpointRequest,
-    db: Session = Depends(get_db_session),
     _user: dict = Depends(get_current_user),
 ):
     """Create a named checkpoint (MatrixOne snapshot) for time-travel queries."""
     from core.replay.time_machine import TimeMachine
-    tm = TimeMachine(lambda: db)
+    tm = TimeMachine(SessionLocal)
     result = tm.create_checkpoint(req.name, req.description)
     return CheckpointResponse(
         checkpoint_name=result["checkpoint_name"],
@@ -65,12 +64,11 @@ def create_checkpoint(
 
 @router.get("/checkpoints", response_model=list[CheckpointResponse])
 def list_checkpoints(
-    db: Session = Depends(get_db_session),
     _user: dict = Depends(get_current_user),
 ):
     """List all available checkpoints."""
     from core.replay.time_machine import TimeMachine
-    tm = TimeMachine(lambda: db)
+    tm = TimeMachine(SessionLocal)
     return [
         CheckpointResponse(
             checkpoint_name=c.get("snapshot_name", c.get("name", "")),
@@ -85,12 +83,11 @@ def get_events_at_checkpoint(
     name: str,
     session_id: str | None = None,
     limit: int = Query(100, ge=1, le=1000),
-    db: Session = Depends(get_db_session),
     _user: dict = Depends(get_current_user),
 ):
     """Time-travel query: read events as they were at a checkpoint (read-only)."""
     from core.replay.time_machine import TimeMachine
-    tm = TimeMachine(lambda: db)
+    tm = TimeMachine(SessionLocal)
     try:
         events = tm.get_events_at_checkpoint(name, session_id=session_id, limit=limit)
     except Exception as e:
@@ -112,12 +109,11 @@ def get_events_at_checkpoint(
 @router.get("/lineage/{event_id}/chain", response_model=list[LineageNode])
 def get_causal_chain(
     event_id: str,
-    db: Session = Depends(get_db_session),
     _user: dict = Depends(get_current_user),
 ):
     """Get the full causal chain for an event (upstream + downstream)."""
     from core.events.event_reader import EventReader
-    reader = EventReader(lambda: db)
+    reader = EventReader(SessionLocal)
 
     # First get the event to find its causal_chain_id
     event = reader.get_event(event_id)
@@ -133,12 +129,11 @@ def get_causal_chain(
 @router.get("/lineage/{event_id}/upstream", response_model=list[LineageNode])
 def trace_upstream(
     event_id: str,
-    db: Session = Depends(get_db_session),
     _user: dict = Depends(get_current_user),
 ):
     """Trace upstream: walk parent_event_id chain to find all ancestors."""
     from core.events.event_reader import EventReader
-    reader = EventReader(lambda: db)
+    reader = EventReader(SessionLocal)
     chain: list[LineageNode] = []
     current_id: str | None = event_id
     seen: set[str] = set()
@@ -160,12 +155,11 @@ def trace_upstream(
 def sandbox_checkpoint(
     name: str,
     req: SandboxCheckpointRequest,
-    db: Session = Depends(get_db_session),
     _user: dict = Depends(get_current_user),
 ):
     """Create a checkpoint within a sandbox."""
     from core.sandbox.sandbox import Sandbox
-    sb = Sandbox(lambda: db)
+    sb = Sandbox(SessionLocal)
     try:
         sb.snapshot(name, req.checkpoint_name)
     except Exception as e:
@@ -177,12 +171,11 @@ def sandbox_checkpoint(
 def sandbox_restore(
     name: str,
     req: SandboxCheckpointRequest,
-    db: Session = Depends(get_db_session),
     _user: dict = Depends(get_current_user),
 ):
     """Restore a sandbox to a previously created checkpoint."""
     from core.sandbox.sandbox import Sandbox
-    sb = Sandbox(lambda: db)
+    sb = Sandbox(SessionLocal)
     try:
         sb.restore(name, req.checkpoint_name)
     except Exception as e:

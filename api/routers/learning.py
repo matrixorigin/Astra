@@ -5,9 +5,8 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from core.llm.client import LLMClient
 from core.logging_config import get_logger
@@ -92,7 +91,6 @@ class FeedbackResponse(BaseModel):
 @router.post("/trigger", response_model=LearningTriggerResponse)
 async def trigger_learning(
     request: LearningTriggerRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ) -> LearningTriggerResponse:
     """Trigger learning cycle from recent failures.
@@ -119,9 +117,9 @@ async def trigger_learning(
         if request.weights:
             weights = SignalWeights(**request.weights)
 
-        llm_client = LLMClient(lambda: db)
+        llm_client = LLMClient(SessionLocal)
         pipeline = SkillPipeline(
-            lambda: db, llm_client,
+            SessionLocal, llm_client,
             audit=False,
             learning=True,
             learning_weights=weights,
@@ -184,7 +182,6 @@ async def get_signal_types(
 
 @router.get("/stats", response_model=LearningStatsResponse)
 async def get_learning_stats(
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ) -> LearningStatsResponse:
     """Get learning statistics.
@@ -201,8 +198,8 @@ async def get_learning_stats(
         Learning statistics
     """
     try:
-        llm_client = LLMClient(lambda: db)
-        pipeline = SkillPipeline(lambda: db, llm_client, audit=False, learning=True)
+        llm_client = LLMClient(SessionLocal)
+        pipeline = SkillPipeline(SessionLocal, llm_client, audit=False, learning=True)
 
         stats = pipeline.stats()
 
@@ -230,7 +227,6 @@ async def get_learning_stats(
 @router.post("/feedback", response_model=FeedbackResponse)
 async def submit_feedback(
     request: FeedbackRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ) -> FeedbackResponse:
     """Submit feedback for a skill selection event.
@@ -251,24 +247,28 @@ async def submit_feedback(
     try:
         from api.models import SkillSelectionEvent
 
-        # Find event
-        event = db.query(SkillSelectionEvent).filter(
-            SkillSelectionEvent.event_id == request.event_id
-        ).first()
+        db = SessionLocal()
+        try:
+            # Find event
+            event = db.query(SkillSelectionEvent).filter(
+                SkillSelectionEvent.event_id == request.event_id
+            ).first()
 
-        if not event:
-            raise HTTPException(status_code=404, detail="Event not found")
+            if not event:
+                raise HTTPException(status_code=404, detail="Event not found")
 
-        # Update event based on feedback type
-        if request.feedback_type == "wrong_skill":
-            event.selection_correctness = 0
-            event.correction_suggestion = request.correct_skills
+            # Update event based on feedback type
+            if request.feedback_type == "wrong_skill":
+                event.selection_correctness = 0
+                event.correction_suggestion = request.correct_skills
 
-        if request.satisfaction_score:
-            event.user_feedback_score = request.satisfaction_score
-            event.selection_correctness = 1 if request.satisfaction_score >= 4 else 0
+            if request.satisfaction_score:
+                event.user_feedback_score = request.satisfaction_score
+                event.selection_correctness = 1 if request.satisfaction_score >= 4 else 0
 
-        db.commit()
+            db.commit()
+        finally:
+            db.close()
 
         return FeedbackResponse(
             status="success",

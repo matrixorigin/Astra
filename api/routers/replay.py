@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from api.services.replay_service import ReplayService
@@ -52,12 +52,11 @@ class ComparisonResponse(BaseModel):
 async def replay_session(
     session_id: str,
     request: ReplaySessionRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """重放会话"""
     try:
-        service = ReplayService(lambda: db)
+        service = ReplayService(SessionLocal)
         result = service.replay_session(
             session_id=session_id,
             user_id=current_user["user_id"],
@@ -90,7 +89,6 @@ async def replay_session(
 )
 async def compare_replay(
     session_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """对比重放结果
@@ -98,7 +96,7 @@ async def compare_replay(
     注意：这是简化版本，实际需要先执行重放再对比
     """
     try:
-        service = ReplayService(lambda: db)
+        service = ReplayService(SessionLocal)
 
         # 先执行重放
         replay_result = service.replay_session(

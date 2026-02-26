@@ -1,14 +1,11 @@
 """Streaming API endpoints (deprecated — use /chat/stream instead)."""
 
 import json
-from typing import Annotated
-
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.routers.chat import _build_chat_loop, _ensure_session
 from core.logging_config import get_logger
@@ -29,13 +26,16 @@ class StreamChatRequest(BaseModel):
 @router.post("/streaming/chat", deprecated=True, include_in_schema=False)
 async def stream_chat(
     request: StreamChatRequest,
-    current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
+    current_user: dict = Depends(get_current_user),
 ):
     """Deprecated — use /chat/stream from chat router instead."""
     user_id = current_user["user_id"]
-    session_id = _ensure_session(db, user_id, request.session_id, None)
-    loop = _build_chat_loop(db)
+    db = SessionLocal()
+    try:
+        session_id = _ensure_session(db, user_id, request.session_id, None)
+    finally:
+        db.close()
+    loop = _build_chat_loop(SessionLocal)
 
     async def event_generator():
         try:

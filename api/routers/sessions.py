@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.services.session_service import SessionService
 
@@ -60,12 +60,11 @@ class SessionListResponse(BaseModel):
 )
 async def create_session(
     request: CreateSessionRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """创建 Session"""
     try:
-        service = SessionService(lambda: db)
+        service = SessionService(SessionLocal)
         result = service.create_session(
             user_id=current_user["user_id"],
             agent_id=request.agent_id,
@@ -96,12 +95,11 @@ async def list_sessions(
     session_status: str | None = Query(None, description="过滤状态"),
     limit: int = Query(50, ge=1, le=100, description="限制数量"),
     offset: int = Query(0, ge=0, description="偏移量"),
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """列出 Sessions"""
     try:
-        service = SessionService(lambda: db)
+        service = SessionService(SessionLocal)
         result = service.list_sessions(
             user_id=current_user["user_id"],
             agent_id=agent_id,
@@ -125,12 +123,11 @@ async def list_sessions(
 )
 async def get_session(
     session_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """获取 Session"""
     try:
-        service = SessionService(lambda: db)
+        service = SessionService(SessionLocal)
         result = service.get_session(session_id=session_id, user_id=current_user["user_id"])
         return result
     except ValueError as e:
@@ -154,12 +151,11 @@ async def get_session(
 async def update_session(
     session_id: str,
     request: UpdateSessionRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """更新 Session"""
     try:
-        service = SessionService(lambda: db)
+        service = SessionService(SessionLocal)
         result = service.update_session(
             session_id=session_id,
             user_id=current_user["user_id"],
@@ -188,12 +184,11 @@ async def update_session(
 )
 async def delete_session(
     session_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """删除 Session"""
     try:
-        service = SessionService(lambda: db)
+        service = SessionService(SessionLocal)
         service.delete_session(session_id=session_id, user_id=current_user["user_id"])
     except ValueError as e:
         raise HTTPException(
@@ -215,12 +210,11 @@ async def delete_session(
 )
 async def close_session(
     session_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """关闭 Session"""
     try:
-        service = SessionService(lambda: db)
+        service = SessionService(SessionLocal)
         result = service.update_session(
             session_id=session_id,
             user_id=current_user["user_id"],

@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.services.decision_service import DecisionService
 from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
@@ -65,12 +65,11 @@ class DecisionListResponse(BaseModel):
 )
 async def record_decision(
     request: RecordDecisionRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """记录决策"""
     try:
-        service = DecisionService(lambda: db)
+        service = DecisionService(SessionLocal)
         result = service.record_decision(
             user_id=current_user["user_id"],
             session_id=request.session_id,
@@ -100,11 +99,10 @@ async def list_decisions(
     decision_type: str | None = Query(None),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """列出决策"""
-    service = DecisionService(lambda: db)
+    service = DecisionService(SessionLocal)
     return service.list_decisions(
         user_id=current_user["user_id"],
         session_id=session_id,
@@ -121,12 +119,11 @@ async def list_decisions(
 )
 async def get_decision(
     decision_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """获取决策"""
     try:
-        service = DecisionService(lambda: db)
+        service = DecisionService(SessionLocal)
         return service.get_decision(
             decision_id=decision_id,
             user_id=current_user["user_id"]
@@ -142,12 +139,11 @@ async def get_decision(
 )
 async def audit_decision(
     decision_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """获取决策及其完整上下文，用于审计"""
     try:
-        service = DecisionService(lambda: db)
+        service = DecisionService(SessionLocal)
         return service.get_decision_with_context(
             decision_id=decision_id,
             user_id=current_user["user_id"]

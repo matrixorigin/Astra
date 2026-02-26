@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session, SessionLocal
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from core.logging_config import get_logger
 
@@ -183,14 +183,17 @@ def _get_engine():
 async def chat(
     request: ChatRequest,
     current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
 ):
     """Create an AgentRun. Returns run_id immediately.
 
     Poll /chat/runs/{run_id} or stream /chat/runs/{run_id}/stream for progress.
     """
     user_id = current_user["user_id"]
-    session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
+    db = SessionLocal()
+    try:
+        session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
+    finally:
+        db.close()
 
     engine = _get_engine()
     
@@ -219,11 +222,14 @@ async def chat(
 async def chat_stream(
     request: ChatRequest,
     current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
 ):
     """Stream chat response as SSE. Returns run_id in first event."""
     user_id = current_user["user_id"]
-    session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
+    db = SessionLocal()
+    try:
+        session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
+    finally:
+        db.close()
 
     engine = _get_engine()
     
@@ -609,7 +615,6 @@ def _persist_turn_events(
 async def chat_turn(
     request: ChatTurnRequest,
     current_user: Annotated[dict, Depends(get_current_user)],
-    db: Annotated[Session, Depends(get_db_session)],
 ):
     """One LLM turn in the edge-cloud agentic loop.
 
@@ -617,7 +622,11 @@ async def chat_turn(
     returns SSE stream of text_delta, tool_call, usage, turn_complete events.
     """
     user_id = current_user["user_id"]
-    session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
+    db = SessionLocal()
+    try:
+        session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
+    finally:
+        db.close()
 
     # Detect tool changes: compare new edge_tools with cached set.
     # On change, we rebuild the system prompt (with new Self-Model) but preserve
@@ -631,14 +640,18 @@ async def chat_turn(
     tools_schema = _session_tools.get(session_id, [])
 
     # Build conversation messages with context enrichment
-    llm_messages = _build_turn_messages(
-        db, user_id, session_id,
-        request.messages, request.tool_results, request.project_rules,
-        agent_id=request.agent_id,
-        edge_tools=request.edge_tools,
-        edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
-        force_rebuild_system=tools_changed,
-    )
+    db = SessionLocal()
+    try:
+        llm_messages = _build_turn_messages(
+            db, user_id, session_id,
+            request.messages, request.tool_results, request.project_rules,
+            agent_id=request.agent_id,
+            edge_tools=request.edge_tools,
+            edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
+            force_rebuild_system=tools_changed,
+        )
+    finally:
+        db.close()
 
     model = request.model
 

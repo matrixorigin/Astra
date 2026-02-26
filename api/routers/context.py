@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.services.context_service import ContextService
 from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
@@ -46,12 +46,11 @@ class SnapshotListResponse(BaseModel):
 )
 async def create_snapshot(
     request: CreateSnapshotRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """创建上下文快照"""
     try:
-        service = ContextService(lambda: db)
+        service = ContextService(SessionLocal)
         result = service.create_snapshot(
             user_id=current_user["user_id"],
             session_id=request.session_id,
@@ -77,12 +76,11 @@ async def list_snapshots(
     session_id: str | None = Query(None),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """列出上下文快照"""
     try:
-        service = ContextService(lambda: db)
+        service = ContextService(SessionLocal)
         return service.list_snapshots(
             user_id=current_user["user_id"],
             session_id=session_id,
@@ -100,12 +98,11 @@ async def list_snapshots(
 )
 async def get_snapshot(
     context_capture_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """获取上下文快照"""
     try:
-        service = ContextService(lambda: db)
+        service = ContextService(SessionLocal)
         return service.get_snapshot(
             context_capture_id=context_capture_id,
             user_id=current_user["user_id"]

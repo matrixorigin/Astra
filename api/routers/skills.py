@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from api.database import get_db_session
+from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.services.exceptions import ResourceNotFoundError
 from api.services.skill_service import SkillService
@@ -57,12 +57,11 @@ class SkillVersionResponse(BaseModel):
 )
 async def register_skill(
     request: RegisterSkillRequest,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """注册技能"""
     try:
-        service = SkillService(lambda: db)
+        service = SkillService(SessionLocal)
         result = service.register_skill(
             user_id=current_user["user_id"],
             skill_id=request.skill_id,
@@ -88,11 +87,10 @@ async def register_skill(
 async def list_skills(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """列出技能"""
-    service = SkillService(lambda: db)
+    service = SkillService(SessionLocal)
     return service.list_skills(limit=limit, offset=offset)
 
 
@@ -104,12 +102,11 @@ async def list_skills(
 async def get_skill(
     skill_id: str,
     version: str | None = Query(None),
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """获取技能"""
     try:
-        service = SkillService(lambda: db)
+        service = SkillService(SessionLocal)
         return service.get_skill(skill_id=skill_id, version=version)
     except ResourceNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -122,9 +119,8 @@ async def get_skill(
 )
 async def list_skill_versions(
     skill_id: str,
-    db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user)
 ):
     """列出技能版本"""
-    service = SkillService(lambda: db)
+    service = SkillService(SessionLocal)
     return service.list_skill_versions(skill_id=skill_id)
