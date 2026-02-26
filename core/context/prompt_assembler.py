@@ -505,19 +505,24 @@ class PromptAssembler(DbConsumer):
         return "\n\n".join(parts) if parts else None
 
     def _build_memory(self, user_id: str, session_id: str, query: str) -> str | None:
-        """§4: Cross-session continuity + observations + few-shot.
+        """§4: Tiered memory (L0 profile + L1 query-relevant) + legacy fallbacks.
 
-        Imports are deferred to method body to break circular imports:
-        core.context.continuity → core.llm → core.context. This is standard
-        Python practice for circular dependency resolution.
-
-        Uses `except Exception` (not `except ImportError`) because these modules
-        may execute initialization code at import time (DB connections, config
-        loading) that can raise arbitrary exceptions beyond ImportError.
-        Each subsystem is independently optional — failure in one (e.g. Observer
-        DB table missing) must not block the others from contributing.
+        Primary: TieredMemoryLoader (new memory system)
+        Fallback: continuity + observations + few-shot (legacy)
         """
         parts = []
+
+        # Primary: new tiered memory system (L0 + L1)
+        try:
+            from core.memory.tiered_loader import TieredMemoryLoader
+            loader = TieredMemoryLoader(self._db_factory)
+            tiered_section = loader.build_section(user_id, query)
+            if tiered_section:
+                parts.append(tiered_section)
+        except Exception as e:
+            logger.debug("TieredMemoryLoader skipped: %s", e)
+
+        # Fallback: legacy continuity (cross-session context)
         try:
             from core.context.continuity import SessionContinuity
             cont = SessionContinuity(self._db_factory)
@@ -528,12 +533,9 @@ class PromptAssembler(DbConsumer):
         except Exception as e:
             logger.debug("Continuity skipped: %s", e)
 
+        # Fallback: legacy observations (will be removed in Task 10)
         try:
             from core.memory.observer import Observer
-            # Observer.get_observations() is a pure DB read — llm_client is only
-            # needed for observe() (writing new observations).  Passing None avoids
-            # creating a full LLMClient (3 DB sessions for router/config/providers)
-            # on every call, which matters for refresh_memory (called every turn).
             obs = Observer(self._db_factory, llm_client=None)
             observations = obs.get_observations(user_id, session_id)
             obs_section = obs.format_for_context(observations)
@@ -542,6 +544,7 @@ class PromptAssembler(DbConsumer):
         except Exception as e:
             logger.debug("Observer skipped: %s", e)
 
+        # Few-shot examples
         try:
             from core.context.few_shot import FewShotRetriever
             fsr = FewShotRetriever(self._db_factory)
