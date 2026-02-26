@@ -126,7 +126,7 @@ class TestChatTurnMultiTurnE2E:
             resp = client.post(f"/sessions/{session_id}/close", headers=headers)
         assert resp.status_code == 200
         assert resp.json()["status"] == "closed"
-        mock_hooks.assert_called_once()
+        mock_hooks.assert_called_once_with(session_id, "lifecycle_uid")
 
     def test_events_persisted_with_tool_calls(self, client, db):
         """Tool call and tool result events are persisted correctly."""

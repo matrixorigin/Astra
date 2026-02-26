@@ -820,20 +820,27 @@ async def chat_turn(
         _session_cache[session_id] = entry
     tools_schema = entry.get("tools", [])
 
-    # Build conversation messages with context enrichment
-    db = SessionLocal()
-    try:
-        llm_messages, snapshot_id = _build_turn_messages(
-            db, user_id, session_id,
-            request.messages, request.tool_results, request.project_rules,
-            agent_id=request.agent_id,
-            edge_tools=request.edge_tools,
-            edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
-            force_rebuild_system=tools_changed,
-            username=current_user.get("username"),
-        )
-    finally:
-        db.close()
+    # Build conversation messages with context enrichment.
+    # Runs in a thread to avoid blocking the event loop — _build_turn_messages
+    # does synchronous DB queries (recovery, PromptAssembler, snapshot save).
+    import asyncio
+
+    def _build_sync():
+        db = SessionLocal()
+        try:
+            return _build_turn_messages(
+                db, user_id, session_id,
+                request.messages, request.tool_results, request.project_rules,
+                agent_id=request.agent_id,
+                edge_tools=request.edge_tools,
+                edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
+                force_rebuild_system=tools_changed,
+                username=current_user.get("username"),
+            )
+        finally:
+            db.close()
+
+    llm_messages, snapshot_id = await asyncio.to_thread(_build_sync)
 
     model = request.model
 
