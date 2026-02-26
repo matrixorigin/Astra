@@ -20,7 +20,8 @@ The new MatrixOne-native memory system is implemented in `core/memory/`:
 | **Profile Manager** | ✅ Implemented | `profile.py` — L0 profile synthesis + caching |
 | **Memory Sandbox** | ✅ Implemented | `sandbox.py` — zero-copy branch validation |
 | **Provenance** | ✅ Implemented | `provenance.py` — PITR queries, diff, rollback |
-| **Health** | ✅ Implemented | `health.py` — pollution detection, cleanup |
+| **Health** | ✅ Implemented | `health.py` — pollution detection, cleanup, orphan branch cleanup |
+| **Governance** | ✅ Implemented | `governance.py` — GovernanceScheduler with decay, cleanup, health |
 | **Tiered Loader** | ✅ Implemented | `tiered_loader.py` — L0+L1 for PromptAssembler |
 | **Pipeline** | ✅ Implemented | `typed_pipeline.py` — observe→sandbox→reflect |
 | **Config** | ✅ Implemented | `config.py` — MemoryGovernanceConfig |

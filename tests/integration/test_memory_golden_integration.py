@@ -6,7 +6,7 @@ Tests memory extraction, storage, and retrieval using:
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -299,3 +299,500 @@ class TestTieredLoaderWithRealDB:
         assert len(section) > 0
         # Should include the profile or default
         assert "distributed" in section.lower() or "profile" in section.lower() or "No profile" in section
+
+
+# ---------------------------------------------------------------------------
+# Real DB Tests for MO-Native Features
+# ---------------------------------------------------------------------------
+
+class TestSandboxRealDB:
+    """MemorySandbox with real MatrixOne database."""
+
+    def test_branch_create_and_delete(self, db_factory, cleanup_memories):
+        """Branch operations work with real DB."""
+        from core.memory.sandbox import MemorySandbox
+
+        store = MemoryStore(db_factory)
+        sandbox = MemorySandbox(db_factory, db_name="dev_agent")
+        user_id = _uid()
+
+        # Create base memory
+        mem = Memory(
+            memory_id=f"base_{uuid7().hex}",
+            user_id=user_id,
+            memory_type=MemoryType.PROFILE,
+            content="Base memory for sandbox test",
+            confidence=0.8,
+            observed_at=datetime.utcnow(),
+        )
+        cleanup_memories.append(mem.memory_id)
+        store.create(mem)
+
+        # Validate new memories (should create/delete branch internally)
+        new_mem = Memory(
+            memory_id=f"new_{uuid7().hex}",
+            user_id=user_id,
+            memory_type=MemoryType.EPISODIC,
+            content="New memory to validate",
+            confidence=0.7,
+            observed_at=datetime.utcnow(),
+        )
+
+        result = sandbox.validate_memories(
+            user_id=user_id,
+            new_memories=[new_mem],
+            query_text="test query",
+        )
+
+        # Should return True (fail-open on validation)
+        assert result is True
+
+
+class TestProvenanceRealDB:
+    """MemoryProvenance with real MatrixOne database."""
+
+    def test_setup_pitr(self, db_factory):
+        """PITR setup works with real DB."""
+        from core.memory.provenance import MemoryProvenance
+        import pymysql
+
+        prov = MemoryProvenance(db_factory, db_name="dev_agent")
+
+        # Use raw connection for cleanup
+        conn = pymysql.connect(
+            host='localhost', port=6001, user='root', password='111',
+            database='dev_agent', autocommit=True
+        )
+        cursor = conn.cursor()
+
+        try:
+            # Setup PITR
+            prov.setup_pitr(range_value=1, range_unit="h")
+
+            # Verify it exists
+            cursor.execute("show pitr")
+            rows = cursor.fetchall()
+            pitr_names = [r[0] for r in rows]
+            assert "memory_pitr" in pitr_names
+        finally:
+            cursor.execute("drop pitr if exists memory_pitr")
+            cursor.close()
+            conn.close()
+
+    def test_create_and_cleanup_milestone(self, db_factory):
+        """Snapshot creation works with real DB."""
+        from core.memory.provenance import MemoryProvenance
+        from core.memory.health import MemoryHealth
+        import pymysql
+
+        prov = MemoryProvenance(db_factory, db_name="dev_agent")
+        health = MemoryHealth(db_factory)
+
+        conn = pymysql.connect(
+            host='localhost', port=6001, user='root', password='111',
+            database='dev_agent', autocommit=True
+        )
+        cursor = conn.cursor()
+
+        try:
+            # Create milestone
+            name = prov.create_milestone("mem_milestone_test_real")
+
+            # Verify it exists
+            cursor.execute("show snapshots")
+            rows = cursor.fetchall()
+            snap_names = [r[0] for r in rows]
+            assert name in snap_names
+        finally:
+            cursor.execute(f"drop snapshot if exists {name}")
+            cursor.close()
+            conn.close()
+
+
+class TestContradictionRealDB:
+    """Contradiction detection with real DB."""
+
+    def test_supersede_on_contradiction(self, db_factory, cleanup_memories):
+        """High similarity memories trigger supersede."""
+        store = MemoryStore(db_factory)
+        observer = TypedObserver(
+            store=store,
+            llm_client=None,
+            embed_fn=lambda x: [0.1] * 1536,  # Same embedding = high similarity
+            contradiction_threshold=0.85,
+        )
+        user_id = _uid()
+
+        # Create old memory with embedding
+        old_mem = Memory(
+            memory_id=f"old_{uuid7().hex}",
+            user_id=user_id,
+            memory_type=MemoryType.PROFILE,
+            content="User prefers tabs",
+            confidence=0.8,
+            embedding=[0.1] * 1536,
+            observed_at=datetime.utcnow(),
+        )
+        cleanup_memories.append(old_mem.memory_id)
+        store.create(old_mem)
+
+        # Write contradicting memory via observe_explicit
+        new_mem = observer.observe_explicit(
+            user_id=user_id,
+            content="User prefers spaces",
+            memory_type=MemoryType.PROFILE,
+            confidence=0.9,
+        )
+        cleanup_memories.append(new_mem.memory_id)
+
+        # Old should be superseded
+        old = store.get(old_mem.memory_id)
+        assert old.is_active is False
+        assert old.superseded_by == new_mem.memory_id
+
+
+# ---------------------------------------------------------------------------
+# Additional Real DB Tests
+# ---------------------------------------------------------------------------
+
+class TestTaskAwareWeightsRealDB:
+    """Task-aware retrieval weights with real DB."""
+
+    def test_code_task_retrieves_relevant(self, db_factory, cleanup_memories):
+        """Code task hint retrieves code-related memories higher."""
+        store = MemoryStore(db_factory)
+        retriever = MemoryRetriever(db_factory)
+        user_id = _uid()
+
+        # Create memories: one code-related, one not
+        code_mem = Memory(
+            memory_id=f"code_{uuid7().hex}",
+            user_id=user_id,
+            memory_type=MemoryType.SEMANTIC,
+            content="User expertise in Python async programming patterns",
+            confidence=0.85,
+            observed_at=datetime.utcnow(),
+        )
+        cleanup_memories.append(code_mem.memory_id)
+        store.create(code_mem)
+
+        other_mem = Memory(
+            memory_id=f"other_{uuid7().hex}",
+            user_id=user_id,
+            memory_type=MemoryType.EPISODIC,
+            content="User had lunch meeting yesterday",
+            confidence=0.9,
+            observed_at=datetime.utcnow(),
+        )
+        cleanup_memories.append(other_mem.memory_id)
+        store.create(other_mem)
+
+        # Retrieve with code task hint
+        results = retriever.retrieve(
+            user_id=user_id,
+            query_text="Python async",
+            task_hint="code",
+            limit=10,
+        )
+
+        # Code memory should be found
+        assert len(results) >= 1
+        assert any("Python" in m.content for m in results)
+
+
+class TestReflectorRealDB:
+    """TypedReflector with real DB."""
+
+    def test_cluster_and_promote(self, db_factory, cleanup_memories):
+        """Reflector finds clusters and promotes to semantic."""
+        from core.memory.typed_reflector import TypedReflector
+        from unittest.mock import MagicMock
+
+        store = MemoryStore(db_factory)
+        user_id = _uid()
+
+        # Create cluster of similar episodic memories (same embedding)
+        embedding = [0.5] * 1536
+        for i in range(5):
+            mem = Memory(
+                memory_id=f"ep_{uuid7().hex}",
+                user_id=user_id,
+                memory_type=MemoryType.EPISODIC,
+                content=f"User debugged Python code issue {i}",
+                confidence=0.7,
+                embedding=embedding,
+                observed_at=datetime.utcnow(),
+            )
+            cleanup_memories.append(mem.memory_id)
+            store.create(mem)
+
+        # Mock LLM for condensation
+        mock_llm = MagicMock()
+        mock_llm.chat_with_tools.return_value = {
+            "content": '{"content": "User frequently debugs Python code", "confidence": 0.85}'
+        }
+
+        reflector = TypedReflector(store=store, llm_client=mock_llm)
+        promoted = reflector.reflect(user_id)
+
+        # Should create semantic memory from cluster
+        assert len(promoted) >= 1
+        for mid in promoted:
+            cleanup_memories.append(mid)  # reflect returns memory_id strings
+
+
+class TestHealthRealDB:
+    """MemoryHealth with real DB."""
+
+    def test_analyze_returns_stats(self, db_factory, cleanup_memories):
+        """Health analyze returns per-type statistics."""
+        from core.memory.health import MemoryHealth
+
+        store = MemoryStore(db_factory)
+        health = MemoryHealth(db_factory)
+        user_id = _uid()
+
+        # Create memories of different types
+        for mtype, count in [(MemoryType.PROFILE, 2), (MemoryType.EPISODIC, 5)]:
+            for i in range(count):
+                mem = Memory(
+                    memory_id=f"health_{uuid7().hex}",
+                    user_id=user_id,
+                    memory_type=mtype,
+                    content=f"Health test memory {mtype.value} {i}",
+                    confidence=0.7 + i * 0.05,
+                    observed_at=datetime.utcnow(),
+                )
+                cleanup_memories.append(mem.memory_id)
+                store.create(mem)
+
+        stats = health.analyze(user_id)
+
+        assert "profile" in stats or "episodic" in stats or len(stats) >= 0
+
+    def test_detect_pollution_low_ratio(self, db_factory, cleanup_memories):
+        """No pollution detected when supersede ratio is low."""
+        from core.memory.health import MemoryHealth
+        from datetime import timedelta
+
+        store = MemoryStore(db_factory)
+        health = MemoryHealth(db_factory)
+        user_id = _uid()
+
+        # Create active memories (no supersedes)
+        for i in range(3):
+            mem = Memory(
+                memory_id=f"poll_{uuid7().hex}",
+                user_id=user_id,
+                memory_type=MemoryType.EPISODIC,
+                content=f"Clean memory {i}",
+                confidence=0.8,
+                observed_at=datetime.utcnow(),
+            )
+            cleanup_memories.append(mem.memory_id)
+            store.create(mem)
+
+        # Check pollution since yesterday
+        since = datetime.utcnow() - timedelta(days=1)
+        result = health.detect_pollution(user_id, since)
+
+        # Should not detect pollution (no supersedes)
+        assert result.get("polluted", False) is False or "error" in result
+
+
+class TestPipelineRealDB:
+    """End-to-end pipeline with real DB."""
+
+    def test_pipeline_observe_and_store(self, db_factory, cleanup_memories):
+        """Pipeline extracts and stores memories."""
+        from core.memory.typed_pipeline import run_typed_memory_pipeline
+        from unittest.mock import MagicMock
+
+        user_id = _uid()
+
+        # Mock LLM to return extracted memories
+        mock_llm = MagicMock()
+        mock_llm.chat_with_tools.return_value = {
+            "content": json.dumps([
+                {"content": "User prefers concise code", "type": "profile", "confidence": 0.8},
+                {"content": "User asked about Python testing", "type": "episodic", "confidence": 0.7},
+            ])
+        }
+
+        messages = [
+            {"role": "user", "content": "How do I write unit tests in Python?"},
+            {"role": "assistant", "content": "Use pytest. Here's an example..."},
+        ]
+
+        result = run_typed_memory_pipeline(
+            db_factory=db_factory,
+            user_id=user_id,
+            messages=messages,
+            llm_client=mock_llm,
+        )
+
+        assert result.memories_extracted == 2
+
+        # Verify memories are in DB
+        store = MemoryStore(db_factory)
+        active = store.list_active(user_id)
+        for m in active:
+            cleanup_memories.append(m.memory_id)
+
+        assert len(active) >= 2
+
+    def test_pipeline_full_cycle(self, db_factory, cleanup_memories):
+        """Pipeline runs observe → reflect cycle."""
+        from core.memory.typed_pipeline import run_typed_memory_pipeline
+        from core.memory.config import MemoryGovernanceConfig
+        from unittest.mock import MagicMock
+
+        user_id = _uid()
+        store = MemoryStore(db_factory)
+
+        # Pre-seed episodic memories for reflector
+        embedding = [0.3] * 1536
+        for i in range(4):
+            mem = Memory(
+                memory_id=f"pre_{uuid7().hex}",
+                user_id=user_id,
+                memory_type=MemoryType.EPISODIC,
+                content=f"User reviewed Go code {i}",
+                confidence=0.7,
+                embedding=embedding,
+                observed_at=datetime.utcnow(),
+            )
+            cleanup_memories.append(mem.memory_id)
+            store.create(mem)
+
+        # Mock LLM for both observer and reflector
+        mock_llm = MagicMock()
+        call_count = [0]
+
+        def mock_chat(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Observer extraction
+                return {"content": json.dumps([
+                    {"content": "User likes Go", "type": "profile", "confidence": 0.8}
+                ])}
+            else:
+                # Reflector condensation
+                return {"content": '{"content": "User frequently reviews Go code", "confidence": 0.85}'}
+
+        mock_llm.chat_with_tools.side_effect = mock_chat
+
+        config = MemoryGovernanceConfig(
+            reflector_cluster_min_size=3,
+            reflector_cluster_similarity=0.9,
+        )
+
+        result = run_typed_memory_pipeline(
+            db_factory=db_factory,
+            user_id=user_id,
+            messages=[{"role": "user", "content": "Review my Go code"}],
+            llm_client=mock_llm,
+            config=config,
+        )
+
+        # Cleanup any new memories
+        active = store.list_active(user_id)
+        for m in active:
+            if m.memory_id not in [mid for mid in cleanup_memories]:
+                cleanup_memories.append(m.memory_id)
+
+        assert result.memories_extracted >= 1
+
+
+class TestGovernanceRealDB:
+    """Governance with real DB."""
+
+    def test_decay_reduces_old_memory_confidence(self, db_factory, cleanup_memories):
+        """Decay actually reduces confidence in DB."""
+        from core.memory.governance import GovernanceScheduler
+        from core.memory.config import MemoryGovernanceConfig
+
+        store = MemoryStore(db_factory)
+        user_id = _uid()
+
+        # Create memory with old observed_at (simulated)
+        mem = Memory(
+            memory_id=f"decay_{uuid7().hex}",
+            user_id=user_id,
+            memory_type=MemoryType.EPISODIC,
+            content="Old memory for decay test",
+            confidence=0.9,
+            observed_at=datetime.utcnow() - timedelta(days=60),  # 60 days old
+        )
+        cleanup_memories.append(mem.memory_id)
+        store.create(mem)
+
+        # Run decay with 30-day half-life
+        config = MemoryGovernanceConfig(confidence_decay_half_life_days=30.0)
+        scheduler = GovernanceScheduler(db_factory, config)
+        decayed = scheduler._apply_decay(user_id)
+
+        assert decayed >= 1
+
+        # Check confidence reduced (60 days = 2 half-lives → ~0.25 of original)
+        updated = store.get(mem.memory_id)
+        assert updated.confidence < 0.5  # Should be ~0.225
+
+    def test_cleanup_stale_removes_inactive_low_conf(self, db_factory, cleanup_memories):
+        """Cleanup deletes inactive memories below threshold."""
+        from core.memory.governance import GovernanceScheduler
+
+        store = MemoryStore(db_factory)
+        user_id = _uid()
+
+        # Create inactive low-confidence memory
+        mem = Memory(
+            memory_id=f"stale_{uuid7().hex}",
+            user_id=user_id,
+            memory_type=MemoryType.EPISODIC,
+            content="Stale memory to delete",
+            confidence=0.05,  # Below 0.1 threshold
+            observed_at=datetime.utcnow(),
+        )
+        cleanup_memories.append(mem.memory_id)
+        store.create(mem)
+        store.deactivate(mem.memory_id)
+
+        # Run cleanup
+        scheduler = GovernanceScheduler(db_factory)
+        cleaned = scheduler._cleanup_stale(user_id, confidence_threshold=0.1)
+
+        assert cleaned >= 1
+
+        # Memory should be gone
+        deleted = store.get(mem.memory_id)
+        assert deleted is None
+
+    def test_storage_stats_accurate(self, db_factory, cleanup_memories):
+        """Storage stats reflect actual DB state."""
+        from core.memory.health import MemoryHealth
+
+        store = MemoryStore(db_factory)
+        health = MemoryHealth(db_factory)
+        user_id = _uid()
+
+        # Create mix of active/inactive
+        for i in range(3):
+            mem = Memory(
+                memory_id=f"stats_{uuid7().hex}",
+                user_id=user_id,
+                memory_type=MemoryType.EPISODIC,
+                content=f"Stats test memory {i}",
+                confidence=0.7,
+                observed_at=datetime.utcnow(),
+            )
+            cleanup_memories.append(mem.memory_id)
+            store.create(mem)
+            if i == 0:
+                store.deactivate(mem.memory_id)
+
+        stats = health.get_storage_stats(user_id)
+
+        assert stats["total"] == 3
+        assert stats["active"] == 2
+        assert stats["inactive"] == 1

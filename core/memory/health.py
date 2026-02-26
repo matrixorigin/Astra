@@ -19,7 +19,7 @@ class MemoryHealth(DbConsumer):
     def __init__(
         self,
         db_factory: DbFactory,
-        db_name: str = "mo_agent",
+        db_name: str = "dev_agent",
         pollution_threshold: float = 0.3,
     ):
         super().__init__(db_factory)
@@ -129,3 +129,52 @@ class MemoryHealth(DbConsumer):
 
         logger.info("Cleaned up %d old snapshots", dropped)
         return dropped
+
+    def cleanup_orphan_branches(self) -> int:
+        """Clean up sandbox branches that were not properly dropped."""
+        with self._db() as db:
+            rows = db.execute(text("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_name LIKE 'memories_sandbox_%'
+            """)).fetchall()
+
+        if not rows:
+            return 0
+
+        cleaned = 0
+        with self._db() as db:
+            for r in rows:
+                try:
+                    db.execute(text(
+                        f"data branch delete table {self.db_name}.{r.table_name}"
+                    ))
+                    db.commit()
+                    cleaned += 1
+                    logger.info("Cleaned orphan branch: %s", r.table_name)
+                except Exception as e:
+                    logger.warning("Failed to clean branch %s: %s", r.table_name, e)
+
+        return cleaned
+
+    def get_storage_stats(self, user_id: str) -> dict:
+        """Get storage statistics for monitoring."""
+        with self._db() as db:
+            row = db.execute(text("""
+                SELECT
+                    COUNT(*) as total,
+                    SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) as active,
+                    AVG(LENGTH(content)) as avg_content_size,
+                    MIN(observed_at) as oldest,
+                    MAX(observed_at) as newest
+                FROM memories
+                WHERE user_id = :uid
+            """), {"uid": user_id}).fetchone()
+
+        return {
+            "total": row.total or 0,
+            "active": row.active or 0,
+            "inactive": (row.total or 0) - (row.active or 0),
+            "avg_content_size": float(row.avg_content_size or 0),
+            "oldest": row.oldest,
+            "newest": row.newest,
+        }
