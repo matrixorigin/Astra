@@ -170,11 +170,12 @@ class TestMemoryRetrieverRealDB:
         # Retrieve with keyword query
         results = retriever.retrieve(
             user_id=user_id,
+            session_id="test_session",
             query_text="Golang concurrency",
             limit=10,
         )
         
-        # Should find the memory (keyword match)
+        # Should find the memory (keyword match or cross-session)
         assert any("Golang" in m.content for m in results) or len(results) >= 0
 
 
@@ -293,7 +294,7 @@ class TestTieredLoaderWithRealDB:
         store.create(mem)
         
         # Build section
-        section = loader.build_section(user_id, query="How to design a distributed cache?")
+        section = loader.build_section(user_id, session_id="test_session", query="How to design a distributed cache?")
         
         assert section is not None
         assert len(section) > 0
@@ -490,12 +491,13 @@ class TestTaskAwareWeightsRealDB:
         # Retrieve with code task hint
         results = retriever.retrieve(
             user_id=user_id,
+            session_id="test_session",
             query_text="Python async",
             task_hint="code",
             limit=10,
         )
 
-        # Code memory should be found
+        # Code memory should be found (cross-session since session_id=NULL)
         assert len(results) >= 1
         assert any("Python" in m.content for m in results)
 

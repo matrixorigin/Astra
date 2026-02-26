@@ -52,6 +52,7 @@ class TieredMemoryLoader:
     def load_l1(
         self,
         user_id: str,
+        session_id: str,
         query: str,
         query_embedding: Optional[list[float]] = None,
         task_hint: Optional[str] = None,
@@ -64,6 +65,7 @@ class TieredMemoryLoader:
             memories = self._retriever.retrieve(
                 user_id=user_id,
                 query_text=query,
+                session_id=session_id,
                 query_embedding=query_embedding,
                 memory_types=[MemoryType.EPISODIC, MemoryType.SEMANTIC, MemoryType.PROCEDURAL],
                 limit=limit,
@@ -82,6 +84,7 @@ class TieredMemoryLoader:
     def build_section(
         self,
         user_id: str,
+        session_id: str,
         query: str,
         query_embedding: Optional[list[float]] = None,
         task_hint: Optional[str] = None,
@@ -93,7 +96,7 @@ class TieredMemoryLoader:
         if l0:
             parts.append(l0)
 
-        l1 = self.load_l1(user_id, query, query_embedding, task_hint)
+        l1 = self.load_l1(user_id, session_id, query, query_embedding, task_hint)
         if l1:
             parts.append(l1)
 

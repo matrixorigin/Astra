@@ -5,7 +5,7 @@ from typing import Any
 
 from cli.tools.base import EdgeTool, SideEffect
 
-MAX_OUTPUT = 100 * 1024  # 100KB
+MAX_OUTPUT = 30 * 1024  # 30KB (~7K tokens)
 
 
 async def _find_git_root(project_root: str) -> str | None:

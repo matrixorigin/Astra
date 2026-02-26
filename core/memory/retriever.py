@@ -15,6 +15,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from core.db_consumer import DbConsumer, DbFactory
+from core.memory.metrics import metrics, Timer
 from core.memory.types import Memory, MemoryType, RetrievalWeights
 
 logger = logging.getLogger(__name__)
@@ -29,8 +30,8 @@ TASK_WEIGHTS: dict[str, RetrievalWeights] = {
 
 # SQL with keyword filter + confidence/temporal scoring
 # MATCH is used in WHERE for filtering, score computed from confidence + temporal
-_KEYWORD_SQL = text("""\
-SELECT m.memory_id, m.content, m.memory_type, m.confidence, m.observed_at,
+_KEYWORD_SQL = """\
+SELECT m.memory_id, m.content, m.memory_type, m.confidence, m.observed_at, m.session_id,
     (
         :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
         :w_conf * (m.confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
@@ -39,13 +40,14 @@ FROM memories m
 WHERE m.user_id = :uid AND m.is_active = 1
     AND m.memory_type IN :types
     AND MATCH(m.content) AGAINST(:query_text IN BOOLEAN MODE)
+    {session_filter}
 ORDER BY relevance DESC
 LIMIT :lim
-""")
+"""
 
 # Fallback: no keyword match, just confidence + temporal
-_FALLBACK_SQL = text("""\
-SELECT m.memory_id, m.content, m.memory_type, m.confidence, m.observed_at,
+_FALLBACK_SQL = """\
+SELECT m.memory_id, m.content, m.memory_type, m.confidence, m.observed_at, m.session_id,
     (
         :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
         :w_conf * (m.confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
@@ -53,9 +55,10 @@ SELECT m.memory_id, m.content, m.memory_type, m.confidence, m.observed_at,
 FROM memories m
 WHERE m.user_id = :uid AND m.is_active = 1
     AND m.memory_type IN :types
+    {session_filter}
 ORDER BY relevance DESC
 LIMIT :lim
-""")
+"""
 
 
 class MemoryRetriever(DbConsumer):
@@ -70,13 +73,22 @@ class MemoryRetriever(DbConsumer):
         self,
         user_id: str,
         query_text: str,
+        session_id: str,
         query_embedding: Optional[list[float]] = None,
         memory_types: Optional[list[MemoryType]] = None,
         limit: int = 10,
         task_hint: Optional[str] = None,
         weights: Optional[RetrievalWeights] = None,
+        include_cross_session: bool = True,
     ) -> list[Memory]:
         """Retrieve memories ranked by relevance.
+
+        Args:
+            user_id: User ID
+            query_text: Query text for keyword matching
+            session_id: Current session ID (required)
+            include_cross_session: If True (default), also include memories with session_id=NULL
+                                   (profile/semantic memories shared across sessions)
 
         Strategy:
         1. Try keyword filter first (MATCH in WHERE)
@@ -110,20 +122,32 @@ class MemoryRetriever(DbConsumer):
             "lim": limit,
         }
 
-        with self._db() as db:
-            # Try keyword search first
-            if query_text and query_text.strip():
-                params["query_text"] = query_text
-                try:
-                    rows = db.execute(_KEYWORD_SQL, params).fetchall()
-                    if rows:
-                        return self._to_memories(rows, user_id)
-                except Exception as e:
-                    logger.debug("Keyword search failed, falling back: %s", e)
+        # Build session filter (always applied)
+        if include_cross_session:
+            session_filter = "AND (m.session_id = :session_id OR m.session_id IS NULL)"
+        else:
+            session_filter = "AND m.session_id = :session_id"
+        params["session_id"] = session_id
 
-            # Fallback: no keyword filter
-            rows = db.execute(_FALLBACK_SQL, params).fetchall()
-            return self._to_memories(rows, user_id)
+        with Timer("retriever_retrieve"):
+            with self._db() as db:
+                # Try keyword search first
+                if query_text and query_text.strip():
+                    params["query_text"] = query_text
+                    try:
+                        sql = text(_KEYWORD_SQL.format(session_filter=session_filter))
+                        rows = db.execute(sql, params).fetchall()
+                        if rows:
+                            metrics.increment("retrieval_keyword_hits")
+                            return self._to_memories(rows, user_id)
+                    except Exception as e:
+                        logger.debug("Keyword search failed, falling back: %s", e)
+
+                # Fallback: no keyword filter
+                sql = text(_FALLBACK_SQL.format(session_filter=session_filter))
+                rows = db.execute(sql, params).fetchall()
+                metrics.increment("retrieval_fallback_hits")
+                return self._to_memories(rows, user_id)
 
     def _to_memories(self, rows, user_id: str) -> list[Memory]:
         return [
@@ -133,6 +157,7 @@ class MemoryRetriever(DbConsumer):
                 memory_type=MemoryType(r.memory_type),
                 content=r.content,
                 confidence=r.confidence,
+                session_id=getattr(r, "session_id", None),
                 observed_at=r.observed_at,
             )
             for r in rows

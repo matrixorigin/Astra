@@ -18,11 +18,13 @@ class MemoryRecord(Base):
         FulltextIndex("ft_memory_content", ["content"], parser=FulltextParserType.NGRAM),
         Index("idx_memory_user_type_active", "user_id", "memory_type", "is_active"),
         Index("idx_memory_user_active", "user_id", "is_active"),
+        Index("idx_memory_user_session", "user_id", "session_id"),
         Index("idx_memory_observed_at", "observed_at"),
     )
 
     memory_id = Column(String(64), primary_key=True)
     user_id = Column(String(64), nullable=False)
+    session_id = Column(String(64), nullable=True)  # NULL = cross-session (profile/semantic)
     memory_type = Column(String(20), nullable=False)  # profile/episodic/semantic/procedural/working
     content = Column(Text, nullable=False)
     confidence = Column(Float, default=0.75, nullable=False)

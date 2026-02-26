@@ -35,7 +35,7 @@ class TestL0ProfileInPrompt:
         db_factory = lambda: mock_db
 
         loader = TieredMemoryLoader(db_factory)
-        section = loader.build_section(uid(), query="test")
+        section = loader.build_section(uid(), session_id="test_session", query="test")
 
         # Should always return something (profile or default)
         assert section is not None

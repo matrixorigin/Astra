@@ -8,7 +8,7 @@ from typing import Any
 from cli.tools.base import EdgeTool, SideEffect
 
 DEFAULT_TIMEOUT = 120  # seconds
-MAX_OUTPUT = 100 * 1024  # 100KB
+MAX_OUTPUT = 30 * 1024  # 30KB (~7K tokens)
 
 
 class BashTool(EdgeTool):

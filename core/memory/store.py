@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from api.models.memory import MemoryRecord
 from core.db_consumer import DbConsumer, DbFactory
+from core.memory.metrics import metrics, Timer
 from core.memory.types import Memory, MemoryType
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,7 @@ def _to_domain(row: MemoryRecord) -> Memory:
         source_event_ids=row.source_event_ids or [],
         superseded_by=row.superseded_by,
         is_active=bool(row.is_active),
+        session_id=row.session_id,
         observed_at=row.observed_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -48,27 +50,31 @@ class MemoryStore(DbConsumer):
         if not memory.observed_at:
             memory.observed_at = now
 
-        with self._db() as db:
-            row = MemoryRecord(
-                memory_id=memory.memory_id,
-                user_id=memory.user_id,
-                memory_type=memory.memory_type.value,
-                content=memory.content,
-                confidence=memory.confidence,
-                embedding=memory.embedding,
-                source_event_ids=memory.source_event_ids,
-                is_active=1,
-                observed_at=memory.observed_at,
-            )
-            db.add(row)
-            db.commit()
-            memory.created_at = row.created_at
+        with Timer("store_create"):
+            with self._db() as db:
+                row = MemoryRecord(
+                    memory_id=memory.memory_id,
+                    user_id=memory.user_id,
+                    session_id=memory.session_id,
+                    memory_type=memory.memory_type.value,
+                    content=memory.content,
+                    confidence=memory.confidence,
+                    embedding=memory.embedding,
+                    source_event_ids=memory.source_event_ids,
+                    is_active=1,
+                    observed_at=memory.observed_at,
+                )
+                db.add(row)
+                db.commit()
+                memory.created_at = row.created_at
+        metrics.increment("memories_created")
         return memory
 
     def get(self, memory_id: str) -> Optional[Memory]:
-        with self._db() as db:
-            row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
-            return _to_domain(row) if row else None
+        with Timer("store_get"):
+            with self._db() as db:
+                row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
+                return _to_domain(row) if row else None
 
     def list_active(
         self,

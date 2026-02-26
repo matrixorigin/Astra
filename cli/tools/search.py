@@ -8,8 +8,8 @@ from typing import Any
 
 from cli.tools.base import EdgeTool, SideEffect
 
-MAX_MATCHES = 500
-MAX_OUTPUT = 100 * 1024  # 100KB
+MAX_MATCHES = 200
+MAX_OUTPUT = 30 * 1024  # 30KB (~7K tokens)
 
 
 class GrepTool(EdgeTool):

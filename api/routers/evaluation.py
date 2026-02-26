@@ -802,6 +802,14 @@ def memory_health(
 
     return result
 
+
+@router.get("/memory-metrics")
+def memory_metrics() -> dict:
+    """Memory system performance metrics."""
+    from core.memory.metrics import metrics
+    return metrics.get_stats()
+
+
 # ── Training Data Pipeline ─────────────────────────────────────────────────────
 
 class TrainingDataExtractRequest(BaseModel):

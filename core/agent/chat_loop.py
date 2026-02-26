@@ -301,12 +301,27 @@ class ChatLoop:
                 slo_escalation_model=self._check_slo_escalation(session_id),
             )
             
-            llm_result = self.llm.chat_with_tools(
-                messages=messages,
-                tools=tools_schema,
-                tool_choice="auto",
-                model=model,
-            )
+            try:
+                llm_result = self.llm.chat_with_tools(
+                    messages=messages,
+                    tools=tools_schema,
+                    tool_choice="auto",
+                    model=model,
+                )
+            except Exception as e:
+                error_msg = str(e)
+                # Detect context length exceeded error and force compact
+                if "context length" in error_msg.lower() or "token" in error_msg.lower():
+                    logger.warning("Context length exceeded, forcing compaction")
+                    messages = compact(messages, max_tokens // 2, llm_summarize=llm_summarize)
+                    llm_result = self.llm.chat_with_tools(
+                        messages=messages,
+                        tools=tools_schema,
+                        tool_choice="auto",
+                        model=model,
+                    )
+                else:
+                    raise
 
             tool_calls = llm_result.get("tool_calls", [])
 
@@ -445,6 +460,11 @@ class ChatLoop:
                 )
 
                 # Append tool result in OpenAI protocol format
+                # Truncate large results to prevent context overflow
+                MAX_TOOL_RESULT = 50000  # ~12K tokens
+                if len(result_str) > MAX_TOOL_RESULT:
+                    result_str = result_str[:MAX_TOOL_RESULT] + f"\n... [truncated, {len(result_str)} bytes total]"
+                
                 messages.append(
                     {
                         "role": "tool",

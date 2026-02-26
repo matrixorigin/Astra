@@ -29,6 +29,7 @@ class Memory:
     source_event_ids: list[str] = field(default_factory=list)
     superseded_by: Optional[str] = None
     is_active: bool = True
+    session_id: Optional[str] = None  # NULL = cross-session (profile/semantic)
     observed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
