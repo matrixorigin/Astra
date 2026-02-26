@@ -142,10 +142,18 @@ class ChatLoop:
         self.mcp_bridge = None  # Set via set_mcp_bridge()
         self._few_shot = None  # Initialized lazily on first use
         self._escalated_model: str | None | object = _UNSET  # SLO escalation cache
+        self._memory_store = None  # For tool output storage
         try:
             from core.context.few_shot import FewShotRetriever
             if hasattr(llm_client, '_db_factory'):
                 self._few_shot = FewShotRetriever(llm_client._db_factory)
+        except Exception:
+            pass
+        # Initialize memory store for tool output handling
+        try:
+            from core.memory.store import MemoryStore
+            if hasattr(event_logger, '_db_factory'):
+                self._memory_store = MemoryStore(event_logger._db_factory)
         except Exception:
             pass
 
@@ -459,11 +467,17 @@ class ChatLoop:
                     metadata=metadata
                 )
 
-                # Append tool result in OpenAI protocol format
-                # Truncate large results to prevent context overflow
-                MAX_TOOL_RESULT = 50000  # ~12K tokens
-                if len(result_str) > MAX_TOOL_RESULT:
-                    result_str = result_str[:MAX_TOOL_RESULT] + f"\n... [truncated, {len(result_str)} bytes total]"
+                # Process tool output: large results → store in mo-trustmem + return summary
+                from core.agent.tool_output_handler import process_tool_output
+                if getattr(self, '_memory_store', None):
+                    result_str = process_tool_output(
+                        output=result_str,
+                        tool_name=fn_name,
+                        session_id=session_id,
+                        user_id=user_id,
+                        memory_store=self._memory_store,
+                        turn_event_id=user_event.event_id,
+                    )
                 
                 messages.append(
                     {
@@ -645,6 +659,17 @@ class ChatLoop:
             causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
         )
+        # Process tool output: large results → store in mo-trustmem + return summary
+        from core.agent.tool_output_handler import process_tool_output
+        if getattr(self, '_memory_store', None):
+            result_str = process_tool_output(
+                output=result_str,
+                tool_name=fn_name,
+                session_id=session_id,
+                user_id=user_id,
+                memory_store=self._memory_store,
+                turn_event_id=user_event.event_id,
+            )
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 
     async def run_step_stream(
