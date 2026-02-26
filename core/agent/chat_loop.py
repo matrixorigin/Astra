@@ -490,6 +490,9 @@ class ChatLoop:
                 # Process tool output: large results → store in mo-trustmem + return summary
                 from core.agent.tool_output_handler import process_tool_output
                 if getattr(self, '_memory_store', None):
+                    # Estimate remaining tokens for dynamic threshold
+                    msg_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
+                    remaining = max_tokens - msg_tokens if isinstance(max_tokens, int) else None
                     result_str = process_tool_output(
                         output=result_str,
                         tool_name=fn_name,
@@ -497,6 +500,7 @@ class ChatLoop:
                         user_id=user_id,
                         memory_store=self._memory_store,
                         turn_event_id=user_event.event_id,
+                        remaining_tokens=remaining,
                     )
                 
                 messages.append(
@@ -682,6 +686,10 @@ class ChatLoop:
         # Process tool output: large results → store in mo-trustmem + return summary
         from core.agent.tool_output_handler import process_tool_output
         if getattr(self, '_memory_store', None):
+            # Estimate remaining tokens for dynamic threshold
+            msg_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
+            max_ctx = self.llm.config.get("max_context_tokens", 128000) if hasattr(self.llm, 'config') else 128000
+            remaining = max_ctx - msg_tokens if isinstance(max_ctx, int) else None
             result_str = process_tool_output(
                 output=result_str,
                 tool_name=fn_name,
@@ -689,6 +697,7 @@ class ChatLoop:
                 user_id=user_id,
                 memory_store=self._memory_store,
                 turn_event_id=user_event.event_id,
+                remaining_tokens=remaining,
             )
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 

@@ -5,6 +5,7 @@ Handles large tool outputs by:
 2. Generating structured summary (rule-based, zero LLM cost)
 3. Returning summary + memory reference
 4. Reusing similar historical results via Retriever
+5. Dynamic threshold based on remaining context budget
 """
 
 from __future__ import annotations
@@ -18,7 +19,30 @@ if TYPE_CHECKING:
     from core.memory.retriever import MemoryRetriever
     from core.memory.store import MemoryStore
 
-SUMMARY_THRESHOLD = 10 * 1024  # 10KB
+SUMMARY_THRESHOLD = 10 * 1024  # 10KB default
+MIN_THRESHOLD = 2 * 1024      # 2KB minimum (always summarize if larger)
+MAX_THRESHOLD = 50 * 1024     # 50KB maximum (never skip summarization above this)
+
+
+def compute_dynamic_threshold(remaining_tokens: int | None) -> int:
+    """Compute summary threshold based on remaining context budget.
+    
+    Args:
+        remaining_tokens: Estimated remaining tokens in context window.
+                         None means use default threshold.
+    
+    Returns:
+        Threshold in bytes. Outputs larger than this will be summarized.
+    """
+    if remaining_tokens is None:
+        return SUMMARY_THRESHOLD
+    
+    # Heuristic: allow ~20% of remaining budget for tool output
+    # 1 token ≈ 4 chars
+    budget_bytes = int(remaining_tokens * 4 * 0.2)
+    
+    # Clamp to reasonable range
+    return max(MIN_THRESHOLD, min(MAX_THRESHOLD, budget_bytes))
 
 
 # --- Structured Summary Generators (rule-based, zero LLM cost) ---
@@ -85,6 +109,7 @@ def process_tool_output(
     user_id: str,
     memory_store: MemoryStore,
     turn_event_id: str | None = None,
+    remaining_tokens: int | None = None,
 ) -> str:
     """Process tool output: small returns directly, large stores + summarizes.
     
@@ -95,11 +120,13 @@ def process_tool_output(
         user_id: Current user ID
         memory_store: mo-trustmem MemoryStore instance
         turn_event_id: Optional event ID for provenance tracking
+        remaining_tokens: Optional remaining context budget for dynamic threshold
     
     Returns:
         Original output (if small) or summary + memory reference (if large)
     """
-    if len(output) <= SUMMARY_THRESHOLD:
+    threshold = compute_dynamic_threshold(remaining_tokens)
+    if len(output) <= threshold:
         return output
     
     # 1. Store full output in mo-trustmem

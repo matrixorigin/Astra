@@ -171,3 +171,33 @@ class TestToolResultMemoryType:
     def test_tool_result_is_string_enum(self):
         """TOOL_RESULT works as string."""
         assert MemoryType.TOOL_RESULT.value == "tool_result"
+
+
+class TestDynamicThreshold:
+    """Tests for dynamic threshold computation."""
+
+    def test_default_threshold(self):
+        """None remaining_tokens uses default threshold."""
+        from core.agent.tool_output_handler import compute_dynamic_threshold, SUMMARY_THRESHOLD
+        assert compute_dynamic_threshold(None) == SUMMARY_THRESHOLD
+
+    def test_low_budget_reduces_threshold(self):
+        """Low remaining tokens reduces threshold."""
+        from core.agent.tool_output_handler import compute_dynamic_threshold, MIN_THRESHOLD
+        # 5000 tokens * 4 chars * 0.2 = 4000 bytes
+        threshold = compute_dynamic_threshold(5000)
+        assert threshold == 4000
+
+    def test_high_budget_increases_threshold(self):
+        """High remaining tokens increases threshold (up to max)."""
+        from core.agent.tool_output_handler import compute_dynamic_threshold, MAX_THRESHOLD
+        # 100000 tokens would give 80000 bytes, but capped at MAX
+        threshold = compute_dynamic_threshold(100000)
+        assert threshold == MAX_THRESHOLD
+
+    def test_very_low_budget_uses_minimum(self):
+        """Very low budget uses minimum threshold."""
+        from core.agent.tool_output_handler import compute_dynamic_threshold, MIN_THRESHOLD
+        # 1000 tokens * 4 * 0.2 = 800 bytes, but min is 2KB
+        threshold = compute_dynamic_threshold(1000)
+        assert threshold == MIN_THRESHOLD
