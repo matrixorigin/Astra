@@ -280,19 +280,8 @@ class ChatLoop:
             return plain_content
 
         # 6. Multi-turn tool use loop
-        # Pre-fetch observations once (avoid N+1 in tool loop)
-        _obs_section = None
-        if self.observer and user_id:
-            _obs = self.observer.get_observations(user_id, session_id)
-            _obs_section = self.observer.format_for_context(_obs) if _obs else None
-
         last_skill_name: str | None = None
         for _round in range(MAX_TOOL_ROUNDS):
-            # Replace observed messages with observations (before compaction)
-            if _obs_section:
-                messages = self.observer.build_context_with_observations(
-                    messages, user_id, session_id, _cached_obs_section=_obs_section,
-                )
 
             # Compact if approaching context limit
             from core.context.compaction import compact, needs_compaction
@@ -859,18 +848,8 @@ class ChatLoop:
             return
 
         # Multi-turn tool use loop with streaming
-        # Pre-fetch observations once
-        _obs_section = None
-        if self.observer and user_id:
-            _obs = self.observer.get_observations(user_id, session_id)
-            _obs_section = self.observer.format_for_context(_obs) if _obs else None
-
         last_skill_name: str | None = None
         for _round in range(MAX_TOOL_ROUNDS):
-            if _obs_section:
-                messages = self.observer.build_context_with_observations(
-                    messages, user_id, session_id, _cached_obs_section=_obs_section,
-                )
 
             # Compact if approaching context limit
             from core.context.compaction import compact, needs_compaction
@@ -1605,7 +1584,7 @@ class ChatLoop:
             if few_shot_section:
                 sections.append(few_shot_section)
 
-        # §3 Observations + prior context (semi-stable, changes across sessions)
+        # §3 Prior context (semi-stable, changes across sessions)
         if self.continuity and session_id and user_id:
             prior = self.continuity.load_prior_context(
                 user_id=user_id, current_session_id=session_id,
@@ -1613,12 +1592,6 @@ class ChatLoop:
             section = prior.to_prompt_section()
             if section:
                 sections.append(section)
-
-        if self.observer and user_id:
-            observations = self.observer.get_observations(user_id, session_id)
-            obs_section = self.observer.format_for_context(observations)
-            if obs_section:
-                sections.append(obs_section)
 
         # §4 Working memory (changes within session)
         if self.scratchpad and session_id:

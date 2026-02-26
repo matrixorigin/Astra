@@ -175,24 +175,28 @@ class MemoryGovernanceEngine(DbConsumer):
             return count
 
     def _run_reflector(self) -> int:
-        """Run Reflector on all users with accumulated observations."""
+        """Run TypedReflector to promote episodic clusters to semantic memories."""
+        from core.memory.store import MemoryStore
+        from core.memory.typed_reflector import TypedReflector
+        from core.memory.types import MemoryType
+        from sqlalchemy import distinct, text
+
         with self._db() as db:
-            from api.models import Observation
-            from sqlalchemy import distinct
+            # Find users with episodic memories
+            result = db.execute(text(
+                "SELECT DISTINCT user_id FROM memories WHERE memory_type = :mtype AND is_active = 1"
+            ), {"mtype": MemoryType.EPISODIC.value})
+            user_ids = [row[0] for row in result.fetchall()]
 
-            user_ids = db.query(distinct(Observation.user_id)).filter(
-                Observation.is_reflected == 0
-            ).all()
+        total = 0
+        store = MemoryStore(self._db_factory)
+        reflector = TypedReflector(store=store, llm_client=self.llm_client)
 
-            total = 0
-            for (user_id,) in user_ids:
-                from core.memory.reflector import Reflector
-                reflector = Reflector(self._db_factory, llm_client=self.llm_client)
-                result = reflector.reflect(user_id)
-                if result.get("reflected"):
-                    total += result.get("before", 0) - result.get("after", 0)
+        for user_id in user_ids:
+            promoted = reflector.reflect(user_id)
+            total += len(promoted)
 
-            return total
+        return total
     
     def _apply_confidence_decay(self) -> int:
         """Apply confidence decay to all knowledge entries.

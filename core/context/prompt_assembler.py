@@ -512,7 +512,7 @@ class PromptAssembler(DbConsumer):
         """
         parts = []
 
-        # Primary: new tiered memory system (L0 + L1)
+        # Primary: tiered memory system (L0 + L1)
         try:
             from core.memory.tiered_loader import TieredMemoryLoader
             loader = TieredMemoryLoader(self._db_factory)
@@ -521,28 +521,6 @@ class PromptAssembler(DbConsumer):
                 parts.append(tiered_section)
         except Exception as e:
             logger.debug("TieredMemoryLoader skipped: %s", e)
-
-        # Fallback: legacy continuity (cross-session context)
-        try:
-            from core.context.continuity import SessionContinuity
-            cont = SessionContinuity(self._db_factory)
-            prior = cont.load_prior_context(user_id=user_id, current_session_id=session_id)
-            section = prior.to_prompt_section()
-            if section:
-                parts.append(section)
-        except Exception as e:
-            logger.debug("Continuity skipped: %s", e)
-
-        # Fallback: legacy observations (will be removed in Task 10)
-        try:
-            from core.memory.observer import Observer
-            obs = Observer(self._db_factory, llm_client=None)
-            observations = obs.get_observations(user_id, session_id)
-            obs_section = obs.format_for_context(observations)
-            if obs_section:
-                parts.append(obs_section)
-        except Exception as e:
-            logger.debug("Observer skipped: %s", e)
 
         # Few-shot examples
         try:

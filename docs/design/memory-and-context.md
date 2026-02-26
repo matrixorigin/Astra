@@ -1,7 +1,42 @@
 # Memory and Context
 
 > **Status**: Core Design — single source of truth for memory and context architecture  
-> **Last Updated**: 2026-02-21
+> **Last Updated**: 2026-02-27
+
+---
+
+## Implementation Status (v2 Memory System)
+
+The new MatrixOne-native memory system is implemented in `core/memory/`:
+
+| Component | Status | Module |
+|-----------|--------|--------|
+| **Memory Types** | ✅ Implemented | `types.py` — MemoryType enum, Memory dataclass |
+| **Memory Store** | ✅ Implemented | `store.py` — CRUD + atomic supersede |
+| **Memory Model** | ✅ Implemented | `api/models/memory.py` — MemoryRecord with vector + fulltext |
+| **Hybrid Retriever** | ✅ Implemented | `retriever.py` — L2_DISTANCE + MATCH AGAINST + temporal + confidence |
+| **Typed Observer** | ✅ Implemented | `typed_observer.py` — typed extraction + contradiction detection |
+| **Typed Reflector** | ✅ Implemented | `typed_reflector.py` — episodic→semantic promotion |
+| **Profile Manager** | ✅ Implemented | `profile.py` — L0 profile synthesis + caching |
+| **Memory Sandbox** | ✅ Implemented | `sandbox.py` — zero-copy branch validation |
+| **Provenance** | ✅ Implemented | `provenance.py` — PITR queries, diff, rollback |
+| **Health** | ✅ Implemented | `health.py` — pollution detection, cleanup |
+| **Tiered Loader** | ✅ Implemented | `tiered_loader.py` — L0+L1 for PromptAssembler |
+| **Pipeline** | ✅ Implemented | `typed_pipeline.py` — observe→sandbox→reflect |
+| **Config** | ✅ Implemented | `config.py` — MemoryGovernanceConfig |
+
+### MatrixOne-Native Capabilities Used
+
+- **PITR**: `create pitr`, `{timestamp = '...'}` reads, `restore from pitr`
+- **Snapshot**: `create snapshot`, `{snapshot = '...'}` reads, `restore from snapshot`
+- **Branch**: `data branch create table`, `data branch diff`, `data branch merge`, `data branch delete table`
+- **Vector**: `L2_DISTANCE()` in SQL
+- **Fulltext**: `MATCH() AGAINST()` with NGRAM parser
+- **HTAP**: Real-time analytics on transactional data
+
+### Legacy System (v1)
+
+The old system (`Observer` → `Observation` model, `SessionContinuity`) remains functional for backward compatibility. It will be deprecated once v2 is validated in production.
 
 ---
 

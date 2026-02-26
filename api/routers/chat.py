@@ -164,8 +164,8 @@ def _build_chat_loop(db_factory):
         firewall=firewall,
     )
 
-    from core.memory.observer import Observer
-    loop.set_observer(Observer(db_factory, llm_client=llm_client))
+    from core.memory.typed_observer import TypedObserver
+    loop.set_observer(TypedObserver(db_factory, llm_client=llm_client))
 
     return loop
 

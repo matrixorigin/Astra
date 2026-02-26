@@ -105,21 +105,20 @@ class TurnHooks(DbConsumer):
         user_id: str,
         messages: list[dict[str, Any]],
     ) -> None:
-        """Run Observer in a background thread."""
-        from core.memory.observer import Observer
+        """Run TypedObserver in a background thread."""
+        from core.memory.typed_pipeline import run_typed_memory_pipeline
 
         llm = self._llm_client
         db_factory = self._db_factory
 
         def _bg():
             try:
-                db = db_factory()
-                try:
-                    Observer(db, llm_client=llm).observe(
-                        session_id=session_id, user_id=user_id, messages=messages,
-                    )
-                finally:
-                    db.close()
+                run_typed_memory_pipeline(
+                    db_factory=db_factory,
+                    user_id=user_id,
+                    messages=messages,
+                    llm_client=llm,
+                )
             except Exception as e:
                 logger.debug("Observer failed (non-fatal): %s", e)
 

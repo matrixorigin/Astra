@@ -5,16 +5,15 @@ from api.base import Base  # noqa: F401
 # auth
 from api.models.auth import RefreshToken, Role, User, UserRole  # noqa: F401
 
-# agent / session / event / memory
+# agent / session / event
 from api.models.agent import (  # noqa: F401
     Agent,
     AgentScratchpad,
     Event,
-    Observation,
     Session,
 )
 
-# memory (new)
+# memory
 from api.models.memory import MemoryRecord  # noqa: F401
 
 # skills

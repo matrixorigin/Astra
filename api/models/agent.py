@@ -100,23 +100,3 @@ class AgentScratchpad(Base):
     related_note_ids = Column(JSON)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-
-
-class Observation(Base):
-    """Observational memory: structured observations extracted by Observer agent."""
-    __tablename__ = "observations"
-
-    observation_id = Column(String(64), primary_key=True)
-    user_id = Column(String(64), nullable=False, index=True)
-    session_id = Column(String(64), nullable=False, index=True)
-    content = Column(Text, nullable=False)
-    priority = Column(String(10), default="medium")
-    observation_type = Column(String(50))
-    observed_at = Column(DateTime, nullable=False)
-    referenced_at = Column(DateTime)
-    source_event_ids = Column(JSON, nullable=False)
-    is_reflected = Column(SmallInteger, server_default="0")
-    version = Column(Integer, default=1)
-    observed_msg_index = Column(Integer, default=0)
-    confidence = Column(Float, default=0.75)
-    created_at = Column(DateTime, default=func.now())
