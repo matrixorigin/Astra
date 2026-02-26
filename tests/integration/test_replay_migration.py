@@ -270,3 +270,90 @@ class TestLegacyPathPreserved:
 
         assert len(events) == 1
         assert events[0].event_type == StreamEventType.TEXT_DELTA
+
+
+class TestTimeTravelReplay:
+    """Test replay_stream_at and get_stream_state_at."""
+
+    @pytest.mark.asyncio
+    async def test_replay_stream_at_filters_by_timestamp(self, db_session, session_id, chain_id, cleanup, run_id):
+        """Events after the cutoff timestamp are excluded."""
+        from datetime import datetime, timezone, timedelta
+
+        now = datetime.now(timezone.utc)
+        early = now - timedelta(hours=1)
+        late = now + timedelta(hours=1)
+
+        # Insert two stream events at different times
+        eid1 = _uid()
+        db_session.execute(
+            text(
+                "INSERT INTO conversation_events "
+                "(event_id, session_id, user_id, agent_id, agent_version, "
+                "event_type, content, causal_chain_id, created_at) "
+                "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "
+                "'stream_text_delta', :content, :chain, :ts)"
+            ),
+            {
+                "eid": eid1, "sid": session_id,
+                "content": json.dumps({"event_type": "text_delta", "data": {"delta": "early"}, "stream_event_id": eid1}),
+                "chain": chain_id, "ts": early,
+            },
+        )
+        eid2 = _uid()
+        db_session.execute(
+            text(
+                "INSERT INTO conversation_events "
+                "(event_id, session_id, user_id, agent_id, agent_version, "
+                "event_type, content, causal_chain_id, created_at) "
+                "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "
+                "'stream_text_delta', :content, :chain, :ts)"
+            ),
+            {
+                "eid": eid2, "sid": session_id,
+                "content": json.dumps({"event_type": "text_delta", "data": {"delta": "late"}, "stream_event_id": eid2}),
+                "chain": chain_id, "ts": late,
+            },
+        )
+        db_session.commit()
+
+        replay = StreamReplay(lambda: db_session)
+
+        # Replay up to 'now' — should only get the early event
+        events = []
+        async for ev in replay.replay_stream_at(session_id, now):
+            events.append(ev)
+
+        assert len(events) == 1
+        assert events[0].data["delta"] == "early"
+
+    @pytest.mark.asyncio
+    async def test_get_stream_state_at_accumulates_text(self, db_session, session_id, chain_id, cleanup, run_id):
+        """get_stream_state_at reconstructs accumulated text."""
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+
+        for i, delta in enumerate(["Hello ", "world", "!"]):
+            eid = _uid()
+            db_session.execute(
+                text(
+                    "INSERT INTO conversation_events "
+                    "(event_id, session_id, user_id, agent_id, agent_version, "
+                    "event_type, content, causal_chain_id, created_at) "
+                    "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "
+                    "'stream_text_delta', :content, :chain, :ts)"
+                ),
+                {
+                    "eid": eid, "sid": session_id,
+                    "content": json.dumps({"event_type": "text_delta", "data": {"delta": delta}, "stream_event_id": eid}),
+                    "chain": chain_id, "ts": now,
+                },
+            )
+        db_session.commit()
+
+        replay = StreamReplay(lambda: db_session)
+        state = replay.get_stream_state_at(session_id, now)
+
+        assert state["text_accumulated"] == "Hello world!"
+        assert len(state["events"]) == 3

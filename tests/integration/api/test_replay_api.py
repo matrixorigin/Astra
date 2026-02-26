@@ -1,10 +1,10 @@
 """Integration tests for replay API."""
 
 import pytest
+from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from api.main import app
-from api.database import get_db_session
 from api.repositories.user_repository import UserRepository
 
 
@@ -12,14 +12,6 @@ from api.repositories.user_repository import UserRepository
 def client():
     """Create test client."""
     return TestClient(app)
-
-
-@pytest.fixture
-def db_session():
-    """Get database session."""
-    session = next(get_db_session())
-    yield session
-    session.close()
 
 
 # auth_headers fixture now provided by tests/integration/conftest.py
@@ -98,22 +90,18 @@ class TestReplaySession:
 
     def test_replay_session_unauthorized(self, client, auth_headers, db_session):
         """Test replay session owned by another user."""
-        # Create another user
+        # Create another user with unique name
         from core.auth.password import hash_password
-        from uuid import uuid4
+        
+        uid = str(uuid4())[:8]
+        other_username = f"otherreplay_{uid}"
         
         repo = UserRepository(lambda: db_session)
         
-        # Clean up first
-        existing = repo.get_by_username("otherreplayuser")
-        if existing:
-            repo.delete(existing.user_id)
-            db_session.commit()
-        
         other_user = repo.create({
             "user_id": str(uuid4()),
-            "username": "otherreplayuser",
-            "email": "otherreplay@example.com",
+            "username": other_username,
+            "email": f"otherreplay_{uid}@example.com",
             "password_hash": hash_password("password123"),
             "is_active": 1,
         })
@@ -122,7 +110,7 @@ class TestReplaySession:
         response = client.post(
             "/auth/login",
             json={
-                "username": "otherreplayuser",
+                "username": other_username,
                 "password": "password123",
             },
         )

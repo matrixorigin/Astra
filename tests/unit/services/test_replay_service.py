@@ -24,21 +24,19 @@ from api.repositories.user_repository import UserRepository
 
 @pytest.fixture
 def test_user(db_session):
-    """测试用户 fixture"""
+    """测试用户 fixture — worker-isolated"""
     repo = UserRepository(lambda: db_session)
     
-    # 清理
-    user = repo.get_by_username("replaytest")
-    if user:
-        repo.delete(user.user_id)
-        db_session.commit()
+    # Use unique username per test run
+    uid = str(uuid4())[:8]
+    username = f"replaytest_{uid}"
     
     # 创建
     from core.auth.password import hash_password
     user_data = {
         "user_id": str(uuid4()),
-        "username": "replaytest",
-        "email": "replaytest@example.com",
+        "username": username,
+        "email": f"replaytest_{uid}@example.com",
         "password_hash": hash_password("password123"),
         "is_active": 1,
     }
@@ -48,8 +46,11 @@ def test_user(db_session):
     yield user
     
     # 清理
-    repo.delete(user.user_id)
-    db_session.commit()
+    try:
+        repo.delete(user.user_id)
+        db_session.commit()
+    except Exception:
+        db_session.rollback()
 
 
 @pytest.fixture

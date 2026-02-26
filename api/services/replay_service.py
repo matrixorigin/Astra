@@ -20,6 +20,7 @@ from api.repositories import EventRepository, SessionRepository
 from api.services.exceptions import PermissionDeniedError, ResourceNotFoundError
 from core.auth.audit_logger import AuditLogger
 from core.db_consumer import DbFactory
+from core.exceptions import ReplayError
 from core.skills.mocking import MockMode, ToolMockingLayer
 
 
@@ -192,10 +193,9 @@ class ReplayService:
         """
         # Initialize ToolMockingLayer
         execution_mode = MockMode.REPLAY if mock_mode else MockMode.PRODUCTION
-        from api.database import SessionLocal
         mocker = ToolMockingLayer(
             mode=execution_mode,
-            db_factory=SessionLocal,
+            db_factory=self._db_factory,
             session_id=event.session_id if mock_mode else None
         )
 
@@ -206,7 +206,7 @@ class ReplayService:
                 skill_version = skill_version_override.get(skill_name) if skill_version_override else event.skill_version
 
                 # Parse skill params from metadata
-                metadata = json.loads(event.metadata) if event.metadata else {}
+                metadata = event.event_metadata if event.event_metadata else {}
                 skill_params = metadata.get("skill_params", {})
 
                 # Invoke skill through mocking layer
@@ -305,4 +305,46 @@ class ReplayService:
             "mismatched_events": mismatched,
             "details": details[:10],  # Limit to 10 for readability
             "compared_at": datetime.now(timezone.utc).isoformat()
+        }
+
+    def verify_reproducibility(self, session_id: str, user_id: str) -> dict[str, Any]:
+        """Verify that a session can be reproduced.
+
+        Checks all skill_invocation events have recorded results available.
+
+        Args:
+            session_id: Session to verify
+            user_id: User ID for permission check
+
+        Returns:
+            dict with reproducibility assessment
+
+        Raises:
+            ResourceNotFoundError: Session not found
+            PermissionDeniedError: User lacks permission
+        """
+        session = self.session_repo.get_by_id(session_id)
+        if not session:
+            raise ResourceNotFoundError(f"Session {session_id} not found")
+        if session.user_id != user_id:
+            raise PermissionDeniedError(f"Permission denied for Session {session_id}")
+
+        events, _ = self.event_repo.get_by_session(session_id)
+
+        issues = []
+        for event in events:
+            if event.event_type == "skill_invocation" and event.skill_name:
+                metadata = event.event_metadata or {}
+                if not metadata.get("skill_params"):
+                    issues.append({
+                        "type": "missing_input",
+                        "event_id": event.event_id,
+                        "message": "Event metadata missing skill_params",
+                    })
+
+        return {
+            "session_id": session_id,
+            "reproducible": len(issues) == 0,
+            "events_checked": len(events),
+            "issues": issues,
         }

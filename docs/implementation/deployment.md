@@ -28,7 +28,7 @@ mo-agent-engine/
 │   ├── skills/             # SkillRegistry, selector, auditable selector
 │   ├── llm/                # LLMClient, providers, router, rate limiter
 │   ├── sandbox/            # Sandbox (clone), Branch (diff/merge)
-│   ├── replay/             # Session replay, ToolMockingLayer
+│   ├── replay/             # TimeMachine, SemanticDiff (session replay via api/services/replay_service)
 │   ├── auth/               # UserManager, PermissionChecker, AuditLogger
 │   ├── repos/              # RepoRegistry, TokenResolver
 │   ├── scope/              # ScopeResolver (scope-based config)

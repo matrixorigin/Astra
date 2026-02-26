@@ -1,5 +1,9 @@
-"""Replay package for conversation reproduction."""
+"""Replay package for conversation reproduction.
 
-from .engine import ReplayEngine
+Core components:
+- TimeMachine: Time-travel via MatrixOne snapshots
+- SemanticDiff: Compare agent behaviors across sessions/checkpoints
+- StreamReplay: Reconstruct streams from logged events (in core/agent/)
 
-__all__ = ["ReplayEngine"]
+Session-level replay is handled by api.services.replay_service.ReplayService.
+"""

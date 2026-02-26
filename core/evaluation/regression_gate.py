@@ -3,6 +3,7 @@
 Extends replay gating from selector to all versioned inputs.
 """
 
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 from enum import Enum
@@ -18,6 +19,16 @@ from core.db_consumer import DbConsumer, DbFactory
 from api.services.replay_service import ReplayService
 
 logger = get_logger(__name__)
+
+_SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _validate_sandbox_name(name: str) -> None:
+    """Validate sandbox name to prevent SQL injection in dynamic table references."""
+    if not _SAFE_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid sandbox name: {name!r}. Only alphanumeric, dash, underscore allowed."
+        )
 
 
 class ChangeType(str, Enum):
@@ -208,6 +219,7 @@ class RegressionGate(DbConsumer):
         change_content: dict[str, Any],
     ):
         """Apply change to sandbox environment."""
+        _validate_sandbox_name(sandbox_name)
         with self._db() as db:
             try:
                 if change_type == ChangeType.PROMPT:

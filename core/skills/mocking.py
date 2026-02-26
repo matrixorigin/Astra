@@ -5,7 +5,9 @@ This module intercepts skill executions and provides two modes:
 - REPLAY: Return recorded results without re-execution
 """
 
+import asyncio
 import hashlib
+import inspect
 import json
 import logging
 from enum import Enum
@@ -13,6 +15,7 @@ from typing import Any, Protocol
 
 
 from core.db_consumer import DbConsumer, DbFactory
+from core.exceptions import ReplayError
 from core.skills.base import SideEffectCategory, Skill
 
 logger = logging.getLogger(__name__)
@@ -29,11 +32,6 @@ class MockMode(str, Enum):
 class SecurityError(Exception):
     """Raised when dangerous operations are blocked in replay mode"""
 
-    pass
-
-
-class ReplayError(Exception):
-    """Raised when replay cannot proceed due to missing data"""
     pass
 
 
@@ -131,25 +129,10 @@ class ToolMockingLayer(DbConsumer):
                     )
 
         # Production mode or READ operations: Execute normally
-        # Validate input first
         validated_input = skill.validate_input(params)
         result = skill.execute(validated_input)
-
-        # If skill.execute is async, run it synchronously
-        import asyncio
-        import inspect
         if inspect.isawaitable(result):
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            if loop and loop.is_running():
-                # Already in async context — create a task
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor() as pool:
-                    result = pool.submit(asyncio.run, result).result()
-            else:
-                result = asyncio.run(result)
+            result = asyncio.run(result)
 
         # Record result in production mode
         if self.mode == MockMode.PRODUCTION:
@@ -317,13 +300,16 @@ class ToolMockingLayer(DbConsumer):
         with self._db() as session:
             events = session.query(EventModel).filter(
                 EventModel.session_id == self.session_id,
-                EventModel.skill_result.isnot(None)
+                EventModel.event_metadata.isnot(None),
+                EventModel.event_type.in_(['tool_result', 'stream_tool_result'])
             ).all()
             
             results = {}
             for event in events:
-                key = self._make_key(event.skill_name, event.event_metadata.get("skill_params", {}))
-                results[key] = event.skill_result
+                metadata = event.event_metadata or {}
+                if metadata.get("skill_result") is not None:
+                    key = self._make_key(event.skill_name, metadata.get("skill_params", {}))
+                    results[key] = metadata["skill_result"]
         return results
 
     def _make_key(self, skill_name: str, params: dict) -> str:

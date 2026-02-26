@@ -762,3 +762,30 @@ class TestSkillTableName:
         assert "test_sb.skills_registry" in sql_text
         assert "skill_name" in sql_text
         assert "skill_definition" in sql_text
+
+
+class TestSandboxNameValidation:
+    """Sandbox name must be safe for SQL interpolation."""
+
+    def test_rejects_sql_injection(self):
+        from core.evaluation.regression_gate import _validate_sandbox_name
+        for bad in ["'; DROP TABLE --", "a b", "foo'bar", "x;y"]:
+            with pytest.raises(ValueError, match="Invalid sandbox name"):
+                _validate_sandbox_name(bad)
+
+    def test_accepts_valid_names(self):
+        from core.evaluation.regression_gate import _validate_sandbox_name
+        for name in ["gate_abc12345", "test-sb", "my_sandbox"]:
+            _validate_sandbox_name(name)  # no raise
+
+    def test_apply_change_rejects_bad_sandbox_name(self):
+        _mock_db = Mock()
+        gate = RegressionGate.__new__(RegressionGate)
+        gate._db_factory = lambda: _mock_db
+        with pytest.raises(ValueError, match="Invalid sandbox name"):
+            gate._apply_change_to_sandbox(
+                sandbox_name="bad name!",
+                change_type=ChangeType.PROMPT,
+                change_id="test",
+                change_content={"content": "x"},
+            )

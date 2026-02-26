@@ -15,8 +15,8 @@ from sqlalchemy import delete, text
 from core.skills.mocking import (
     ToolMockingLayer,
     MockMode as ExecutionMode,  # Aliased for compatibility with test
-    ReplayError
 )
+from core.exceptions import ReplayError
 from core.skills.base import SideEffectCategory
 from api.database import get_db_session
 from api.models import Event
