@@ -45,6 +45,8 @@ _MAX_COMPLETED_RUNS = 500
 _GC_INTERVAL_SECONDS = 300
 # Batch flush threshold for run_events (streaming events)
 _RUN_EVENT_FLUSH_SIZE = 20
+# Hard cap on pending inserts to prevent unbounded memory growth during DB outages.
+_MAX_PENDING_EVENTS = 500
 
 # Global GC task reference
 _gc_task: asyncio.Task | None = None
@@ -265,11 +267,11 @@ class RunEngine(DbConsumer):
                             pass
             except Exception:
                 pass
-            # Wait for GateTrigger daemon threads
+            # Wait for GateTrigger daemon threads (run in executor to avoid blocking the event loop)
             try:
                 gt = getattr(loop, '_gate_trigger', None) if loop else None
                 if gt and hasattr(gt, 'wait_all'):
-                    gt.wait_all(timeout=5.0)
+                    await asyncio.get_event_loop().run_in_executor(None, gt.wait_all, 5.0)
             except Exception:
                 pass
             _run_tasks.pop(run.run_id, None)
@@ -568,7 +570,13 @@ class RunEngine(DbConsumer):
         except Exception as e:
             if not _retried:
                 logger.warning("Event batch commit failed, retrying with fresh session: %s", e)
-                self._pending_inserts = batch + self._pending_inserts
+                merged = batch + self._pending_inserts
+                # Cap to prevent unbounded growth during persistent DB outages.
+                if len(merged) > _MAX_PENDING_EVENTS:
+                    dropped = len(merged) - _MAX_PENDING_EVENTS
+                    merged = merged[-_MAX_PENDING_EVENTS:]
+                    logger.warning("Pending event buffer capped: %d oldest events dropped", dropped)
+                self._pending_inserts = merged
                 self._flush_run_events(_retried=True)
             else:
                 logger.error("Event batch commit failed after retry, %d events dropped: %s", len(batch), e)

@@ -63,7 +63,7 @@ def auth_headers(client, db_session):
 def clear_turn_caches():
     """Reset per-session state between tests to ensure isolation.
 
-    _turn_histories and _session_tools are module-level dicts (in-memory cache).
+    _session_cache is a module-level LRU dict (in-memory cache).
     Without clearing, a session_id from test A could leak into test B.
 
     NOTE: These tests share an in-process FastAPI app and DB connection,
@@ -71,11 +71,9 @@ def clear_turn_caches():
     is enforced by not marking them with @pytest.mark.forked.
     """
     from api.routers import chat
-    chat._turn_histories.clear()
-    chat._session_tools.clear()
+    chat._session_cache.clear()
     yield
-    chat._turn_histories.clear()
-    chat._session_tools.clear()
+    chat._session_cache.clear()
 
 
 # ============================================================================

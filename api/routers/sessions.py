@@ -219,6 +219,12 @@ async def close_session(
             user_id=current_user["user_id"],
             status="closed"
         )
+        # Evict from in-memory cache so closed sessions don't consume RAM.
+        try:
+            from api.routers.chat import _session_cache
+            _session_cache.pop(session_id, None)
+        except Exception:
+            pass
         return result
     except ValueError as e:
         raise HTTPException(

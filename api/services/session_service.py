@@ -1,5 +1,6 @@
 """Session Service - 业务逻辑层"""
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
@@ -13,6 +14,8 @@ from core.db_consumer import DbFactory
 
 class SessionService:
     """Session 业务服务"""
+
+    _logger = logging.getLogger(__name__)
 
     def __init__(self, db_factory: DbFactory):
         self._db_factory = db_factory
@@ -226,6 +229,7 @@ class SessionService:
                 update_data["ended_at"] = datetime.now(timezone.utc)
             if status in ("closed", "ended"):
                 self._cleanup_sandbox(session_id)
+                self._run_close_hooks(session_id, session.user_id)
 
         if not update_data:
             # 没有更新内容，直接返回当前信息
@@ -361,3 +365,31 @@ class SessionService:
                         pass
         except Exception:
             pass  # Best-effort, Tier 2 will catch any misses
+
+    def _run_close_hooks(self, session_id: str, user_id: str) -> None:
+        """Run lifecycle hooks on session close: quality scoring + knowledge extraction."""
+        db = self._db_factory()
+        try:
+            # Session-level quality scoring
+            try:
+                from core.evaluation.multi_level_scorer import score_session
+                score_session(db, session_id)
+            except Exception as e:
+                self._logger.warning("Session-level scoring failed (non-fatal): %s", e)
+
+            # Knowledge extraction from causal chains
+            try:
+                from api.models import Event
+                from core.events.event_logger import EventLogger
+                from skills.knowledge.api import KnowledgeExtractor
+
+                extractor = KnowledgeExtractor(db, event_logger=EventLogger.from_session(db))
+                chains = db.query(Event.causal_chain_id).filter(
+                    Event.session_id == session_id
+                ).distinct().all()
+                for (chain_id,) in chains:
+                    extractor.extract_from_chain(chain_id, user_id)
+            except Exception as e:
+                self._logger.warning("Knowledge extraction failed (non-fatal): %s", e)
+        finally:
+            db.close()

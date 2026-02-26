@@ -410,9 +410,9 @@ class _LRUDict(OrderedDict):
             super().clear()
 
 
-_turn_histories: _LRUDict = _LRUDict(_MAX_CACHED_SESSIONS)
-# Cache edge_tools per session so subsequent turns reuse them
-_session_tools: _LRUDict = _LRUDict(_MAX_CACHED_SESSIONS)
+# Unified per-session cache: {"history": list[dict], "tools": list[dict]}
+# Single LRU ensures history and tools are evicted together.
+_session_cache: _LRUDict = _LRUDict(_MAX_CACHED_SESSIONS)
 
 
 def _tool_names(tools: list[dict[str, Any]]) -> set[str]:
@@ -439,7 +439,7 @@ def _build_turn_messages(
     saved by PromptAssembler BEFORE the LLM call (only on first turn or system
     rebuild); None on subsequent turns that reuse the cached system prompt.
     """
-    history = _turn_histories.get(session_id)
+    history = (_session_cache.get(session_id) or {}).get("history")
     context_capture_id: str | None = None
 
     # Recover from DB if not in memory (server restart)
@@ -493,7 +493,9 @@ def _build_turn_messages(
                 "content": tr.get("result", ""),
             })
 
-    _turn_histories[session_id] = history
+    entry = _session_cache.get(session_id) or {}
+    entry["history"] = history
+    _session_cache[session_id] = entry
     return history, context_capture_id
 
 
@@ -506,13 +508,18 @@ _MAX_RECOVERY_EVENTS = 50
 
 
 def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_id: str | None = None) -> list[dict[str, Any]]:
-    """Rebuild conversation history from persisted events (for server restart recovery)."""
+    """Rebuild conversation history from persisted events (for server restart recovery).
+
+    Recovers user_query, llm_response, tool_call_start, and tool_result events
+    to produce a valid OpenAI message sequence:
+        user → assistant(tool_calls) → tool(result) → assistant → ...
+    """
     try:
         rows = db.execute(
-            # safe: _MAX_RECOVERY_EVENTS is a module-level int constant, not user input
             text(f"""
-                SELECT event_type, content FROM conversation_events
-                WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response')
+                SELECT event_type, content, metadata FROM conversation_events
+                WHERE session_id = :sid
+                  AND event_type IN ('user_query', 'llm_response', 'tool_call_start', 'tool_result')
                 ORDER BY created_at ASC LIMIT {_MAX_RECOVERY_EVENTS}
             """),
             {"sid": session_id},
@@ -520,11 +527,6 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
         if not rows:
             return []
 
-        # Rebuild system prompt via assembler.
-        # NOTE: edge_context is not available on recovery (project_rules, edge_profile
-        # are transient and not persisted). The recovered prompt will lack Self-Model
-        # edge tool info and project context. This is an accepted limitation — the
-        # edge will re-send these on the next fresh session.
         first_query = next((r[1] for r in rows if r[0] == "user_query"), "")
         from core.context.prompt_assembler import PromptAssembler
         assembled = PromptAssembler(SessionLocal).assemble(
@@ -534,12 +536,61 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
         history: list[dict[str, Any]] = [
             {"role": "system", "content": assembled.system_message}
         ]
+
+        # Accumulate tool_calls for the current assistant message.
+        # When we see an llm_response after tool_call_start events, we emit
+        # the assistant message with tool_calls attached, then the tool results,
+        # then the final assistant text.
+        pending_tool_calls: list[dict[str, Any]] = []
+
         for row in rows:
             etype, content = row[0], row[1] or ""
+            meta = row[2] if len(row) > 2 else None
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except (json.JSONDecodeError, TypeError):
+                    meta = {}
+            meta = meta or {}
+
             if etype == "user_query":
                 history.append({"role": "user", "content": content})
+            elif etype == "tool_call_start":
+                # Accumulate tool call info for the next assistant message.
+                try:
+                    tc_data = json.loads(content) if isinstance(content, str) else {}
+                except (json.JSONDecodeError, TypeError):
+                    tc_data = {}
+                pending_tool_calls.append({
+                    "id": tc_data.get("tool_call_id", meta.get("tool_call_id", "")),
+                    "type": "function",
+                    "function": {
+                        "name": tc_data.get("name", meta.get("name", "")),
+                        "arguments": tc_data.get("arguments", "{}"),
+                    },
+                })
+            elif etype == "tool_result":
+                # Emit pending assistant+tool_calls before the tool result.
+                if pending_tool_calls:
+                    history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+                    pending_tool_calls = []
+                tool_call_id = meta.get("tool_call_id", "")
+                try:
+                    result_data = json.loads(content) if isinstance(content, str) else {}
+                except (json.JSONDecodeError, TypeError):
+                    result_data = {}
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result_data.get("result", content)[:4000] if isinstance(result_data, dict) else str(content)[:4000],
+                })
             elif etype == "llm_response":
+                # Flush any remaining pending tool_calls (shouldn't happen normally).
+                if pending_tool_calls:
+                    history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+                    pending_tool_calls = []
                 history.append({"role": "assistant", "content": content})
+
         return history
     except SQLAlchemyError as e:
         logger.debug("History recovery failed: %s", e)
@@ -664,12 +715,14 @@ async def chat_turn(
     # On change, we rebuild the system prompt (with new Self-Model) but preserve
     # conversation history — see force_rebuild_system in _build_turn_messages.
     tools_changed = False
+    entry = _session_cache.get(session_id) or {}
     if request.edge_tools:
-        cached = _session_tools.get(session_id, [])
+        cached = entry.get("tools", [])
         if cached and _tool_names(request.edge_tools) != _tool_names(cached):
             tools_changed = True
-        _session_tools[session_id] = request.edge_tools
-    tools_schema = _session_tools.get(session_id, [])
+        entry["tools"] = request.edge_tools
+        _session_cache[session_id] = entry
+    tools_schema = (_session_cache.get(session_id) or {}).get("tools", [])
 
     # Build conversation messages with context enrichment
     db = SessionLocal()
@@ -730,7 +783,9 @@ async def chat_turn(
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text}
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
-            _turn_histories.setdefault(session_id, []).append(assistant_msg)
+            _entry = _session_cache.get(session_id) or {}
+            _entry.setdefault("history", []).append(assistant_msg)
+            _session_cache[session_id] = _entry
 
             # Persist events (non-blocking, best-effort)
             _persist_turn_events(
