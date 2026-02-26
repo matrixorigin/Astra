@@ -29,6 +29,10 @@ _RATING_MAP = {
 class TurnHooks(DbConsumer):
     """Post-turn persistence hooks shared by ChatLoop and /chat/turn."""
 
+    # TODO(future-arch): Async tasks (Observer, implicit feedback) should go through
+    # an internal event bus or API endpoints instead of direct DB access. Benefits:
+    # consistent auth/audit, decoupled from DB schema, enables distributed workers.
+
     def __init__(self, db_factory: DbFactory, llm_client: Any = None):
         super().__init__(db_factory)
         self._llm_client = llm_client

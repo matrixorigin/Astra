@@ -93,6 +93,9 @@ class Observer(DbConsumer):
     Tracks observed message count per (user, session) in the observations
     table itself (max source index), so it survives restarts and works
     across multiple instances.
+
+    .. todo:: future-arch: Replace direct DB queries with internal API
+       when splitting into distributed workers.
     """
 
     def __init__(self, db_factory: DbFactory, llm_client=None):

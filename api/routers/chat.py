@@ -823,22 +823,24 @@ def _persist_turn_events(
     context_capture_id so DecisionAudit can reference it.
     """
     from uuid_utils import uuid7
+    from core.events.event_logger import EventLogger
 
     user_content = next((m["content"] for m in messages if m.get("role") == "user"), None)
+    el = EventLogger(SessionLocal)
+    parent_event_id = None
+    causal_chain_id = str(uuid7())
 
+    # Phase 1: persist user query
     try:
-        from core.events.event_logger import EventLogger
-        el = EventLogger(SessionLocal)
-
-        # Persist user query
-        parent_event_id = None
-        causal_chain_id = str(uuid7())
         if user_content:
             user_ev = el.create_user_query(user_id=user_id, session_id=session_id, content=user_content)
             parent_event_id = user_ev.event_id
             causal_chain_id = user_ev.causal_chain_id
+    except Exception as e:
+        logger.warning("Phase 1 (user_query) failed: %s", e)
 
-        # Persist tool results from edge
+    # Phase 2: persist tool results from edge
+    try:
         if tool_results:
             for tr in tool_results:
                 meta = {"source": "edge", "tool_call_id": tr.get("tool_call_id"), "name": tr.get("name", "")}
@@ -852,9 +854,11 @@ def _persist_turn_events(
                     causal_chain_id=causal_chain_id,
                     metadata=meta,
                 )
+    except Exception as e:
+        logger.warning("Phase 2 (tool_results) failed: %s", e)
 
-        # Persist LLM tool calls so _recover_history_from_db can reconstruct
-        # the full assistant(tool_calls) → tool(result) message sequence.
+    # Phase 3: persist tool calls + LLM response + history snapshot
+    try:
         if tool_calls:
             for tc in tool_calls:
                 tc_id = tc.get("id", "")
@@ -868,7 +872,6 @@ def _persist_turn_events(
                     metadata={"tool_call_id": tc_id, "name": tc_func.get("name", "")},
                 )
 
-        # Persist LLM response (tool_call names are already in tool_call events)
         if full_text or tool_calls:
             el.create_llm_response(
                 user_id=user_id, session_id=session_id,
@@ -878,21 +881,20 @@ def _persist_turn_events(
                 causal_chain_id=causal_chain_id,
             )
 
-        # Periodic history snapshot (every _SNAPSHOT_INTERVAL turns)
         if history and turn_count > 0 and turn_count % _SNAPSHOT_TURN_INTERVAL == 0:
-            try:
-                el.create_stream_event(
-                    user_id=user_id, session_id=session_id,
-                    event_type="session_history_snapshot",
-                    content=json.dumps(history),
-                    parent_event_id=parent_event_id,
-                    causal_chain_id=causal_chain_id,
-                    metadata={"turn_count": turn_count},
-                )
-            except Exception as e:
-                logger.debug("History snapshot skipped: %s", e)
+            el.create_stream_event(
+                user_id=user_id, session_id=session_id,
+                event_type="session_history_snapshot",
+                content=json.dumps(history),
+                parent_event_id=parent_event_id,
+                causal_chain_id=causal_chain_id,
+                metadata={"turn_count": turn_count},
+            )
+    except Exception as e:
+        logger.warning("Phase 3 (llm_response/snapshot) failed: %s", e)
 
-        # Post-turn hooks (decision audit, skill selection, observer, feedback)
+    # Phase 4: post-turn hooks (decision audit, skill selection, observer, feedback)
+    try:
         from core.agent.turn_hooks import TurnHooks
         hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client())
 
@@ -906,9 +908,8 @@ def _persist_turn_events(
         if user_content:
             hooks.run_observer(session_id, user_id, messages)
             hooks.detect_implicit_feedback(user_content, messages, parent_event_id)
-
     except Exception as e:
-        logger.warning("Event persistence failed (non-fatal): %s", e)
+        logger.warning("Phase 4 (TurnHooks) failed: %s", e)
 
 
 # Lazy-initialized shared LLM client for background tasks (Observer).
@@ -988,8 +989,8 @@ async def chat_turn(
         yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id})}\n\n"
 
         try:
-            from core.llm.client import LLMClient
-            llm = LLMClient(SessionLocal, user_id=user_id)
+            llm = _get_shared_llm_client()
+            llm.set_user_context(user_id=user_id)
 
             full_text = ""
             tool_calls: list[dict[str, Any]] = []
@@ -1076,7 +1077,21 @@ async def chat_turn(
 
         except Exception as e:
             logger.error("chat_turn error: %s", e, exc_info=True)
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            from core.llm.client import BudgetExceededError
+            from core.exceptions import LLMRateLimitError, LLMTimeoutError, TransientError
+            from sqlalchemy.exc import SQLAlchemyError
+            err: dict[str, Any] = {"type": "error", "message": str(e)}
+            if isinstance(e, BudgetExceededError):
+                err.update(code="BUDGET_EXCEEDED", retryable=False)
+            elif isinstance(e, LLMRateLimitError):
+                err.update(code="LLM_RATE_LIMIT", retryable=True, retry_after_ms=5000)
+            elif isinstance(e, (LLMTimeoutError, TransientError)):
+                err.update(code="LLM_TIMEOUT", retryable=True, retry_after_ms=2000)
+            elif isinstance(e, (SQLAlchemyError, ConnectionError, OSError)):
+                err.update(code="SERVER_ERROR", retryable=True, retry_after_ms=1000)
+            else:
+                err.update(code="INTERNAL_ERROR", retryable=False)
+            yield f"data: {json.dumps(err)}\n\n"
 
     return StreamingResponse(
         event_generator(),

@@ -109,6 +109,9 @@ class EventPipeline:
 
     Hot path: emit() enqueues in-memory, returns immediately.
     Background: drain → classify → batch → flush to DB.
+
+    .. todo:: future-arch: Flush target should be swappable (direct DB
+       vs internal API) to support edge-cloud split deployment.
     """
 
     FLUSH_INTERVAL_S = 0.2  # 200ms

@@ -129,3 +129,11 @@ class AuthorizationError(AgentError):
 
     def __init__(self, message: str = "Authorization failed"):
         super().__init__(message, code="AUTHORIZATION_ERROR")
+
+
+class TransientError(AgentError):
+    """Retryable error (DB timeout, network, rate limit)."""
+
+    def __init__(self, message: str, retry_after_ms: int = 1000):
+        self.retry_after_ms = retry_after_ms
+        super().__init__(message, code="TRANSIENT_ERROR")

@@ -3,6 +3,7 @@
 Edge sends user message + tool results → cloud returns text + tool_calls → edge executes tools → repeat.
 """
 
+import asyncio
 import sys
 from dataclasses import dataclass, field
 from itertools import islice
@@ -60,6 +61,7 @@ class TurnResult:
     run_id: str | None = None
     usage: dict[str, int] = field(default_factory=dict)
     has_tool_calls: bool = False
+    error: dict[str, Any] | None = None
 
 
 def load_project_rules(project_root: str) -> str | None:
@@ -148,6 +150,7 @@ async def _consume_turn(sse_stream, renderer: Renderer) -> TurnResult:
         elif etype == "turn_complete":
             result.has_tool_calls = event.get("has_tool_calls", False)
         elif etype == "error":
+            result.error = event
             renderer.error(event.get("message", "Unknown cloud error"))
     return result
 
@@ -201,28 +204,42 @@ async def edge_chat_loop(
         if send_edge_tools:
             last_sent_tools = current_tool_names
 
-        # Call cloud
-        try:
-            sse_stream = api_client.chat_turn(
-                messages=messages,
-                session_id=session_id,
-                tool_results=tool_results if tool_results else None,
-                project_rules=project_rules if turn == 0 else None,
-                agent_id=agent_id,
-                model=model,
-                edge_tools=send_edge_tools,
-                edge_profile=edge_profile if turn == 0 else None,
-            )
-            result = await _consume_turn(sse_stream, renderer)
-        except KeyboardInterrupt:
-            renderer.error("Interrupted by user")
-            break
-        except (ConnectionError, OSError, TimeoutError) as e:
-            renderer.error(f"Network error: {e}")
-            break
-        except Exception as e:
-            renderer.error(f"{type(e).__name__}: {e}")
-            break
+        # Call cloud with retry for transient errors
+        _MAX_RETRIES = 2
+        _BACKOFF = [1.0, 3.0]
+        result = TurnResult()
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                sse_stream = api_client.chat_turn(
+                    messages=messages,
+                    session_id=session_id,
+                    tool_results=tool_results if tool_results else None,
+                    project_rules=project_rules if turn == 0 else None,
+                    agent_id=agent_id,
+                    model=model,
+                    edge_tools=send_edge_tools,
+                    edge_profile=edge_profile if turn == 0 else None,
+                )
+                result = await _consume_turn(sse_stream, renderer)
+                if result.error and result.error.get("retryable") and attempt < _MAX_RETRIES:
+                    delay = result.error.get("retry_after_ms", _BACKOFF[attempt] * 1000) / 1000
+                    renderer.info(f"  ⟳ Retrying in {delay:.0f}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            except (ConnectionError, OSError, TimeoutError) as e:
+                if attempt < _MAX_RETRIES:
+                    renderer.info(f"  ⟳ Network error, retrying in {_BACKOFF[attempt]:.0f}s...")
+                    await asyncio.sleep(_BACKOFF[attempt])
+                    continue
+                renderer.error(f"Network error: {e}")
+                break
+            except KeyboardInterrupt:
+                renderer.error("Interrupted by user")
+                return final_text
+            except Exception as e:
+                renderer.error(f"{type(e).__name__}: {e}")
+                break
 
         # Track session from first response
         if result.session_id and not session_id:

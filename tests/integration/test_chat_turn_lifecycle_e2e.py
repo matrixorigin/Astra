@@ -244,23 +244,22 @@ class TestChatTurnMultiTurnE2E:
         assert turn1_system != turn2_system
 
     def test_model_routing_uses_user_id(self, client, db):
-        """LLMClient in /chat/turn is created with user_id for model routing."""
+        """Shared LLMClient in /chat/turn receives set_user_context with correct user_id."""
         headers, user_id = self._auth(client, db)
 
-        with patch("core.llm.client.LLMClient.__init__", return_value=None) as mock_init, \
+        with patch("core.llm.client.LLMClient.set_user_context") as mock_ctx, \
              patch("core.llm.client.LLMClient.chat_stream",
                    return_value=fake_llm_stream([{"type": "text", "content": "hi"}])):
             client.post("/chat/turn", json={
                 "messages": [{"role": "user", "content": "hello"}],
             }, headers=headers)
 
-        # Verify the LLMClient in event_generator was constructed with the exact user_id.
         calls_with_user_id = [
-            c for c in mock_init.call_args_list
+            c for c in mock_ctx.call_args_list
             if c.kwargs.get("user_id") == user_id
         ]
         assert len(calls_with_user_id) == 1, \
-            f"Expected exactly 1 LLMClient(user_id='{user_id}'), got {mock_init.call_args_list}"
+            f"Expected set_user_context(user_id='{user_id}'), got {mock_ctx.call_args_list}"
 
     def test_recovery_then_refresh_corrects_stale_memory(self, client, db):
         """After server restart recovery (stale first_query memory), the next

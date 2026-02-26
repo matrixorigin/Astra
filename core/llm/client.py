@@ -520,7 +520,9 @@ class LLMClient(DbConsumer):
         model: str | None = None,
         task_hint: str | None = None,
     ):
-        """Yield tool calls and text chunks."""
+        """Yield tool calls and text chunks. Logs token usage at end."""
+        start = time.time()
+        trace_id = str(uuid7())
         model = self._resolve_model(model)
         self._check_budget(model, messages)
         temp = self.config.get("temperature", 0.7)
@@ -539,12 +541,42 @@ class LLMClient(DbConsumer):
                 provider = self._get_provider(model_cfg.provider)
                 if hasattr(provider, 'cache_enabled'):
                     provider.cache_enabled = model_cfg.enable_cache
+                usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}
                 for chunk in provider.complete_with_tools_stream(
                     messages, tools, model_cfg.model_name, tool_choice, temp, max_tok
                 ):
-                    if chunk["type"] != "usage":
+                    if chunk["type"] == "usage":
+                        usage["prompt"] = chunk.get("prompt", 0)
+                        usage["completion"] = chunk.get("completion", 0)
+                        usage["cache_read"] = chunk.get("cache_read", 0)
+                        usage["cache_creation"] = chunk.get("cache_creation", 0)
+                    else:
                         yield chunk
                 breaker.record_success()
+                latency = int((time.time() - start) * 1000)
+                cost = self.router.calculate_cost(
+                    model_cfg.model_name,
+                    usage["prompt"],
+                    usage["completion"],
+                    cache_read_tokens=usage["cache_read"],
+                    cache_creation_tokens=usage["cache_creation"],
+                )
+                self._record_spend(cost)
+                self._log_call(
+                    trace_id, self.user_id, model_cfg.provider,
+                    LLMResponse(
+                        content="[streamed+tools]",
+                        model=model_cfg.model_name, provider=model_cfg.provider,
+                        tokens_prompt=usage["prompt"], tokens_completion=usage["completion"],
+                        tokens_total=usage["prompt"] + usage["completion"],
+                        latency_ms=latency, cost_usd=cost,
+                        cache_read_tokens=usage["cache_read"],
+                        cache_creation_tokens=usage["cache_creation"],
+                    ),
+                    "success",
+                )
+                yield {"type": "usage", "prompt": usage["prompt"], "completion": usage["completion"],
+                       "cache_read": usage["cache_read"], "cache_creation": usage["cache_creation"]}
                 return
             except (BudgetExceededError, PermissionError):
                 raise
