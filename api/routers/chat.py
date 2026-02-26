@@ -2,6 +2,7 @@
 
 import json
 import threading
+import time
 from collections import OrderedDict
 from typing import Annotated, Any
 
@@ -417,7 +418,13 @@ _SESSION_TTL = 86400  # 24 hours in seconds
 
 
 class _SessionCache(_LRUDict):
-    """LRU dict with per-entry TTL for session data."""
+    """LRU dict with per-entry TTL for session data.
+
+    Values are dicts with keys: history (list), tools (list), ts (float).
+    The ts field is managed automatically — callers should not set it.
+    Uses OrderedDict.__getitem__ (not super().__getitem__) inside self._lock
+    to avoid redundant RLock re-acquisition from _LRUDict.__getitem__.
+    """
 
     def __init__(self, maxsize: int, ttl: int = _SESSION_TTL):
         super().__init__(maxsize)
@@ -427,17 +434,17 @@ class _SessionCache(_LRUDict):
         with self._lock:
             if key not in self:
                 return default
-            import time
-            entry = super().__getitem__(key)
+            entry = OrderedDict.__getitem__(self, key)
             if time.monotonic() - entry.get("ts", 0) > self._ttl:
-                super().pop(key, None)
+                OrderedDict.__delitem__(self, key)
                 return default
             entry["ts"] = time.monotonic()
             self.move_to_end(key)
             return entry
 
     def __setitem__(self, key, value):
-        import time
+        if not isinstance(value, dict):
+            raise TypeError(f"_SessionCache values must be dict, got {type(value).__name__}")
         value.setdefault("ts", time.monotonic())
         super().__setitem__(key, value)
 

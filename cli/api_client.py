@@ -13,6 +13,9 @@ from typing import Any
 import httpx
 from httpx_sse import aconnect_sse
 
+# Sentinel to distinguish "field not loaded / not changed" from "explicitly set to None".
+_UNSET = object()
+
 
 class APIClient:
     """Client for mo-agent API server."""
@@ -39,8 +42,26 @@ class APIClient:
         self._access_token: str | None = None
         self._refresh_token: str | None = None
         self._current_username: str | None = None
-        self._default_model: str | None = None
-        self._last_session_id: str | None = None
+        # _UNSET means "not loaded yet / no change to persist".
+        # None means "explicitly cleared by caller" and will be written to file.
+        self._default_model: str | None | object = _UNSET
+        self._last_session_id: str | None | object = _UNSET
+
+    @staticmethod
+    def load_profile(
+        profile: str | None = None,
+        credentials_path: Path | None = None,
+    ) -> dict[str, Any]:
+        """Read profile data from credentials file without creating an HTTP client."""
+        path = credentials_path or Path.home() / ".mo-agent" / "credentials.json"
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+            name = profile or os.getenv("MO_AGENT_PROFILE") or data.get("current_profile", "default")
+            return data.get("profiles", {}).get(name, {})
+        except Exception:
+            return {}
 
     async def __aenter__(self) -> "APIClient":
         """Async context manager entry."""
@@ -112,9 +133,11 @@ class APIClient:
             "access_token": self._access_token,
             "refresh_token": self._refresh_token,
         })
-        if self._default_model is not None:
+        # Only write optional fields if they have been loaded or explicitly set.
+        # _UNSET means "not touched" — preserve whatever is already in the file.
+        if self._default_model is not _UNSET:
             existing["default_model"] = self._default_model
-        if self._last_session_id is not None:
+        if self._last_session_id is not _UNSET:
             existing["last_session_id"] = self._last_session_id
         data.setdefault("profiles", {})[profile_name] = existing
         

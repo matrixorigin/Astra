@@ -241,11 +241,9 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
     # Load persisted defaults from profile
     try:
         from cli.api_client import APIClient as _AC
-        import asyncio as _aio
-        async def _load():
-            async with _AC(base_url=client.base_url, profile=client.profile) as ac:
-                return ac._default_model, ac._last_session_id
-        _dm, _ls = _aio.run(_load())
+        _profile = _AC.load_profile(profile=client.profile)
+        _dm = _profile.get("default_model")
+        _ls = _profile.get("last_session_id")
         if not selected_model and _dm:
             selected_model = _dm
         if resume and not session_id and _ls:
