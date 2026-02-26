@@ -481,12 +481,17 @@ def _build_turn_messages(
     cached_sections = cached.get("sections")
     context_capture_id: str | None = None
 
-    # Recover from DB if not in memory (server restart)
+    # Recover from DB if not in memory (server restart).
+    # Also recovers sections so incremental refresh works on subsequent turns.
     if history is None:
-        history = _recover_history_from_db(db, user_id, session_id, agent_id)
+        history, cached_sections = _recover_history_from_db(db, user_id, session_id, agent_id)
 
     # Rebuild system prompt: either first turn (empty history) or forced by tool change.
     # On force_rebuild_system we replace history[0] in-place, preserving conversation.
+    # NOTE: on mid-session rebuild, project_rules and edge_profile may be None (only
+    # sent on turn 0). The rebuilt prompt will have updated tool info but stale/missing
+    # project context. This is acceptable — the Self-Model tool section is the primary
+    # reason for rebuild, and project context doesn't change mid-session.
     if not history or force_rebuild_system:
         user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
 
@@ -562,12 +567,17 @@ def _build_turn_messages(
 _MAX_RECOVERY_EVENTS = 50
 
 
-def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_id: str | None = None) -> list[dict[str, Any]]:
+def _recover_history_from_db(
+    db: Session, user_id: str, session_id: str, agent_id: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, str] | None]:
     """Rebuild conversation history from persisted events (for server restart recovery).
 
     Recovers user_query, llm_response, tool_call, and tool_result events
     to produce a valid OpenAI message sequence:
         user → assistant(tool_calls) → tool(result) → assistant → ...
+
+    Returns (history, sections).  sections is the prompt section dict from
+    PromptAssembler so that subsequent turns can do incremental refresh.
     """
     try:
         rows = db.execute(
@@ -580,7 +590,7 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
             {"sid": session_id},
         ).fetchall()
         if not rows:
-            return []
+            return [], None
 
         first_query = next((r[1] for r in rows if r[0] == "user_query"), "")
         from core.context.prompt_assembler import PromptAssembler
@@ -667,10 +677,10 @@ def _recover_history_from_db(db: Session, user_id: str, session_id: str, agent_i
         # Intentionally discard trailing pending_tool_calls: incomplete tool
         # call sequences (e.g. run cancelled mid-tool) should not be sent to
         # the LLM — they would produce an invalid message sequence.
-        return history
+        return history, assembled.sections
     except SQLAlchemyError as e:
         logger.debug("History recovery failed: %s", e)
-        return []
+        return [], None
 
 
 def _persist_turn_events(
@@ -881,21 +891,29 @@ async def chat_turn(
                 context_capture_id=snapshot_id,
             )
 
-            yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"
-
-            # Post-turn firewall verification (non-blocking, best-effort)
+            # Pre-completion firewall verification (must arrive before turn_complete
+            # because edge clients may close the connection on turn_complete).
+            # Runs in a thread to avoid blocking the event loop — verify_response
+            # is synchronous and may do DB queries + claim extraction.
+            firewall_warning: dict[str, Any] | None = None
             if full_text and snapshot_id:
                 try:
+                    import asyncio
                     from core.verification.firewall import HallucinationFirewall
                     fw = HallucinationFirewall(SessionLocal, context_manager=None)
-                    result = fw.verify_response(full_text, snapshot_id)
+                    result = await asyncio.to_thread(fw.verify_response, full_text, snapshot_id)
                     if not result.safe_to_deliver:
-                        yield f"data: {json.dumps({'type': 'warning', 'message': 'Response may contain unverified claims', 'claims_failed': result.claims_failed})}\n\n"
+                        firewall_warning = {'type': 'warning', 'message': 'Response may contain unverified claims', 'claims_failed': result.claims_failed}
                 except Exception as e:
                     logger.debug("Firewall verification skipped: %s", e)
 
+            if firewall_warning:
+                yield f"data: {json.dumps(firewall_warning)}\n\n"
+
+            yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"
+
         except Exception as e:
-            logger.error(f"chat_turn error: {e}", exc_info=True)
+            logger.error("chat_turn error: %s", e, exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(

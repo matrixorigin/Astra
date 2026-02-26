@@ -782,9 +782,10 @@ class TestRecoverHistoryUsesAssembler:
 
         try:
             from api.routers.chat import _recover_history_from_db
-            history = _recover_history_from_db(db_session, user_id, session_id)
+            history, sections = _recover_history_from_db(db_session, user_id, session_id)
 
             assert history, "Recovery should return non-empty history"
+            assert sections is not None, "Recovery should return sections for incremental refresh"
             system_msg = history[0]["content"]
             # Must contain Self-Model from assembler — the old hardcoded fallback is not acceptable
             assert _SELF_MODEL_MARKER in system_msg, \
@@ -847,7 +848,8 @@ class TestRecoverHistoryToolCalls:
 
     def _recover(self):
         from api.routers.chat import _recover_history_from_db
-        return _recover_history_from_db(self.db, self.uid, self.sid)
+        history, _sections = _recover_history_from_db(self.db, self.uid, self.sid)
+        return history
 
     def test_single_tool_call_round_trip(self):
         """user → tool_call_start → tool_result → llm_response produces valid sequence."""

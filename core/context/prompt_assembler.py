@@ -84,6 +84,15 @@ SNAPSHOT_SECTION_CHARS = 2000
 _MAX_HISTORY_EVENTS = 20
 
 
+# Canonical section ordering — shared by assemble() and refresh_memory().
+# Cache-friendly: stable sections first (identity, self_model, project_context)
+# so LLM providers can cache the prefix across turns.
+_SECTION_ORDER = [
+    "identity", "self_model", "project_context", "memory",
+    "working_memory", "history", "constraints",
+]
+
+
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate. ASCII ≈ 4 chars/token, CJK ≈ 1 char/token.
 
@@ -215,10 +224,8 @@ class PromptAssembler(DbConsumer):
         if total > max_tokens:
             sections, breakdown = self._compress(sections, breakdown, max_tokens)
 
-        # Assemble in cache-friendly order
-        ordered_keys = ["identity", "self_model", "project_context", "memory",
-                        "working_memory", "history", "constraints"]
-        parts = [sections[k] for k in ordered_keys if k in sections]
+        # Assemble in cache-friendly order (see _SECTION_ORDER)
+        parts = [sections[k] for k in _SECTION_ORDER if k in sections]
         system_message = "\n\n".join(parts)
 
         # Cache prefix = stable sections (identity + self_model + project_context)
@@ -250,11 +257,17 @@ class PromptAssembler(DbConsumer):
         user_id: str,
         user_query: str,
         current_sections: dict[str, str],
+        max_tokens: int = 8000,
     ) -> AssembledPrompt:
-        """Refresh §4 (memory) for subsequent turns, keeping stable sections.
+        """Refresh §4 (memory) and §5 (working memory) for turn 2+.
 
-        Re-runs _build_memory() with the latest query, replaces the memory
-        section, rebuilds the system message, and saves a new snapshot.
+        Re-runs _build_memory() and _build_working_memory() with the latest
+        query, keeps all other sections unchanged, applies budget compression,
+        rebuilds the system message, and saves a new snapshot.
+
+        tools_schema is not returned (empty list) because tool definitions
+        don't change during incremental refresh — the caller already has them
+        cached from the initial assemble() call.
         """
         sections = dict(current_sections)
         breakdown: dict[str, int] = {}
@@ -277,10 +290,13 @@ class PromptAssembler(DbConsumer):
         for k, v in sections.items():
             breakdown[k] = _estimate_tokens(v)
 
+        # Compress if over budget (memory may have grown with new observations)
+        total = sum(breakdown.values())
+        if total > max_tokens:
+            sections, breakdown = self._compress(sections, breakdown, max_tokens)
+
         # Reassemble
-        ordered_keys = ["identity", "self_model", "project_context", "memory",
-                        "working_memory", "history", "constraints"]
-        parts = [sections[k] for k in ordered_keys if k in sections]
+        parts = [sections[k] for k in _SECTION_ORDER if k in sections]
         system_message = "\n\n".join(parts)
 
         snapshot_id = self._save_snapshot(session_id, sections, breakdown)

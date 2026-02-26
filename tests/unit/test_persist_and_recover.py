@@ -30,11 +30,13 @@ class TestRecoverHistory:
              patch("core.context.prompt_assembler.PromptAssembler") as mock_pa:
             mock_exec.return_value.fetchall.return_value = rows
             mock_pa.return_value.assemble.return_value = MagicMock(
-                system_message="system", snapshot_id=None, token_breakdown={}
+                system_message="system", snapshot_id=None, token_breakdown={},
+                sections={"identity": "system"},
             )
             from api.routers.chat import _recover_history_from_db
-            history = _recover_history_from_db(db, "u1", "s1")
+            history, sections = _recover_history_from_db(db, "u1", "s1")
 
+        assert sections is not None
         assert history[0] == {"role": "system", "content": "system"}
         assert history[1] == {"role": "user", "content": "Hello"}
         assert history[2] == {"role": "assistant", "content": "Hi there!"}
@@ -59,10 +61,11 @@ class TestRecoverHistory:
              patch("core.context.prompt_assembler.PromptAssembler") as mock_pa:
             mock_exec.return_value.fetchall.return_value = rows
             mock_pa.return_value.assemble.return_value = MagicMock(
-                system_message="sys", snapshot_id=None, token_breakdown={}
+                system_message="sys", snapshot_id=None, token_breakdown={},
+                sections={"identity": "sys"},
             )
             from api.routers.chat import _recover_history_from_db
-            history = _recover_history_from_db(db, "u1", "s1")
+            history, sections = _recover_history_from_db(db, "u1", "s1")
 
         # system, user, assistant(tool_calls), tool, assistant
         assert len(history) == 5
@@ -79,7 +82,7 @@ class TestRecoverHistory:
              patch.object(db, "execute") as mock_exec:
             mock_exec.return_value.fetchall.return_value = []
             from api.routers.chat import _recover_history_from_db
-            assert _recover_history_from_db(db, "u1", "s1") == []
+            assert _recover_history_from_db(db, "u1", "s1") == ([], None)
 
 
 # ---------------------------------------------------------------------------

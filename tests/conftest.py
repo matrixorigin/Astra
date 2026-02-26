@@ -200,6 +200,48 @@ def _clear_chat_module_state():
         pass
 
 
+# ============================================================================
+# Shared SSE / Streaming Test Helpers
+# ============================================================================
+
+def parse_sse_events(text: str) -> list[dict]:
+    """Parse SSE text into a list of JSON event dicts."""
+    import json as _json
+    events = []
+    for line in text.strip().split("\n"):
+        if line.startswith("data: "):
+            events.append(_json.loads(line[6:]))
+    return events
+
+
+async def _fake_stream_gen(chunks):
+    for c in chunks:
+        yield c
+
+
+def fake_llm_stream(chunks):
+    """Return an async generator that yields the given chunks.
+
+    Usage with patch:
+        patch("...LLMClient.chat_stream", return_value=fake_llm_stream([...]))
+    """
+    return _fake_stream_gen(chunks)
+
+
+def get_auth_headers(client, db, *, username="testuser", user_id="test_uid",
+                     email="test@test.com", password="password123"):
+    """Create a user (if needed) and return Authorization headers."""
+    from api.models import User
+    from core.auth.password import hash_password
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        user = User(user_id=user_id, username=username,
+                    email=email, password_hash=hash_password(password))
+        db.add(user)
+        db.commit()
+    resp = client.post("/auth/login", json={"username": username, "password": password})
+    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
 
 # ============================================================================
 # Shared Fixtures for Selector Tests
