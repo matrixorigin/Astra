@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import text
 from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
@@ -217,16 +216,15 @@ class ModelRouter(DbConsumer):
 
     def _get_quality_data(self) -> dict[str, float]:
         """Get average quality per model."""
+        from api.models import ModelQualityMetric
+        from sqlalchemy import func as sqlfunc
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT model, AVG(quality_score) as avg_quality "
-                    "FROM model_quality_metrics "
-                    "GROUP BY model"
-                )
-            ).fetchall()
-
-            return {row[0]: float(row[1]) for row in rows}
+            rows = (
+                db.query(ModelQualityMetric.model, sqlfunc.avg(ModelQualityMetric.quality_score))
+                .group_by(ModelQualityMetric.model)
+                .all()
+            )
+            return {model: float(avg_q) for model, avg_q in rows}
 
     def _estimate_cost(self, model: str, task_type: str) -> float:
         """Estimate cost for a model on a task type.
@@ -239,18 +237,16 @@ class ModelRouter(DbConsumer):
             Estimated cost in dollars
         """
         with self._db() as db:
-            row = db.execute(
-                text(
-                    "SELECT AVG(cost) FROM model_quality_metrics "
-                    "WHERE model = :model AND task_type = :task_type"
-                ),
-                {"model": model, "task_type": task_type},
-            ).fetchone()
+            from api.models import ModelQualityMetric
+            from sqlalchemy import func as sqlfunc
+            row = (
+                db.query(sqlfunc.avg(ModelQualityMetric.cost))
+                .filter(ModelQualityMetric.model == model, ModelQualityMetric.task_type == task_type)
+                .scalar()
+            )
 
-            if row:
-                cost = row[0]
-                if cost is not None:
-                    return float(cost)
+            if row is not None:
+                return float(row)
 
             # Default estimates
             defaults = {

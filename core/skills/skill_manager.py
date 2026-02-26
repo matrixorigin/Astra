@@ -13,9 +13,9 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from api.models import (
-    SkillDefinition,
     SkillInstallation,
     SkillPermission,
+    SkillRegistry,
     UserCredential,
     UserRole,
 )
@@ -56,8 +56,8 @@ class SkillManager(DbConsumer):
 
     # ── internal queries (accept db to avoid nested sessions) ────────────────
 
-    def _get_definition(self, db: Session, skill_name: str) -> SkillDefinition | None:
-        return db.query(SkillDefinition).filter_by(name=skill_name, is_active=1).first()
+    def _get_definition(self, db: Session, skill_name: str) -> SkillRegistry | None:
+        return db.query(SkillRegistry).filter_by(skill_name=skill_name, is_active=1).first()
 
     def _get_installation(self, db: Session, user_id: str, skill_name: str) -> SkillInstallation | None:
         return db.query(SkillInstallation).filter_by(user_id=user_id, skill_name=skill_name, status="installed").first()
@@ -66,7 +66,7 @@ class SkillManager(DbConsumer):
     # Returned ORM objects are expunged from the session so callers can safely
     # access any loaded attribute after the session is closed.
 
-    def get_definition(self, skill_name: str) -> SkillDefinition | None:
+    def get_definition(self, skill_name: str) -> SkillRegistry | None:
         with self._db() as db:
             row = self._get_definition(db, skill_name)
             if row is not None:
@@ -107,9 +107,11 @@ class SkillManager(DbConsumer):
             PermissionDeniedError: user lacks permission or skill deactivated
         """
         with self._db() as db:
-            defn = db.query(SkillDefinition).filter_by(name=skill_name).first()
+            defn = db.query(SkillRegistry).filter_by(skill_name=skill_name).first()
             if defn is None:
                 return  # Builtin skill — not in catalog at all
+            if getattr(defn, "source", "builtin") == "builtin":
+                return  # Builtin skills skip install/permission checks
             status = getattr(defn, "status", "active") or "active"
             if status != "active":
                 raise PermissionDeniedError(
@@ -141,7 +143,7 @@ class SkillManager(DbConsumer):
     # ── permission check ──────────────────────────────────────────────────────
 
     def _check_permission(
-        self, db: Session, user_id: str, skill_name: str, *, _defn: SkillDefinition | None = None
+        self, db: Session, user_id: str, skill_name: str, *, _defn: SkillRegistry | None = None
     ) -> bool:
         defn = _defn or self._get_definition(db, skill_name)
         if defn is None:

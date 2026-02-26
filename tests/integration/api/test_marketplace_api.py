@@ -28,7 +28,7 @@ def db_session():
 
 @pytest.fixture(autouse=True)
 def seed_skill_definition(db_session, test_user):
-    """Insert a public SkillDefinition so install works."""
+    """Insert a public skill in skills_registry so install works."""
     db_session.execute(text(
         "DELETE FROM skill_installations WHERE skill_name = 'github'"
     ))
@@ -36,17 +36,17 @@ def seed_skill_definition(db_session, test_user):
         "DELETE FROM user_credentials WHERE skill_name = 'github'"
     ))
     db_session.execute(text(
-        "DELETE FROM skill_definitions WHERE name = 'github'"
+        "DELETE FROM skills_registry WHERE skill_name = 'github'"
     ))
     db_session.execute(text(
-        "INSERT INTO skill_definitions (skill_id, name, version, description, manifest, is_active, is_public, created_by, created_at) "
-        "VALUES (:sid, 'github', '1.0.0', 'GitHub integration', '{}', 1, 1, :uid, NOW())"
+        "INSERT INTO skills_registry (skill_id, skill_name, version, description, manifest, is_active, is_public, source, created_by, created_at) "
+        "VALUES (:sid, 'github', '1.0.0', 'GitHub integration', '{}', 1, 1, 'marketplace', :uid, NOW())"
     ), {"sid": str(uuid4()), "uid": test_user.user_id})
     db_session.commit()
     yield
     db_session.execute(text("DELETE FROM skill_installations WHERE skill_name = 'github'"))
     db_session.execute(text("DELETE FROM user_credentials WHERE skill_name = 'github'"))
-    db_session.execute(text("DELETE FROM skill_definitions WHERE name = 'github'"))
+    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'github'"))
     db_session.commit()
 
 
@@ -100,7 +100,7 @@ def test_upgrade_skill(client, auth_headers, db_session):
     client.post("/marketplace/install", headers=auth_headers, json={"skill_name": "github"})
 
     # Bump definition version
-    db_session.execute(text("UPDATE skill_definitions SET version = '2.0.0' WHERE name = 'github'"))
+    db_session.execute(text("UPDATE skills_registry SET version = '2.0.0' WHERE skill_name = 'github'"))
     db_session.commit()
 
     resp = client.post("/marketplace/upgrade", headers=auth_headers, json={"skill_name": "github"})
@@ -170,10 +170,10 @@ def test_credential_update_overwrites(client, auth_headers):
 
 def test_install_permission_denied(client, auth_headers, db_session):
     """Non-public skill without explicit permission should 403."""
-    # Insert a private skill definition
+    # Insert a private skill
     db_session.execute(text(
-        "INSERT INTO skill_definitions (skill_id, name, version, description, manifest, is_active, is_public, created_by, created_at) "
-        "VALUES (:sid, 'private_skill', '1.0.0', 'Private', '{}', 1, 0, 'admin', NOW())"
+        "INSERT INTO skills_registry (skill_id, skill_name, version, description, manifest, is_active, is_public, source, created_by, created_at) "
+        "VALUES (:sid, 'private_skill', '1.0.0', 'Private', '{}', 1, 0, 'marketplace', 'admin', NOW())"
     ), {"sid": str(uuid4())})
     db_session.commit()
 
@@ -181,5 +181,5 @@ def test_install_permission_denied(client, auth_headers, db_session):
     assert resp.status_code == 403
 
     # Cleanup
-    db_session.execute(text("DELETE FROM skill_definitions WHERE name = 'private_skill'"))
+    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name = 'private_skill'"))
     db_session.commit()

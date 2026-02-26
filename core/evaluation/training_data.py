@@ -294,14 +294,14 @@ class TrainingDataPipeline(DbConsumer):
         """
         # Get recent training data for comparison
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT input_text, output_text FROM training_data "
-                    "WHERE session_id != :session_id "
-                    "ORDER BY created_at DESC LIMIT 100"
-                ),
-                {"session_id": session_id},
-            ).fetchall()
+            from api.models import TrainingData
+            rows = (
+                db.query(TrainingData.input_text, TrainingData.output_text)
+                .filter(TrainingData.session_id != session_id)
+                .order_by(TrainingData.created_at.desc())
+                .limit(100)
+                .all()
+            )
 
             if not rows:
                 return 0.0

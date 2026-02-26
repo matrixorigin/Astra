@@ -15,8 +15,7 @@ from core.verification.firewall import HallucinationFirewall, FirewallResult
 def firewall():
     db = Mock()
     ctx = Mock()
-    with patch("core.verification.firewall.ClaimExtractor"), \
-         patch("core.verification.schema.init_hallucination_tables"):
+    with patch("core.verification.firewall.ClaimExtractor"):
         fw = HallucinationFirewall(lambda: db, ctx, llm_client=None, use_llm_extraction=False)
     return fw
 

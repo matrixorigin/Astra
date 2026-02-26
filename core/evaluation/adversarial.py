@@ -176,15 +176,18 @@ class AdversarialEvaluator(DbConsumer):
     def get_attack_summary(self, agent_id: str) -> dict[str, Any]:
         """Get summary of attacks on an agent."""
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT attack_type, severity, COUNT(*) as count "
-                    "FROM adversarial_attacks "
-                    "WHERE agent_id = :agent_id "
-                    "GROUP BY attack_type, severity"
-                ),
-                {"agent_id": agent_id},
-            ).fetchall()
+            from api.models import AdversarialAttack
+            from sqlalchemy import func as sqlfunc
+            rows = (
+                db.query(
+                    AdversarialAttack.attack_type,
+                    AdversarialAttack.severity,
+                    sqlfunc.count().label("count"),
+                )
+                .filter(AdversarialAttack.agent_id == agent_id)
+                .group_by(AdversarialAttack.attack_type, AdversarialAttack.severity)
+                .all()
+            )
 
             summary: dict[str, Any] = {
                 "total_attacks": sum(r[2] for r in rows),

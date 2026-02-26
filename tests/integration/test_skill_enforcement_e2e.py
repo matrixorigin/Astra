@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 from sqlalchemy import text
 
-from api.models import SkillDefinition
+from api.models import SkillRegistry
 from core.skills.skill_manager import (
     SkillManager,
     SkillNotFoundError,
@@ -46,21 +46,22 @@ def mgr(db_factory, cred_mgr):
 def _seed_skill(db_session):
     """Insert a marketplace skill definition + public permission."""
     skill_id = _uuid()
-    db_session.add(SkillDefinition(
+    db_session.add(SkillRegistry(
         skill_id=skill_id,
-        name="github",
+        skill_name="github",
         version="1.0.0",
         description="GitHub integration",
         manifest={"depends_on": [], "credentials": []},
         is_active=True,
         is_public=True,
+        source="marketplace",
         created_by="admin",
         created_at=_now(),
     ))
     db_session.commit()
     yield "github"
     db_session.execute(text("DELETE FROM skill_installations WHERE skill_name = 'github'"))
-    db_session.execute(text("DELETE FROM skill_definitions WHERE skill_id = :id"), {"id": skill_id})
+    db_session.execute(text("DELETE FROM skills_registry WHERE skill_id = :id"), {"id": skill_id})
     db_session.commit()
 
 
@@ -68,21 +69,21 @@ def _seed_skill(db_session):
 def _seed_skills_with_dep(db_session):
     """Insert two skills: 'base_skill' and 'dependent_skill' (depends on base_skill)."""
     ids = [_uuid(), _uuid()]
-    db_session.add(SkillDefinition(
-        skill_id=ids[0], name="base_skill", version="1.0.0",
+    db_session.add(SkillRegistry(
+        skill_id=ids[0], skill_name="base_skill", version="1.0.0",
         description="Base", manifest={"depends_on": []},
-        is_active=True, is_public=True, created_by="admin", created_at=_now(),
+        is_active=True, is_public=True, source="marketplace", created_by="admin", created_at=_now(),
     ))
-    db_session.add(SkillDefinition(
-        skill_id=ids[1], name="dependent_skill", version="1.0.0",
+    db_session.add(SkillRegistry(
+        skill_id=ids[1], skill_name="dependent_skill", version="1.0.0",
         description="Depends on base", manifest={"depends_on": ["base_skill"]},
-        is_active=True, is_public=True, created_by="admin", created_at=_now(),
+        is_active=True, is_public=True, source="marketplace", created_by="admin", created_at=_now(),
     ))
     db_session.commit()
     yield
     db_session.execute(text("DELETE FROM skill_installations WHERE skill_name IN ('base_skill', 'dependent_skill')"))
     for sid in ids:
-        db_session.execute(text("DELETE FROM skill_definitions WHERE skill_id = :id"), {"id": sid})
+        db_session.execute(text("DELETE FROM skills_registry WHERE skill_id = :id"), {"id": sid})
     db_session.commit()
 
 

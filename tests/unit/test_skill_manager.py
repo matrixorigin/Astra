@@ -11,7 +11,7 @@ import pytest
 
 from api.models import (
     Role,
-    SkillDefinition,
+    SkillRegistry,
     SkillInstallation,
     SkillPermission,
     User,
@@ -51,13 +51,14 @@ def _unique_name(prefix="skill"):
 
 def _seed_skill(db, name=None, version="1.0.0", is_public=True):
     name = name or _unique_name()
-    defn = SkillDefinition(
+    defn = SkillRegistry(
         skill_id=_uid(),
-        name=name,
+        skill_name=name,
         version=version,
         manifest={"tables": [f"sk_{name}_data"]},
         is_active=1,
         is_public=1 if is_public else 0,
+        source="marketplace",
         created_at=_now(),
     )
     db.add(defn)
@@ -85,7 +86,7 @@ def _seed_permission(db, skill_name, grantee_type, grantee_id):
 class TestGetDefinition:
     def test_found(self, mgr, db_session):
         defn = _seed_skill(db_session)
-        assert mgr.get_definition(defn.name) is not None
+        assert mgr.get_definition(defn.skill_name) is not None
 
     def test_not_found(self, mgr):
         assert mgr.get_definition("nonexistent_xyz") is None
@@ -94,7 +95,7 @@ class TestGetDefinition:
         defn = _seed_skill(db_session)
         defn.is_active = 0
         db_session.flush()
-        assert mgr.get_definition(defn.name) is None
+        assert mgr.get_definition(defn.skill_name) is None
 
 
 # ── check_permission ──────────────────────────────────────────────────────────
@@ -103,17 +104,17 @@ class TestGetDefinition:
 class TestCheckPermission:
     def test_public_skill_always_allowed(self, mgr, db_session):
         defn = _seed_skill(db_session, is_public=True)
-        assert mgr.check_permission("any-user", defn.name) is True
+        assert mgr.check_permission("any-user", defn.skill_name) is True
 
     def test_private_skill_denied_without_grant(self, mgr, db_session):
         defn = _seed_skill(db_session, is_public=False)
-        assert mgr.check_permission(_uid(), defn.name) is False
+        assert mgr.check_permission(_uid(), defn.skill_name) is False
 
     def test_private_skill_allowed_with_user_grant(self, mgr, db_session):
         defn = _seed_skill(db_session, is_public=False)
         uid = _uid()
-        _seed_permission(db_session, defn.name, "user", uid)
-        assert mgr.check_permission(uid, defn.name) is True
+        _seed_permission(db_session, defn.skill_name, "user", uid)
+        assert mgr.check_permission(uid, defn.skill_name) is True
 
     def test_private_skill_allowed_with_role_grant(self, mgr, db_session):
         defn = _seed_skill(db_session, is_public=False)
@@ -122,10 +123,10 @@ class TestCheckPermission:
         db_session.add(User(user_id=uid, username=f"u_{uid[:8]}", email=f"{uid[:8]}@test.com", password_hash="x"))
         db_session.add(Role(role_id=role_id, role_name=f"r_{role_id[:8]}"))
         db_session.flush()
-        _seed_permission(db_session, defn.name, "role", role_id)
+        _seed_permission(db_session, defn.skill_name, "role", role_id)
         db_session.add(UserRole(user_id=uid, role_id=role_id))
         db_session.flush()
-        assert mgr.check_permission(uid, defn.name) is True
+        assert mgr.check_permission(uid, defn.skill_name) is True
 
     def test_nonexistent_skill(self, mgr):
         assert mgr.check_permission(_uid(), "nope_xyz") is False
@@ -137,16 +138,16 @@ class TestCheckPermission:
 class TestInstall:
     def test_install_records_installation(self, mgr, db_session):
         defn = _seed_skill(db_session)
-        inst = mgr.install(_uid(), defn.name)
-        assert inst.skill_name == defn.name
+        inst = mgr.install(_uid(), defn.skill_name)
+        assert inst.skill_name == defn.skill_name
         assert inst.status == "installed"
         assert inst.skill_version == "1.0.0"
 
     def test_install_idempotent(self, mgr, db_session):
         defn = _seed_skill(db_session)
         uid = _uid()
-        inst1 = mgr.install(uid, defn.name)
-        inst2 = mgr.install(uid, defn.name)
+        inst1 = mgr.install(uid, defn.skill_name)
+        inst2 = mgr.install(uid, defn.skill_name)
         assert inst1.installation_id == inst2.installation_id
 
     def test_install_skill_not_found(self, mgr):
@@ -156,7 +157,7 @@ class TestInstall:
     def test_install_permission_denied(self, mgr, db_session):
         defn = _seed_skill(db_session, is_public=False)
         with pytest.raises(PermissionDeniedError):
-            mgr.install(_uid(), defn.name)
+            mgr.install(_uid(), defn.skill_name)
 
 
 # ── uninstall ─────────────────────────────────────────────────────────────────
@@ -166,16 +167,16 @@ class TestUninstall:
     def test_uninstall_marks_and_deletes_creds(self, mgr, db_session):
         defn = _seed_skill(db_session)
         uid = _uid()
-        mgr.install(uid, defn.name)
-        mgr.save_credential(uid, defn.name, "token", "ghp_xxx")
+        mgr.install(uid, defn.skill_name)
+        mgr.save_credential(uid, defn.skill_name, "token", "ghp_xxx")
 
-        mgr.uninstall(uid, defn.name)
+        mgr.uninstall(uid, defn.skill_name)
 
         inst = db_session.query(SkillInstallation).filter_by(
-            user_id=uid, skill_name=defn.name
+            user_id=uid, skill_name=defn.skill_name
         ).first()
         assert inst.status == "uninstalled"
-        assert mgr.get_credential(uid, defn.name, "token") is None
+        assert mgr.get_credential(uid, defn.skill_name, "token") is None
 
     def test_uninstall_not_installed(self, mgr):
         with pytest.raises(SkillNotInstalledError):
@@ -189,23 +190,23 @@ class TestUpgrade:
     def test_upgrade_bumps_version(self, mgr, db_session):
         defn = _seed_skill(db_session, version="1.0.0")
         uid = _uid()
-        mgr.install(uid, defn.name)
+        mgr.install(uid, defn.skill_name)
         defn.version = "1.1.0"
         db_session.flush()
-        inst = mgr.upgrade(uid, defn.name)
+        inst = mgr.upgrade(uid, defn.skill_name)
         assert inst.skill_version == "1.1.0"
 
     def test_upgrade_already_latest(self, mgr, db_session):
         defn = _seed_skill(db_session, version="1.0.0")
         uid = _uid()
-        mgr.install(uid, defn.name)
-        inst = mgr.upgrade(uid, defn.name)
+        mgr.install(uid, defn.skill_name)
+        inst = mgr.upgrade(uid, defn.skill_name)
         assert inst.skill_version == "1.0.0"
 
     def test_upgrade_not_installed(self, mgr, db_session):
         defn = _seed_skill(db_session)
         with pytest.raises(SkillNotInstalledError):
-            mgr.upgrade(_uid(), defn.name)
+            mgr.upgrade(_uid(), defn.skill_name)
 
 
 # ── credentials ───────────────────────────────────────────────────────────────
@@ -284,9 +285,9 @@ class TestListInstalled:
         defn1 = _seed_skill(db_session)
         defn2 = _seed_skill(db_session)
         uid = _uid()
-        mgr.install(uid, defn1.name)
-        mgr.install(uid, defn2.name)
-        mgr.uninstall(uid, defn2.name)
+        mgr.install(uid, defn1.skill_name)
+        mgr.install(uid, defn2.skill_name)
+        mgr.uninstall(uid, defn2.skill_name)
         installed = mgr.list_installed(uid)
         assert len(installed) == 1
-        assert installed[0].skill_name == defn1.name
+        assert installed[0].skill_name == defn1.skill_name

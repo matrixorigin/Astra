@@ -190,11 +190,11 @@ class TestSkillRollback:
     """Verify upgrade→rollback lifecycle."""
 
     def _create_skill_def(self, db, name, version="1.0"):
-        from api.models import SkillDefinition
+        from api.models import SkillRegistry as SkillRegistryModel
         from uuid_utils import uuid7
-        sd = SkillDefinition(
-            skill_id=str(uuid7()), name=name, version=version,
-            is_active=1, is_public=1, manifest={},
+        sd = SkillRegistryModel(
+            skill_id=str(uuid7()), skill_name=name, version=version,
+            is_active=1, is_public=1, source="marketplace", manifest={},
         )
         db.add(sd)
         db.commit()
@@ -214,7 +214,7 @@ class TestSkillRollback:
         assert inst.skill_version == "1.0"
 
         db_session.execute(text(
-            "UPDATE skill_definitions SET version = '2.0' WHERE name = :n"
+            "UPDATE skills_registry SET version = '2.0' WHERE skill_name = :n"
         ), {"n": skill})
         db_session.commit()
 
@@ -235,7 +235,7 @@ class TestSkillRollback:
         mgr.install(uid, skill)
 
         db_session.execute(text(
-            "UPDATE skill_definitions SET version = '2.0' WHERE name = :n"
+            "UPDATE skills_registry SET version = '2.0' WHERE skill_name = :n"
         ), {"n": skill})
         db_session.commit()
         mgr.upgrade(uid, skill)

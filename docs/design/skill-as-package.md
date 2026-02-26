@@ -49,7 +49,7 @@ github.get_pr_checks(repo, pr_number)       # → GitHub API + cache
 │    agents, model_registry                                     │
 │                                                               │
 │  Skill infrastructure tables (no prefix, part of core):       │
-│    skill_definitions, skill_permissions,                      │
+│    skills_registry, skill_permissions,                        │
 │    skill_installations, user_credentials                      │
 │                                                               │
 │  Skill business tables (sk_{skill}_ prefix):                  │
@@ -65,8 +65,8 @@ github.get_pr_checks(repo, pr_number)       # → GitHub API + cache
 
 | Category | Prefix | Defined in | Examples |
 |----------|--------|------------|----------|
-| Core platform | (none) | `api/models.py` | `users`, `roles`, `sessions`, `agents` |
-| Skill infrastructure | (none) | `api/models.py` | `skill_definitions`, `skill_installations`, `skill_permissions`, `user_credentials` |
+| Core platform | (none) | `api/models/` | `users`, `roles`, `sessions`, `agents` |
+| Skill infrastructure | (none) | `api/models/skill.py` | `skills_registry`, `skill_installations`, `skill_permissions`, `user_credentials` |
 | Skill business data | `sk_{skill}_` | `skills/{skill}/models.py` | `sk_github_repos`, `sk_github_pr_cache` |
 
 Rules:
@@ -216,26 +216,28 @@ class GetPRChecksAction:
 
 ## 6. Platform Tables
 
-### 6.1 skill_definitions — marketplace catalog
+### 6.1 skills_registry — unified skill catalog
 
-> **Note**: `skill_definitions` is the marketplace catalog (what skills exist, their manifests).
-> `skills_registry` (see `memory-and-context.md`) is the runtime registry tracking active versions
-> and selection history. Both tables are needed — different purposes.
+> `skills_registry` is the single source of truth for all skills (builtin, marketplace, user).
+> The `source` column distinguishes origin. The former `skill_definitions` table has been merged here.
 
 ```python
-class SkillDefinition(Base):
-    __tablename__ = "skill_definitions"
+class SkillRegistry(Base):
+    __tablename__ = "skills_registry"
 
-    skill_id = Column(String(36), primary_key=True)
-    name = Column(String(100), nullable=False, unique=True)
-    version = Column(String(20), nullable=False)
+    skill_id = Column(String(255), primary_key=True)  # skill_name@version
+    skill_name = Column(String(255), nullable=False, index=True)
+    version = Column(String(32), nullable=False)
     description = Column(Text)
-    manifest = Column(JSON, nullable=False)
-    is_active = Column(Boolean, default=True)
-    is_public = Column(Boolean, default=False)
+    skill_definition = Column(JSON)
+    source = Column(String(20), default="builtin")  # builtin/marketplace/user
+    manifest = Column(JSON)
+    is_active = Column(SmallInteger, default=1)
+    is_public = Column(SmallInteger, default=0)
+    status = Column(String(20), default="active")
     created_by = Column(String(36))
-    created_at = Column(DateTime, nullable=False)
-    updated_at = Column(DateTime)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 ```
 
 ### 6.2 skill_installations — per-user install state

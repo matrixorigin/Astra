@@ -107,14 +107,14 @@ class TestModelRouter:
 
     def test_estimate_cost_from_db(self):
         db = _mock_db()
-        db.execute.return_value = Mock(fetchone=Mock(return_value=(0.025,)))
+        db.query.return_value.filter.return_value.scalar.return_value = 0.025
 
         router = ModelRouter(lambda: db)
         assert router._estimate_cost("gpt-4", "code_review") == 0.025
 
     def test_estimate_cost_falls_back_to_default(self):
         db = _mock_db()
-        db.execute.return_value = Mock(fetchone=Mock(return_value=None))
+        db.query.return_value.filter.return_value.scalar.return_value = None
 
         router = ModelRouter(lambda: db)
         assert router._estimate_cost("gpt-4", "unknown_task") == 0.03

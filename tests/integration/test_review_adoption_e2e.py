@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 os.environ.setdefault("MATRIXONE_DATABASE", "test_dev_agent_v3")
 
-from api.models import SkillDefinition
+from api.models import SkillRegistry as SkillRegistryModel
 
 
 def _session_local():
@@ -96,13 +96,14 @@ class TestSkillLifecycle:
     """Verify draft→active→deprecated lifecycle transitions."""
 
     def _create_skill(self, db, name, status="active"):
-        skill = SkillDefinition(
+        skill = SkillRegistryModel(
             skill_id=f"sk_{os.urandom(4).hex()}",
-            name=name,
+            skill_name=name,
             version="1.0.0",
             is_active=1 if status == "active" else 0,
             is_public=1,
             status=status,
+            source="marketplace",
             manifest={},
         )
         db.add(skill)
@@ -118,7 +119,7 @@ class TestSkillLifecycle:
         registry = SkillRegistry(lambda: db_session)
         registry.publish(name)
 
-        row = db_session.query(SkillDefinition).filter_by(name=name).first()
+        row = db_session.query(SkillRegistryModel).filter_by(skill_name=name).first()
         assert row.status == "active"
         assert row.is_active == 1
 
@@ -131,7 +132,7 @@ class TestSkillLifecycle:
         registry = SkillRegistry(lambda: db_session)
         registry.deprecate(name)
 
-        row = db_session.query(SkillDefinition).filter_by(name=name).first()
+        row = db_session.query(SkillRegistryModel).filter_by(skill_name=name).first()
         assert row.status == "deprecated"
         assert row.is_active == 0
 

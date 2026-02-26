@@ -151,14 +151,10 @@ class TestAdversarialEvaluator:
 
     def test_get_attack_summary(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchall=Mock(
-                return_value=[
-                    ("jailbreak", "critical", 2),
-                    ("hallucination", "high", 1),
-                ]
-            )
-        )
+        db.query.return_value.filter.return_value.group_by.return_value.all.return_value = [
+            ("jailbreak", "critical", 2),
+            ("hallucination", "high", 1),
+        ]
 
         evaluator = AdversarialEvaluator(lambda: db)
         summary = evaluator.get_attack_summary("agent-1")
@@ -170,14 +166,10 @@ class TestAdversarialEvaluator:
 
     def test_get_attack_summary_with_low_severity(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchall=Mock(
-                return_value=[
-                    ("jailbreak", "low", 8),
-                    ("jailbreak", "critical", 2),
-                ]
-            )
-        )
+        db.query.return_value.filter.return_value.group_by.return_value.all.return_value = [
+            ("jailbreak", "low", 8),
+            ("jailbreak", "critical", 2),
+        ]
 
         evaluator = AdversarialEvaluator(lambda: db)
         summary = evaluator.get_attack_summary("agent-1")

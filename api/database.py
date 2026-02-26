@@ -116,17 +116,31 @@ def get_db_context():
 
 def init_db():
     """Initialize database - create tables and indexes if not exist."""
-    from sqlalchemy import inspect
+    from sqlalchemy import inspect, text
 
     from api.models import Base
 
     # Auto-discover skill models (skills/*/models.py) so their tables are in Base.metadata
     _import_skill_models()
 
-    existing = set(inspect(engine).get_table_names(schema=engine.url.database))
+    inspector = inspect(engine)
+    existing = set(inspector.get_table_names(schema=engine.url.database))
     tables_to_create = [t for t in Base.metadata.sorted_tables if t.name not in existing]
     if tables_to_create:
         Base.metadata.create_all(bind=engine, tables=tables_to_create, checkfirst=True)
+
+    # Migrate: add columns merged from skill_definitions into skills_registry
+    if "skills_registry" in existing:
+        cols = {c["name"] for c in inspector.get_columns("skills_registry", schema=engine.url.database)}
+        with engine.begin() as conn:
+            for col, ddl in [
+                ("source", "VARCHAR(20) DEFAULT 'builtin'"),
+                ("manifest", "JSON"),
+                ("is_public", "SMALLINT DEFAULT 0"),
+                ("created_by", "VARCHAR(36)"),
+            ]:
+                if col not in cols:
+                    conn.execute(text(f"ALTER TABLE skills_registry ADD COLUMN {col} {ddl}"))
 
 
 def _import_skill_models():

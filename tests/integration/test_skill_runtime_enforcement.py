@@ -14,7 +14,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from api.models import (
-    SkillDefinition,
+    SkillRegistry,
     SkillInstallation,
     SkillPermission,
     User,
@@ -46,7 +46,7 @@ def _cleanup(db_session):
     for skill_name in _cleanup_skills:
         db_session.query(SkillPermission).filter_by(skill_name=skill_name).delete()
         db_session.query(SkillInstallation).filter_by(skill_name=skill_name).delete()
-        db_session.query(SkillDefinition).filter_by(name=skill_name).delete()
+        db_session.query(SkillRegistry).filter_by(skill_name=skill_name).delete()
     for user_id in _cleanup_users:
         db_session.query(User).filter_by(user_id=user_id).delete()
     db_session.commit()
@@ -89,15 +89,16 @@ def _create_user(db: Session, user_id: str) -> User:
     return user
 
 
-def _create_skill(db: Session, skill_name: str, manifest: dict | None = None) -> SkillDefinition:
+def _create_skill(db: Session, skill_name: str, manifest: dict | None = None) -> SkillRegistry:
     """Create test skill definition."""
     _cleanup_skills.append(skill_name)
-    skill = SkillDefinition(
+    skill = SkillRegistry(
         skill_id=_uid("skill"),
-        name=skill_name,
+        skill_name=skill_name,
         version="1.0.0",
         is_active=1,
         is_public=0,
+        source="marketplace",
         manifest=manifest or {},
     )
     db.add(skill)

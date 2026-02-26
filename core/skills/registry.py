@@ -379,11 +379,11 @@ class SkillRegistry:
 
     def publish(self, skill_name: str) -> None:
         """Transition skill from draft → active. Triggers gate if configured."""
-        from api.models import SkillDefinition
+        from api.models import SkillRegistry as SkillModel
         db = self._db_factory()
         try:
-            row = db.query(SkillDefinition).filter(
-                SkillDefinition.name == skill_name,
+            row = db.query(SkillModel).filter(
+                SkillModel.skill_name == skill_name,
             ).first()
             if not row:
                 raise ValueError(f"Skill '{skill_name}' not found")
@@ -408,11 +408,11 @@ class SkillRegistry:
 
     def deprecate(self, skill_name: str) -> None:
         """Transition skill from active → deprecated."""
-        from api.models import SkillDefinition
+        from api.models import SkillRegistry as SkillModel
         db = self._db_factory()
         try:
-            row = db.query(SkillDefinition).filter(
-                SkillDefinition.name == skill_name, SkillDefinition.status == "active",
+            row = db.query(SkillModel).filter(
+                SkillModel.skill_name == skill_name, SkillModel.status == "active",
             ).first()
             if not row:
                 raise ValueError(f"No active skill '{skill_name}' to deprecate")

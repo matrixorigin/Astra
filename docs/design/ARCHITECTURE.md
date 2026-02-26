@@ -63,7 +63,7 @@ We don't compete on "smarter LLM." We compete on **trust infrastructure**: every
 │              PLATFORM STATE (Platform DB)                    │
 │  Identity: users, roles, permissions                        │
 │  Runtime: sessions, events, decisions, snapshots, audit     │
-│  Catalog: skill_definitions, skill_permissions, models      │
+│  Catalog: skills_registry, skill_permissions, models         │
 │  Credentials: user_credentials (encrypted)                  │
 ├─────────────────────────────────────────────────────────────┤
 │              SKILL DATA (sk_{skill}_{table} prefix)         │

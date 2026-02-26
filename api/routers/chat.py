@@ -19,10 +19,6 @@ from core.logging_config import get_logger
 logger = get_logger(__name__)
 router = APIRouter()
 
-# Implicit-feedback signal → numeric rating for PromptFeedback
-_RATING_MAP = {"correction": 1, "frustration": 1, "rephrasing": 2,
-               "clarification": 3, "positive": 5}
-
 
 # ---------------------------------------------------------------------------
 # Request / Response models
@@ -558,15 +554,12 @@ def _persist_turn_events(
 ) -> str | None:
     """Persist events for this turn: user query, tool results, LLM response.
 
-    Also writes decision audit, skill selection, observations, and implicit feedback.
-    All writes are best-effort — failures are logged but never block the response.
+    Also writes decision audit, skill selection, observations, and implicit feedback
+    via TurnHooks. All writes are best-effort — failures are logged but never block.
 
-    NOTE: The ``db`` parameter is unused. Each write creates its own session via
-    SessionLocal because this function runs inside an async SSE generator where
-    the caller's session may already be closed. Keeping the parameter for API
-    stability with the existing call site.
+    Context snapshot is NOT saved here — it is saved BEFORE the LLM call by
+    PromptAssembler (the correct timing). This fixes the duplicate-snapshot bug.
     """
-    from api.models import DecisionAudit, SkillSelectionEvent
     from uuid_utils import uuid7
 
     context_capture_id = None
@@ -577,7 +570,7 @@ def _persist_turn_events(
         from core.events.event_logger import EventLogger
         el = EventLogger(SessionLocal)
 
-        # Persist user query (first user message only)
+        # Persist user query
         parent_event_id = None
         causal_chain_id = str(uuid7())
         if user_content:
@@ -585,7 +578,7 @@ def _persist_turn_events(
             parent_event_id = user_ev.event_id
             causal_chain_id = user_ev.causal_chain_id
 
-        # Persist tool results from edge (tagged source: "edge")
+        # Persist tool results from edge
         if tool_results:
             for tr in tool_results:
                 meta = {"source": "edge", "tool_call_id": tr.get("tool_call_id")}
@@ -613,103 +606,27 @@ def _persist_turn_events(
                 causal_chain_id=causal_chain_id,
             )
 
-        # Context snapshot + decision audit + skill selection event
-        # Written in a single session to keep them consistent.
+        # Post-turn hooks via TurnHooks (decision audit, skill selection, observer, feedback)
         if parent_event_id:
-            try:
-                from core.context.manager import ContextManager
-                ctx_mgr = ContextManager(SessionLocal)
-                ctx = ctx_mgr.build_context(session_id=session_id, query=user_content or "")
-                context_capture_id = ctx_mgr.save_snapshot(ctx, session_id, parent_event_id)
+            from core.agent.turn_hooks import TurnHooks
+            hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client())
+            hooks.record_decision_audit(session_id, parent_event_id, tool_calls, full_text, context_capture_id)
+            hooks.record_skill_selection(session_id, user_content or "", tool_calls)
 
-                db_w = SessionLocal()
-                try:
-                    db_w.add(DecisionAudit(
-                        decision_id=str(uuid7()),
-                        session_id=session_id,
-                        event_id=parent_event_id,
-                        decision_type="tool_selection" if tc_names else "response_generation",
-                        decision_output={"text": full_text[:500], "tool_calls": tc_names},
-                        context_capture_id=context_capture_id,
-                    ))
-                    if tc_names:
-                        db_w.add(SkillSelectionEvent(
-                            event_id=str(uuid7()),
-                            session_id=session_id,
-                            user_query=(user_content or "")[:2000],
-                            selected_skills=tc_names,
-                            skill_name=tc_names[0],
-                            selection_method="llm_tool_choice",
-                        ))
-                    db_w.commit()
-                finally:
-                    db_w.close()
-            except Exception as e:
-                logger.debug("Context snapshot / decision audit skipped: %s", e)
-
-        # Observations via Observer (background thread).
-        # Observer.observe() already guards against redundant work via
-        # observed_msg_index and a token threshold, so calling it every turn
-        # is safe — it will no-op when there's nothing new to process.
         if user_content:
-            _spawn_observer(session_id, user_id, messages)
+            from core.agent.turn_hooks import TurnHooks
+            hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client())
+            hooks.run_observer(session_id, user_id, messages)
 
-        # Implicit feedback detection — lightweight heuristic, zero LLM cost.
-        # Only fires when there's a prior assistant message to evaluate against.
         if user_content and len(messages) >= 2:
-            try:
-                from core.context.implicit_feedback import ImplicitFeedbackDetector
-                prev_assistant = next(
-                    (m["content"] for m in reversed(messages) if m.get("role") == "assistant"),
-                    None,
-                )
-                signal = ImplicitFeedbackDetector.detect(user_content, prev_assistant)
-                if signal.signal_type != "neutral":
-                    # TODO: PromptFeedback.record_feedback still uses raw SQL internally.
-                    # Convert to ORM when prompts.py is refactored.
-                    from core.context.prompts import PromptFeedback
-                    PromptFeedback(SessionLocal).record_feedback(
-                        prompt_template_id="chat_turn",
-                        prompt_version="auto",
-                        llm_request_id=parent_event_id or "",
-                        user_rating=_RATING_MAP.get(signal.signal_type, 3),
-                        user_comment=f"[implicit:{signal.signal_type}] {signal.evidence}",
-                        metadata={"source": "implicit_heuristic", "confidence": str(signal.confidence)},
-                    )
-            except Exception as e:
-                logger.debug("Implicit feedback skipped: %s", e)
+            from core.agent.turn_hooks import TurnHooks
+            hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client())
+            hooks.detect_implicit_feedback(user_content, messages, parent_event_id)
 
     except Exception as e:
         logger.warning("Event persistence failed (non-fatal): %s", e)
 
     return context_capture_id
-
-
-def _spawn_observer(session_id: str, user_id: str, messages: list[dict[str, Any]]) -> None:
-    """Run Observer in a background thread with its own DB session and LLM client."""
-    try:
-        from core.memory.observer import Observer
-
-        # Reuse the module-level LLM client that chat_turn already created,
-        # rather than constructing a new LLMClient (which does DB queries,
-        # config loading, and provider init on every call).
-        llm_ref = _get_shared_llm_client()
-
-        def _bg():
-            try:
-                bg_db = SessionLocal()
-                try:
-                    Observer(bg_db, llm_client=llm_ref).observe(
-                        session_id=session_id, user_id=user_id, messages=messages,
-                    )
-                finally:
-                    bg_db.close()
-            except Exception as e:
-                logger.debug("Observer failed (non-fatal): %s", e)
-
-        threading.Thread(target=_bg, daemon=True).start()
-    except Exception as e:
-        logger.debug("Observer setup skipped: %s", e)
 
 
 # Lazy-initialized shared LLM client for background tasks (Observer).

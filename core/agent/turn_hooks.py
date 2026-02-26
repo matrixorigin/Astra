@@ -1,0 +1,153 @@
+"""Shared post-turn hooks for ChatLoop and /chat/turn.
+
+Extracts the common persistence logic (decision audit, skill selection,
+observer, implicit feedback) so both code paths stay in sync.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+from typing import Any, Callable
+
+from core.db_consumer import DbFactory
+
+logger = logging.getLogger(__name__)
+
+# Implicit-feedback rating map (signal_type → 1-5 rating)
+_RATING_MAP = {"positive": 5, "correction": 2, "negative": 1, "neutral": 3}
+
+
+class TurnHooks:
+    """Post-turn persistence hooks shared by ChatLoop and /chat/turn."""
+
+    def __init__(self, db_factory: DbFactory, llm_client: Any = None):
+        self._db_factory = db_factory
+        self._llm_client = llm_client
+
+    # ── Decision audit ────────────────────────────────────────────────
+
+    def record_decision_audit(
+        self,
+        session_id: str,
+        event_id: str,
+        tool_calls: list[dict[str, Any]],
+        response_text: str,
+        context_capture_id: str | None,
+    ) -> None:
+        """Record a decision audit entry."""
+        try:
+            from api.models import DecisionAudit
+            from uuid_utils import uuid7
+
+            tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+            db = self._db_factory()
+            try:
+                db.add(DecisionAudit(
+                    decision_id=str(uuid7()),
+                    session_id=session_id,
+                    event_id=event_id,
+                    decision_type="tool_selection" if tc_names else "response_generation",
+                    decision_output={"text": response_text[:500], "tool_calls": tc_names},
+                    context_capture_id=context_capture_id,
+                ))
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug("Decision audit skipped: %s", e)
+
+    # ── Skill selection event ─────────────────────────────────────────
+
+    def record_skill_selection(
+        self,
+        session_id: str,
+        user_content: str,
+        tool_calls: list[dict[str, Any]],
+    ) -> None:
+        """Record skill selection event if tools were called."""
+        tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
+        if not tc_names:
+            return
+        try:
+            from api.models import SkillSelectionEvent
+            from uuid_utils import uuid7
+
+            db = self._db_factory()
+            try:
+                db.add(SkillSelectionEvent(
+                    event_id=str(uuid7()),
+                    session_id=session_id,
+                    user_query=(user_content or "")[:2000],
+                    selected_skills=tc_names,
+                    skill_name=tc_names[0],
+                    selection_method="llm_tool_choice",
+                ))
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            logger.debug("Skill selection event skipped: %s", e)
+
+    # ── Observer ──────────────────────────────────────────────────────
+
+    def run_observer(
+        self,
+        session_id: str,
+        user_id: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Run Observer in a background thread."""
+        try:
+            from core.memory.observer import Observer
+
+            llm = self._llm_client
+
+            def _bg():
+                try:
+                    db = self._db_factory()
+                    try:
+                        Observer(db, llm_client=llm).observe(
+                            session_id=session_id, user_id=user_id, messages=messages,
+                        )
+                    finally:
+                        db.close()
+                except Exception as e:
+                    logger.debug("Observer failed (non-fatal): %s", e)
+
+            threading.Thread(target=_bg, daemon=True).start()
+        except Exception as e:
+            logger.debug("Observer setup skipped: %s", e)
+
+    # ── Implicit feedback ─────────────────────────────────────────────
+
+    def detect_implicit_feedback(
+        self,
+        user_content: str,
+        messages: list[dict[str, Any]],
+        parent_event_id: str | None,
+    ) -> None:
+        """Detect and record implicit feedback from user message."""
+        if not user_content or len(messages) < 2:
+            return
+        try:
+            from core.context.implicit_feedback import ImplicitFeedbackDetector
+            from core.context.prompts import PromptFeedback
+
+            prev_assistant = next(
+                (m["content"] for m in reversed(messages) if m.get("role") == "assistant"),
+                None,
+            )
+            signal = ImplicitFeedbackDetector.detect(user_content, prev_assistant)
+            if signal.signal_type != "neutral":
+                PromptFeedback(self._db_factory).record_feedback(
+                    prompt_template_id="chat_turn",
+                    prompt_version="auto",
+                    llm_request_id=parent_event_id or "",
+                    user_rating=_RATING_MAP.get(signal.signal_type, 3),
+                    user_comment=f"[implicit:{signal.signal_type}] {signal.evidence}",
+                    metadata={"source": "implicit_heuristic", "confidence": str(signal.confidence)},
+                )
+        except Exception as e:
+            logger.debug("Implicit feedback skipped: %s", e)

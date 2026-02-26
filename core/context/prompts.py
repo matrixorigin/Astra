@@ -309,8 +309,6 @@ class PromptFeedback(DbConsumer):
         Returns:
             feedback_id
         """
-        import json
-
         from uuid_utils import uuid7
 
         if not 1 <= user_rating <= 5:
@@ -319,23 +317,16 @@ class PromptFeedback(DbConsumer):
         feedback_id = str(uuid7())
 
         with self._db() as db:
-            db.execute(
-                text("""
-                INSERT INTO llm_feedback
-                (feedback_id, prompt_template_id, prompt_version, llm_request_id,
-                 rating, comment, metadata, created_at)
-                VALUES (:feedback_id, :template_id, :version, :request_id, :rating, :comment, :metadata, NOW())
-                """),
-                {
-                    "feedback_id": feedback_id,
-                    "template_id": prompt_template_id,
-                    "version": prompt_version,
-                    "request_id": llm_request_id,
-                    "rating": user_rating,
-                    "comment": user_comment,
-                    "metadata": json.dumps(metadata or {}),
-                }
-            )
+            from api.models import LLMFeedback
+            db.add(LLMFeedback(
+                feedback_id=feedback_id,
+                prompt_template_id=prompt_template_id,
+                prompt_version=prompt_version,
+                llm_request_id=llm_request_id,
+                rating=user_rating,
+                comment=user_comment,
+                feedback_metadata=metadata or {},
+            ))
             db.commit()
 
         logger.info(

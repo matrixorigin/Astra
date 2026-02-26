@@ -22,7 +22,7 @@ class TestDataQuality:
 class TestTrainingDataPipeline:
     def test_extract_examples(self):
         db = _mock_db()
-        # First call: fetch user-agent pairs; Second call: contamination check
+        # First call: fetch user-agent pairs (raw SQL)
         fetch_pairs = Mock()
         fetch_pairs.fetchall.return_value = [
             ("evt-1", "How do I implement a binary search tree?",
@@ -33,10 +33,10 @@ class TestTrainingDataPipeline:
              "```python\nclass Node:\n    def __init__(self, val):\n        self.val = val\n```\n"
              "This gives you a working BST with O(log n) operations."),
         ]
-        fetch_contamination = Mock()
-        fetch_contamination.fetchall.return_value = []  # No existing training data
+        db.execute.return_value = fetch_pairs
 
-        db.execute.side_effect = [fetch_pairs, fetch_contamination]
+        # Contamination check now uses ORM query chain
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = []
 
         pipeline = TrainingDataPipeline(lambda: db)
         examples = pipeline.extract_examples("sess-1", min_quality=DataQuality.SILVER)
@@ -136,12 +136,10 @@ class TestTrainingDataPipeline:
 
     def test_contamination_detection(self):
         db = _mock_db()
-        # Existing training data
-        fetch_existing = Mock()
-        fetch_existing.fetchall.return_value = [
+        # Existing training data — ORM query chain
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [
             ("What is Python?", "Python is a programming language used for web development and data science."),
         ]
-        db.execute.return_value = fetch_existing
 
         pipeline = TrainingDataPipeline(lambda: db)
         # Near-duplicate should have high contamination
@@ -154,11 +152,9 @@ class TestTrainingDataPipeline:
 
     def test_contamination_clean(self):
         db = _mock_db()
-        fetch_existing = Mock()
-        fetch_existing.fetchall.return_value = [
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [
             ("What is Python?", "Python is a programming language."),
         ]
-        db.execute.return_value = fetch_existing
 
         pipeline = TrainingDataPipeline(lambda: db)
         # Completely different content should have low contamination
