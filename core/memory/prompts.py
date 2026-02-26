@@ -27,5 +27,5 @@ These episodic memories describe related experiences:
 {episodic_list}
 
 Synthesize into ONE semantic memory: a general fact or principle.
-Return JSON: {"content": "...", "confidence": <average_of_sources>}
+Return JSON with keys "content" and "confidence" (average of sources).
 """
