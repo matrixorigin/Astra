@@ -6,7 +6,7 @@ Assembles the system prompt as a materialized view over distributed state:
   §1 Identity (agent profile from DB)
   §2 Self-Model (capabilities, boundaries, learned insights)
   §3 Project Context (rules + profile from edge)
-  §4 Memory (continuity, observations, few-shot)
+  §4 Memory (tiered: L0 profile + L1 semantic/episodic)
   §5 Working Memory (scratchpad)
   §6 History (budget-capped conversation events)
   §7 Constraints (behavioral rules)

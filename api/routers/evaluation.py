@@ -734,8 +734,7 @@ def observability_metrics(
 # ---------------------------------------------------------------------------
 
 class MemoryHealthResponse(BaseModel):
-    observations: dict[str, int] = {}
-    reflections: dict[str, int] = {}
+    memories: dict[str, int] = {}
     knowledge: dict[str, int] = {}
     pollution: dict[str, int] = {}
     governance: dict[str, Any] = {}
@@ -746,20 +745,27 @@ def memory_health(
     user_id: str | None = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ) -> MemoryHealthResponse:
-    """Memory pipeline health: observations, reflections, knowledge, pollution."""
+    """Memory pipeline health: memories, knowledge, pollution."""
     uid = user_id or current_user.get("user_id", "system")
     result = MemoryHealthResponse()
     db = SessionLocal()
     try:
-        # Observations
+        # Memories (new system)
         try:
             row = db.execute(text("""
                 SELECT COUNT(*) as total,
-                       SUM(CASE WHEN is_reflected = 0 THEN 1 ELSE 0 END) as pending
-                FROM observations WHERE user_id = :uid
+                       SUM(CASE WHEN memory_type = 'episodic' THEN 1 ELSE 0 END) as episodic,
+                       SUM(CASE WHEN memory_type = 'semantic' THEN 1 ELSE 0 END) as semantic,
+                       SUM(CASE WHEN memory_type = 'profile' THEN 1 ELSE 0 END) as profile
+                FROM memories WHERE user_id = :uid AND is_active = 1
             """), {"uid": uid}).fetchone()
             if row:
-                result.observations = {"total": row[0], "pending_reflection": row[1] or 0}
+                result.memories = {
+                    "total": row[0],
+                    "episodic": row[1] or 0,
+                    "semantic": row[2] or 0,
+                    "profile": row[3] or 0,
+                }
         except Exception:
             pass
 
