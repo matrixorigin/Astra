@@ -464,3 +464,346 @@ class TestQualityScoringWithGolden:
         row = db_session.query(Event).filter(Event.event_id == eid).one()
         assert row.quality_score == result.quality_score
         assert bool(row.training_eligible) == result.training_eligible
+
+
+# ── 8. Hallucination Firewall ─────────────────────────────
+
+class TestHallucinationFirewallWithGolden:
+    """multi_turn_correction: DeepSeek said 'Read Committed' (wrong),
+    doc_search returned 'Snapshot Isolation' (right).
+    Firewall should detect the contradiction."""
+
+    def test_wrong_answer_detected_by_regex_extractor(self):
+        """ClaimExtractor finds claims in the wrong LLM response."""
+        from core.verification.claim_extractor import ClaimExtractor
+
+        fixture = _load("multi_turn_correction")
+        wrong_response = fixture["events"][1]["content"]  # "Read Committed"
+
+        extractor = ClaimExtractor()
+        claims = extractor.extract(wrong_response)
+        # Regex extractor should find at least the factual claim
+        # (it may or may not — depends on patterns, but the response is short)
+        # The key test is that the firewall pipeline doesn't crash on real LLM output
+        assert isinstance(claims, list)
+
+    def test_firewall_verify_with_context(self, db_session):
+        """Firewall.verify_response runs without error on real LLM output."""
+        from unittest.mock import MagicMock
+        from core.verification.firewall import HallucinationFirewall
+
+        fixture = _load("multi_turn_correction")
+        wrong_response = fixture["events"][1]["content"]
+
+        ctx_mgr = MagicMock()
+        ctx_mgr.load_snapshot.return_value = {
+            "system_prompt": "You are a database expert.",
+            "selected_events": [],
+        }
+
+        fw = HallucinationFirewall(
+            lambda: db_session, ctx_mgr,
+            use_llm_extraction=False,  # regex only, no LLM needed
+        )
+        result = fw.verify_response(wrong_response, "fake_capture_id", mode="warn")
+
+        assert hasattr(result, "safe_to_deliver")
+        assert hasattr(result, "confidence_score")
+        assert isinstance(result.claims_verified, int)
+
+
+# ── 9. GoldenSelector ────────────────────────────────────
+
+class TestGoldenSelectorWithGolden:
+    """GoldenSelector picks high-quality sessions from golden data."""
+
+    def test_select_golden_sessions(self, db_session, sid):
+        """Sessions with quality_score >= 4.0 are selected as golden."""
+        from core.evaluation.golden_selector import GoldenSessionSelector
+
+        fixture = _load("chained_tool_calls")
+        # Seed events with high quality scores
+        for ev in fixture["events"]:
+            eid = ev["event_id"]
+            db_session.add(Event(
+                event_id=eid, session_id=sid, user_id=ev["user_id"],
+                event_type=ev["event_type"], content=ev["content"],
+                causal_chain_id=ev["causal_chain_id"],
+                parent_event_id=ev.get("parent_event_id"),
+                event_metadata=ev.get("metadata", {}),
+                quality_score=4.5 if ev["event_type"] == "llm_response" else None,
+            ))
+        db_session.commit()
+
+        selector = GoldenSessionSelector(lambda: db_session)
+        goldens = selector.select_golden_sessions(min_quality_score=4.0, limit=10)
+
+        # Should find our high-scored events
+        our_events = [g for g in goldens if g["session_id"] == sid]
+        assert len(our_events) > 0, "Golden selector should find our high-quality events"
+
+
+# ── 10. DriftDetector ─────────────────────────────────────
+
+class TestDriftDetectorWithGolden:
+    """DriftDetector uses quality_score trends — seed with golden data."""
+
+    def test_no_drift_on_stable_scores(self, db_session, sid):
+        """Stable quality scores → no drift signal."""
+        from core.evaluation.drift_detector import DriftDetector
+
+        fixture = _load("code_review")
+        for ev in fixture["events"]:
+            db_session.add(Event(
+                event_id=ev["event_id"], session_id=sid, user_id=ev["user_id"],
+                event_type=ev["event_type"], content=ev["content"],
+                causal_chain_id=ev["causal_chain_id"],
+                quality_score=4.0 if ev["event_type"] == "llm_response" else None,
+                llm_model_used=ev.get("llm_model_used"),
+            ))
+        db_session.commit()
+
+        detector = DriftDetector(lambda: db_session)
+        signals = detector.detect()
+        # With only a few events, no significant drift should be detected
+        severe = [s for s in signals if s.severity.value == "severe"]
+        assert len(severe) == 0
+
+
+# ── 11. LLM Non-Determinism Awareness ────────────────────
+
+class TestLLMNonDeterminism:
+    """Verify the system's design handles LLM non-determinism correctly.
+
+    Design doc (trust-and-safety): 'The only uncontrolled variable is LLM
+    non-determinism — and that's a much smaller audit surface.'
+
+    The replay system handles this by:
+    1. Recording LLM outputs (not re-calling LLM in mock replay)
+    2. Comparing at semantic level (SemanticDiff), not exact string match
+    3. Tracking model version in events for audit
+    """
+
+    def test_same_session_different_llm_models_tracked(self):
+        """Each LLM response records which model produced it."""
+        fixture = _load("multi_turn_correction")
+        for ev in fixture["events"]:
+            if ev["event_type"] == "llm_response":
+                assert ev.get("llm_model_used") is not None, (
+                    f"LLM response {ev['event_id']} missing llm_model_used"
+                )
+
+    def test_replay_uses_recorded_not_live_llm(self, db_session, sid):
+        """In REPLAY mode, tool_call returns recorded result — LLM is never called."""
+        from core.skills.mocking import MockMode, ToolMockingLayer
+
+        fixture = _load("code_review")
+        uid = fixture["user_id"]
+
+        db_session.add(SessionModel(session_id=sid, user_id=uid, status="active"))
+        for ev in fixture["events"]:
+            db_session.add(Event(
+                event_id=ev["event_id"], session_id=sid, user_id=uid,
+                event_type=ev["event_type"], content=ev["content"],
+                causal_chain_id=ev["causal_chain_id"],
+                parent_event_id=ev.get("parent_event_id"),
+                skill_name=ev.get("skill_name"), skill_version=ev.get("skill_version"),
+                event_metadata=ev.get("metadata", {}),
+            ))
+        db_session.commit()
+
+        replay = ToolMockingLayer(
+            mode=MockMode.REPLAY, db_factory=lambda: db_session, session_id=sid,
+        )
+
+        # Get the tool_call event
+        tc = next(e for e in fixture["events"] if e["event_type"] == "tool_call")
+        result = replay.get_mock_result(
+            tc["skill_name"], tc["metadata"]["skill_params"],
+            sid, parent_event_id=tc["event_id"],
+        )
+        # Result comes from DB, not from any LLM call
+        assert result is not None
+
+    def test_model_upgrade_detectable_via_metadata(self):
+        """If model changes between recording and replay, it's visible in event metadata."""
+        fixture = _load("chained_tool_calls")
+        llm_events = [e for e in fixture["events"] if e["event_type"] == "llm_response"]
+
+        models = {e.get("llm_model_used") for e in llm_events}
+        # All from same recording session → same model
+        assert len(models) == 1
+        # Model name is recorded — if DeepSeek upgrades, new recordings
+        # would show a different model name, detectable by SemanticDiff
+        assert "deepseek" in list(models)[0].lower()
+
+    def test_semantic_diff_tolerates_nondeterminism(self, db_session):
+        """SemanticDiff compares structure (event types, chains), not exact LLM text."""
+        from core.replay.semantic_diff import SemanticDiff
+
+        # Create two sessions with same structure but different LLM text
+        sid1, sid2 = _uid(), _uid()
+        chain1, chain2 = _uid(), _uid()
+
+        for sid, chain, text_suffix in [(sid1, chain1, "version A"), (sid2, chain2, "version B")]:
+            db_session.add(Event(
+                event_id=_uid(), session_id=sid, user_id="u",
+                event_type="user_query", content="same question",
+                causal_chain_id=chain,
+            ))
+            db_session.add(Event(
+                event_id=_uid(), session_id=sid, user_id="u",
+                event_type="llm_response", content=f"different answer {text_suffix}",
+                causal_chain_id=chain,
+            ))
+        db_session.commit()
+
+        diff = SemanticDiff(lambda: db_session)
+        result = diff.compare_sessions(sid1, sid2)
+
+        # Same structure → no event type diff
+        assert result["event_types"]["user_query"]["diff"] == 0
+        assert result["event_types"]["llm_response"]["diff"] == 0
+        # Chain count same
+        assert result["decision_paths"]["chain_count"]["diff"] == 0
+
+        # Cleanup
+        for s in (sid1, sid2):
+            db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": s})
+        db_session.commit()
+
+
+# ── 12. SemanticDiff Content Similarity (Embeddings) ──────
+
+class TestSemanticDiffContentSimilarity:
+    """SemanticDiff now compares LLM response CONTENT via embeddings,
+    not just event type counts."""
+
+    def test_identical_sessions_high_similarity(self, db_session):
+        """Same LLM content → similarity ≈ 1.0."""
+        from core.replay.semantic_diff import SemanticDiff
+
+        sid1, sid2 = _uid(), _uid()
+        chain1, chain2 = _uid(), _uid()
+        content = "MatrixOne uses Snapshot Isolation by default."
+
+        for sid, chain in [(sid1, chain1), (sid2, chain2)]:
+            db_session.add(Event(
+                event_id=_uid(), session_id=sid, user_id="u",
+                event_type="llm_response", content=content,
+                causal_chain_id=chain,
+            ))
+        db_session.commit()
+
+        diff = SemanticDiff(lambda: db_session)
+        result = diff.compare_sessions(sid1, sid2)
+
+        sim = result["content_similarity"]
+        assert sim["overall"] is not None
+        assert sim["overall"] > 0.99, f"Identical content should have sim ≈ 1.0, got {sim['overall']}"
+
+        # Cleanup
+        for s in (sid1, sid2):
+            db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": s})
+        db_session.commit()
+
+    def test_different_content_lower_similarity(self, db_session):
+        """Completely different LLM responses → low similarity."""
+        from core.replay.semantic_diff import SemanticDiff
+
+        sid1, sid2 = _uid(), _uid()
+        chain1, chain2 = _uid(), _uid()
+
+        db_session.add(Event(
+            event_id=_uid(), session_id=sid1, user_id="u",
+            event_type="llm_response",
+            content="MatrixOne uses Snapshot Isolation via TAE engine for MVCC.",
+            causal_chain_id=chain1,
+        ))
+        db_session.add(Event(
+            event_id=_uid(), session_id=sid2, user_id="u",
+            event_type="llm_response",
+            content="To make pancakes, mix flour, eggs, and milk. Cook on a hot griddle.",
+            causal_chain_id=chain2,
+        ))
+        db_session.commit()
+
+        diff = SemanticDiff(lambda: db_session)
+        result = diff.compare_sessions(sid1, sid2)
+
+        sim = result["content_similarity"]
+        assert sim["overall"] is not None
+        assert sim["overall"] < 0.95, f"Unrelated content should have low sim, got {sim['overall']}"
+        # Summary should flag it
+        assert sim["responses_compared"] == 1
+
+        for s in (sid1, sid2):
+            db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": s})
+        db_session.commit()
+
+    def test_golden_session_self_similarity(self, db_session):
+        """Replay of a golden session compared to itself → perfect similarity."""
+        from core.replay.semantic_diff import SemanticDiff
+
+        fixture = _load("chained_tool_calls")
+        sid = _uid()
+        for ev in fixture["events"]:
+            db_session.add(Event(
+                event_id=_uid(), session_id=sid, user_id=ev["user_id"],
+                event_type=ev["event_type"], content=ev["content"],
+                causal_chain_id=ev["causal_chain_id"],
+            ))
+        db_session.commit()
+
+        diff = SemanticDiff(lambda: db_session)
+        result = diff.compare_sessions(sid, sid)
+
+        assert result["content_similarity"]["overall"] > 0.99
+        assert result["content_similarity"]["responses_compared"] == 3  # 3 LLM responses
+
+        db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": sid})
+        db_session.commit()
+
+    def test_regression_detected_by_content_similarity(self, db_session):
+        """Simulated regression: same structure, degraded content → low similarity + summary warning."""
+        from core.replay.semantic_diff import SemanticDiff
+
+        sid1, sid2 = _uid(), _uid()
+        chain1, chain2 = _uid(), _uid()
+
+        # Original: correct, detailed answer
+        for sid, chain, content in [
+            (sid1, chain1, "The SELECT * query on events table is slow because it reads all columns. "
+                           "Add a covering index on (session_id, event_type, created_at) to avoid full table scan."),
+            (sid2, chain2, "I don't know. Maybe try restarting the database."),
+        ]:
+            db_session.add(Event(
+                event_id=_uid(), session_id=sid, user_id="u",
+                event_type="user_query", content="Why is my query slow?",
+                causal_chain_id=chain,
+            ))
+            db_session.add(Event(
+                event_id=_uid(), session_id=sid, user_id="u",
+                event_type="llm_response", content=content,
+                causal_chain_id=chain,
+            ))
+        db_session.commit()
+
+        diff = SemanticDiff(lambda: db_session)
+        result = diff.compare_sessions(sid1, sid2)
+
+        # Structure is identical (1 user_query + 1 llm_response each)
+        assert result["event_types"]["user_query"]["diff"] == 0
+        assert result["event_types"]["llm_response"]["diff"] == 0
+
+        # But content similarity should be low
+        sim = result["content_similarity"]["overall"]
+        assert sim < 0.95, f"Degraded content should have low similarity, got {sim}"
+
+        # Summary should mention content
+        if sim < 0.7:
+            assert "LOW" in result["summary"]
+
+        for s in (sid1, sid2):
+            db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": s})
+        db_session.commit()

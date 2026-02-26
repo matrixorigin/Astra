@@ -69,7 +69,7 @@ class GoldenSessionSelector(DbConsumer):
                     e.metadata,
                     e.skills_snapshot
                 FROM conversation_events e
-                WHERE e.event_type = 'LLM_RESPONSE'
+                WHERE e.event_type = 'llm_response'
                 AND e.quality_score >= :min_quality
             """
         

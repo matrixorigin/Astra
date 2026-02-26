@@ -1,6 +1,7 @@
 """Semantic Diff - Compare agent decisions and behaviors.
 
 Provides high-level comparison of agent performance, not just data differences.
+Includes content-level semantic similarity via embeddings.
 """
 
 import re
@@ -8,6 +9,8 @@ from collections import Counter
 
 from core.events.event_reader import EventReader
 from core.db_consumer import DbConsumer, DbFactory
+from core.context.embeddings import EmbeddingService
+from core.skills.learning_similarity import cosine_similarity
 
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -28,9 +31,10 @@ def _validate_name(name: str, label: str = "name") -> None:
 class SemanticDiff(DbConsumer):
     """Semantic difference analyzer for agent behaviors."""
 
-    def __init__(self, db_factory: DbFactory) -> None:
+    def __init__(self, db_factory: DbFactory, embedding_service: EmbeddingService | None = None) -> None:
         super().__init__(db_factory)
         self.reader = EventReader(self._db_factory)
+        self._embedder = embedding_service or EmbeddingService(db_factory)
 
     def compare_sessions(self, session_id1: str, session_id2: str) -> dict:
         """Compare two sessions semantically."""
@@ -41,6 +45,7 @@ class SemanticDiff(DbConsumer):
         path_diff = self._compare_decision_paths(events1, events2)
         type_diff = self._compare_event_types(events1, events2)
         quality_diff = self._compare_quality(events1, events2)
+        content_diff = self._compare_content_similarity(events1, events2)
 
         return {
             "session1": session_id1,
@@ -49,7 +54,8 @@ class SemanticDiff(DbConsumer):
             "decision_paths": path_diff,
             "event_types": type_diff,
             "quality": quality_diff,
-            "summary": self._generate_summary(token_diff, path_diff, type_diff),
+            "content_similarity": content_diff,
+            "summary": self._generate_summary(token_diff, path_diff, type_diff, content_diff),
         }
 
     def compare_checkpoints(self, checkpoint1: str, checkpoint2: str, session_id: str) -> dict:
@@ -156,7 +162,7 @@ class SemanticDiff(DbConsumer):
         }
 
     @staticmethod
-    def _generate_summary(token_diff: dict, path_diff: dict, type_diff: dict) -> str:
+    def _generate_summary(token_diff: dict, path_diff: dict, type_diff: dict, content_diff: dict | None = None) -> str:
         """Generate human-readable summary."""
         parts = []
         tc = token_diff["total"]["diff"]
@@ -171,4 +177,44 @@ class SemanticDiff(DbConsumer):
         elif cc < 0:
             parts.append(f"{abs(cc)} fewer decision chains")
 
+        if content_diff and content_diff.get("overall") is not None:
+            sim = content_diff["overall"]
+            if sim < 0.7:
+                parts.append(f"Content similarity LOW ({sim:.2f})")
+            elif sim < 0.9:
+                parts.append(f"Content similarity moderate ({sim:.2f})")
+
         return "; ".join(parts) if parts else "No significant changes"
+
+    def _compare_content_similarity(self, events1: list, events2: list) -> dict:
+        """Compare LLM response content via embedding cosine similarity.
+
+        Pairs LLM responses by position and computes per-pair similarity.
+        Overall score is the mean. Low similarity flags semantic regression.
+        """
+        responses1 = [e.content for e in events1 if e.event_type == "llm_response" and e.content]
+        responses2 = [e.content for e in events2 if e.event_type == "llm_response" and e.content]
+
+        if not responses1 or not responses2:
+            return {"overall": None, "pairs": [], "note": "No LLM responses to compare"}
+
+        pairs = []
+        for i, (r1, r2) in enumerate(zip(responses1, responses2)):
+            v1 = self._embedder.embed_text(r1)
+            v2 = self._embedder.embed_text(r2)
+            sim = cosine_similarity(v1, v2)
+            pairs.append({
+                "index": i,
+                "similarity": round(sim, 4),
+                "preview1": r1[:80],
+                "preview2": r2[:80],
+            })
+
+        overall = sum(p["similarity"] for p in pairs) / len(pairs)
+        return {
+            "overall": round(overall, 4),
+            "pairs": pairs,
+            "responses_compared": len(pairs),
+            "responses_session1": len(responses1),
+            "responses_session2": len(responses2),
+        }
