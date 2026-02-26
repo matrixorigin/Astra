@@ -39,9 +39,26 @@ def cleanup_fan_in_tasks() -> None:
 
 def cleanup_run_tasks() -> None:
     """Cancel all pending run tasks. Call during test teardown."""
-    for t in list(_run_tasks.values()):
-        if not t.done():
-            t.cancel()
+    import asyncio
+
+    tasks_to_cancel = [t for t in _run_tasks.values() if not t.done()]
+    for t in tasks_to_cancel:
+        t.cancel()
+
+    # Try to let cancelled tasks finish
+    if tasks_to_cancel:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Can't await in running loop, just cancel and clear
+                pass
+            else:
+                loop.run_until_complete(
+                    asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+                )
+        except Exception:
+            pass
+
     _run_tasks.clear()
     _active_runs.clear()
     _run_events.clear()

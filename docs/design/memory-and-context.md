@@ -34,9 +34,9 @@ The new MatrixOne-native memory system is implemented in `core/memory/`:
 - **Fulltext**: `MATCH() AGAINST()` with NGRAM parser
 - **HTAP**: Real-time analytics on transactional data
 
-### Legacy System (v1)
+### Legacy System (v1) — Removed
 
-The old system (`Observer` → `Observation` model, `SessionContinuity`) remains functional for backward compatibility. It will be deprecated once v2 is validated in production.
+The old system (`Observer` → `Observation` model, `SessionContinuity`) has been removed. All code now uses the v2 typed memory system.
 
 ---
 
