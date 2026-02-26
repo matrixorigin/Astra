@@ -54,7 +54,7 @@ def create_checkpoint(
 ):
     """Create a named checkpoint (MatrixOne snapshot) for time-travel queries."""
     from core.replay.time_machine import TimeMachine
-    tm = TimeMachine(db=db)
+    tm = TimeMachine(lambda: db)
     result = tm.create_checkpoint(req.name, req.description)
     return CheckpointResponse(
         checkpoint_name=result["checkpoint_name"],
@@ -70,7 +70,7 @@ def list_checkpoints(
 ):
     """List all available checkpoints."""
     from core.replay.time_machine import TimeMachine
-    tm = TimeMachine(db=db)
+    tm = TimeMachine(lambda: db)
     return [
         CheckpointResponse(
             checkpoint_name=c.get("snapshot_name", c.get("name", "")),
@@ -90,7 +90,7 @@ def get_events_at_checkpoint(
 ):
     """Time-travel query: read events as they were at a checkpoint (read-only)."""
     from core.replay.time_machine import TimeMachine
-    tm = TimeMachine(db=db)
+    tm = TimeMachine(lambda: db)
     try:
         events = tm.get_events_at_checkpoint(name, session_id=session_id, limit=limit)
     except Exception as e:
@@ -117,7 +117,7 @@ def get_causal_chain(
 ):
     """Get the full causal chain for an event (upstream + downstream)."""
     from core.events.event_reader import EventReader
-    reader = EventReader(db=db)
+    reader = EventReader(lambda: db)
 
     # First get the event to find its causal_chain_id
     event = reader.get_event(event_id)
@@ -138,7 +138,7 @@ def trace_upstream(
 ):
     """Trace upstream: walk parent_event_id chain to find all ancestors."""
     from core.events.event_reader import EventReader
-    reader = EventReader(db=db)
+    reader = EventReader(lambda: db)
     chain: list[LineageNode] = []
     current_id: str | None = event_id
     seen: set[str] = set()
@@ -165,7 +165,7 @@ def sandbox_checkpoint(
 ):
     """Create a checkpoint within a sandbox."""
     from core.sandbox.sandbox import Sandbox
-    sb = Sandbox(db=db)
+    sb = Sandbox(lambda: db)
     try:
         sb.snapshot(name, req.checkpoint_name)
     except Exception as e:
@@ -182,7 +182,7 @@ def sandbox_restore(
 ):
     """Restore a sandbox to a previously created checkpoint."""
     from core.sandbox.sandbox import Sandbox
-    sb = Sandbox(db=db)
+    sb = Sandbox(lambda: db)
     try:
         sb.restore(name, req.checkpoint_name)
     except Exception as e:

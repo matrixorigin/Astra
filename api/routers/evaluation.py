@@ -176,7 +176,7 @@ def detect_drift(
     from core.evaluation.drift_detector import DriftDetector
 
     try:
-        signals = DriftDetector(db).detect()
+        signals = DriftDetector(lambda: db).detect()
     except Exception:
         logger.debug("drift: detector not ready, returning empty")
         return []
@@ -233,7 +233,7 @@ def get_calibration(
     from core.evaluation.confidence_calibrator import ConfidenceCalibrator
 
     try:
-        cal = ConfidenceCalibrator(db)
+        cal = ConfidenceCalibrator(lambda: db)
         result = cal.measure(agent_id=agent_id, days=days)
         adj = cal.compute_adjustment(result)
     except Exception:
@@ -371,7 +371,7 @@ def run_closed_loop(
     calibration_resp: CalibrationResponse | None = None
     db = SessionLocal()
     try:
-        cal = ConfidenceCalibrator(db)
+        cal = ConfidenceCalibrator(lambda: db)
         cal_result = cal.measure(days=days)
         adj = cal.compute_adjustment(cal_result)
         calibration_resp = CalibrationResponse(
@@ -399,8 +399,8 @@ def run_closed_loop(
     try:
         from core.llm.client import LLMClient
 
-        llm = LLMClient(db)
-        learner = InputFaceLearner(db, llm)
+        llm = LLMClient(lambda: db)
+        learner = InputFaceLearner(lambda: db, llm)
         results = learner.diagnose_and_fix(days=days, dry_run=dry_run, faces=faces)
         diagnoses = [
             LoopDiagnosisItem(
@@ -429,7 +429,7 @@ def run_closed_loop(
     try:
         from core.skills.self_improving_selector import SelfImprovingSelector
 
-        selector = SelfImprovingSelector(session=db)
+        selector = SelfImprovingSelector(lambda: db)
         skill_learning_resp = selector.learn_from_failures(days=days)
     except Exception as e:
         logger.error("Closed loop skill learning phase failed: %s", e)
@@ -518,7 +518,7 @@ def trust_report(
         # 1. Confidence calibration
         try:
             from core.evaluation.confidence_calibrator import ConfidenceCalibrator
-            cal = ConfidenceCalibrator(db)
+            cal = ConfidenceCalibrator(lambda: db)
             cal_result = cal.measure(agent_id=agent_id, days=days)
             result.confidence_calibration = {
                 "calibration_error": round(cal_result.calibration_error, 4),
@@ -532,7 +532,7 @@ def trust_report(
         # 2. SLO compliance
         try:
             from core.evaluation.slo_monitor import SLOMonitor
-            monitor = SLOMonitor(db)
+            monitor = SLOMonitor(lambda: db)
             report = monitor.check_agent(agent_id, period_days=days)
             total = len(report.statuses)
             met = sum(1 for s in report.statuses if s.met)
@@ -549,7 +549,7 @@ def trust_report(
         # 3. Drift
         try:
             from core.evaluation.drift_detector import DriftDetector
-            detector = DriftDetector(db)
+            detector = DriftDetector(lambda: db)
             signals = detector.detect()
             critical = sum(1 for s in signals if s.severity.value == "critical")
             result.drift_summary = {
@@ -618,7 +618,7 @@ def slo_dashboard(
         agent_ids = [r[0] for r in rows] if rows else []
 
         from core.evaluation.slo_monitor import SLOMonitor
-        monitor = SLOMonitor(db)
+        monitor = SLOMonitor(lambda: db)
         entries = []
         for aid in agent_ids:
             report = monitor.check_agent(aid, period_days=period_days)
@@ -652,7 +652,7 @@ def slo_history(
 ):
     """SLO history: daily metrics for a single agent."""
     from core.evaluation.slo_monitor import SLOMonitor
-    monitor = SLOMonitor(db)
+    monitor = SLOMonitor(lambda: db)
     metrics = monitor.get_daily_metrics(agent_id, days)
     return {"agent_id": agent_id, "days": days, "daily_metrics": metrics}
 
@@ -810,7 +810,7 @@ def extract_training_data(
     """Extract high-quality conversation pairs as training data."""
     from core.data_versioning.training_data_pipeline import DatasetConfig, TrainingDataPipeline
     from core.utils.id_generator import generate_id
-    pipeline = TrainingDataPipeline(db)
+    pipeline = TrainingDataPipeline(lambda: db)
     dataset_id = generate_id()
     config = DatasetConfig(
         dataset_id=dataset_id,
@@ -838,7 +838,7 @@ def export_training_data(
 ):
     """Export a training dataset as JSONL file."""
     from core.data_versioning.training_data_pipeline import TrainingDataPipeline
-    pipeline = TrainingDataPipeline(db)
+    pipeline = TrainingDataPipeline(lambda: db)
     try:
         output_path = pipeline.export_dataset(dataset_id, format=format)
     except Exception as e:

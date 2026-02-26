@@ -149,10 +149,10 @@ class BatchEventWriter(DbConsumer):
 _writer = None
 
 
-def get_batch_writer(db: Session | None = None) -> BatchEventWriter | None:
+def get_batch_writer(db_factory=None) -> BatchEventWriter | None:
     """Get global batch writer instance."""
     global _writer
-    if _writer is None and db:
-        _writer = BatchEventWriter(db)
+    if _writer is None and db_factory:
+        _writer = BatchEventWriter(db_factory)
         _writer.start()
     return _writer

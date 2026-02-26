@@ -71,11 +71,11 @@ class TrainingDataPipeline(DbConsumer):
         """Initialize training data pipeline.
         
         Args:
-            db: Database session
+            db_factory: Callable that returns a DB session.
             source_db: Source database for branching
         """
         super().__init__(db_factory)
-        self.branch = Branch(database=source_db, db=db)
+        self.branch = Branch(db_factory, database=source_db)
         self.source_db = source_db
     
     def create_dataset(self, config: DatasetConfig) -> str:

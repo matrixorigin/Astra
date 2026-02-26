@@ -49,13 +49,13 @@ def run_drift_pipeline(db_factory: Callable) -> PipelineResult:
     db = db_factory()
     try:
         # 1. Detect
-        detector = DriftDetector(db)
+        detector = DriftDetector(lambda: db)
         signals = detector.detect()
         if not signals:
             return PipelineResult()
 
         # 2. Build corrector with available dependencies
-        regression_gate = _try_build_regression_gate(db)
+        regression_gate = _try_build_regression_gate(lambda: db)
         prompt_optimizer = _try_build_prompt_optimizer(db)
         corrector = DriftCorrector(
             db_factory=lambda: db,
@@ -111,10 +111,10 @@ def run_drift_pipeline_async(db_factory: Callable) -> None:
 # ── Dependency builders ──────────────────────────────────────────
 
 
-def _try_build_regression_gate(db):
+def _try_build_regression_gate(db_factory):
     try:
         from core.evaluation.regression_gate import RegressionGate
-        return RegressionGate(db)
+        return RegressionGate(db_factory)
     except Exception:
         return None
 

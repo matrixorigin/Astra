@@ -324,7 +324,7 @@ class HallucinationFirewall(DbConsumer):
             # Primary: embedding cosine similarity
             try:
                 from core.context.embeddings import EmbeddingService
-                svc = EmbeddingService()
+                svc = EmbeddingService(self._db_factory)
                 resp_vec = svc.embed_text(response[:2000])
                 ctx_vec = svc.embed_text(ctx_text[:2000])
                 dot = sum(a * b for a, b in zip(resp_vec, ctx_vec))

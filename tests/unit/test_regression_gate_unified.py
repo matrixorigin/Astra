@@ -368,6 +368,13 @@ class TestGateExecution:
         assert result["sessions_tested"] == 1
         assert "metrics" in result
         
+        # Verify ReplayService was constructed with a callable (db_factory)
+        mock_replay_class.assert_called_once()
+        db_factory_arg = mock_replay_class.call_args[0][0]
+        assert callable(db_factory_arg), (
+            f"ReplayService must receive a callable db_factory, got {type(db_factory_arg).__name__}"
+        )
+
         # Verify sandbox was created and deleted
         mock_sandbox.create.assert_called_once()
         mock_sandbox.delete.assert_called_once()
@@ -466,6 +473,13 @@ class TestSelectorChangeValidation:
         assert result["change_id"] == "selector_v2"
         assert "metrics" in result
 
+        # Verify ReplayService was constructed with a callable (db_factory)
+        mock_replay_class.assert_called_once()
+        db_factory_arg = mock_replay_class.call_args[0][0]
+        assert callable(db_factory_arg), (
+            f"ReplayService must receive a callable db_factory, got {type(db_factory_arg).__name__}"
+        )
+
 
 class TestRollbackMechanism:
     """Test rollback mechanism for failed gates."""
@@ -555,6 +569,11 @@ class TestSandboxCleanup:
         
         # Verify sandbox.delete() was called despite the failure
         mock_sandbox.delete.assert_called_once()
+
+        # Verify ReplayService was constructed with a callable (db_factory)
+        mock_replay_class.assert_called_once()
+        db_factory_arg = mock_replay_class.call_args[0][0]
+        assert callable(db_factory_arg)
     
     @patch.object(RegressionGate, '_apply_change_to_sandbox')
     @patch.object(RegressionGate, '_create_snapshot')
@@ -617,6 +636,11 @@ class TestSandboxCleanup:
         # Verify sandbox was created and deleted
         mock_sandbox.create.assert_called_once()
         mock_sandbox.delete.assert_called_once()
+
+        # Verify ReplayService was constructed with a callable (db_factory)
+        mock_replay_class.assert_called_once()
+        db_factory_arg = mock_replay_class.call_args[0][0]
+        assert callable(db_factory_arg)
 
 
 class TestNewChangeTypes:

@@ -107,7 +107,7 @@ class RegressionGate(DbConsumer):
             # 4. Replay golden sessions
             replay_results = []
             with self._db() as replay_db:
-                replay_svc = ReplayService(replay_db)
+                replay_svc = ReplayService(lambda: replay_db)
                 for session in golden_sessions:
                     result = replay_svc.replay_session(
                         session_id=session["session_id"],
