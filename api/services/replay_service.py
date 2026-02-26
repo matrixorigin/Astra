@@ -200,8 +200,8 @@ class ReplayService:
         )
 
         try:
-            if event.event_type == "skill_invocation":
-                # Replay skill invocation
+            if event.event_type == "tool_call" and event.skill_name:
+                # Replay tool invocation via mocking layer
                 skill_name = event.skill_name
                 skill_version = skill_version_override.get(skill_name) if skill_version_override else event.skill_version
 
@@ -310,7 +310,7 @@ class ReplayService:
     def verify_reproducibility(self, session_id: str, user_id: str) -> dict[str, Any]:
         """Verify that a session can be reproduced.
 
-        Checks all skill_invocation events have recorded results available.
+        Checks all tool_call events have recorded results available.
 
         Args:
             session_id: Session to verify
@@ -333,7 +333,7 @@ class ReplayService:
 
         issues = []
         for event in events:
-            if event.event_type == "skill_invocation" and event.skill_name:
+            if event.event_type == "tool_call" and event.skill_name:
                 metadata = event.event_metadata or {}
                 if not metadata.get("skill_params"):
                     issues.append({

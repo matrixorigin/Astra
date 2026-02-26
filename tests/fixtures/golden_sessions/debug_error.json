@@ -1,0 +1,100 @@
+{
+  "scenario": "debug_type_cast_error",
+  "description": "Debug MatrixOne type cast error with doc search",
+  "session_id": "019c9a53-9a5d-7832-b984-8a3cd28dcaf6",
+  "user_id": "golden_user",
+  "events": [
+    {
+      "event_id": "019c9a53-9a5d-7832-b984-8a5c1d907f05",
+      "session_id": "019c9a53-9a5d-7832-b984-8a3cd28dcaf6",
+      "user_id": "golden_user",
+      "event_type": "user_query",
+      "content": "I'm getting this error:\n\n```\nsqlalchemy.exc.OperationalError: (pymysql.err.OperationalError) (20101, \"internal error: Can't cast 'abc' to INT type\")\n```\n\nWhat's wrong?",
+      "causal_chain_id": "019c9a53-9a5d-7832-b984-8a45123a321a",
+      "parent_event_id": null,
+      "created_at": "2026-02-26T14:21:36.221943+00:00",
+      "metadata": {}
+    },
+    {
+      "event_id": "019c9a53-c09d-7fc1-bf4e-c2007ebf65e3",
+      "session_id": "019c9a53-9a5d-7832-b984-8a3cd28dcaf6",
+      "user_id": "golden_user",
+      "event_type": "llm_response",
+      "content": "This error occurs when you're trying to insert or compare a string value (`'abc'`) with an integer column in your database. Here's how to fix it:\n\n**Common causes and solutions:**\n\n1. **Check your data types** - Ensure the column you're inserting into/querying is actually an `INT` type, not a string.\n\n2. **Verify your insert/update values** - Look for places where you might be passing string `'abc'` instead of an integer:\n   ```python\n   # Wrong\n   session.query(User).filter(User.id == 'abc')  # 'abc' is string\n   \n   # Right  \n   session.query(User).filter(User.id == 123)    # 123 is integer\n   ```\n\n3. **Check CSV/JSON imports** - If importing data, ensure numeric fields don't contain text values.\n\n4. **Examine your model definition**:\n   ```python\n   # Make sure the column is Integer, not String\n   id = Column(Integer, primary_key=True)  # ✓ Correct\n   id = Column(String, primary_key=True)   # ✗ Might cause this error\n   ```\n\n**Debug steps:**\n- Print the SQL query being executed with `echo=True` in engine creation\n- Check the exact value being passed where the error occurs\n- Verify database schema matches your SQLAlchemy model\n\nThe database is rejecting the operation because it can't convert the text `'abc'` to an integer.",
+      "causal_chain_id": "019c9a53-9a5d-7832-b984-8a45123a321a",
+      "parent_event_id": "019c9a53-9a5d-7832-b984-8a5c1d907f05",
+      "created_at": "2026-02-26T14:21:46.013988+00:00",
+      "metadata": {
+        "model": "deepseek-chat"
+      },
+      "token_usage": {
+        "prompt": 66,
+        "completion": 306,
+        "total": 372
+      },
+      "llm_model_used": "deepseek-chat",
+      "latency_ms": 9792
+    },
+    {
+      "event_id": "019c9a53-c09d-7fc1-bf4e-c21cf6460ce4",
+      "session_id": "019c9a53-9a5d-7832-b984-8a3cd28dcaf6",
+      "user_id": "golden_user",
+      "event_type": "tool_call",
+      "content": "doc_search",
+      "skill_name": "doc_search",
+      "skill_version": "1.0.0",
+      "causal_chain_id": "019c9a53-9a5d-7832-b984-8a45123a321a",
+      "parent_event_id": "019c9a53-c09d-7fc1-bf4e-c2007ebf65e3",
+      "created_at": "2026-02-26T14:21:46.013997+00:00",
+      "metadata": {
+        "skill_params": {
+          "query": "MatrixOne type cast error 20101"
+        }
+      }
+    },
+    {
+      "event_id": "019c9a53-c09d-7fc1-bf4e-c22c4acc79f4",
+      "session_id": "019c9a53-9a5d-7832-b984-8a3cd28dcaf6",
+      "user_id": "golden_user",
+      "event_type": "tool_result",
+      "content": "Error 20101: Type mismatch in MatrixOne. Ensure column types match query parameters. Common cause: passing string to INT column without CAST().",
+      "skill_name": "doc_search",
+      "skill_version": "1.0.0",
+      "causal_chain_id": "019c9a53-9a5d-7832-b984-8a45123a321a",
+      "parent_event_id": "019c9a53-c09d-7fc1-bf4e-c21cf6460ce4",
+      "created_at": "2026-02-26T14:21:46.013999+00:00",
+      "metadata": {
+        "skill_params": {
+          "query": "MatrixOne type cast error 20101"
+        },
+        "skill_result": {
+          "data": "Error 20101: Type mismatch in MatrixOne. Ensure column types match query parameters. Common cause: passing string to INT column without CAST().",
+          "source": "live"
+        }
+      }
+    },
+    {
+      "event_id": "019c9a53-e69c-79a3-a3b3-d9303911421d",
+      "session_id": "019c9a53-9a5d-7832-b984-8a3cd28dcaf6",
+      "user_id": "golden_user",
+      "event_type": "llm_response",
+      "content": "**Use `CAST()` in your query** to explicitly convert the string to integer:\n\n```python\n# If you need to convert a string parameter to INT\nfrom sqlalchemy import cast, Integer\n\n# Example 1: In a filter\nresult = session.query(User).filter(\n    cast(User.id, Integer) == '123'  # CAST string '123' to INT\n).all()\n\n# Example 2: In a WHERE clause with literal\nfrom sqlalchemy import literal\nresult = session.query(User).filter(\n    User.id == cast(literal('123'), Integer)\n).all()\n\n# Example 3: If inserting/updating, fix the data type instead\n# Don't use CAST here - ensure you're passing integers:\nsession.add(User(id=123))  # Pass integer 123, not string '123'\n```\n\n**Better fix:** Convert your data at the application level before querying:\n```python\n# Convert string to int before querying\nuser_id = int('123')  # Convert to integer first\nresult = session.query(User).filter(User.id == user_id).all()\n```\n\n**Most likely:** You're passing a string parameter where MatrixOne expects an integer. Find where `'abc'` is being passed and either:\n1. Convert it to integer with `int()` in Python\n2. Use `CAST()` in the SQL query if you must keep it as string\n\nCheck your parameter values - they should be integers, not strings.",
+      "causal_chain_id": "019c9a53-9a5d-7832-b984-8a45123a321a",
+      "parent_event_id": "019c9a53-c09d-7fc1-bf4e-c22c4acc79f4",
+      "created_at": "2026-02-26T14:21:55.740708+00:00",
+      "metadata": {
+        "model": "deepseek-chat"
+      },
+      "token_usage": {
+        "prompt": 419,
+        "completion": 305,
+        "total": 724
+      },
+      "llm_model_used": "deepseek-chat",
+      "latency_ms": 9726
+    }
+  ],
+  "recorded_at": "2026-02-26T14:21:55.740722+00:00",
+  "model": "deepseek-chat",
+  "event_count": 5
+}

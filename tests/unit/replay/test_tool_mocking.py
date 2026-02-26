@@ -124,7 +124,7 @@ class TestToolMockingLayer:
         db.add(Event(
             event_id=event_id,
             session_id="sess_123",
-            event_type="skill_invocation",
+            event_type="tool_call",
             content=json.dumps({
                 "skill_name": "test_skill",
                 "skill_version": "1.0.0",

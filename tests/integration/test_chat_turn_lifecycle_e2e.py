@@ -888,7 +888,7 @@ class TestCostTrackingFix:
         llm.user_id = "test"
         llm._active_user_id = "test"
 
-        chunks = asyncio.get_event_loop().run_until_complete(
+        chunks = asyncio.run(
             _collect_async(llm.chat_with_tools_stream([], [], model="gpt-4o"))
         )
 

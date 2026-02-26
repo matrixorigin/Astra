@@ -1,0 +1,115 @@
+{
+  "scenario": "code_review_sql_injection",
+  "description": "Multi-turn code review: SQL injection detection and fix",
+  "session_id": "019c9a53-48cc-7681-8e00-7cd8385c1dfa",
+  "user_id": "golden_user",
+  "events": [
+    {
+      "event_id": "019c9a53-48cc-7681-8e00-7cf23fd12c56",
+      "session_id": "019c9a53-48cc-7681-8e00-7cd8385c1dfa",
+      "user_id": "golden_user",
+      "event_type": "user_query",
+      "content": "Review this Python function and suggest improvements:\n\n```python\ndef get_user(db, user_id):\n    result = db.execute(f\"SELECT * FROM users WHERE id = '{user_id}'\")\n    rows = result.fetchall()\n    if len(rows) > 0:\n        return rows[0]\n    else:\n        return None\n```",
+      "causal_chain_id": "019c9a53-48cc-7681-8e00-7ce310dde59c",
+      "parent_event_id": null,
+      "created_at": "2026-02-26T14:21:15.340029+00:00",
+      "metadata": {}
+    },
+    {
+      "event_id": "019c9a53-6af0-7da0-8e3c-68fa0ece875e",
+      "session_id": "019c9a53-48cc-7681-8e00-7cd8385c1dfa",
+      "user_id": "golden_user",
+      "event_type": "llm_response",
+      "content": "**Critical Issues:**\n1. **SQL Injection vulnerability** - Never use f-strings directly with SQL queries.\n2. **No connection/transaction management** - The `db` object's lifecycle isn't handled.\n3. **Inefficient query** - Uses `fetchall()` when only one row is needed.\n\n**Improved version:**\n```python\ndef get_user(db, user_id):\n    \"\"\"Fetch a user by ID using parameterized query.\"\"\"\n    try:\n        with db.cursor() as cursor:\n            cursor.execute(\"SELECT * FROM users WHERE id = %s\", (user_id,))\n            return cursor.fetchone()  # Returns None if no results\n    except Exception as e:\n        # Log error appropriately\n        raise\n```\n\n**Key changes:**\n- Uses parameterized query (`%s` placeholder) to prevent SQL injection\n- Uses `fetchone()` instead of `fetchall()` for single-row queries\n- Context manager ensures proper cursor cleanup\n- Removed explicit `None` return (already implicit in `fetchone()`)\n- Added error handling (adjust based on your DB library)\n\n**Note:** Placeholder syntax may vary (`?` for SQLite, `%s` for MySQL/PostgreSQL).",
+      "causal_chain_id": "019c9a53-48cc-7681-8e00-7ce310dde59c",
+      "parent_event_id": "019c9a53-48cc-7681-8e00-7cf23fd12c56",
+      "created_at": "2026-02-26T14:21:24.080421+00:00",
+      "metadata": {
+        "model": "deepseek-chat",
+        "finish_reason": "stop"
+      },
+      "token_usage": {
+        "prompt": 84,
+        "completion": 254,
+        "total": 338
+      },
+      "llm_model_used": "deepseek-chat",
+      "latency_ms": 8740
+    },
+    {
+      "event_id": "019c9a53-6af0-7da0-8e3c-6903ce4e9447",
+      "session_id": "019c9a53-48cc-7681-8e00-7cd8385c1dfa",
+      "user_id": "golden_user",
+      "event_type": "tool_call",
+      "content": "code_search",
+      "skill_name": "code_search",
+      "skill_version": "1.0.0",
+      "causal_chain_id": "019c9a53-48cc-7681-8e00-7ce310dde59c",
+      "parent_event_id": "019c9a53-6af0-7da0-8e3c-68fa0ece875e",
+      "created_at": "2026-02-26T14:21:24.080436+00:00",
+      "metadata": {
+        "skill_params": {
+          "query": "SQL injection f-string",
+          "scope": "project"
+        }
+      }
+    },
+    {
+      "event_id": "019c9a53-6af0-7da0-8e3c-6918c072c3e6",
+      "session_id": "019c9a53-48cc-7681-8e00-7cd8385c1dfa",
+      "user_id": "golden_user",
+      "event_type": "tool_result",
+      "content": "Found 3 instances of f-string SQL in: db_consumer.py:45, user_repo.py:23, event_repo.py:67",
+      "skill_name": "code_search",
+      "skill_version": "1.0.0",
+      "causal_chain_id": "019c9a53-48cc-7681-8e00-7ce310dde59c",
+      "parent_event_id": "019c9a53-6af0-7da0-8e3c-6903ce4e9447",
+      "created_at": "2026-02-26T14:21:24.080440+00:00",
+      "metadata": {
+        "skill_params": {
+          "query": "SQL injection f-string",
+          "scope": "project"
+        },
+        "skill_result": {
+          "data": "Found 3 instances of f-string SQL in: db_consumer.py:45, user_repo.py:23, event_repo.py:67",
+          "source": "live"
+        }
+      }
+    },
+    {
+      "event_id": "019c9a53-6af0-7da0-8e3c-692b80469d23",
+      "session_id": "019c9a53-48cc-7681-8e00-7cd8385c1dfa",
+      "user_id": "golden_user",
+      "event_type": "user_query",
+      "content": "Can you write the fixed version using parameterized queries?",
+      "causal_chain_id": "019c9a53-48cc-7681-8e00-7ce310dde59c",
+      "parent_event_id": "019c9a53-6af0-7da0-8e3c-6918c072c3e6",
+      "created_at": "2026-02-26T14:21:24.080444+00:00",
+      "metadata": {}
+    },
+    {
+      "event_id": "019c9a53-9a5d-7832-b984-8a2da845fa29",
+      "session_id": "019c9a53-48cc-7681-8e00-7cd8385c1dfa",
+      "user_id": "golden_user",
+      "event_type": "llm_response",
+      "content": "Here's the fixed version using parameterized queries:\n\n```python\ndef get_user(db, user_id):\n    \"\"\"Fetch a user by ID using parameterized query to prevent SQL injection.\"\"\"\n    # Using parameterized query - syntax varies by database library\n    query = \"SELECT * FROM users WHERE id = ?\"\n    params = (user_id,)\n    \n    # Alternative syntax for different databases:\n    # PostgreSQL/MySQL: \"SELECT * FROM users WHERE id = %s\"\n    # SQLite: \"SELECT * FROM users WHERE id = ?\"\n    # SQLAlchemy: Use session.query(User).filter(User.id == user_id).first()\n    \n    result = db.execute(query, params)  # Pass parameters separately\n    return result.fetchone()  # Returns None if no results found\n```\n\n**Key points:**\n1. **Parameterized query**: The query string contains placeholders (`?` or `%s`)\n2. **Separate parameters**: User input is passed as a separate tuple parameter\n3. **Database-agnostic**: The exact placeholder syntax depends on your DB library:\n   - SQLite: `?`\n   - PostgreSQL/MySQL: `%s`\n   - SQLAlchemy: Use ORM methods instead\n4. **Simplified logic**: `fetchone()` returns `None` automatically if no rows exist\n\n**For specific databases:**\n```python\n# PostgreSQL with psycopg2\ncursor.execute(\"SELECT * FROM users WHERE id = %s\", (user_id,))\n\n# SQLite\ncursor.execute(\"SELECT * FROM users WHERE id = ?\", (user_id,))\n\n# MySQL with mysql-connector\ncursor.execute(\"SELECT * FROM users WHERE id = %s\", (user_id,))\n```\n\nAlways check your database library's documentation for the correct parameter placeholder syntax.",
+      "causal_chain_id": "019c9a53-48cc-7681-8e00-7ce310dde59c",
+      "parent_event_id": "019c9a53-6af0-7da0-8e3c-692b80469d23",
+      "created_at": "2026-02-26T14:21:36.221674+00:00",
+      "metadata": {
+        "model": "deepseek-chat",
+        "finish_reason": "stop"
+      },
+      "token_usage": {
+        "prompt": 353,
+        "completion": 374,
+        "total": 727
+      },
+      "llm_model_used": "deepseek-chat",
+      "latency_ms": 12141
+    }
+  ],
+  "recorded_at": "2026-02-26T14:21:36.221684+00:00",
+  "model": "deepseek-chat",
+  "event_count": 6
+}
