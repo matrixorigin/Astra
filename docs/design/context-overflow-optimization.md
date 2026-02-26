@@ -22,14 +22,16 @@ Agent 多轮 tool 调用后 context 爆炸，导致 `context length exceeded` �
 
 ### 已完成：终极方案（mo-trustmem 原生上下文管理）
 
-**状态**：✅ v1.1 完成
+**状态**：✅ v1.2 完成
 
 | 组件 | 文件 | 状态 |
 |------|------|------|
 | `MemoryType.TOOL_RESULT` | `core/memory/types.py` | ✅ |
 | `process_tool_output()` | `core/agent/tool_output_handler.py` | ✅ |
 | `find_similar_result()` | `core/agent/tool_output_handler.py` | ✅ |
+| `compute_dynamic_threshold()` | `core/agent/tool_output_handler.py` | ✅ |
 | `SUMMARY_GENERATORS` | `core/agent/tool_output_handler.py` | ✅ |
-| 单元测试 (13 tests) | `tests/unit/test_tool_output_handler.py` | ✅ |
+| 单元测试 (17 tests) | `tests/unit/test_tool_output_handler.py` | ✅ |
 | 集成到 chat_loop | `core/agent/chat_loop.py` | ✅ |
 | 历史结果复用 | `core/agent/chat_loop.py` | ✅ |
+| 动态预算 | `core/agent/chat_loop.py` | ✅ |
