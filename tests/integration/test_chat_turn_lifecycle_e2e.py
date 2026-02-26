@@ -31,19 +31,25 @@ def client():
 
 
 def _unique_auth(client, db, prefix="lc"):
-    """Create a unique user per test for -n auto isolation (Task 10)."""
+    """Create a unique user per test for -n auto isolation (Task 10).
+
+    Returns (headers, user_id) so tests can make precise assertions on user_id.
+    """
     uid = uuid4().hex[:8]
-    return get_auth_headers(
+    user_id = f"{prefix}_uid_{uid}"
+    headers = get_auth_headers(
         client, db,
         username=f"{prefix}_{uid}",
-        user_id=f"{prefix}_uid_{uid}",
+        user_id=user_id,
         email=f"{prefix}_{uid}@test.com",
         password="pass123",
     )
+    return headers, user_id
 
 
-_TOOLS = [{"type": "function", "function": {"name": "read_file", "description": "Read",
-           "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+# Frozen — prevents accidental mutation across tests.
+_TOOLS = ({"type": "function", "function": {"name": "read_file", "description": "Read",
+           "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},)
 
 
 class TestChatTurnMultiTurnE2E:
@@ -54,7 +60,7 @@ class TestChatTurnMultiTurnE2E:
 
     def test_full_multi_turn_lifecycle(self, client, db):
         """Turn 1 (tool_call) → Turn 2 (tool_result + text) → Turn 3 (new query + context refresh)."""
-        headers = self._auth(client, db)
+        headers, _ = self._auth(client, db)
         tools = list(_TOOLS)
 
         # ── Turn 1: user message → LLM returns tool_call ──
@@ -120,18 +126,17 @@ class TestChatTurnMultiTurnE2E:
         assert "user_query" in types
         assert "llm_response" in types
 
-        # ── Verify context snapshots: exactly 2 ──
-        # Turn 1: assemble() creates snapshot.  Turn 2: tool_result turn has no
-        # Each turn that triggers context assembly or refresh creates a snapshot.
-        # Turn 1: full assembly. Turn 2: tool_results trigger refresh. Turn 3: new query refresh.
+        # ── Verify context snapshots ──
+        # Turn 1: full assembly → snapshot. Turn 2: tool_result refresh → snapshot.
+        # Turn 3: new query refresh → snapshot. Total = 3.
         snapshot_count = db.execute(sql_text(
             "SELECT COUNT(*) FROM context_snapshots WHERE session_id = :sid",
         ), {"sid": session_id}).scalar()
-        assert snapshot_count >= 2, f"Expected >=2 snapshots, got {snapshot_count}"
+        assert snapshot_count == 3, f"Expected 3 snapshots (one per turn), got {snapshot_count}"
 
     def test_session_close_triggers_hooks(self, client, db):
         """Closing a text-only session triggers scoring and knowledge extraction hooks."""
-        headers = self._auth(client, db)
+        headers, user_id = self._auth(client, db)
 
         # Create a session via /chat/turn (no tools — uses chat_stream path)
         with patch("core.llm.client.LLMClient.chat_stream",
@@ -146,12 +151,11 @@ class TestChatTurnMultiTurnE2E:
             resp = client.post(f"/sessions/{session_id}/close", headers=headers)
         assert resp.status_code == 200
         assert resp.json()["status"] == "closed"
-        mock_hooks.assert_called_once()
-        assert mock_hooks.call_args[0][0] == session_id
+        mock_hooks.assert_called_once_with(session_id, user_id)
 
     def test_events_persisted_with_tool_calls(self, client, db):
         """Tool call and tool result events are persisted correctly."""
-        headers = self._auth(client, db)
+        headers, _ = self._auth(client, db)
         tools = [{"type": "function", "function": {"name": "bash", "description": "run",
                   "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}}]
 
@@ -195,7 +199,7 @@ class TestChatTurnMultiTurnE2E:
         Mocks _build_memory to return query-dependent content, then verifies
         the system message in the LLM call actually contains the refreshed memory.
         """
-        headers = self._auth(client, db)
+        headers, _ = self._auth(client, db)
 
         captured_messages: list[list] = []
 
@@ -241,7 +245,7 @@ class TestChatTurnMultiTurnE2E:
 
     def test_model_routing_uses_user_id(self, client, db):
         """LLMClient in /chat/turn is created with user_id for model routing."""
-        headers = self._auth(client, db)
+        headers, user_id = self._auth(client, db)
 
         with patch("core.llm.client.LLMClient.__init__", return_value=None) as mock_init, \
              patch("core.llm.client.LLMClient.chat_stream",
@@ -250,13 +254,13 @@ class TestChatTurnMultiTurnE2E:
                 "messages": [{"role": "user", "content": "hello"}],
             }, headers=headers)
 
-        # At least one LLMClient call must include a user_id kwarg (any value)
+        # Verify the LLMClient in event_generator was constructed with the exact user_id.
         calls_with_user_id = [
             c for c in mock_init.call_args_list
-            if c.kwargs.get("user_id") is not None
+            if c.kwargs.get("user_id") == user_id
         ]
-        assert len(calls_with_user_id) >= 1, \
-            f"Expected LLMClient(user_id=...) call, got {mock_init.call_args_list}"
+        assert len(calls_with_user_id) == 1, \
+            f"Expected exactly 1 LLMClient(user_id='{user_id}'), got {mock_init.call_args_list}"
 
     def test_recovery_then_refresh_corrects_stale_memory(self, client, db):
         """After server restart recovery (stale first_query memory), the next
@@ -267,7 +271,7 @@ class TestChatTurnMultiTurnE2E:
         Recovery uses first_query="read main.py" for memory search (stale).
         Turn 2's refresh_memory should re-search with "write tests" (current).
         """
-        headers = self._auth(client, db)
+        headers, _ = self._auth(client, db)
 
         # ── Turn 1: establish session with events in DB ──
         with patch("core.llm.client.LLMClient.chat_stream",
@@ -309,10 +313,10 @@ class TestChatTurnMultiTurnE2E:
         assert r2.status_code == 200
 
         # _build_memory is called twice:
-        # 1. During recovery's assemble() with first_query="read main.py"
+        # 1. During recovery's assemble() with last_query="read main.py" (only 1 turn in DB)
         # 2. During refresh_memory() with current query="write tests for it"
         assert len(memory_queries) >= 2, f"Expected ≥2 _build_memory calls, got {memory_queries}"
-        # Recovery call uses first_query (stale)
+        # Recovery call uses last user query from DB (which is the only one)
         assert memory_queries[0] == "read main.py"
         # Refresh call uses current query (corrected)
         assert memory_queries[-1] == "write tests for it"
@@ -332,7 +336,7 @@ class TestSessionCloseE2E:
 
     def test_close_evicts_cache_and_updates_db(self, client, db):
         """Create session → 2 turns → close → verify cache eviction + DB status."""
-        headers = _unique_auth(client, db, "close")
+        headers, _ = _unique_auth(client, db, "close")
 
         # Turn 1
         with patch("core.llm.client.LLMClient.chat_stream",
@@ -380,7 +384,7 @@ class TestChatTurnExpanded:
 
     def test_history_recovery_after_cache_eviction(self, client, db):
         """Clear cache between turns → turn 3 still works via DB recovery."""
-        headers = _unique_auth(client, db, "evict")
+        headers, _ = _unique_auth(client, db, "evict")
 
         # Turn 1
         with patch("core.llm.client.LLMClient.chat_stream",
@@ -421,7 +425,7 @@ class TestChatTurnExpanded:
 
     def test_tool_schema_change_rebuilds_system(self, client, db):
         """Sending different edge_tools on turn 2 triggers force_rebuild_system."""
-        headers = _unique_auth(client, db, "toolchg")
+        headers, _ = _unique_auth(client, db, "toolchg")
         tools_v1 = list(_TOOLS)
         tools_v2 = [{"type": "function", "function": {"name": "write_file", "description": "Write",
                      "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
@@ -451,15 +455,16 @@ class TestChatTurnExpanded:
             }, headers=headers)
 
         sys2 = captured_messages[1][0]["content"]
-        # System prompt should be rebuilt (different tool set → different Self-Model)
-        # At minimum, the system message should exist and be a string
-        assert isinstance(sys2, str) and len(sys2) > 0
+        # System prompt should be rebuilt with the new tool set and differ from turn 1
+        assert "write_file" in sys2.lower() or sys2 != sys1, \
+            f"Expected rebuilt system prompt with write_file tool, got: {sys2[:500]}"
+        assert sys2 != sys1, "System prompt should differ after tool schema change"
 
     # ── 8.6: Edge profile injection ──
 
     def test_edge_profile_in_system_prompt(self, client, db):
         """edge_profile fields appear in the system prompt."""
-        headers = _unique_auth(client, db, "profile")
+        headers, _ = _unique_auth(client, db, "profile")
 
         captured_messages: list[list] = []
 
@@ -489,15 +494,16 @@ class TestChatTurnExpanded:
 
     def test_budget_exceeded_emits_error(self, client, db):
         """BudgetExceededError during LLM call produces an SSE error event."""
-        headers = _unique_auth(client, db, "budget")
+        headers, _ = _unique_auth(client, db, "budget")
 
         from core.llm.client import BudgetExceededError
 
-        async def _raise(*a, **kw):
+        async def _budget_exceeded_stream(*a, **kw):
             raise BudgetExceededError("Session budget $5.00 exceeded")
-            yield  # noqa: unreachable — makes this an async generator
+            # yield makes this an async generator (required by async for)
+            yield  # pragma: no cover
 
-        with patch("core.llm.client.LLMClient.chat_stream", side_effect=_raise):
+        with patch("core.llm.client.LLMClient.chat_stream", side_effect=_budget_exceeded_stream):
             r = client.post("/chat/turn", json={
                 "messages": [{"role": "user", "content": "hello"}],
             }, headers=headers)
@@ -511,7 +517,7 @@ class TestChatTurnExpanded:
 
     def test_firewall_warning_emitted(self, client, db):
         """When firewall returns unsafe, a warning event appears before turn_complete."""
-        headers = _unique_auth(client, db, "fw")
+        headers, _ = _unique_auth(client, db, "fw")
 
         # Mock firewall to return unsafe result
         mock_result = MagicMock()
@@ -541,7 +547,7 @@ class TestChatTurnExpanded:
 
     def test_context_snapshots_across_turns(self, client, db):
         """After 3 turns, context_snapshots table has >=2 rows for this session."""
-        headers = _unique_auth(client, db, "snap")
+        headers, _ = _unique_auth(client, db, "snap")
 
         session_id = None
         for i in range(3):

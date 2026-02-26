@@ -232,6 +232,10 @@ class LLMClient(DbConsumer):
         from core.llm.model_resolver import resolve_model
         return resolve_model(request_model=model, default_model=self.config.get("model", "gpt-4o"))
 
+    def resolve_model_name(self, model: str | None = None) -> str:
+        """Public accessor: return the model name that would be used for a request."""
+        return self._resolve_model(model)
+
     # ── Budget control (#7) ────────────────────────────────────────
 
     def _check_budget(self, model: str, messages: list | None = None):

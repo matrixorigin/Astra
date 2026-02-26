@@ -418,7 +418,7 @@ class _LRUDict(OrderedDict):
 # TTL (24h) evicts idle sessions even if LRU capacity is not reached.
 _SESSION_TTL = 86400  # 24 hours in seconds
 # Persist a full history snapshot every N turns (reduces DB write volume).
-_SNAPSHOT_INTERVAL = 3
+_SNAPSHOT_TURN_INTERVAL = 3
 
 
 class _SessionCache(_LRUDict):
@@ -471,8 +471,13 @@ def _tool_names(tools: list[dict[str, Any]]) -> set[str]:
     return {t.get("function", {}).get("name", "") for t in tools}
 
 
-def _get_session_entry(session_id: str) -> dict[str, Any]:
-    """Get or create a session cache entry with default fields."""
+def _peek_session_entry(session_id: str) -> dict[str, Any] | None:
+    """Read-only lookup — returns None if not cached. No LRU side-effects."""
+    return _session_cache.get(session_id)
+
+
+def _get_or_create_session_entry(session_id: str) -> dict[str, Any]:
+    """Get existing or create new cache entry (may evict LRU entries)."""
     entry = _session_cache.get(session_id)
     if entry is None:
         entry = {"history": None, "tools": [], "sections": None,
@@ -482,17 +487,30 @@ def _get_session_entry(session_id: str) -> dict[str, Any]:
 
 
 def _classify_task(messages: list[dict[str, Any]]) -> str | None:
-    """Derive a task_hint from user messages for model routing."""
-    text = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+    """Best-effort task hint for model routing (soft signal only).
+
+    Returns "simple" | "code" | "reasoning" | None.  The model router MUST
+    have a fallback for None — this heuristic is intentionally conservative
+    and returns None when confidence is low.
+    """
+    # Use the LAST user message — in multi-turn tool loops the first message
+    # may be from a previous intent.
+    texts = [m.get("content", "") for m in messages if m.get("role") == "user"]
+    text = texts[-1] if texts else ""
     if not text:
         return None
     lower = text.lower()
-    if any(k in lower for k in ("```", "def ", "func ", "class ", ".py", ".go", ".ts", ".js")):
+    # Code: only match when code artifacts are clearly present (fenced blocks,
+    # or file extensions preceded by a word boundary like space/punctuation).
+    if "```" in lower:
         return "code"
-    if any(k in lower for k in ("explain", "why ", "analyze", "reason", "compare")):
+    import re
+    if re.search(r'(?<!\w)\.(py|go|ts|js|rs|java|cpp|rb)\b', lower):
+        return "code"
+    # Reasoning: require word boundaries to avoid false positives like "classic".
+    if re.search(r'\b(explain|analyze|reason|compare)\b', lower):
         return "reasoning"
-    if len(text) < 50 and not any(c in text for c in ("`", "/", "\\")):
-        return "simple"
+    # Default: no hint — let the model router use its default.
     return None
 
 
@@ -515,7 +533,7 @@ def _build_turn_messages(
     saved by PromptAssembler BEFORE the LLM call; on turn 2+ it comes from
     incremental memory refresh.
     """
-    entry = _get_session_entry(session_id)
+    entry = _get_or_create_session_entry(session_id)
     history = entry.get("history")
     cached_sections = entry.get("sections")
     context_capture_id: str | None = None
@@ -559,23 +577,33 @@ def _build_turn_messages(
         else:
             history = [{"role": "system", "content": system}]
     elif cached_sections:
-        # Turn 2+: incremental memory refresh when new user query OR tool results arrive
+        # Turn 2+: incremental memory refresh when new user query OR tool results arrive.
         user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
         should_refresh = bool(user_query) or bool(tool_results)
         if should_refresh:
-            from core.context.prompt_assembler import PromptAssembler
-            try:
-                refreshed = PromptAssembler(SessionLocal).refresh_memory(
-                    session_id=session_id,
-                    user_id=user_id,
-                    user_query=user_query or "(tool results received)",
-                    current_sections=cached_sections,
+            # For tool-result-only turns (no new user query), use the last user
+            # message from history so memory retrieval gets a semantically
+            # meaningful query instead of a placeholder string.
+            refresh_query = user_query
+            if not refresh_query and history:
+                refresh_query = next(
+                    (m.get("content", "") for m in reversed(history) if m.get("role") == "user"),
+                    "",
                 )
-                history[0] = {"role": "system", "content": refreshed.system_message}
-                context_capture_id = refreshed.snapshot_id
-                cached_sections = refreshed.sections
-            except Exception as e:
-                logger.debug("Memory refresh failed (non-fatal): %s", e)
+            if refresh_query:
+                from core.context.prompt_assembler import PromptAssembler
+                try:
+                    refreshed = PromptAssembler(SessionLocal).refresh_memory(
+                        session_id=session_id,
+                        user_id=user_id,
+                        user_query=refresh_query,
+                        current_sections=cached_sections,
+                    )
+                    history[0] = {"role": "system", "content": refreshed.system_message}
+                    context_capture_id = refreshed.snapshot_id
+                    cached_sections = refreshed.sections
+                except Exception as e:
+                    logger.debug("Memory refresh failed (non-fatal): %s", e)
 
     # Append new user messages from edge
     for msg in messages:
@@ -606,6 +634,78 @@ def _build_turn_messages(
 _MAX_RECOVERY_EVENTS = 50
 
 
+def _append_recovered_events(
+    history: list[dict[str, Any]], rows: list,
+) -> list[dict[str, Any]]:
+    """Append DB event rows to an existing history list (OpenAI message format).
+
+    Used by both snapshot post-fill and full event-by-event reconstruction.
+    Handles tool_call batching: accumulates tool_call events, flushes them as
+    one assistant message when the first tool_result arrives.
+    """
+    pending_tool_calls: list[dict[str, Any]] = []
+    in_tool_batch = False
+
+    for row in rows:
+        etype, content = row[0], row[1] or ""
+        meta = row[2] if len(row) > 2 else None
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        meta = meta or {}
+
+        if etype == "user_query":
+            in_tool_batch = False
+            history.append({"role": "user", "content": content})
+        elif etype == "tool_call":
+            try:
+                tc_data = json.loads(content) if isinstance(content, str) else {}
+            except (json.JSONDecodeError, TypeError):
+                tc_data = {}
+            pending_tool_calls.append({
+                "id": tc_data.get("tool_call_id", meta.get("tool_call_id", "")),
+                "type": "function",
+                "function": {
+                    "name": tc_data.get("name", meta.get("name", "")),
+                    "arguments": tc_data.get("arguments", "{}"),
+                },
+            })
+        elif etype == "tool_result":
+            tool_call_id = meta.get("tool_call_id", "")
+            tool_name = meta.get("name", "")
+            if pending_tool_calls:
+                history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+                pending_tool_calls = []
+                in_tool_batch = True
+            elif not in_tool_batch:
+                if not tool_call_id:
+                    continue
+                history.append({"role": "assistant", "content": "", "tool_calls": [{
+                    "id": tool_call_id, "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }]})
+                in_tool_batch = True
+            try:
+                result_data = json.loads(content) if isinstance(content, str) else {}
+            except (json.JSONDecodeError, TypeError):
+                result_data = {}
+            history.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": result_data.get("result", content)[:4000] if isinstance(result_data, dict) else str(content)[:4000],
+            })
+        elif etype == "llm_response":
+            in_tool_batch = False
+            if pending_tool_calls:
+                history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
+                pending_tool_calls = []
+            history.append({"role": "assistant", "content": content})
+
+    return history
+
+
 def _recover_history_from_db(
     db: Session, user_id: str, session_id: str, agent_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str] | None]:
@@ -621,7 +721,7 @@ def _recover_history_from_db(
     try:
         snap_row = db.execute(
             text("""
-                SELECT content FROM conversation_events
+                SELECT content, created_at FROM conversation_events
                 WHERE session_id = :sid AND event_type = 'session_history_snapshot'
                 ORDER BY created_at DESC LIMIT 1
             """),
@@ -630,15 +730,37 @@ def _recover_history_from_db(
         if snap_row and snap_row[0]:
             history = json.loads(snap_row[0])
             if isinstance(history, list) and history:
-                # Rebuild sections from system message via PromptAssembler
+                # Use the LAST user message for memory retrieval — first_query
+                # would be stale for long conversations.
                 from core.context.prompt_assembler import PromptAssembler
-                first_query = next((m.get("content", "") for m in history if m.get("role") == "user"), "")
+                last_query = next(
+                    (m.get("content", "") for m in reversed(history) if m.get("role") == "user"),
+                    "",
+                )
                 assembled = PromptAssembler(SessionLocal).assemble(
-                    agent_id=agent_id, user_query=first_query,
+                    agent_id=agent_id, user_query=last_query,
                     session_id=session_id, user_id=user_id,
                 )
                 # Replace system message with fresh one (may have updated agent config)
                 history[0] = {"role": "system", "content": assembled.system_message}
+
+                # Append events that arrived AFTER the snapshot (e.g. snapshot
+                # was at turn 3 but conversation continued to turn 5).
+                snap_ts = snap_row[1]
+                if snap_ts:
+                    post_rows = db.execute(
+                        text(f"""
+                            SELECT event_type, content, metadata FROM conversation_events
+                            WHERE session_id = :sid
+                              AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result')
+                              AND created_at > :snap_ts
+                            ORDER BY created_at ASC LIMIT {_MAX_RECOVERY_EVENTS}
+                        """),
+                        {"sid": session_id, "snap_ts": snap_ts},
+                    ).fetchall()
+                    if post_rows:
+                        history = _append_recovered_events(history, post_rows)
+
                 return history, assembled.sections
     except Exception as e:
         logger.debug("Snapshot recovery failed, falling back to events: %s", e)
@@ -657,91 +779,21 @@ def _recover_history_from_db(
         if not rows:
             return [], None
 
-        first_query = next((r[1] for r in rows if r[0] == "user_query"), "")
+        # Use the LAST user query for memory retrieval (most relevant context).
+        last_query = ""
+        for r in reversed(rows):
+            if r[0] == "user_query":
+                last_query = r[1] or ""
+                break
         from core.context.prompt_assembler import PromptAssembler
         assembled = PromptAssembler(SessionLocal).assemble(
-            agent_id=agent_id, user_query=first_query,
+            agent_id=agent_id, user_query=last_query,
             session_id=session_id, user_id=user_id,
         )
         history: list[dict[str, Any]] = [
             {"role": "system", "content": assembled.system_message}
         ]
-
-        # State machine for reconstructing OpenAI message sequences:
-        #   tool_call events accumulate in pending_tool_calls.
-        #   The first tool_result flushes them as one assistant message.
-        #   Subsequent tool_results in the same batch just append tool messages.
-        #   If tool_call was lost, we synthesize from tool_result metadata.
-        pending_tool_calls: list[dict[str, Any]] = []
-        # True after we've emitted the assistant+tool_calls for the current
-        # batch — subsequent tool_results just append tool messages.
-        in_tool_batch = False
-
-        for row in rows:
-            etype, content = row[0], row[1] or ""
-            meta = row[2] if len(row) > 2 else None
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except (json.JSONDecodeError, TypeError):
-                    meta = {}
-            meta = meta or {}
-
-            if etype == "user_query":
-                in_tool_batch = False
-                history.append({"role": "user", "content": content})
-            elif etype == "tool_call":
-                try:
-                    tc_data = json.loads(content) if isinstance(content, str) else {}
-                except (json.JSONDecodeError, TypeError):
-                    tc_data = {}
-                pending_tool_calls.append({
-                    "id": tc_data.get("tool_call_id", meta.get("tool_call_id", "")),
-                    "type": "function",
-                    "function": {
-                        "name": tc_data.get("name", meta.get("name", "")),
-                        "arguments": tc_data.get("arguments", "{}"),
-                    },
-                })
-            elif etype == "tool_result":
-                tool_call_id = meta.get("tool_call_id", "")
-                tool_name = meta.get("name", "")
-                if pending_tool_calls:
-                    # First tool_result: flush all accumulated tool_calls as
-                    # one assistant message.
-                    history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
-                    pending_tool_calls = []
-                    in_tool_batch = True
-                elif not in_tool_batch:
-                    # tool_call was lost (truncated by _MAX_RECOVERY_EVENTS).
-                    # Synthesize from metadata to keep the sequence valid.
-                    if not tool_call_id:
-                        continue  # Cannot construct valid pair — skip.
-                    history.append({"role": "assistant", "content": "", "tool_calls": [{
-                        "id": tool_call_id, "type": "function",
-                        "function": {"name": tool_name, "arguments": "{}"},
-                    }]})
-                    in_tool_batch = True
-                # Append tool result message.
-                try:
-                    result_data = json.loads(content) if isinstance(content, str) else {}
-                except (json.JSONDecodeError, TypeError):
-                    result_data = {}
-                history.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": result_data.get("result", content)[:4000] if isinstance(result_data, dict) else str(content)[:4000],
-                })
-            elif etype == "llm_response":
-                in_tool_batch = False
-                if pending_tool_calls:
-                    history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
-                    pending_tool_calls = []
-                history.append({"role": "assistant", "content": content})
-
-        # Intentionally discard trailing pending_tool_calls: incomplete tool
-        # call sequences (e.g. run cancelled mid-tool) should not be sent to
-        # the LLM — they would produce an invalid message sequence.
+        history = _append_recovered_events(history, rows)
         return history, assembled.sections
     except SQLAlchemyError as e:
         logger.debug("History recovery failed: %s", e)
@@ -827,12 +879,12 @@ def _persist_turn_events(
             )
 
         # Periodic history snapshot (every _SNAPSHOT_INTERVAL turns)
-        if history and turn_count > 0 and turn_count % _SNAPSHOT_INTERVAL == 0:
+        if history and turn_count > 0 and turn_count % _SNAPSHOT_TURN_INTERVAL == 0:
             try:
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
                     event_type="session_history_snapshot",
-                    content=json.dumps(history, default=str),
+                    content=json.dumps(history),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
                     metadata={"turn_count": turn_count},
@@ -897,14 +949,15 @@ async def chat_turn(
     # On change, we rebuild the system prompt (with new Self-Model) but preserve
     # conversation history — see force_rebuild_system in _build_turn_messages.
     tools_changed = False
-    entry = _get_session_entry(session_id)
+    existing = _peek_session_entry(session_id)
     if request.edge_tools:
-        cached = entry.get("tools", [])
+        cached = (existing or {}).get("tools", [])
         if cached and _tool_names(request.edge_tools) != _tool_names(cached):
             tools_changed = True
+        entry = _get_or_create_session_entry(session_id)
         entry["tools"] = request.edge_tools
         _session_cache[session_id] = entry
-    tools_schema = entry.get("tools", [])
+    tools_schema = (existing or {}).get("tools", []) if not request.edge_tools else request.edge_tools
 
     # Build conversation messages with context enrichment.
     # Runs in a thread to avoid blocking the event loop — _build_turn_messages
@@ -970,7 +1023,7 @@ async def chat_turn(
                 yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc.get('function', {}).get('name', ''), 'arguments': parsed_args})}\n\n"
 
             # Update session cache: append assistant message, increment turn_count
-            _entry = _get_session_entry(session_id)
+            _entry = _get_or_create_session_entry(session_id)
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text}
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
@@ -980,16 +1033,21 @@ async def chat_turn(
             current_turn_count = _entry["turn_count"]
             current_history = list(_entry.get("history", []))
 
-            # Resolve model name for audit
-            resolved_model = model or "default"
+            # Resolve actual model name for audit (not the user's request, but
+            # what the router selected — may differ due to fallback chain).
+            resolved_model = llm.resolve_model_name(model)
 
-            # Persist events in background thread (non-blocking, best-effort)
+            # Persist events in background thread (non-blocking, best-effort).
+            # Deep-copy mutable dicts to avoid sharing state with the main thread.
+            import copy
             _persist_args = dict(
                 user_id=user_id, session_id=session_id,
-                messages=list(request.messages), tool_results=list(request.tool_results or []),
-                full_text=full_text, tool_calls=list(tool_calls),
+                messages=copy.deepcopy(request.messages),
+                tool_results=copy.deepcopy(request.tool_results or []),
+                full_text=full_text, tool_calls=copy.deepcopy(tool_calls),
                 context_capture_id=snapshot_id, model_used=resolved_model,
-                history=current_history, turn_count=current_turn_count,
+                history=copy.deepcopy(current_history),
+                turn_count=current_turn_count,
             )
             _t = threading.Thread(target=_persist_turn_events, kwargs=_persist_args, daemon=True)
             _persist_threads.append(_t)
