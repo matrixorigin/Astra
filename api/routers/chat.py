@@ -633,12 +633,13 @@ def _build_turn_messages(
                 last_tc_ids = {tc["id"] for tc in m["tool_calls"]}
                 break
         for tr in tool_results:
-            tc_id = tr.get("tool_call_id", "")
+            tc_id = tr.get("tool_call_id", "") if isinstance(tr, dict) else ""
             if tc_id not in consumed and tc_id in last_tc_ids:
+                result = tr.get("result", "")
                 history.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
-                    "content": tr.get("result", ""),
+                    "content": str(result) if not isinstance(result, str) else result,
                 })
 
     entry["history"] = history

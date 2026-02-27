@@ -482,3 +482,27 @@ class TestPlaceholderReplacement:
         tc1_msgs = [m for m in history if m.get("tool_call_id") == "tc1"]
         assert len(tc1_msgs) == 1
         assert tc1_msgs[0]["content"] == "file contents"
+
+    def test_non_string_result_coerced(self):
+        """tool_result with non-string content (dict, int) is coerced to str."""
+        history = [_sys(), _user(), _assistant_tc("tc1", "tc2")]
+        consumed = merge_tool_results_into_history(
+            history, [
+                {"tool_call_id": "tc1", "result": {"key": "value"}},
+                {"tool_call_id": "tc2", "result": 42},
+            ]
+        )
+        assert consumed == {"tc1", "tc2"}
+        _validate_sequence(history)
+        tool_msgs = {m["tool_call_id"]: m for m in history if m["role"] == "tool"}
+        assert isinstance(tool_msgs["tc1"]["content"], str)
+        assert isinstance(tool_msgs["tc2"]["content"], str)
+
+    def test_non_dict_tool_result_skipped(self):
+        """Non-dict entries in tool_results are silently skipped."""
+        history = [_sys(), _user(), _assistant_tc("tc1")]
+        consumed = merge_tool_results_into_history(
+            history, [_tr("tc1", "ok"), "not a dict", 123]
+        )
+        assert consumed == {"tc1"}
+        _validate_sequence(history)

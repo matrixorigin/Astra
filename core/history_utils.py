@@ -46,9 +46,13 @@ def merge_tool_results_into_history(
     if tool_results:
         pending: dict[str, dict[str, Any]] = {}
         for tr in tool_results:
-            tc_id = tr.get("tool_call_id", "")
+            tc_id = tr.get("tool_call_id", "") if isinstance(tr, dict) else ""
             if tc_id and tc_id not in pending:
                 pending[tc_id] = tr
+
+        def _result_content(tr: dict[str, Any]) -> str:
+            v = tr.get("result", "")
+            return str(v) if not isinstance(v, str) else v
 
         _PLACEHOLDER_MARKER = "[not executed"
         inserts: list[tuple[int, dict[str, Any]]] = []
@@ -75,13 +79,13 @@ def merge_tool_results_into_history(
                 if tc_id in existing:
                     idx, is_placeholder = existing[tc_id]
                     if is_placeholder:
-                        history[idx]["content"] = pending[tc_id].get("result", "")
+                        history[idx]["content"] = _result_content(pending[tc_id])
                     consumed.add(tc_id)
                 else:
                     inserts.append((insert_at, {
                         "role": "tool",
                         "tool_call_id": tc_id,
-                        "content": pending[tc_id].get("result", ""),
+                        "content": _result_content(pending[tc_id]),
                     }))
                     consumed.add(tc_id)
                     insert_at += 1
