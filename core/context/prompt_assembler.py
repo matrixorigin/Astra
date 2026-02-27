@@ -516,7 +516,7 @@ class PromptAssembler(DbConsumer):
         try:
             from core.memory.tiered_loader import TieredMemoryLoader
             loader = TieredMemoryLoader(self._db_factory)
-            tiered_section = loader.build_section(user_id, query)
+            tiered_section, _ = loader.build_section(user_id, session_id, query)
             if tiered_section:
                 parts.append(tiered_section)
         except Exception as e:

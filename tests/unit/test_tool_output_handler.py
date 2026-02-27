@@ -113,7 +113,7 @@ class TestFindSimilarResult:
 
     def test_no_results_returns_none(self, mock_retriever):
         """No similar results returns None."""
-        mock_retriever.retrieve.return_value = []
+        mock_retriever.retrieve.return_value = ([], None)
         
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever
@@ -129,7 +129,7 @@ class TestFindSimilarResult:
         mock_memory.metadata = {"tool": "grep"}
         mock_memory.content = "test pattern found in file.py"
         mock_memory.created_at = datetime.now() - timedelta(seconds=60)
-        mock_retriever.retrieve.return_value = [mock_memory]
+        mock_retriever.retrieve.return_value = ([mock_memory], None)
         
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever
@@ -142,7 +142,7 @@ class TestFindSimilarResult:
         """Result from different tool returns None."""
         mock_memory = MagicMock()
         mock_memory.metadata = {"tool": "shell"}  # Different tool
-        mock_retriever.retrieve.return_value = [mock_memory]
+        mock_retriever.retrieve.return_value = ([mock_memory], None)
         
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever
@@ -151,8 +151,8 @@ class TestFindSimilarResult:
         assert result is None
 
     def test_cross_session_search(self, mock_retriever):
-        """Cross-session search passes None session_id."""
-        mock_retriever.retrieve.return_value = []
+        """Cross-session search passes global session_id."""
+        mock_retriever.retrieve.return_value = ([], None)
         
         find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,
@@ -160,7 +160,7 @@ class TestFindSimilarResult:
         )
         
         call_kwargs = mock_retriever.retrieve.call_args[1]
-        assert call_kwargs["session_id"] is None
+        assert call_kwargs["session_id"] == "global"
 
 
 class TestToolResultMemoryType:
@@ -314,7 +314,7 @@ class TestStalenessCheck:
         mock_memory.metadata = {"tool": "grep"}
         mock_memory.content = "test pattern"
         mock_memory.created_at = datetime.now() - timedelta(seconds=600)  # 10 min old
-        mock_retriever.retrieve.return_value = [mock_memory]
+        mock_retriever.retrieve.return_value = ([mock_memory], None)
         
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,
@@ -334,7 +334,7 @@ class TestStalenessCheck:
         mock_memory.metadata = {"tool": "grep"}
         mock_memory.content = "test pattern found"
         mock_memory.created_at = datetime.now() - timedelta(seconds=60)  # 1 min old
-        mock_retriever.retrieve.return_value = [mock_memory]
+        mock_retriever.retrieve.return_value = ([mock_memory], None)
         
         result = find_similar_result(
             "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,

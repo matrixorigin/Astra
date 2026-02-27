@@ -304,10 +304,10 @@ def find_similar_result(
             query_parts.append(str(params[key]))
     query = ' '.join(query_parts)
     
-    results = retriever.retrieve(
+    results, _ = retriever.retrieve(
         user_id=user_id,
-        query=query,
-        session_id=None if cross_session else session_id,
+        query_text=query,
+        session_id=session_id if not cross_session else "global",
         memory_types=[MemoryType.TOOL_RESULT],
         limit=1,
     )
