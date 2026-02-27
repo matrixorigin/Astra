@@ -36,7 +36,7 @@ class MemoryProvenance(DbConsumer):
     def setup_pitr(self, range_value: int = 14, range_unit: str = "d") -> None:
         """One-time setup: create PITR for memories table."""
         self._exec_ddl(
-            f"create pitr if not exists memory_pitr for table {self.db_name} memories "
+            f"create pitr if not exists memory_pitr for table {self.db_name} mem_memories "
             f"range {range_value} '{range_unit}'"
         )
 

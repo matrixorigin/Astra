@@ -38,7 +38,6 @@
 
 | Change | Rationale |
 |--------|-----------|
-| **Removed `TypedReflector`** | Operated on `MemoryType.EPISODIC` rows — architecture says episodic lives in `conversation_events` |
 | **Removed `MemoryType.EPISODIC`** | No episodic rows in `memories` table |
 | **Renamed `confidence` → `initial_confidence`** | Immutable at write time; `effective_confidence()` at query time |
 | **Removed `_apply_decay()` from governance** | Eliminates double-decay bug (B2) |

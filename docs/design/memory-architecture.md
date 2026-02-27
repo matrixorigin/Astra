@@ -853,11 +853,14 @@ Runs on final reply (when LLM returns text without tool_calls). Extracts typed m
 - **Contradiction detection**: DB-side L2_DISTANCE finds semantically similar existing memories; if content differs → atomic supersede
 - **No in-memory fallback**: contradiction detection requires DB vector search; no silent degradation
 
-### Reflector
+### Reflector (Design Target)
 
-> 🔵 **Design Target** — TypedReflector was removed. Episodic→semantic promotion
-> is not implemented. Observer extracts directly to semantic/profile/procedural types.
-> Session summaries are handled by `SessionSummarizer` (see §Cross-Session Continuity).
+Not yet implemented. Observer extracts directly to semantic/profile/procedural types.
+Cross-session continuity is handled by `SessionSummarizer` (see §Cross-Session Continuity).
+
+A future Reflector would cluster episodic events from `conversation_events` and
+promote patterns into semantic memories — enabling the agent to generalize from
+experience rather than only recording explicit facts.
 
 ### Memory Pipeline
 

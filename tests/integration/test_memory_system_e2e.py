@@ -13,7 +13,6 @@ import pytest
 from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever, TASK_WEIGHTS
 from core.memory.typed_observer import TypedObserver
-# TypedReflector removed
 from core.memory.profile import ProfileManager
 from core.memory.tiered_loader import TieredMemoryLoader
 from core.memory.health import MemoryHealth
@@ -132,16 +131,6 @@ class TestContradictionDetection:
 
         contradiction, _ = observer._find_contradiction(new_mem)
         assert contradiction is None
-
-
-class TestReflectorRemoved:
-    """Reflector removed — episodic type eliminated."""
-
-    def test_no_reflector_module(self):
-        """TypedReflector module no longer exists."""
-        import importlib
-        with pytest.raises(ModuleNotFoundError):
-            importlib.import_module("core.memory.typed_reflector")
 
 
 class TestHealthDetection:

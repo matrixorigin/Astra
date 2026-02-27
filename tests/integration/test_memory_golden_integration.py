@@ -19,7 +19,6 @@ from api.database import get_db_session
 from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever
 from core.memory.typed_observer import TypedObserver, _parse_json_array
-# TypedReflector removed
 from core.memory.profile import ProfileManager
 from core.memory.tiered_loader import TieredMemoryLoader
 from core.memory.types import Memory, MemoryType
@@ -577,16 +576,6 @@ class TestTaskAwareWeightsRealDB:
         # Code memory should be found (cross-session since session_id=NULL)
         assert len(results) >= 1
         assert any("Python" in m.content for m in results)
-
-
-class TestReflectorRemoved:
-    """TypedReflector removed — episodic type eliminated."""
-
-    def test_no_reflector_module(self):
-        """TypedReflector module no longer exists."""
-        import importlib
-        with pytest.raises(ModuleNotFoundError):
-            importlib.import_module("core.memory.typed_reflector")
 
 
 class TestHealthRealDB:

@@ -94,13 +94,6 @@ class TestNoDecayMutation:
             assert "initial_confidence =" not in sql or "SET" not in sql
 
 
-class TestNoReflector:
-    def test_no_reflector_in_governance(self):
-        import importlib
-        with pytest.raises(ModuleNotFoundError):
-            importlib.import_module("core.memory.typed_reflector")
-
-
 class TestQuarantineConfig:
     def test_custom_threshold(self, mock_db):
         config = MemoryGovernanceConfig(quarantine_threshold=0.5)
