@@ -286,6 +286,7 @@ class TestObserverReceivesMessages:
 
         assert len(observer_messages) == 1
         assert observer_messages[0]["role"] == "assistant"
+        assert "configuration" in observer_messages[0]["content"]
 
     def test_observer_skipped_when_no_text(self):
         """No full_text at all: observer should NOT run."""

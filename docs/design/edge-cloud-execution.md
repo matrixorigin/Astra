@@ -129,7 +129,8 @@ data: {"type": "turn_complete", "has_tool_calls": true}
 
 **Incomplete turn handling**: If edge disconnects before sending tool_results
 (max turns, crash, network), cloud auto-heals the history on the next request
-by injecting placeholder tool messages for orphaned tool_calls. Cloud owns
+by scanning the entire history and injecting placeholder tool messages for any
+orphaned tool_calls (including partial results). Cloud owns
 history integrity — edge is not required to "flush" pending results.
 
 ### Edge loop pseudocode

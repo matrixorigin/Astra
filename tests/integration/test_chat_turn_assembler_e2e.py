@@ -901,3 +901,67 @@ class TestCloudHistoryHealing:
         # Verify the healed tool message is present
         tool_msgs = [m for m in captured_messages if m.get("role") == "tool"]
         assert any("tc_heal" == m.get("tool_call_id") for m in tool_msgs)
+
+    def test_healing_required_when_tool_calls_orphaned(self, client, auth_headers):
+        """Negative regression: without healing, orphaned tool_calls would
+        produce an invalid message sequence.  Verify the healing actually
+        injects placeholders (not that the sequence happens to be valid by
+        accident).
+        """
+        # Turn 1: LLM returns tool_calls
+        async def turn1_stream(messages, tools, *args, **kwargs):
+            async for chunk in fake_stream_gen([
+                {"type": "tool_call", "data": {
+                    "id": "tc_neg", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "z.py"}'},
+                }},
+            ]):
+                yield chunk
+
+        edge_tools = [{"type": "function", "function": {
+            "name": "read_file", "description": "r",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }}]
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn1_stream):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "read z.py"}],
+                "edge_tools": edge_tools,
+            }, headers=auth_headers)
+        session_id = parse_sse(r1.text)[0]["session_id"]
+
+        # Turn 2: edge sends user message without tool_results.
+        # Patch _heal_orphaned_tool_calls to a no-op → history stays broken.
+        captured_messages = []
+
+        async def turn2_stream(messages, tools, *args, **kwargs):
+            captured_messages.extend(messages)
+            async for chunk in fake_stream_gen([
+                {"type": "text", "content": "ok"},
+            ]):
+                yield chunk
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn2_stream), \
+             patch("api.routers.chat._heal_orphaned_tool_calls"):  # no-op
+            client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "continue"}],
+                "session_id": session_id,
+            }, headers=auth_headers)
+
+        # Without healing, the orphaned tool_call has no matching tool message
+        has_orphan = False
+        for i, msg in enumerate(captured_messages):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected = {tc["id"] for tc in msg["tool_calls"]}
+                found = set()
+                for j in range(i + 1, len(captured_messages)):
+                    if captured_messages[j].get("role") == "tool":
+                        found.add(captured_messages[j].get("tool_call_id"))
+                    else:
+                        break
+                if expected - found:
+                    has_orphan = True
+        assert has_orphan, (
+            "Without healing, history should have orphaned tool_calls — "
+            "this proves the healing code is necessary"
+        )

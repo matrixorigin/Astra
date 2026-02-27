@@ -516,6 +516,48 @@ def _classify_task(messages: list[dict[str, Any]]) -> str | None:
     return None
 
 
+def _heal_orphaned_tool_calls(history: list[dict[str, Any]]) -> None:
+    """Scan history and inject placeholder tool messages for any assistant
+    tool_calls that lack matching tool responses.
+
+    OpenAI-compatible APIs require every tool_call to be followed (before the
+    next non-tool message) by a tool message with the same tool_call_id.
+    Edge may skip tool_results due to max-turns, crash, Ctrl-C, or network
+    disconnect.  Cloud heals these gaps so the LLM API never rejects history.
+
+    Mutates *history* in-place.  Inserts are done in reverse index order so
+    earlier indices remain valid while we splice.
+    """
+    # Collect (insert_position, placeholder_msg) pairs.
+    inserts: list[tuple[int, dict[str, Any]]] = []
+    for i, msg in enumerate(history):
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            continue
+        expected = {tc["id"] for tc in msg["tool_calls"]}
+        found: set[str] = set()
+        for j in range(i + 1, len(history)):
+            if history[j].get("role") == "tool":
+                found.add(history[j].get("tool_call_id", ""))
+            else:
+                break
+        missing = expected - found
+        if missing:
+            # Insert right after the last existing tool message (or after
+            # the assistant message itself if there are none).
+            insert_at = i + 1 + len(found)
+            for tc in msg["tool_calls"]:
+                if tc["id"] in missing:
+                    inserts.append((insert_at, {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": "[not executed -- edge disconnected]",
+                    }))
+                    insert_at += 1
+    # Splice in reverse so indices stay valid.
+    for pos, placeholder in reversed(inserts):
+        history.insert(pos, placeholder)
+
+
 def _build_turn_messages(
     db: Session,
     user_id: str,
@@ -608,18 +650,13 @@ def _build_turn_messages(
                     logger.debug("Memory refresh failed (non-fatal): %s", e)
 
     # History integrity: cloud guarantees a valid OpenAI message sequence
-    # regardless of edge behavior. If the last assistant message has tool_calls
-    # but edge never sent tool_results (max-turns, crash, Ctrl-C, network),
-    # inject placeholder tool messages so the LLM API accepts the history.
-    if (history and not tool_results
-            and history[-1].get("role") == "assistant"
-            and history[-1].get("tool_calls")):
-        for tc in history[-1]["tool_calls"]:
-            history.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": "[not executed — edge turn limit reached]",
-            })
+    # regardless of edge behavior.  Scan the *entire* history for orphaned
+    # tool_calls (assistant has tool_calls but no matching tool messages
+    # follow).  This handles: max-turns, crash, Ctrl-C, network disconnect,
+    # and partial tool_results (edge sent results for some calls but not all).
+    # We collect placeholders first, then splice them in reverse order so
+    # indices stay valid.
+    _heal_orphaned_tool_calls(history)
 
     # Append new user messages from edge
     for msg in messages:
@@ -925,6 +962,11 @@ def _persist_turn_events(
         # Intermediate turns (tool_call→tool_result cycles) have no meaningful
         # content for memory extraction. Aligns with Mastra/Claude Code approach.
         is_final_reply = bool(full_text) and not tool_calls
+        if full_text and tool_calls:
+            logger.debug(
+                "Observer skipped: intermediate turn has text (%d chars) + %d tool_calls",
+                len(full_text), len(tool_calls),
+            )
         if is_final_reply:
             observer_messages: list[dict[str, Any]] = []
             if user_content:
