@@ -10,7 +10,7 @@ from core.memory.retriever import MemoryRetriever, TASK_WEIGHTS, _KEYWORD_SQL, _
 from core.memory.types import MemoryType, RetrievalWeights
 
 
-MemRow = namedtuple("MemRow", ["memory_id", "content", "memory_type", "confidence", "observed_at", "session_id"])
+MemRow = namedtuple("MemRow", ["memory_id", "content", "memory_type", "initial_confidence", "observed_at", "session_id"])
 
 
 @pytest.fixture
@@ -41,13 +41,13 @@ class TestTaskWeights:
 class TestRetrieveWithEmbedding:
     def test_returns_memories(self, retriever, mock_db):
         mock_db.execute.return_value.fetchall.return_value = [
-            MemRow("m1", "Go testing", "episodic", 0.9, datetime(2026, 2, 26), None),
+            MemRow("m1", "Go testing", "semantic", 0.9, datetime(2026, 2, 26), None),
             MemRow("m2", "Python flask", "semantic", 0.7, datetime(2026, 2, 25), None),
         ]
         results, _ = retriever.retrieve("u1", "Go testing", session_id="s1")
         assert len(results) == 2
         assert results[0].memory_id == "m1"
-        assert results[0].memory_type == MemoryType.EPISODIC
+        assert results[0].memory_type == MemoryType.SEMANTIC
 
     def test_uses_keyword_sql_with_query(self, retriever, mock_db):
         retriever.retrieve("u1", "test query", session_id="s1")
@@ -109,7 +109,6 @@ class TestRetrieveDefaults:
         params = mock_db.execute.call_args[0][1]
         types = params["types"]
         assert "profile" in types
-        assert "episodic" in types
         assert "semantic" in types
         assert "procedural" in types
         assert "working" not in types

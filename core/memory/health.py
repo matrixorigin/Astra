@@ -33,7 +33,7 @@ class MemoryHealth(DbConsumer):
                 SELECT
                     memory_type,
                     COUNT(*) as total,
-                    AVG(confidence) as avg_confidence,
+                    AVG(initial_confidence) as avg_confidence,
                     COUNT(CASE WHEN superseded_by IS NOT NULL THEN 1 END) as superseded,
                     AVG(TIMESTAMPDIFF(HOUR, observed_at, NOW())) as avg_staleness_hours
                 FROM memories
@@ -90,7 +90,7 @@ class MemoryHealth(DbConsumer):
                 FROM memories
                 WHERE user_id = :uid
                   AND is_active = 1
-                  AND confidence < 0.5
+                  AND initial_confidence < 0.5
                 ORDER BY observed_at DESC
                 LIMIT 1
             """), {"uid": user_id}).fetchone()

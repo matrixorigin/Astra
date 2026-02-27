@@ -24,14 +24,14 @@ class MemoryRecord(Base):
 
     memory_id = Column(String(64), primary_key=True)
     user_id = Column(String(64), nullable=False)
-    session_id = Column(String(64), nullable=True)  # NULL = cross-session (profile/semantic)
-    memory_type = Column(String(20), nullable=False)  # profile/episodic/semantic/procedural/working
+    session_id = Column(String(64), nullable=True)
+    memory_type = Column(String(20), nullable=False)
     content = Column(Text, nullable=False)
-    confidence = Column(Float, default=0.75, nullable=False)
+    initial_confidence = Column(Float, default=0.75, nullable=False)
     embedding = Column(VectorType(1536, VectorPrecision.F32))
     source_event_ids = Column(JSON, nullable=False, default=list)
     superseded_by = Column(String(64), nullable=True)
     is_active = Column(SmallInteger, server_default="1", nullable=False)
-    observed_at = Column(DateTime, nullable=False)  # PITR time anchor
+    observed_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())

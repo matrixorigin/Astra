@@ -2,7 +2,6 @@
 
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
 
 import pytest
 
@@ -11,7 +10,6 @@ from core.memory.config import MemoryGovernanceConfig
 
 
 class TestGovernanceScheduler:
-    """Tests for GovernanceScheduler."""
 
     @pytest.fixture
     def mock_db_factory(self):
@@ -20,96 +18,66 @@ class TestGovernanceScheduler:
     @pytest.fixture
     def config(self):
         return MemoryGovernanceConfig(
-            confidence_decay_half_life_days=30.0,
-            reflector_cluster_min_size=3,
-            reflector_cluster_similarity=0.7,
             pollution_threshold=0.3,
             milestone_snapshot_keep_n=5,
         )
 
-    def test_apply_decay_updates_confidence(self, mock_db_factory, config):
-        """Decay reduces confidence based on age."""
-        scheduler = GovernanceScheduler(mock_db_factory, config)
+    @pytest.fixture
+    def scheduler(self, mock_db_factory, config):
+        return GovernanceScheduler(mock_db_factory, config)
 
-        mock_session = MagicMock()
-        mock_result = MagicMock()
-        mock_result.rowcount = 5
-        mock_session.execute.return_value = mock_result
-
-        with patch.object(scheduler, "_db") as mock_db:
-            mock_db.return_value.__enter__.return_value = mock_session
-            mock_db.return_value.__exit__.return_value = None
-
-            count = scheduler._apply_decay("user123")
-
-        assert count == 5
-        mock_session.execute.assert_called_once()
-        mock_session.commit.assert_called_once()
-
-    def test_cleanup_stale_deletes_low_confidence_inactive(
-        self, mock_db_factory, config
-    ):
+    def test_cleanup_stale_deletes_low_confidence_inactive(self, scheduler):
         """Cleanup removes inactive memories below threshold."""
-        scheduler = GovernanceScheduler(mock_db_factory, config)
-
         mock_session = MagicMock()
-        mock_result = MagicMock()
-        mock_result.rowcount = 3
-        mock_session.execute.return_value = mock_result
+        mock_session.execute.return_value.rowcount = 3
 
         with patch.object(scheduler, "_db") as mock_db:
             mock_db.return_value.__enter__.return_value = mock_session
             mock_db.return_value.__exit__.return_value = None
-
             count = scheduler._cleanup_stale("user123", confidence_threshold=0.1)
 
         assert count == 3
-        # Verify DELETE was called
-        call_args = mock_session.execute.call_args
-        sql_text = str(call_args[0][0])
+        sql_text = str(mock_session.execute.call_args[0][0])
         assert "DELETE FROM memories" in sql_text
         assert "is_active = 0" in sql_text
-        assert "confidence <" in sql_text
+        assert "initial_confidence <" in sql_text
 
-    def test_run_cycle_executes_all_steps(self, mock_db_factory, config):
-        """Full cycle runs decay, reflector, health, cleanup."""
-        scheduler = GovernanceScheduler(mock_db_factory, config)
+    def test_cleanup_tool_results_respects_ttl(self, scheduler):
+        """Tool result cleanup uses configured TTL."""
+        mock_session = MagicMock()
+        mock_session.execute.return_value.rowcount = 2
 
-        # Mock all internal methods
-        with patch.object(scheduler, "_apply_decay", return_value=2) as mock_decay, \
-             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 1}) as mock_reflect, \
-             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}) as mock_poll, \
+        with patch.object(scheduler, "_db") as mock_db:
+            mock_db.return_value.__enter__.return_value = mock_session
+            mock_db.return_value.__exit__.return_value = None
+            count = scheduler._cleanup_tool_results()
+
+        assert count == 2
+        sql_text = str(mock_session.execute.call_args[0][0])
+        assert "memory_type = :mtype" in sql_text
+        assert "TIMESTAMPDIFF" in sql_text
+
+    def test_run_cycle_executes_all_steps(self, scheduler):
+        """Full cycle runs health, stale cleanup, branches, snapshots, tool_results."""
+        with patch.object(scheduler, "_health_check") as mock_health, \
              patch.object(scheduler, "_cleanup_stale", return_value=3) as mock_stale, \
-             patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0) as mock_branches, \
-             patch.object(scheduler.health, "cleanup_snapshots", return_value=1) as mock_snaps, \
-             patch.object(scheduler, "_cleanup_tool_results", return_value=2) as mock_tool:
+             patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
+             patch.object(scheduler.health, "cleanup_snapshots", return_value=1), \
+             patch.object(scheduler, "_cleanup_tool_results", return_value=2):
 
             result = scheduler.run_cycle("user123")
 
-        assert result.decayed_count == 2
-        assert result.promoted_count == 1
         assert result.cleaned_stale == 3
         assert result.cleaned_branches == 0
         assert result.cleaned_snapshots == 1
         assert result.cleaned_tool_results == 2
-        assert result.pollution_detected is False
         assert len(result.errors) == 0
-
-        mock_decay.assert_called_once_with("user123")
-        mock_reflect.assert_called_once_with("user123")
-        mock_poll.assert_called_once()
         mock_stale.assert_called_once_with("user123")
-        mock_branches.assert_called_once()
-        mock_snaps.assert_called_once()
-        mock_tool.assert_called_once()
 
-    def test_run_cycle_detects_pollution(self, mock_db_factory, config):
+    def test_run_cycle_detects_pollution(self, scheduler):
         """Cycle flags pollution when threshold exceeded."""
-        scheduler = GovernanceScheduler(mock_db_factory, config)
-
-        with patch.object(scheduler, "_apply_decay", return_value=0), \
-             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 0}), \
-             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": True, "ratio": 0.5}), \
+        with patch.object(scheduler.health, "detect_pollution",
+                          return_value={"is_polluted": True, "ratio": 0.5}), \
              patch.object(scheduler, "_cleanup_stale", return_value=0), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
              patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
@@ -119,13 +87,9 @@ class TestGovernanceScheduler:
 
         assert result.pollution_detected is True
 
-    def test_run_cycle_continues_on_error(self, mock_db_factory, config):
+    def test_run_cycle_continues_on_error(self, scheduler):
         """Cycle continues even if one step fails."""
-        scheduler = GovernanceScheduler(mock_db_factory, config)
-
-        with patch.object(scheduler, "_apply_decay", side_effect=Exception("decay error")), \
-             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 1}), \
-             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
+        with patch.object(scheduler, "_health_check", side_effect=Exception("health error")), \
              patch.object(scheduler, "_cleanup_stale", return_value=2), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
              patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
@@ -133,19 +97,12 @@ class TestGovernanceScheduler:
 
             result = scheduler.run_cycle("user123")
 
-        # Decay failed but other steps ran
-        assert result.decayed_count == 0
-        assert result.promoted_count == 1
         assert result.cleaned_stale == 2
-        assert "decay" in result.errors[0]
+        assert any("health" in e for e in result.errors)
 
-    def test_last_cycle_tracked_per_user(self, mock_db_factory, config):
+    def test_last_cycle_tracked_per_user(self, scheduler):
         """Each user has independent last_cycle timestamp."""
-        scheduler = GovernanceScheduler(mock_db_factory, config)
-
-        with patch.object(scheduler, "_apply_decay", return_value=0), \
-             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 0}), \
-             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
+        with patch.object(scheduler, "_health_check"), \
              patch.object(scheduler, "_cleanup_stale", return_value=0), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
              patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
@@ -156,15 +113,10 @@ class TestGovernanceScheduler:
 
         assert "user1" in scheduler._last_cycle
         assert "user2" in scheduler._last_cycle
-        assert scheduler._last_cycle["user1"] != scheduler._last_cycle["user2"] or True  # timestamps close
 
-    def test_explain_populates_step_stats(self, mock_db_factory, config):
+    def test_explain_populates_step_stats(self, scheduler):
         """explain=True populates detailed stats for each step."""
-        scheduler = GovernanceScheduler(mock_db_factory, config)
-
-        with patch.object(scheduler, "_apply_decay", return_value=2), \
-             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 1}), \
-             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
+        with patch.object(scheduler, "_health_check"), \
              patch.object(scheduler, "_cleanup_stale", return_value=3), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
              patch.object(scheduler.health, "cleanup_snapshots", return_value=1), \
@@ -172,30 +124,20 @@ class TestGovernanceScheduler:
 
             result = scheduler.run_cycle("user123", explain=True)
 
-        # All step stats populated
-        assert result.decay_stats is not None
-        assert result.decay_stats.executed is True
-        assert result.decay_stats.success is True
-        assert result.decay_stats.count == 2
-        assert result.decay_stats.elapsed_ms > 0
-
-        assert result.reflector_stats.success is True
-        assert result.reflector_stats.count == 1
-
+        assert result.health_stats is not None
+        assert result.health_stats.executed is True
         assert result.health_stats.success is True
+
+        assert result.cleanup_stale_stats.success is True
         assert result.cleanup_stale_stats.count == 3
+
         assert result.cleanup_snapshots_stats.count == 1
         assert result.cleanup_tool_results_stats.count == 2
-
         assert result.total_ms > 0
 
-    def test_explain_captures_step_errors(self, mock_db_factory, config):
+    def test_explain_captures_step_errors(self, scheduler):
         """explain=True captures error details per step."""
-        scheduler = GovernanceScheduler(mock_db_factory, config)
-
-        with patch.object(scheduler, "_apply_decay", side_effect=Exception("decay failed")), \
-             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 1}), \
-             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
+        with patch.object(scheduler, "_health_check", side_effect=Exception("health failed")), \
              patch.object(scheduler, "_cleanup_stale", return_value=0), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
              patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
@@ -203,21 +145,14 @@ class TestGovernanceScheduler:
 
             result = scheduler.run_cycle("user123", explain=True)
 
-        # Decay failed
-        assert result.decay_stats.executed is True
-        assert result.decay_stats.success is False
-        assert result.decay_stats.error == "decay failed"
+        assert result.health_stats.executed is True
+        assert result.health_stats.success is False
+        assert result.health_stats.error == "health failed"
+        assert result.cleanup_stale_stats.success is True
 
-        # Other steps succeeded
-        assert result.reflector_stats.success is True
-
-    def test_explain_false_no_stats(self, mock_db_factory, config):
+    def test_explain_false_no_stats(self, scheduler):
         """explain=False leaves stats as None."""
-        scheduler = GovernanceScheduler(mock_db_factory, config)
-
-        with patch.object(scheduler, "_apply_decay", return_value=1), \
-             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 0}), \
-             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
+        with patch.object(scheduler, "_health_check"), \
              patch.object(scheduler, "_cleanup_stale", return_value=0), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
              patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
@@ -225,64 +160,36 @@ class TestGovernanceScheduler:
 
             result = scheduler.run_cycle("user123", explain=False)
 
-        assert result.decay_stats is None
-        assert result.reflector_stats is None
+        assert result.health_stats is None
+        assert result.cleanup_stale_stats is None
         assert result.total_ms == 0
 
+    def test_no_decay_mutation(self, scheduler):
+        """Governance no longer has _apply_decay — decay is query-time only."""
+        assert not hasattr(scheduler, "_apply_decay")
 
-class TestMemoryHealthExtensions:
-    """Tests for new MemoryHealth methods."""
+    def test_no_reflector(self, scheduler):
+        """Governance no longer has reflector — episodic type eliminated."""
+        assert not hasattr(scheduler, "reflector")
 
-    @pytest.fixture
-    def mock_db_factory(self):
-        return MagicMock()
 
-    def test_cleanup_orphan_branches_finds_sandbox_tables(self, mock_db_factory):
-        """Orphan cleanup finds and deletes sandbox tables."""
-        from core.memory.health import MemoryHealth
+class TestGovernanceCycleResult:
 
-        health = MemoryHealth(mock_db_factory)
+    def test_defaults(self):
+        r = GovernanceCycleResult()
+        assert r.cleaned_stale == 0
+        assert r.cleaned_tool_results == 0
+        assert r.pollution_detected is False
+        assert r.errors == []
+        assert r.health_stats is None
 
-        mock_session = MagicMock()
-        # First call: find orphan tables
-        mock_rows = [
-            MagicMock(table_name="memories_sandbox_abc123"),
-            MagicMock(table_name="memories_sandbox_def456"),
-        ]
-        mock_session.execute.return_value.fetchall.return_value = mock_rows
 
-        with patch.object(health, "_db") as mock_db:
-            mock_db.return_value.__enter__.return_value = mock_session
-            mock_db.return_value.__exit__.return_value = None
+class TestGovernanceStepStats:
 
-            count = health.cleanup_orphan_branches()
-
-        # Should attempt to delete both
-        assert mock_session.execute.call_count >= 1
-
-    def test_get_storage_stats_returns_metrics(self, mock_db_factory):
-        """Storage stats returns count and size metrics."""
-        from core.memory.health import MemoryHealth
-
-        health = MemoryHealth(mock_db_factory)
-
-        mock_session = MagicMock()
-        mock_row = MagicMock(
-            total=100,
-            active=80,
-            avg_content_size=150.5,
-            oldest=datetime(2026, 1, 1),
-            newest=datetime(2026, 2, 26),
-        )
-        mock_session.execute.return_value.fetchone.return_value = mock_row
-
-        with patch.object(health, "_db") as mock_db:
-            mock_db.return_value.__enter__.return_value = mock_session
-            mock_db.return_value.__exit__.return_value = None
-
-            stats = health.get_storage_stats("user123")
-
-        assert stats["total"] == 100
-        assert stats["active"] == 80
-        assert stats["inactive"] == 20
-        assert stats["avg_content_size"] == 150.5
+    def test_defaults(self):
+        s = GovernanceStepStats()
+        assert s.executed is False
+        assert s.success is False
+        assert s.error is None
+        assert s.count == 0
+        assert s.elapsed_ms == 0.0

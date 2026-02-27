@@ -16,7 +16,6 @@ from core.memory.types import Memory, MemoryType
 from core.memory.profile import ProfileManager
 from core.memory.tiered_loader import TieredMemoryLoader
 from core.memory.typed_observer import TypedObserver
-from core.memory.typed_reflector import TypedReflector
 from core.memory.governance import GovernanceScheduler
 from core.memory.health import MemoryHealth
 from core.memory.config import MemoryGovernanceConfig
@@ -73,7 +72,7 @@ class TestObserverToPromptClosedLoop:
             user_id=user_id,
             content="User strongly prefers Python for data analysis",
             memory_type=MemoryType.PROFILE,
-            confidence=0.9,
+            initial_confidence=0.9,
         )
         memory_cleanup.append(mem.memory_id)
         
@@ -103,7 +102,7 @@ class TestObserverToPromptClosedLoop:
         memories = [
             ("User prefers Go for backend", MemoryType.PROFILE),
             ("User likes Python for ML", MemoryType.PROFILE),
-            ("User asked about Kubernetes", MemoryType.EPISODIC),
+            ("User asked about Kubernetes", MemoryType.SEMANTIC),
         ]
         
         for content, mtype in memories:
@@ -112,7 +111,7 @@ class TestObserverToPromptClosedLoop:
                 user_id=user_id,
                 memory_type=mtype,
                 content=content,
-                confidence=0.8,
+                initial_confidence=0.8,
                 embedding=_embed(content),
                 observed_at=datetime.utcnow(),
             )
@@ -148,7 +147,7 @@ class TestMultiTurnMemoryAccumulation:
             user_id=user_id,
             content="User prefers functional programming",
             memory_type=MemoryType.PROFILE,
-            confidence=0.8,
+            initial_confidence=0.8,
         )
         memory_cleanup.append(mem1.memory_id)
         
@@ -156,8 +155,8 @@ class TestMultiTurnMemoryAccumulation:
         mem2, _ = observer.observe_explicit(
             user_id=user_id,
             content="User asked about Haskell monads",
-            memory_type=MemoryType.EPISODIC,
-            confidence=0.7,
+            memory_type=MemoryType.SEMANTIC,
+            initial_confidence=0.7,
         )
         memory_cleanup.append(mem2.memory_id)
         
@@ -166,7 +165,7 @@ class TestMultiTurnMemoryAccumulation:
             user_id=user_id,
             content="User dislikes mutable state",
             memory_type=MemoryType.SEMANTIC,
-            confidence=0.85,
+            initial_confidence=0.85,
         )
         memory_cleanup.append(mem3.memory_id)
         
@@ -213,7 +212,7 @@ class TestContradictionAndSupersede:
             user_id=user_id,
             content="User prefers tabs",
             memory_type=MemoryType.PROFILE,
-            confidence=0.8,
+            initial_confidence=0.8,
         )
         memory_cleanup.append(old.memory_id)
         
@@ -222,7 +221,7 @@ class TestContradictionAndSupersede:
             user_id=user_id,
             content="User prefers spaces",
             memory_type=MemoryType.PROFILE,
-            confidence=0.9,
+            initial_confidence=0.9,
         )
         memory_cleanup.append(new.memory_id)
         
@@ -279,7 +278,7 @@ class TestProfileAndL0:
                 user_id=user_id,
                 memory_type=MemoryType.PROFILE,
                 content=pref,
-                confidence=0.8,
+                initial_confidence=0.8,
                 embedding=_embed(pref),
                 observed_at=datetime.utcnow(),
             )
@@ -303,7 +302,7 @@ class TestProfileAndL0:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="User is a senior developer",
-            confidence=0.9,
+            initial_confidence=0.9,
             embedding=_embed("User is a senior developer"),
             observed_at=datetime.utcnow(),
         )
@@ -323,31 +322,28 @@ class TestProfileAndL0:
 class TestGovernanceRealExecution:
     """Test Governance with real DB."""
 
-    def test_decay_reduces_confidence(self, db_factory, memory_cleanup):
-        """Decay reduces confidence of old memories."""
+    def test_decay_is_query_time_only(self, db_factory, memory_cleanup):
+        """Confidence is immutable in DB — decay computed at query time."""
         user_id = _uid()
         store = MemoryStore(db_factory)
-        config = MemoryGovernanceConfig(confidence_decay_half_life_days=1.0)
-        scheduler = GovernanceScheduler(db_factory, config)
         
         old_mem = Memory(
             memory_id=str(uuid7()),
             user_id=user_id,
-            memory_type=MemoryType.EPISODIC,
+            memory_type=MemoryType.SEMANTIC,
             content="Old event",
-            confidence=1.0,
+            initial_confidence=1.0,
             embedding=_embed("Old event"),
             observed_at=datetime.utcnow() - timedelta(days=7),
         )
         memory_cleanup.append(old_mem.memory_id)
         store.create(old_mem)
         
-        original_conf = store.get(old_mem.memory_id).confidence
-        
-        decayed_count = scheduler._apply_decay(user_id)
-        
-        new_conf = store.get(old_mem.memory_id).confidence
-        assert new_conf < original_conf
+        stored = store.get(old_mem.memory_id)
+        # DB value unchanged
+        assert stored.initial_confidence == 1.0
+        # Query-time decay is lower
+        assert stored.effective_confidence(half_life_days=1.0) < 0.01
 
     def test_full_governance_cycle(self, db_factory, memory_cleanup):
         """Full governance cycle runs without error."""
@@ -360,9 +356,9 @@ class TestGovernanceRealExecution:
             mem = Memory(
                 memory_id=str(uuid7()),
                 user_id=user_id,
-                memory_type=MemoryType.EPISODIC,
+                memory_type=MemoryType.SEMANTIC,
                 content=f"Event {i}",
-                confidence=0.8,
+                initial_confidence=0.8,
                 embedding=_embed(f"Event {i}"),
                 observed_at=datetime.utcnow() - timedelta(days=i),
             )
@@ -383,13 +379,13 @@ class TestHealthDetection:
         health = MemoryHealth(db_factory)
         
         # Create memories
-        for mtype in [MemoryType.PROFILE, MemoryType.EPISODIC]:
+        for mtype in [MemoryType.PROFILE, MemoryType.SEMANTIC]:
             mem = Memory(
                 memory_id=str(uuid7()),
                 user_id=user_id,
                 memory_type=mtype,
                 content=f"{mtype.value} memory",
-                confidence=0.7,
+                initial_confidence=0.7,
                 embedding=_embed(f"{mtype.value} memory"),
                 observed_at=datetime.utcnow(),
             )
@@ -400,7 +396,7 @@ class TestHealthDetection:
         
         # Stats keyed by memory_type value
         assert "profile" in stats or MemoryType.PROFILE.value in stats
-        assert "episodic" in stats or MemoryType.EPISODIC.value in stats
+        assert "profile" in stats or "semantic" in stats
 
 
 class TestTaskAwareRetrieval:
@@ -418,7 +414,7 @@ class TestTaskAwareRetrieval:
             user_id=user_id,
             memory_type=MemoryType.PROCEDURAL,
             content="Always run tests before commit",
-            confidence=0.8,
+            initial_confidence=0.8,
             embedding=_embed("Always run tests before commit"),
             observed_at=datetime.utcnow(),
         )

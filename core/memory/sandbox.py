@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from core.db_consumer import DbConsumer, DbFactory
 from core.memory.explain import SandboxStats
-from core.memory.metrics import metrics
+from core.memory.metrics import MemoryMetrics
 from core.memory.types import Memory
 
 logger = logging.getLogger(__name__)
@@ -27,9 +27,10 @@ logger = logging.getLogger(__name__)
 class MemorySandbox(DbConsumer):
     """Validate memories in a branch before committing."""
 
-    def __init__(self, db_factory: DbFactory, db_name: str = "dev_agent"):
+    def __init__(self, db_factory: DbFactory, db_name: str = "dev_agent", metrics: Optional[MemoryMetrics] = None):
         super().__init__(db_factory)
         self.db_name = db_name
+        self._metrics = metrics or MemoryMetrics()
 
     def validate_memories(
         self,
@@ -86,7 +87,7 @@ class MemorySandbox(DbConsumer):
 
         except Exception as e:
             logger.warning("Sandbox validation failed: %s", e)
-            metrics.increment("sandbox_validation_errors")
+            self._metrics.increment("sandbox_validation_errors")
             if stats:
                 stats.error = str(e)
                 stats.total_ms = (time.time() - start) * 1000
@@ -121,7 +122,7 @@ class MemorySandbox(DbConsumer):
                 if vec_literal:
                     db.execute(text(f"""
                         INSERT INTO {branch_name}
-                        (memory_id, user_id, memory_type, content, confidence,
+                        (memory_id, user_id, memory_type, content, initial_confidence,
                          embedding, source_event_ids, is_active, observed_at, created_at)
                         VALUES (:mid, :uid, :mtype, :content, :conf,
                                 :vec, :sources, 1, :obs_at, :created_at)
@@ -130,7 +131,7 @@ class MemorySandbox(DbConsumer):
                         "uid": m.user_id,
                         "mtype": m.memory_type.value,
                         "content": m.content,
-                        "conf": m.confidence,
+                        "conf": m.initial_confidence,
                         "vec": vec_literal,
                         "sources": source_ids,
                         "obs_at": now,
@@ -139,7 +140,7 @@ class MemorySandbox(DbConsumer):
                 else:
                     db.execute(text(f"""
                         INSERT INTO {branch_name}
-                        (memory_id, user_id, memory_type, content, confidence,
+                        (memory_id, user_id, memory_type, content, initial_confidence,
                          source_event_ids, is_active, observed_at, created_at)
                         VALUES (:mid, :uid, :mtype, :content, :conf,
                                 :sources, 1, :obs_at, :created_at)
@@ -148,7 +149,7 @@ class MemorySandbox(DbConsumer):
                         "uid": m.user_id,
                         "mtype": m.memory_type.value,
                         "content": m.content,
-                        "conf": m.confidence,
+                        "conf": m.initial_confidence,
                         "sources": source_ids,
                         "obs_at": now,
                         "created_at": now,

@@ -41,7 +41,6 @@ def trust_tier_defaults(tier: str) -> dict[str, float]:
 RETENTION_POLICIES = {
     "sensory": {"ttl_hours": 1, "decay": "auto_purge"},
     "working": {"ttl_hours": None, "decay": "archive_on_close"},
-    "episodic": {"ttl_days": 90, "decay": "compress_to_summary"},
     "semantic": {"ttl_days": None, "decay": "confidence_decay"},
     "procedural": {"ttl_days": None, "decay": "version_only"},
 }
@@ -175,28 +174,8 @@ class MemoryGovernanceEngine(DbConsumer):
             return count
 
     def _run_reflector(self) -> int:
-        """Run TypedReflector to promote episodic clusters to semantic memories."""
-        from core.memory.store import MemoryStore
-        from core.memory.typed_reflector import TypedReflector
-        from core.memory.types import MemoryType
-        from sqlalchemy import distinct, text
-
-        with self._db() as db:
-            # Find users with episodic memories
-            result = db.execute(text(
-                "SELECT DISTINCT user_id FROM memories WHERE memory_type = :mtype AND is_active = 1"
-            ), {"mtype": MemoryType.EPISODIC.value})
-            user_ids = [row[0] for row in result.fetchall()]
-
-        total = 0
-        store = MemoryStore(self._db_factory)
-        reflector = TypedReflector(store=store, llm_client=self.llm_client)
-
-        for user_id in user_ids:
-            promoted = reflector.reflect(user_id)
-            total += len(promoted)
-
-        return total
+        """Reflector removed — episodic type eliminated. No-op for backward compat."""
+        return 0
     
     def _apply_confidence_decay(self) -> int:
         """Apply confidence decay to all knowledge entries.

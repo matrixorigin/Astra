@@ -13,7 +13,7 @@ import pytest
 from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever, TASK_WEIGHTS
 from core.memory.typed_observer import TypedObserver
-from core.memory.typed_reflector import TypedReflector
+# TypedReflector removed
 from core.memory.profile import ProfileManager
 from core.memory.tiered_loader import TieredMemoryLoader
 from core.memory.health import MemoryHealth
@@ -71,7 +71,7 @@ class TestContradictionDetection:
         mock_row = MagicMock()
         mock_row.memory_id = "old1"
         mock_row.content = "User prefers tabs"
-        mock_row.confidence = 0.8
+        mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 0.1  # Very close → contradiction
         mock_db.execute.return_value.fetchone.return_value = mock_row
 
@@ -83,7 +83,7 @@ class TestContradictionDetection:
 
         new_mem = Memory(
             memory_id="new1", user_id="u", memory_type=MemoryType.PROFILE,
-            content="User prefers spaces", confidence=0.9,
+            content="User prefers spaces", initial_confidence=0.9,
             embedding=[0.1] * 768,
             observed_at=datetime.utcnow(),
         )
@@ -98,7 +98,7 @@ class TestContradictionDetection:
         mock_row = MagicMock()
         mock_row.memory_id = "go1"
         mock_row.content = "User likes Go"
-        mock_row.confidence = 0.8
+        mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 5.0  # Very far → not a contradiction
         mock_db.execute.return_value.fetchone.return_value = mock_row
 
@@ -110,7 +110,7 @@ class TestContradictionDetection:
 
         rust_mem = Memory(
             memory_id="rust1", user_id="u", memory_type=MemoryType.PROFILE,
-            content="User likes Rust", confidence=0.8,
+            content="User likes Rust", initial_confidence=0.8,
             embedding=[0.0] * 767 + [1.0],
             observed_at=datetime.utcnow(),
         )
@@ -125,7 +125,7 @@ class TestContradictionDetection:
 
         new_mem = Memory(
             memory_id="new1", user_id="u", memory_type=MemoryType.PROFILE,
-            content="User prefers spaces", confidence=0.9,
+            content="User prefers spaces", initial_confidence=0.9,
             embedding=[0.1] * 768,
             observed_at=datetime.utcnow(),
         )
@@ -134,28 +134,14 @@ class TestContradictionDetection:
         assert contradiction is None
 
 
-class TestEpisodicToSemanticPromotion:
-    """Episodic→semantic promotion via reflector."""
+class TestReflectorRemoved:
+    """Reflector removed — episodic type eliminated."""
 
-    def test_cluster_detection(self):
-        """Reflector can find clusters of similar memories."""
-        store = MagicMock()
-        reflector = TypedReflector(store=store, llm_client=MagicMock())
-
-        # Create cluster of identical embeddings
-        episodics = [
-            Memory(
-                memory_id=f"ep{i}", user_id="u", memory_type=MemoryType.EPISODIC,
-                content=f"User debugged Go code {i}", confidence=0.7,
-                embedding=[0.5] * 768, observed_at=datetime.utcnow(),
-            )
-            for i in range(5)
-        ]
-
-        clusters = reflector._find_clusters(episodics)
-        # All same embedding = one cluster
-        assert len(clusters) == 1
-        assert len(clusters[0]) == 5
+    def test_no_reflector_module(self):
+        """TypedReflector module no longer exists."""
+        import importlib
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("core.memory.typed_reflector")
 
 
 class TestHealthDetection:
@@ -201,28 +187,28 @@ class TestMemoryTypes:
 
     def test_all_memory_types_defined(self):
         """All expected memory types exist."""
-        assert MemoryType.EPISODIC.value == "episodic"
         assert MemoryType.SEMANTIC.value == "semantic"
         assert MemoryType.PROCEDURAL.value == "procedural"
         assert MemoryType.PROFILE.value == "profile"
         assert MemoryType.WORKING.value == "working"
+        assert MemoryType.TOOL_RESULT.value == "tool_result"
 
     def test_memory_dataclass_fields(self):
         """Memory dataclass has all required fields."""
         mem = Memory(
             memory_id="test",
             user_id="user",
-            memory_type=MemoryType.EPISODIC,
+            memory_type=MemoryType.SEMANTIC,
             content="test content",
-            confidence=0.8,
+            initial_confidence=0.8,
             observed_at=datetime.utcnow(),
         )
 
         assert mem.memory_id == "test"
         assert mem.user_id == "user"
-        assert mem.memory_type == MemoryType.EPISODIC
+        assert mem.memory_type == MemoryType.SEMANTIC
         assert mem.content == "test content"
-        assert mem.confidence == 0.8
+        assert mem.initial_confidence == 0.8
         assert mem.is_active is True  # default
         assert mem.embedding is None  # optional
         assert mem.superseded_by is None  # optional
@@ -248,7 +234,7 @@ class TestObserverExtraction:
         """_parse_json_array handles plain JSON."""
         from core.memory.typed_observer import _parse_json_array
 
-        text = '[{"content": "test", "type": "episodic"}]'
+        text = '[{"content": "test", "type": "semantic"}]'
         result = _parse_json_array(text)
         assert len(result) == 1
 

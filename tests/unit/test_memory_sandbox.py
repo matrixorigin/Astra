@@ -24,7 +24,7 @@ def sandbox(mock_db):
 def _mem(mid="m1", content="test", embedding=None):
     return Memory(
         memory_id=mid, user_id="u1", memory_type=MemoryType.PROFILE,
-        content=content, confidence=0.8, embedding=embedding,
+        content=content, initial_confidence=0.8, embedding=embedding,
         observed_at=datetime(2026, 2, 26),
     )
 

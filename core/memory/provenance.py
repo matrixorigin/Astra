@@ -47,14 +47,14 @@ class MemoryProvenance(DbConsumer):
         ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
         with self._db() as db:
             rows = db.execute(text(f"""
-                SELECT memory_id, content, memory_type, confidence, observed_at
+                SELECT memory_id, content, memory_type, initial_confidence, observed_at
                 FROM memories {{timestamp = '{ts_str}'}}
                 WHERE user_id = :uid AND is_active = 1
                 ORDER BY observed_at DESC LIMIT :lim
             """), {"uid": user_id, "lim": limit}).fetchall()
         return [
             {"memory_id": r.memory_id, "content": r.content,
-             "memory_type": r.memory_type, "confidence": r.confidence,
+             "memory_type": r.memory_type, "initial_confidence": r.initial_confidence,
              "observed_at": r.observed_at}
             for r in rows
         ]
@@ -67,7 +67,7 @@ class MemoryProvenance(DbConsumer):
         after = approx_time + timedelta(seconds=window_seconds)
         with self._db() as db:
             rows = db.execute(text("""
-                SELECT memory_id, content, memory_type, confidence, observed_at
+                SELECT memory_id, content, memory_type, initial_confidence, observed_at
                 FROM memories
                 WHERE user_id = :uid
                   AND observed_at BETWEEN :before AND :after

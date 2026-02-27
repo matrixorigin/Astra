@@ -1,4 +1,4 @@
-"""Unit tests for TypedObserver — Task 3."""
+"""Unit tests for TypedObserver."""
 
 import json
 from datetime import datetime
@@ -9,10 +9,6 @@ import pytest
 from core.memory.typed_observer import TypedObserver, _parse_json_array
 from core.memory.types import Memory, MemoryType
 
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 @pytest.fixture
 def mock_store():
@@ -31,7 +27,6 @@ def mock_llm():
 
 
 def _embed_fn(text):
-    """Deterministic fake embedding: hash-based."""
     h = hash(text) % 1000
     return [h / 1000.0] * 10
 
@@ -43,10 +38,6 @@ def observer(mock_store, mock_llm):
         contradiction_threshold=0.85,
     )
 
-
-# ---------------------------------------------------------------------------
-# JSON parsing
-# ---------------------------------------------------------------------------
 
 class TestParseJsonArray:
     def test_bare_json(self):
@@ -62,27 +53,23 @@ class TestParseJsonArray:
         assert _parse_json_array("nothing here") == []
 
 
-# ---------------------------------------------------------------------------
-# Typed extraction
-# ---------------------------------------------------------------------------
-
 class TestTypedExtraction:
     def test_extracts_typed_memories(self, observer, mock_llm, mock_store):
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "profile", "content": "prefers Go", "confidence": 0.9},
-            {"type": "episodic", "content": "discussed testing", "confidence": 0.7},
+            {"type": "semantic", "content": "discussed testing", "confidence": 0.7},
         ])}
         results, _ = observer.observe("u1", [{"role": "user", "content": "I prefer Go"}])
         assert len(results) == 2
         assert results[0].memory_type == MemoryType.PROFILE
-        assert results[1].memory_type == MemoryType.EPISODIC
+        assert results[1].memory_type == MemoryType.SEMANTIC
 
-    def test_invalid_type_defaults_to_episodic(self, observer, mock_llm):
+    def test_invalid_type_defaults_to_semantic(self, observer, mock_llm):
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "invalid_type", "content": "something", "confidence": 0.5},
         ])}
         results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
-        assert results[0].memory_type == MemoryType.EPISODIC
+        assert results[0].memory_type == MemoryType.SEMANTIC
 
     def test_skips_empty_content(self, observer, mock_llm):
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
@@ -96,7 +83,7 @@ class TestTypedExtraction:
             {"type": "profile", "content": "test", "confidence": 1.5},
         ])}
         results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
-        assert results[0].confidence == 1.0
+        assert results[0].initial_confidence == 1.0
 
     def test_no_llm_returns_empty(self, mock_store):
         obs = TypedObserver(store=mock_store, llm_client=None)
@@ -111,19 +98,37 @@ class TestTypedExtraction:
         assert results[0].observed_at is not None
 
 
-# ---------------------------------------------------------------------------
-# Contradiction detection
-# ---------------------------------------------------------------------------
+class TestSensitivityFilter:
+    def test_blocks_email(self, observer, mock_llm):
+        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
+            {"type": "profile", "content": "email is user@example.com", "confidence": 0.9},
+        ])}
+        results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
+        assert len(results) == 0
+
+    def test_blocks_aws_key(self, observer, mock_llm):
+        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
+            {"type": "semantic", "content": "key is AKIAIOSFODNN7EXAMPLE", "confidence": 0.8},
+        ])}
+        results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
+        assert len(results) == 0
+
+    def test_allows_clean_content(self, observer, mock_llm):
+        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
+            {"type": "profile", "content": "prefers Go", "confidence": 0.9},
+        ])}
+        results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
+        assert len(results) == 1
+
 
 class TestContradictionDetection:
     def test_contradiction_supersedes(self, mock_llm, mock_store):
-        """'prefers tabs' then 'prefers spaces' → old superseded (DB-side)."""
         mock_db = MagicMock()
         mock_row = MagicMock()
         mock_row.memory_id = "old1"
         mock_row.content = "prefers tabs"
-        mock_row.confidence = 0.8
-        mock_row.l2_dist = 0.1  # Very close → contradiction
+        mock_row.initial_confidence = 0.8
+        mock_row.l2_dist = 0.1
         mock_db.execute.return_value.fetchone.return_value = mock_row
 
         observer = TypedObserver(
@@ -144,13 +149,12 @@ class TestContradictionDetection:
         assert mock_store.supersede.call_args[0][0] == "old1"
 
     def test_non_contradiction_both_active(self, mock_llm, mock_store):
-        """'likes Go' + 'likes Rust' → both active (distant vectors)."""
         mock_db = MagicMock()
         mock_row = MagicMock()
         mock_row.memory_id = "old1"
         mock_row.content = "likes Go"
-        mock_row.confidence = 0.8
-        mock_row.l2_dist = 5.0  # Very far → not a contradiction
+        mock_row.initial_confidence = 0.8
+        mock_row.l2_dist = 5.0
         mock_db.execute.return_value.fetchone.return_value = mock_row
 
         observer = TypedObserver(
@@ -180,23 +184,19 @@ class TestContradictionDetection:
         mock_store.create.assert_called_once()
 
 
-# ---------------------------------------------------------------------------
-# Explicit write (MemoryWriteTool path)
-# ---------------------------------------------------------------------------
-
 class TestObserveExplicit:
     def test_writes_directly(self, observer, mock_store):
         result, _ = observer.observe_explicit("u1", "remember this", MemoryType.SEMANTIC)
         assert result.content == "remember this"
         assert result.memory_type == MemoryType.SEMANTIC
-        assert result.confidence == 0.9
+        assert result.initial_confidence == 0.9
 
     def test_runs_contradiction_check(self, mock_store):
         mock_db = MagicMock()
         mock_row = MagicMock()
         mock_row.memory_id = "old1"
         mock_row.content = "old fact"
-        mock_row.confidence = 0.8
+        mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 0.1
         mock_db.execute.return_value.fetchone.return_value = mock_row
 
@@ -208,3 +208,7 @@ class TestObserveExplicit:
 
         observer.observe_explicit("u1", "new fact", MemoryType.PROFILE)
         mock_store.supersede.assert_called_once()
+
+    def test_blocks_sensitive_content(self, observer):
+        with pytest.raises(ValueError, match="sensitivity filter"):
+            observer.observe_explicit("u1", "password=secret123", MemoryType.SEMANTIC)

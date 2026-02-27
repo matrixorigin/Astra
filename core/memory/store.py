@@ -7,12 +7,11 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from api.models.memory import MemoryRecord
 from core.db_consumer import DbConsumer, DbFactory
-from core.memory.metrics import metrics, Timer
+from core.memory.metrics import MemoryMetrics, Timer
 from core.memory.types import Memory, MemoryType
 
 logger = logging.getLogger(__name__)
@@ -24,7 +23,7 @@ def _to_domain(row: MemoryRecord) -> Memory:
         user_id=row.user_id,
         memory_type=MemoryType(row.memory_type),
         content=row.content,
-        confidence=row.confidence,
+        initial_confidence=row.initial_confidence,
         embedding=row.embedding,
         source_event_ids=row.source_event_ids or [],
         superseded_by=row.superseded_by,
@@ -39,18 +38,18 @@ def _to_domain(row: MemoryRecord) -> Memory:
 class MemoryStore(DbConsumer):
     """CRUD operations on the memories table."""
 
-    def __init__(self, db_factory: DbFactory):
+    def __init__(self, db_factory: DbFactory, metrics: Optional[MemoryMetrics] = None):
         super().__init__(db_factory)
+        self._metrics = metrics or MemoryMetrics()
 
     def create(self, memory: Memory) -> Memory:
-        """Insert a new memory record."""
         if not memory.memory_id:
             memory.memory_id = uuid.uuid4().hex
         now = datetime.utcnow()
         if not memory.observed_at:
             memory.observed_at = now
 
-        with Timer("store_create"):
+        with Timer("store_create", self._metrics):
             with self._db() as db:
                 row = MemoryRecord(
                     memory_id=memory.memory_id,
@@ -58,7 +57,7 @@ class MemoryStore(DbConsumer):
                     session_id=memory.session_id,
                     memory_type=memory.memory_type.value,
                     content=memory.content,
-                    confidence=memory.confidence,
+                    initial_confidence=memory.initial_confidence,
                     embedding=memory.embedding,
                     source_event_ids=memory.source_event_ids,
                     is_active=1,
@@ -67,11 +66,11 @@ class MemoryStore(DbConsumer):
                 db.add(row)
                 db.commit()
                 memory.created_at = row.created_at
-        metrics.increment("memories_created")
+        self._metrics.increment("memories_created")
         return memory
 
     def get(self, memory_id: str) -> Optional[Memory]:
-        with Timer("store_get"):
+        with Timer("store_get", self._metrics):
             with self._db() as db:
                 row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
                 return _to_domain(row) if row else None
@@ -91,7 +90,6 @@ class MemoryStore(DbConsumer):
             return [_to_domain(r) for r in q.all()]
 
     def supersede(self, old_id: str, new_memory: Memory) -> Memory:
-        """Atomic: deactivate old memory + insert new one in a single transaction."""
         if not new_memory.memory_id:
             new_memory.memory_id = uuid.uuid4().hex
         now = datetime.utcnow()
@@ -111,7 +109,7 @@ class MemoryStore(DbConsumer):
                 session_id=new_memory.session_id,
                 memory_type=new_memory.memory_type.value,
                 content=new_memory.content,
-                confidence=new_memory.confidence,
+                initial_confidence=new_memory.initial_confidence,
                 embedding=new_memory.embedding,
                 source_event_ids=new_memory.source_event_ids,
                 is_active=1,

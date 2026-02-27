@@ -2,8 +2,6 @@
 
 L0: Profile (always loaded, ~200 tokens)
 L1: Query-aware retrieval (per-turn, ~800 tokens)
-
-Supports explain=True for EXPLAIN ANALYZE style execution stats.
 """
 
 from __future__ import annotations
@@ -15,7 +13,7 @@ from typing import Optional
 
 from core.db_consumer import DbFactory
 from core.memory.explain import RetrievalStats
-from core.memory.metrics import metrics
+from core.memory.metrics import MemoryMetrics
 from core.memory.profile import ProfileManager
 from core.memory.retriever import MemoryRetriever
 from core.memory.store import MemoryStore
@@ -26,7 +24,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TieredLoaderStats:
-    """Stats for tiered memory loading."""
     l0_loaded: bool = False
     l0_tokens: int = 0
     l0_ms: float = 0.0
@@ -41,8 +38,9 @@ class TieredLoaderStats:
 class TieredMemoryLoader:
     """Load L0 (profile) + L1 (query-relevant) memories for prompt §4."""
 
-    def __init__(self, db_factory: DbFactory):
+    def __init__(self, db_factory: DbFactory, metrics: Optional[MemoryMetrics] = None):
         self._db_factory = db_factory
+        self._metrics = metrics or MemoryMetrics()
         self._store: Optional[MemoryStore] = None
         self._profile_mgr: Optional[ProfileManager] = None
         self._retriever: Optional[MemoryRetriever] = None
@@ -50,25 +48,24 @@ class TieredMemoryLoader:
     def _ensure_initialized(self) -> bool:
         if self._store is None:
             try:
-                self._store = MemoryStore(self._db_factory)
+                self._store = MemoryStore(self._db_factory, metrics=self._metrics)
                 self._profile_mgr = ProfileManager(self._store)
-                self._retriever = MemoryRetriever(self._db_factory)
+                self._retriever = MemoryRetriever(self._db_factory, metrics=self._metrics)
                 return True
             except Exception as e:
                 logger.debug("TieredMemoryLoader init failed: %s", e)
-                metrics.increment("tiered_loader_init_errors")
+                self._metrics.increment("tiered_loader_init_errors")
                 return False
         return True
 
     def load_l0(self, user_id: str) -> str:
-        """Load L0 profile (~200 tokens). Cached."""
         if not self._ensure_initialized():
             return ""
         try:
             return self._profile_mgr.get_profile(user_id)
         except Exception as e:
             logger.debug("L0 load failed: %s", e)
-            metrics.increment("tiered_loader_l0_errors")
+            self._metrics.increment("tiered_loader_l0_errors")
             return ""
 
     def load_l1(
@@ -81,11 +78,6 @@ class TieredMemoryLoader:
         limit: int = 10,
         explain: bool = False,
     ) -> tuple[str, Optional[RetrievalStats]]:
-        """Load L1 query-relevant memories (~800 tokens).
-        
-        Returns:
-            (text, stats) — stats is None when explain=False or on error.
-        """
         if not self._ensure_initialized():
             return ("", None)
         try:
@@ -94,7 +86,7 @@ class TieredMemoryLoader:
                 query_text=query,
                 session_id=session_id,
                 query_embedding=query_embedding,
-                memory_types=[MemoryType.EPISODIC, MemoryType.SEMANTIC, MemoryType.PROCEDURAL],
+                memory_types=[MemoryType.SEMANTIC, MemoryType.PROCEDURAL],
                 limit=limit,
                 task_hint=task_hint,
                 explain=explain,
@@ -107,7 +99,7 @@ class TieredMemoryLoader:
             return "\n".join(lines), stats
         except Exception as e:
             logger.debug("L1 load failed: %s", e)
-            metrics.increment("tiered_loader_l1_errors")
+            self._metrics.increment("tiered_loader_l1_errors")
             return "", None
 
     def build_section(
@@ -119,26 +111,19 @@ class TieredMemoryLoader:
         task_hint: Optional[str] = None,
         explain: bool = False,
     ) -> tuple[str, Optional[TieredLoaderStats]]:
-        """Build complete §4 memory section: L0 + L1.
-        
-        Returns:
-            (text, stats) — stats is None when explain=False.
-        """
         start = time.time() if explain else 0
         stats = TieredLoaderStats() if explain else None
         parts = []
 
-        # L0
         l0_start = time.time() if explain else 0
         l0 = self.load_l0(user_id)
         if l0:
             parts.append(l0)
         if stats:
             stats.l0_loaded = bool(l0)
-            stats.l0_tokens = len(l0.split()) if l0 else 0  # rough estimate
+            stats.l0_tokens = len(l0.split()) if l0 else 0
             stats.l0_ms = (time.time() - l0_start) * 1000
 
-        # L1
         l1_start = time.time() if explain else 0
         l1, retrieval_stats = self.load_l1(user_id, session_id, query, query_embedding, task_hint, explain=explain)
         if l1:
@@ -154,6 +139,5 @@ class TieredMemoryLoader:
         return "\n\n".join(parts), stats
 
     def invalidate_profile(self, user_id: str) -> None:
-        """Invalidate L0 cache when profile changes."""
         if self._profile_mgr:
             self._profile_mgr.invalidate(user_id)

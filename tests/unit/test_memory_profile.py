@@ -21,13 +21,13 @@ def manager(mock_store):
     return ProfileManager(store=mock_store, max_tokens=200)
 
 
-def _profile_mem(content, confidence=0.8):
+def _profile_mem(content, initial_confidence=0.8):
     return Memory(
         memory_id=f"m{hash(content) % 1000}",
         user_id="u1",
         memory_type=MemoryType.PROFILE,
         content=content,
-        confidence=confidence,
+        initial_confidence=initial_confidence,
         observed_at=datetime(2026, 2, 26),
     )
 
@@ -93,8 +93,8 @@ class TestUpdateFromMemories:
         manager.get_profile("u1")
 
         episodic = Memory(
-            memory_id="e1", user_id="u1", memory_type=MemoryType.EPISODIC,
-            content="event", confidence=0.7,
+            memory_id="e1", user_id="u1", memory_type=MemoryType.SEMANTIC,
+            content="event", initial_confidence=0.7,
         )
         result = manager.update_from_memories("u1", [episodic])
 

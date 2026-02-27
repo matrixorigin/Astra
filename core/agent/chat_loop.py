@@ -1891,8 +1891,18 @@ class ChatLoop:
         if messages:
             from api.database import SessionLocal
             from core.agent.turn_hooks import TurnHooks
-            hooks = TurnHooks(SessionLocal, llm_client=self.llm)
+            hooks = TurnHooks(SessionLocal, llm_client=self.llm, embed_fn=self._get_embed_fn())
             hooks.run_observer(session_id, user_id, messages)
+
+    def _get_embed_fn(self):
+        """Lazy-init embedding function for memory pipeline."""
+        try:
+            from api.database import SessionLocal
+            from core.context.embeddings import EmbeddingService
+            svc = EmbeddingService(SessionLocal)
+            return svc.embed_text
+        except Exception:
+            return None
 
     def _check_slo_escalation(self, session_id: str) -> str | None:
         """Return escalated model name if a recent SLO escalation event exists."""

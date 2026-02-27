@@ -57,7 +57,7 @@ class ProfileManager:
         # Sort by confidence (highest first), then by recency (newest first).
         # observed_at may be None — treat as epoch 0 so they sort last.
         _epoch = datetime(1970, 1, 1)
-        memories.sort(key=lambda m: (-m.confidence, -(m.observed_at or _epoch).timestamp()))
+        memories.sort(key=lambda m: (-m.initial_confidence, -(m.observed_at or _epoch).timestamp()))
 
         lines = []
         total_chars = 0

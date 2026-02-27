@@ -37,14 +37,14 @@ def _mem(mid="m1", uid="u1", mtype=MemoryType.PROFILE, content="likes Go"):
 class TestMemoryTypes:
     def test_memory_type_values(self):
         assert MemoryType.PROFILE.value == "profile"
-        assert MemoryType.EPISODIC.value == "episodic"
         assert MemoryType.SEMANTIC.value == "semantic"
         assert MemoryType.PROCEDURAL.value == "procedural"
         assert MemoryType.WORKING.value == "working"
+        assert MemoryType.TOOL_RESULT.value == "tool_result"
 
     def test_memory_defaults(self):
         m = _mem()
-        assert m.confidence == 0.75
+        assert m.initial_confidence == 0.75
         assert m.is_active is True
         assert m.embedding is None
         assert m.source_event_ids == []
@@ -98,7 +98,7 @@ class TestMemoryStoreGet:
         row.user_id = "u1"
         row.memory_type = "profile"
         row.content = "likes Go"
-        row.confidence = 0.9
+        row.initial_confidence = 0.9
         row.embedding = None
         row.source_event_ids = ["e1"]
         row.superseded_by = None
@@ -120,7 +120,7 @@ class TestMemoryStoreListActive:
         assert store.list_active("u1") == []
 
     def test_list_active_filters_by_type(self, store, mock_db):
-        store.list_active("u1", memory_type=MemoryType.EPISODIC)
+        store.list_active("u1", memory_type=MemoryType.SEMANTIC)
         # Verify filter was called (type filter added)
         assert mock_db.query.return_value.filter.return_value.filter.called
 

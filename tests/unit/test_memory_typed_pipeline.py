@@ -1,4 +1,4 @@
-"""Unit tests for typed memory pipeline — Task 9."""
+"""Unit tests for typed memory pipeline."""
 
 import json
 from unittest.mock import MagicMock, patch
@@ -58,10 +58,10 @@ class TestTypedPipeline:
 
         assert result.profile_changed is True
 
-    def test_no_profile_change_for_episodic(self, mock_db):
+    def test_no_profile_change_for_semantic(self, mock_db):
         mock_llm = MagicMock()
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
-            {"type": "episodic", "content": "discussed testing", "confidence": 0.7},
+            {"type": "semantic", "content": "discussed testing", "confidence": 0.7},
         ])}
 
         with patch("core.memory.typed_pipeline.MemoryStore") as MockStore:
@@ -80,10 +80,7 @@ class TestTypedPipeline:
         assert result.profile_changed is False
 
     def test_uses_custom_config(self, mock_db):
-        config = MemoryGovernanceConfig(
-            contradiction_similarity_threshold=0.9,
-            reflector_cluster_min_size=5,
-        )
+        config = MemoryGovernanceConfig(contradiction_similarity_threshold=0.9)
         mock_llm = MagicMock()
         mock_llm.chat_with_tools.return_value = {"content": "[]"}
 
@@ -110,3 +107,8 @@ class TestTypedPipeline:
 
         assert len(result.errors) > 0
         assert "observer" in result.errors[0]
+
+    def test_no_reflector_in_result(self, mock_db):
+        """Pipeline no longer has clusters_promoted — reflector removed."""
+        result = TypedPipelineResult()
+        assert not hasattr(result, "clusters_promoted")

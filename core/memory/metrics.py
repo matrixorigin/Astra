@@ -1,4 +1,4 @@
-"""Memory metrics — simple in-process metrics collection."""
+"""Memory metrics — plain class, no singleton. Pass instances via DI."""
 
 from __future__ import annotations
 
@@ -39,58 +39,40 @@ class MetricStats:
 
 
 class MemoryMetrics:
-    """Thread-safe metrics collector for memory operations."""
+    """Thread-safe metrics collector for memory operations. No singleton."""
 
-    _instance: Optional["MemoryMetrics"] = None
-    _lock = threading.Lock()
-
-    def __new__(cls) -> "MemoryMetrics":
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
-                    cls._instance._init()
-        return cls._instance
-
-    def _init(self) -> None:
+    def __init__(self) -> None:
         self._metrics: dict[str, MetricStats] = defaultdict(MetricStats)
         self._counters: dict[str, int] = defaultdict(int)
-        self._data_lock = threading.Lock()
+        self._lock = threading.Lock()
 
     def record_latency(self, operation: str, latency_ms: float) -> None:
-        """Record operation latency in milliseconds."""
-        with self._data_lock:
+        with self._lock:
             self._metrics[f"{operation}_latency_ms"].record(latency_ms)
 
     def increment(self, counter: str, value: int = 1) -> None:
-        """Increment a counter."""
-        with self._data_lock:
+        with self._lock:
             self._counters[counter] += value
 
     def get_stats(self) -> dict:
-        """Get all metrics as a dictionary."""
-        with self._data_lock:
+        with self._lock:
             return {
                 "latencies": {k: v.to_dict() for k, v in self._metrics.items()},
                 "counters": dict(self._counters),
             }
 
     def reset(self) -> None:
-        """Reset all metrics."""
-        with self._data_lock:
+        with self._lock:
             self._metrics.clear()
             self._counters.clear()
-
-
-# Singleton instance
-metrics = MemoryMetrics()
 
 
 class Timer:
     """Context manager for timing operations."""
 
-    def __init__(self, operation: str):
+    def __init__(self, operation: str, metrics: MemoryMetrics):
         self.operation = operation
+        self.metrics = metrics
         self.start_time: float = 0
 
     def __enter__(self) -> "Timer":
@@ -99,4 +81,4 @@ class Timer:
 
     def __exit__(self, *args) -> None:
         elapsed_ms = (time.perf_counter() - self.start_time) * 1000
-        metrics.record_latency(self.operation, elapsed_ms)
+        self.metrics.record_latency(self.operation, elapsed_ms)

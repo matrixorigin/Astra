@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -10,11 +11,10 @@ from typing import Optional
 
 class MemoryType(str, enum.Enum):
     PROFILE = "profile"
-    EPISODIC = "episodic"
     SEMANTIC = "semantic"
     PROCEDURAL = "procedural"
     WORKING = "working"
-    TOOL_RESULT = "tool_result"  # Tool output storage, session-scoped, 7-day decay
+    TOOL_RESULT = "tool_result"
 
 
 @dataclass
@@ -25,15 +25,22 @@ class Memory:
     user_id: str
     memory_type: MemoryType
     content: str
-    confidence: float = 0.75
+    initial_confidence: float = 0.75
     embedding: Optional[list[float]] = None
     source_event_ids: list[str] = field(default_factory=list)
     superseded_by: Optional[str] = None
     is_active: bool = True
-    session_id: Optional[str] = None  # NULL = cross-session (profile/semantic)
+    session_id: Optional[str] = None
     observed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    def effective_confidence(self, half_life_days: float = 30.0) -> float:
+        """Query-time confidence decay. Never mutates stored value."""
+        if self.observed_at is None:
+            return self.initial_confidence
+        age_days = (datetime.utcnow() - self.observed_at).total_seconds() / 86400.0
+        return self.initial_confidence * math.exp(-age_days / half_life_days)
 
 
 @dataclass

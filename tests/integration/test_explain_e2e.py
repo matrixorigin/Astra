@@ -63,7 +63,7 @@ class TestExplainE2E:
             user_id=user_id,
             memory_type=MemoryType.SEMANTIC,
             content="User prefers Python for data analysis",
-            confidence=0.9,
+            initial_confidence=0.9,
             embedding=_embed("Python data analysis"),
             observed_at=datetime.utcnow(),
         )
@@ -115,7 +115,7 @@ class TestExplainE2E:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="User prefers tabs",
-            confidence=0.8,
+            initial_confidence=0.8,
             embedding=[0.5] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -135,7 +135,7 @@ class TestExplainE2E:
             user_id=user_id,
             content="User prefers spaces",
             memory_type=MemoryType.PROFILE,
-            confidence=0.9,
+            initial_confidence=0.9,
             explain=True,
         )
         cleanup_memories.append(new_mem.memory_id)
@@ -161,7 +161,7 @@ class TestExplainE2E:
         mock_llm = MagicMock()
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "profile", "content": "User likes Go", "confidence": 0.9},
-            {"type": "episodic", "content": "Discussed testing", "confidence": 0.7},
+            {"type": "semantic", "content": "Discussed testing", "confidence": 0.7},
         ])}
 
         result = run_typed_memory_pipeline(
@@ -225,7 +225,7 @@ class TestExplainE2E:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="User is a senior Python developer",
-            confidence=0.95,
+            initial_confidence=0.95,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(profile_mem.memory_id)
@@ -235,9 +235,9 @@ class TestExplainE2E:
         episodic_mem = Memory(
             memory_id=f"ep_{uuid4().hex}",
             user_id=user_id,
-            memory_type=MemoryType.EPISODIC,
+            memory_type=MemoryType.SEMANTIC,
             content="Discussed async patterns yesterday",
-            confidence=0.8,
+            initial_confidence=0.8,
             embedding=_embed("async patterns"),
             observed_at=datetime.utcnow(),
         )
@@ -286,7 +286,7 @@ class TestExplainE2E:
             user_id=user_id,
             memory_type=MemoryType.SEMANTIC,
             content="Vector search test memory",
-            confidence=0.9,
+            initial_confidence=0.9,
             embedding=[0.1] * 1536,
             observed_at=datetime.utcnow(),
         )

@@ -1,13 +1,9 @@
 """Typed Observer — extracts typed memories with atomic contradiction detection.
 
-Replaces the old Observer (which extracted untyped Observations).
 Uses MemoryStore for persistence and contradiction resolution.
-
 Contradiction detection uses DB-side L2_DISTANCE with IVF-flat index.
-No in-memory fallback — at scale, loading all active memories into Python
-is not viable, and silently falling back would mask DB errors.
 
-Supports explain=True for EXPLAIN ANALYZE style execution stats.
+Includes sensitivity filter — blocks PII/credentials from long-term storage.
 """
 
 from __future__ import annotations
@@ -24,7 +20,9 @@ from sqlalchemy import text
 
 from core.db_consumer import DbFactory
 from core.memory.explain import ContradictionStats, ObserverStats
+from core.memory.metrics import MemoryMetrics
 from core.memory.prompts import OBSERVER_EXTRACTION_PROMPT
+from core.memory.sensitivity import check_sensitivity
 from core.memory.store import MemoryStore
 from core.memory.types import Memory, MemoryType
 
@@ -32,15 +30,10 @@ logger = logging.getLogger(__name__)
 
 _VALID_TYPES = {t.value for t in MemoryType if t != MemoryType.WORKING}
 
-# L2_DISTANCE threshold corresponding to ~0.85 cosine similarity for normalized vectors.
-# For unit-norm vectors: L2² = 2(1 - cos_sim), so L2 = sqrt(2*(1-0.85)) ≈ 0.548.
 _DEFAULT_L2_THRESHOLD = 0.55
 
-# SQL: find the single closest active memory of the same type with different content.
-# Uses DB-side L2_DISTANCE — accelerated by IVF-flat index on memories(embedding).
-# MatrixOne syntax: ORDER BY L2_DISTANCE(...) ASC LIMIT N triggers index scan.
 _CONTRADICTION_SQL = """\
-SELECT m.memory_id, m.content, m.confidence,
+SELECT m.memory_id, m.content, m.initial_confidence,
     L2_DISTANCE(m.embedding, :query_vec) AS l2_dist
 FROM memories m
 WHERE m.user_id = :uid
@@ -80,11 +73,7 @@ def _parse_json_array(text_str: str) -> list[dict[str, Any]]:
 class TypedObserver:
     """Extract typed memories from conversation turns.
 
-    Flow: LLM extraction → embed → contradiction detection → store.
-
-    Contradiction detection requires db_factory. Uses DB-side L2_DISTANCE
-    with IVF-flat index (ORDER BY L2_DISTANCE ASC LIMIT 1). No in-memory
-    fallback — at scale, loading all memories into Python is not viable.
+    Flow: LLM extraction → sensitivity filter → embed → contradiction detection → store.
     """
 
     def __init__(
@@ -94,14 +83,14 @@ class TypedObserver:
         embed_fn: Any = None,
         contradiction_threshold: float = 0.85,
         db_factory: Optional[DbFactory] = None,
+        metrics: Optional[MemoryMetrics] = None,
     ):
         self.store = store
         self.llm = llm_client
         self.embed_fn = embed_fn
         self.contradiction_threshold = contradiction_threshold
         self._db_factory = db_factory
-        # Convert cosine threshold to L2 threshold for DB queries.
-        # For unit-norm vectors: L2 = sqrt(2 * (1 - cos_sim)).
+        self._metrics = metrics or MemoryMetrics()
         self._l2_threshold = (2.0 * (1.0 - contradiction_threshold)) ** 0.5
 
     def observe(
@@ -111,11 +100,6 @@ class TypedObserver:
         source_event_ids: Optional[list[str]] = None,
         explain: bool = False,
     ) -> tuple[list[Memory], Optional[ObserverStats]]:
-        """Extract and persist typed memories from a conversation turn.
-
-        Returns:
-            (memories, stats) — stats is None when explain=False.
-        """
         start = time.time() if explain else 0
         stats = ObserverStats() if explain else None
 
@@ -131,7 +115,7 @@ class TypedObserver:
                 if c_stats.found:
                     stats.memories_superseded += 1
                 if stats.contradiction is None:
-                    stats.contradiction = c_stats  # keep first
+                    stats.contradiction = c_stats
 
         if stats:
             stats.memories_stored = len(results)
@@ -145,11 +129,7 @@ class TypedObserver:
         messages: list[dict[str, Any]],
         source_event_ids: Optional[list[str]] = None,
     ) -> list[Memory]:
-        """Extract candidate memories WITHOUT persisting. Returns in-memory objects.
-
-        Used by the pipeline to separate extraction from storage, allowing
-        sandbox validation between the two steps.
-        """
+        """Extract candidate memories WITHOUT persisting. Applies sensitivity filter."""
         if not self.llm:
             return []
 
@@ -163,6 +143,13 @@ class TypedObserver:
         for item in raw:
             mem = self._parse_item(item, user_id, source_event_ids or [], now)
             if not mem:
+                continue
+
+            # Sensitivity filter — block PII/credentials
+            sensitivity = check_sensitivity(mem.content)
+            if sensitivity.blocked:
+                logger.info("Sensitivity filter blocked memory: %s", sensitivity.matched_labels)
+                self._metrics.increment("sensitivity_blocked")
                 continue
 
             if self.embed_fn:
@@ -184,17 +171,24 @@ class TypedObserver:
         user_id: str,
         content: str,
         memory_type: MemoryType,
-        confidence: float = 0.9,
+        initial_confidence: float = 0.9,
         source_event_ids: Optional[list[str]] = None,
         explain: bool = False,
     ) -> tuple[Memory, Optional[ContradictionStats]]:
         """Directly write a memory (from MemoryWriteTool), skipping LLM extraction."""
+        # Sensitivity filter
+        sensitivity = check_sensitivity(content)
+        if sensitivity.blocked:
+            logger.warning("Sensitivity filter blocked explicit memory: %s", sensitivity.matched_labels)
+            self._metrics.increment("sensitivity_blocked")
+            raise ValueError(f"Content blocked by sensitivity filter: {sensitivity.matched_labels}")
+
         mem = Memory(
             memory_id=uuid.uuid4().hex,
             user_id=user_id,
             memory_type=memory_type,
             content=content,
-            confidence=confidence,
+            initial_confidence=initial_confidence,
             source_event_ids=source_event_ids or [],
             observed_at=datetime.utcnow(),
         )
@@ -229,9 +223,9 @@ class TypedObserver:
     ) -> Optional[Memory]:
         if not isinstance(item, dict) or not item.get("content"):
             return None
-        mtype_str = item.get("type", "episodic")
+        mtype_str = item.get("type", "semantic")
         if mtype_str not in _VALID_TYPES:
-            mtype_str = "episodic"
+            mtype_str = "semantic"
         confidence = item.get("confidence", 0.7)
         if not isinstance(confidence, (int, float)):
             confidence = 0.7
@@ -242,15 +236,14 @@ class TypedObserver:
             user_id=user_id,
             memory_type=MemoryType(mtype_str),
             content=item["content"],
-            confidence=confidence,
+            initial_confidence=confidence,
             source_event_ids=source_event_ids,
             observed_at=now,
         )
 
     def _store_with_contradiction_check(self, mem: Memory, explain: bool = False) -> tuple[Memory, Optional[ContradictionStats]]:
-        """Check for contradicting memory and supersede if found, else create."""
         stats = ContradictionStats() if explain else None
-        
+
         if mem.embedding is not None:
             contradiction, c_stats = self._find_contradiction(mem, explain)
             if stats and c_stats:
@@ -270,14 +263,8 @@ class TypedObserver:
         return self.store.create(mem), stats
 
     def _find_contradiction(self, new: Memory, explain: bool = False) -> tuple[Optional[Memory], Optional[ContradictionStats]]:
-        """Find an existing memory that contradicts the new one.
-
-        Uses DB-side L2_DISTANCE with IVF-flat index. Requires db_factory.
-        Skips contradiction detection when no embedding or no db_factory.
-        DB errors propagate — no silent fallback.
-        """
         stats = ContradictionStats(checked=True) if explain else None
-        
+
         if new.embedding is None or self._db_factory is None:
             if stats:
                 stats.checked = False
@@ -316,6 +303,6 @@ class TypedObserver:
                 user_id=new.user_id,
                 memory_type=new.memory_type,
                 content=row.content,
-                confidence=row.confidence,
+                initial_confidence=row.initial_confidence,
             ), stats
         return None, stats

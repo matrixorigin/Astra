@@ -66,7 +66,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             memory_type=MemoryType.SEMANTIC,
             content="Vector search verification memory",
-            confidence=0.9,
+            initial_confidence=0.9,
             embedding=[0.1] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -99,7 +99,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             memory_type=MemoryType.SEMANTIC,
             content="Python programming language expertise",
-            confidence=0.9,
+            initial_confidence=0.9,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -132,7 +132,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="Base memory for sandbox test",
-            confidence=0.8,
+            initial_confidence=0.8,
             embedding=[0.5] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -145,7 +145,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="New memory to validate in sandbox",
-            confidence=0.9,
+            initial_confidence=0.9,
             embedding=[0.5] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -176,7 +176,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="User prefers tabs",
-            confidence=0.8,
+            initial_confidence=0.8,
             embedding=[0.5] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -196,7 +196,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             content="User prefers spaces",
             memory_type=MemoryType.PROFILE,
-            confidence=0.9,
+            initial_confidence=0.9,
             explain=True,
         )
         cleanup_memories.append(new_mem.memory_id)
@@ -222,7 +222,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             memory_type=MemoryType.SEMANTIC,
             content="Summary test memory for all paths",
-            confidence=0.9,
+            initial_confidence=0.9,
             embedding=[0.3] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -255,7 +255,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="Sandbox test",
-            confidence=0.9,
+            initial_confidence=0.9,
             embedding=[0.3] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -277,7 +277,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             content="Contradiction test",
             memory_type=MemoryType.PROFILE,
-            confidence=0.9,
+            initial_confidence=0.9,
             explain=True,
         )
         cd_ok = stats.checked and stats.error is None

@@ -17,7 +17,7 @@ from api.database import get_db_session
 from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever
 from core.memory.typed_observer import TypedObserver, _parse_json_array
-from core.memory.typed_reflector import TypedReflector
+# TypedReflector removed
 from core.memory.profile import ProfileManager
 from core.memory.tiered_loader import TieredMemoryLoader
 from core.memory.types import Memory, MemoryType
@@ -77,7 +77,7 @@ class TestMemoryStoreRealDB:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="User prefers Python for scripting",
-            confidence=0.85,
+            initial_confidence=0.85,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -100,15 +100,15 @@ class TestMemoryStoreRealDB:
             mem = Memory(
                 memory_id=f"list_{uuid7().hex}",
                 user_id=user_id,
-                memory_type=MemoryType.EPISODIC,
+                memory_type=MemoryType.SEMANTIC,
                 content=f"User action {i}",
-                confidence=0.7,
+                initial_confidence=0.7,
                 observed_at=datetime.utcnow(),
             )
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
         
-        active = store.list_active(user_id, MemoryType.EPISODIC)
+        active = store.list_active(user_id, MemoryType.SEMANTIC)
         assert len(active) >= 3
 
     def test_supersede_memory(self, db_factory, cleanup_memories):
@@ -121,7 +121,7 @@ class TestMemoryStoreRealDB:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="User prefers tabs",
-            confidence=0.8,
+            initial_confidence=0.8,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(old_mem.memory_id)
@@ -132,7 +132,7 @@ class TestMemoryStoreRealDB:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="User prefers spaces",
-            confidence=0.9,
+            initial_confidence=0.9,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(new_mem.memory_id)
@@ -161,7 +161,7 @@ class TestMemoryRetrieverRealDB:
             user_id=user_id,
             memory_type=MemoryType.SEMANTIC,
             content="User expertise in Golang concurrency patterns",
-            confidence=0.9,
+            initial_confidence=0.9,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -180,7 +180,7 @@ class TestMemoryRetrieverRealDB:
 
     def test_vector_search_uses_ivfflat_index(self, db_factory, cleanup_memories):
         """Verify L2_DISTANCE vector search actually uses ivfflat index (not fallback)."""
-        from core.memory.metrics import metrics
+        from core.memory.metrics import MemoryMetrics
         
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
@@ -198,7 +198,7 @@ class TestMemoryRetrieverRealDB:
                 user_id=user_id,
                 memory_type=MemoryType.SEMANTIC,
                 content=f"Vector test memory {i}",
-                confidence=0.8,
+                initial_confidence=0.8,
                 embedding=emb,
                 observed_at=datetime.utcnow(),
             )
@@ -268,7 +268,7 @@ class TestMemoryExtractionFromGolden:
         mock_llm = MagicMock()
         mock_llm.chat_with_tools.return_value = {
             "content": json.dumps([
-                {"content": "User needs help with SQL injection prevention", "type": "episodic", "confidence": 0.8},
+                {"content": "User needs help with SQL injection prevention", "type": "semantic", "confidence": 0.8},
                 {"content": "User works with Python database code", "type": "profile", "confidence": 0.7},
             ])
         }
@@ -320,9 +320,9 @@ class TestProfileSynthesisFromGolden:
             mem = Memory(
                 memory_id=f"pat_{uuid7().hex}",  # Full UUID
                 user_id=user_id,
-                memory_type=MemoryType.EPISODIC,
+                memory_type=MemoryType.SEMANTIC,
                 content=content,
-                confidence=0.7,
+                initial_confidence=0.7,
                 observed_at=datetime.utcnow(),
             )
             cleanup_memories.append(mem.memory_id)
@@ -349,7 +349,7 @@ class TestTieredLoaderWithRealDB:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="User is an expert in distributed systems",
-            confidence=0.9,
+            initial_confidence=0.9,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -374,7 +374,7 @@ class TestSandboxRealDB:
     def test_branch_create_and_delete(self, db_factory, cleanup_memories):
         """Branch operations work with real DB — verify NOT fallback."""
         from core.memory.sandbox import MemorySandbox
-        from core.memory.metrics import metrics
+        from core.memory.metrics import MemoryMetrics
 
         store = MemoryStore(db_factory)
         sandbox = MemorySandbox(db_factory, db_name="test_dev_agent_v3")
@@ -386,7 +386,7 @@ class TestSandboxRealDB:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="Base memory for sandbox test",
-            confidence=0.8,
+            initial_confidence=0.8,
             embedding=[0.5] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -397,9 +397,9 @@ class TestSandboxRealDB:
         new_mem = Memory(
             memory_id=f"new_{uuid7().hex}",
             user_id=user_id,
-            memory_type=MemoryType.EPISODIC,
+            memory_type=MemoryType.SEMANTIC,
             content="New memory to validate",
-            confidence=0.7,
+            initial_confidence=0.7,
             embedding=[0.5] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -505,7 +505,7 @@ class TestContradictionRealDB:
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="User prefers tabs",
-            confidence=0.8,
+            initial_confidence=0.8,
             embedding=[0.1] * 1536,
             observed_at=datetime.utcnow(),
         )
@@ -517,7 +517,7 @@ class TestContradictionRealDB:
             user_id=user_id,
             content="User prefers spaces",
             memory_type=MemoryType.PROFILE,
-            confidence=0.9,
+            initial_confidence=0.9,
         )
         cleanup_memories.append(new_mem.memory_id)
 
@@ -546,7 +546,7 @@ class TestTaskAwareWeightsRealDB:
             user_id=user_id,
             memory_type=MemoryType.SEMANTIC,
             content="User expertise in Python async programming patterns",
-            confidence=0.85,
+            initial_confidence=0.85,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(code_mem.memory_id)
@@ -555,9 +555,9 @@ class TestTaskAwareWeightsRealDB:
         other_mem = Memory(
             memory_id=f"other_{uuid7().hex}",
             user_id=user_id,
-            memory_type=MemoryType.EPISODIC,
+            memory_type=MemoryType.SEMANTIC,
             content="User had lunch meeting yesterday",
-            confidence=0.9,
+            initial_confidence=0.9,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(other_mem.memory_id)
@@ -577,45 +577,14 @@ class TestTaskAwareWeightsRealDB:
         assert any("Python" in m.content for m in results)
 
 
-class TestReflectorRealDB:
-    """TypedReflector with real DB."""
+class TestReflectorRemoved:
+    """TypedReflector removed — episodic type eliminated."""
 
-    def test_cluster_and_promote(self, db_factory, cleanup_memories):
-        """Reflector finds clusters and promotes to semantic."""
-        from core.memory.typed_reflector import TypedReflector
-        from unittest.mock import MagicMock
-
-        store = MemoryStore(db_factory)
-        user_id = _uid()
-
-        # Create cluster of similar episodic memories (same embedding)
-        embedding = [0.5] * 1536
-        for i in range(5):
-            mem = Memory(
-                memory_id=f"ep_{uuid7().hex}",
-                user_id=user_id,
-                memory_type=MemoryType.EPISODIC,
-                content=f"User debugged Python code issue {i}",
-                confidence=0.7,
-                embedding=embedding,
-                observed_at=datetime.utcnow(),
-            )
-            cleanup_memories.append(mem.memory_id)
-            store.create(mem)
-
-        # Mock LLM for condensation
-        mock_llm = MagicMock()
-        mock_llm.chat_with_tools.return_value = {
-            "content": '{"content": "User frequently debugs Python code", "confidence": 0.85}'
-        }
-
-        reflector = TypedReflector(store=store, llm_client=mock_llm)
-        promoted = reflector.reflect(user_id)
-
-        # Should create semantic memory from cluster
-        assert len(promoted) >= 1
-        for mid in promoted:
-            cleanup_memories.append(mid)  # reflect returns memory_id strings
+    def test_no_reflector_module(self):
+        """TypedReflector module no longer exists."""
+        import importlib
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module("core.memory.typed_reflector")
 
 
 class TestHealthRealDB:
@@ -630,14 +599,14 @@ class TestHealthRealDB:
         user_id = _uid()
 
         # Create memories of different types
-        for mtype, count in [(MemoryType.PROFILE, 2), (MemoryType.EPISODIC, 5)]:
+        for mtype, count in [(MemoryType.PROFILE, 2), (MemoryType.SEMANTIC, 5)]:
             for i in range(count):
                 mem = Memory(
                     memory_id=f"health_{uuid7().hex}",
                     user_id=user_id,
                     memory_type=mtype,
                     content=f"Health test memory {mtype.value} {i}",
-                    confidence=0.7 + i * 0.05,
+                    initial_confidence=0.7 + i * 0.05,
                     observed_at=datetime.utcnow(),
                 )
                 cleanup_memories.append(mem.memory_id)
@@ -645,7 +614,7 @@ class TestHealthRealDB:
 
         stats = health.analyze(user_id)
 
-        assert "profile" in stats or "episodic" in stats or len(stats) >= 0
+        assert "profile" in stats or "semantic" in stats or len(stats) >= 0
 
     def test_detect_pollution_low_ratio(self, db_factory, cleanup_memories):
         """No pollution detected when supersede ratio is low."""
@@ -661,9 +630,9 @@ class TestHealthRealDB:
             mem = Memory(
                 memory_id=f"poll_{uuid7().hex}",
                 user_id=user_id,
-                memory_type=MemoryType.EPISODIC,
+                memory_type=MemoryType.SEMANTIC,
                 content=f"Clean memory {i}",
-                confidence=0.8,
+                initial_confidence=0.8,
                 observed_at=datetime.utcnow(),
             )
             cleanup_memories.append(mem.memory_id)
@@ -692,7 +661,7 @@ class TestPipelineRealDB:
         mock_llm.chat_with_tools.return_value = {
             "content": json.dumps([
                 {"content": "User prefers concise code", "type": "profile", "confidence": 0.8},
-                {"content": "User asked about Python testing", "type": "episodic", "confidence": 0.7},
+                {"content": "User asked about Python testing", "type": "semantic", "confidence": 0.7},
             ])
         }
 
@@ -719,7 +688,7 @@ class TestPipelineRealDB:
         assert len(active) >= 2
 
     def test_pipeline_full_cycle(self, db_factory, cleanup_memories):
-        """Pipeline runs observe → reflect cycle."""
+        """Pipeline runs observe → persist cycle (no reflector)."""
         from core.memory.typed_pipeline import run_typed_memory_pipeline
         from core.memory.config import MemoryGovernanceConfig
         from unittest.mock import MagicMock
@@ -727,56 +696,24 @@ class TestPipelineRealDB:
         user_id = _uid()
         store = MemoryStore(db_factory)
 
-        # Pre-seed episodic memories for reflector
-        embedding = [0.3] * 1536
-        for i in range(4):
-            mem = Memory(
-                memory_id=f"pre_{uuid7().hex}",
-                user_id=user_id,
-                memory_type=MemoryType.EPISODIC,
-                content=f"User reviewed Go code {i}",
-                confidence=0.7,
-                embedding=embedding,
-                observed_at=datetime.utcnow(),
-            )
-            cleanup_memories.append(mem.memory_id)
-            store.create(mem)
-
-        # Mock LLM for both observer and reflector
         mock_llm = MagicMock()
-        call_count = [0]
-
-        def mock_chat(*args, **kwargs):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                # Observer extraction
-                return {"content": json.dumps([
-                    {"content": "User likes Go", "type": "profile", "confidence": 0.8}
-                ])}
-            else:
-                # Reflector condensation
-                return {"content": '{"content": "User frequently reviews Go code", "confidence": 0.85}'}
-
-        mock_llm.chat_with_tools.side_effect = mock_chat
-
-        config = MemoryGovernanceConfig(
-            reflector_cluster_min_size=3,
-            reflector_cluster_similarity=0.9,
-        )
+        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
+            {"content": "User likes Go", "type": "profile", "confidence": 0.8}
+        ])}
 
         result = run_typed_memory_pipeline(
             db_factory=db_factory,
             user_id=user_id,
             messages=[{"role": "user", "content": "Review my Go code"}],
             llm_client=mock_llm,
-            config=config,
         )
 
-        # Cleanup any new memories
         active = store.list_active(user_id)
         for m in active:
             if m.memory_id not in [mid for mid in cleanup_memories]:
                 cleanup_memories.append(m.memory_id)
+
+        assert result.memories_extracted >= 1
 
         assert result.memories_extracted >= 1
 
@@ -796,24 +733,20 @@ class TestGovernanceRealDB:
         mem = Memory(
             memory_id=f"decay_{uuid7().hex}",
             user_id=user_id,
-            memory_type=MemoryType.EPISODIC,
+            memory_type=MemoryType.SEMANTIC,
             content="Old memory for decay test",
-            confidence=0.9,
+            initial_confidence=0.9,
             observed_at=datetime.utcnow() - timedelta(days=60),  # 60 days old
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
 
-        # Run decay with 30-day half-life
+        # Decay is query-time only — DB value unchanged
         config = MemoryGovernanceConfig(confidence_decay_half_life_days=30.0)
-        scheduler = GovernanceScheduler(db_factory, config)
-        decayed = scheduler._apply_decay(user_id)
-
-        assert decayed >= 1
-
-        # Check confidence reduced (60 days = 2 half-lives → ~0.25 of original)
-        updated = store.get(mem.memory_id)
-        assert updated.confidence < 0.5  # Should be ~0.225
+        stored = store.get(mem.memory_id)
+        assert stored.initial_confidence == 0.9
+        # Query-time decay: 60 days / 30 half-life = 2 half-lives → ~0.12
+        assert stored.effective_confidence(half_life_days=30.0) < 0.2
 
     def test_cleanup_stale_removes_inactive_low_conf(self, db_factory, cleanup_memories):
         """Cleanup deletes inactive memories below threshold."""
@@ -826,9 +759,9 @@ class TestGovernanceRealDB:
         mem = Memory(
             memory_id=f"stale_{uuid7().hex}",
             user_id=user_id,
-            memory_type=MemoryType.EPISODIC,
+            memory_type=MemoryType.SEMANTIC,
             content="Stale memory to delete",
-            confidence=0.05,  # Below 0.1 threshold
+            initial_confidence=0.05,  # Below 0.1 threshold
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -858,9 +791,9 @@ class TestGovernanceRealDB:
             mem = Memory(
                 memory_id=f"stats_{uuid7().hex}",
                 user_id=user_id,
-                memory_type=MemoryType.EPISODIC,
+                memory_type=MemoryType.SEMANTIC,
                 content=f"Stats test memory {i}",
-                confidence=0.7,
+                initial_confidence=0.7,
                 observed_at=datetime.utcnow(),
             )
             cleanup_memories.append(mem.memory_id)

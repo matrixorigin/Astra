@@ -33,9 +33,10 @@ class TurnHooks(DbConsumer):
     # an internal event bus or API endpoints instead of direct DB access. Benefits:
     # consistent auth/audit, decoupled from DB schema, enables distributed workers.
 
-    def __init__(self, db_factory: DbFactory, llm_client: Any = None):
+    def __init__(self, db_factory: DbFactory, llm_client: Any = None, embed_fn: Any = None):
         super().__init__(db_factory)
         self._llm_client = llm_client
+        self._embed_fn = embed_fn
 
     # ── Decision audit ────────────────────────────────────────────────
 
@@ -110,6 +111,7 @@ class TurnHooks(DbConsumer):
 
         llm = self._llm_client
         db_factory = self._db_factory
+        embed_fn = self._embed_fn
 
         def _bg():
             try:
@@ -118,6 +120,7 @@ class TurnHooks(DbConsumer):
                     user_id=user_id,
                     messages=messages,
                     llm_client=llm,
+                    embed_fn=embed_fn,
                 )
             except Exception as e:
                 logger.debug("Observer failed (non-fatal): %s", e)
