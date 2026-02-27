@@ -2,6 +2,9 @@
 
 > Design Document — 2026-02-22
 > Status: Draft (v3 — single DB, no BYOD for skill tables)
+>
+> 🔵 **Implementation Status**: `SkillManager` (install/uninstall/credential CRUD) is implemented.
+> Marketplace discovery, publishing, RBAC, and MatrixOne Publication distribution are Design Targets.
 
 ## 1. Problem Statement
 

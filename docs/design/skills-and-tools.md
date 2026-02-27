@@ -343,6 +343,10 @@ For the full package structure (schema.py, migrations/, manifest.yaml), see [ski
 
 ## 6. Skill Marketplace
 
+> 🔵 **Design Target** — Marketplace discovery, publishing, and RBAC are not yet implemented.
+> Current implementation: `SkillManager` supports install/uninstall/credential CRUD for
+> platform-defined skills. The marketplace vision below describes the target architecture.
+
 ### The Vision: App Store for Agent Skills
 
 Skills are publishable, discoverable, and installable — like an app store. Admin publishes skills to the marketplace, controls visibility per user/role, and users install skills to enable capabilities.
@@ -378,7 +382,7 @@ Skill business tables (`sk_{skill}_{table}`) are defined in `skills/{name}/model
 
 For full table schemas and install/uninstall lifecycle, see [skill-as-package.md](skill-as-package.md).
 
-### MatrixOne-Enhanced Distribution (opt-in)
+### MatrixOne-Enhanced Distribution (Design Target, opt-in)
 
 When both publisher and subscriber are on MatrixOne, skill distribution can leverage native Publication for zero-copy, auto-updating skill catalogs:
 
@@ -443,7 +447,7 @@ Admin grants access → users can install
 
 All marketplace tables (skill_definitions, skill_permissions, skill_installations, user_credentials) are defined in [skill-as-package.md](skill-as-package.md). They live in the platform DB alongside skill business tables (`sk_{skill}_{table}`).
 
-### MatrixOne-Enhanced: Version Pinning via Clone
+### MatrixOne-Enhanced: Version Pinning via Clone (Design Target)
 
 Subscribers who need version stability can clone instead of subscribing:
 

@@ -1,7 +1,8 @@
 """Skill framework for mo-agent-engine.
 
-Skills are first-class citizens with versioning, declarative requirements,
-and full lifecycle management.
+All tools are skills. Execution location is determined by runtime_requirements,
+not by skill classification. The executor inspects requirements and routes
+to local (filesystem), remote (database/sandbox), or MCP runtime automatically.
 """
 
 from abc import ABC, abstractmethod
@@ -14,9 +15,26 @@ InputT = TypeVar("InputT", bound="SkillInput")
 OutputT = TypeVar("OutputT", bound="SkillOutput")
 
 
-class RepoType(str, Enum):
-    """Repository types"""
+# ---------------------------------------------------------------------------
+# Runtime requirements — executor uses these to route execution
+# ---------------------------------------------------------------------------
 
+class RuntimeRequirement(str, Enum):
+    """What runtime capabilities a skill needs. Executor routes based on these."""
+
+    FILESYSTEM = "filesystem"  # Needs local filesystem access → local runtime
+    DATABASE = "database"      # Needs platform DB → remote runtime
+    NETWORK = "network"        # Needs network/API access → either runtime
+    SANDBOX = "sandbox"        # Needs isolated sandbox → remote runtime
+    GPU = "gpu"                # Needs GPU → heavyweight backend
+    NONE = "none"              # Pure computation, runs anywhere
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class RepoType(str, Enum):
     CODE = "code"
     CI = "ci"
     TESTER = "tester"
@@ -24,76 +42,88 @@ class RepoType(str, Enum):
 
 
 class AccessScope(str, Enum):
-    """Access scopes for repositories"""
-
     READ = "read"
     WRITE = "write"
     ADMIN = "admin"
 
 
 class SideEffectCategory(str, Enum):
-    """Side-effect categories for replay safety"""
+    """Side-effect categories for replay safety and permission checking."""
 
-    READ = "read"  # Safe to replay, no external changes
-    WRITE = "write"  # Has side-effects, must use recorded results
-    DESTRUCTIVE = "destructive"  # Dangerous, blocked in replay mode
+    READ = "read"
+    WRITE = "write"
+    EXECUTE = "execute"        # Shell/subprocess execution
+    DESTRUCTIVE = "destructive"
 
+
+# ---------------------------------------------------------------------------
+# Profiles and requirements
+# ---------------------------------------------------------------------------
 
 class SideEffectProfile(BaseModel):
-    """Side-effect profile for a skill"""
-
     category: SideEffectCategory
-    external_apis: list[str] = []  # e.g., ["github", "llm"]
-    mock_strategy: str = "recorded"  # How to mock in replay mode
+    external_apis: list[str] = []
+    mock_strategy: str = "recorded"
 
 
 class SkillRequirement(BaseModel):
-    """What a skill needs to run"""
+    """What a skill needs to run."""
 
-    repo_types: list[RepoType]  # e.g., ["code"] or ["code", "ci"]
-    min_access: AccessScope  # e.g., READ or WRITE
-    llm_required: bool = True  # Does this skill need LLM?
-
-    # Execution backend routing (all optional, backward-compatible)
-    gpu_required: bool = False
-    conda_env: str | None = None
+    runtime: list[RuntimeRequirement] = [RuntimeRequirement.NONE]
+    llm_required: bool = False
     timeout_seconds: int = 60
     min_memory_gb: float = 0.5
-    async_execution: bool = False  # If True, skill runs as background job
+    gpu_required: bool = False
+    conda_env: str | None = None
+    async_execution: bool = False
+    # Legacy fields — used by cloud skills (builtin, extended, delegation)
+    repo_types: list[RepoType] = []
+    min_access: AccessScope = AccessScope.READ
 
+
+# ---------------------------------------------------------------------------
+# Input / Output
+# ---------------------------------------------------------------------------
 
 class SkillInput(BaseModel):
-    """Base class for skill inputs"""
+    """Base class for skill inputs."""
 
-    repo_id: int | None = None  # Resolved by framework
-    user_id: str | None = None  # Injected by executor
-    session_id: str | None = None  # Injected by executor
+    repo_id: int | None = None
+    user_id: str | None = None
+    session_id: str | None = None
 
-    # Fields auto-injected by framework, excluded from LLM tool schema
     _FRAMEWORK_FIELDS: ClassVar[set[str]] = {"repo_id", "user_id", "session_id"}
 
 
 class SkillOutput(BaseModel):
-    """Base class for skill outputs"""
+    """Base class for skill outputs."""
 
     success: bool
     result: Any
     error: str | None = None
-    cost: float = 0.0  # LLM cost if applicable
+    cost: float = 0.0
 
+
+# ---------------------------------------------------------------------------
+# Skill base class
+# ---------------------------------------------------------------------------
 
 class Skill(ABC, Generic[InputT, OutputT]):
-    """Base class for all skills"""
+    """Base class for ALL tools/skills in the system.
+
+    Every tool — file ops, shell, git, grep, GitHub, code execution,
+    delegation — inherits from this. Execution location is orthogonal:
+    the executor reads ``requirements.runtime`` and routes accordingly.
+    """
 
     name: str
-    version: str  # Semantic versioning (1.0.0)
-    description: str
-    requirements: SkillRequirement
+    version: str = "1.0.0"
+    description: str = ""
+    requirements: SkillRequirement = SkillRequirement()
     side_effect_profile: SideEffectProfile = SideEffectProfile(
-        category=SideEffectCategory.READ
-    )  # Default to READ (safe)
+        category=SideEffectCategory.READ,
+    )
 
-    # Auto-populated by __init_subclass__ from Generic type args
     _input_cls: ClassVar[type["SkillInput"] | None] = None
     _output_cls: ClassVar[type["SkillOutput"] | None] = None
 
@@ -107,7 +137,6 @@ class Skill(ABC, Generic[InputT, OutputT]):
                 break
 
     def validate_input(self, input_data: dict) -> InputT:
-        """Validate and parse input. Override for custom logic."""
         if self._input_cls is None:
             raise TypeError(f"{type(self).__name__} has no _input_cls; "
                             "specify Generic type args or override validate_input()")
@@ -115,5 +144,31 @@ class Skill(ABC, Generic[InputT, OutputT]):
 
     @abstractmethod
     async def execute(self, input: InputT) -> OutputT:
-        """Execute the skill"""
-        pass
+        """Execute the skill."""
+        ...
+
+    def to_openai_schema(self) -> dict[str, Any]:
+        """Return OpenAI function calling tool schema.
+
+        Derives parameters from ``_input_cls`` Pydantic schema, excluding
+        framework-injected fields. Skills can override for custom schemas.
+        """
+        if self._input_cls is not None:
+            schema = self._input_cls.model_json_schema()
+            props = {k: v for k, v in schema.get("properties", {}).items()
+                     if k not in SkillInput._FRAMEWORK_FIELDS}
+            required = [r for r in schema.get("required", [])
+                        if r not in SkillInput._FRAMEWORK_FIELDS]
+            params = {"type": "object", "properties": props}
+            if required:
+                params["required"] = required
+        else:
+            params = {"type": "object", "properties": {}}
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": params,
+            },
+        }

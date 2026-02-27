@@ -1,42 +1,72 @@
-"""Base class for edge tools."""
+"""Base class for edge tools — thin adapter over core Skill framework.
 
-from abc import ABC, abstractmethod
+EdgeTool is a Skill subclass that preserves the simple ``execute(**kwargs) -> str``
+interface used by file_ops, shell, git, search, and introspection tools.
+All EdgeTools are Skills; the ToolRouter and SkillExecutor treat them uniformly.
+"""
+
+from abc import abstractmethod
 from enum import Enum
 from typing import Any
 
+from core.skills.base import (
+    RuntimeRequirement,
+    SideEffectCategory,
+    SideEffectProfile,
+    Skill,
+    SkillInput,
+    SkillOutput,
+    SkillRequirement,
+)
+
 
 class SideEffect(str, Enum):
-    """Side effect classification for permission checking."""
+    """Side effect classification for permission checking.
+
+    Maps 1:1 to SideEffectCategory but kept as the public API for edge tools
+    and the permission system.
+    """
+
     READ = "read"
     WRITE = "write"
     EXECUTE = "execute"
 
 
-class EdgeTool(ABC):
-    """Abstract base for tools that execute on the user's machine."""
+# Mapping from SideEffect → SideEffectCategory
+_SIDE_EFFECT_MAP: dict[SideEffect, SideEffectCategory] = {
+    SideEffect.READ: SideEffectCategory.READ,
+    SideEffect.WRITE: SideEffectCategory.WRITE,
+    SideEffect.EXECUTE: SideEffectCategory.EXECUTE,
+}
+
+
+class EdgeTool(Skill[SkillInput, SkillOutput]):
+    """Skill adapter for tools that run on the user's machine.
+
+    Subclasses define ``name``, ``description``, ``parameters`` (JSON Schema dict),
+    ``side_effect``, and ``async execute(**kwargs) -> str``.  The Skill framework
+    fields (``requirements``, ``side_effect_profile``, ``to_openai_schema``) are
+    derived automatically.
+    """
+
+    # Subclasses set these as class attributes or properties
+    name: str
+    description: str
+    parameters: dict[str, Any]
+    side_effect: SideEffect
+
+    # Default: edge tools need local filesystem
+    requirements: SkillRequirement = SkillRequirement(
+        runtime=[RuntimeRequirement.FILESYSTEM],
+        llm_required=False,
+    )
 
     @property
-    @abstractmethod
-    def name(self) -> str:
-        """Tool name matching OpenAI function calling convention."""
-
-    @property
-    @abstractmethod
-    def description(self) -> str:
-        """Human-readable description for LLM."""
-
-    @property
-    @abstractmethod
-    def parameters(self) -> dict[str, Any]:
-        """JSON Schema for tool parameters."""
-
-    @property
-    @abstractmethod
-    def side_effect(self) -> SideEffect:
-        """Side effect level for permission checking."""
+    def side_effect_profile(self) -> SideEffectProfile:  # type: ignore[override]
+        return SideEffectProfile(category=_SIDE_EFFECT_MAP[self.side_effect])
 
     @abstractmethod
-    async def execute(self, **kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> str:  # type: ignore[override]
         """Execute the tool and return result as string."""
 
     def to_openai_schema(self) -> dict[str, Any]:
