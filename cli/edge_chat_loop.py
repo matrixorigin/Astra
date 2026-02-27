@@ -292,6 +292,29 @@ async def edge_chat_loop(
         # Clear messages after first turn — cloud has the history
         messages = []
     else:
+        # Flush pending tool_results so cloud history stays valid.
+        # Without this, the last assistant message has tool_calls with no
+        # matching tool responses, causing API errors on the next turn.
+        if tool_results:
+            for tr in tool_results:
+                tr["result"] = (
+                    f"[MAX TURNS REACHED] {tr['result']}\n\n"
+                    "You have reached the maximum number of turns. "
+                    "Summarize your progress and stop calling tools."
+                )
+            try:
+                sse_stream = api_client.chat_turn(
+                    messages=[],
+                    session_id=session_id,
+                    tool_results=tool_results,
+                    agent_id=agent_id,
+                    model=model,
+                )
+                result = await _consume_turn(sse_stream, renderer)
+                if result.text:
+                    final_text = result.text
+            except Exception:
+                pass  # best-effort; loop is already over
         renderer.error(f"Reached maximum turns ({MAX_TURNS})")
 
     return final_text

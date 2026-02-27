@@ -822,3 +822,159 @@ class TestToolCallStartPersistence:
         meta = json.loads(row[0]) if isinstance(row[0], str) else row[0]
         assert meta["name"] == "read_file", "tool_result metadata must include name for recovery"
         assert meta["tool_call_id"] == "tc_meta"
+
+
+# ============================================================================
+# Regression: max-turns flush keeps cloud history valid for next user message
+# ============================================================================
+
+class TestMaxTurnsFlushHistory:
+    """Reproduce the real bug: after hitting MAX_TURNS, the next user message
+    fails with 'tool_calls must be followed by tool messages'.
+
+    This test walks through the cloud-side session cache to verify that
+    flushing tool_results after max-turns produces a valid OpenAI message
+    sequence (every assistant tool_calls has matching tool messages).
+    """
+
+    def test_history_valid_after_max_turns_flush(self, client, auth_headers):
+        """Turn 1: assistant returns tool_calls.
+        Turn 2: edge sends tool_results with MAX TURNS marker (the flush).
+        Turn 3: user sends a new message — should NOT get 400 error.
+
+        We verify the LLM messages on turn 3 have valid tool_calls/tool pairing.
+        """
+        # Turn 1: LLM returns a tool_call
+        async def turn1_stream(messages, tools, *args, **kwargs):
+            async for chunk in fake_stream_gen([
+                {"type": "tool_call", "data": {
+                    "id": "tc_max", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "x.py"}'},
+                }},
+            ]):
+                yield chunk
+
+        edge_tools = [{"type": "function", "function": {
+            "name": "read_file", "description": "r",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }}]
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn1_stream):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "read x.py"}],
+                "edge_tools": edge_tools,
+            }, headers=auth_headers)
+        assert r1.status_code == 200
+        session_id = parse_sse(r1.text)[0]["session_id"]
+
+        # Turn 2: edge flushes tool_results with MAX TURNS REACHED marker
+        async def turn2_stream(messages, tools, *args, **kwargs):
+            async for chunk in fake_stream_gen([
+                {"type": "text", "content": "Summary after max turns."},
+            ]):
+                yield chunk
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn2_stream):
+            r2 = client.post("/chat/turn", json={
+                "messages": [],
+                "session_id": session_id,
+                "tool_results": [{
+                    "tool_call_id": "tc_max",
+                    "name": "read_file",
+                    "result": "[MAX TURNS REACHED] content of x.py\n\nSummarize your progress.",
+                }],
+            }, headers=auth_headers)
+        assert r2.status_code == 200
+
+        # Turn 3: user sends a new message — this is where the real bug hit
+        captured_messages = []
+
+        async def turn3_stream(messages, tools, *args, **kwargs):
+            captured_messages.extend(messages)
+            # Validate: every assistant message with tool_calls must be followed
+            # by matching tool messages before the next non-tool message.
+            for i, msg in enumerate(messages):
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    expected_ids = {tc["id"] for tc in msg["tool_calls"]}
+                    found_ids = set()
+                    for j in range(i + 1, len(messages)):
+                        if messages[j].get("role") == "tool":
+                            found_ids.add(messages[j].get("tool_call_id"))
+                        else:
+                            break
+                    missing = expected_ids - found_ids
+                    assert not missing, (
+                        f"assistant message at index {i} has tool_calls {expected_ids} "
+                        f"but missing tool responses for {missing} — "
+                        f"this would cause API 400 'insufficient tool messages'"
+                    )
+            async for chunk in fake_stream_gen([
+                {"type": "text", "content": "ok"},
+            ]):
+                yield chunk
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn3_stream):
+            r3 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "continue"}],
+                "session_id": session_id,
+            }, headers=auth_headers)
+        assert r3.status_code == 200
+        assert captured_messages, "Turn 3 should have reached the LLM"
+
+    def test_missing_flush_detected_as_invalid(self, client, auth_headers):
+        """Negative test: if edge skips the flush after max-turns, the next
+        user message hits an invalid history (tool_calls without tool responses).
+
+        This proves the integration test catches the real bug.
+        """
+        # Turn 1: LLM returns a tool_call
+        async def turn1_stream(messages, tools, *args, **kwargs):
+            async for chunk in fake_stream_gen([
+                {"type": "tool_call", "data": {
+                    "id": "tc_nf", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "y.py"}'},
+                }},
+            ]):
+                yield chunk
+
+        edge_tools = [{"type": "function", "function": {
+            "name": "read_file", "description": "r",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }}]
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn1_stream):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "read y.py"}],
+                "edge_tools": edge_tools,
+            }, headers=auth_headers)
+        session_id = parse_sse(r1.text)[0]["session_id"]
+
+        # SKIP flush — go directly to next user message (the bug scenario)
+        validation_errors = []
+
+        async def turn2_stream(messages, tools, *args, **kwargs):
+            for i, msg in enumerate(messages):
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    expected_ids = {tc["id"] for tc in msg["tool_calls"]}
+                    found_ids = set()
+                    for j in range(i + 1, len(messages)):
+                        if messages[j].get("role") == "tool":
+                            found_ids.add(messages[j].get("tool_call_id"))
+                        else:
+                            break
+                    missing = expected_ids - found_ids
+                    if missing:
+                        validation_errors.append(missing)
+            async for chunk in fake_stream_gen([{"type": "text", "content": "ok"}]):
+                yield chunk
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn2_stream):
+            client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "continue"}],
+                "session_id": session_id,
+            }, headers=auth_headers)
+
+        assert validation_errors, (
+            "Without flush, history should have orphaned tool_calls — "
+            "this is the bug that causes 'insufficient tool messages' API error"
+        )

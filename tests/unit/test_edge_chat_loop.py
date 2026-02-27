@@ -336,7 +336,48 @@ class TestEdgeChatLoop:
 
         api = MockAPIClient(turns)
         await edge_chat_loop("Loop forever", api, router, perms, renderer=renderer)
-        assert len(api.calls) == 25  # MAX_TURNS
+        assert len(api.calls) == 26  # MAX_TURNS + 1 flush call
+        assert any("maximum turns" in e.lower() for e in renderer.errors)
+
+    @pytest.mark.asyncio
+    async def test_max_turns_flushes_tool_results(self, router, perms, renderer):
+        """After hitting MAX_TURNS, pending tool_results are flushed to cloud
+        so the conversation history stays valid for subsequent turns.
+
+        Reproduces: 'tool_calls' with no matching tool messages → API 400 error
+        on the next user message.
+        """
+        from cli.edge_chat_loop import MAX_TURNS
+
+        # 25 turns of tool calls, then a 26th turn that returns a summary
+        turns: list[list[dict[str, Any]]] = []
+        for i in range(MAX_TURNS):
+            turns.append([
+                {"type": "tool_call", "id": f"tc_{i}", "name": "read_file",
+                 "arguments": {"path": "hello.txt"}},
+                {"type": "turn_complete", "has_tool_calls": True},
+            ])
+        # The flush turn — cloud receives tool_results and returns final text
+        turns.append([
+            {"type": "text_delta", "content": "Here is my summary."},
+            {"type": "turn_complete", "has_tool_calls": False},
+        ])
+
+        api = MockAPIClient(turns)
+        result = await edge_chat_loop("Loop forever", api, router, perms, renderer=renderer)
+
+        # Should have MAX_TURNS + 1 calls: 25 normal + 1 flush
+        assert len(api.calls) == MAX_TURNS + 1
+
+        # The flush call must carry tool_results
+        flush_call = api.calls[MAX_TURNS]
+        assert flush_call.get("tool_results") is not None
+        assert len(flush_call["tool_results"]) > 0
+        # Tool results should contain the MAX TURNS REACHED marker
+        assert any("MAX TURNS REACHED" in tr["result"] for tr in flush_call["tool_results"])
+
+        # Final text should come from the flush turn
+        assert result == "Here is my summary."
         assert any("maximum turns" in e.lower() for e in renderer.errors)
 
 
