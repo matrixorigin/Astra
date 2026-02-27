@@ -465,11 +465,20 @@ _session_cache: _SessionCache = _SessionCache(_MAX_CACHED_SESSIONS)
 _persist_threads: list[threading.Thread] = []
 
 
-def _flush_persist_threads(timeout: float = 15.0) -> None:
-    """Join all pending persistence threads. Used by tests for deterministic assertions."""
+def _flush_persist_threads(timeout: float = 30.0) -> None:
+    """Join all pending persistence threads. Used by tests for deterministic assertions.
+
+    Raises TimeoutError if any thread does not finish within *timeout* seconds
+    so that tests fail loudly instead of silently reading incomplete data.
+    """
     while _persist_threads:
         t = _persist_threads.pop(0)
         t.join(timeout=timeout)
+        if t.is_alive():
+            raise TimeoutError(
+                f"Persist thread {t.name} still alive after {timeout}s — "
+                "DB assertions would read incomplete data"
+            )
 
 
 def _tool_names(tools: list[dict[str, Any]]) -> set[str]:
@@ -890,6 +899,7 @@ def _persist_turn_events(
 _shared_llm_client = None
 _shared_llm_lock = threading.Lock()
 _shared_embed_fn = _UNSET = object()
+_shared_embed_lock = threading.Lock()
 
 
 def _get_shared_llm_client():
@@ -907,14 +917,14 @@ def _get_shared_embed_fn():
     """Get or create a shared embed_fn for memory pipeline."""
     global _shared_embed_fn
     if _shared_embed_fn is _UNSET:
-        try:
-            from core.context.embeddings import EmbeddingService
-            svc = EmbeddingService(SessionLocal)
-            # Use embed_fn even for mock — enables contradiction detection
-            # and memory storage with embeddings for the full pipeline to work.
-            _shared_embed_fn = svc.embed_text
-        except Exception:
-            _shared_embed_fn = None
+        with _shared_embed_lock:
+            if _shared_embed_fn is _UNSET:
+                try:
+                    from core.context.embeddings import EmbeddingService
+                    svc = EmbeddingService(SessionLocal)
+                    _shared_embed_fn = svc.embed_text
+                except Exception:
+                    _shared_embed_fn = None
     return _shared_embed_fn
 
 
