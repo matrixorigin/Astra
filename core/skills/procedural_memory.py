@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from api.models import SkillSelectionLearning
 from core.memory.types import Memory, MemoryType, TrustTier
+from core.skills.learning_similarity import normalize_confidence
 
 
 def learning_to_memory(row: SkillSelectionLearning) -> Memory:
@@ -30,16 +31,12 @@ def learning_to_memory(row: SkillSelectionLearning) -> Memory:
         parts.append(f"correct=[{correct}]")
     content = " ".join(parts)
 
-    # Map confidence: learning uses 0-100, memory uses 0-1
-    raw_conf = row.confidence if row.confidence is not None else 10.0
-    normalized = min(1.0, raw_conf / 100.0) if raw_conf > 1.0 else max(0.0, raw_conf)
-
     return Memory(
         memory_id=row.learning_id,
         user_id="__system__",
         memory_type=MemoryType.PROCEDURAL,
         content=content,
-        initial_confidence=normalized,
+        initial_confidence=normalize_confidence(row.confidence),
         embedding=row.query_embedding if hasattr(row, "query_embedding") else None,
         is_active=bool(row.is_active) if row.is_active is not None else True,
         observed_at=row.created_at,

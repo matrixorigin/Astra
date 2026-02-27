@@ -440,11 +440,13 @@ class SkillRegistry:
             if not current:
                 raise ValueError(f"No active version of '{skill_name}' to rollback")
 
+            # Find the most recent inactive version that hasn't been deprecated.
+            # "deprecated" means explicitly rolled back — not eligible for re-activation.
             previous = db.query(SkillModel).filter(
                 SkillModel.skill_name == skill_name,
                 SkillModel.is_active == 0,
-                SkillModel.status.in_(("active", "deprecated")),
-            ).order_by(SkillModel.created_at.desc()).first()
+                SkillModel.status == "active",
+            ).order_by(SkillModel.created_at.desc(), SkillModel.skill_id.desc()).first()
             if not previous:
                 raise ValueError(f"No previous version of '{skill_name}' to rollback to")
 
@@ -453,6 +455,7 @@ class SkillRegistry:
             previous.is_active = 1
             previous.status = "active"
             activated_version = previous.version
+            old_version = current.version
             db.commit()
         except Exception:
             db.rollback()
@@ -462,7 +465,7 @@ class SkillRegistry:
 
         self._skills.pop(skill_name, None)
         self._get_cached.cache_clear()
-        logger.info("Rolled back %s: %s → %s", skill_name, current.version, activated_version)
+        logger.info("Rolled back %s: %s → %s", skill_name, old_version, activated_version)
         return activated_version
 
     def uninstall(self, skill_name: str) -> int:

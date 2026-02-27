@@ -389,3 +389,100 @@ class TestListAvailable:
 
         # Should return empty list for non-existent repo
         assert len(available) == 0
+
+
+_ROLLBACK_SKILL_NAMES = ["rb_skill", "rb_single"]
+_UNINSTALL_SKILL_NAMES = ["un_skill", "un_cache"]
+
+
+class TestSkillRollback:
+    """Tests for SkillRegistry.rollback()."""
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, mock_db):
+        from api.models import SkillRegistry as SkillModel
+        yield
+        mock_db.query(SkillModel).filter(
+            SkillModel.skill_name.in_(_ROLLBACK_SKILL_NAMES)
+        ).delete(synchronize_session="fetch")
+        mock_db.commit()
+
+    def test_rollback_activates_previous_version(self, registry, mock_db):
+        from api.models import SkillRegistry as SkillModel
+
+        registry.register(MockSkill("rb_skill", "1.0.0"), is_active=True)
+        registry.register(MockSkill("rb_skill", "2.0.0"), is_active=True)
+
+        activated = registry.rollback("rb_skill")
+        assert activated == "1.0.0"
+
+        mock_db.expire_all()
+        v1 = mock_db.query(SkillModel).filter(SkillModel.skill_id == "rb_skill@1.0.0").first()
+        v2 = mock_db.query(SkillModel).filter(SkillModel.skill_id == "rb_skill@2.0.0").first()
+        assert v1.is_active == 1 and v1.status == "active"
+        assert v2.is_active == 0 and v2.status == "deprecated"
+
+    def test_rollback_consecutive(self, registry, mock_db):
+        """v3 → v2 → v1: consecutive rollbacks through the version chain."""
+        from api.models import SkillRegistry as SkillModel
+
+        registry.register(MockSkill("rb_skill", "1.0.0"), is_active=True)
+        registry.register(MockSkill("rb_skill", "2.0.0"), is_active=True)
+        registry.register(MockSkill("rb_skill", "3.0.0"), is_active=True)
+
+        assert registry.rollback("rb_skill") == "2.0.0"
+        assert registry.rollback("rb_skill") == "1.0.0"
+
+        mock_db.expire_all()
+        v1 = mock_db.query(SkillModel).filter(SkillModel.skill_id == "rb_skill@1.0.0").first()
+        v2 = mock_db.query(SkillModel).filter(SkillModel.skill_id == "rb_skill@2.0.0").first()
+        v3 = mock_db.query(SkillModel).filter(SkillModel.skill_id == "rb_skill@3.0.0").first()
+        assert v1.is_active == 1 and v1.status == "active"
+        assert v2.is_active == 0 and v2.status == "deprecated"
+        assert v3.is_active == 0 and v3.status == "deprecated"
+
+    def test_rollback_no_active_raises(self, registry, mock_db):
+        with pytest.raises(ValueError, match="No active version"):
+            registry.rollback("nonexistent_skill")
+
+    def test_rollback_no_previous_raises(self, registry, mock_db):
+        registry.register(MockSkill("rb_single", "1.0.0"), is_active=True)
+
+        with pytest.raises(ValueError, match="No previous version"):
+            registry.rollback("rb_single")
+
+
+class TestSkillUninstall:
+    """Tests for SkillRegistry.uninstall()."""
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, mock_db):
+        from api.models import SkillRegistry as SkillModel
+        yield
+        mock_db.query(SkillModel).filter(
+            SkillModel.skill_name.in_(_UNINSTALL_SKILL_NAMES)
+        ).delete(synchronize_session="fetch")
+        mock_db.commit()
+
+    def test_uninstall_removes_all_versions(self, registry, mock_db):
+        from api.models import SkillRegistry as SkillModel
+
+        registry.register(MockSkill("un_skill", "1.0.0"), is_active=False)
+        registry.register(MockSkill("un_skill", "2.0.0"), is_active=True)
+
+        count = registry.uninstall("un_skill")
+        assert count == 2
+
+        mock_db.expire_all()
+        assert mock_db.query(SkillModel).filter(SkillModel.skill_name == "un_skill").count() == 0
+
+    def test_uninstall_nonexistent_returns_zero(self, registry):
+        count = registry.uninstall("no_such_skill")
+        assert count == 0
+
+    def test_uninstall_clears_memory_cache(self, registry, mock_db):
+        registry.register(MockSkill("un_cache", "1.0.0"), is_active=True)
+        assert "un_cache" in registry._skills
+
+        registry.uninstall("un_cache")
+        assert "un_cache" not in registry._skills

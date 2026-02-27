@@ -74,6 +74,16 @@ def context_matches(learning_features: dict[str, Any] | None, query_features: di
 
 
 def normalize_confidence(value: float | None) -> float:
+    """Normalize confidence to 0.0–1.0 range.
+
+    Convention: the learning system stores confidence on a 0–100 scale
+    (default 10.0, increments of 10, capped at 99). Values > 1.0 are
+    divided by 100. Values in [0.0, 1.0] are treated as already normalized.
+
+    This means values like 1.01 map to 0.0101 (interpreted as 1.01%).
+    In practice the learning system never produces values in (0, 10),
+    so the boundary is unambiguous for real data.
+    """
     if value is None:
         return 0.0
     if value <= 1.0:
