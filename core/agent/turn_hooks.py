@@ -63,6 +63,7 @@ class TurnHooks(DbConsumer):
                     decision_type="tool_selection" if tc_names else "response_generation",
                     decision_output={"text": response_text[:500], "tool_calls": tc_names, "model_used": model_used},
                     context_capture_id=context_capture_id,
+                    model_used=model_used,
                 ))
                 db.commit()
         except Exception as e:

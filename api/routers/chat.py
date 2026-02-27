@@ -769,6 +769,7 @@ def _persist_turn_events(
     tool_calls: list[dict[str, Any]],
     context_capture_id: str | None = None,
     model_used: str | None = None,
+    token_usage: dict[str, int] | None = None,
     history: list[dict[str, Any]] | None = None,
     turn_count: int = 0,
 ) -> None:
@@ -846,6 +847,8 @@ def _persist_turn_events(
                 agent_id="dev-agent", agent_version="0.1.0",
                 parent_event_id=parent_event_id,
                 causal_chain_id=causal_chain_id,
+                llm_model_used=model_used,
+                token_usage=token_usage,
             )
 
         if history and turn_count > 0 and turn_count % _SNAPSHOT_TURN_INTERVAL == 0:
@@ -995,6 +998,7 @@ async def chat_turn(
 
                 full_text = ""
                 tool_calls: list[dict[str, Any]] = []
+                usage: dict[str, int] = {}
 
                 if tools_schema:
                     async for chunk in llm.chat_with_tools_stream(
@@ -1006,6 +1010,7 @@ async def chat_turn(
                         elif chunk["type"] == "tool_call":
                             tool_calls.append(chunk["data"])
                         elif chunk["type"] == "usage":
+                            usage = {"prompt": chunk.get("prompt", 0), "completion": chunk.get("completion", 0), "total": chunk.get("prompt", 0) + chunk.get("completion", 0)}
                             yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
                 else:
                     async for chunk in llm.chat_stream(
@@ -1048,6 +1053,7 @@ async def chat_turn(
                 tool_results=copy.deepcopy(request.tool_results or []),
                 full_text=full_text, tool_calls=copy.deepcopy(tool_calls),
                 context_capture_id=snapshot_id, model_used=resolved_model,
+                token_usage=usage if usage else None,
                 history=copy.deepcopy(current_history),
                 turn_count=current_turn_count,
             )
