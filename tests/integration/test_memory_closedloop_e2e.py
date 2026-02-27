@@ -432,3 +432,63 @@ class TestTaskAwareRetrieval:
         
         assert len(results) >= 1
         assert any("tests" in r.content for r in results)
+
+
+class TestSensitivityFilterRealDB:
+    """Sensitivity filter blocks PII from reaching the database."""
+
+    def test_pii_blocked_before_persist(self, db_factory, memory_cleanup):
+        """Observer rejects content containing PII — nothing stored."""
+        user_id = _uid()
+        store = MemoryStore(db_factory)
+        observer = TypedObserver(store=store, llm_client=None, embed_fn=_embed)
+
+        with pytest.raises(ValueError, match="sensitivity filter"):
+            observer.observe_explicit(
+                user_id=user_id,
+                content="Contact me at alice@example.com for details",
+                memory_type=MemoryType.SEMANTIC,
+                initial_confidence=0.9,
+            )
+
+        # Verify nothing leaked to DB
+        results, _ = MemoryRetriever(db_factory).retrieve(
+            user_id=user_id,
+            query_text="alice email",
+            session_id=_sid(),
+            query_embedding=_embed("alice email"),
+            limit=10,
+        )
+        assert len(results) == 0
+
+    def test_aws_key_blocked(self, db_factory, memory_cleanup):
+        """AWS access key pattern is caught."""
+        user_id = _uid()
+        store = MemoryStore(db_factory)
+        observer = TypedObserver(store=store, llm_client=None, embed_fn=_embed)
+
+        with pytest.raises(ValueError, match="sensitivity filter"):
+            observer.observe_explicit(
+                user_id=user_id,
+                content="Use key AKIAIOSFODNN7EXAMPLE for S3",
+                memory_type=MemoryType.PROCEDURAL,
+                initial_confidence=0.8,
+            )
+
+    def test_clean_content_passes(self, db_factory, memory_cleanup):
+        """Non-PII content persists normally."""
+        user_id = _uid()
+        store = MemoryStore(db_factory)
+        observer = TypedObserver(store=store, llm_client=None, embed_fn=_embed)
+
+        mem, _ = observer.observe_explicit(
+            user_id=user_id,
+            content="User prefers dark mode in IDE",
+            memory_type=MemoryType.PROFILE,
+            initial_confidence=0.9,
+        )
+        memory_cleanup.append(mem.memory_id)
+
+        stored = store.get(mem.memory_id)
+        assert stored is not None
+        assert "dark mode" in stored.content
