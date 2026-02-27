@@ -302,11 +302,7 @@ repo = registry.create(
 sandbox = Sandbox(db=db, account="sys")  # Specify account
 sandbox.create("exp1", description="Test", created_by="alice")
 
-# Method 1: Switch to sandbox database
-sandbox.use("exp1")
-db.execute("SELECT * FROM events")  # Queries exp1.events
-
-# Method 2: Use explicit database name
+# Query sandbox via fully-qualified table name
 db.execute("SELECT * FROM exp1.events")
 
 # Manage sandbox

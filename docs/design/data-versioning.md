@@ -76,9 +76,8 @@ sandbox.create("experiment_1", description="Test new prompt")
 # Or from a specific checkpoint
 sandbox.create("experiment_2", from_snapshot="checkpoint_20260211")
 
-# Sandbox is a separate database — complete isolation
-sandbox.use("experiment_1")
-# All reads/writes hit the sandbox, not production
+# Sandbox is a separate database — query via fully-qualified names
+db.execute("SELECT * FROM experiment_1.prompt_templates")
 ```
 
 ### Use Cases

@@ -8,8 +8,8 @@ import os
 # Set test encryption key
 os.environ["TOKEN_ENCRYPTION_KEY"] = "test-encryption-key-for-unit-tests-only"
 
-# Embedding: use local model with native 384 dimensions for dev/test
-os.environ.setdefault("EMBEDDING_PROVIDER", "local")
+# Embedding: use mock provider for fast tests (no model loading)
+os.environ.setdefault("EMBEDDING_PROVIDER", "mock")
 os.environ.setdefault("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 os.environ.setdefault("EMBEDDING_DIM", "384")
 

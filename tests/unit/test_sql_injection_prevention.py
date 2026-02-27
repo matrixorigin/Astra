@@ -89,17 +89,6 @@ class TestSQLInjectionPrevention:
         with pytest.raises(ValueError):
             sandbox.delete("'; DROP TABLE auth_users--")
 
-    def test_sandbox_use_sql_injection(self):
-        """Test sandbox use rejects SQL injection attempts."""
-        from unittest.mock import Mock
-        from sqlalchemy.orm import Session
-        
-        mock_db = Mock(spec=Session)
-        sandbox = Sandbox(lambda: mock_db)
-        
-        with pytest.raises(ValueError):
-            sandbox.use("'; DROP TABLE auth_users--")
-
     def test_add_table_sql_injection(self):
         """Test add_table rejects SQL injection via Branch._qualify → validate_identifier."""
         from unittest.mock import Mock

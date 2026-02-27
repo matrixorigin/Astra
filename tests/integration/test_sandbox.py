@@ -211,17 +211,12 @@ def test_info(sandbox, db_session, source_table):
 
 
 def test_use_sandbox(sandbox, db_session, source_table):
+    """Verify sandbox contains branched data via fully-qualified query."""
     name = _unique_name()
     sandbox.create(name, tables=[source_table])
 
-    # Get current DB
-    current_db = db_session.execute(text("SELECT DATABASE()")).scalar()
-
-    # Switch to sandbox
-    sandbox.use(name)
-    r = db_session.execute(text(f"SELECT count(*) FROM {source_table}"))
+    # Query sandbox via fully-qualified name (safe with connection pooling)
+    r = db_session.execute(text(f"SELECT count(*) FROM {name}.{source_table}"))
     assert r.scalar() == 3
 
-    # Switch back
-    sandbox.use(current_db)
     sandbox.delete(name)

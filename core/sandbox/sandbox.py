@@ -293,11 +293,9 @@ class Sandbox(DbConsumer):
     # Query & Metadata
     # ------------------------------------------------------------------
 
-    def use(self, sandbox: str) -> None:
-        """Switch to sandbox database."""
-        with self._db() as db:
-            validate_identifier(sandbox)
-            db.execute(text(f"USE {sandbox}"))
+    # use() removed — executing USE on a pooled connection pollutes the
+    # connection's database context for all subsequent consumers.
+    # Use fully-qualified table names (``sandbox_name.table``) instead.
 
     def info(self, sandbox: str) -> dict:
         """Get sandbox info with metadata."""

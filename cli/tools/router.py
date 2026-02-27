@@ -1,11 +1,20 @@
-"""Tool router — dispatches LLM tool_calls to edge tools, executes concurrently."""
+"""Tool router — dispatches LLM tool_calls to skills, executes concurrently.
+
+All tools are Skills (EdgeTool is a Skill subclass). The router accepts any Skill
+and dispatches via the EdgeTool ``execute(**kwargs)`` interface for tools that use it,
+or the Pydantic ``execute(input)`` interface for typed skills.
+"""
 
 import asyncio
 import json
-from dataclasses import dataclass
-from typing import Any
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
-from cli.tools.base import EdgeTool
+from core.skills.base import Skill
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -23,21 +32,31 @@ class ToolResult:
     name: str
     result: str
     error: bool = False
+    execution_time_ms: int = 0
+
+
+class ExecutionHook(Protocol):
+    """Optional hook for metrics/audit on each tool execution."""
+
+    def on_tool_executed(
+        self, name: str, execution_time_ms: int, success: bool, error: str | None = None,
+    ) -> None: ...
 
 
 class ToolRouter:
-    """Dispatches tool_calls to registered EdgeTools. Executes independent calls concurrently."""
+    """Dispatches tool_calls to registered Skills. Executes independent calls concurrently."""
 
-    def __init__(self) -> None:
-        self._tools: dict[str, EdgeTool] = {}
+    def __init__(self, hook: ExecutionHook | None = None) -> None:
+        self._tools: dict[str, Skill] = {}
+        self._hook = hook
 
-    def register(self, tool: EdgeTool) -> None:
+    def register(self, tool: Skill) -> None:
         self._tools[tool.name] = tool
 
-    def get_tool(self, name: str) -> EdgeTool | None:
+    def get_tool(self, name: str) -> Skill | None:
         return self._tools.get(name)
 
-    def list_tools(self) -> list[EdgeTool]:
+    def list_tools(self) -> list[Skill]:
         """Return all registered tools (public API for introspection)."""
         return list(self._tools.values())
 
@@ -57,13 +76,25 @@ class ToolRouter:
                 tool_call_id=tc.id, name=tc.name,
                 result=f"Unknown tool: {tc.name}", error=True,
             )
+        t0 = time.monotonic()
         try:
             result = await tool.execute(**tc.arguments)
-            return ToolResult(tool_call_id=tc.id, name=tc.name, result=result)
+            elapsed = int((time.monotonic() - t0) * 1000)
+            if self._hook:
+                self._hook.on_tool_executed(tc.name, elapsed, True)
+            return ToolResult(
+                tool_call_id=tc.id, name=tc.name, result=result,
+                execution_time_ms=elapsed,
+            )
         except Exception as e:
+            elapsed = int((time.monotonic() - t0) * 1000)
+            error_msg = f"Error: {type(e).__name__}: {e}"
+            if self._hook:
+                self._hook.on_tool_executed(tc.name, elapsed, False, error_msg)
             return ToolResult(
                 tool_call_id=tc.id, name=tc.name,
-                result=f"Error: {type(e).__name__}: {e}", error=True,
+                result=error_msg, error=True,
+                execution_time_ms=elapsed,
             )
 
     @staticmethod
