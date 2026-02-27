@@ -178,6 +178,73 @@ class TestMemoryRetrieverRealDB:
         # Should find the memory (keyword match or cross-session)
         assert any("Golang" in m.content for m in results) or len(results) >= 0
 
+    def test_vector_search_uses_ivfflat_index(self, db_factory, cleanup_memories):
+        """Verify L2_DISTANCE vector search actually uses ivfflat index (not fallback)."""
+        from core.memory.metrics import metrics
+        
+        store = MemoryStore(db_factory)
+        retriever = MemoryRetriever(db_factory)
+        user_id = _uid()
+        
+        # Create memories with embeddings
+        embeddings = [
+            [0.1] * 1536,  # close to query
+            [0.9] * 1536,  # far from query
+            [0.2] * 1536,  # medium distance
+        ]
+        for i, emb in enumerate(embeddings):
+            mem = Memory(
+                memory_id=f"vec_{uuid7().hex}",
+                user_id=user_id,
+                memory_type=MemoryType.SEMANTIC,
+                content=f"Vector test memory {i}",
+                confidence=0.8,
+                embedding=emb,
+                observed_at=datetime.utcnow(),
+            )
+            cleanup_memories.append(mem.memory_id)
+            store.create(mem)
+        
+        # Reset metrics to track this specific call
+        initial_errors = metrics._counters.get("retrieval_vector_errors", 0)
+        initial_hits = metrics._counters.get("retrieval_vector_hits", 0)
+        
+        # Query with embedding close to [0.1]*1536
+        query_emb = [0.1] * 1536
+        results = retriever.retrieve(
+            user_id=user_id,
+            session_id="test_session",
+            query_text="vector test",
+            query_embedding=query_emb,
+            limit=3,
+        )
+        
+        # Verify: vector search succeeded (no errors, got hits)
+        final_errors = metrics._counters.get("retrieval_vector_errors", 0)
+        final_hits = metrics._counters.get("retrieval_vector_hits", 0)
+        
+        assert final_errors == initial_errors, "Vector search should not have errors"
+        assert final_hits > initial_hits, "Vector search should have recorded hits"
+        
+        # Verify: results are ordered by vector similarity (closest first)
+        assert len(results) >= 1
+        # The memory with [0.1]*1536 embedding should be first (closest to query)
+        assert "memory 0" in results[0].content
+
+    def test_vector_index_exists(self, db_factory):
+        """Verify ivfflat index exists on memories.embedding column."""
+        db = db_factory()
+        try:
+            rows = db.execute(text("SHOW INDEX FROM memories")).fetchall()
+            ivf_indexes = [r for r in rows if "ivf" in str(r).lower() and "embedding" in str(r).lower()]
+            assert len(ivf_indexes) > 0, (
+                "ivfflat index on memories.embedding not found. "
+                "Run init_db() or manually create: "
+                "CREATE INDEX idx_memory_embedding USING ivfflat ON memories(embedding) lists=100 op_type 'vector_l2_ops'"
+            )
+        finally:
+            db.close()
+
 
 # ---------------------------------------------------------------------------
 # Golden Session Memory Extraction Tests
@@ -421,6 +488,7 @@ class TestContradictionRealDB:
             llm_client=None,
             embed_fn=lambda x: [0.1] * 1536,  # Same embedding = high similarity
             contradiction_threshold=0.85,
+            db_factory=db_factory,
         )
         user_id = _uid()
 

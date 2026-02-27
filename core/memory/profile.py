@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from core.memory.store import MemoryStore
@@ -53,8 +54,10 @@ class ProfileManager:
         if not memories:
             return _DEFAULT_PROFILE
 
-        # Sort by confidence (highest first), then by recency
-        memories.sort(key=lambda m: (-m.confidence, m.observed_at or 0), reverse=False)
+        # Sort by confidence (highest first), then by recency (newest first).
+        # observed_at may be None — treat as epoch 0 so they sort last.
+        _epoch = datetime(1970, 1, 1)
+        memories.sort(key=lambda m: (-m.confidence, -(m.observed_at or _epoch).timestamp()))
 
         lines = []
         total_chars = 0

@@ -108,6 +108,7 @@ class MemoryStore(DbConsumer):
             row = MemoryRecord(
                 memory_id=new_memory.memory_id,
                 user_id=new_memory.user_id,
+                session_id=new_memory.session_id,
                 memory_type=new_memory.memory_type.value,
                 content=new_memory.content,
                 confidence=new_memory.confidence,

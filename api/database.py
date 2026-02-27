@@ -1,5 +1,6 @@
 """Database connection and session management with SQLAlchemy."""
 
+import logging
 from contextlib import contextmanager
 from decimal import Decimal
 
@@ -8,6 +9,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from config.settings import get_settings
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -144,6 +146,22 @@ def init_db():
                         conn.execute(text(f"ALTER TABLE skills_registry ADD COLUMN {col} {ddl}"))
                     except Exception as e:
                         logger.warning("Migration: failed to add column %s: %s", col, e)
+
+    # Create IVF-flat vector index on memories.embedding for L2_DISTANCE queries.
+    # SQLAlchemy Index doesn't support USING ivfflat syntax, so we create it via raw DDL.
+    # MatrixOne doesn't support IF NOT EXISTS for CREATE INDEX, so check first.
+    if "memories" in existing or "memories" in {t.name for t in tables_to_create}:
+        try:
+            with engine.begin() as conn:
+                idx_rows = conn.execute(text("SHOW INDEX FROM memories")).fetchall()
+                has_vec_idx = any("idx_memory_embedding" in str(r) for r in idx_rows)
+                if not has_vec_idx:
+                    conn.execute(text(
+                        "CREATE INDEX idx_memory_embedding "
+                        "USING ivfflat ON memories(embedding) lists=100 op_type 'vector_l2_ops'"
+                    ))
+        except Exception as e:
+            logger.warning("Migration: failed to create vector index: %s", e)
 
 
 def _import_skill_models():

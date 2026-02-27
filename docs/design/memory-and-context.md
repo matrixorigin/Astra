@@ -9,13 +9,22 @@
 
 The new MatrixOne-native memory system is implemented in `core/memory/`:
 
+> **Architecture Note**: The design sections below describe a multi-table schema
+> (`knowledge_entries`, `knowledge_entry_sources`, `agent_scratchpad`) for
+> pedagogical clarity. The actual implementation uses a **unified `memories`
+> table** with a `memory_type` enum (`profile`/`episodic`/`semantic`/`procedural`/
+> `working`/`tool_result`) to distinguish all memory layers. This simplification
+> reduces JOIN complexity and lets all memory types share the same CRUD, vector
+> index, fulltext index, and governance lifecycle. The `MemoryRecord` model is
+> defined in `api/models/memory.py`.
+
 | Component | Status | Module |
 |-----------|--------|--------|
 | **Memory Types** | ✅ Implemented | `types.py` — MemoryType enum, Memory dataclass |
 | **Memory Store** | ✅ Implemented | `store.py` — CRUD + atomic supersede |
 | **Memory Model** | ✅ Implemented | `api/models/memory.py` — MemoryRecord with vector + fulltext |
 | **Hybrid Retriever** | ✅ Implemented | `retriever.py` — L2_DISTANCE + MATCH AGAINST + temporal + confidence |
-| **Typed Observer** | ✅ Implemented | `typed_observer.py` — typed extraction + contradiction detection |
+| **Typed Observer** | ✅ Implemented | `typed_observer.py` — typed extraction + DB-side contradiction detection (IVF-flat L2_DISTANCE, no fallback) |
 | **Typed Reflector** | ✅ Implemented | `typed_reflector.py` — episodic→semantic promotion |
 | **Profile Manager** | ✅ Implemented | `profile.py` — L0 profile synthesis + caching |
 | **Memory Sandbox** | ✅ Implemented | `sandbox.py` — zero-copy branch validation |
@@ -25,7 +34,7 @@ The new MatrixOne-native memory system is implemented in `core/memory/`:
 | **Metrics** | ✅ Implemented | `metrics.py` — latency/counter tracking, `/api/v1/evaluation/memory-metrics` |
 | **Session Isolation** | ✅ Implemented | `session_id` column, retriever supports session filtering |
 | **Tiered Loader** | ✅ Implemented | `tiered_loader.py` — L0+L1 for PromptAssembler |
-| **Pipeline** | ✅ Implemented | `typed_pipeline.py` — observe→sandbox→reflect |
+| **Pipeline** | ✅ Implemented | `typed_pipeline.py` — extract→sandbox→persist→reflect |
 | **Config** | ✅ Implemented | `config.py` — MemoryGovernanceConfig |
 
 ### MatrixOne-Native Capabilities Used
@@ -435,8 +444,8 @@ CREATE TABLE knowledge_entry_sources (
   INDEX idx_event (event_id)
 );
 
--- Vector index for semantic search
-CREATE INDEX idx_knowledge_vec USING HNSW ON knowledge_entries(embedding);
+-- Vector index for semantic search (IVF-flat, MatrixOne native)
+CREATE INDEX idx_knowledge_vec USING ivfflat ON knowledge_entries(embedding) lists=100 op_type "vector_l2_ops";
 -- Fulltext index for keyword search
 CREATE FULLTEXT INDEX idx_knowledge_ft ON knowledge_entries(value);
 ```
@@ -509,14 +518,29 @@ No single retrieval method works for all memory types:
 
 ### MatrixOne-Native Retrieval (No External Vector DB)
 
-**Critical design decision**: We do NOT use an external vector database. MatrixOne natively supports VECTOR type, IVF/HNSW indexes, fulltext search, and hybrid search. All memory retrieval happens in a single SQL query — no Pinecone, no Milvus, no sync headaches.
+**Critical design decision**: We do NOT use an external vector database. MatrixOne natively supports VECTOR type, IVF-flat indexes, fulltext search, and hybrid search. All memory retrieval happens in SQL — no Pinecone, no Milvus, no sync headaches.
+
+**Implementation** (`core/memory/retriever.py`): 3-phase hybrid retrieval:
+
+```
+Phase 1 (SQL): Keyword filter (MATCH in WHERE) + temporal/confidence scoring
+               Falls back to temporal/confidence only if no keyword matches.
+Phase 2 (SQL): L2_DISTANCE vector nearest-neighbor search (when embedding provided).
+               Over-fetches 2× limit for merge headroom.
+Phase 3 (App): Merge phase 1 + phase 2 candidates, re-rank by weighted 4-dim score:
+               vector_sim × w_vec + keyword_match × w_kw + temporal × w_time + confidence × w_conf
+```
+
+MO fulltext limitation: `MATCH() AGAINST()` can only be used in `WHERE` for filtering,
+not in `SELECT` for arithmetic scoring. So keyword is a binary signal (1.0 if matched,
+0.0 if not). The 4-dim merge happens application-side in `_merge_and_rerank()`.
 
 > **Note**: `sk_knowledge_entries` and `conversation_events` are both in the platform database. See [skill-as-package.md](skill-as-package.md) for the table naming convention.
 
 ```sql
 -- knowledge_entries stores embeddings directly
 ALTER TABLE knowledge_entries ADD COLUMN embedding VECF64(1536);
-CREATE INDEX idx_knowledge_vec USING HNSW ON knowledge_entries(embedding);
+CREATE INDEX idx_knowledge_vec USING ivfflat ON knowledge_entries(embedding) lists=100 op_type "vector_l2_ops";
 CREATE FULLTEXT INDEX idx_knowledge_ft ON knowledge_entries(value);
 
 -- conversation_events: NO embedding column. Events are pure fact records.
@@ -525,7 +549,7 @@ CREATE FULLTEXT INDEX idx_knowledge_ft ON knowledge_entries(value);
 ALTER TABLE conversation_events DROP COLUMN IF EXISTS embedding;
 
 -- event_embeddings: async-generated, separate table for vector search
--- Narrow table = better HNSW index cache hit rate
+-- Narrow table = better IVF-flat index cache hit rate
 -- Can be regenerated when embedding model changes
 CREATE TABLE IF NOT EXISTS event_embeddings (
     event_id VARCHAR(36) PRIMARY KEY,
@@ -534,7 +558,7 @@ CREATE TABLE IF NOT EXISTS event_embeddings (
     model_version VARCHAR(32),
     created_at DATETIME DEFAULT NOW()
 );
-CREATE INDEX idx_embeddings_vec USING HNSW ON event_embeddings(embedding);
+CREATE INDEX idx_embeddings_vec USING ivfflat ON event_embeddings(embedding) lists=100 op_type "vector_l2_ops";
 CREATE FULLTEXT INDEX idx_events_ft ON conversation_events(content);
 ```
 

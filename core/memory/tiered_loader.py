@@ -10,6 +10,7 @@ import logging
 from typing import Optional
 
 from core.db_consumer import DbFactory
+from core.memory.metrics import metrics
 from core.memory.profile import ProfileManager
 from core.memory.retriever import MemoryRetriever
 from core.memory.store import MemoryStore
@@ -36,6 +37,7 @@ class TieredMemoryLoader:
                 return True
             except Exception as e:
                 logger.debug("TieredMemoryLoader init failed: %s", e)
+                metrics.increment("tiered_loader_init_errors")
                 return False
         return True
 
@@ -47,6 +49,7 @@ class TieredMemoryLoader:
             return self._profile_mgr.get_profile(user_id)
         except Exception as e:
             logger.debug("L0 load failed: %s", e)
+            metrics.increment("tiered_loader_l0_errors")
             return ""
 
     def load_l1(
@@ -79,6 +82,7 @@ class TieredMemoryLoader:
             return "\n".join(lines)
         except Exception as e:
             logger.debug("L1 load failed: %s", e)
+            metrics.increment("tiered_loader_l1_errors")
             return ""
 
     def build_section(

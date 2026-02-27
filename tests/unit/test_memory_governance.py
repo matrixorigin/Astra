@@ -81,7 +81,8 @@ class TestGovernanceScheduler:
              patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}) as mock_poll, \
              patch.object(scheduler, "_cleanup_stale", return_value=3) as mock_stale, \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0) as mock_branches, \
-             patch.object(scheduler.health, "cleanup_snapshots", return_value=1) as mock_snaps:
+             patch.object(scheduler.health, "cleanup_snapshots", return_value=1) as mock_snaps, \
+             patch.object(scheduler, "_cleanup_tool_results", return_value=2) as mock_tool:
 
             result = scheduler.run_cycle("user123")
 
@@ -90,6 +91,7 @@ class TestGovernanceScheduler:
         assert result.cleaned_stale == 3
         assert result.cleaned_branches == 0
         assert result.cleaned_snapshots == 1
+        assert result.cleaned_tool_results == 2
         assert result.pollution_detected is False
         assert len(result.errors) == 0
 
@@ -99,6 +101,7 @@ class TestGovernanceScheduler:
         mock_stale.assert_called_once_with("user123")
         mock_branches.assert_called_once()
         mock_snaps.assert_called_once()
+        mock_tool.assert_called_once()
 
     def test_run_cycle_detects_pollution(self, mock_db_factory, config):
         """Cycle flags pollution when threshold exceeded."""
@@ -109,7 +112,8 @@ class TestGovernanceScheduler:
              patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": True, "ratio": 0.5}), \
              patch.object(scheduler, "_cleanup_stale", return_value=0), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
-             patch.object(scheduler.health, "cleanup_snapshots", return_value=0):
+             patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
+             patch.object(scheduler, "_cleanup_tool_results", return_value=0):
 
             result = scheduler.run_cycle("user123")
 
@@ -124,7 +128,8 @@ class TestGovernanceScheduler:
              patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
              patch.object(scheduler, "_cleanup_stale", return_value=2), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
-             patch.object(scheduler.health, "cleanup_snapshots", return_value=0):
+             patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
+             patch.object(scheduler, "_cleanup_tool_results", return_value=0):
 
             result = scheduler.run_cycle("user123")
 
@@ -143,7 +148,8 @@ class TestGovernanceScheduler:
              patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
              patch.object(scheduler, "_cleanup_stale", return_value=0), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
-             patch.object(scheduler.health, "cleanup_snapshots", return_value=0):
+             patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
+             patch.object(scheduler, "_cleanup_tool_results", return_value=0):
 
             scheduler.run_cycle("user1")
             scheduler.run_cycle("user2")

@@ -27,6 +27,7 @@ class GovernanceCycleResult:
     cleaned_stale: int = 0
     cleaned_branches: int = 0
     cleaned_snapshots: int = 0
+    cleaned_tool_results: int = 0
     pollution_detected: bool = False
     errors: list[str] = field(default_factory=list)
 
@@ -114,6 +115,13 @@ class GovernanceScheduler(DbConsumer):
             logger.error("Snapshot cleanup failed: %s", e)
             result.errors.append(f"cleanup_snapshots: {e}")
 
+        # 7. Cleanup expired TOOL_RESULT memories (TTL-based)
+        try:
+            result.cleaned_tool_results = self._cleanup_tool_results()
+        except Exception as e:
+            logger.error("Tool result cleanup failed: %s", e)
+            result.errors.append(f"cleanup_tool_results: {e}")
+
         self._last_cycle[user_id] = datetime.utcnow()
         return result
 
@@ -152,3 +160,25 @@ class GovernanceScheduler(DbConsumer):
             )
             db.commit()
             return result.rowcount
+
+    def _cleanup_tool_results(self) -> int:
+        """Delete TOOL_RESULT memories older than configured TTL.
+
+        Unlike other memory types, TOOL_RESULT has a hard TTL (default 24h)
+        independent of confidence decay. This prevents tool output accumulation.
+        """
+        ttl_hours = self.config.tool_result_ttl_hours
+        with self._db() as db:
+            result = db.execute(
+                text("""
+                    DELETE FROM memories
+                    WHERE memory_type = :mtype
+                      AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :ttl
+                """),
+                {"mtype": "tool_result", "ttl": ttl_hours},
+            )
+            db.commit()
+            count = result.rowcount
+            if count > 0:
+                logger.info("Cleaned %d expired TOOL_RESULT memories (TTL=%dh)", count, ttl_hours)
+            return count

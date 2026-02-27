@@ -1,17 +1,23 @@
 """Typed memory pipeline: TypedObserver → Sandbox → TypedReflector.
 
-Uses the new Memory model and tiered architecture.
+Pipeline phases:
+  Phase 1: Observer extracts candidate memories (NOT yet persisted)
+  Phase 2: Sandbox validates candidates in a zero-copy branch (optional)
+  Phase 3: Persist validated memories (rejected candidates are discarded)
+  Phase 4: Reflector promotes episodic clusters to semantic
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
 from core.db_consumer import DbFactory
 from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
+from core.memory.metrics import metrics
 from core.memory.store import MemoryStore
 from core.memory.typed_observer import TypedObserver
 from core.memory.typed_reflector import TypedReflector
@@ -42,20 +48,13 @@ def run_typed_memory_pipeline(
     config: Optional[MemoryGovernanceConfig] = None,
     query_for_sandbox: Optional[str] = None,
 ) -> TypedPipelineResult:
-    """Run typed memory pipeline: observe → (optional sandbox) → reflect.
+    """Run typed memory pipeline: extract → validate → persist → reflect.
 
-    Args:
-        db_factory: Database session factory
-        user_id: Target user
-        messages: Conversation messages to observe
-        source_event_ids: Event IDs that produced these messages
-        llm_client: LLM client for extraction
-        embed_fn: Embedding function
-        config: Governance config (uses DEFAULT_CONFIG if None)
-        query_for_sandbox: Query text for sandbox validation (if None, skip sandbox)
-
-    Returns:
-        Pipeline result with counts and profile_changed flag
+    Phase 1: Observer extracts candidate memories (returned, NOT stored).
+    Phase 2: Sandbox validates candidates in a branch (if query_for_sandbox provided).
+             Rejected candidates are discarded; validated ones proceed.
+    Phase 3: Persist validated memories via store (with contradiction check).
+    Phase 4: Reflector promotes episodic clusters to semantic.
     """
     if config is None:
         config = DEFAULT_CONFIG
@@ -64,38 +63,76 @@ def run_typed_memory_pipeline(
     store = MemoryStore(db_factory)
     profile_mgr = ProfileManager(store)
 
-    # Phase 1: Observer — extract typed memories
+    # Phase 1: Observer — extract candidate memories (NOT persisted yet)
+    candidates: list[Memory] = []
     try:
         observer = TypedObserver(
             store=store,
             llm_client=llm_client,
             embed_fn=embed_fn,
             contradiction_threshold=config.contradiction_similarity_threshold,
+            db_factory=db_factory,
         )
-        extracted = observer.observe(user_id, messages, source_event_ids)
-        result.memories_extracted = len(extracted)
-
-        # Check if profile changed
-        result.profile_changed = profile_mgr.update_from_memories(user_id, extracted)
-
+        candidates = observer.extract_candidates(user_id, messages, source_event_ids)
+        result.memories_extracted = len(candidates)
     except Exception as e:
         logger.error("Typed pipeline observer failed: %s", e)
         result.errors.append(f"observer: {e}")
         return result
 
+    if not candidates:
+        return result
+
     # Phase 2: Sandbox validation (optional, for configured types)
-    if query_for_sandbox and extracted:
+    validated = candidates  # default: all pass
+    if query_for_sandbox:
+        validated = []
         try:
             sandbox = MemorySandbox(db_factory)
-            for mem in extracted:
+            # Split into sandbox-eligible and pass-through
+            needs_validation = []
+            for mem in candidates:
                 if mem.memory_type.value in config.sandbox_enabled_types:
-                    # Already stored by observer, but we can validate retroactively
-                    # In production, sandbox would be called BEFORE store.create()
-                    result.memories_validated += 1
-        except Exception as e:
-            logger.warning("Sandbox validation skipped: %s", e)
+                    needs_validation.append(mem)
+                else:
+                    validated.append(mem)
 
-    # Phase 3: Reflector — promote episodic clusters to semantic
+            if needs_validation:
+                passed = sandbox.validate_memories(
+                    user_id=user_id,
+                    new_memories=needs_validation,
+                    query_text=query_for_sandbox,
+                    query_embedding=needs_validation[0].embedding,
+                )
+                if passed:
+                    validated.extend(needs_validation)
+                    result.memories_validated = len(needs_validation)
+                else:
+                    result.memories_rejected = len(needs_validation)
+                    logger.info(
+                        "Sandbox rejected %d memories for user %s",
+                        len(needs_validation), user_id,
+                    )
+            else:
+                validated = candidates
+        except Exception as e:
+            logger.warning("Sandbox validation failed, accepting all: %s", e)
+            metrics.increment("sandbox_validation_errors")
+            validated = candidates
+
+    # Phase 3: Persist validated memories (with contradiction check)
+    persisted: list[Memory] = []
+    for mem in validated:
+        try:
+            stored = observer.persist_with_contradiction_check(mem)
+            persisted.append(stored)
+        except Exception as e:
+            logger.warning("Failed to persist memory: %s", e)
+
+    # Check if profile changed
+    result.profile_changed = profile_mgr.update_from_memories(user_id, persisted)
+
+    # Phase 4: Reflector — promote episodic clusters to semantic
     try:
         reflector = TypedReflector(
             store=store,

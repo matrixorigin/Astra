@@ -1,6 +1,7 @@
 """MemorySandbox — write-ahead validation using MO zero-copy branch.
 
 Validates new memories in an isolated branch before committing to main table.
+All SQL uses parameterized queries — no f-string interpolation of user data.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from core.db_consumer import DbConsumer, DbFactory
+from core.memory.metrics import metrics
 from core.memory.types import Memory
 
 logger = logging.getLogger(__name__)
@@ -66,12 +68,14 @@ class MemorySandbox(DbConsumer):
 
         except Exception as e:
             logger.warning("Sandbox validation failed: %s", e)
+            metrics.increment("sandbox_validation_errors")
             return True  # Fail open: allow write if validation errors
 
         finally:
             self._drop_branch(branch_name)
 
     def _create_branch(self, branch_name: str) -> None:
+        # branch_name is internally generated (uuid hex), not user input — safe for DDL.
         with self._db() as db:
             db.execute(text(
                 f"data branch create table {branch_name} from memories"
@@ -79,28 +83,52 @@ class MemorySandbox(DbConsumer):
             db.commit()
 
     def _insert_to_branch(self, branch_name: str, memories: list[Memory]) -> None:
+        # branch_name is internally generated (uuid hex), safe for DDL.
+        # All user-controlled values go through parameterized :placeholders.
         with self._db() as db:
             for m in memories:
-                vec_str = (
-                    "[" + ",".join(str(v) for v in m.embedding) + "]"
-                    if m.embedding else "NULL"
-                )
-                source_ids = str(m.source_event_ids).replace("'", '"')
-                db.execute(text(f"""
-                    INSERT INTO {branch_name}
-                    (memory_id, user_id, memory_type, content, confidence,
-                     embedding, source_event_ids, is_active, observed_at)
-                    VALUES (:mid, :uid, :mtype, :content, :conf,
-                            {vec_str}, :sources, 1, :obs_at)
-                """), {
-                    "mid": m.memory_id,
-                    "uid": m.user_id,
-                    "mtype": m.memory_type.value,
-                    "content": m.content,
-                    "conf": m.confidence,
-                    "sources": source_ids,
-                    "obs_at": m.observed_at,
-                })
+                # Embedding: serialize to string for MO vector literal, or NULL.
+                # This is a numeric array we control (from embed_fn), not user text.
+                if m.embedding:
+                    vec_literal = "[" + ",".join(str(v) for v in m.embedding) + "]"
+                else:
+                    vec_literal = None
+
+                source_ids = str(m.source_event_ids).replace("'", '"') if m.source_event_ids else "[]"
+
+                if vec_literal:
+                    db.execute(text(f"""
+                        INSERT INTO {branch_name}
+                        (memory_id, user_id, memory_type, content, confidence,
+                         embedding, source_event_ids, is_active, observed_at)
+                        VALUES (:mid, :uid, :mtype, :content, :conf,
+                                :vec, :sources, 1, :obs_at)
+                    """), {
+                        "mid": m.memory_id,
+                        "uid": m.user_id,
+                        "mtype": m.memory_type.value,
+                        "content": m.content,
+                        "conf": m.confidence,
+                        "vec": vec_literal,
+                        "sources": source_ids,
+                        "obs_at": m.observed_at,
+                    })
+                else:
+                    db.execute(text(f"""
+                        INSERT INTO {branch_name}
+                        (memory_id, user_id, memory_type, content, confidence,
+                         source_event_ids, is_active, observed_at)
+                        VALUES (:mid, :uid, :mtype, :content, :conf,
+                                :sources, 1, :obs_at)
+                    """), {
+                        "mid": m.memory_id,
+                        "uid": m.user_id,
+                        "mtype": m.memory_type.value,
+                        "content": m.content,
+                        "conf": m.confidence,
+                        "sources": source_ids,
+                        "obs_at": m.observed_at,
+                    })
             db.commit()
 
     def _retrieval_score(
@@ -110,16 +138,20 @@ class MemorySandbox(DbConsumer):
         query_text: str,
         query_embedding: Optional[list[float]],
     ) -> float:
-        """Compute aggregate retrieval score for top-5 results."""
+        """Compute aggregate retrieval score for top-5 results.
+
+        table_name is internally generated (branch_name or literal "memories") — safe for DDL.
+        """
         with self._db() as db:
             if query_embedding:
+                # Vector literal from embed_fn (numeric array), passed as parameter.
                 vec_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
                 rows = db.execute(text(f"""
-                    SELECT (1.0 / (1.0 + L2_DISTANCE(embedding, '{vec_str}'))) AS sim
+                    SELECT (1.0 / (1.0 + L2_DISTANCE(embedding, :vec))) AS sim
                     FROM {table_name}
                     WHERE user_id = :uid AND is_active = 1
                     ORDER BY sim DESC LIMIT 5
-                """), {"uid": user_id}).fetchall()
+                """), {"uid": user_id, "vec": vec_str}).fetchall()
             else:
                 rows = db.execute(text(f"""
                     SELECT confidence AS sim

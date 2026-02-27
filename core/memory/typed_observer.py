@@ -2,6 +2,10 @@
 
 Replaces the old Observer (which extracted untyped Observations).
 Uses MemoryStore for persistence and contradiction resolution.
+
+Contradiction detection uses DB-side L2_DISTANCE with IVF-flat index.
+No in-memory fallback — at scale, loading all active memories into Python
+is not viable, and silently falling back would mask DB errors.
 """
 
 from __future__ import annotations
@@ -13,7 +17,9 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from core.db_consumer import DbConsumer, DbFactory
+from sqlalchemy import text
+
+from core.db_consumer import DbFactory
 from core.memory.prompts import OBSERVER_EXTRACTION_PROMPT
 from core.memory.store import MemoryStore
 from core.memory.types import Memory, MemoryType
@@ -22,23 +28,43 @@ logger = logging.getLogger(__name__)
 
 _VALID_TYPES = {t.value for t in MemoryType if t != MemoryType.WORKING}
 
+# L2_DISTANCE threshold corresponding to ~0.85 cosine similarity for normalized vectors.
+# For unit-norm vectors: L2² = 2(1 - cos_sim), so L2 = sqrt(2*(1-0.85)) ≈ 0.548.
+_DEFAULT_L2_THRESHOLD = 0.55
 
-def _parse_json_array(text: str) -> list[dict[str, Any]]:
+# SQL: find the single closest active memory of the same type with different content.
+# Uses DB-side L2_DISTANCE — accelerated by IVF-flat index on memories(embedding).
+# MatrixOne syntax: ORDER BY L2_DISTANCE(...) ASC LIMIT N triggers index scan.
+_CONTRADICTION_SQL = """\
+SELECT m.memory_id, m.content, m.confidence,
+    L2_DISTANCE(m.embedding, :query_vec) AS l2_dist
+FROM memories m
+WHERE m.user_id = :uid
+    AND m.is_active = 1
+    AND m.memory_type = :mtype
+    AND m.embedding IS NOT NULL
+    AND m.memory_id != :exclude_id
+ORDER BY l2_dist ASC
+LIMIT 1
+"""
+
+
+def _parse_json_array(text_str: str) -> list[dict[str, Any]]:
     """Robustly extract a JSON array from LLM output."""
-    text = text.strip()
+    text_str = text_str.strip()
     try:
-        result = json.loads(text)
+        result = json.loads(text_str)
         if isinstance(result, list):
             return result
     except json.JSONDecodeError:
         pass
-    m = re.search(r"```(?:json)?\s*(\[.*?])\s*```", text, re.DOTALL)
+    m = re.search(r"```(?:json)?\s*(\[.*?])\s*```", text_str, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-    m = re.search(r"\[.*]", text, re.DOTALL)
+    m = re.search(r"\[.*]", text_str, re.DOTALL)
     if m:
         try:
             return json.loads(m.group(0))
@@ -51,6 +77,10 @@ class TypedObserver:
     """Extract typed memories from conversation turns.
 
     Flow: LLM extraction → embed → contradiction detection → store.
+
+    Contradiction detection requires db_factory. Uses DB-side L2_DISTANCE
+    with IVF-flat index (ORDER BY L2_DISTANCE ASC LIMIT 1). No in-memory
+    fallback — at scale, loading all memories into Python is not viable.
     """
 
     def __init__(
@@ -59,11 +89,16 @@ class TypedObserver:
         llm_client: Any = None,
         embed_fn: Any = None,
         contradiction_threshold: float = 0.85,
+        db_factory: Optional[DbFactory] = None,
     ):
         self.store = store
         self.llm = llm_client
         self.embed_fn = embed_fn
         self.contradiction_threshold = contradiction_threshold
+        self._db_factory = db_factory
+        # Convert cosine threshold to L2 threshold for DB queries.
+        # For unit-norm vectors: L2 = sqrt(2 * (1 - cos_sim)).
+        self._l2_threshold = (2.0 * (1.0 - contradiction_threshold)) ** 0.5
 
     def observe(
         self,
@@ -71,7 +106,26 @@ class TypedObserver:
         messages: list[dict[str, Any]],
         source_event_ids: Optional[list[str]] = None,
     ) -> list[Memory]:
-        """Extract and persist typed memories from a conversation turn."""
+        """Extract and persist typed memories from a conversation turn.
+
+        Convenience method that calls extract_candidates + persist in one shot.
+        For pipeline use (where sandbox validation sits between extract and persist),
+        call extract_candidates() and persist_with_contradiction_check() separately.
+        """
+        candidates = self.extract_candidates(user_id, messages, source_event_ids)
+        return [self._store_with_contradiction_check(m) for m in candidates]
+
+    def extract_candidates(
+        self,
+        user_id: str,
+        messages: list[dict[str, Any]],
+        source_event_ids: Optional[list[str]] = None,
+    ) -> list[Memory]:
+        """Extract candidate memories WITHOUT persisting. Returns in-memory objects.
+
+        Used by the pipeline to separate extraction from storage, allowing
+        sandbox validation between the two steps.
+        """
         if not self.llm:
             return []
 
@@ -93,10 +147,13 @@ class TypedObserver:
                 except Exception as e:
                     logger.warning("Embedding failed: %s", e)
 
-            stored = self._store_with_contradiction_check(mem)
-            results.append(stored)
+            results.append(mem)
 
         return results
+
+    def persist_with_contradiction_check(self, mem: Memory) -> Memory:
+        """Persist a single memory with contradiction detection. Public API for pipeline."""
+        return self._store_with_contradiction_check(mem)
 
     def observe_explicit(
         self,
@@ -168,8 +225,7 @@ class TypedObserver:
     def _store_with_contradiction_check(self, mem: Memory) -> Memory:
         """Check for contradicting memory and supersede if found, else create."""
         if mem.embedding is not None:
-            existing = self.store.list_active(mem.user_id, mem.memory_type)
-            contradiction = self._find_contradiction(mem, existing)
+            contradiction = self._find_contradiction(mem)
             if contradiction:
                 logger.info(
                     "Contradiction detected: '%s' supersedes '%s'",
@@ -179,33 +235,40 @@ class TypedObserver:
 
         return self.store.create(mem)
 
-    def _find_contradiction(self, new: Memory, existing: list[Memory]) -> Optional[Memory]:
+    def _find_contradiction(self, new: Memory) -> Optional[Memory]:
         """Find an existing memory that contradicts the new one.
 
-        Heuristic: same type + high vector similarity + different content.
+        Uses DB-side L2_DISTANCE with IVF-flat index. Requires db_factory.
+        Skips contradiction detection when no embedding or no db_factory.
+        DB errors propagate — no silent fallback.
         """
-        if new.embedding is None:
+        if new.embedding is None or self._db_factory is None:
             return None
 
-        best_sim = 0.0
-        best_match: Optional[Memory] = None
+        vec_str = "[" + ",".join(str(v) for v in new.embedding) + "]"
+        db = self._db_factory()
+        try:
+            row = db.execute(
+                text(_CONTRADICTION_SQL),
+                {
+                    "query_vec": vec_str,
+                    "uid": new.user_id,
+                    "mtype": new.memory_type.value,
+                    "exclude_id": new.memory_id,
+                },
+            ).fetchone()
+        finally:
+            db.close()
 
-        for old in existing:
-            if old.embedding is None:
-                continue
-            sim = self._cosine_similarity(new.embedding, old.embedding)
-            if sim > self.contradiction_threshold and sim > best_sim:
-                if old.content.strip() != new.content.strip():
-                    best_sim = sim
-                    best_match = old
+        if row is None:
+            return None
 
-        return best_match
-
-    @staticmethod
-    def _cosine_similarity(a: list[float], b: list[float]) -> float:
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = sum(x * x for x in a) ** 0.5
-        norm_b = sum(x * x for x in b) ** 0.5
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
+        if float(row.l2_dist) <= self._l2_threshold and row.content.strip() != new.content.strip():
+            return Memory(
+                memory_id=row.memory_id,
+                user_id=new.user_id,
+                memory_type=new.memory_type,
+                content=row.content,
+                confidence=row.confidence,
+            )
+        return None

@@ -115,49 +115,54 @@ class TestTypedExtraction:
 # ---------------------------------------------------------------------------
 
 class TestContradictionDetection:
-    def test_contradiction_supersedes(self, observer, mock_llm, mock_store):
-        """'prefers tabs' then 'prefers spaces' → old superseded."""
-        # Existing memory with similar embedding
-        old_mem = Memory(
-            memory_id="old1", user_id="u1", memory_type=MemoryType.PROFILE,
-            content="prefers tabs", confidence=0.8,
-            embedding=[0.5] * 10,  # will have high similarity with same-type
-        )
-        mock_store.list_active.return_value = [old_mem]
+    def test_contradiction_supersedes(self, mock_llm, mock_store):
+        """'prefers tabs' then 'prefers spaces' → old superseded (DB-side)."""
+        mock_db = MagicMock()
+        mock_row = MagicMock()
+        mock_row.memory_id = "old1"
+        mock_row.content = "prefers tabs"
+        mock_row.confidence = 0.8
+        mock_row.l2_dist = 0.1  # Very close → contradiction
+        mock_db.execute.return_value.fetchone.return_value = mock_row
 
-        # New extraction
+        observer = TypedObserver(
+            store=mock_store, llm_client=mock_llm,
+            embed_fn=lambda t: [0.5] * 10,
+            contradiction_threshold=0.85,
+            db_factory=lambda: mock_db,
+        )
+
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "profile", "content": "prefers spaces", "confidence": 0.9},
         ])}
 
-        # Make embeddings nearly identical to trigger contradiction
-        def same_embed(text):
-            return [0.5] * 10
-
-        observer.embed_fn = same_embed
         results = observer.observe("u1", [{"role": "user", "content": "I prefer spaces"}])
 
         assert len(results) == 1
         mock_store.supersede.assert_called_once()
         assert mock_store.supersede.call_args[0][0] == "old1"
 
-    def test_non_contradiction_both_active(self, observer, mock_llm, mock_store):
-        """'likes Go' + 'likes Rust' → both active (different embeddings)."""
-        old_mem = Memory(
-            memory_id="old1", user_id="u1", memory_type=MemoryType.PROFILE,
-            content="likes Go", confidence=0.8,
-            embedding=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    def test_non_contradiction_both_active(self, mock_llm, mock_store):
+        """'likes Go' + 'likes Rust' → both active (distant vectors)."""
+        mock_db = MagicMock()
+        mock_row = MagicMock()
+        mock_row.memory_id = "old1"
+        mock_row.content = "likes Go"
+        mock_row.confidence = 0.8
+        mock_row.l2_dist = 5.0  # Very far → not a contradiction
+        mock_db.execute.return_value.fetchone.return_value = mock_row
+
+        observer = TypedObserver(
+            store=mock_store, llm_client=mock_llm,
+            embed_fn=lambda t: [0.0, 1.0] + [0.0] * 8,
+            contradiction_threshold=0.85,
+            db_factory=lambda: mock_db,
         )
-        mock_store.list_active.return_value = [old_mem]
 
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "profile", "content": "likes Rust", "confidence": 0.8},
         ])}
 
-        def different_embed(text):
-            return [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-
-        observer.embed_fn = different_embed
         results = observer.observe("u1", [{"role": "user", "content": "I also like Rust"}])
 
         assert len(results) == 1
@@ -185,13 +190,20 @@ class TestObserveExplicit:
         assert result.memory_type == MemoryType.SEMANTIC
         assert result.confidence == 0.9
 
-    def test_runs_contradiction_check(self, observer, mock_store):
-        old_mem = Memory(
-            memory_id="old1", user_id="u1", memory_type=MemoryType.PROFILE,
-            content="old fact", confidence=0.8, embedding=[0.5] * 10,
+    def test_runs_contradiction_check(self, mock_store):
+        mock_db = MagicMock()
+        mock_row = MagicMock()
+        mock_row.memory_id = "old1"
+        mock_row.content = "old fact"
+        mock_row.confidence = 0.8
+        mock_row.l2_dist = 0.1
+        mock_db.execute.return_value.fetchone.return_value = mock_row
+
+        observer = TypedObserver(
+            store=mock_store, llm_client=None,
+            embed_fn=lambda t: [0.5] * 10,
+            db_factory=lambda: mock_db,
         )
-        mock_store.list_active.return_value = [old_mem]
-        observer.embed_fn = lambda t: [0.5] * 10
 
         observer.observe_explicit("u1", "new fact", MemoryType.PROFILE)
         mock_store.supersede.assert_called_once()

@@ -66,44 +66,71 @@ class TestContradictionDetection:
     """Contradiction detection: 'prefers tabs' superseded by 'prefers spaces'."""
 
     def test_high_similarity_different_content_is_contradiction(self):
-        """High vector similarity + different content = contradiction."""
-        store = MagicMock()
-        observer = TypedObserver(store=store, llm_client=None, embed_fn=None)
+        """High vector similarity + different content = contradiction (DB-side)."""
+        mock_db = MagicMock()
+        mock_row = MagicMock()
+        mock_row.memory_id = "old1"
+        mock_row.content = "User prefers tabs"
+        mock_row.confidence = 0.8
+        mock_row.l2_dist = 0.1  # Very close → contradiction
+        mock_db.execute.return_value.fetchone.return_value = mock_row
 
-        old_mem = Memory(
-            memory_id="old1", user_id="u", memory_type=MemoryType.PROFILE,
-            content="User prefers tabs", confidence=0.8,
-            embedding=[0.1] * 768, observed_at=datetime.utcnow(),
+        store = MagicMock()
+        observer = TypedObserver(
+            store=store, llm_client=None, embed_fn=None,
+            db_factory=lambda: mock_db,
         )
+
         new_mem = Memory(
             memory_id="new1", user_id="u", memory_type=MemoryType.PROFILE,
             content="User prefers spaces", confidence=0.9,
-            embedding=[0.1] * 768,  # Same embedding = high similarity
+            embedding=[0.1] * 768,
             observed_at=datetime.utcnow(),
         )
 
-        # Same embedding = similarity 1.0 > threshold
-        contradiction = observer._find_contradiction(new_mem, [old_mem])
-        assert contradiction == old_mem
+        contradiction = observer._find_contradiction(new_mem)
+        assert contradiction is not None
+        assert contradiction.memory_id == "old1"
 
     def test_low_similarity_not_contradiction(self):
-        """Low vector similarity = not a contradiction."""
-        store = MagicMock()
-        observer = TypedObserver(store=store, llm_client=None, embed_fn=None)
+        """Distant vector match = not a contradiction (DB-side)."""
+        mock_db = MagicMock()
+        mock_row = MagicMock()
+        mock_row.memory_id = "go1"
+        mock_row.content = "User likes Go"
+        mock_row.confidence = 0.8
+        mock_row.l2_dist = 5.0  # Very far → not a contradiction
+        mock_db.execute.return_value.fetchone.return_value = mock_row
 
-        go_mem = Memory(
-            memory_id="go1", user_id="u", memory_type=MemoryType.PROFILE,
-            content="User likes Go", confidence=0.8,
-            embedding=[1.0] + [0.0] * 767, observed_at=datetime.utcnow(),
+        store = MagicMock()
+        observer = TypedObserver(
+            store=store, llm_client=None, embed_fn=None,
+            db_factory=lambda: mock_db,
         )
+
         rust_mem = Memory(
             memory_id="rust1", user_id="u", memory_type=MemoryType.PROFILE,
             content="User likes Rust", confidence=0.8,
-            embedding=[0.0] * 767 + [1.0],  # Orthogonal = low similarity
+            embedding=[0.0] * 767 + [1.0],
             observed_at=datetime.utcnow(),
         )
 
-        contradiction = observer._find_contradiction(rust_mem, [go_mem])
+        contradiction = observer._find_contradiction(rust_mem)
+        assert contradiction is None
+
+    def test_no_db_factory_skips_contradiction_detection(self):
+        """Without db_factory, contradiction detection is skipped (returns None)."""
+        store = MagicMock()
+        observer = TypedObserver(store=store, llm_client=None, embed_fn=None, db_factory=None)
+
+        new_mem = Memory(
+            memory_id="new1", user_id="u", memory_type=MemoryType.PROFILE,
+            content="User prefers spaces", confidence=0.9,
+            embedding=[0.1] * 768,
+            observed_at=datetime.utcnow(),
+        )
+
+        contradiction = observer._find_contradiction(new_mem)
         assert contradiction is None
 
 
