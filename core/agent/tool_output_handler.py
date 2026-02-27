@@ -235,17 +235,19 @@ def process_tool_output(
         return output
     
     # 1. Store full output in mo-trustmem
+    import uuid
+    from core.memory.types import Memory
     source_events = [turn_event_id] if turn_event_id else []
     try:
-        memory = memory_store.create(
+        mem_obj = Memory(
+            memory_id=uuid.uuid4().hex,
             user_id=user_id,
-            content=output,
             memory_type=MemoryType.TOOL_RESULT,
+            content=output,
             session_id=session_id,
-            source=f"tool:{tool_name}",
             source_event_ids=source_events,
-            metadata={"tool": tool_name, "size": len(output)},
         )
+        memory = memory_store.create(mem_obj)
     except Exception as e:
         # Fallback: truncate if mo-trustmem write fails
         record_tool_output(tool_name, len(output), threshold, was_summarized=True)
@@ -256,15 +258,6 @@ def process_tool_output(
     
     # 3. Store summary text for replay determinism (摘要也需要持久化)
     result = f"{summary}\n\n[Full output ({len(output)} bytes): memory:{memory.memory_id}]"
-    
-    # Update memory metadata with summary for replay
-    try:
-        memory_store.update_metadata(
-            memory.memory_id,
-            {"summary": summary, "summary_version": "v1.3"}
-        )
-    except Exception:
-        pass  # Non-critical for replay
     
     # 4. Record metrics
     record_tool_output(tool_name, len(output), len(result), was_summarized=True)
@@ -317,20 +310,16 @@ def find_similar_result(
     
     result = results[0]
     
-    # Verify same tool
-    if result.metadata.get("tool") != tool_name:
-        return None
-    
     # Staleness check: reject if too old
-    if result.created_at:
-        age = datetime.now() - result.created_at
+    ref_time = result.observed_at or result.created_at
+    if ref_time:
+        age = datetime.now() - ref_time
         if age > timedelta(seconds=max_age_seconds):
             return None
     
     # Check key param match (e.g., same grep pattern)
     if "pattern" in params:
-        old_content = result.content
-        if params["pattern"] not in old_content[:1000]:
+        if params["pattern"] not in result.content[:1000]:
             return None
     
     return f"[Reusing previous {tool_name} result: memory:{result.memory_id}]"

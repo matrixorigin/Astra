@@ -172,8 +172,7 @@ class SkillPipeline:
             try:
                 from core.context.embeddings import EmbeddingService
                 _svc = EmbeddingService(db_factory)
-                if _svc.provider != "mock":
-                    embed_fn = _svc.embed_text
+                embed_fn = _svc.embed_text
             except Exception:  # noqa: BLE001
                 pass  # no embeddings available — keyword fallback
 

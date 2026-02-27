@@ -84,9 +84,9 @@ class TestProcessToolOutput:
         
         # Should store
         mock_store.create.assert_called_once()
-        call_kwargs = mock_store.create.call_args[1]
-        assert call_kwargs["memory_type"] == MemoryType.TOOL_RESULT
-        assert call_kwargs["session_id"] == "sess1"
+        mem_arg = mock_store.create.call_args[0][0]
+        assert mem_arg.memory_type == MemoryType.TOOL_RESULT
+        assert mem_arg.session_id == "sess1"
         
         # Should return summary + reference
         assert "memory:mem_123" in result
@@ -100,8 +100,8 @@ class TestProcessToolOutput:
             turn_event_id="event_456"
         )
         
-        call_kwargs = mock_store.create.call_args[1]
-        assert "event_456" in call_kwargs["source_event_ids"]
+        mem_arg = mock_store.create.call_args[0][0]
+        assert "event_456" in mem_arg.source_event_ids
 
 
 class TestFindSimilarResult:
@@ -126,8 +126,8 @@ class TestFindSimilarResult:
         from datetime import datetime, timedelta
         mock_memory = MagicMock()
         mock_memory.memory_id = "mem_old"
-        mock_memory.metadata = {"tool": "grep"}
         mock_memory.content = "test pattern found in file.py"
+        mock_memory.observed_at = datetime.now() - timedelta(seconds=60)
         mock_memory.created_at = datetime.now() - timedelta(seconds=60)
         mock_retriever.retrieve.return_value = ([mock_memory], None)
         
@@ -138,14 +138,19 @@ class TestFindSimilarResult:
         assert "memory:mem_old" in result
         assert "Reusing" in result
 
-    def test_wrong_tool_returns_none(self, mock_retriever):
-        """Result from different tool returns None."""
+    def test_stale_result_returns_none(self, mock_retriever):
+        """Result older than max_age_seconds returns None."""
+        from datetime import datetime, timedelta
         mock_memory = MagicMock()
-        mock_memory.metadata = {"tool": "shell"}  # Different tool
+        mock_memory.memory_id = "mem_old"
+        mock_memory.content = "test pattern found"
+        mock_memory.observed_at = datetime.now() - timedelta(seconds=600)
+        mock_memory.created_at = datetime.now() - timedelta(seconds=600)
         mock_retriever.retrieve.return_value = ([mock_memory], None)
         
         result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,
+            max_age_seconds=300,
         )
         
         assert result is None
@@ -311,9 +316,9 @@ class TestStalenessCheck:
         
         mock_retriever = MagicMock()
         mock_memory = MagicMock()
-        mock_memory.metadata = {"tool": "grep"}
         mock_memory.content = "test pattern"
-        mock_memory.created_at = datetime.now() - timedelta(seconds=600)  # 10 min old
+        mock_memory.observed_at = datetime.now() - timedelta(seconds=600)  # 10 min old
+        mock_memory.created_at = datetime.now() - timedelta(seconds=600)
         mock_retriever.retrieve.return_value = ([mock_memory], None)
         
         result = find_similar_result(
@@ -331,9 +336,9 @@ class TestStalenessCheck:
         mock_retriever = MagicMock()
         mock_memory = MagicMock()
         mock_memory.memory_id = "mem_fresh"
-        mock_memory.metadata = {"tool": "grep"}
         mock_memory.content = "test pattern found"
-        mock_memory.created_at = datetime.now() - timedelta(seconds=60)  # 1 min old
+        mock_memory.observed_at = datetime.now() - timedelta(seconds=60)  # 1 min old
+        mock_memory.created_at = datetime.now() - timedelta(seconds=60)
         mock_retriever.retrieve.return_value = ([mock_memory], None)
         
         result = find_similar_result(

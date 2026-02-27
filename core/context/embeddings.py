@@ -51,41 +51,54 @@ class EmbeddingService(DbConsumer):
                     try:
                         from sqlalchemy import text
                         with self._db() as db:
-                            # Try openai first, then any available provider
-                            for prov in ("openai", None):
-                                if prov:
-                                    row = db.execute(
-                                        text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE AND provider=:provider ORDER BY created_at DESC LIMIT 1"),
-                                        {"provider": prov}
-                                    ).first()
-                                else:
-                                    row = db.execute(
-                                        text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
-                                    ).first()
-                                if row:
-                                    # Decrypt encrypted_value
-                                    encrypted_value = row[0]
-                                    api_key = decrypt_token(encrypted_value) if encrypted_value else None
-                                    actual_provider = row[1]
-                                    # Extract base_url from metadata
-                                    meta = row[2]
-                                    if meta:
-                                        import json as _json
-                                        try:
-                                            meta_dict = _json.loads(meta) if isinstance(meta, str) else meta
-                                            base_url = meta_dict.get("base_url")
-                                        except Exception:
-                                            pass
-                                    break
+                            # Try llm_models first (primary source), then tokens table (legacy)
+                            row = db.execute(
+                                text("SELECT api_key_encrypted, provider, base_url FROM llm_models WHERE is_active=1 ORDER BY created_at LIMIT 1")
+                            ).first()
+                            if row:
+                                api_key = decrypt_token(row[0]) if row[0] else None
+                                actual_provider = row[1]
+                                base_url = row[2]
+                            else:
+                                # Fallback: tokens table (legacy path)
+                                for prov in ("openai", None):
+                                    if prov:
+                                        row = db.execute(
+                                            text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE AND provider=:provider ORDER BY created_at DESC LIMIT 1"),
+                                            {"provider": prov}
+                                        ).first()
+                                    else:
+                                        row = db.execute(
+                                            text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
+                                        ).first()
+                                    if row:
+                                        encrypted_value = row[0]
+                                        api_key = decrypt_token(encrypted_value) if encrypted_value else None
+                                        actual_provider = row[1]
+                                        meta = row[2]
+                                        if meta:
+                                            import json as _json
+                                            try:
+                                                meta_dict = _json.loads(meta) if isinstance(meta, str) else meta
+                                                base_url = meta_dict.get("base_url")
+                                            except Exception:
+                                                pass
+                                        break
                     except Exception:
                         pass
                 # Providers that don't support OpenAI-compatible embeddings
-                _NO_EMBED = {"deepseek", "groq"}
-                if not api_key or actual_provider in _NO_EMBED:
-                    if actual_provider in _NO_EMBED:
-                        logger.info(f"Provider '{actual_provider}' does not support embeddings, using mock")
-                    else:
-                        logger.info("No embedding-capable API key found, using mock")
+                _NO_EMBED = {"groq"}
+                if not api_key:
+                    logger.info("No embedding-capable API key found, using mock")
+                    self.provider = "mock"
+                elif actual_provider in {"deepseek"}:
+                    # Deepseek doesn't support embeddings API — use mock (hash-based, deterministic).
+                    # Mock embeddings still enable the pipeline: contradiction detection works for
+                    # exact/near-exact duplicates, governance runs, memories get stored with embeddings.
+                    logger.info(f"Provider '{actual_provider}' does not support embeddings, using mock (pipeline still active)")
+                    self.provider = "mock"
+                elif actual_provider in _NO_EMBED:
+                    logger.info(f"Provider '{actual_provider}' does not support embeddings, using mock")
                     self.provider = "mock"
                 else:
                     kwargs = {"api_key": api_key}

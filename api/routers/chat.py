@@ -790,7 +790,7 @@ def _persist_turn_events(
     except Exception as e:
         logger.warning("Phase 1 (user_query) failed: %s", e)
 
-    # Phase 2: persist tool results from edge
+    # Phase 2: persist tool results from edge + backfill selection metrics
     try:
         if tool_results:
             for tr in tool_results:
@@ -805,6 +805,13 @@ def _persist_turn_events(
                     causal_chain_id=causal_chain_id,
                     metadata=meta,
                 )
+            # Backfill execution metrics on the most recent skill_selection_event
+            try:
+                from core.agent.turn_hooks import TurnHooks
+                _bh = TurnHooks(SessionLocal)
+                _bh.backfill_selection_metrics(session_id, tool_results)
+            except Exception:
+                pass
     except Exception as e:
         logger.warning("Phase 2 (tool_results) failed: %s", e)
 
@@ -847,7 +854,7 @@ def _persist_turn_events(
     # Phase 4: post-turn hooks (decision audit, skill selection, observer, feedback)
     try:
         from core.agent.turn_hooks import TurnHooks
-        hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client())
+        hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client(), embed_fn=_get_shared_embed_fn())
 
         if parent_event_id:
             hooks.record_decision_audit(
@@ -882,6 +889,7 @@ def _persist_turn_events(
 # Avoids constructing a new LLMClient per turn (expensive: DB queries + provider init).
 _shared_llm_client = None
 _shared_llm_lock = threading.Lock()
+_shared_embed_fn = _UNSET = object()
 
 
 def _get_shared_llm_client():
@@ -893,6 +901,21 @@ def _get_shared_llm_client():
                 from core.llm.client import LLMClient
                 _shared_llm_client = LLMClient(SessionLocal)
     return _shared_llm_client
+
+
+def _get_shared_embed_fn():
+    """Get or create a shared embed_fn for memory pipeline."""
+    global _shared_embed_fn
+    if _shared_embed_fn is _UNSET:
+        try:
+            from core.context.embeddings import EmbeddingService
+            svc = EmbeddingService(SessionLocal)
+            # Use embed_fn even for mock — enables contradiction detection
+            # and memory storage with embeddings for the full pipeline to work.
+            _shared_embed_fn = svc.embed_text
+        except Exception:
+            _shared_embed_fn = None
+    return _shared_embed_fn
 
 
 @router.post("/chat/turn")

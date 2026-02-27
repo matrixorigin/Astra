@@ -75,19 +75,20 @@ class TurnHooks(DbConsumer):
         session_id: str,
         user_content: str,
         tool_calls: list[dict[str, Any]],
-    ) -> None:
-        """Record skill selection event if tools were called."""
+    ) -> str | None:
+        """Record skill selection event if tools were called. Returns event_id."""
         tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
         if not tc_names:
-            return
+            return None
 
         from api.models import SkillSelectionEvent
         from uuid_utils import uuid7
 
+        event_id = str(uuid7())
         try:
             with self._db() as db:
                 db.add(SkillSelectionEvent(
-                    event_id=str(uuid7()),
+                    event_id=event_id,
                     session_id=session_id,
                     user_query=(user_content or "")[:2000],
                     selected_skills=tc_names,
@@ -95,8 +96,33 @@ class TurnHooks(DbConsumer):
                     selection_method="llm_tool_choice",
                 ))
                 db.commit()
+            return event_id
         except Exception as e:
             logger.debug("Skill selection event skipped: %s", e)
+            return None
+
+    def backfill_selection_metrics(
+        self,
+        session_id: str,
+        tool_calls: list[dict[str, Any]],
+        elapsed_ms: int | None = None,
+    ) -> None:
+        """Backfill execution metrics on the most recent skill_selection_event for this session."""
+        if not tool_calls:
+            return
+        try:
+            from sqlalchemy import text as sa_text
+            with self._db() as db:
+                db.execute(
+                    sa_text("""UPDATE skill_selection_events
+                               SET execution_time_ms = :t, execution_success = 1
+                               WHERE session_id = :sid AND execution_time_ms IS NULL
+                               ORDER BY created_at DESC LIMIT 1"""),
+                    {"t": elapsed_ms or 0, "sid": session_id},
+                )
+                db.commit()
+        except Exception as e:
+            logger.debug("Backfill selection metrics skipped: %s", e)
 
     # ── Observer ──────────────────────────────────────────────────────
 
