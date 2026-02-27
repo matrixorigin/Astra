@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import text
@@ -95,14 +96,15 @@ class MemorySandbox(DbConsumer):
                     vec_literal = None
 
                 source_ids = str(m.source_event_ids).replace("'", '"') if m.source_event_ids else "[]"
+                now = m.observed_at or datetime.utcnow()
 
                 if vec_literal:
                     db.execute(text(f"""
                         INSERT INTO {branch_name}
                         (memory_id, user_id, memory_type, content, confidence,
-                         embedding, source_event_ids, is_active, observed_at)
+                         embedding, source_event_ids, is_active, observed_at, created_at)
                         VALUES (:mid, :uid, :mtype, :content, :conf,
-                                :vec, :sources, 1, :obs_at)
+                                :vec, :sources, 1, :obs_at, :created_at)
                     """), {
                         "mid": m.memory_id,
                         "uid": m.user_id,
@@ -111,15 +113,16 @@ class MemorySandbox(DbConsumer):
                         "conf": m.confidence,
                         "vec": vec_literal,
                         "sources": source_ids,
-                        "obs_at": m.observed_at,
+                        "obs_at": now,
+                        "created_at": now,
                     })
                 else:
                     db.execute(text(f"""
                         INSERT INTO {branch_name}
                         (memory_id, user_id, memory_type, content, confidence,
-                         source_event_ids, is_active, observed_at)
+                         source_event_ids, is_active, observed_at, created_at)
                         VALUES (:mid, :uid, :mtype, :content, :conf,
-                                :sources, 1, :obs_at)
+                                :sources, 1, :obs_at, :created_at)
                     """), {
                         "mid": m.memory_id,
                         "uid": m.user_id,
@@ -127,7 +130,8 @@ class MemorySandbox(DbConsumer):
                         "content": m.content,
                         "conf": m.confidence,
                         "sources": source_ids,
-                        "obs_at": m.observed_at,
+                        "obs_at": now,
+                        "created_at": now,
                     })
             db.commit()
 

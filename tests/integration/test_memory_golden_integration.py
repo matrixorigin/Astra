@@ -377,24 +377,29 @@ class TestSandboxRealDB:
     """MemorySandbox with real MatrixOne database."""
 
     def test_branch_create_and_delete(self, db_factory, cleanup_memories):
-        """Branch operations work with real DB."""
+        """Branch operations work with real DB — verify NOT fallback."""
         from core.memory.sandbox import MemorySandbox
+        from core.memory.metrics import metrics
 
         store = MemoryStore(db_factory)
-        sandbox = MemorySandbox(db_factory, db_name="dev_agent")
+        sandbox = MemorySandbox(db_factory, db_name="test_dev_agent_v3")
         user_id = _uid()
 
-        # Create base memory
+        # Create base memory with embedding for vector comparison
         mem = Memory(
             memory_id=f"base_{uuid7().hex}",
             user_id=user_id,
             memory_type=MemoryType.PROFILE,
             content="Base memory for sandbox test",
             confidence=0.8,
+            embedding=[0.5] * 1536,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
+
+        # Track error counter BEFORE
+        initial_errors = metrics._counters.get("sandbox_validation_errors", 0)
 
         # Validate new memories (should create/delete branch internally)
         new_mem = Memory(
@@ -403,6 +408,7 @@ class TestSandboxRealDB:
             memory_type=MemoryType.EPISODIC,
             content="New memory to validate",
             confidence=0.7,
+            embedding=[0.5] * 1536,
             observed_at=datetime.utcnow(),
         )
 
@@ -410,9 +416,18 @@ class TestSandboxRealDB:
             user_id=user_id,
             new_memories=[new_mem],
             query_text="test query",
+            query_embedding=[0.5] * 1536,
         )
 
-        # Should return True (fail-open on validation)
+        # Track error counter AFTER
+        final_errors = metrics._counters.get("sandbox_validation_errors", 0)
+
+        # Key assertion: error counter should NOT have increased (not fallback)
+        assert final_errors == initial_errors, (
+            f"Sandbox validation should succeed without fallback. "
+            f"Errors before={initial_errors}, after={final_errors}"
+        )
+        # Result should be True (new memory improves or maintains quality)
         assert result is True
 
 
