@@ -1,4 +1,4 @@
-"""Integration tests for unified model management (llm_models table)."""
+"""Integration tests for unified model management (infra_llm_models table)."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,10 +23,10 @@ def client(db_session):
 
 @pytest.fixture
 def clean_models(db_session):
-    db_session.execute(text("DELETE FROM llm_models"))
+    db_session.execute(text("DELETE FROM infra_llm_models"))
     db_session.commit()
     yield
-    db_session.execute(text("DELETE FROM llm_models"))
+    db_session.execute(text("DELETE FROM infra_llm_models"))
     db_session.commit()
 
 

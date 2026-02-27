@@ -86,7 +86,7 @@ class TestBuildSection:
 
     def test_explain_returns_stats(self, loader):
         loader.load_l0 = MagicMock(return_value="profile")
-        loader.load_l1 = MagicMock(return_value=("memories", None))
+        loader.load_l1 = MagicMock(return_value=("mem_memories", None))
         _, stats = loader.build_section("u1", "s1", "query", explain=True)
         assert stats is not None
         assert stats.l0_loaded is True

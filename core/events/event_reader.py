@@ -80,7 +80,7 @@ class EventReader(DbConsumer):
             Optional[ConversationEvent]: Event if found, None otherwise
         """
         with self._db() as db:
-            query = text("SELECT * FROM conversation_events WHERE event_id = :event_id")
+            query = text("SELECT * FROM agent_events WHERE event_id = :event_id")
             result = db.execute(query, {"event_id": event_id})
             row = result.fetchone()
         
@@ -111,7 +111,7 @@ class EventReader(DbConsumer):
             """
 
             sql = f"""
-                SELECT {columns} FROM conversation_events
+                SELECT {columns} FROM agent_events
                 WHERE session_id = :session_id
                 ORDER BY created_at DESC
             """
@@ -141,7 +141,7 @@ class EventReader(DbConsumer):
             """
 
             sql = f"""
-                SELECT {columns} FROM conversation_events
+                SELECT {columns} FROM agent_events
                 WHERE user_id = :user_id
                 ORDER BY created_at DESC
             """
@@ -164,7 +164,7 @@ class EventReader(DbConsumer):
         """
         with self._db() as db:
             query = text("""
-                SELECT * FROM conversation_events
+                SELECT * FROM agent_events
                 WHERE causal_chain_id = :causal_chain_id
                 ORDER BY created_at ASC
             """)

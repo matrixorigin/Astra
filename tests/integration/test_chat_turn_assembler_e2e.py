@@ -481,7 +481,7 @@ class TestIntrospectionAuditLogging:
         flush_persist_threads()
         row = db_session.execute(
             sql_text("""
-                SELECT metadata FROM conversation_events
+                SELECT metadata FROM agent_events
                 WHERE event_type = 'tool_result'
                 AND content LIKE '%get_agent_info%'
                 ORDER BY created_at DESC LIMIT 1
@@ -512,7 +512,7 @@ class TestIntrospectionAuditLogging:
         flush_persist_threads()
         row = db_session.execute(
             sql_text("""
-                SELECT metadata FROM conversation_events
+                SELECT metadata FROM agent_events
                 WHERE event_type = 'tool_result'
                 AND content LIKE '%bash%'
                 ORDER BY created_at DESC LIMIT 1
@@ -627,14 +627,14 @@ class TestIntrospectionMemoryEndpoint:
         session_id = unique_test_id()
 
         user_row = db_session.execute(sql_text(
-            "SELECT user_id FROM users WHERE username = 'assembler_test_user'"
+            "SELECT user_id FROM auth_users WHERE username = 'assembler_test_user'"
         )).fetchone()
         assert user_row, "Test user should exist"
         user_id = user_row[0]
 
         # Create session
         db_session.execute(sql_text("""
-            INSERT INTO sessions (session_id, user_id, agent_id, status, event_count, created_at, last_active_at)
+            INSERT INTO agent_sessions (session_id, user_id, agent_id, status, event_count, created_at, last_active_at)
             VALUES (:sid, :uid, 'test', 'active', 0, NOW(), NOW())
         """), {"sid": session_id, "uid": user_id})
         db_session.commit()
@@ -649,11 +649,11 @@ class TestIntrospectionMemoryEndpoint:
 
             # Verify structure AND values for empty session
             assert data["episodic"] == {"total_events": 0, "user_queries": 0, "tool_calls": 0}
-            assert data["semantic"] == {"context_snapshots": 0, "peak_snapshot_tokens": 0}
+            assert data["semantic"] == {"ctx_snapshots": 0, "peak_snapshot_tokens": 0}
             assert data["procedural"]["skill_selections"] == 0
             assert data["procedural"]["accuracy_rate"] is None
         finally:
-            db_session.execute(sql_text("DELETE FROM sessions WHERE session_id = :sid"), {"sid": session_id})
+            db_session.execute(sql_text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": session_id})
             db_session.commit()
 
     def test_rejects_other_users_session(self, client, auth_headers):
@@ -675,14 +675,14 @@ class TestIntrospectionMemoryEndpoint:
 # ============================================================================
 
 class TestTurnHooksE2E:
-    """Verify /chat/turn writes decision_audit and skill_selection_events rows.
+    """Verify /chat/turn writes ctx_decision_audits and skill_selection_events rows.
 
     Hook writes happen inside _persist_turn_events which runs in a background
     thread (Task 5).  A short sleep is needed before DB assertions.
     """
 
     def test_tool_call_turn_writes_audit_and_selection(self, client, auth_headers, db_session):
-        """A turn with tool_calls should produce both decision_audit and skill_selection_events rows."""
+        """A turn with tool_calls should produce both ctx_decision_audits and skill_selection_events rows."""
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=fake_stream([
             {"type": "text", "content": "Let me check."},
             {"type": "tool_call", "data": {"id": "tc_1", "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}},
@@ -703,12 +703,12 @@ class TestTurnHooksE2E:
 
         flush_persist_threads()
 
-        # decision_audit: tool_selection
+        # ctx_decision_audits: tool_selection
         audit_row = db_session.execute(
-            sql_text("SELECT decision_type FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
+            sql_text("SELECT decision_type FROM ctx_decision_audits WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
             {"sid": sid},
         ).fetchone()
-        assert audit_row is not None, "decision_audit row should exist"
+        assert audit_row is not None, "ctx_decision_audits row should exist"
         assert audit_row[0] == "tool_selection"
 
         # skill_selection_events
@@ -721,7 +721,7 @@ class TestTurnHooksE2E:
         assert sse_row[1] == "llm_tool_choice"
 
     def test_plain_text_turn_writes_response_generation_audit(self, client, auth_headers, db_session):
-        """A turn without tool_calls should write decision_audit with type=response_generation."""
+        """A turn without tool_calls should write ctx_decision_audits with type=response_generation."""
         with patch("core.llm.client.LLMClient.chat_stream", return_value=fake_stream([
             {"type": "text", "content": "Hello!"},
         ])):
@@ -738,10 +738,10 @@ class TestTurnHooksE2E:
 
         flush_persist_threads()
         row = db_session.execute(
-            sql_text("SELECT decision_type FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
+            sql_text("SELECT decision_type FROM ctx_decision_audits WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"),
             {"sid": sid},
         ).fetchone()
-        assert row is not None, "decision_audit should exist for plain text responses"
+        assert row is not None, "ctx_decision_audits should exist for plain text responses"
         assert row[0] == "response_generation"
 
 
@@ -753,7 +753,7 @@ class TestToolCallStartPersistence:
     """Verify /chat/turn persists tool_call events to DB for recovery."""
 
     def test_tool_call_persisted(self, client, auth_headers, db_session):
-        """After a turn with tool_calls, tool_call events exist in conversation_events."""
+        """After a turn with tool_calls, tool_call events exist in agent_events."""
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=fake_stream([
             {"type": "text", "content": "Running."},
             {"type": "tool_call", "data": {"id": "tc_persist", "function": {"name": "bash", "arguments": '{"cmd":"ls"}'}}},
@@ -775,7 +775,7 @@ class TestToolCallStartPersistence:
         flush_persist_threads()
         row = db_session.execute(
             sql_text("""
-                SELECT content, metadata FROM conversation_events
+                SELECT content, metadata FROM agent_events
                 WHERE session_id = :sid AND event_type = 'tool_call'
                 ORDER BY created_at DESC LIMIT 1
             """),
@@ -812,7 +812,7 @@ class TestToolCallStartPersistence:
         flush_persist_threads()
         row = db_session.execute(
             sql_text("""
-                SELECT metadata FROM conversation_events
+                SELECT metadata FROM agent_events
                 WHERE session_id = :sid AND event_type = 'tool_result'
                 ORDER BY created_at DESC LIMIT 1
             """),

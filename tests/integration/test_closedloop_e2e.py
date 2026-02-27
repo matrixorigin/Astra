@@ -44,7 +44,7 @@ def _seed_llm_events(db: Session, agent_id: str, n: int = 10, quality: float = 4
         eid = generate_id()
         ts = datetime.now() - timedelta(days=i % 7)
         db.execute(text("""
-            INSERT INTO conversation_events
+            INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, quality_score, `metadata`,
                  causal_chain_id, created_at)
@@ -554,7 +554,7 @@ class TestSLOWeeklyGovernance:
                 assert hasattr(s, "burn_rate")
         finally:
             db_session.execute(
-                text("DELETE FROM conversation_events WHERE agent_id = 'slo_test_agent'")
+                text("DELETE FROM agent_events WHERE agent_id = 'slo_test_agent'")
             )
             db_session.commit()
 
@@ -748,7 +748,7 @@ class TestGovernanceTaskRunnerIntegration:
 
         # Lock must be released after run
         lock_row = db_session.execute(
-            text("SELECT * FROM distributed_locks WHERE lock_name = 'governance_eval_daily'")
+            text("SELECT * FROM infra_distributed_locks WHERE lock_name = 'governance_eval_daily'")
         ).first()
         assert lock_row is None, "Lock must be released after successful run"
 
@@ -778,7 +778,7 @@ class TestGovernanceTaskRunnerIntegration:
             assert result is None  # Skipped because lock is held
         finally:
             db_session.execute(
-                text("DELETE FROM distributed_locks WHERE lock_name = 'governance_eval_daily'")
+                text("DELETE FROM infra_distributed_locks WHERE lock_name = 'governance_eval_daily'")
             )
             db_session.commit()
 
@@ -814,7 +814,7 @@ class TestGovernanceTaskRunnerIntegration:
             assert result["drift_signals"] == 0
         finally:
             db_session.execute(
-                text("DELETE FROM distributed_locks WHERE lock_name = 'governance_eval_daily'")
+                text("DELETE FROM infra_distributed_locks WHERE lock_name = 'governance_eval_daily'")
             )
             db_session.commit()
 

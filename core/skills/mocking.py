@@ -215,7 +215,7 @@ class ToolMockingLayer(DbConsumer):
         expected_version: str | None = None,
     ) -> Any | None:
         """
-        Query recorded skill result from conversation_events.
+        Query recorded skill result from agent_events.
 
         Lookup strategy:
         1. If parent_event_id provided, find exact event (RECOMMENDED for concurrency safety)
@@ -327,7 +327,7 @@ class ToolMockingLayer(DbConsumer):
         skill_version: str | None = None,
     ) -> None:
         """
-        Record skill result in conversation_events metadata.
+        Record skill result in agent_events metadata.
 
         Note: This assumes the event already exists (created by EventLogger).
         We only UPDATE the metadata with skill_result.

@@ -3,13 +3,14 @@
 from api.base import Base  # noqa: F401
 
 # auth
-from api.models.auth import RefreshToken, Role, User, UserRole  # noqa: F401
+from api.models.auth import AuditLog, RefreshToken, Role, Token, User, UserRole  # noqa: F401
 
-# agent / session / event
+# agent / session / event / run
 from api.models.agent import (  # noqa: F401
     Agent,
     AgentScratchpad,
     Event,
+    RunEvent,
     Session,
 )
 
@@ -25,17 +26,17 @@ from api.models.skill import (  # noqa: F401
     SkillRegistry,
     SkillSelectionEvent,
     SkillSelectionLearning,
-    UserCredential,
+    SkillUserCredential,
 )
+
+# Keep backward-compat alias
+UserCredential = SkillUserCredential
 
 # evaluation / quality / feedback / training
 from api.models.evaluation import (  # noqa: F401
-    AdversarialAttack,
     GateResult,
     LLMCallLog,
     LLMFeedback,
-    ModelArtifact,
-    ModelQualityMetric,
     QualityAssessment,
     TrainingData,
     UserFeedback,
@@ -53,21 +54,19 @@ from api.models.context import (  # noqa: F401
 # verification
 from api.models.verification import ClaimEvidence, HallucinationCheck  # noqa: F401
 
-# workflow / run / trigger
-from api.models.workflow import RunEvent, Trigger, WorkflowDefinition, WorkflowRun  # noqa: F401
+# workflow / trigger
+from api.models.workflow import Trigger, WorkflowDefinition, WorkflowRun  # noqa: F401
 
 # infra
 from api.models.infra import (  # noqa: F401
-    AuditLog,
     Config,
     DistributedLock,
     LLMModel,
     Repo,
     SandboxMetadata,
-    Token,
 )
 
-# Re-exports from skill knowledge models (kept from original models.py)
+# Re-exports from skill knowledge models
 from skills.knowledge.models import SkKnowledgeEntry as KnowledgeEntry  # noqa: F401
 from skills.knowledge.models import SkKnowledgeEntrySource as KnowledgeEntrySource  # noqa: F401
 from skills.knowledge.models import SkKnowledgeRelation as KnowledgeRelation  # noqa: F401

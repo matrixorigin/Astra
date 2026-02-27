@@ -89,7 +89,7 @@ def _ensure_session(db: Session, user_id: str, session_id: str | None, agent_id:
     """Return existing session_id or create a new one."""
     if session_id:
         row = db.execute(
-            text("SELECT session_id FROM sessions WHERE session_id = :sid"),
+            text("SELECT session_id FROM agent_sessions WHERE session_id = :sid"),
             {"sid": session_id},
         ).first()
         if not row:
@@ -262,7 +262,7 @@ async def chat_stream(
         yield f"data: {json.dumps({'event_type': 'session_info', 'data': {'session_id': session_id, 'run_id': run.run_id}})}\n\n"
 
         try:
-            async for event in engine.stream_run_events(run.run_id):
+            async for event in engine.stream_agent_run_events(run.run_id):
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
@@ -290,7 +290,7 @@ async def get_run_status(
     if run.user_id != current_user["user_id"]:
         raise HTTPException(status_code=403, detail="Not authorized to view this run")
 
-    events = engine.get_run_events(run_id)
+    events = engine.get_agent_run_events(run_id)
     return RunStatusResponse(
         run_id=run.run_id,
         session_id=run.session_id,
@@ -315,7 +315,7 @@ async def stream_run(
         raise HTTPException(status_code=403, detail="Not authorized to view this run")
 
     async def event_generator():
-        async for event in engine.stream_run_events(run_id, last_index=last_index):
+        async for event in engine.stream_agent_run_events(run_id, last_index=last_index):
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(
@@ -681,7 +681,7 @@ def _recover_history_from_db(
     try:
         snap_row = db.execute(
             text("""
-                SELECT content, created_at FROM conversation_events
+                SELECT content, created_at FROM agent_events
                 WHERE session_id = :sid AND event_type = 'session_history_snapshot'
                 ORDER BY created_at DESC LIMIT 1
             """),
@@ -710,7 +710,7 @@ def _recover_history_from_db(
                 if snap_ts:
                     post_rows = db.execute(
                         text(f"""
-                            SELECT event_type, content, metadata FROM conversation_events
+                            SELECT event_type, content, metadata FROM agent_events
                             WHERE session_id = :sid
                               AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result')
                               AND created_at > :snap_ts
@@ -729,7 +729,7 @@ def _recover_history_from_db(
     try:
         rows = db.execute(
             text(f"""
-                SELECT event_type, content, metadata FROM conversation_events
+                SELECT event_type, content, metadata FROM agent_events
                 WHERE session_id = :sid
                   AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result')
                 ORDER BY created_at ASC LIMIT {_MAX_RECOVERY_EVENTS}
@@ -866,7 +866,7 @@ def _persist_turn_events(
         hooks = TurnHooks(SessionLocal, llm_client=_get_shared_llm_client(), embed_fn=_get_shared_embed_fn())
 
         if parent_event_id:
-            hooks.record_decision_audit(
+            hooks.record_ctx_decision_audits(
                 session_id, parent_event_id, tool_calls, full_text,
                 context_capture_id, model_used=model_used,
             )

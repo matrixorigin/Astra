@@ -123,7 +123,7 @@ _registry.register("submit_job", _execute_submit_job, _SUBMIT_JOB_SCHEMA)
 # ── Built-in: submit_workflow ──
 
 async def _execute_submit_workflow(params: dict[str, Any], run_id: str | None = None) -> dict:
-    """Submit a workflow. Persists to workflow_definitions + workflow_runs tables."""
+    """Submit a workflow. Persists to wf_definitions + wf_runs tables."""
     import asyncio as _aio
     from uuid import uuid4
 
@@ -142,10 +142,10 @@ async def _execute_submit_workflow(params: dict[str, Any], run_id: str | None = 
     _persist_workflow_start(wf_id, workflow, initial_inputs, run_id)
 
     # In-memory state for resume
-    _workflow_runs[wf_id] = {"workflow": workflow, "engine": WorkflowEngine(wf_run_id=wf_id), "wf_run": None}
+    _wf_runs[wf_id] = {"workflow": workflow, "engine": WorkflowEngine(wf_run_id=wf_id), "wf_run": None}
 
     async def _run_then_resolve() -> None:
-        entry = _workflow_runs[wf_id]
+        entry = _wf_runs[wf_id]
         engine = entry["engine"]
         try:
             wf_run = await engine.execute(workflow, initial_inputs=initial_inputs)
@@ -173,7 +173,7 @@ async def _execute_submit_workflow(params: dict[str, Any], run_id: str | None = 
 
 
 # Workflow state for resume
-_workflow_runs: dict[str, dict] = {}  # wf_id → {workflow, engine, wf_run}
+_wf_runs: dict[str, dict] = {}  # wf_id → {workflow, engine, wf_run}
 _workflow_waits: dict[str, str] = {}  # inner_handle → wf_id
 
 
@@ -188,14 +188,14 @@ async def resume_workflow(inner_handle: str, event_result: dict) -> bool:
     if not wf_id:
         return False
 
-    entry = _workflow_runs.get(wf_id)
+    entry = _wf_runs.get(wf_id)
 
     # DB fallback: workflow might be on another worker — restore it
     if not entry or not entry.get("wf_run"):
         entry = _restore_workflow_entry(wf_id)
         if not entry:
             return False
-        _workflow_runs[wf_id] = entry
+        _wf_runs[wf_id] = entry
 
     engine = entry["engine"]
     workflow = entry["workflow"]
@@ -295,7 +295,7 @@ def _resolve_workflow(wf_id: str, result: dict) -> None:
             from api.database import SessionLocal
             await RunEngine(SessionLocal).resume_run(waiting_run_id, result)
         _aio.create_task(_do_resume())
-    _workflow_runs.pop(wf_id, None)
+    _wf_runs.pop(wf_id, None)
 
 
 async def cleanup_stale_workflows(max_age_hours: int = 24) -> int:
@@ -322,7 +322,7 @@ async def cleanup_stale_workflows(max_age_hours: int = 24) -> int:
                 row.error = f"Timed out after {max_age_hours}h"
                 row.completed_at = datetime.now(timezone.utc)
                 # Clean in-memory state
-                _workflow_runs.pop(row.run_id, None)
+                _wf_runs.pop(row.run_id, None)
                 if row.waiting_for:
                     _workflow_waits.pop(row.waiting_for, None)
                 count += 1
@@ -338,7 +338,7 @@ async def cleanup_stale_workflows(max_age_hours: int = 24) -> int:
 
 
 def _persist_workflow_state(wf_id: str, wf_run) -> None:
-    """Update workflow_runs table with current state."""
+    """Update wf_runs table with current state."""
     try:
         from api.database import get_db_session
         from api.models import WorkflowRun as WFRunModel
@@ -363,7 +363,7 @@ def _persist_workflow_state(wf_id: str, wf_run) -> None:
 
 
 def _persist_workflow_start(wf_id: str, workflow, initial_inputs: dict, agent_run_id: str | None) -> None:
-    """Create workflow_definitions + workflow_runs records."""
+    """Create wf_definitions + wf_runs records."""
     try:
         from api.database import get_db_session
         from api.models import WorkflowDefinition, WorkflowRun as WFRunModel
@@ -568,7 +568,7 @@ def restore_waiting_workflows() -> int:
                 for sid, sr_data in (row.step_results or {}).items():
                     wf_run.step_results[sid] = StepResult(**sr_data)
 
-                _workflow_runs[row.run_id] = {
+                _wf_runs[row.run_id] = {
                     "workflow": workflow, "engine": WorkflowEngine(), "wf_run": wf_run,
                 }
                 if row.waiting_for:

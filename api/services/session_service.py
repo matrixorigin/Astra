@@ -358,7 +358,7 @@ class SessionService:
 
             from core.sandbox import Sandbox
             result = self.db_session.execute(
-                text("SELECT sandbox_name FROM sandbox_metadata WHERE session_id = :sid AND status = 'active'"),
+                text("SELECT sandbox_name FROM infra_sandbox_metadata WHERE session_id = :sid AND status = 'active'"),
                 {"sid": session_id},
             )
             names = [row._mapping["sandbox_name"] for row in result]

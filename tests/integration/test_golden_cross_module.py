@@ -33,8 +33,8 @@ def sid():
 def cleanup(db_session, sid):
     yield
     try:
-        db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": sid})
-        db_session.execute(text("DELETE FROM sessions WHERE session_id = :s"), {"s": sid})
+        db_session.execute(text("DELETE FROM agent_events WHERE session_id = :s"), {"s": sid})
+        db_session.execute(text("DELETE FROM agent_sessions WHERE session_id = :s"), {"s": sid})
         db_session.commit()
     except Exception:
         db_session.rollback()
@@ -162,8 +162,8 @@ class TestAuditLoggerWithGolden:
     """ReplayService replay generates audit log entries."""
 
     def test_replay_creates_audit_log(self, db_session, sid):
-        """Replaying a golden session writes an audit_logs entry."""
-        from api.models.infra import AuditLog
+        """Replaying a golden session writes an auth_audit_logs entry."""
+        from api.models.auth import AuditLog
         from api.services.replay_service import ReplayService
 
         fixture = _load("code_review")
@@ -584,7 +584,7 @@ class TestLLMNonDeterminism:
     3. Tracking model version in events for audit
     """
 
-    def test_same_session_different_llm_models_tracked(self):
+    def test_same_session_different_infra_llm_models_tracked(self):
         """Each LLM response records which model produced it."""
         fixture = _load("multi_turn_correction")
         for ev in fixture["events"]:
@@ -669,7 +669,7 @@ class TestLLMNonDeterminism:
 
         # Cleanup
         for s in (sid1, sid2):
-            db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": s})
+            db_session.execute(text("DELETE FROM agent_events WHERE session_id = :s"), {"s": s})
         db_session.commit()
 
 
@@ -704,7 +704,7 @@ class TestSemanticDiffContentSimilarity:
 
         # Cleanup
         for s in (sid1, sid2):
-            db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": s})
+            db_session.execute(text("DELETE FROM agent_events WHERE session_id = :s"), {"s": s})
         db_session.commit()
 
     def test_different_content_lower_similarity(self, db_session):
@@ -738,7 +738,7 @@ class TestSemanticDiffContentSimilarity:
         assert sim["responses_compared"] == 1
 
         for s in (sid1, sid2):
-            db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": s})
+            db_session.execute(text("DELETE FROM agent_events WHERE session_id = :s"), {"s": s})
         db_session.commit()
 
     def test_golden_session_self_similarity(self, db_session):
@@ -761,7 +761,7 @@ class TestSemanticDiffContentSimilarity:
         assert result["content_similarity"]["overall"] > 0.99
         assert result["content_similarity"]["responses_compared"] == 3  # 3 LLM responses
 
-        db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": sid})
+        db_session.execute(text("DELETE FROM agent_events WHERE session_id = :s"), {"s": sid})
         db_session.commit()
 
     def test_regression_detected_by_content_similarity(self, db_session):
@@ -805,5 +805,5 @@ class TestSemanticDiffContentSimilarity:
             assert "LOW" in result["summary"]
 
         for s in (sid1, sid2):
-            db_session.execute(text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": s})
+            db_session.execute(text("DELETE FROM agent_events WHERE session_id = :s"), {"s": s})
         db_session.commit()

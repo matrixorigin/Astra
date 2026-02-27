@@ -104,7 +104,7 @@ class EventLogger(DbConsumer):
             context_snapshot=event.context_snapshot.model_dump() if event.context_snapshot else None,
             token_usage=event.token_usage.model_dump() if event.token_usage else None,
             embedding_ref=event.embedding_ref,
-            embedding=None,  # No longer written inline; EmbeddingWorker fills event_embeddings
+            embedding=None,  # No longer written inline; EmbeddingWorker fills ctx_event_embeddings
             created_at=event.created_at,
             prompt_template_id=event.prompt_template_id,
             skills_snapshot=event.skills_snapshot,

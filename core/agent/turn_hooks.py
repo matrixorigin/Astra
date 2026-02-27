@@ -40,7 +40,7 @@ class TurnHooks(DbConsumer):
 
     # ── Decision audit ────────────────────────────────────────────────
 
-    def record_decision_audit(
+    def record_ctx_decision_audits(
         self,
         session_id: str,
         event_id: str,

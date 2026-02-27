@@ -9,8 +9,8 @@ from core.auth.seed_roles import seed_roles, SEED_ROLES
 def test_seed_roles_creates_roles(db_session):
     """Test that seed_roles creates default roles."""
     # Clear roles
-    db_session.execute(text("DELETE FROM user_roles"))
-    db_session.execute(text("DELETE FROM roles"))
+    db_session.execute(text("DELETE FROM auth_user_roles"))
+    db_session.execute(text("DELETE FROM auth_roles"))
     db_session.commit()
 
     # Seed roles
@@ -18,7 +18,7 @@ def test_seed_roles_creates_roles(db_session):
     assert count == len(SEED_ROLES)
 
     # Verify roles exist
-    result = db_session.execute(text("SELECT role_name FROM roles ORDER BY role_name")).fetchall()
+    result = db_session.execute(text("SELECT role_name FROM auth_roles ORDER BY role_name")).fetchall()
     role_names = [row[0] for row in result]
     assert "mo_agent_admin" in role_names
     assert "mo_agent_user" in role_names
@@ -27,8 +27,8 @@ def test_seed_roles_creates_roles(db_session):
 def test_seed_roles_is_idempotent(db_session):
     """Test that seed_roles can be called multiple times safely."""
     # Clear roles
-    db_session.execute(text("DELETE FROM user_roles"))
-    db_session.execute(text("DELETE FROM roles"))
+    db_session.execute(text("DELETE FROM auth_user_roles"))
+    db_session.execute(text("DELETE FROM auth_roles"))
     db_session.commit()
 
     # First seed
@@ -40,20 +40,20 @@ def test_seed_roles_is_idempotent(db_session):
     assert count2 == 0
 
     # Verify still only have expected roles
-    result = db_session.execute(text("SELECT COUNT(*) FROM roles")).fetchone()
+    result = db_session.execute(text("SELECT COUNT(*) FROM auth_roles")).fetchone()
     assert result[0] == len(SEED_ROLES)
 
 
 def test_seed_roles_preserves_existing(db_session):
     """Test that seed_roles doesn't affect existing roles."""
     # Clear roles
-    db_session.execute(text("DELETE FROM user_roles"))
-    db_session.execute(text("DELETE FROM roles"))
+    db_session.execute(text("DELETE FROM auth_user_roles"))
+    db_session.execute(text("DELETE FROM auth_roles"))
     db_session.commit()
 
     # Create one role manually
     db_session.execute(
-        text("INSERT INTO roles (role_id, role_name, description) VALUES (:id, :name, :desc)"),
+        text("INSERT INTO auth_roles (role_id, role_name, description) VALUES (:id, :name, :desc)"),
         {"id": "role-admin", "name": "mo_agent_admin", "desc": "Admin role"}
     )
     db_session.commit()
@@ -63,7 +63,7 @@ def test_seed_roles_preserves_existing(db_session):
     assert count == len(SEED_ROLES) - 1  # Only creates the missing role
 
     # Verify all roles exist
-    result = db_session.execute(text("SELECT COUNT(*) FROM roles")).fetchone()
+    result = db_session.execute(text("SELECT COUNT(*) FROM auth_roles")).fetchone()
     assert result[0] == len(SEED_ROLES)
 
 
@@ -73,8 +73,8 @@ def test_first_user_gets_admin_role(db_session):
     from api.models import User
     
     # Clear users
-    db_session.execute(text("DELETE FROM user_roles"))
-    db_session.execute(text("DELETE FROM users"))
+    db_session.execute(text("DELETE FROM auth_user_roles"))
+    db_session.execute(text("DELETE FROM auth_users"))
     db_session.commit()
 
     # Ensure roles exist
@@ -94,8 +94,8 @@ def test_first_user_gets_admin_role(db_session):
     # Verify user has admin role
     result = db_session.execute(
         text("""
-            SELECT r.role_name FROM user_roles ur
-            JOIN roles r ON ur.role_id = r.role_id
+            SELECT r.role_name FROM auth_user_roles ur
+            JOIN auth_roles r ON ur.role_id = r.role_id
             WHERE ur.user_id = :user_id
         """),
         {"user_id": user.user_id}
@@ -110,8 +110,8 @@ def test_second_user_no_admin_role(db_session):
     from api.routers.auth import register, RegisterRequest
     
     # Clear users
-    db_session.execute(text("DELETE FROM user_roles"))
-    db_session.execute(text("DELETE FROM users"))
+    db_session.execute(text("DELETE FROM auth_user_roles"))
+    db_session.execute(text("DELETE FROM auth_users"))
     db_session.commit()
 
     # Ensure roles exist
@@ -138,8 +138,8 @@ def test_second_user_no_admin_role(db_session):
     # Verify second user has no roles
     result = db_session.execute(
         text("""
-            SELECT r.role_name FROM user_roles ur
-            JOIN roles r ON ur.role_id = r.role_id
+            SELECT r.role_name FROM auth_user_roles ur
+            JOIN auth_roles r ON ur.role_id = r.role_id
             WHERE ur.user_id = :user_id
         """),
         {"user_id": user2.user_id}

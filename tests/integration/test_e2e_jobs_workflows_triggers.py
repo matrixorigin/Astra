@@ -251,7 +251,7 @@ class TestW4_WorkflowCRUD:
         db = next(get_db_session())
         try:
             db.execute(text(
-                "INSERT INTO workflow_definitions "
+                "INSERT INTO wf_definitions "
                 "(workflow_id, name, version, description, definition, is_active) "
                 "VALUES (:wid, :name, :ver, :desc, :defn, 1)"
             ), {
@@ -259,7 +259,7 @@ class TestW4_WorkflowCRUD:
                 "desc": "Test workflow", "defn": '{"steps": []}',
             })
             db.execute(text(
-                "INSERT INTO workflow_runs "
+                "INSERT INTO wf_runs "
                 "(run_id, workflow_id, status, current_step_idx, step_results) "
                 "VALUES (:rid, :wid, :status, 0, :sr)"
             ), {"rid": run_id, "wid": wf_id, "status": "waiting", "sr": '{}'})
@@ -291,7 +291,7 @@ class TestW4_WorkflowCRUD:
         db = next(get_db_session())
         try:
             db.execute(text(
-                "UPDATE workflow_runs SET waiting_for = :wf WHERE run_id = :rid"
+                "UPDATE wf_runs SET waiting_for = :wf WHERE run_id = :rid"
             ), {"wf": f"approval:{run_id}", "rid": run_id})
             db.commit()
         finally:

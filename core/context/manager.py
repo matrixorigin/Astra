@@ -233,7 +233,7 @@ class ContextManager(DbConsumer):
 
         Returns dict of section → {allocated: int, used: int} per design §2.
         Fixed allocations: system 500, skills 1000, reserve 500.
-        Loads overrides from configs table if available (set by ContextBudgetTuner).
+        Loads overrides from infra_configs table if available (set by ContextBudgetTuner).
         """
         fixed_tokens = 500 + 1000 + 500  # system + skills + reserve
         available = max(0, total_tokens - fixed_tokens)
@@ -264,7 +264,7 @@ class ContextManager(DbConsumer):
             import json
             with self._db() as db:
                 row = db.execute(
-                    text("SELECT value FROM configs WHERE key_name = 'context_budget_ratios' LIMIT 1"),
+                    text("SELECT value FROM infra_configs WHERE key_name = 'context_budget_ratios' LIMIT 1"),
                 ).first()
             if row:
                 overrides = json.loads(row[0]) if isinstance(row[0], str) else row[0]

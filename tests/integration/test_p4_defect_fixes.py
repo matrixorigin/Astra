@@ -82,7 +82,7 @@ class TestJsonSerialization:
         corrector._record(signal, correction)
 
         row = db_session.execute(text(
-            "SELECT content FROM conversation_events WHERE event_type = 'drift_correction' "
+            "SELECT content FROM agent_events WHERE event_type = 'drift_correction' "
             "AND event_id = :eid"
         ), {"eid": f"drift_gpt-4_{int(signal.detected_at.timestamp())}"}).fetchone()
 

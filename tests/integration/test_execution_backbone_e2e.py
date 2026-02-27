@@ -8,7 +8,7 @@ Only the LLM provider is faked. Everything else is real:
   - Real DB (MatrixOne)
   - Real HTTP API (FastAPI TestClient)
   - Real RunEngine, ChatLoop, AsyncToolRegistry, EventLogger
-  - Real event persistence to conversation_events + run_events
+  - Real event persistence to agent_events + agent_run_events
 
 Test scenarios match the design doc (durable-agent-runs.md):
   1. POST /chat → run completes → GET status shows completed
@@ -16,7 +16,7 @@ Test scenarios match the design doc (durable-agent-runs.md):
   3. Trigger → run: webhook trigger fires → creates and executes AgentRun
   4. Crash recovery: run parks → restore from DB → resume
   5. Cancel: DELETE /chat/runs/{run_id} → cancelled
-  6. SSE event persistence: run_events table populated
+  6. SSE event persistence: agent_run_events table populated
   7. Optimistic lock: double resume rejected
   8. Schedule trigger: claim_and_advance prevents double fire
 """
@@ -37,7 +37,7 @@ from core.agent.run_engine import (
     RunEngine,
     _active_runs,
     _child_runs,
-    _run_events,
+    _agent_run_events,
     _run_tasks,
     _run_waiters,
     cleanup_fan_in_tasks,
@@ -104,12 +104,12 @@ def _patch_job(job_id: str):
 
 @pytest.fixture(autouse=True)
 def _clean_globals():
-    for d in (_active_runs, _run_events, _run_waiters, _run_tasks,
+    for d in (_active_runs, _agent_run_events, _run_waiters, _run_tasks,
               _child_runs):
         d.clear()
     cleanup_fan_in_tasks()
     yield
-    for d in (_active_runs, _run_events, _run_waiters, _run_tasks,
+    for d in (_active_runs, _agent_run_events, _run_waiters, _run_tasks,
               _child_runs):
         d.clear()
     cleanup_fan_in_tasks()
@@ -129,13 +129,13 @@ def session_id(db):
     ).session_id
     yield sid
     # Clean up all test data tied to this session
-    db.execute(text("DELETE FROM run_events WHERE run_id IN "
+    db.execute(text("DELETE FROM agent_run_events WHERE run_id IN "
                     "(SELECT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) "
-                    "FROM conversation_events WHERE session_id = :sid AND event_type = 'run_started')"),
+                    "FROM agent_events WHERE session_id = :sid AND event_type = 'run_started')"),
                {"sid": sid})
-    db.execute(text("DELETE FROM conversation_events WHERE session_id = :sid"), {"sid": sid})
-    db.execute(text("DELETE FROM triggers WHERE session_id = :sid"), {"sid": sid})
-    db.execute(text("DELETE FROM sessions WHERE session_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM wf_triggers WHERE session_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
     db.commit()
 
 
@@ -218,7 +218,7 @@ def _mock_chat_loop(responses: list[str | dict]):
 
 
 class TestRunRestore:
-    """Crash recovery: restore run state from conversation_events."""
+    """Crash recovery: restore run state from agent_events."""
 
     @pytest.mark.asyncio
     async def test_restore_waiting_run_from_db(self, session_id, db):
@@ -256,7 +256,7 @@ class TestRunRestore:
 
         assert run.status == RunStatus.COMPLETED
         _active_runs.clear()
-        _run_events.clear()
+        _agent_run_events.clear()
 
         restored = engine.restore_run(run_id)
         assert restored.status == RunStatus.COMPLETED
@@ -283,7 +283,7 @@ class TestWaitResume:
         assert run.status == RunStatus.COMPLETED
 
         rows = db.execute(
-            text("SELECT event_type FROM conversation_events "
+            text("SELECT event_type FROM agent_events "
                  "WHERE JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :rid ORDER BY created_at"),
             {"rid": run.run_id},
         ).fetchall()
@@ -314,7 +314,7 @@ class TestCrossWorkerResume:
 
         # CRASH — clear all in-memory state
         _active_runs.clear()
-        _run_events.clear()
+        _agent_run_events.clear()
         _run_waiters.clear()
         _run_tasks.clear()
 
@@ -358,7 +358,7 @@ class TestFanOutFanIn:
         # Verify in DB
         rows = db.execute(
             text("SELECT JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.parent_run_id')) "
-                 "FROM conversation_events "
+                 "FROM agent_events "
                  "WHERE event_type = 'run_started' "
                  "AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :rid"),
             {"rid": child.run_id},
@@ -397,7 +397,7 @@ class TestTriggerToRun:
             session_id=session_id,
         )
         db.execute(
-            text("UPDATE triggers SET next_fire_at = :past WHERE trigger_id = :tid"),
+            text("UPDATE wf_triggers SET next_fire_at = :past WHERE trigger_id = :tid"),
             {"past": datetime(2020, 1, 1), "tid": trig["trigger_id"]},
         )
         db.commit()
@@ -416,10 +416,10 @@ class TestTriggerToRun:
 
 
 class TestSSEPersistence:
-    """Events persisted to run_events table."""
+    """Events persisted to agent_run_events table."""
 
     @pytest.mark.asyncio
-    async def test_events_in_run_events_and_cross_worker_load(self, session_id, db):
+    async def test_events_in_agent_run_events_and_cross_worker_load(self, session_id, db):
         """SSE events in DB; loadable after clearing local buffer."""
         engine = RunEngine(lambda: db)
         run = engine.create_run(
@@ -431,15 +431,15 @@ class TestSSEPersistence:
             await engine.start_run(run)
 
         rows = db.execute(
-            text("SELECT idx, event_type FROM run_events WHERE run_id = :rid ORDER BY idx"),
+            text("SELECT idx, event_type FROM agent_run_events WHERE run_id = :rid ORDER BY idx"),
             {"rid": run.run_id},
         ).fetchall()
         assert len(rows) >= 1
         assert rows[0][0] == 0
 
         # Cross-worker: clear local, load from DB
-        _run_events.pop(run.run_id, None)
-        events = engine.get_run_events(run.run_id)
+        _agent_run_events.pop(run.run_id, None)
+        events = engine.get_agent_run_events(run.run_id)
         assert len(events) >= 1
         assert events[0]["run_id"] == run.run_id
 

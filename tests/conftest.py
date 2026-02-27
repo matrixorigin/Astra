@@ -63,8 +63,8 @@ def test_engine():
             # silently failed under concurrent DDL pressure from 24 xdist workers.
             from sqlalchemy import inspect as sa_inspect
             tables = set(sa_inspect(engine).get_table_names(schema=engine.url.database))
-            required = {"conversation_events", "gate_results", "skill_selection_events",
-                        "skill_selection_learning", "configs"}
+            required = {"agent_events", "eval_gate_results", "skill_selection_events",
+                        "skill_selection_learnings", "infra_configs"}
             missing = required - tables
             if missing:
                 raise RuntimeError(f"Tables missing after init_db: {missing}")

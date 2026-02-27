@@ -16,7 +16,7 @@ def db(request):
     yield database
 
     # Cleanup
-    database.execute(text("DELETE FROM event_embeddings WHERE event_id LIKE 'test_%'"))
+    database.execute(text("DELETE FROM ctx_event_embeddings WHERE event_id LIKE 'test_%'"))
     database.commit()
 
 
@@ -56,7 +56,7 @@ def test_store_and_retrieve_embedding(db, db_factory):
     # Retrieve
     from sqlalchemy import text
     row = db.execute(
-        text("SELECT model_name, model_version, metadata FROM event_embeddings WHERE event_id = :event_id"),
+        text("SELECT model_name, model_version, metadata FROM ctx_event_embeddings WHERE event_id = :event_id"),
         {"event_id": event_id},
     ).fetchone()
 

@@ -104,7 +104,7 @@ class RegressionGate(DbConsumer):
                 sandbox_name,
                 description=f"Gate {gate_id}",
                 created_by="system",
-                tables=["prompt_templates", "skills_registry", "configs", "conversation_events", "sk_knowledge_entries"],
+                tables=["ctx_prompt_templates", "skill_registry", "infra_configs", "agent_events", "sk_knowledge_entries"],
             )
             
             # 3. Apply change to sandbox
@@ -185,7 +185,7 @@ class RegressionGate(DbConsumer):
                     user_id,
                     AVG(quality_score) as avg_score,
                     COUNT(*) as event_count
-                FROM conversation_events
+                FROM agent_events
                 WHERE quality_score >= 4.0
                   AND training_eligible = TRUE
                   AND created_at > DATE_SUB(NOW(), INTERVAL 30 DAY)
@@ -225,7 +225,7 @@ class RegressionGate(DbConsumer):
                 if change_type == ChangeType.PROMPT:
                     # Update prompt template in sandbox
                     db.execute(text(f"""
-                        UPDATE {sandbox_name}.prompt_templates 
+                        UPDATE {sandbox_name}.ctx_prompt_templates 
                         SET content = :content, updated_at = NOW()
                         WHERE template_id = :template_id
                     """), {
@@ -238,7 +238,7 @@ class RegressionGate(DbConsumer):
                     if skill_definition is None:
                         skill_definition = change_content.get("skill_definition", {})
                     db.execute(text(f"""
-                        INSERT INTO {sandbox_name}.skills_registry 
+                        INSERT INTO {sandbox_name}.skill_registry 
                         (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
                         VALUES (:skill_id, :skill_name, :version, :description, :definition, 1, NOW(), NOW())
                         ON DUPLICATE KEY UPDATE
@@ -317,10 +317,10 @@ class RegressionGate(DbConsumer):
                         version = suspected.get("version")
                         if skill_name and version:
                             db.execute(text(f"""
-                                INSERT INTO {sandbox_name}.skills_registry 
+                                INSERT INTO {sandbox_name}.skill_registry 
                                 (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
                                 SELECT skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at
-                                FROM skills_registry
+                                FROM skill_registry
                                 WHERE skill_name = :skill_name AND version = :version
                                 ON DUPLICATE KEY UPDATE
                                 skill_definition = VALUES(skill_definition),
@@ -336,9 +336,9 @@ class RegressionGate(DbConsumer):
                         version = suspected.get("version")
                         if template_id and version:
                             db.execute(text(f"""
-                                INSERT INTO {sandbox_name}.prompt_templates (template_id, version, content, created_at)
+                                INSERT INTO {sandbox_name}.ctx_prompt_templates (template_id, version, content, created_at)
                                 SELECT template_id, version, content, created_at
-                                FROM prompt_templates
+                                FROM ctx_prompt_templates
                                 WHERE template_id = :template_id AND version = :version
                                 ON DUPLICATE KEY UPDATE content = VALUES(content)
                             """), {"template_id": template_id, "version": version})
@@ -461,7 +461,7 @@ class RegressionGate(DbConsumer):
                 created_at = datetime.fromisoformat(created_at_str.replace('+00:00', ''))
             
                 db.execute(text("""
-                    INSERT INTO gate_results (
+                    INSERT INTO eval_gate_results (
                         gate_id, change_type, change_id,
                         snapshot_used, sessions_tested,
                         error_rate, score_delta, passed,
@@ -499,7 +499,7 @@ class RegressionGate(DbConsumer):
                     snapshot_used, sessions_tested,
                     error_rate, score_delta, passed,
                     metrics, created_at
-                FROM gate_results
+                FROM eval_gate_results
                 ORDER BY created_at DESC
                 LIMIT :limit
             """), {"limit": limit})

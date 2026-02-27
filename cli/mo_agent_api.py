@@ -50,11 +50,11 @@ class SyncAPIClient:
         finally:
             loop.close()
     
-    def stream_run_events(self, run_id: str):
+    def stream_agent_run_events(self, run_id: str):
         """Stream run events synchronously."""
         async def _stream():
             async with APIClient(base_url=self.base_url, profile=self.profile) as client:
-                async for event in client.stream_run_events(run_id):
+                async for event in client.stream_agent_run_events(run_id):
                     yield event
         
         # Run async generator synchronously

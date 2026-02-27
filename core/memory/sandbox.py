@@ -69,7 +69,7 @@ class MemorySandbox(DbConsumer):
             self._insert_to_branch(branch_name, new_memories)
 
             score_main = self._retrieval_score(
-                "memories", user_id, query_text, query_embedding
+                "mem_memories", user_id, query_text, query_embedding
             )
             score_branch = self._retrieval_score(
                 branch_name, user_id, query_text, query_embedding
@@ -100,7 +100,7 @@ class MemorySandbox(DbConsumer):
         # branch_name is internally generated (uuid hex), not user input — safe for DDL.
         with self._db() as db:
             db.execute(text(
-                f"data branch create table {branch_name} from memories"
+                f"data branch create table {branch_name} from mem_memories"
             ))
             db.commit()
 
@@ -165,7 +165,7 @@ class MemorySandbox(DbConsumer):
     ) -> float:
         """Compute aggregate retrieval score for top-5 results.
 
-        table_name is internally generated (branch_name or literal "memories") — safe for DDL.
+        table_name is internally generated (branch_name or literal "mem_memories") — safe for DDL.
         """
         with self._db() as db:
             if query_embedding:

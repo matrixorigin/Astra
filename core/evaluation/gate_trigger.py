@@ -3,7 +3,7 @@
 Ref: trust-and-safety.md §4
 Triggers: skill_version_changed, prompt_template_changed
 
-Distributed-safe: uses distributed_locks table (same mechanism as
+Distributed-safe: uses infra_distributed_locks table (same mechanism as
 MemoryGovernanceScheduler) to ensure only ONE instance runs the gate
 per change_id across N replicas.
 
@@ -134,7 +134,7 @@ class GateTrigger:
         # Slow path: take over only if expired (previous gate crashed)
         result = db.execute(
             text(
-                "UPDATE distributed_locks "
+                "UPDATE infra_distributed_locks "
                 "SET instance_id = :iid, acquired_at = :now, expires_at = :exp "
                 "WHERE lock_name = :name AND expires_at < :now"
             ),
@@ -148,7 +148,7 @@ class GateTrigger:
         from sqlalchemy import text
         try:
             db.execute(
-                text("DELETE FROM distributed_locks WHERE lock_name = :name"),
+                text("DELETE FROM infra_distributed_locks WHERE lock_name = :name"),
                 {"name": lock_name},
             )
             db.commit()

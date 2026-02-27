@@ -35,7 +35,7 @@ _DEFAULT_L2_THRESHOLD = 0.55
 _CONTRADICTION_SQL = """\
 SELECT m.memory_id, m.content, m.initial_confidence,
     L2_DISTANCE(m.embedding, :query_vec) AS l2_dist
-FROM memories m
+FROM mem_memories m
 WHERE m.user_id = :uid
     AND m.is_active = 1
     AND m.memory_type = :mtype

@@ -84,10 +84,10 @@ def cleanup(db_session, sid):
     yield
     try:
         db_session.execute(text(
-            "DELETE FROM conversation_events WHERE session_id = :s"
+            "DELETE FROM agent_events WHERE session_id = :s"
         ), {"s": sid})
         db_session.execute(text(
-            "DELETE FROM sessions WHERE session_id = :s"
+            "DELETE FROM agent_sessions WHERE session_id = :s"
         ), {"s": sid})
         db_session.commit()
     except Exception:
@@ -291,10 +291,10 @@ class TestComplexMultiTurnReplay:
 
         # Cleanup sid2
         db_session.execute(text(
-            "DELETE FROM conversation_events WHERE session_id = :s"
+            "DELETE FROM agent_events WHERE session_id = :s"
         ), {"s": sid2})
         db_session.execute(text(
-            "DELETE FROM sessions WHERE session_id = :s"
+            "DELETE FROM agent_sessions WHERE session_id = :s"
         ), {"s": sid2})
         db_session.commit()
 

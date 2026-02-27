@@ -1,8 +1,8 @@
 """Integration tests for A5: Replay migration.
 
 Tests the two-path replay:
-1. Chunk-level from run_events (primary)
-2. Full-text fallback from conversation_events (when chunks missing)
+1. Chunk-level from agent_run_events (primary)
+2. Full-text fallback from agent_events (when chunks missing)
 """
 
 import json
@@ -38,9 +38,9 @@ def chain_id():
 def cleanup(db_session, run_id, session_id):
     yield
     try:
-        db_session.execute(text("DELETE FROM run_events WHERE run_id = :r"), {"r": run_id})
+        db_session.execute(text("DELETE FROM agent_run_events WHERE run_id = :r"), {"r": run_id})
         db_session.execute(
-            text("DELETE FROM conversation_events WHERE session_id = :s"), {"s": session_id}
+            text("DELETE FROM agent_events WHERE session_id = :s"), {"s": session_id}
         )
         db_session.commit()
     except Exception:
@@ -50,7 +50,7 @@ def cleanup(db_session, run_id, session_id):
 def _insert_run_event(db, run_id, idx, event_type, data, event_id=None, agent_id=None):
     db.execute(
         text(
-            "INSERT INTO run_events (run_id, idx, event_type, data, event_id, agent_id) "
+            "INSERT INTO agent_run_events (run_id, idx, event_type, data, event_id, agent_id) "
             "VALUES (:run_id, :idx, :et, :data, :eid, :aid)"
         ),
         {
@@ -68,7 +68,7 @@ def _insert_llm_response(db, session_id, run_id, chain_id, content):
     eid = _uid()
     db.execute(
         text(
-            "INSERT INTO conversation_events "
+            "INSERT INTO agent_events "
             "(event_id, session_id, user_id, agent_id, agent_version, "
             "event_type, content, causal_chain_id, run_id, created_at) "
             "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "
@@ -80,12 +80,12 @@ def _insert_llm_response(db, session_id, run_id, chain_id, content):
 
 
 class TestChunkLevelReplay:
-    """Replay from run_events when run is complete."""
+    """Replay from agent_run_events when run is complete."""
 
     @pytest.mark.asyncio
     async def test_completed_run_replays_chunks(self, db_session, run_id, session_id, chain_id, cleanup):
-        """Normal completed run → chunk-level output from run_events."""
-        # Populate run_events with stream chunks
+        """Normal completed run → chunk-level output from agent_run_events."""
+        # Populate agent_run_events with stream chunks
         _insert_run_event(db_session, run_id, 0, "text_message_start", {"role": "assistant"})
         _insert_run_event(db_session, run_id, 1, "text_message_content", {"delta": "Hello "})
         _insert_run_event(db_session, run_id, 2, "text_message_content", {"delta": "world"})
@@ -130,8 +130,8 @@ class TestFulltextFallback:
 
     @pytest.mark.asyncio
     async def test_missing_chunks_falls_back_to_fulltext(self, db_session, run_id, session_id, chain_id, cleanup):
-        """Simulated crash: no run_events → fallback to llm_response."""
-        # Only llm_response in conversation_events, no run_events
+        """Simulated crash: no agent_run_events → fallback to llm_response."""
+        # Only llm_response in agent_events, no agent_run_events
         _insert_llm_response(db_session, session_id, run_id, chain_id, "Full response text")
         db_session.commit()
 
@@ -178,7 +178,7 @@ class TestToolOnlyTurn:
         eid = _uid()
         db_session.execute(
             text(
-                "INSERT INTO conversation_events "
+                "INSERT INTO agent_events "
                 "(event_id, session_id, user_id, agent_id, agent_version, "
                 "event_type, content, causal_chain_id, run_id, created_at) "
                 "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "
@@ -244,11 +244,11 @@ class TestLegacyPathPreserved:
 
     @pytest.mark.asyncio
     async def test_no_run_id_uses_legacy(self, db_session, session_id, chain_id, cleanup, run_id):
-        """Without run_id, replay uses stream_* events from conversation_events."""
+        """Without run_id, replay uses stream_* events from agent_events."""
         eid = _uid()
         db_session.execute(
             text(
-                "INSERT INTO conversation_events "
+                "INSERT INTO agent_events "
                 "(event_id, session_id, user_id, agent_id, agent_version, "
                 "event_type, content, causal_chain_id, created_at) "
                 "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "
@@ -288,7 +288,7 @@ class TestTimeTravelReplay:
         eid1 = _uid()
         db_session.execute(
             text(
-                "INSERT INTO conversation_events "
+                "INSERT INTO agent_events "
                 "(event_id, session_id, user_id, agent_id, agent_version, "
                 "event_type, content, causal_chain_id, created_at) "
                 "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "
@@ -303,7 +303,7 @@ class TestTimeTravelReplay:
         eid2 = _uid()
         db_session.execute(
             text(
-                "INSERT INTO conversation_events "
+                "INSERT INTO agent_events "
                 "(event_id, session_id, user_id, agent_id, agent_version, "
                 "event_type, content, causal_chain_id, created_at) "
                 "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "
@@ -338,7 +338,7 @@ class TestTimeTravelReplay:
             eid = _uid()
             db_session.execute(
                 text(
-                    "INSERT INTO conversation_events "
+                    "INSERT INTO agent_events "
                     "(event_id, session_id, user_id, agent_id, agent_version, "
                     "event_type, content, causal_chain_id, created_at) "
                     "VALUES (:eid, :sid, 'test_user', 'test-agent', '0.1', "

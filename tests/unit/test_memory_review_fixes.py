@@ -330,7 +330,7 @@ class TestToolResultCleanup:
         assert count == 5
         call_args = mock_session.execute.call_args
         sql_text = str(call_args[0][0])
-        assert "DELETE FROM memories" in sql_text
+        assert "DELETE FROM mem_memories" in sql_text
         params = call_args[0][1]
         assert params["mtype"] == "tool_result"
         assert params["ttl"] == 24

@@ -124,7 +124,7 @@ def get_quality_trend(
     model: str | None = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ) -> QualityTrendResponse:
-    """Daily quality score trend from conversation_events."""
+    """Daily quality score trend from agent_events."""
     db = SessionLocal()
     try:
         params: dict[str, Any] = {"days": days}
@@ -139,7 +139,7 @@ def get_quality_trend(
                        AVG(quality_score) AS avg_score,
                        COUNT(*) AS cnt,
                        llm_model_used
-                FROM conversation_events
+                FROM agent_events
                 WHERE quality_score IS NOT NULL
                   AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
                   {model_filter}
@@ -206,7 +206,7 @@ def get_gate_history(
             rows = db.execute(text("""
                 SELECT gate_id, change_type, change_id, sessions_tested,
                        error_rate, score_delta, passed, created_at
-                FROM gate_results
+                FROM eval_gate_results
                 ORDER BY created_at DESC
                 LIMIT :limit
             """), {"limit": limit}).fetchall()
@@ -263,13 +263,13 @@ def get_session_scores(
     min_score: float = Query(default=0.0, ge=0.0, le=5.0),
     current_user: dict = Depends(get_current_user),
 ) -> list[SessionScoreResponse]:
-    """Session-level quality scores from quality_assessments."""
+    """Session-level quality scores from eval_quality_assessments."""
     db = SessionLocal()
     try:
         try:
             rows = db.execute(text("""
                 SELECT target_id, score, COALESCE(step_count, 0)
-                FROM quality_assessments
+                FROM eval_quality_assessments
                 WHERE level = 'session' AND score >= :min_score
                 ORDER BY updated_at DESC
                 LIMIT :limit
@@ -470,7 +470,7 @@ def _record_loop_event(
     try:
         # causal_chain_id = loop_id: each loop execution is its own causal chain root
         db.execute(text("""
-            INSERT INTO conversation_events
+            INSERT INTO agent_events
             (event_id, session_id, user_id, agent_id, agent_version,
              event_type, content, causal_chain_id, created_at)
             VALUES (:eid, 'system', 'system', 'system', '1.0.0',
@@ -574,7 +574,7 @@ def trust_report(
         row = db.execute(text("""
             SELECT COUNT(*) as total,
                    SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' THEN 1 ELSE 0 END) as safe
-            FROM conversation_events
+            FROM agent_events
             WHERE event_type = 'hallucination_check'
               AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
         """), {"days": days}).fetchone()
@@ -617,7 +617,7 @@ def slo_dashboard(
     try:
         try:
             rows = db.execute(text("""
-                SELECT DISTINCT agent_id FROM conversation_events
+                SELECT DISTINCT agent_id FROM agent_events
                 WHERE event_type = 'llm_response'
                   AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
                   AND agent_id IS NOT NULL
@@ -684,7 +684,7 @@ def observability_metrics(
         row = db.execute(text("""
             SELECT AVG(quality_score) as avg_quality,
                    COUNT(*) as total_responses
-            FROM conversation_events
+            FROM agent_events
             WHERE agent_id = :aid AND event_type = 'llm_response'
               AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
         """), {"aid": agent_id, "days": days}).fetchone()
@@ -699,7 +699,7 @@ def observability_metrics(
                    AVG(turn_count) as avg_turns
             FROM (
                 SELECT session_id, COUNT(*) as turn_count
-                FROM conversation_events
+                FROM agent_events
                 WHERE agent_id = :aid
                   AND created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
                 GROUP BY session_id
@@ -757,7 +757,7 @@ def memory_health(
                        SUM(CASE WHEN memory_type = 'episodic' THEN 1 ELSE 0 END) as episodic,
                        SUM(CASE WHEN memory_type = 'semantic' THEN 1 ELSE 0 END) as semantic,
                        SUM(CASE WHEN memory_type = 'profile' THEN 1 ELSE 0 END) as profile
-                FROM memories WHERE user_id = :uid AND is_active = 1
+                FROM mem_memories WHERE user_id = :uid AND is_active = 1
             """), {"uid": uid}).fetchone()
             if row:
                 result.memories = {

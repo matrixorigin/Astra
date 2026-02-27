@@ -1,6 +1,6 @@
 """Training data extraction pipeline — P2 Data Versioning.
 
-Branch conversation_events, extract with full lineage and contamination detection.
+Branch agent_events, extract with full lineage and contamination detection.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ class DatasetConfig:
     dataset_id: str
     name: str
     description: str
-    source_table: str = "conversation_events"
+    source_table: str = "agent_events"
     filters: dict = field(default_factory=dict)  # e.g., {"skill_name": "sql_generator"}
     quality_threshold: float = 0.75
     sample_size: Optional[int] = None
@@ -79,7 +79,7 @@ class TrainingDataPipeline(DbConsumer):
         self.source_db = source_db
     
     def create_dataset(self, config: DatasetConfig) -> str:
-        """Create training dataset with branched conversation_events.
+        """Create training dataset with branched agent_events.
         
         Args:
             config: Dataset configuration
@@ -182,7 +182,7 @@ class TrainingDataPipeline(DbConsumer):
                     content,
                     CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.quality_score')) AS DECIMAL(3,2)) as quality_score,
                     created_at
-                FROM {branch_name}.conversation_events
+                FROM {branch_name}.agent_events
                 WHERE event_type = 'llm_response'
                 AND CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.quality_score')) AS DECIMAL(3,2)) >= :quality_threshold
             """
@@ -199,7 +199,7 @@ class TrainingDataPipeline(DbConsumer):
                 # Get input from previous user event
                 input_row = db.execute(text(f"""
                     SELECT content
-                    FROM {branch_name}.conversation_events
+                    FROM {branch_name}.agent_events
                     WHERE session_id = :session_id
                     AND event_type = 'user_query'
                     AND created_at < :created_at
@@ -229,7 +229,7 @@ class TrainingDataPipeline(DbConsumer):
                 lineage = DatasetLineage(
                     dataset_id=dataset_id,
                     source_branch=branch_name,
-                    source_table="conversation_events",
+                    source_table="agent_events",
                     extraction_query=query,
                     extracted_at=datetime.utcnow(),
                     row_count=len(rows),
@@ -331,7 +331,7 @@ class TrainingDataPipeline(DbConsumer):
             for session_id in test_session_ids:
                 result = db.execute(text(f"""
                     SELECT COUNT(*) as count
-                    FROM {branch_name}.conversation_events
+                    FROM {branch_name}.agent_events
                     WHERE session_id = :session_id
                 """), {"session_id": session_id}).fetchone()
             
@@ -396,4 +396,4 @@ class TrainingDataPipeline(DbConsumer):
             db.commit()
         
             # Delete branch
-            self.branch.delete(f"{branch_name}.conversation_events")
+            self.branch.delete(f"{branch_name}.agent_events")

@@ -79,14 +79,14 @@ def seed_agents(db) -> int:
     count = 0
     for agent in SEED_AGENTS:
         existing = db.execute(
-            text("SELECT 1 FROM agents WHERE agent_id = :aid"),
+            text("SELECT 1 FROM agent_agents WHERE agent_id = :aid"),
             {"aid": agent["agent_id"]},
         ).fetchone()
         if existing:
             continue
         db.execute(
             text(
-                "INSERT INTO agents (agent_id, agent_name, agent_type, owner_user_id, agent_config) "
+                "INSERT INTO agent_agents (agent_id, agent_name, agent_type, owner_user_id, agent_config) "
                 "VALUES (:aid, :name, :type, :owner, :config)"
             ),
             {

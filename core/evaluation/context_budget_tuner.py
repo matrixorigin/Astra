@@ -1,6 +1,6 @@
 """Context budget tuner — closed-loop optimization of token allocation.
 
-Observe: quality_score per task_type + budget utilization from context_snapshots
+Observe: quality_score per task_type + budget utilization from ctx_snapshots
 Diagnose: identify task_types where under/over-allocation correlates with low quality
 Propose: adjust ratios toward sections with higher utilization in high-quality sessions
 Validate: RegressionGate(ChangeType.CONTEXT_BUDGET)
@@ -40,8 +40,8 @@ class ContextBudgetTuner(DbConsumer):
                     cs.task_type,
                     AVG(ce.quality_score) AS avg_quality,
                     COUNT(*) AS sample_count
-                FROM context_snapshots cs
-                JOIN conversation_events ce ON ce.snapshot_id = cs.context_capture_id
+                FROM ctx_snapshots cs
+                JOIN agent_events ce ON ce.snapshot_id = cs.context_capture_id
                 WHERE ce.quality_score IS NOT NULL
                   AND cs.task_type IS NOT NULL
                   AND ce.created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
@@ -61,7 +61,7 @@ class ContextBudgetTuner(DbConsumer):
             if stats:
                 budget_rows = db.execute(text("""
                     SELECT cs.task_type, cs.token_budget
-                    FROM context_snapshots cs
+                    FROM ctx_snapshots cs
                     WHERE cs.task_type IS NOT NULL
                       AND cs.token_budget IS NOT NULL
                       AND cs.created_at > DATE_SUB(NOW(), INTERVAL :days DAY)
@@ -189,7 +189,7 @@ class ContextBudgetTuner(DbConsumer):
             value = json.dumps(proposals)
             try:
                 db.execute(text("""
-                    INSERT INTO configs (key_name, value, updated_at)
+                    INSERT INTO infra_configs (key_name, value, updated_at)
                     VALUES ('context_budget_ratios', :value, NOW())
                     ON DUPLICATE KEY UPDATE value = :value, updated_at = NOW()
                 """), {"value": value})

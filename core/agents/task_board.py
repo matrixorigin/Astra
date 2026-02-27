@@ -2,7 +2,7 @@
 
 Design ref: agents-and-orchestration.md §5 "Agent Teams"
 
-Task board is implemented via conversation_events with special event_type values:
+Task board is implemented via agent_events with special event_type values:
 - team_task: Lead creates a task
 - team_task_claimed: Member claims a task (creates lock)
 - team_task_done: Member completes a task
@@ -102,7 +102,7 @@ class TaskBoard(DbConsumer):
                 # causal_chain_id = task_id: task is the root of its own causal chain
                 db.execute(
                     text(
-                        "INSERT INTO conversation_events "
+                        "INSERT INTO agent_events "
                         "(event_id, session_id, user_id, agent_id, agent_version, "
                         "event_type, content, metadata, causal_chain_id, parent_event_id, created_at) "
                         "VALUES (:id, :sid, 'system', 'system', '1.0.0', "
@@ -145,7 +145,7 @@ class TaskBoard(DbConsumer):
         with self._db() as db:
             existing = db.execute(
                 text(
-                    "SELECT COUNT(*) FROM conversation_events "
+                    "SELECT COUNT(*) FROM agent_events "
                     "WHERE parent_event_id = :task_id AND event_type = 'team_task_claimed'"
                 ),
                 {"task_id": task_id},
@@ -172,7 +172,7 @@ class TaskBoard(DbConsumer):
                 # causal_chain_id = eid: claim is an independent action, linked to task via parent_event_id
                 db.execute(
                     text(
-                        "INSERT INTO conversation_events "
+                        "INSERT INTO agent_events "
                         "(event_id, session_id, user_id, agent_id, agent_version, "
                         "event_type, content, metadata, causal_chain_id, parent_event_id, created_at) "
                         "VALUES (:id, :sid, 'system', 'system', '1.0.0', "
@@ -223,7 +223,7 @@ class TaskBoard(DbConsumer):
                 # causal_chain_id = eid: completion is an independent action, linked to task via parent_event_id
                 db.execute(
                     text(
-                        "INSERT INTO conversation_events "
+                        "INSERT INTO agent_events "
                         "(event_id, session_id, user_id, agent_id, agent_version, "
                         "event_type, content, metadata, causal_chain_id, parent_event_id, created_at) "
                         "VALUES (:id, :sid, 'system', 'system', '1.0.0', "
@@ -255,7 +255,7 @@ class TaskBoard(DbConsumer):
             rows = db.execute(
                 text(
                     "SELECT event_id, content, metadata, created_at "
-                    "FROM conversation_events "
+                    "FROM agent_events "
                     "WHERE session_id = :sid AND event_type = 'team_task' "
                     "AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.team_id')) = :team_id "
                     "AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.status')) = 'open' "
@@ -319,7 +319,7 @@ class TaskBoard(DbConsumer):
                 msg_id = generate_id()
                 db.execute(
                     text(
-                        "INSERT INTO conversation_events "
+                        "INSERT INTO agent_events "
                         "(event_id, session_id, user_id, agent_id, agent_version, "
                         "event_type, content, metadata, causal_chain_id, created_at) "
                         "VALUES (:id, :sid, 'system', 'system', '1.0.0', "
@@ -353,7 +353,7 @@ class TaskBoard(DbConsumer):
             rows = db.execute(
                 text(
                     "SELECT event_id, content, metadata, created_at "
-                    "FROM conversation_events "
+                    "FROM agent_events "
                     "WHERE session_id = :sid AND event_type = 'agent_message' "
                     "AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.to_agent')) = :agent_id "
                     "ORDER BY created_at DESC LIMIT :limit"

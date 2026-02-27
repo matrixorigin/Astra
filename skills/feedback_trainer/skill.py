@@ -85,25 +85,8 @@ class FeedbackTrainerSkill(Skill[TrainerInput, TrainerOutput]):
         onnx_path = str(output_dir / "model.onnx")
         _export_onnx(str(output_dir), onnx_path, input.base_model)
 
-        # 5. Register artifact
+        # 5. Artifact registration removed (artifact_manager deleted)
         artifact_id = None
-        if self._db:
-            from core.models.artifact_manager import ArtifactManager
-            mgr = ArtifactManager(self._db)
-            artifact_id = mgr.save(
-                model_name="feedback_classifier",
-                version=self.version,
-                artifact_path=onnx_path,
-                base_model=input.base_model,
-                artifact_format="onnx",
-                metrics=metrics,
-                training_config={
-                    "epochs": input.epochs, "batch_size": input.batch_size,
-                    "lr": input.learning_rate,
-                },
-                dataset_size=len(samples),
-                activate=True,
-            )
 
         return TrainerOutput(
             success=True, result=metrics,

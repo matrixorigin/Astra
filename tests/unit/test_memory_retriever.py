@@ -80,7 +80,7 @@ class TestRetrieveWithoutEmbedding:
         call_args = mock_db.execute.call_args
         # SQL is now a text() object created from template
         sql_str = str(call_args[0][0])
-        assert "FROM memories m" in sql_str
+        assert "FROM mem_memories m" in sql_str
         assert "MATCH" not in sql_str  # Fallback doesn't use MATCH
 
     def test_redistributes_weights(self, retriever, mock_db):

@@ -185,7 +185,7 @@ class TestGitHubAPIMethods:
         assert result["overall"] == "failure"
 
     @pytest.mark.asyncio
-    async def test_list_workflow_runs(self, api, mock_gh_client):
+    async def test_list_wf_runs(self, api, mock_gh_client):
         mock_run = MagicMock()
         mock_run.name = "Build"
         mock_run.status = "completed"
@@ -193,9 +193,9 @@ class TestGitHubAPIMethods:
         mock_run.html_url = "url"
         mock_run.created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
         mock_repo = MagicMock()
-        mock_repo.get_workflow_runs.return_value = [mock_run]
+        mock_repo.get_wf_runs.return_value = [mock_run]
         mock_gh_client.get_repo.return_value = mock_repo
-        result = await api.list_workflow_runs("owner/repo", limit=5)
+        result = await api.list_wf_runs("owner/repo", limit=5)
         assert len(result) == 1
         assert result[0]["name"] == "Build"
 
@@ -243,7 +243,7 @@ class TestActions:
     async def test_ci_status_action(self):
         from skills.github.actions import CIStatusAction, CIStatusInput
         mock_api = AsyncMock(spec=GitHubSkillAPI)
-        mock_api.list_workflow_runs.return_value = [
+        mock_api.list_wf_runs.return_value = [
             {"name": "Build", "status": "completed", "conclusion": "success",
              "html_url": "u", "created_at": "t"}
         ]

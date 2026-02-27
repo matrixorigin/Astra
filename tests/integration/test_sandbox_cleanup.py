@@ -31,7 +31,7 @@ def test_cleanup_expired(sandbox, cleaner, db_session):
 
     # Backdate updated_at to make it look expired
     db_session.execute(text(
-        f"UPDATE {SOURCE_DB}.sandbox_metadata "
+        f"UPDATE {SOURCE_DB}.infra_sandbox_metadata "
         f"SET updated_at = '2020-01-01 00:00:00' WHERE sandbox_name = :n"
     ), {"n": name})
     db_session.commit()

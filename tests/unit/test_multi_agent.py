@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from core.agent.run import RunStatus
 from core.agent.run_engine import (
-    RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks, _child_runs,
+    RunEngine, _active_runs, _agent_run_events, _run_waiters, _run_tasks, _child_runs,
     _MAX_RESUME_INPUT_CHARS, cleanup_fan_in_tasks,
 )
 from core.events.models import StreamEvent, StreamEventType
@@ -21,14 +21,14 @@ from core.events.models import StreamEvent, StreamEventType
 @pytest.fixture(autouse=True)
 def clean_state():
     _active_runs.clear()
-    _run_events.clear()
+    _agent_run_events.clear()
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
     cleanup_fan_in_tasks()
     yield
     _active_runs.clear()
-    _run_events.clear()
+    _agent_run_events.clear()
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
@@ -149,7 +149,7 @@ class TestMultiAgentE2E:
         assert parent.status == RunStatus.COMPLETED
 
         # Verify child output was captured
-        child_events = _run_events.get(child.run_id, [])
+        child_events = _agent_run_events.get(child.run_id, [])
         child_text = "".join(
             ev.get("data", {}).get("chunk", "")
             for ev in child_events if ev.get("event_type") == "text_delta"

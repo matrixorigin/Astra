@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-# Patterns that should never be persisted into memories.
+# Patterns that should never be persisted into mem_memories.
 _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("email", re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}")),
     ("phone", re.compile(r"\b\d{3}[-.]?\d{3,4}[-.]?\d{4}\b")),

@@ -73,7 +73,7 @@ class TimeMachine(DbConsumer):
 
             if session_id:
                 query = text(f"""
-                    SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
+                    SELECT {cols} FROM agent_events {{SNAPSHOT = '{checkpoint_name}'}}
                     WHERE session_id = :session_id
                     ORDER BY created_at DESC
                     LIMIT :lim
@@ -81,7 +81,7 @@ class TimeMachine(DbConsumer):
                 rows = db.execute(query, {"session_id": session_id, "lim": limit}).fetchall()
             else:
                 query = text(f"""
-                    SELECT {cols} FROM conversation_events {{SNAPSHOT = '{checkpoint_name}'}}
+                    SELECT {cols} FROM agent_events {{SNAPSHOT = '{checkpoint_name}'}}
                     ORDER BY created_at DESC
                     LIMIT :lim
                 """)

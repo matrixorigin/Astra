@@ -49,7 +49,7 @@ class TestCriticalPathVerification:
             db = db_factory()
             try:
                 db.execute(
-                    text("DELETE FROM memories WHERE memory_id IN :ids"),
+                    text("DELETE FROM mem_memories WHERE memory_id IN :ids"),
                     {"ids": tuple(memory_ids)}
                 )
                 db.commit()

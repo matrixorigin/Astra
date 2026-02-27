@@ -11,7 +11,7 @@ from api.models._constants import EMBEDDING_DIM
 
 
 class ContextSnapshot(Base):
-    __tablename__ = "context_snapshots"
+    __tablename__ = "ctx_snapshots"
     context_capture_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), nullable=False, index=True)
     event_id = Column(String(36), nullable=False, index=True)
@@ -33,7 +33,7 @@ class ContextSnapshot(Base):
 
 
 class DecisionAudit(Base):
-    __tablename__ = "decision_audit"
+    __tablename__ = "ctx_decision_audits"
     decision_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), nullable=False, index=True)
     event_id = Column(String(36), nullable=True, index=True)
@@ -49,7 +49,7 @@ class DecisionAudit(Base):
 
 
 class EventEmbedding(Base):
-    __tablename__ = "event_embeddings"
+    __tablename__ = "ctx_event_embeddings"
     event_id = Column(String(36), primary_key=True)
     embedding = Column(VectorType(EMBEDDING_DIM, VectorPrecision.F32))
     model_name = Column(String(50))
@@ -60,7 +60,7 @@ class EventEmbedding(Base):
 
 
 class PromptTemplate(Base):
-    __tablename__ = "prompt_templates"
+    __tablename__ = "ctx_prompt_templates"
     template_id = Column(String(64), primary_key=True)
     version = Column(String(32), nullable=False)
     content = Column(Text, nullable=False)
@@ -72,7 +72,7 @@ class PromptTemplate(Base):
 
 
 class PromptVariant(Base):
-    __tablename__ = "prompt_variants"
+    __tablename__ = "ctx_prompt_variants"
     __table_args__ = (
         UniqueConstraint('prompt_template_id', 'version', name='uq_template_version'),
     )

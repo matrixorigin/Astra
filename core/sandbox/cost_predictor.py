@@ -50,7 +50,7 @@ class BranchCostPredictor(DbConsumer):
             try:
                 sql = text("""
                     SELECT AVG(total_tokens) as avg_tokens
-                    FROM llm_call_logs
+                    FROM eval_llm_call_logs
                     WHERE total_tokens > 0
                 """)
                 result = db.execute(sql).scalar()
@@ -65,7 +65,7 @@ class BranchCostPredictor(DbConsumer):
                 sql = text("""
                     SELECT AVG(cnt) FROM (
                         SELECT session_id, COUNT(*) as cnt
-                        FROM conversation_events
+                        FROM agent_events
                         WHERE event_type IN ('user_query', 'llm_response')
                         GROUP BY session_id
                     ) sub

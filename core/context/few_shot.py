@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class FewShotRetriever(DbConsumer):
-    """Retrieve high-quality examples from llm_feedback for few-shot prompting."""
+    """Retrieve high-quality examples from eval_llm_feedback for few-shot prompting."""
 
     def __init__(self, db_factory: DbFactory, min_rating: int = 4, max_examples: int = 2):
         super().__init__(db_factory)
@@ -23,7 +23,7 @@ class FewShotRetriever(DbConsumer):
         self.max_examples = max_examples
 
     def retrieve(self, query: str, task_type: str | None = None) -> list[dict[str, Any]]:
-        """Find similar high-rated examples via conversation_events.
+        """Find similar high-rated examples via agent_events.
 
         Strategy: feedback → context_snapshot → event → find user query + next agent response.
         Falls back gracefully if no feedback data exists.
@@ -32,10 +32,10 @@ class FewShotRetriever(DbConsumer):
             try:
                 sql = """
                     SELECT f.rating, e_user.content AS user_query, e_agent.content AS agent_response
-                    FROM llm_feedback f
-                    JOIN context_snapshots cs ON f.llm_request_id = cs.llm_request_id
-                    JOIN conversation_events e_user ON cs.event_id = e_user.event_id
-                    LEFT JOIN conversation_events e_agent
+                    FROM eval_llm_feedback f
+                    JOIN ctx_snapshots cs ON f.llm_request_id = cs.llm_request_id
+                    JOIN agent_events e_user ON cs.event_id = e_user.event_id
+                    LEFT JOIN agent_events e_agent
                         ON e_agent.parent_event_id = e_user.event_id
                         AND e_agent.event_type = 'llm_response'
                     WHERE f.rating >= :min_rating AND e_user.content IS NOT NULL

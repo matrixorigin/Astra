@@ -55,7 +55,7 @@ def create_trigger(
 
     db.execute(
         text(
-            "INSERT INTO triggers "
+            "INSERT INTO wf_triggers "
             "(trigger_id, user_id, agent_id, trigger_type, name, user_input, context, "
             " cron_expr, secret, session_id, next_fire_at, is_active, created_at) "
             "VALUES (:tid, :uid, :aid, :tt, :name, :input, :ctx, "
@@ -85,7 +85,7 @@ def create_trigger(
 
 def get_trigger(db: Session, trigger_id: str) -> dict | None:
     row = db.execute(
-        text("SELECT * FROM triggers WHERE trigger_id = :tid"),
+        text("SELECT * FROM wf_triggers WHERE trigger_id = :tid"),
         {"tid": trigger_id},
     ).mappings().first()
     return dict(row) if row else None
@@ -94,7 +94,7 @@ def get_trigger(db: Session, trigger_id: str) -> dict | None:
 def list_triggers(db: Session, user_id: str) -> list[dict]:
     rows = db.execute(
         text("SELECT trigger_id, trigger_type, name, agent_id, is_active, cron_expr, next_fire_at "
-             "FROM triggers WHERE user_id = :uid ORDER BY created_at DESC"),
+             "FROM wf_triggers WHERE user_id = :uid ORDER BY created_at DESC"),
         {"uid": user_id},
     ).mappings().fetchall()
     return [dict(r) for r in rows]
@@ -102,7 +102,7 @@ def list_triggers(db: Session, user_id: str) -> list[dict]:
 
 def delete_trigger(db: Session, trigger_id: str) -> bool:
     result = db.execute(
-        text("DELETE FROM triggers WHERE trigger_id = :tid"),
+        text("DELETE FROM wf_triggers WHERE trigger_id = :tid"),
         {"tid": trigger_id},
     )
     db.commit()
@@ -166,7 +166,7 @@ def advance_schedule(db: Session, trigger_id: str) -> None:
     now = datetime.now(timezone.utc)
     next_fire = croniter(trig["cron_expr"], now).get_next(datetime)
     db.execute(
-        text("UPDATE triggers SET next_fire_at = :nf WHERE trigger_id = :tid"),
+        text("UPDATE wf_triggers SET next_fire_at = :nf WHERE trigger_id = :tid"),
         {"nf": next_fire, "tid": trigger_id},
     )
     db.commit()
@@ -185,7 +185,7 @@ def claim_and_advance(db: Session, trigger_id: str) -> bool:
     next_fire = croniter(trig["cron_expr"], now).get_next(datetime)
     result = db.execute(
         text(
-            "UPDATE triggers SET next_fire_at = :nf "
+            "UPDATE wf_triggers SET next_fire_at = :nf "
             "WHERE trigger_id = :tid AND next_fire_at <= :now"
         ),
         {"nf": next_fire, "tid": trigger_id, "now": now},
@@ -203,7 +203,7 @@ def get_due_triggers(db: Session) -> list[str]:
     """Get all active schedule triggers whose next_fire_at <= now."""
     rows = db.execute(
         text(
-            "SELECT trigger_id FROM triggers "
+            "SELECT trigger_id FROM wf_triggers "
             "WHERE trigger_type = 'schedule' AND is_active = 1 "
             "AND next_fire_at <= :now"
         ),

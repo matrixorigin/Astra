@@ -23,7 +23,7 @@ def db(db_session):
     })
     db_session.execute(
         text("""
-        INSERT INTO configs (config_id, key_name, scope_type, scope_user_id, value) 
+        INSERT INTO infra_configs (config_id, key_name, scope_type, scope_user_id, value) 
         VALUES (:config_id, :key_name, :scope_type, :scope_user_id, :value) 
         ON DUPLICATE KEY UPDATE value = :value2
         """),
@@ -44,10 +44,10 @@ def db(db_session):
         "pricing": {"prompt": 0.03, "completion": 0.06},
         "is_active": True,
     }])
-    db_session.execute(text("DELETE FROM configs WHERE key_name = 'model_registry' AND scope_type = 'global'"))
+    db_session.execute(text("DELETE FROM infra_configs WHERE key_name = 'model_registry' AND scope_type = 'global'"))
     db_session.execute(
         text("""
-        INSERT INTO configs (config_id, key_name, scope_type, scope_user_id, value)
+        INSERT INTO infra_configs (config_id, key_name, scope_type, scope_user_id, value)
         VALUES ('test_model_reg', 'model_registry', 'global', NULL, :value)
         """),
         {"value": models_json},
@@ -55,8 +55,8 @@ def db(db_session):
     db_session.commit()
     yield db_session
     # Cleanup
-    db_session.execute(text("DELETE FROM llm_call_logs WHERE event_id LIKE 'test_%'"))
-    db_session.execute(text("DELETE FROM configs WHERE config_id IN ('test_llm_config_001', 'test_model_reg')"))
+    db_session.execute(text("DELETE FROM eval_llm_call_logs WHERE event_id LIKE 'test_%'"))
+    db_session.execute(text("DELETE FROM infra_configs WHERE config_id IN ('test_llm_config_001', 'test_model_reg')"))
     db_session.commit()
 
 
@@ -112,7 +112,7 @@ def test_get_call_logs_by_user(client, db):
     # Insert test logs
     db.execute(
         text("""
-        INSERT INTO llm_call_logs (
+        INSERT INTO eval_llm_call_logs (
             log_id, event_id, user_id, provider, model,
             tokens_prompt, tokens_completion, tokens_total,
             cost_usd, latency_ms, status, created_at

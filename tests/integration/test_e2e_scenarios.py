@@ -220,7 +220,7 @@ class TestScenario2_DecisionAudit:
     Verifies the core promise: every decision binds to a data snapshot.
     """
 
-    def test_decision_audit_trail(self, client, auth_headers):
+    def test_ctx_decision_audits_trail(self, client, auth_headers):
         """Create snapshot → record decision → audit with context."""
         h = auth_headers
 
@@ -309,7 +309,7 @@ class TestScenario3_ClosedLoop:
             eid = generate_id()
             cid = generate_id()
             db_session.execute(text("""
-                INSERT INTO conversation_events
+                INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, causal_chain_id, quality_score,
                  llm_model_used, created_at)
@@ -360,7 +360,7 @@ class TestScenario3_ClosedLoop:
 class TestScenario4_EvaluationQueries:
     """Quality trend, drift signals, calibration, session scores — all via API.
 
-    These are read-only endpoints that aggregate data from conversation_events.
+    These are read-only endpoints that aggregate data from agent_events.
     """
 
     def test_quality_trend(self, client, auth_headers, db_session):
@@ -372,7 +372,7 @@ class TestScenario4_EvaluationQueries:
         for qs in [4.0, 4.5, 3.0, 5.0]:
             eid = generate_id()
             db_session.execute(text("""
-                INSERT INTO conversation_events
+                INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, causal_chain_id, quality_score,
                  training_eligible, created_at)
@@ -418,7 +418,7 @@ class TestScenario4_EvaluationQueries:
         cid = generate_id()
         eid = generate_id()
         db_session.execute(text("""
-            INSERT INTO conversation_events
+            INSERT INTO agent_events
             (event_id, session_id, user_id, agent_id, agent_version,
              event_type, content, causal_chain_id, quality_score, created_at)
             VALUES (:eid, :sid, 'system', 'system', '1.0.0',

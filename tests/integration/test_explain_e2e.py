@@ -45,7 +45,7 @@ class TestExplainE2E:
             db = db_factory()
             try:
                 db.execute(
-                    text("DELETE FROM memories WHERE memory_id IN :ids"),
+                    text("DELETE FROM mem_memories WHERE memory_id IN :ids"),
                     {"ids": tuple(memory_ids)}
                 )
                 db.commit()
@@ -181,7 +181,7 @@ class TestExplainE2E:
         db = db_factory()
         try:
             rows = db.execute(
-                text("SELECT memory_id FROM memories WHERE user_id = :uid"),
+                text("SELECT memory_id FROM mem_memories WHERE user_id = :uid"),
                 {"uid": user_id}
             ).fetchall()
             for row in rows:

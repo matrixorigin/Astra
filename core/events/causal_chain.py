@@ -55,7 +55,7 @@ class CausalChainManager(DbConsumer):
         """
         with self._db() as db:
             query = text("""
-                SELECT * FROM conversation_events
+                SELECT * FROM agent_events
                 WHERE parent_event_id = :event_id
                 ORDER BY created_at ASC
             """)

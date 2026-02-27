@@ -48,7 +48,7 @@ class MemoryProvenance(DbConsumer):
         with self._db() as db:
             rows = db.execute(text(f"""
                 SELECT memory_id, content, memory_type, initial_confidence, observed_at
-                FROM memories {{timestamp = '{ts_str}'}}
+                FROM mem_memories {{timestamp = '{ts_str}'}}
                 WHERE user_id = :uid AND is_active = 1
                 ORDER BY observed_at DESC LIMIT :lim
             """), {"uid": user_id, "lim": limit}).fetchall()
@@ -68,7 +68,7 @@ class MemoryProvenance(DbConsumer):
         with self._db() as db:
             rows = db.execute(text("""
                 SELECT memory_id, content, memory_type, initial_confidence, observed_at
-                FROM memories
+                FROM mem_memories
                 WHERE user_id = :uid
                   AND observed_at BETWEEN :before AND :after
                 ORDER BY observed_at
@@ -83,7 +83,7 @@ class MemoryProvenance(DbConsumer):
         """Rollback to just before a specific memory was written."""
         with self._db() as db:
             row = db.execute(text(
-                "SELECT observed_at FROM memories WHERE memory_id = :mid"
+                "SELECT observed_at FROM mem_memories WHERE memory_id = :mid"
             ), {"mid": memory_id}).fetchone()
             if not row or not row.observed_at:
                 return False
@@ -95,7 +95,7 @@ class MemoryProvenance(DbConsumer):
         ts_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
         try:
             self._exec_ddl(
-                f"restore database {self.db_name} table memories "
+                f"restore database {self.db_name} table mem_memories "
                 f"from pitr memory_pitr '{ts_str}'"
             )
             logger.info("Rolled back memories to %s", ts_str)
@@ -108,7 +108,7 @@ class MemoryProvenance(DbConsumer):
         """Restore memories table from a named snapshot."""
         try:
             self._exec_ddl(
-                f"restore account sys database {self.db_name} table memories "
+                f"restore account sys database {self.db_name} table mem_memories "
                 f"from snapshot {snapshot_name}"
             )
             logger.info("Rolled back memories to snapshot %s", snapshot_name)
@@ -141,7 +141,7 @@ class MemoryProvenance(DbConsumer):
         """Get source event IDs for a memory."""
         with self._db() as db:
             row = db.execute(text(
-                "SELECT source_event_ids FROM memories WHERE memory_id = :mid"
+                "SELECT source_event_ids FROM mem_memories WHERE memory_id = :mid"
             ), {"mid": memory_id}).fetchone()
         if not row or not row.source_event_ids:
             return []

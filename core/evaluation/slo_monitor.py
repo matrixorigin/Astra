@@ -147,7 +147,7 @@ class SLOMonitor(DbConsumer):
                     AND JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.hallucination_detected')) = 'true'
                     THEN 1 ELSE 0 END) * 1.0 / NULLIF(COUNT(*), 0) AS hallucination_rate,
                 COUNT(*) AS total_responses
-            FROM conversation_events
+            FROM agent_events
             WHERE agent_id = :agent_id
               AND event_type = 'llm_response'
               AND created_at >= DATE_SUB(NOW(), INTERVAL :days DAY)
@@ -309,14 +309,14 @@ class SLOMonitor(DbConsumer):
         """Find most recent skill/prompt change (global, not agent-specific).
         
         Returns change metadata to bind as suspected regression source.
-        Note: skills_registry and prompt_templates are global resources without agent_id,
+        Note: skill_registry and ctx_prompt_templates are global resources without agent_id,
         so this returns the most recent change across all agents within 7 days.
         """
         try:
             # Find most recent skill change
             skill_row = db.execute(text("""
                 SELECT skill_name, version, updated_at
-                FROM skills_registry
+                FROM skill_registry
                 WHERE updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
                 ORDER BY updated_at DESC
                 LIMIT 1
@@ -325,7 +325,7 @@ class SLOMonitor(DbConsumer):
             # Find most recent prompt change
             prompt_row = db.execute(text("""
                 SELECT template_id, version, created_at
-                FROM prompt_templates
+                FROM ctx_prompt_templates
                 WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
                 ORDER BY created_at DESC
                 LIMIT 1
@@ -366,7 +366,7 @@ class SLOMonitor(DbConsumer):
             from core.utils.id_generator import generate_id
             eid = generate_id()
             db.execute(text("""
-                INSERT INTO conversation_events
+                INSERT INTO agent_events
                     (event_id, session_id, user_id, agent_id, agent_version,
                      event_type, content, causal_chain_id, created_at)
                 VALUES

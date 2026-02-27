@@ -32,7 +32,7 @@ class TokenResolver(DbConsumer):
         """Resolve repo token with priority fallback.
 
         Priority:
-        1. Repo-specific token (from repos.token_id)
+        1. Repo-specific token (from infra_repos.token_id)
         2. User default token (scope_user_id, no scope_repo)
         3. Global fallback (if config allows)
         """
@@ -121,7 +121,7 @@ class TokenResolver(DbConsumer):
     def _get_repo_specific_token(
         self, repo_id: str | None, repo_url: str | None, user_id: str
     ) -> Token | None:
-        """Get repo-specific token from repos table."""
+        """Get repo-specific token from infra_repos table."""
         with self._db() as db:
             from api.models import Repo as RepoModel
             from api.models import Token as TokenModel
@@ -156,7 +156,7 @@ class TokenResolver(DbConsumer):
         """Get global fallback token."""
         with self._db() as db:
             query = """
-                SELECT * FROM tokens
+                SELECT * FROM auth_tokens
                 WHERE type = 'repo'
                   AND scope_user_id IS NULL
                   AND scope_repo IS NULL
@@ -178,7 +178,7 @@ class TokenResolver(DbConsumer):
 
         with self._db() as db:
             result = db.execute(
-                text("SELECT value FROM configs WHERE key_name = 'allow_global_repo_token'")
+                text("SELECT value FROM infra_configs WHERE key_name = 'allow_global_repo_token'")
             ).first()
 
             if not result:

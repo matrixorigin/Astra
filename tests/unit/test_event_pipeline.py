@@ -157,17 +157,17 @@ class TestFlushCritical:
 
 
 class TestDoFlush:
-    def test_critical_routes_to_conversation_events(self, fake_db):
+    def test_critical_routes_to_agent_events(self, fake_db):
         factory, sessions = fake_db
         pipeline = EventPipeline(factory)
         db = factory()
         ev = _make_event(EventType.USER_QUERY)
         pipeline._do_flush(db, [ev])
-        # Should have executed INSERT for conversation_events
+        # Should have executed INSERT for agent_events
         assert db.committed == 1
         assert len(db.executed) == 1  # 1 CE insert, 0 RE
 
-    def test_durable_routes_to_conversation_events(self, fake_db):
+    def test_durable_routes_to_agent_events(self, fake_db):
         factory, _ = fake_db
         pipeline = EventPipeline(factory)
         db = factory()
@@ -186,7 +186,7 @@ class TestDoFlush:
         assert db.committed == 0
         assert len(db.executed) == 0
 
-    def test_ephemeral_with_run_id_routes_to_run_events(self, fake_db):
+    def test_ephemeral_with_run_id_routes_to_agent_run_events(self, fake_db):
         factory, _ = fake_db
         pipeline = EventPipeline(factory)
         db = factory()

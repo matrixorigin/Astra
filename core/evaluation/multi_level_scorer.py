@@ -34,7 +34,7 @@ def score_chain(db: Session, causal_chain_id: str, session_id: str) -> dict[str,
     rows = db.execute(
         text("""
             SELECT event_id, quality_score
-            FROM conversation_events
+            FROM agent_events
             WHERE causal_chain_id = :cid AND quality_score IS NOT NULL
             ORDER BY created_at ASC
         """),
@@ -80,7 +80,7 @@ def score_session(db: Session, session_id: str) -> dict[str, Any] | None:
     rows = db.execute(
         text("""
             SELECT target_id, score, step_count, failure_count
-            FROM quality_assessments
+            FROM eval_quality_assessments
             WHERE session_id = :sid AND level = 'chain'
             ORDER BY created_at ASC
         """),
@@ -118,7 +118,7 @@ def _upsert_assessment(
     """Insert or update a quality assessment row.
 
     MatrixOne does not support ON DUPLICATE KEY UPDATE when the conflict is on
-    a unique key but not the primary key.  quality_assessments has PK =
+    a unique key but not the primary key.  eval_quality_assessments has PK =
     assessment_id (always new uuid) and UK = (level, target_id), so we must
     use SELECT + INSERT/UPDATE.
     """
@@ -128,14 +128,14 @@ def _upsert_assessment(
     details = _json_dumps(result.get("details"))
 
     row = db.execute(
-        text("SELECT assessment_id FROM quality_assessments "
+        text("SELECT assessment_id FROM eval_quality_assessments "
              "WHERE level = :lvl AND target_id = :tid"),
         {"lvl": level, "tid": target_id},
     ).fetchone()
 
     if row:
         db.execute(
-            text("UPDATE quality_assessments "
+            text("UPDATE eval_quality_assessments "
                  "SET score = :score, step_count = :sc, failure_count = :fc, "
                  "details = :details, updated_at = :now "
                  "WHERE assessment_id = :aid"),
@@ -144,7 +144,7 @@ def _upsert_assessment(
         )
     else:
         db.execute(
-            text("INSERT INTO quality_assessments "
+            text("INSERT INTO eval_quality_assessments "
                  "(assessment_id, level, target_id, session_id, score, "
                  "step_count, failure_count, details, created_at, updated_at) "
                  "VALUES (:aid, :lvl, :tid, :sid, :score, :sc, :fc, "

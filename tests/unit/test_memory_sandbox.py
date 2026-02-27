@@ -88,17 +88,17 @@ class TestRetrievalScore:
         mock_db.execute.return_value.fetchall.return_value = [
             MagicMock(sim=0.8), MagicMock(sim=0.6),
         ]
-        score = sandbox._retrieval_score("memories", "u1", "query", [0.1] * 10)
+        score = sandbox._retrieval_score("mem_memories", "u1", "query", [0.1] * 10)
         assert score == 0.7  # (0.8 + 0.6) / 2
 
     def test_without_embedding(self, sandbox, mock_db):
         mock_db.execute.return_value.fetchall.return_value = [
             MagicMock(sim=0.9),
         ]
-        score = sandbox._retrieval_score("memories", "u1", "query", None)
+        score = sandbox._retrieval_score("mem_memories", "u1", "query", None)
         assert score == 0.9
 
     def test_empty_returns_zero(self, sandbox, mock_db):
         mock_db.execute.return_value.fetchall.return_value = []
-        score = sandbox._retrieval_score("memories", "u1", "query", [0.1] * 10)
+        score = sandbox._retrieval_score("mem_memories", "u1", "query", [0.1] * 10)
         assert score == 0.0

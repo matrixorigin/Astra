@@ -68,8 +68,8 @@ class SandboxCleaner(DbConsumer):
         with self._db() as db:
             try:
                 r = db.execute(text(f"""
-                    SELECT m.sandbox_name FROM {self.source_db}.sandbox_metadata m
-                    JOIN sessions s ON m.session_id = s.session_id
+                    SELECT m.sandbox_name FROM {self.source_db}.infra_sandbox_metadata m
+                    JOIN agent_sessions s ON m.session_id = s.session_id
                     WHERE m.status = 'active' AND s.status = 'closed'
                 """))
                 return [row._mapping["sandbox_name"] for row in r]
@@ -81,8 +81,8 @@ class SandboxCleaner(DbConsumer):
         with self._db() as db:
             try:
                 r = db.execute(text(f"""
-                    SELECT m.sandbox_name FROM {self.source_db}.sandbox_metadata m
-                    JOIN sessions s ON m.session_id = s.session_id
+                    SELECT m.sandbox_name FROM {self.source_db}.infra_sandbox_metadata m
+                    JOIN agent_sessions s ON m.session_id = s.session_id
                     WHERE m.status = 'active' AND s.status = 'active'
                       AND s.updated_at < :cutoff
                 """), {"cutoff": cutoff})
@@ -95,7 +95,7 @@ class SandboxCleaner(DbConsumer):
         with self._db() as db:
             try:
                 r = db.execute(text(f"""
-                    SELECT sandbox_name FROM {self.source_db}.sandbox_metadata
+                    SELECT sandbox_name FROM {self.source_db}.infra_sandbox_metadata
                     WHERE status = 'active' AND session_id IS NULL
                       AND updated_at < :cutoff
                 """), {"cutoff": cutoff})
@@ -119,7 +119,7 @@ class SandboxCleaner(DbConsumer):
                 known = set()
                 try:
                     r = db.execute(text(
-                        f"SELECT sandbox_name FROM {self.source_db}.sandbox_metadata"
+                        f"SELECT sandbox_name FROM {self.source_db}.infra_sandbox_metadata"
                     ))
                     known = {row._mapping["sandbox_name"] for row in r}
                 except Exception:

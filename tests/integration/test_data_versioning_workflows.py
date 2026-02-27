@@ -229,7 +229,7 @@ class TestTrainingDataPipeline:
         lineage = DatasetLineage(
             dataset_id="dataset_001",
             source_branch="dataset_dataset_001",
-            source_table="conversation_events",
+            source_table="agent_events",
             extraction_query="SELECT * FROM ...",
             extracted_at=datetime.utcnow(),
             row_count=100,
@@ -316,8 +316,8 @@ class TestDataVersioningIntegration:
         lineage = DatasetLineage(
             dataset_id="dataset_001",
             source_branch="dataset_dataset_001",
-            source_table="conversation_events",
-            extraction_query="SELECT * FROM conversation_events WHERE quality_score > 0.75",
+            source_table="agent_events",
+            extraction_query="SELECT * FROM agent_events WHERE quality_score > 0.75",
             extracted_at=datetime.utcnow(),
             row_count=1000,
             metadata={

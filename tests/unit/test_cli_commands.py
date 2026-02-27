@@ -204,9 +204,9 @@ class TestAdminCLIToAPI:
         assert "tok-1" in result.output
         assert "openai" in result.output
 
-    def test_audit_logs_calls_api_client(self, runner, mock_admin_api_client):
+    def test_auth_audit_logs_calls_api_client(self, runner, mock_admin_api_client):
         """Test audit logs command calls API client."""
-        mock_admin_api_client.admin_audit_logs.return_value = [
+        mock_admin_api_client.admin_auth_audit_logs.return_value = [
             {"user_id": "alice", "action": "login", "timestamp": "2026-02-23T10:00:00Z"},
             {"user_id": "bob", "action": "create_session", "timestamp": "2026-02-23T11:00:00Z"},
         ]
@@ -214,7 +214,7 @@ class TestAdminCLIToAPI:
         result = runner.invoke(admin_cli, ["audit", "logs", "--user", "alice"])
         
         assert result.exit_code == 0
-        mock_admin_api_client.admin_audit_logs.assert_called_once()
+        mock_admin_api_client.admin_auth_audit_logs.assert_called_once()
         assert "alice" in result.output
         assert "login" in result.output
 

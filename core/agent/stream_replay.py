@@ -1,8 +1,8 @@
 """Stream replay engine for reconstructing streams from logged events.
 
 Supports two replay paths:
-1. Chunk-level: Read stream_text_delta from run_events (high fidelity)
-2. Full-text fallback: Read llm_response from conversation_events
+1. Chunk-level: Read stream_text_delta from agent_run_events (high fidelity)
+2. Full-text fallback: Read llm_response from agent_events
 
 Chunk-level replay is gated on run completion to avoid partial reads.
 Falls back to full-text when chunks are missing or run is incomplete.
@@ -37,8 +37,8 @@ class StreamReplay(DbConsumer):
     ) -> AsyncIterator[StreamEvent]:
         """Replay stream from logged events.
 
-        If run_id is provided, attempts chunk-level replay from run_events first.
-        Falls back to full-text replay from conversation_events.
+        If run_id is provided, attempts chunk-level replay from agent_run_events first.
+        Falls back to full-text replay from agent_events.
 
         Args:
             session_id: Session to replay
@@ -48,7 +48,7 @@ class StreamReplay(DbConsumer):
         Yields:
             StreamEvent: Reconstructed stream events
         """
-        # Try chunk-level replay from run_events
+        # Try chunk-level replay from agent_run_events
         if run_id:
             chunks = self._load_run_chunks(run_id)
             if chunks is not None:
@@ -58,13 +58,13 @@ class StreamReplay(DbConsumer):
                 return
             # chunks is None → run not complete or not found; fall back
             logger.warning(
-                "No chunks in run_events for run %s, falling back to full-text", run_id
+                "No chunks in agent_run_events for run %s, falling back to full-text", run_id
             )
             for event in self._replay_fulltext_by_run(run_id):
                 yield event
             return
 
-        # Legacy path: stream_* events from conversation_events
+        # Legacy path: stream_* events from agent_events
         events = self._query_stream_events(session_id, causal_chain_id)
         for event in events:
             stream_event = self._reconstruct_stream_event(event)
@@ -140,20 +140,20 @@ class StreamReplay(DbConsumer):
 
         return state
 
-    # ── Chunk-level replay (run_events) ───────────────────────
+    # ── Chunk-level replay (agent_run_events) ───────────────────────
 
     _TERMINAL_TYPES = ("run_completed", "run_failed", "run_cancelled",
                        "stream_run_finished", "stream_run_error")
 
     def _is_run_complete(self, run_id: str) -> bool:
-        """Check if run has a terminal event in run_events."""
+        """Check if run has a terminal event in agent_run_events."""
         with self._db() as db:
             placeholders = ", ".join(f":t{i}" for i in range(len(self._TERMINAL_TYPES)))
             params = {f"t{i}": t for i, t in enumerate(self._TERMINAL_TYPES)}
             params["run_id"] = run_id
             row = db.execute(
                 text(
-                    f"SELECT 1 FROM run_events "
+                    f"SELECT 1 FROM agent_run_events "
                     f"WHERE run_id = :run_id AND event_type IN ({placeholders}) LIMIT 1"
                 ),
                 params,
@@ -161,7 +161,7 @@ class StreamReplay(DbConsumer):
             return row is not None
 
     def _load_run_chunks(self, run_id: str) -> list[StreamEvent] | None:
-        """Load chunk-level events from run_events.
+        """Load chunk-level events from agent_run_events.
 
         Returns:
             list[StreamEvent]: Events (possibly empty) if run is complete.
@@ -174,7 +174,7 @@ class StreamReplay(DbConsumer):
 
             rows = db.execute(
                 text(
-                    "SELECT event_type, data, event_id, agent_id FROM run_events "
+                    "SELECT event_type, data, event_id, agent_id FROM agent_run_events "
                     "WHERE run_id = :run_id AND idx >= 0 ORDER BY idx"
                 ),
                 {"run_id": run_id},
@@ -201,10 +201,10 @@ class StreamReplay(DbConsumer):
 
             return events
 
-    # ── Full-text fallback (conversation_events) ──────────────
+    # ── Full-text fallback (agent_events) ──────────────
 
     def _replay_fulltext_by_run(self, run_id: str) -> list[StreamEvent]:
-        """Replay from llm_response events in conversation_events for a run.
+        """Replay from llm_response events in agent_events for a run.
 
         Synthesizes stream events from full-text responses when chunk-level
         data is unavailable (crash recovery, missing chunks).
@@ -213,7 +213,7 @@ class StreamReplay(DbConsumer):
             rows = db.execute(
                 text(
                     "SELECT event_id, content, agent_id, causal_chain_id "
-                    "FROM conversation_events "
+                    "FROM agent_events "
                     "WHERE run_id = :run_id AND event_type = 'llm_response' "
                     "ORDER BY created_at"
                 ),
@@ -233,7 +233,7 @@ class StreamReplay(DbConsumer):
                 events.append(StreamEvent(event_type=StreamEventType.TEXT_MESSAGE_END, data={}, **kwargs))
             return events
 
-    # ── Legacy path (stream_* in conversation_events) ─────────
+    # ── Legacy path (stream_* in agent_events) ─────────
 
     def _query_stream_events(
         self,
@@ -241,7 +241,7 @@ class StreamReplay(DbConsumer):
         causal_chain_id: str | None = None,
         before_timestamp: datetime | None = None,
     ) -> list[Event]:
-        """Query stream events from conversation_events (legacy path)."""
+        """Query stream events from agent_events (legacy path)."""
         with self._db() as db:
             conditions = [
                 Event.session_id == session_id,

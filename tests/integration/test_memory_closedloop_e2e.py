@@ -731,7 +731,7 @@ class TestSessionSummaryWiring:
 
             # Check memories table for session summary
             row = db.execute(text(
-                "SELECT memory_id, content, session_id FROM memories "
+                "SELECT memory_id, content, session_id FROM mem_memories "
                 "WHERE user_id = 'summary_wiring_test' AND content LIKE '%session_summary%' "
                 "ORDER BY created_at DESC LIMIT 1"
             )).fetchone()

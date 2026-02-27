@@ -28,7 +28,7 @@ def test_user(db_session):
     existing = repo.get_by_username(username)
     if existing:
         from sqlalchemy import text as _text
-        db_session.execute(_text("DELETE FROM user_roles WHERE user_id = :uid"), {"uid": existing.user_id})
+        db_session.execute(_text("DELETE FROM auth_user_roles WHERE user_id = :uid"), {"uid": existing.user_id})
         repo.delete(existing.user_id)
         db_session.commit()
     
@@ -49,7 +49,7 @@ def test_user(db_session):
     # Cleanup (user_roles first due to FK)
     try:
         from sqlalchemy import text as _text
-        db_session.execute(_text("DELETE FROM user_roles WHERE user_id = :uid"), {"uid": user.user_id})
+        db_session.execute(_text("DELETE FROM auth_user_roles WHERE user_id = :uid"), {"uid": user.user_id})
         repo.delete(user.user_id)
         db_session.commit()
     except:
@@ -82,16 +82,16 @@ def admin_headers(client, test_user, db_session):
     seed_roles(db_session)
 
     role = db_session.execute(
-        text("SELECT role_id FROM roles WHERE role_name = 'mo_agent_admin' LIMIT 1")
+        text("SELECT role_id FROM auth_roles WHERE role_name = 'mo_agent_admin' LIMIT 1")
     ).fetchone()
     if role:
         existing = db_session.execute(
-            text("SELECT 1 FROM user_roles WHERE user_id = :uid AND role_id = :rid"),
+            text("SELECT 1 FROM auth_user_roles WHERE user_id = :uid AND role_id = :rid"),
             {"uid": test_user.user_id, "rid": role[0]},
         ).fetchone()
         if not existing:
             db_session.execute(
-                text("INSERT INTO user_roles (user_id, role_id) VALUES (:uid, :rid)"),
+                text("INSERT INTO auth_user_roles (user_id, role_id) VALUES (:uid, :rid)"),
                 {"uid": test_user.user_id, "rid": role[0]},
             )
             db_session.commit()

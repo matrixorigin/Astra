@@ -132,7 +132,7 @@ class InputFaceLearner(DbConsumer):
                 text("""
                     SELECT f.prompt_template_id, COUNT(*) as cnt,
                            AVG(f.rating) as avg_rating
-                    FROM llm_feedback f
+                    FROM eval_llm_feedback f
                     WHERE f.rating <= 2
                       AND f.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
                       AND f.prompt_template_id IS NOT NULL
@@ -192,8 +192,8 @@ class InputFaceLearner(DbConsumer):
                            SUM(CASE WHEN cs.truncated_sections IS NOT NULL
                                      AND cs.truncated_sections != '[]' THEN 1 ELSE 0 END) as truncated,
                            AVG(COALESCE(f.rating, 3)) as avg_rating
-                    FROM context_snapshots cs
-                    LEFT JOIN llm_feedback f ON cs.llm_request_id = f.llm_request_id
+                    FROM ctx_snapshots cs
+                    LEFT JOIN eval_llm_feedback f ON cs.llm_request_id = f.llm_request_id
                     WHERE cs.created_at > DATE_SUB(UTC_TIMESTAMP(), INTERVAL :days DAY)
                     GROUP BY cs.task_type
                     HAVING truncated > total * 0.3 OR avg_rating < 2.5
@@ -355,7 +355,7 @@ class InputFaceLearner(DbConsumer):
                     eid = generate_id()
                     db.execute(
                         text("""
-                            INSERT INTO conversation_events
+                            INSERT INTO agent_events
                             (event_id, session_id, user_id, agent_id, agent_version,
                              event_type, content, causal_chain_id, created_at)
                             VALUES (:eid, 'system', 'system', 'system', '1.0.0',
@@ -397,7 +397,7 @@ class InputFaceLearner(DbConsumer):
                 eid = generate_id()
                 db.execute(
                     text("""
-                        INSERT INTO conversation_events
+                        INSERT INTO agent_events
                         (event_id, session_id, user_id, agent_id, agent_version,
                          event_type, content, causal_chain_id, created_at)
                         VALUES (:eid, 'system', 'system', 'system', '1.0.0',

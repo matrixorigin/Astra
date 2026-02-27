@@ -10,7 +10,7 @@ Backends:
     (pluggable)      — Celery, APScheduler, Temporal, K8s CronJob, etc.
 
 Distributed safety:
-    - DB table lock (distributed_locks) with heartbeat renewal
+    - DB table lock (infra_distributed_locks) with heartbeat renewal
     - Atomic CAS for expired lock takeover
     - Safe across multi-worker / multi-instance deployments
     - Controlled via GOVERNANCE_ENABLED env var
@@ -243,7 +243,7 @@ class GovernanceTaskRunner:
         # Slow path: atomic CAS — take over only if expired
         result = db.execute(
             text(
-                "UPDATE distributed_locks "
+                "UPDATE infra_distributed_locks "
                 "SET instance_id = :iid, acquired_at = :now, expires_at = :exp "
                 "WHERE lock_name = :name AND expires_at < :now"
             ),
@@ -256,7 +256,7 @@ class GovernanceTaskRunner:
     def _release(db: Session, lock_name: str) -> None:
         try:
             db.execute(
-                text("DELETE FROM distributed_locks WHERE lock_name = :name"),
+                text("DELETE FROM infra_distributed_locks WHERE lock_name = :name"),
                 {"name": lock_name},
             )
             db.commit()
@@ -297,7 +297,7 @@ class GovernanceTaskRunner:
                     new_exp = datetime.now() + timedelta(seconds=LOCK_TTL)
                     db.execute(
                         text(
-                            "UPDATE distributed_locks "
+                            "UPDATE infra_distributed_locks "
                             "SET expires_at = :exp "
                             "WHERE lock_name = :name AND instance_id = :iid"
                         ),

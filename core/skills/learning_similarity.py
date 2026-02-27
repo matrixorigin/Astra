@@ -96,7 +96,7 @@ def semantic_similarity_map(
                 SELECT learning_id, similarity FROM (
                     SELECT learning_id,
                            1.0 / (1.0 + L2_DISTANCE(query_embedding, :vec)) AS similarity
-                    FROM skill_selection_learning
+                    FROM skill_selection_learnings
                     WHERE query_embedding IS NOT NULL
                 ) ranked
                 WHERE similarity >= :threshold

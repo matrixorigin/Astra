@@ -185,7 +185,7 @@ async def test_admin_methods(mock_credentials_path: Path):
         assert hasattr(client, "admin_init")
         assert hasattr(client, "admin_create_token")
         assert hasattr(client, "admin_list_tokens")
-        assert hasattr(client, "admin_audit_logs")
+        assert hasattr(client, "admin_auth_audit_logs")
         assert hasattr(client, "admin_optimize_prompt")
         assert hasattr(client, "admin_feedback_stats")
         assert hasattr(client, "admin_feedback_export")

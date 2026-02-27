@@ -9,8 +9,7 @@ from api.base import Base
 
 
 class QualityAssessment(Base):
-    """Multi-level quality assessment (chain / session)."""
-    __tablename__ = "quality_assessments"
+    __tablename__ = "eval_quality_assessments"
     __table_args__ = (
         UniqueConstraint("level", "target_id", name="uq_level_target"),
         Index("ix_qa_session_level", "session_id", "level"),
@@ -29,8 +28,7 @@ class QualityAssessment(Base):
 
 
 class GateResult(Base):
-    """Unified gate validation results for all change types."""
-    __tablename__ = "gate_results"
+    __tablename__ = "eval_gate_results"
 
     gate_id = Column(String(36), primary_key=True)
     change_type = Column(String(20), nullable=False)
@@ -45,7 +43,7 @@ class GateResult(Base):
 
 
 class LLMFeedback(Base):
-    __tablename__ = "llm_feedback"
+    __tablename__ = "eval_llm_feedback"
     feedback_id = Column(String(36), primary_key=True)
     prompt_template_id = Column(String(64), nullable=False, index=True)
     prompt_version = Column(String(32), nullable=False)
@@ -57,7 +55,7 @@ class LLMFeedback(Base):
 
 
 class LLMCallLog(Base):
-    __tablename__ = "llm_call_logs"
+    __tablename__ = "eval_llm_call_logs"
     log_id = Column(String(36), primary_key=True)
     event_id = Column(String(36), index=True)
     user_id = Column(String(36), index=True)
@@ -75,7 +73,7 @@ class LLMCallLog(Base):
 
 
 class UserFeedback(Base):
-    __tablename__ = "user_feedback"
+    __tablename__ = "eval_user_feedback"
     __table_args__ = (
         Index("ix_feedback_agent_created", "agent_id", "created_at"),
     )
@@ -91,8 +89,7 @@ class UserFeedback(Base):
 
 
 class TrainingData(Base):
-    """Training data extracted from sessions with quality filtering."""
-    __tablename__ = "training_data"
+    __tablename__ = "eval_training_data"
     data_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), nullable=False, index=True)
     input_text = Column(Text, nullable=False)
@@ -100,44 +97,4 @@ class TrainingData(Base):
     quality = Column(String(20), nullable=False)
     contamination_score = Column(Float, nullable=False, default=0.0)
     content_hash = Column(String(64), unique=True, nullable=False)
-    created_at = Column(DateTime, default=func.now())
-
-
-class ModelQualityMetric(Base):
-    """Model routing quality and cost tracking."""
-    __tablename__ = "model_quality_metrics"
-    metric_id = Column(String(36), primary_key=True)
-    task_type = Column(String(50), nullable=False, index=True)
-    model = Column(String(100), nullable=False, index=True)
-    quality_score = Column(Float, nullable=False)
-    cost = Column(Float, nullable=False)
-    recorded_at = Column(DateTime, default=func.now())
-
-
-class AdversarialAttack(Base):
-    """Adversarial attack evaluation results."""
-    __tablename__ = "adversarial_attacks"
-    attack_id = Column(String(36), primary_key=True)
-    agent_id = Column(String(36), nullable=False, index=True)
-    attack_type = Column(String(50), nullable=False)
-    success = Column(SmallInteger, nullable=False)
-    severity = Column(String(20), nullable=False)
-    evidence = Column(Text)
-    recorded_at = Column(DateTime, default=func.now())
-
-
-class ModelArtifact(Base):
-    """Trained model artifacts with versioning and lifecycle."""
-    __tablename__ = "model_artifacts"
-    artifact_id = Column(String(36), primary_key=True)
-    model_name = Column(String(128), nullable=False, index=True)
-    version = Column(String(32), nullable=False)
-    base_model = Column(String(128))
-    artifact_path = Column(Text, nullable=False)
-    artifact_format = Column(String(32), default="onnx")
-    metrics = Column(JSON)
-    training_config = Column(JSON)
-    dataset_size = Column(Integer)
-    is_active = Column(SmallInteger, default=0, index=True)
-    created_by = Column(String(36))
     created_at = Column(DateTime, default=func.now())

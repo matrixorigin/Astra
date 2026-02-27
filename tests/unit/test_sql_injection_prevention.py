@@ -19,10 +19,10 @@ class TestSQLInjectionPrevention:
         """Test invalid identifiers are rejected."""
         # SQL injection attempts
         with pytest.raises(ValueError, match="Invalid identifier"):
-            validate_identifier("'; DROP TABLE users--")
+            validate_identifier("'; DROP TABLE auth_users--")
         
         with pytest.raises(ValueError, match="Invalid identifier"):
-            validate_identifier("table; DELETE FROM users")
+            validate_identifier("table; DELETE FROM auth_users")
         
         with pytest.raises(ValueError, match="Invalid identifier"):
             validate_identifier("table UNION SELECT * FROM passwords")
@@ -70,7 +70,7 @@ class TestSQLInjectionPrevention:
         
         # SQL injection attempts should be rejected
         with pytest.raises(ValueError):
-            sandbox.create("'; DROP TABLE users--")
+            sandbox.create("'; DROP TABLE auth_users--")
         
         with pytest.raises(ValueError):
             sandbox.create("test; DELETE FROM events")
@@ -87,7 +87,7 @@ class TestSQLInjectionPrevention:
         sandbox = Sandbox(lambda: mock_db)
         
         with pytest.raises(ValueError):
-            sandbox.delete("'; DROP TABLE users--")
+            sandbox.delete("'; DROP TABLE auth_users--")
 
     def test_sandbox_use_sql_injection(self):
         """Test sandbox use rejects SQL injection attempts."""
@@ -98,7 +98,7 @@ class TestSQLInjectionPrevention:
         sandbox = Sandbox(lambda: mock_db)
         
         with pytest.raises(ValueError):
-            sandbox.use("'; DROP TABLE users--")
+            sandbox.use("'; DROP TABLE auth_users--")
 
     def test_add_table_sql_injection(self):
         """Test add_table rejects SQL injection via Branch._qualify → validate_identifier."""
@@ -109,7 +109,7 @@ class TestSQLInjectionPrevention:
         sandbox = Sandbox(lambda: mock_db)
         
         with pytest.raises(ValueError):
-            sandbox.add_table("'; DROP TABLE users--", "t1")
+            sandbox.add_table("'; DROP TABLE auth_users--", "t1")
         
         with pytest.raises(ValueError):
-            sandbox.add_table("sandbox1", "'; DROP TABLE users--")
+            sandbox.add_table("sandbox1", "'; DROP TABLE auth_users--")

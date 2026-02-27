@@ -27,7 +27,7 @@ def db_session():
 
 @pytest.fixture(autouse=True)
 def seed_skill_definition(db_session, test_user):
-    """Insert a public skill in skills_registry so install works."""
+    """Insert a public skill in skill_registry so install works."""
     from api.models import SkillRegistry, SkillInstallation, UserCredential
 
     # Clean up

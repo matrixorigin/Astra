@@ -69,8 +69,8 @@ class TrainingDataPipeline(DbConsumer):
             rows = db.execute(
                 text(
                     "SELECT e1.event_id, e1.content, e2.content "
-                    "FROM conversation_events e1 "
-                    "JOIN conversation_events e2 ON e1.event_id = e2.parent_event_id "
+                    "FROM agent_events e1 "
+                    "JOIN agent_events e2 ON e1.event_id = e2.parent_event_id "
                     "WHERE e1.session_id = :session_id "
                     "AND e1.event_type = 'user_query' "
                     "AND e2.event_type = 'llm_response'"

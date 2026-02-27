@@ -321,7 +321,7 @@ class TestStreamingVerificationIntegration:
         # Update metadata
         db_session.execute(
             text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET metadata = :metadata 
                 WHERE event_id = :event_id
             """),
@@ -335,7 +335,7 @@ class TestStreamingVerificationIntegration:
         # Verify metadata was stored
         result = db_session.execute(
             text("""
-                SELECT metadata FROM conversation_events 
+                SELECT metadata FROM agent_events 
                 WHERE event_id = :event_id
             """),
             {"event_id": response_event.event_id},

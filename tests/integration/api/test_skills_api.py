@@ -16,13 +16,13 @@ def cleanup_skills():
     db = next(get_db_session())
     
     # Clean before
-    db.execute(text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
+    db.execute(text('DELETE FROM skill_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
     db.commit()
     
     yield
     
     # Clean after
-    db.execute(text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
+    db.execute(text('DELETE FROM skill_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
     db.commit()
     db.close()
 

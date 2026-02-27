@@ -82,12 +82,12 @@ class DataContext(DbConsumer):
             db.commit()
             db.execute(text(f"CREATE DATABASE IF NOT EXISTS {self.sandbox_name}"))
             db.commit()
-            # Register in sandbox_metadata for cleanup tracking
+            # Register in infra_sandbox_metadata for cleanup tracking
             try:
                 import json
                 db.execute(
                     text(f"""
-                        INSERT INTO {self.source_db}.sandbox_metadata
+                        INSERT INTO {self.source_db}.infra_sandbox_metadata
                         (sandbox_name, user_id, data_source, description, created_by,
                          created_at, updated_at, tags, source_database, status, session_id)
                         VALUES (:name, 'system', :ds, 'code_executor sandbox', 'system',
@@ -178,7 +178,7 @@ class DataContext(DbConsumer):
                 # Clean metadata
                 try:
                     db.execute(text(
-                        f"DELETE FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :n"
+                        f"DELETE FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :n"
                     ), {"n": self.sandbox_name})
                     db.commit()
                 except Exception:

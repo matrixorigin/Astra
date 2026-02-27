@@ -39,13 +39,13 @@ class PromptManager(DbConsumer):
         try:
             if version:
                 query = text("""
-                    SELECT content FROM prompt_templates
+                    SELECT content FROM ctx_prompt_templates
                     WHERE template_id = :template_id AND version = :version
                 """)
                 params = {"template_id": template_id, "version": version}
             else:
                 query = text("""
-                    SELECT content FROM prompt_templates
+                    SELECT content FROM ctx_prompt_templates
                     WHERE template_id = :template_id AND is_active = 1
                     ORDER BY created_at DESC LIMIT 1
                 """)
@@ -84,13 +84,13 @@ class PromptManager(DbConsumer):
                 # If active, deactivate others
                 if is_active:
                     db.execute(
-                        text("UPDATE prompt_templates SET is_active = 0 WHERE template_id = :template_id"),
+                        text("UPDATE ctx_prompt_templates SET is_active = 0 WHERE template_id = :template_id"),
                         {"template_id": template_id}
                     )
 
                 db.execute(
                     text("""
-                    INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+                    INSERT INTO ctx_prompt_templates (template_id, version, content, is_active, created_at, updated_at)
                     VALUES (:template_id, :version, :content, :is_active, NOW(), NOW())
                     ON DUPLICATE KEY UPDATE
                         version = VALUES(version),
@@ -154,7 +154,7 @@ class PromptManager(DbConsumer):
                 # Find current active version
                 current = db.execute(
                     text("""
-                        SELECT version, created_at FROM prompt_templates
+                        SELECT version, created_at FROM ctx_prompt_templates
                         WHERE template_id = :tid AND is_active = 1
                         ORDER BY created_at DESC LIMIT 1
                     """),
@@ -168,7 +168,7 @@ class PromptManager(DbConsumer):
                 # Find previous version
                 previous = db.execute(
                     text("""
-                        SELECT version FROM prompt_templates
+                        SELECT version FROM ctx_prompt_templates
                         WHERE template_id = :tid AND is_active = 0
                         ORDER BY created_at DESC LIMIT 1
                     """),
@@ -181,11 +181,11 @@ class PromptManager(DbConsumer):
 
                 # Deactivate current, activate previous
                 db.execute(
-                    text("UPDATE prompt_templates SET is_active = 0 WHERE template_id = :tid AND version = :ver"),
+                    text("UPDATE ctx_prompt_templates SET is_active = 0 WHERE template_id = :tid AND version = :ver"),
                     {"tid": template_id, "ver": current.version},
                 )
                 db.execute(
-                    text("UPDATE prompt_templates SET is_active = 1 WHERE template_id = :tid AND version = :ver"),
+                    text("UPDATE ctx_prompt_templates SET is_active = 1 WHERE template_id = :tid AND version = :ver"),
                     {"tid": template_id, "ver": previous.version},
                 )
                 db.commit()
@@ -353,7 +353,7 @@ class PromptFeedback(DbConsumer):
                     AVG(rating) as avg_rating,
                     MIN(rating) as min_rating,
                     MAX(rating) as max_rating
-                FROM llm_feedback
+                FROM eval_llm_feedback
                 {where_clause}
                 """),
                 params
@@ -363,7 +363,7 @@ class PromptFeedback(DbConsumer):
             result = db.execute(
                 text(f"""
                 SELECT rating, COUNT(*) as count
-                FROM llm_feedback
+                FROM eval_llm_feedback
                 {where_clause}
                 GROUP BY rating
                 ORDER BY rating
@@ -395,7 +395,7 @@ class PromptFeedback(DbConsumer):
                     comment,
                     metadata,
                     created_at
-                FROM llm_feedback
+                FROM eval_llm_feedback
                 WHERE prompt_template_id = :template_id AND rating <= :threshold
                 ORDER BY created_at DESC
                 LIMIT :limit

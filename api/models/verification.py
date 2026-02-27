@@ -7,8 +7,7 @@ from api.base import Base
 
 
 class HallucinationCheck(Base):
-    """Hallucination firewall verification results."""
-    __tablename__ = "hallucination_checks"
+    __tablename__ = "verify_hallucination_checks"
     check_id = Column(String(64), primary_key=True)
     session_id = Column(String(36), nullable=False, index=True)
     event_id = Column(String(36), nullable=False, index=True)
@@ -23,8 +22,7 @@ class HallucinationCheck(Base):
 
 
 class ClaimEvidence(Base):
-    """Hallucination firewall claim evidence."""
-    __tablename__ = "claim_evidence"
+    __tablename__ = "verify_claim_evidence"
     evidence_id = Column(Integer, primary_key=True, autoincrement=True)
     check_id = Column(String(64), nullable=False, index=True)
     claim_type = Column(String(50), nullable=False)

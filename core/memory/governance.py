@@ -117,7 +117,7 @@ class GovernanceScheduler(DbConsumer):
         """Daily governance for ALL users. Used by scheduler."""
         combined = GovernanceCycleResult()
         with self._db() as db:
-            rows = db.execute(text("SELECT DISTINCT user_id FROM memories WHERE is_active = 1")).fetchall()
+            rows = db.execute(text("SELECT DISTINCT user_id FROM mem_memories WHERE is_active = 1")).fetchall()
         for (uid,) in rows:
             r = self.run_daily(uid)
             combined.cleaned_stale += r.cleaned_stale
@@ -171,7 +171,7 @@ class GovernanceScheduler(DbConsumer):
         ttl = self.config.tool_result_ttl_hours
         with self._db() as db:
             result = db.execute(text("""
-                DELETE FROM memories
+                DELETE FROM mem_memories
                 WHERE memory_type = :mtype
                   AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :ttl
             """), {"mtype": "tool_result", "ttl": ttl})
@@ -186,7 +186,7 @@ class GovernanceScheduler(DbConsumer):
         stale_hours = self.config.working_memory_stale_hours
         with self._db() as db:
             result = db.execute(text("""
-                UPDATE memories SET is_active = 0, updated_at = NOW()
+                UPDATE mem_memories SET is_active = 0, updated_at = NOW()
                 WHERE memory_type = 'working' AND is_active = 1
                   AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :stale_hours
             """), {"stale_hours": stale_hours})
@@ -200,7 +200,7 @@ class GovernanceScheduler(DbConsumer):
         """Delete inactive memories with low initial_confidence (already superseded)."""
         with self._db() as db:
             result = db.execute(text("""
-                DELETE FROM memories
+                DELETE FROM mem_memories
                 WHERE user_id = :uid
                   AND is_active = 0
                   AND initial_confidence < :threshold
@@ -220,7 +220,7 @@ class GovernanceScheduler(DbConsumer):
             for tier in TrustTier:
                 hl = TRUST_TIER_HALF_LIVES[tier]
                 result = db.execute(text("""
-                    UPDATE memories SET is_active = 0, updated_at = NOW()
+                    UPDATE mem_memories SET is_active = 0, updated_at = NOW()
                     WHERE user_id = :uid AND is_active = 1
                       AND COALESCE(trust_tier, 'T3') = :tier
                       AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / :hl)) < :threshold

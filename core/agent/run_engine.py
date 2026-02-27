@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 
 # In-memory: only for THIS worker's active runs (not shared across workers)
 _active_runs: dict[str, AgentRun] = {}
-_run_events: dict[str, list[dict]] = {}  # local buffer, also persisted to DB
+_agent_run_events: dict[str, list[dict]] = {}  # local buffer, also persisted to DB
 _run_waiters: dict[str, asyncio.Event] = {}
 _run_tasks: dict[str, asyncio.Task] = {}
 _child_runs: dict[str, set[str]] = {}  # parent_run_id → {child_run_ids}
@@ -32,8 +32,11 @@ _fan_in_tasks: set[asyncio.Task] = set()  # Track fan-in tasks for cleanup
 def cleanup_fan_in_tasks() -> None:
     """Cancel all pending fan-in tasks. Call during shutdown or test teardown."""
     for t in list(_fan_in_tasks):
-        if not t.done():
-            t.cancel()
+        try:
+            if not t.done():
+                t.cancel()
+        except RuntimeError:
+            pass  # event loop already closed
     _fan_in_tasks.clear()
 
 
@@ -63,7 +66,7 @@ def cleanup_run_tasks() -> None:
 
     _run_tasks.clear()
     _active_runs.clear()
-    _run_events.clear()
+    _agent_run_events.clear()
     _run_waiters.clear()
     _child_runs.clear()
 
@@ -74,7 +77,7 @@ _MAX_RESUME_INPUT_CHARS = 4000
 _MAX_COMPLETED_RUNS = 500
 # Periodic GC interval in seconds
 _GC_INTERVAL_SECONDS = 300
-# Batch flush threshold for run_events (streaming events)
+# Batch flush threshold for agent_run_events (streaming events)
 _RUN_EVENT_FLUSH_SIZE = 20
 # Hard cap on pending inserts to prevent unbounded memory growth during DB outages.
 _MAX_PENDING_EVENTS = 500
@@ -90,7 +93,7 @@ async def _periodic_gc() -> None:
             await asyncio.sleep(_GC_INTERVAL_SECONDS)
             RunEngine._maybe_gc()
             gc.collect()
-            logger.debug(f"Periodic GC: {len(_active_runs)} active runs, {len(_run_events)} event buffers")
+            logger.debug(f"Periodic GC: {len(_active_runs)} active runs, {len(_agent_run_events)} event buffers")
         except asyncio.CancelledError:
             logger.info("Periodic GC task cancelled")
             break
@@ -156,7 +159,7 @@ class RunEngine(DbConsumer):
         )
         self._log_run_event(run, EventType.RUN_STARTED)
         _active_runs[run.run_id] = run
-        _run_events[run.run_id] = []
+        _agent_run_events[run.run_id] = []
         _run_waiters[run.run_id] = asyncio.Event()
         return run
 
@@ -198,16 +201,16 @@ class RunEngine(DbConsumer):
         return child
 
     def _load_agent_prompt(self, agent_id: str) -> str | None:
-        """Load system_prompt from agents table config."""
+        """Load system_prompt from agent_agents table config."""
         config = self._load_agent_config(agent_id)
         return config.get("system_prompt") if config else None
 
     def _load_agent_config(self, agent_id: str) -> dict | None:
-        """Load agent_config from agents table."""
+        """Load agent_config from agent_agents table."""
         try:
             with self._db() as db:
                 row = db.execute(
-                    text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
+                    text("SELECT agent_config FROM agent_agents WHERE agent_id = :aid"),
                     {"aid": agent_id},
                 ).fetchone()
                 if row and row[0]:
@@ -285,7 +288,7 @@ class RunEngine(DbConsumer):
             })
             raise
         finally:
-            self._flush_run_events()
+            self._flush_agent_run_events()
             # Shutdown EventPipeline
             try:
                 _pipeline = getattr(getattr(loop, 'event_logger', None), '_pipeline', None) if loop else None
@@ -358,7 +361,7 @@ class RunEngine(DbConsumer):
             run = self.restore_run(run_id)
             if run and run.status == RunStatus.WAITING:
                 _active_runs[run_id] = run
-                _run_events.setdefault(run_id, [])
+                _agent_run_events.setdefault(run_id, [])
                 _run_waiters.setdefault(run_id, asyncio.Event())
             else:
                 logger.warning(f"Cannot resume run {run_id}: not found or not waiting")
@@ -453,8 +456,8 @@ class RunEngine(DbConsumer):
 
     def _cancel_workflow(self, wf_id: str) -> None:
         """Propagate cancel to a workflow and its in-memory state."""
-        from core.agent.async_tools import _workflow_runs, _workflow_waits
-        entry = _workflow_runs.pop(wf_id, None)
+        from core.agent.async_tools import _wf_runs, _workflow_waits
+        entry = _wf_runs.pop(wf_id, None)
         if entry and entry.get("engine"):
             entry["engine"].cancel(entry["workflow"].name)
         to_remove = [h for h, wid in _workflow_waits.items() if wid == wf_id]
@@ -463,7 +466,7 @@ class RunEngine(DbConsumer):
         try:
             with self._db() as db:
                 db.execute(
-                    text("UPDATE workflow_runs SET status='cancelled', error='Cancelled by user' "
+                    text("UPDATE wf_runs SET status='cancelled', error='Cancelled by user' "
                          "WHERE run_id = :wf_id AND status IN ('running','waiting')"),
                     {"wf_id": wf_id},
                 )
@@ -498,9 +501,9 @@ class RunEngine(DbConsumer):
     def get_run(self, run_id: str) -> AgentRun | None:
         return _active_runs.get(run_id)
 
-    def get_run_events(self, run_id: str, after_index: int = 0) -> list[dict]:
+    def get_agent_run_events(self, run_id: str, after_index: int = 0) -> list[dict]:
         """Get events — local buffer first, DB fallback for cross-worker."""
-        events = _run_events.get(run_id)
+        events = _agent_run_events.get(run_id)
         if events is not None:
             return events[after_index:]
         # Cross-worker: read from DB
@@ -516,7 +519,7 @@ class RunEngine(DbConsumer):
             pass
         return _active_runs.get(run_id)
 
-    async def stream_run_events(self, run_id: str, last_index: int = 0) -> AsyncIterator[dict]:
+    async def stream_agent_run_events(self, run_id: str, last_index: int = 0) -> AsyncIterator[dict]:
         """Yield events as they arrive. Cross-worker safe via DB polling."""
         idx = last_index
         max_idle_polls = 3000  # ~5 min at 0.1s interval
@@ -526,9 +529,9 @@ class RunEngine(DbConsumer):
 
         while idle_count < max_idle_polls:
             # Re-check each iteration (run may be GC'd mid-stream)
-            local = run_id in _run_events
+            local = run_id in _agent_run_events
             if local:
-                events = _run_events.get(run_id, [])
+                events = _agent_run_events.get(run_id, [])
             else:
                 events = self._load_events_from_db(run_id, 0)
 
@@ -562,7 +565,7 @@ class RunEngine(DbConsumer):
         a short-lived session is acquired, all pending INSERTs are executed,
         committed, and the session is released.
         """
-        events = _run_events.setdefault(run_id, [])
+        events = _agent_run_events.setdefault(run_id, [])
         idx = len(events)
         events.append(sse)
         self._pending_inserts.append({
@@ -574,9 +577,9 @@ class RunEngine(DbConsumer):
             "agent_id": sse.get("agent_id"),
         })
         if len(self._pending_inserts) >= _RUN_EVENT_FLUSH_SIZE:
-            self._flush_run_events()
+            self._flush_agent_run_events()
 
-    def _flush_run_events(self, *, _retried: bool = False) -> None:
+    def _flush_agent_run_events(self, *, _retried: bool = False) -> None:
         """Commit all pending run_event INSERTs using a short-lived session.
 
         On failure, retries once with a fresh session (handles transient
@@ -592,7 +595,7 @@ class RunEngine(DbConsumer):
                 for row in batch:
                     db.execute(
                         text(
-                            "INSERT INTO run_events (run_id, idx, event_type, data, event_id, agent_id) "
+                            "INSERT INTO agent_run_events (run_id, idx, event_type, data, event_id, agent_id) "
                             "VALUES (:run_id, :idx, :event_type, :data, :event_id, :agent_id)"
                         ),
                         row,
@@ -608,7 +611,7 @@ class RunEngine(DbConsumer):
                     merged = merged[-_MAX_PENDING_EVENTS:]
                     logger.warning("Pending event buffer capped: %d oldest events dropped", dropped)
                 self._pending_inserts = merged
-                self._flush_run_events(_retried=True)
+                self._flush_agent_run_events(_retried=True)
             else:
                 logger.error("Event batch commit failed after retry, %d events dropped: %s", len(batch), e)
 
@@ -618,7 +621,7 @@ class RunEngine(DbConsumer):
             with self._db() as db:
                 rows = db.execute(
                     text(
-                        "SELECT event_type, data, event_id, agent_id FROM run_events "
+                        "SELECT event_type, data, event_id, agent_id FROM agent_run_events "
                         "WHERE run_id = :run_id AND idx >= :after "
                         "ORDER BY idx"
                     ),
@@ -651,7 +654,7 @@ class RunEngine(DbConsumer):
         with self._db() as db:
             try:
                 row = db.execute(
-                    text("SELECT MIN(idx) FROM run_events "
+                    text("SELECT MIN(idx) FROM agent_run_events "
                          "WHERE run_id = :run_id AND event_type = 'resume_claim'"),
                     {"run_id": run_id},
                 ).fetchone()
@@ -660,7 +663,7 @@ class RunEngine(DbConsumer):
 
                 db.execute(
                     text(
-                        "INSERT INTO run_events (run_id, idx, event_type, data) "
+                        "INSERT INTO agent_run_events (run_id, idx, event_type, data) "
                         "VALUES (:run_id, :idx, 'resume_claim', :data)"
                     ),
                     {
@@ -686,7 +689,7 @@ class RunEngine(DbConsumer):
             with self._db() as db:
                 row = db.execute(
                     text(
-                        "SELECT 1 FROM conversation_events "
+                        "SELECT 1 FROM agent_events "
                         "WHERE event_type = :et AND run_id = :run_id "
                         "LIMIT 1"
                     ),
@@ -701,7 +704,7 @@ class RunEngine(DbConsumer):
             with self._db() as db:
                 row = db.execute(
                     text(
-                        "SELECT run_id FROM conversation_events "
+                        "SELECT run_id FROM agent_events "
                         "WHERE event_type = :et AND waiting_for = :handle "
                         "ORDER BY created_at DESC LIMIT 1"
                     ),
@@ -715,7 +718,7 @@ class RunEngine(DbConsumer):
     # ── Internal ──────────────────────────────────────────────
 
     def _complete_run(self, run: AgentRun) -> None:
-        self._flush_run_events()  # Flush any remaining buffered events before marking complete
+        self._flush_agent_run_events()  # Flush any remaining buffered events before marking complete
         run.status = RunStatus.COMPLETED
         run.completed_at = datetime.now(timezone.utc)
         self._log_run_event(run, EventType.RUN_COMPLETED)
@@ -751,7 +754,7 @@ class RunEngine(DbConsumer):
                 return  # Still waiting for some children
 
             # Collect output — prefer text_done full_text, also gather tool_result
-            child_events = _run_events.get(cid)
+            child_events = _agent_run_events.get(cid)
             if child_events is None:
                 child_events = self._load_events_from_db(cid, 0)
             final_text = ""
@@ -787,7 +790,7 @@ class RunEngine(DbConsumer):
             with self._db() as db:
                 rows = db.execute(
                     text(
-                        "SELECT DISTINCT run_id FROM conversation_events "
+                        "SELECT DISTINCT run_id FROM agent_events "
                         "WHERE event_type = :et "
                         "AND parent_run_id = :pid"
                     ),
@@ -861,7 +864,7 @@ class RunEngine(DbConsumer):
         to_remove = len(completed) - _MAX_COMPLETED_RUNS
         for rid, _ in completed[:to_remove]:
             _active_runs.pop(rid, None)
-            _run_events.pop(rid, None)
+            _agent_run_events.pop(rid, None)
             _run_waiters.pop(rid, None)
 
     @staticmethod
@@ -878,12 +881,12 @@ class RunEngine(DbConsumer):
     # ── State Recovery ────────────────────────────────────────
 
     def restore_run(self, run_id: str) -> AgentRun | None:
-        """Restore run state from conversation_events."""
+        """Restore run state from agent_events."""
         try:
             with self._db() as db:
                 rows = db.execute(
                     text(
-                        "SELECT event_type, content, `metadata` FROM conversation_events "
+                        "SELECT event_type, content, `metadata` FROM agent_events "
                         "WHERE JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :run_id "
                         "ORDER BY created_at"
                     ),

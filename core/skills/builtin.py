@@ -192,7 +192,7 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
 
     async def execute(self, input: CIStatusInput) -> CIStatusOutput:
         """Execute the skill"""
-        runs = await self.github.list_workflow_runs(input.repo_id, input.limit)
+        runs = await self.github.list_wf_runs(input.repo_id, input.limit)
 
         workflows = [
             {

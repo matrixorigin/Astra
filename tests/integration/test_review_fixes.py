@@ -123,18 +123,18 @@ class TestEventFieldConsistency:
     @pytest.fixture(autouse=True)
     def clean_state(self):
         from core.agent.run_engine import (
-            _active_runs, _run_events, _child_runs, _run_waiters, _run_tasks,
+            _active_runs, _agent_run_events, _child_runs, _run_waiters, _run_tasks,
             cleanup_fan_in_tasks,
         )
         _active_runs.clear()
-        _run_events.clear()
+        _agent_run_events.clear()
         _child_runs.clear()
         _run_waiters.clear()
         _run_tasks.clear()
         cleanup_fan_in_tasks()
         yield
         _active_runs.clear()
-        _run_events.clear()
+        _agent_run_events.clear()
         _child_runs.clear()
         _run_waiters.clear()
         _run_tasks.clear()
@@ -154,7 +154,7 @@ class TestEventFieldConsistency:
     async def test_fan_in_reads_chunk_key(self, engine):
         """_check_fan_in collects child output from data['chunk'], not data['text']."""
         from core.agent.run_engine import (
-            _active_runs, _run_events, _child_runs, AgentRun, RunStatus,
+            _active_runs, _agent_run_events, _child_runs, AgentRun, RunStatus,
         )
 
         parent = engine.create_run(session_id="s1", user_id="u1", user_input="review all")
@@ -171,7 +171,7 @@ class TestEventFieldConsistency:
         _active_runs[child_id] = child
 
         # Child events use 'chunk' key (matching real ChatLoop output)
-        _run_events[child_id] = [
+        _agent_run_events[child_id] = [
             {"event_type": "text_delta", "data": {"chunk": "All looks "}},
             {"event_type": "text_delta", "data": {"chunk": "good!"}},
         ]
@@ -188,7 +188,7 @@ class TestEventFieldConsistency:
     async def test_fan_in_old_text_key_gives_empty(self, engine):
         """Verify that old 'text' key would NOT be collected (regression guard)."""
         from core.agent.run_engine import (
-            _active_runs, _run_events, _child_runs, AgentRun, RunStatus,
+            _active_runs, _agent_run_events, _child_runs, AgentRun, RunStatus,
         )
 
         parent = engine.create_run(session_id="s1", user_id="u1", user_input="review")
@@ -205,7 +205,7 @@ class TestEventFieldConsistency:
         _active_runs[child_id] = child
 
         # Simulate OLD format with 'text' key — should NOT be collected
-        _run_events[child_id] = [
+        _agent_run_events[child_id] = [
             {"event_type": "text_delta", "data": {"text": "this should be lost"}},
         ]
 

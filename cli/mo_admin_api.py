@@ -157,7 +157,7 @@ def audit():
 @click.option("--since", default=None)
 @click.option("--limit", default=50)
 @click.pass_context
-def audit_logs(ctx, user, action, since, limit):
+def auth_audit_logs(ctx, user, action, since, limit):
     """View audit logs."""
     client = ctx.obj["client"]
     require_auth(client)
@@ -168,7 +168,7 @@ def audit_logs(ctx, user, action, since, limit):
             since_date = datetime.strptime(since, "%Y-%m-%d").isoformat()
         
         # API only accepts user_id, since, limit - not action
-        logs = client.admin_audit_logs(
+        logs = client.admin_auth_audit_logs(
             user_id=user,
             since=since_date,
             limit=limit,

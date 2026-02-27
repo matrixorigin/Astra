@@ -88,7 +88,7 @@ class Sandbox(DbConsumer):
             tags_json = json.dumps(tags) if tags else None
             db.execute(
                 text(f"""
-                    INSERT INTO {self.source_db}.sandbox_metadata
+                    INSERT INTO {self.source_db}.infra_sandbox_metadata
                     (sandbox_name, user_id, data_source, description, created_by,
                      created_at, updated_at, tags, source_database, source_snapshot, status, session_id)
                     VALUES (:name, :created_by, :data_source, :description, :created_by,
@@ -173,7 +173,7 @@ class Sandbox(DbConsumer):
             # Delete metadata
             try:
                 db.execute(text(
-                    f"DELETE FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :name"
+                    f"DELETE FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :name"
                 ), {"name": name})
                 db.commit()
             except Exception as e:
@@ -223,7 +223,7 @@ class Sandbox(DbConsumer):
         """Create snapshot of sandbox database state."""
         with self._db() as db:
             result = db.execute(
-                text(f"SELECT 1 FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :s"),
+                text(f"SELECT 1 FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :s"),
                 {"s": sandbox},
             )
             if not result.first():
@@ -303,7 +303,7 @@ class Sandbox(DbConsumer):
         """Get sandbox info with metadata."""
         with self._db() as db:
             result_meta = db.execute(
-                text(f"SELECT * FROM {self.source_db}.sandbox_metadata WHERE sandbox_name = :s"),
+                text(f"SELECT * FROM {self.source_db}.infra_sandbox_metadata WHERE sandbox_name = :s"),
                 {"s": sandbox},
             )
             metadata = result_meta.first()
@@ -311,7 +311,7 @@ class Sandbox(DbConsumer):
             tables = self.list_tables(sandbox)
             table_info = []
             for t in tables:
-                if t.startswith("_") or t == "sandbox_metadata":
+                if t.startswith("_") or t == "infra_sandbox_metadata":
                     continue
                 try:
                     cr = db.execute(text(f"SELECT COUNT(*) as count FROM {sandbox}.{t}"))
@@ -341,7 +341,7 @@ class Sandbox(DbConsumer):
     ) -> list[dict[str, str]]:
         """List sandboxes with filtering."""
         with self._db() as db:
-            query = f"SELECT * FROM {self.source_db}.sandbox_metadata WHERE 1=1"
+            query = f"SELECT * FROM {self.source_db}.infra_sandbox_metadata WHERE 1=1"
             params: dict = {}
 
             if prefix:
@@ -396,7 +396,7 @@ class Sandbox(DbConsumer):
 
             if updates:
                 updates.append("updated_at = CURRENT_TIMESTAMP")
-                q = f"UPDATE {self.source_db}.sandbox_metadata SET " + ", ".join(updates) + " WHERE sandbox_name = :name"
+                q = f"UPDATE {self.source_db}.infra_sandbox_metadata SET " + ", ".join(updates) + " WHERE sandbox_name = :name"
                 db.execute(text(q), params)
                 db.commit()
 
@@ -421,7 +421,7 @@ class Sandbox(DbConsumer):
         """Update updated_at timestamp."""
         with self._db() as db:
             db.execute(text(
-                f"UPDATE {self.source_db}.sandbox_metadata SET updated_at = CURRENT_TIMESTAMP(6) "
+                f"UPDATE {self.source_db}.infra_sandbox_metadata SET updated_at = CURRENT_TIMESTAMP(6) "
                 f"WHERE sandbox_name = :s"
             ), {"s": sandbox})
             db.commit()

@@ -131,9 +131,9 @@ def init_db():
     if tables_to_create:
         Base.metadata.create_all(bind=engine, tables=tables_to_create, checkfirst=True)
 
-    # Migrate: add columns merged from skill_definitions into skills_registry
-    if "skills_registry" in existing:
-        cols = {c["name"] for c in inspector.get_columns("skills_registry", schema=engine.url.database)}
+    # Migrate: add columns merged from skill_definitions into skill_registry
+    if "skill_registry" in existing:
+        cols = {c["name"] for c in inspector.get_columns("skill_registry", schema=engine.url.database)}
         with engine.begin() as conn:
             for col, ddl in [
                 ("source", "VARCHAR(20) DEFAULT 'builtin'"),
@@ -143,7 +143,7 @@ def init_db():
             ]:
                 if col not in cols:
                     try:
-                        conn.execute(text(f"ALTER TABLE skills_registry ADD COLUMN {col} {ddl}"))
+                        conn.execute(text(f"ALTER TABLE skill_registry ADD COLUMN {col} {ddl}"))
                     except Exception as e:
                         logger.warning("Migration: failed to add column %s: %s", col, e)
 
@@ -155,10 +155,10 @@ def init_db():
     # recall/speed tradeoff. We use lists=10 as a safe default for early-stage data
     # (works well up to ~10K rows). Revisit when any table exceeds 10K embeddings.
     _VECTOR_INDEXES = [
-        ("memories", "idx_memory_embedding", "memories(embedding)"),
-        ("event_embeddings", "idx_event_emb_vec", "event_embeddings(embedding)"),
+        ("mem_memories", "idx_memory_embedding", "mem_memories(embedding)"),
+        ("ctx_ctx_event_embeddings", "idx_event_emb_vec", "ctx_ctx_event_embeddings(embedding)"),
         ("sk_knowledge_entries", "idx_knowledge_emb_vec", "sk_knowledge_entries(embedding)"),
-        ("skill_selection_learning", "idx_learning_emb_vec", "skill_selection_learning(query_embedding)"),
+        ("skill_selection_learningss", "idx_learning_emb_vec", "skill_selection_learningss(query_embedding)"),
     ]
     for tbl, idx_name, idx_target in _VECTOR_INDEXES:
         if tbl in existing or tbl in {t.name for t in tables_to_create}:

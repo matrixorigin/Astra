@@ -22,7 +22,7 @@ def get_introspection_memory(
     db = SessionLocal()
     try:
         session_row = db.execute(
-            text("SELECT user_id FROM sessions WHERE session_id = :sid"),
+            text("SELECT user_id FROM agent_sessions WHERE session_id = :sid"),
             {"sid": session_id},
         ).fetchone()
         if not session_row or session_row[0] != user_id:
@@ -46,7 +46,7 @@ def _get_episodic_stats(db: Session, session_id: str) -> dict:
                     COUNT(*) as total,
                     SUM(CASE WHEN event_type = 'user_query' THEN 1 ELSE 0 END) as user_queries,
                     SUM(CASE WHEN event_type = 'tool_call' OR event_type = 'tool_result' THEN 1 ELSE 0 END) as tool_calls
-                FROM conversation_events
+                FROM agent_events
                 WHERE session_id = :sid
             """),
             {"sid": session_id},
@@ -64,25 +64,25 @@ def _get_episodic_stats(db: Session, session_id: str) -> dict:
 def _get_semantic_stats(db: Session, session_id: str) -> dict:
     """Count context snapshots and peak token total.
 
-    Uses total_tokens column from context_snapshots table
+    Uses total_tokens column from ctx_snapshots table
     (see api/models.py ContextSnapshot).
     """
     try:
         row = db.execute(
             text("""
                 SELECT COUNT(*), MAX(total_tokens)
-                FROM context_snapshots
+                FROM ctx_snapshots
                 WHERE session_id = :sid
             """),
             {"sid": session_id},
         ).fetchone()
         return {
-            "context_snapshots": row[0] or 0,
+            "ctx_snapshots": row[0] or 0,
             "peak_snapshot_tokens": row[1] or 0,
         }
     except Exception as exc:
         logger.warning("semantic stats query failed: %s", exc)
-        return {"context_snapshots": 0, "peak_snapshot_tokens": 0}
+        return {"ctx_snapshots": 0, "peak_snapshot_tokens": 0}
 
 
 def _get_procedural_stats(db: Session, session_id: str) -> dict:

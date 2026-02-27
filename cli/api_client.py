@@ -425,7 +425,7 @@ class APIClient:
         response = await self._request("GET", f"/chat/runs/{run_id}")
         return response.json()
 
-    async def stream_run_events(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
+    async def stream_agent_run_events(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
         """Stream run events (supports reconnection)."""
         if not self._client:
             raise RuntimeError("Client not initialized")
@@ -659,7 +659,7 @@ class APIClient:
         response = await self._request("GET", "/admin/tokens", params=params)
         return response.json()
 
-    async def admin_audit_logs(
+    async def admin_auth_audit_logs(
         self,
         user_id: str | None = None,
         since: str | None = None,

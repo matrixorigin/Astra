@@ -45,7 +45,7 @@ SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_a
         :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
         :w_conf * (m.initial_confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
     ) AS relevance
-FROM memories m
+FROM mem_memories m
 WHERE m.user_id = :uid AND m.is_active = 1
     AND m.memory_type IN :types
     AND MATCH(m.content) AGAINST(:query_text IN BOOLEAN MODE)
@@ -61,7 +61,7 @@ SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_a
         :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
         :w_conf * (m.initial_confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
     ) AS relevance
-FROM memories m
+FROM mem_memories m
 WHERE m.user_id = :uid AND m.is_active = 1
     AND m.memory_type IN :types
     {session_filter}
@@ -73,7 +73,7 @@ LIMIT :lim
 _VECTOR_SQL = """\
 SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id, m.trust_tier,
     L2_DISTANCE(m.embedding, :query_vec) AS l2_dist
-FROM memories m
+FROM mem_memories m
 WHERE m.user_id = :uid AND m.is_active = 1
     AND m.memory_type IN :types
     AND m.embedding IS NOT NULL

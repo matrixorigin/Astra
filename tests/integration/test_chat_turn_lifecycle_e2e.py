@@ -120,7 +120,7 @@ class TestChatTurnMultiTurnE2E:
         # ── Verify events persisted (wait for background thread) ──
         flush_persist_threads()
         event_types = db.execute(sql_text(
-            "SELECT event_type FROM conversation_events WHERE session_id = :sid ORDER BY created_at",
+            "SELECT event_type FROM agent_events WHERE session_id = :sid ORDER BY created_at",
         ), {"sid": session_id}).fetchall()
         types = [r[0] for r in event_types]
         assert "user_query" in types
@@ -130,7 +130,7 @@ class TestChatTurnMultiTurnE2E:
         # Turn 1: full assembly → snapshot. Turn 2: tool_result refresh → snapshot.
         # Turn 3: new query refresh → snapshot. Total = 3.
         snapshot_count = db.execute(sql_text(
-            "SELECT COUNT(*) FROM context_snapshots WHERE session_id = :sid",
+            "SELECT COUNT(*) FROM ctx_snapshots WHERE session_id = :sid",
         ), {"sid": session_id}).scalar()
         assert snapshot_count == 3, f"Expected 3 snapshots (one per turn), got {snapshot_count}"
 
@@ -187,7 +187,7 @@ class TestChatTurnMultiTurnE2E:
 
         # Verify tool_call and tool_result events in DB
         rows = db.execute(sql_text(
-            "SELECT event_type FROM conversation_events WHERE session_id = :sid AND event_type IN ('tool_call', 'tool_result')",
+            "SELECT event_type FROM agent_events WHERE session_id = :sid AND event_type IN ('tool_call', 'tool_result')",
         ), {"sid": session_id}).fetchall()
         types = [r[0] for r in rows]
         assert "tool_call" in types
@@ -370,7 +370,7 @@ class TestSessionCloseE2E:
 
         # DB status is closed
         row = db.execute(sql_text(
-            "SELECT status FROM sessions WHERE session_id = :sid"
+            "SELECT status FROM agent_sessions WHERE session_id = :sid"
         ), {"sid": session_id}).fetchone()
         assert row[0] == "closed"
 
@@ -547,8 +547,8 @@ class TestChatTurnExpanded:
 
     # ── 8.2: Context snapshots accumulate across turns ──
 
-    def test_context_snapshots_across_turns(self, client, db):
-        """After 3 turns, context_snapshots table has >=2 rows for this session."""
+    def test_ctx_snapshots_across_turns(self, client, db):
+        """After 3 turns, ctx_snapshots table has >=2 rows for this session."""
         headers, _ = _unique_auth(client, db, "snap")
 
         session_id = None
@@ -563,7 +563,7 @@ class TestChatTurnExpanded:
                 session_id = parse_sse_events(r.text)[0]["session_id"]
 
         count = db.execute(sql_text(
-            "SELECT COUNT(*) FROM context_snapshots WHERE session_id = :sid"
+            "SELECT COUNT(*) FROM ctx_snapshots WHERE session_id = :sid"
         ), {"sid": session_id}).scalar()
         assert count >= 2, f"Expected >=2 context snapshots after 3 turns, got {count}"
 
@@ -631,7 +631,7 @@ class TestSnapshotRecoveryFastPath:
 
         # Verify snapshot was written
         snap = db.execute(sql_text(
-            "SELECT COUNT(*) FROM conversation_events WHERE session_id = :sid AND event_type = 'session_history_snapshot'"
+            "SELECT COUNT(*) FROM agent_events WHERE session_id = :sid AND event_type = 'session_history_snapshot'"
         ), {"sid": session_id}).scalar()
         assert snap >= 1, "Snapshot should exist after 3 turns"
 
@@ -763,9 +763,9 @@ class TestResolvedModelInAudit:
         flush_persist_threads()
 
         row = db.execute(sql_text(
-            "SELECT decision_output FROM decision_audit WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"
+            "SELECT decision_output FROM ctx_decision_audits WHERE session_id = :sid ORDER BY created_at DESC LIMIT 1"
         ), {"sid": session_id}).fetchone()
-        assert row is not None, "decision_audit row should exist"
+        assert row is not None, "ctx_decision_audits row should exist"
         import json as _json
         output = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
         assert output.get("model_used") == "gpt-4o-mini", \
@@ -842,7 +842,7 @@ class TestPhasePersistenceIsolation:
         # LLM response should still be persisted (Phase 3)
         flush_persist_threads()
         row = db.execute(
-            sql_text("SELECT content FROM conversation_events WHERE user_id = :uid AND event_type = 'llm_response'"),
+            sql_text("SELECT content FROM agent_events WHERE user_id = :uid AND event_type = 'llm_response'"),
             {"uid": user_id},
         ).fetchone()
         assert row is not None, "Phase 3 (llm_response) should persist even when Phase 1 fails"

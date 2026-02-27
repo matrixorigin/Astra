@@ -79,7 +79,7 @@ class PermissionChecker(DbConsumer):
 
         return False
 
-    def can_view_audit_logs(self, user_id: str, target_user: str | None = None) -> bool:
+    def can_view_auth_audit_logs(self, user_id: str, target_user: str | None = None) -> bool:
         """Check if user can view audit logs."""
         # Admin can view all logs
         if self.is_admin(user_id):

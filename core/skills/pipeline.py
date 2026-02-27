@@ -437,7 +437,7 @@ class SkillPipeline:
             if top_skill:
                 try:
                     row = db.execute(
-                        text("SELECT version FROM skills_registry WHERE skill_name = :n AND is_active = 1 ORDER BY created_at DESC LIMIT 1"),
+                        text("SELECT version FROM skill_registry WHERE skill_name = :n AND is_active = 1 ORDER BY created_at DESC LIMIT 1"),
                         {"n": top_skill},
                     ).fetchone()
                     if row:

@@ -116,7 +116,7 @@ class ImplicitFeedbackMiner(DbConsumer):
                 text(f"""
                     SELECT e.event_id, e.session_id, e.event_type, e.content,
                            e.parent_event_id, e.created_at
-                    FROM conversation_events e
+                    FROM agent_events e
                     {where}
                     ORDER BY e.session_id, e.created_at
                     LIMIT :limit
@@ -177,7 +177,7 @@ class ImplicitFeedbackMiner(DbConsumer):
 
     def analyze_and_store(self, session_id: str | None = None,
                           template_id: str = "system_general") -> int:
-        """Full pipeline: extract → analyze → store as llm_feedback records.
+        """Full pipeline: extract → analyze → store as eval_llm_feedback records.
 
         Returns number of feedback records created.
         """

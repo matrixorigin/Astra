@@ -138,7 +138,7 @@ class TestPollutionDetector:
         assert contradictions[0]["value_count"] == 2
 
     def test_cascade_impact_traces_through_snapshots(self, detector, mock_db):
-        """Test that cascade analysis parses context_snapshots to find affected decisions."""
+        """Test that cascade analysis parses ctx_snapshots to find affected decisions."""
         import json
 
         # Snapshot whose selected_events references the polluted entry
@@ -165,9 +165,9 @@ class TestPollutionDetector:
             except AttributeError:
                 # Column attribute — get parent table name
                 name = model.class_.__tablename__
-            if name == "context_snapshots":
+            if name == "ctx_snapshots":
                 m.all.return_value = [snap]
-            elif name == "decision_audit":
+            elif name == "ctx_decision_audits":
                 m.filter.return_value.all.return_value = [decision]
             elif name == "sk_knowledge_entry_sources":
                 m.filter.return_value.all.return_value = [("ke_downstream",)]

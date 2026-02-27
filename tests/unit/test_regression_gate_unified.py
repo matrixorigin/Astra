@@ -12,7 +12,7 @@ from core.evaluation.regression_gate import RegressionGate, ChangeType
 
 @pytest.fixture
 def setup_tables(db_session):
-    """Ensure gate_results table exists and clean test data."""
+    """Ensure eval_gate_results table exists and clean test data."""
     from core.utils.id_generator import generate_id
     from api.database import init_db
     uid = f"gate_test_{generate_id()[:8]}"
@@ -20,8 +20,8 @@ def setup_tables(db_session):
     # Ensure table exists (init_db is idempotent)
     init_db()
 
-    # Start with a clean gate_results table
-    db_session.execute(text("DELETE FROM gate_results"))
+    # Start with a clean eval_gate_results table
+    db_session.execute(text("DELETE FROM eval_gate_results"))
     db_session.commit()
 
     db_session._test_uid = uid
@@ -29,9 +29,9 @@ def setup_tables(db_session):
 
     # Cleanup
     db_session.execute(text(
-        "DELETE FROM conversation_events WHERE user_id = :uid"
+        "DELETE FROM agent_events WHERE user_id = :uid"
     ), {"uid": uid})
-    db_session.execute(text("DELETE FROM gate_results"))
+    db_session.execute(text("DELETE FROM eval_gate_results"))
     db_session.commit()
 
 
@@ -66,7 +66,7 @@ class TestGoldenSessionSelection:
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET quality_score = 4.5, training_eligible = 1
                 WHERE event_id = :event_id
             """), {"event_id": event.event_id})
@@ -79,7 +79,7 @@ class TestGoldenSessionSelection:
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET quality_score = 2.0, training_eligible = 1
                 WHERE event_id = :event_id
             """), {"event_id": event.event_id})
@@ -109,7 +109,7 @@ class TestGoldenSessionSelection:
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET quality_score = 4.5, training_eligible = 1
                 WHERE event_id = :event_id
             """), {"event_id": event.event_id})
@@ -122,7 +122,7 @@ class TestGoldenSessionSelection:
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET quality_score = 4.5, training_eligible = 1
                 WHERE event_id = :event_id
             """), {"event_id": event.event_id})
@@ -150,7 +150,7 @@ class TestGoldenSessionSelection:
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET quality_score = 4.0, training_eligible = 1
                 WHERE event_id = :event_id
             """), {"event_id": event.event_id})
@@ -163,7 +163,7 @@ class TestGoldenSessionSelection:
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET quality_score = 5.0, training_eligible = 1
                 WHERE event_id = :event_id
             """), {"event_id": event.event_id})
@@ -377,7 +377,7 @@ class TestGateHistory:
         """Test gate history returns recorded results."""
         # Insert test data
         setup_tables.execute(text("""
-            INSERT INTO gate_results 
+            INSERT INTO eval_gate_results 
             (gate_id, change_type, change_id, sessions_tested, error_rate, score_delta, passed, metrics, created_at)
             VALUES
             ('g1', 'prompt', 'test@v1', 10, 0.02, 0.1, 1, '{}', NOW()),
@@ -422,7 +422,7 @@ class TestSelectorChangeValidation:
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET quality_score = 4.5, training_eligible = 1
                 WHERE event_id = :event_id
             """), {"event_id": event.event_id})
@@ -522,7 +522,7 @@ class TestSandboxCleanup:
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET quality_score = 4.5, training_eligible = 1
                 WHERE event_id = :event_id
             """), {"event_id": event.event_id})
@@ -587,7 +587,7 @@ class TestSandboxCleanup:
                 content=f"query {i}",
             )
             setup_tables.execute(text("""
-                UPDATE conversation_events 
+                UPDATE agent_events 
                 SET quality_score = 4.5, training_eligible = 1
                 WHERE event_id = :event_id
             """), {"event_id": event.event_id})
@@ -745,10 +745,10 @@ class TestPollutionGatedQuarantine:
 
 
 class TestSkillTableName:
-    """SKILL gate must write to skills_registry, not skills."""
+    """SKILL gate must write to skill_registry, not skills."""
 
-    def test_apply_skill_change_uses_skills_registry_table(self):
-        """SKILL change should target skills_registry table with correct columns."""
+    def test_apply_skill_change_uses_skill_registry_table(self):
+        """SKILL change should target skill_registry table with correct columns."""
         _mock_db = Mock()
         gate = RegressionGate.__new__(RegressionGate)
         gate._db_factory = lambda: _mock_db
@@ -759,7 +759,7 @@ class TestSkillTableName:
             change_content={"name": "code_review", "version": "2.0.0", "definition": {}},
         )
         sql_text = _mock_db.execute.call_args[0][0].text
-        assert "test_sb.skills_registry" in sql_text
+        assert "test_sb.skill_registry" in sql_text
         assert "skill_name" in sql_text
         assert "skill_definition" in sql_text
 

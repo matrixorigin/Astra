@@ -45,10 +45,10 @@ def register(request: RegisterRequest):
         try:
             db.execute(
                 text(
-                    "INSERT INTO user_roles (user_id, role_id) "
-                    "SELECT :uid, r.role_id FROM roles r "
+                    "INSERT INTO auth_user_roles (user_id, role_id) "
+                    "SELECT :uid, r.role_id FROM auth_roles r "
                     "WHERE r.role_name = 'mo_agent_admin' "
-                    "AND NOT EXISTS (SELECT 1 FROM user_roles ur JOIN roles r2 "
+                    "AND NOT EXISTS (SELECT 1 FROM auth_user_roles ur JOIN auth_roles r2 "
                     "ON ur.role_id = r2.role_id WHERE r2.role_name = 'mo_agent_admin')"
                 ),
                 {"uid": user.user_id},

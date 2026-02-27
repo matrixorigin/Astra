@@ -219,12 +219,12 @@ class TestAdminCLI:
             assert result.exit_code == 0
             assert "No tokens found" in result.output
 
-    def test_audit_logs(self, runner):
+    def test_auth_audit_logs(self, runner):
         """Test audit logs command."""
         with patch("cli.mo_admin_api.SyncAPIClient") as mock_client_class:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
-            mock_client.admin_audit_logs.return_value = [
+            mock_client.admin_auth_audit_logs.return_value = [
                 {
                     "created_at": "2026-02-23T10:00:00",
                     "action": "token_created",
@@ -236,12 +236,12 @@ class TestAdminCLI:
             assert result.exit_code == 0
             assert "token_created" in result.output
 
-    def test_audit_logs_empty(self, runner):
+    def test_auth_audit_logs_empty(self, runner):
         """Test audit logs when no logs."""
         with patch("cli.mo_admin_api.SyncAPIClient") as mock_client_class:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
-            mock_client.admin_audit_logs.return_value = []
+            mock_client.admin_auth_audit_logs.return_value = []
             
             result = runner.invoke(admin_cli, ["audit", "logs"])
             assert result.exit_code == 0

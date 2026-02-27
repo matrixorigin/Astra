@@ -1,4 +1,4 @@
-"""Memory SQLAlchemy model — replaces Observation."""
+"""Memory SQLAlchemy model."""
 
 from matrixone import VectorPrecision, VectorType
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
@@ -14,7 +14,7 @@ from api.models._constants import EMBEDDING_DIM
 class MemoryRecord(Base):
     """Typed, versioned memory with vector embedding and fulltext index."""
 
-    __tablename__ = "memories"
+    __tablename__ = "mem_memories"
     __table_args__ = (
         FulltextIndex("ft_memory_content", ["content"], parser=FulltextParserType.NGRAM),
         Index("idx_memory_user_type_active", "user_id", "memory_type", "is_active"),

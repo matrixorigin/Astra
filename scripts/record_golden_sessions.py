@@ -80,7 +80,7 @@ def scenario_code_review() -> dict:
         "Review this Python function and suggest improvements:\n\n"
         "```python\n"
         "def get_user(db, user_id):\n"
-        "    result = db.execute(f\"SELECT * FROM users WHERE id = '{user_id}'\")\n"
+        "    result = db.execute(f\"SELECT * FROM auth_users WHERE id = '{user_id}'\")\n"
         "    rows = result.fetchall()\n"
         "    if len(rows) > 0:\n"
         "        return rows[0]\n"

@@ -47,7 +47,7 @@ class ContextService:
             # 插入快照 - 使用实际的表字段
             db.execute(
                 text("""
-                INSERT INTO context_snapshots
+                INSERT INTO ctx_snapshots
                 (context_capture_id, session_id, event_id, system_prompt, skill_definitions,
                  selected_events, code_context, documentation, total_tokens, 
                  token_budget, assembly_time_ms, relevance_scores, task_type, created_at)
@@ -117,8 +117,8 @@ class ContextService:
                            cs.code_context, cs.documentation, cs.total_tokens,
                            cs.token_budget, cs.assembly_time_ms, cs.relevance_scores,
                            cs.task_type, cs.created_at
-                    FROM context_snapshots cs
-                    JOIN sessions s ON cs.session_id = s.session_id
+                    FROM ctx_snapshots cs
+                    JOIN agent_sessions s ON cs.session_id = s.session_id
                     WHERE cs.context_capture_id = :context_capture_id AND s.user_id = :user_id
                     """),
                 {"context_capture_id": context_capture_id, "user_id": user_id}
@@ -176,7 +176,7 @@ class ContextService:
                 result = db.execute(
                     text("""
                         SELECT context_capture_id, session_id, event_id, created_at
-                        FROM context_snapshots
+                        FROM ctx_snapshots
                         WHERE session_id = :session_id
                         ORDER BY created_at DESC
                         LIMIT :limit OFFSET :offset
@@ -186,7 +186,7 @@ class ContextService:
                 snapshots = [dict(row._mapping) for row in result]
 
                 count_result = db.execute(
-                    text("SELECT COUNT(*) as total FROM context_snapshots WHERE session_id = :session_id"),
+                    text("SELECT COUNT(*) as total FROM ctx_snapshots WHERE session_id = :session_id"),
                     {"session_id": session_id}
                 )
                 total = count_result.first()._mapping["total"]
@@ -194,8 +194,8 @@ class ContextService:
                 result = db.execute(
                     text("""
                         SELECT cs.context_capture_id, cs.session_id, cs.event_id, cs.created_at
-                        FROM context_snapshots cs
-                        JOIN sessions s ON cs.session_id = s.session_id
+                        FROM ctx_snapshots cs
+                        JOIN agent_sessions s ON cs.session_id = s.session_id
                         WHERE s.user_id = :user_id
                         ORDER BY cs.created_at DESC
                         LIMIT :limit OFFSET :offset
@@ -207,8 +207,8 @@ class ContextService:
                 count_result = db.execute(
                     text("""
                         SELECT COUNT(*) as total
-                        FROM context_snapshots cs
-                        JOIN sessions s ON cs.session_id = s.session_id
+                        FROM ctx_snapshots cs
+                        JOIN agent_sessions s ON cs.session_id = s.session_id
                         WHERE s.user_id = :user_id
                         """),
                     {"user_id": user_id}

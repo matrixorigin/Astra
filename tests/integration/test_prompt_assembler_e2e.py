@@ -319,7 +319,7 @@ class TestPromptAssemblerSnapshot:
     """Test context snapshot audit trail."""
 
     def test_snapshot_persisted_to_db(self, db_session):
-        """Assembling a prompt creates a context_snapshots row."""
+        """Assembling a prompt creates a ctx_snapshots row."""
         from core.context.prompt_assembler import PromptAssembler
 
         pa = PromptAssembler(lambda: db_session)
@@ -329,7 +329,7 @@ class TestPromptAssemblerSnapshot:
 
         assert result.snapshot_id is not None, "Snapshot should be persisted"
         row = db_session.execute(
-            sql_text("SELECT system_prompt FROM context_snapshots WHERE context_capture_id = :cid"),
+            sql_text("SELECT system_prompt FROM ctx_snapshots WHERE context_capture_id = :cid"),
             {"cid": result.snapshot_id},
         ).fetchone()
         assert row is not None
@@ -769,12 +769,12 @@ class TestRecoverHistoryUsesAssembler:
         chain_id = unique_test_id()
         ev1, ev2 = unique_test_id(), unique_test_id()
         db_session.execute(_text("""
-            INSERT INTO conversation_events
+            INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
             VALUES (:eid, :sid, :uid, 'system', '1.0.0', 'user_query', 'hello', :cid, NOW())
         """), {"eid": ev1, "sid": session_id, "uid": user_id, "cid": chain_id})
         db_session.execute(_text("""
-            INSERT INTO conversation_events
+            INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
             VALUES (:eid, :sid, :uid, 'system', '1.0.0', 'llm_response', 'Hi there!', :cid, NOW())
         """), {"eid": ev2, "sid": session_id, "uid": user_id, "cid": chain_id})
@@ -796,8 +796,8 @@ class TestRecoverHistoryUsesAssembler:
             assert "assistant" in roles
         finally:
             # Cleanup even if assertions fail
-            db_session.execute(_text("DELETE FROM context_snapshots WHERE session_id = :sid"), {"sid": session_id})
-            db_session.execute(_text("DELETE FROM conversation_events WHERE session_id = :sid"), {"sid": session_id})
+            db_session.execute(_text("DELETE FROM ctx_snapshots WHERE session_id = :sid"), {"sid": session_id})
+            db_session.execute(_text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": session_id})
             db_session.commit()
 
 
@@ -815,7 +815,7 @@ def _insert_event(db, sid, uid, cid, etype, content, metadata=None, seq=0):
     eid = unique_test_id()
     meta_json = json.dumps(metadata) if metadata else None
     db.execute(_t("""
-        INSERT INTO conversation_events
+        INSERT INTO agent_events
             (event_id, session_id, user_id, agent_id, agent_version,
              event_type, content, causal_chain_id, metadata, created_at)
         VALUES (:eid, :sid, :uid, 'system', '1.0.0',
@@ -842,8 +842,8 @@ class TestRecoverHistoryToolCalls:
         self.cid = unique_test_id()
         yield
         from sqlalchemy import text as _t
-        db_session.execute(_t("DELETE FROM context_snapshots WHERE session_id = :sid"), {"sid": self.sid})
-        db_session.execute(_t("DELETE FROM conversation_events WHERE session_id = :sid"), {"sid": self.sid})
+        db_session.execute(_t("DELETE FROM ctx_snapshots WHERE session_id = :sid"), {"sid": self.sid})
+        db_session.execute(_t("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": self.sid})
         db_session.commit()
 
     def _recover(self):

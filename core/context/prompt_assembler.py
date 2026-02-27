@@ -329,7 +329,7 @@ class PromptAssembler(DbConsumer):
             if agent_id:
                 try:
                     row = db.execute(
-                        text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
+                        text("SELECT agent_config FROM agent_agents WHERE agent_id = :aid"),
                         {"aid": agent_id},
                     ).fetchone()
                     if row and row[0]:
@@ -350,7 +350,7 @@ class PromptAssembler(DbConsumer):
                 return "default"
             try:
                 row = db.execute(
-                    text("SELECT agent_type FROM agents WHERE agent_id = :aid"),
+                    text("SELECT agent_type FROM agent_agents WHERE agent_id = :aid"),
                     {"aid": agent_id},
                 ).fetchone()
                 return row[0] if row and row[0] else "default"
@@ -383,7 +383,7 @@ class PromptAssembler(DbConsumer):
             # Cloud skills
             try:
                 rows = db.execute(
-                    text("SELECT skill_name FROM skills_registry WHERE is_active = 1 LIMIT 20")
+                    text("SELECT skill_name FROM skill_registry WHERE is_active = 1 LIMIT 20")
                 ).fetchall()
                 if rows:
                     names = [r[0] for r in rows]
@@ -395,7 +395,7 @@ class PromptAssembler(DbConsumer):
             if agent_id:
                 try:
                     row = db.execute(
-                        text("SELECT agent_config FROM agents WHERE agent_id = :aid"),
+                        text("SELECT agent_config FROM agent_agents WHERE agent_id = :aid"),
                         {"aid": agent_id},
                     ).fetchone()
                     if row and row[0]:
@@ -561,7 +561,7 @@ class PromptAssembler(DbConsumer):
                     # _MAX_HISTORY_EVENTS is a module-level int constant (not user input),
                     # so f-string interpolation is safe from SQL injection.
                     text(f"""
-                        SELECT event_type, content FROM conversation_events
+                        SELECT event_type, content FROM agent_events
                         WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response')
                         ORDER BY created_at DESC LIMIT {_MAX_HISTORY_EVENTS}
                     """),
@@ -636,7 +636,7 @@ class PromptAssembler(DbConsumer):
     def _save_snapshot(self, session_id: str, sections: dict[str, str], breakdown: dict[str, int]) -> str | None:
         """Persist context snapshot for audit.
 
-        Uses the production context_snapshots schema (context_capture_id PK).
+        Uses the production ctx_snapshots schema (context_capture_id PK).
         Stores assembled sections in system_prompt and token breakdown in token_budget.
 
         Commits immediately because callers (chat_turn, recovery) use autocommit=False
@@ -649,7 +649,7 @@ class PromptAssembler(DbConsumer):
                 capture_id = str(uuid7())
                 db.execute(
                     text("""
-                        INSERT INTO context_snapshots
+                        INSERT INTO ctx_snapshots
                             (context_capture_id, session_id, event_id, system_prompt, token_budget, created_at)
                         VALUES (:cid, :sess, :eid, :prompt, :budget, NOW())
                     """),

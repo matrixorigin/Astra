@@ -61,7 +61,7 @@ class PromptEvolver(DbConsumer):
 
             row = db.execute(
                 text(
-                    "SELECT MAX(version) FROM prompt_variants "
+                    "SELECT MAX(version) FROM ctx_prompt_variants "
                     "WHERE prompt_template_id = :template_id"
                 ),
                 {"template_id": prompt_template_id},
@@ -70,7 +70,7 @@ class PromptEvolver(DbConsumer):
 
             db.execute(
                 text(
-                    "INSERT INTO prompt_variants "
+                    "INSERT INTO ctx_prompt_variants "
                     "(variant_id, prompt_template_id, version, content, description, created_at) "
                     "VALUES (:id, :template_id, :version, :content, :desc, NOW())"
                 ),
@@ -120,7 +120,7 @@ class PromptEvolver(DbConsumer):
 
             db.execute(
                 text(
-                    "UPDATE prompt_variants SET quality_score = :score "
+                    "UPDATE ctx_prompt_variants SET quality_score = :score "
                     "WHERE variant_id = :id"
                 ),
                 {"score": avg_score, "id": variant_id},
@@ -138,7 +138,7 @@ class PromptEvolver(DbConsumer):
         """
         with self._db() as db:
             row = db.execute(
-                text("SELECT content, version FROM prompt_variants WHERE variant_id = :id"),
+                text("SELECT content, version FROM ctx_prompt_variants WHERE variant_id = :id"),
                 {"id": variant_id},
             ).fetchone()
 
@@ -169,7 +169,7 @@ class PromptEvolver(DbConsumer):
 
             db.execute(
                 text(
-                    "UPDATE prompt_templates SET content = :content, updated_at = NOW() "
+                    "UPDATE ctx_prompt_templates SET content = :content, updated_at = NOW() "
                     "WHERE template_id = :template_id"
                 ),
                 {"content": content, "template_id": prompt_template_id},
@@ -184,7 +184,7 @@ class PromptEvolver(DbConsumer):
             row = db.execute(
                 text(
                     "SELECT variant_id, version, content, quality_score "
-                    "FROM prompt_variants "
+                    "FROM ctx_prompt_variants "
                     "WHERE prompt_template_id = :template_id "
                     "ORDER BY quality_score DESC LIMIT 1"
                 ),
@@ -213,7 +213,7 @@ class PromptEvolver(DbConsumer):
         # Get variant content
         with self._db() as db:
             row = db.execute(
-                text("SELECT content FROM prompt_variants WHERE variant_id = :id"),
+                text("SELECT content FROM ctx_prompt_variants WHERE variant_id = :id"),
                 {"id": variant_id},
             ).fetchone()
 

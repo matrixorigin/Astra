@@ -29,10 +29,10 @@ def user_id():
 
 def _insert_event(db, *, session_id, user_id, chain_id, quality_score=None,
                   event_type="llm_response", training_eligible=False):
-    """Insert a minimal conversation_events row for testing."""
+    """Insert a minimal agent_events row for testing."""
     eid = generate_id()
     db.execute(text("""
-        INSERT INTO conversation_events
+        INSERT INTO agent_events
         (event_id, session_id, user_id, agent_id, agent_version,
          event_type, content, causal_chain_id, quality_score, training_eligible, created_at)
         VALUES (:eid, :sid, :uid, 'test-agent', '1.0',
@@ -79,9 +79,9 @@ class TestScoreChain:
         assert result["step_count"] == 1
         assert result["score"] == pytest.approx(4.5, abs=0.01)
 
-        # Verify persisted to quality_assessments
+        # Verify persisted to eval_quality_assessments
         row = db.execute(text(
-            "SELECT score, level FROM quality_assessments "
+            "SELECT score, level FROM eval_quality_assessments "
             "WHERE target_id = :tid AND level = 'chain'"
         ), {"tid": chain_id}).fetchone()
         assert row is not None
@@ -130,7 +130,7 @@ class TestScoreChain:
 
         # Should still be exactly 1 row
         count = db.execute(text(
-            "SELECT COUNT(*) FROM quality_assessments "
+            "SELECT COUNT(*) FROM eval_quality_assessments "
             "WHERE target_id = :tid AND level = 'chain'"
         ), {"tid": chain_id}).fetchone()[0]
         assert count == 1
@@ -193,7 +193,7 @@ class TestScoreSession:
         score_session(db, session_id)
 
         count = db.execute(text(
-            "SELECT COUNT(*) FROM quality_assessments "
+            "SELECT COUNT(*) FROM eval_quality_assessments "
             "WHERE target_id = :tid AND level = 'session'"
         ), {"tid": session_id}).fetchone()[0]
         assert count == 1
@@ -379,7 +379,7 @@ class TestEvaluationActionAPI:
         loop_id = resp.json()["loop_id"]
 
         row = db.execute(text(
-            "SELECT event_type, content FROM conversation_events WHERE event_id = :eid"
+            "SELECT event_type, content FROM agent_events WHERE event_id = :eid"
         ), {"eid": loop_id}).first()
         assert row is not None, "Loop audit event not found in DB"
         assert row[0] == "closed_loop_execution"

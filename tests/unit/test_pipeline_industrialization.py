@@ -1,7 +1,7 @@
 """Tests for multi-agent collaboration industrialization fixes.
 
 Covers:
-- Rollback table name fix (selector_learnings → skill_selection_learning)
+- Rollback table name fix (selector_learnings → skill_selection_learnings)
 - Learning correction order preservation
 - Exact-name skill backfill (no semantic drift)
 - FeedbackBuffer thread-safe flush

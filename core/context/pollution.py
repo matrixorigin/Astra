@@ -116,7 +116,7 @@ class PollutionDetector(DbConsumer):
                 KnowledgeEntry.value != entry.value,
             ).count()
         
-            # Signal 3: Downstream quality (simplified - would need context_snapshots join)
+            # Signal 3: Downstream quality (simplified - would need ctx_snapshots join)
             # For now, use confidence as proxy
             downstream_quality = entry.confidence * 5.0  # Scale to 0-5
         
@@ -206,7 +206,7 @@ class PollutionDetector(DbConsumer):
         """Analyze cascade impact of a polluted entry.
 
         Traces contamination graph:
-        1. Find context_snapshots whose selected_events contain this entry
+        1. Find ctx_snapshots whose selected_events contain this entry
         2. Find decisions linked to those snapshots
         3. Check if those decisions produced knowledge entries (via source_event_ids)
         4. Recurse up to max_depth

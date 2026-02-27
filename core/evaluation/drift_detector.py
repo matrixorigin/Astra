@@ -97,7 +97,7 @@ class DriftDetector(DbConsumer):
                         THEN quality_score END) AS previous_avg,
                     COUNT(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
                         THEN 1 END) AS recent_count
-                FROM conversation_events
+                FROM agent_events
                 WHERE event_type = 'llm_response'
                   AND quality_score IS NOT NULL
                   AND llm_model_used IS NOT NULL
@@ -128,7 +128,7 @@ class DriftDetector(DbConsumer):
                         THEN quality_score END) AS previous_avg,
                     COUNT(CASE WHEN created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
                         THEN 1 END) AS recent_count
-                FROM conversation_events
+                FROM agent_events
                 WHERE event_type = 'llm_response'
                   AND quality_score IS NOT NULL
                   AND llm_model_used IS NOT NULL
@@ -307,7 +307,7 @@ class DriftCorrector(DbConsumer):
         with self._db() as db:
             try:
                 db.execute(text("""
-                    INSERT INTO conversation_events
+                    INSERT INTO agent_events
                         (event_id, session_id, user_id, agent_id, agent_version,
                          event_type, content, causal_chain_id, created_at, llm_model_used)
                     VALUES

@@ -75,7 +75,7 @@ class EmbeddingService(DbConsumer):
         with self._db() as db:
             db.execute(
                 text("""
-                INSERT INTO event_embeddings
+                INSERT INTO ctx_event_embeddings
                 (event_id, embedding, model_name, model_version, metadata, created_at, updated_at)
                 VALUES (:event_id, :embedding, :model_name, :model_version, :metadata, NOW(), NOW())
                 ON DUPLICATE KEY UPDATE embedding = VALUES(embedding), metadata = VALUES(metadata), updated_at = NOW()
@@ -107,8 +107,8 @@ class EmbeddingService(DbConsumer):
             SELECT e.event_id, e.session_id, e.content, e.event_type, e.created_at,
                 L2_DISTANCE(emb.embedding, :vec1) AS distance,
                 1.0 / (1.0 + L2_DISTANCE(emb.embedding, :vec2)) AS similarity
-            FROM conversation_events e
-            JOIN event_embeddings emb ON e.event_id = emb.event_id
+            FROM agent_events e
+            JOIN ctx_event_embeddings emb ON e.event_id = emb.event_id
             {where_clause}
             ORDER BY distance ASC LIMIT :limit
         """

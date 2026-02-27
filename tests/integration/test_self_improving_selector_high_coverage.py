@@ -22,11 +22,11 @@ def db():
 
 @pytest.fixture
 def clean_db(db):
-    db.execute(text("DELETE FROM skill_selection_learning WHERE query_pattern LIKE 'hc_%'"))
+    db.execute(text("DELETE FROM skill_selection_learnings WHERE query_pattern LIKE 'hc_%'"))
     db.execute(text("DELETE FROM skill_selection_events WHERE user_query LIKE 'hc_%'"))
     db.commit()
     yield
-    db.execute(text("DELETE FROM skill_selection_learning WHERE query_pattern LIKE 'hc_%'"))
+    db.execute(text("DELETE FROM skill_selection_learnings WHERE query_pattern LIKE 'hc_%'"))
     db.execute(text("DELETE FROM skill_selection_events WHERE user_query LIKE 'hc_%'"))
     db.commit()
 

@@ -86,28 +86,28 @@ class SelfImprovingSelector(DbConsumer):
         
             # Check if table exists using raw SQL
             result = db.execute(
-                text("SELECT 1 FROM information_schema.tables WHERE table_name = 'skill_selection_learning' LIMIT 1")
+                text("SELECT 1 FROM information_schema.tables WHERE table_name = 'skill_selection_learnings' LIMIT 1")
             ).fetchone()
             if not result:
                 return
         
             # Get columns using raw SQL to avoid SQLAlchemy type parsing issues
             columns_result = db.execute(
-                text("SELECT column_name FROM information_schema.columns WHERE table_name = 'skill_selection_learning'")
+                text("SELECT column_name FROM information_schema.columns WHERE table_name = 'skill_selection_learnings'")
             ).fetchall()
             columns = {row[0] for row in columns_result}
         
             if "query_embedding" not in columns:
                 db.execute(
-                    text("ALTER TABLE skill_selection_learning ADD COLUMN query_embedding TEXT")
+                    text("ALTER TABLE skill_selection_learnings ADD COLUMN query_embedding TEXT")
                 )
             if "context_features" not in columns:
                 db.execute(
-                    text("ALTER TABLE skill_selection_learning ADD COLUMN context_features JSON")
+                    text("ALTER TABLE skill_selection_learnings ADD COLUMN context_features JSON")
                 )
             if "is_active" not in columns:
                 db.execute(
-                    text("ALTER TABLE skill_selection_learning ADD COLUMN is_active TINYINT(1) DEFAULT 1")
+                    text("ALTER TABLE skill_selection_learnings ADD COLUMN is_active TINYINT(1) DEFAULT 1")
                 )
             try:
                 db.commit()
@@ -650,7 +650,7 @@ class SelfImprovingSelector(DbConsumer):
                 signal_breakdown[signal_type.value] = count
         
             # Query regression gate results (validates selector changes before deployment)
-            # Wrapped in try/except because gate_results table may not exist yet
+            # Wrapped in try/except because eval_gate_results table may not exist yet
             # under concurrent DDL (xdist workers) or fresh deployments.
             total_gates = 0
             passed = 0
@@ -659,12 +659,12 @@ class SelfImprovingSelector(DbConsumer):
             avg_improvement_pct = 0.0
             try:
                 from api.models import GateResult
-                gate_results = db.query(GateResult).filter(GateResult.change_type == "selector").all()
-                total_gates = len(gate_results)
-                passed = sum(1 for g in gate_results if g.passed)
+                eval_gate_results = db.query(GateResult).filter(GateResult.change_type == "selector").all()
+                total_gates = len(eval_gate_results)
+                passed = sum(1 for g in eval_gate_results if g.passed)
                 failed = total_gates - passed
                 pass_rate = passed / total_gates if total_gates > 0 else 0.0
-                improvements = [g.score_delta for g in gate_results if g.score_delta is not None]
+                improvements = [g.score_delta for g in eval_gate_results if g.score_delta is not None]
                 avg_improvement_pct = sum(improvements) / len(improvements) if improvements else 0.0
             except Exception:
                 db.rollback()

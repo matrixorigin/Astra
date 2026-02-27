@@ -150,36 +150,12 @@ class ModelRouter(DbConsumer):
         quality_score: float,
         cost: float,
     ) -> None:
-        """Record quality and cost for a task."""
-        from api.models import ModelQualityMetric
-        from uuid_utils import uuid7
-        with self._db() as db:
-            db.add(ModelQualityMetric(
-                metric_id=str(uuid7()),
-                task_type=task_type,
-                model=model,
-                quality_score=quality_score,
-                cost=cost,
-            ))
-            db.commit()
-            logger.info(f"Quality recorded: {model} on {task_type}: {quality_score}/5 @ ${cost}")
+        """Record quality and cost for a task (no-op, metrics table removed)."""
+        logger.info(f"Quality recorded: {model} on {task_type}: {quality_score}/5 @ ${cost}")
 
     def _get_efficiency_ranking(self, task_type: str) -> dict[str, float]:
         """Get efficiency ranking (quality/cost) for models on a task type."""
-        from sqlalchemy import func as sa_func
-        from api.models import ModelQualityMetric as MQM
-        with self._db() as db:
-
-            rows = db.query(
-                MQM.model,
-                sa_func.avg(MQM.quality_score).label("avg_quality"),
-                sa_func.avg(MQM.cost).label("avg_cost"),
-                (sa_func.avg(MQM.quality_score) / sa_func.avg(MQM.cost)).label("efficiency"),
-            ).filter(MQM.task_type == task_type).group_by(MQM.model).order_by(
-                (sa_func.avg(MQM.quality_score) / sa_func.avg(MQM.cost)).desc()
-            ).all()
-
-            return {row[0]: float(row[3]) for row in rows}
+        return {}
 
     def _select_by_efficiency(
         self,
@@ -215,44 +191,15 @@ class ModelRouter(DbConsumer):
 
     def _get_quality_data(self) -> dict[str, float]:
         """Get average quality per model."""
-        from api.models import ModelQualityMetric
-        from sqlalchemy import func as sqlfunc
-        with self._db() as db:
-            rows = (
-                db.query(ModelQualityMetric.model, sqlfunc.avg(ModelQualityMetric.quality_score))
-                .group_by(ModelQualityMetric.model)
-                .all()
-            )
-            return {model: float(avg_q) for model, avg_q in rows}
+        return {}
 
     def _estimate_cost(self, model: str, task_type: str) -> float:
-        """Estimate cost for a model on a task type.
-
-        Args:
-            model: Model name
-            task_type: Task type
-
-        Returns:
-            Estimated cost in dollars
-        """
-        from api.models import ModelQualityMetric
-        from sqlalchemy import func as sqlfunc
-        with self._db() as db:
-            row = (
-                db.query(sqlfunc.avg(ModelQualityMetric.cost))
-                .filter(ModelQualityMetric.model == model, ModelQualityMetric.task_type == task_type)
-                .scalar()
-            )
-
-            if row is not None:
-                return float(row)
-
-            # Default estimates
-            defaults = {
-                "gpt-4": 0.03,
-                "gpt-3.5": 0.001,
-                "claude-opus": 0.03,
-                "claude-sonnet": 0.003,
-                "claude-haiku": 0.0003,
-            }
-            return defaults.get(model, 0.01)
+        """Estimate cost for a model on a task type."""
+        defaults = {
+            "gpt-4": 0.03,
+            "gpt-3.5": 0.001,
+            "claude-opus": 0.03,
+            "claude-sonnet": 0.003,
+            "claude-haiku": 0.0003,
+        }
+        return defaults.get(model, 0.01)

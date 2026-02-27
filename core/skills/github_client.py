@@ -88,8 +88,8 @@ class GitHubClient:
     async def list_prs(self, repo_id: int, state: str = "open", limit: int = 10) -> list[dict]:
         return await self._api.list_prs(self.default_repo, state, limit)
 
-    async def list_workflow_runs(self, repo_id: int, limit: int = 5) -> list[dict]:
-        return await self._api.list_workflow_runs(self.default_repo, limit)
+    async def list_wf_runs(self, repo_id: int, limit: int = 5) -> list[dict]:
+        return await self._api.list_wf_runs(self.default_repo, limit)
 
     def get_rate_limit(self) -> dict:
         return self._api.get_rate_limit()

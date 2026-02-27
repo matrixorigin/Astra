@@ -74,7 +74,7 @@ def test_time_machine_checkpoint(time_machine, db):
     # Create initial event directly
     db.execute(
         text("""
-        INSERT INTO conversation_events 
+        INSERT INTO agent_events 
         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
         VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
         """),
@@ -99,7 +99,7 @@ def test_time_machine_checkpoint(time_machine, db):
     # Create another event after checkpoint
     db.execute(
         text("""
-        INSERT INTO conversation_events 
+        INSERT INTO agent_events 
         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
         VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
         """),
@@ -147,17 +147,17 @@ def test_sandbox_experiment(sandbox, db):
     
     sandbox_name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
 
-    # Create sandbox with conversation_events table branched
-    sandbox.create(sandbox_name, tables=["conversation_events"])
+    # Create sandbox with agent_events table branched
+    sandbox.create(sandbox_name, tables=["agent_events"])
 
     # Get counts — sandbox should have same data as source at branch point
     result = db.execute(text("SELECT DATABASE() as db"))
     current_db = result.first()._mapping["db"]
 
-    result = db.execute(text(f"select count(*) as count from {current_db}.conversation_events"))
+    result = db.execute(text(f"select count(*) as count from {current_db}.agent_events"))
     main_count_before = result.first()._mapping["count"]
 
-    result = db.execute(text(f"select count(*) as count from {sandbox_name}.conversation_events"))
+    result = db.execute(text(f"select count(*) as count from {sandbox_name}.agent_events"))
     sandbox_count = result.first()._mapping["count"]
 
     assert sandbox_count == main_count_before
@@ -165,7 +165,7 @@ def test_sandbox_experiment(sandbox, db):
     # Add event to main AFTER sandbox creation — sandbox should NOT see it
     db.execute(
         text("""
-        INSERT INTO conversation_events 
+        INSERT INTO agent_events 
         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
         VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
         """),
@@ -184,10 +184,10 @@ def test_sandbox_experiment(sandbox, db):
     db.commit()
 
     # Main has one more, sandbox unchanged
-    result = db.execute(text(f"select count(*) as count from {current_db}.conversation_events"))
+    result = db.execute(text(f"select count(*) as count from {current_db}.agent_events"))
     main_count_after = result.first()._mapping["count"]
 
-    result = db.execute(text(f"select count(*) as count from {sandbox_name}.conversation_events"))
+    result = db.execute(text(f"select count(*) as count from {sandbox_name}.agent_events"))
     sandbox_count_after = result.first()._mapping["count"]
 
     assert main_count_after == main_count_before + 1
@@ -207,7 +207,7 @@ def test_git_for_data_restore(git, db):
     # Create test event directly
     db.execute(
         text("""
-        INSERT INTO conversation_events 
+        INSERT INTO agent_events 
         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, causal_chain_id, created_at)
         VALUES (:event_id, :session_id, :user_id, :agent_id, :agent_version, :event_type, :content, :causal_chain_id, :created_at)
         """),
@@ -230,25 +230,25 @@ def test_git_for_data_restore(git, db):
 
     # Modify event
     db.execute(
-        text("UPDATE conversation_events SET content = :content WHERE event_id = :event_id"),
+        text("UPDATE agent_events SET content = :content WHERE event_id = :event_id"),
         {"content": "Modified content", "event_id": str(test_event_id)}
     )
     db.commit()
 
     # Verify modification
     result = db.execute(
-        text("SELECT content FROM conversation_events WHERE event_id = :event_id"),
+        text("SELECT content FROM agent_events WHERE event_id = :event_id"),
         {"event_id": str(test_event_id)}
     )
     row = result.first()
     assert row._mapping["content"] == "Modified content"
 
     # Restore table from snapshot (lightweight operation)
-    git.restore_table_from_snapshot("conversation_events", snapshot_name)
+    git.restore_table_from_snapshot("agent_events", snapshot_name)
 
     # Verify restoration
     result = db.execute(
-        text("SELECT content FROM conversation_events WHERE event_id = :event_id"),
+        text("SELECT content FROM agent_events WHERE event_id = :event_id"),
         {"event_id": str(test_event_id)}
     )
     row = result.first()

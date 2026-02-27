@@ -111,7 +111,7 @@ class ConfidenceCalibrator(DbConsumer):
                     SELECT
                         CAST(JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.confidence_score')) AS DOUBLE) AS conf,
                         quality_score
-                    FROM conversation_events
+                    FROM agent_events
                     WHERE event_type = 'llm_response'
                       AND quality_score IS NOT NULL
                       AND `metadata` IS NOT NULL

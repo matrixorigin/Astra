@@ -635,7 +635,7 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
     result = db.execute(
         text("""
         SELECT event_id, event_type, content, created_at, metadata
-        FROM conversation_events
+        FROM agent_events
         WHERE event_type IN ('plan_created', 'plan_revised')
           AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.goal')) = :goal_id
         ORDER BY created_at DESC, event_id DESC
@@ -655,7 +655,7 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
     # Check if this plan was already completed or failed
     finished = db.execute(
         text("""
-        SELECT 1 FROM conversation_events
+        SELECT 1 FROM agent_events
         WHERE event_type IN ('plan_completed', 'plan_failed')
           AND JSON_UNQUOTE(JSON_EXTRACT(content, '$.plan_id')) = :plan_id
         LIMIT 1
@@ -669,7 +669,7 @@ def restore_plan_from_events(db, goal_id: str) -> Plan | None:
     result = db.execute(
         text("""
         SELECT event_type, content
-        FROM conversation_events
+        FROM agent_events
         WHERE event_type IN ('plan_step_start', 'plan_step_done')
           AND JSON_UNQUOTE(JSON_EXTRACT(content, '$.plan_id')) = :plan_id
         ORDER BY created_at

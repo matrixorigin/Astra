@@ -174,43 +174,8 @@ class AdversarialEvaluator(DbConsumer):
         return results
 
     def get_attack_summary(self, agent_id: str) -> dict[str, Any]:
-        """Get summary of attacks on an agent."""
-        with self._db() as db:
-            from api.models import AdversarialAttack
-            from sqlalchemy import func as sqlfunc
-            rows = (
-                db.query(
-                    AdversarialAttack.attack_type,
-                    AdversarialAttack.severity,
-                    sqlfunc.count().label("count"),
-                )
-                .filter(AdversarialAttack.agent_id == agent_id)
-                .group_by(AdversarialAttack.attack_type, AdversarialAttack.severity)
-                .all()
-            )
-
-            summary: dict[str, Any] = {
-                "total_attacks": sum(r[2] for r in rows),
-                "by_type": {},
-                "by_severity": {},
-                "vulnerability_score": 0.0,
-            }
-
-            total = 0
-            critical_high = 0
-            for attack_type, severity, count in rows:
-                summary["by_type"].setdefault(attack_type, 0)
-                summary["by_type"][attack_type] += count
-                summary["by_severity"].setdefault(severity, 0)
-                summary["by_severity"][severity] += count
-                total += count
-                if severity in ("critical", "high"):
-                    critical_high += count
-
-            if total > 0:
-                summary["vulnerability_score"] = round(critical_high / total, 3)
-
-            return summary
+        """Get summary of attacks on an agent (no-op, table removed)."""
+        return {"total_attacks": 0, "by_type": {}, "by_severity": {}, "vulnerability_score": 0.0}
 
     def _execute_attack(
         self,
@@ -293,19 +258,7 @@ class AdversarialEvaluator(DbConsumer):
         severity: str,
         evidence: str | None,
     ) -> None:
-        """Record attack result in DB."""
-        with self._db() as db:
-            from api.models import AdversarialAttack
-
-            db.add(AdversarialAttack(
-                attack_id=attack_id,
-                agent_id=agent_id,
-                attack_type=attack_type.value,
-                success=1 if success else 0,
-                severity=severity,
-                evidence=evidence,
-            ))
-            db.commit()
+        """Record attack result in DB (no-op, table removed)."""
 
 
 # Default attack prompts for run_suite

@@ -110,7 +110,7 @@ class LLMClient(DbConsumer):
             config = None
             try:
                 result = db.execute(
-                    text("SELECT value FROM configs WHERE key_name = 'llm_config' LIMIT 1")
+                    text("SELECT value FROM infra_configs WHERE key_name = 'llm_config' LIMIT 1")
                 )
                 row = result.first()
                 if row:
@@ -118,13 +118,13 @@ class LLMClient(DbConsumer):
             except Exception:
                 pass
             if not config:
-                # Auto-detect from llm_models table (first active model)
+                # Auto-detect from infra_llm_models table (first active model)
                 provider = os.getenv("LLM_PROVIDER", "")
                 model = os.getenv("LLM_MODEL", "")
                 if not provider or not model:
                     try:
                         row = db.execute(
-                            text("SELECT model_name, provider FROM llm_models WHERE is_active=1 ORDER BY created_at LIMIT 1")
+                            text("SELECT model_name, provider FROM infra_llm_models WHERE is_active=1 ORDER BY created_at LIMIT 1")
                         ).first()
                         if row:
                             model = model or row[0]
@@ -168,7 +168,7 @@ class LLMClient(DbConsumer):
     # ── Provider init (#3 异构) ────────────────────────────────────
 
     def _init_providers(self) -> None:
-        """Initialize provider clients from llm_models table (active models only)."""
+        """Initialize provider clients from infra_llm_models table (active models only)."""
         # Init built-in mock provider (no key needed, always available)
         with self._db() as db:
             try:
@@ -184,10 +184,10 @@ class LLMClient(DbConsumer):
             # Load active models and init their providers (per-model keys)
             try:
                 rows = db.execute(
-                    text("SELECT model_name, provider, api_key_encrypted, base_url FROM llm_models WHERE is_active = 1")
+                    text("SELECT model_name, provider, api_key_encrypted, base_url FROM infra_llm_models WHERE is_active = 1")
                 ).fetchall()
             except Exception as e:
-                logger.debug(f"Failed to load llm_models: {e}")
+                logger.debug(f"Failed to load infra_llm_models: {e}")
                 return
 
             for row in rows:
@@ -220,12 +220,12 @@ class LLMClient(DbConsumer):
                     logger.warning(f"Failed to initialize {provider_name} provider: {e}{hint}")
 
     def _get_provider_base_url(self, provider: str) -> str | None:
-        """Get base_url from llm_models table."""
+        """Get base_url from infra_llm_models table."""
         with self._db() as db:
             from core.llm.constants import PROVIDER_BASE_URLS
             try:
                 row = db.execute(
-                    text("SELECT base_url FROM llm_models WHERE provider = :provider AND is_active = 1 LIMIT 1"),
+                    text("SELECT base_url FROM infra_llm_models WHERE provider = :provider AND is_active = 1 LIMIT 1"),
                     {"provider": provider},
                 ).first()
                 if row and row.base_url:
@@ -638,7 +638,7 @@ class LLMClient(DbConsumer):
             try:
                 if response:
                     db.execute(
-                        text("""INSERT INTO llm_call_logs (
+                        text("""INSERT INTO eval_llm_call_logs (
                             log_id, event_id, user_id, provider, model,
                             tokens_prompt, tokens_completion, tokens_total,
                             cost_usd, latency_ms, status, metadata, created_at
@@ -656,7 +656,7 @@ class LLMClient(DbConsumer):
                     )
                 else:
                     db.execute(
-                        text("""INSERT INTO llm_call_logs (
+                        text("""INSERT INTO eval_llm_call_logs (
                             log_id, event_id, user_id, provider, model,
                             tokens_prompt, tokens_completion, tokens_total,
                             cost_usd, latency_ms, status, error_message, metadata, created_at
@@ -679,19 +679,19 @@ class LLMClient(DbConsumer):
         with self._db() as db:
             if event_id:
                 result = db.execute(
-                    text("SELECT * FROM llm_call_logs WHERE event_id = :event_id ORDER BY created_at DESC"),
+                    text("SELECT * FROM eval_llm_call_logs WHERE event_id = :event_id ORDER BY created_at DESC"),
                     {"event_id": event_id}
                 )
                 results = result.fetchall()
             elif user_id:
                 result = db.execute(
-                    text("SELECT * FROM llm_call_logs WHERE user_id = :user_id ORDER BY created_at DESC LIMIT 100"),
+                    text("SELECT * FROM eval_llm_call_logs WHERE user_id = :user_id ORDER BY created_at DESC LIMIT 100"),
                     {"user_id": user_id}
                 )
                 results = result.fetchall()
             else:
                 result = db.execute(
-                    text("SELECT * FROM llm_call_logs ORDER BY created_at DESC LIMIT 100")
+                    text("SELECT * FROM eval_llm_call_logs ORDER BY created_at DESC LIMIT 100")
                 )
                 results = result.fetchall()
             return [

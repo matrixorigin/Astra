@@ -131,7 +131,7 @@ class PromptOptimizer(DbConsumer):
         with self._db() as db:
             row = db.execute(
                 text(
-                    "SELECT version, content FROM prompt_templates "
+                    "SELECT version, content FROM ctx_prompt_templates "
                     "WHERE template_id = :tid AND is_active = 1 "
                     "ORDER BY created_at DESC LIMIT 1"
                 ),
@@ -149,9 +149,9 @@ class PromptOptimizer(DbConsumer):
                     SELECT f.rating, f.comment, f.llm_request_id,
                            cs.system_prompt, cs.task_type,
                            e.content as user_query
-                    FROM llm_feedback f
-                    LEFT JOIN context_snapshots cs ON f.llm_request_id = cs.llm_request_id
-                    LEFT JOIN conversation_events e ON cs.event_id = e.event_id
+                    FROM eval_llm_feedback f
+                    LEFT JOIN ctx_snapshots cs ON f.llm_request_id = cs.llm_request_id
+                    LEFT JOIN agent_events e ON cs.event_id = e.event_id
                     WHERE f.prompt_template_id = :tid AND f.rating <= :threshold
                     ORDER BY f.created_at DESC
                     LIMIT 20

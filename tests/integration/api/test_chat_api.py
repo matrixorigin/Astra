@@ -49,7 +49,7 @@ def _mock_engine(reply="Hello back!", status=RunStatus.PENDING):
     default_run.status = status
     engine.get_run.return_value = default_run
     engine.restore_run.return_value = default_run
-    engine.get_run_events.return_value = [
+    engine.get_agent_run_events.return_value = [
         {"event_type": "text_done", "data": {"text": reply}},
     ]
     engine.cancel_run.return_value = True
@@ -58,7 +58,7 @@ def _mock_engine(reply="Hello back!", status=RunStatus.PENDING):
         yield {"event_type": "text_delta", "data": {"chunk": reply}, "run_id": run_id}
         yield {"event_type": "run_finished", "data": {}, "run_id": run_id}
 
-    engine.stream_run_events = stream_events
+    engine.stream_agent_run_events = stream_events
     engine.start_run = AsyncMock()
     return engine
 

@@ -55,7 +55,7 @@ def cleanup_memories(db):
     if created_ids:
         try:
             db.execute(text(
-                "DELETE FROM memories WHERE memory_id IN :ids"
+                "DELETE FROM mem_memories WHERE memory_id IN :ids"
             ), {"ids": tuple(created_ids)})
             db.commit()
         except Exception:
@@ -232,7 +232,7 @@ class TestMemoryRetrieverRealDB:
         """Verify ivfflat index exists on memories.embedding column."""
         db = db_factory()
         try:
-            rows = db.execute(text("SHOW INDEX FROM memories")).fetchall()
+            rows = db.execute(text("SHOW INDEX FROM mem_memories")).fetchall()
             ivf_indexes = [r for r in rows if "ivf" in str(r).lower() and "embedding" in str(r).lower()]
             assert len(ivf_indexes) > 0, (
                 "ivfflat index on memories.embedding not found. "

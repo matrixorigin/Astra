@@ -19,7 +19,7 @@ if __name__ == "__main__":
     db = SessionLocal()
     result = db.execute(text("""
         SELECT template_id, version, is_active
-        FROM prompt_templates
+        FROM ctx_prompt_templates
         ORDER BY template_id, version
     """))
 

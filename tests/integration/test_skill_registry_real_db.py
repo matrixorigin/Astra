@@ -46,8 +46,8 @@ def cleanup(db_session):
     yield
     # Clean up test skills
     from sqlalchemy import text
-    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name LIKE 'test_skill_%'"))
-    db_session.execute(text("DELETE FROM skills_registry WHERE skill_name LIKE 'replay_skill%'"))
+    db_session.execute(text("DELETE FROM skill_registry WHERE skill_name LIKE 'test_skill_%'"))
+    db_session.execute(text("DELETE FROM skill_registry WHERE skill_name LIKE 'replay_skill%'"))
     db_session.commit()
 
 

@@ -36,7 +36,7 @@ class MemoryHealth(DbConsumer):
                     AVG(initial_confidence) as avg_confidence,
                     COUNT(CASE WHEN superseded_by IS NOT NULL THEN 1 END) as superseded,
                     AVG(TIMESTAMPDIFF(HOUR, observed_at, NOW())) as avg_staleness_hours
-                FROM memories
+                FROM mem_memories
                 WHERE user_id = :uid
                 GROUP BY memory_type
             """), {"uid": user_id}).fetchall()
@@ -62,7 +62,7 @@ class MemoryHealth(DbConsumer):
                     SELECT
                         COUNT(*) as total_changes,
                         COUNT(CASE WHEN superseded_by IS NOT NULL THEN 1 END) as supersedes
-                    FROM memories
+                    FROM mem_memories
                     WHERE user_id = :uid AND updated_at >= :ts
                 """), {"uid": user_id, "ts": since_timestamp}).fetchone()
 
@@ -87,7 +87,7 @@ class MemoryHealth(DbConsumer):
         with self._db() as db:
             row = db.execute(text("""
                 SELECT memory_id
-                FROM memories
+                FROM mem_memories
                 WHERE user_id = :uid
                   AND is_active = 1
                   AND initial_confidence < 0.5
@@ -166,7 +166,7 @@ class MemoryHealth(DbConsumer):
                     AVG(LENGTH(content)) as avg_content_size,
                     MIN(observed_at) as oldest,
                     MAX(observed_at) as newest
-                FROM memories
+                FROM mem_memories
                 WHERE user_id = :uid
             """), {"uid": user_id}).fetchone()
 

@@ -281,7 +281,7 @@ class TestGoldenSessionSelector:
             
             db_session.execute(
                 text("""
-                    UPDATE conversation_events 
+                    UPDATE agent_events 
                     SET quality_score = :score 
                     WHERE event_id = :event_id
                 """),

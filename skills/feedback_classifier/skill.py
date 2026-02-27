@@ -60,29 +60,8 @@ class FeedbackClassifierSkill(Skill[ClassifierInput, ClassifierOutput]):
         return self._heuristic_fallback(input)
 
     def _ensure_model(self) -> bool:
-        """Lazy-load ONNX model from active artifact. Returns True if ready."""
-        if self._session is not None:
-            return True
-        if not self._db:
-            return False
-        try:
-            from core.models.artifact_manager import ArtifactManager
-            artifact = ArtifactManager(self._db).get_active("feedback_classifier")
-            if not artifact:
-                return False
-
-            from pathlib import Path
-            model_dir = str(Path(artifact["artifact_path"]).parent)
-
-            import onnxruntime as ort
-            from transformers import AutoTokenizer
-
-            self._session = ort.InferenceSession(artifact["artifact_path"])
-            self._tokenizer = AutoTokenizer.from_pretrained(model_dir)
-            return True
-        except Exception as e:
-            logger.debug(f"Failed to load ONNX model, using heuristic fallback: {e}")
-            return False
+        """Lazy-load ONNX model. Returns True if ready (artifact manager removed)."""
+        return self._session is not None
 
     def _predict(self, input: ClassifierInput) -> ClassifierOutput:
         """Run ONNX inference."""

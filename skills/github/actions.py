@@ -192,7 +192,7 @@ class CIStatusAction(Skill[CIStatusInput, CIStatusOutput]):
         self._api = api
 
     async def execute(self, input: CIStatusInput) -> CIStatusOutput:
-        runs = await self._api.list_workflow_runs(input.repo, input.limit)
+        runs = await self._api.list_wf_runs(input.repo, input.limit)
         workflows = [
             {
                 "workflow": r["name"],

@@ -48,7 +48,7 @@ class TestTransactionIsolation:
             try:
                 config_id = str(uuid7())
                 db.execute(text("""
-                    INSERT INTO configs (config_id, key_name, scope_type, scope_user_id, value)
+                    INSERT INTO infra_configs (config_id, key_name, scope_type, scope_user_id, value)
                     VALUES (:id, :key, :scope, :user, :val)
                 """), {
                     "id": config_id,
@@ -60,7 +60,7 @@ class TestTransactionIsolation:
                 db.commit()
                 
                 # Cleanup
-                db.execute(text("DELETE FROM configs WHERE config_id = :id"), {"id": config_id})
+                db.execute(text("DELETE FROM infra_configs WHERE config_id = :id"), {"id": config_id})
                 db.commit()
             except Exception as e:
                 db.rollback()

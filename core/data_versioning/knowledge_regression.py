@@ -160,7 +160,7 @@ class KnowledgeRegression(DbConsumer):
         """Detect sessions affected by quarantined knowledge entry.
 
         Traces impact via source_event_ids: the events that produced the
-        knowledge entry are looked up in conversation_events to find
+        knowledge entry are looked up in agent_events to find
         affected sessions.
 
         Args:
@@ -176,7 +176,7 @@ class KnowledgeRegression(DbConsumer):
                 SELECT COUNT(DISTINCT ce.session_id) as session_count,
                        COUNT(DISTINCT ce.event_id) as decision_count
                 FROM {self.source_db}.sk_knowledge_entry_sources kes
-                JOIN {self.source_db}.conversation_events ce ON kes.event_id = ce.event_id
+                JOIN {self.source_db}.agent_events ce ON kes.event_id = ce.event_id
                 WHERE kes.entry_id = :entry_id
             """), {"entry_id": entry_id}).fetchone()
 

@@ -177,7 +177,7 @@ class TestBranchAuth:
 
     def test_sql_injection_rejected(self, client, headers):
         resp = client.post("/api/v1/branches", json={
-            "name": "x; DROP TABLE users; --",
+            "name": "x; DROP TABLE auth_users; --",
             "source": "y",
         }, headers=headers)
         assert resp.status_code == 422

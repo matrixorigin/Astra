@@ -37,7 +37,7 @@ def cleanup(db_factory):
         from sqlalchemy import text
         db = db_factory()
         try:
-            db.execute(text("DELETE FROM memories WHERE memory_id IN :ids"), {"ids": tuple(ids)})
+            db.execute(text("DELETE FROM mem_memories WHERE memory_id IN :ids"), {"ids": tuple(ids)})
             db.commit()
         finally:
             db.close()

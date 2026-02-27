@@ -86,10 +86,10 @@ def cleanup(db_session, session_id):
     yield
     try:
         db_session.execute(text(
-            "DELETE FROM conversation_events WHERE session_id = :sid"
+            "DELETE FROM agent_events WHERE session_id = :sid"
         ), {"sid": session_id})
         db_session.execute(text(
-            "DELETE FROM sessions WHERE session_id = :sid"
+            "DELETE FROM agent_sessions WHERE session_id = :sid"
         ), {"sid": session_id})
         db_session.commit()
     except Exception:

@@ -115,7 +115,7 @@ class BatchEventWriter(DbConsumer):
             placeholders = ", ".join("(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)" for _ in events)
 
             query = f"""
-                INSERT INTO conversation_events (
+                INSERT INTO agent_events (
                     event_id, user_id, session_id, agent_id, agent_version,
                     event_type, content, parent_event_id, causal_chain_id,
                     created_at, metadata

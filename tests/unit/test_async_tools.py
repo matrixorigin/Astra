@@ -9,7 +9,7 @@ from tests.conftest import make_run_engine_mock_init
 from core.agent.async_tools import (
     AsyncToolRegistry,
     get_async_tool_registry,
-    _workflow_runs,
+    _wf_runs,
     _workflow_waits,
     resume_workflow,
     cleanup_stale_workflows,
@@ -93,7 +93,7 @@ class TestGlobalRegistry:
 class TestResumeWorkflow:
 
     def setup_method(self):
-        _workflow_runs.clear()
+        _wf_runs.clear()
         _workflow_waits.clear()
 
     @pytest.mark.asyncio
@@ -110,7 +110,7 @@ class TestResumeWorkflow:
     @pytest.mark.asyncio
     async def test_resume_no_wf_run(self):
         _workflow_waits["test:1"] = "wf_1"
-        _workflow_runs["wf_1"] = {"workflow": None, "engine": None, "wf_run": None}
+        _wf_runs["wf_1"] = {"workflow": None, "engine": None, "wf_run": None}
         result = await resume_workflow("test:1", {"data": 1})
         assert result is False
 
@@ -129,7 +129,7 @@ class TestCleanupStaleWorkflows:
         mock_row.created_at = datetime.now(timezone.utc) - timedelta(hours=48)
 
         # Pre-populate in-memory state
-        _workflow_runs["wf_stale"] = {"workflow": None, "engine": None, "wf_run": None}
+        _wf_runs["wf_stale"] = {"workflow": None, "engine": None, "wf_run": None}
         _workflow_waits["human:review"] = "wf_stale"
 
         mock_db = MagicMock()
@@ -144,7 +144,7 @@ class TestCleanupStaleWorkflows:
         assert count == 1
         assert mock_row.status == "failed"
         assert "Timed out" in mock_row.error
-        assert "wf_stale" not in _workflow_runs
+        assert "wf_stale" not in _wf_runs
         assert "human:review" not in _workflow_waits
 
     @pytest.mark.asyncio

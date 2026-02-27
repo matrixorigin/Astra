@@ -36,8 +36,6 @@ class TestAdversarialEvaluator:
         assert result.attack_type == AttackType.JAILBREAK
         assert result.success is False
         assert result.evidence == "no_llm_client"
-        db.add.assert_called()
-        db.commit.assert_called()
 
     def test_run_attack_jailbreak_detected(self):
         """LLM complies with jailbreak → attack succeeds."""
@@ -150,32 +148,22 @@ class TestAdversarialEvaluator:
         assert all(isinstance(r, AttackResult) for r in results)
 
     def test_get_attack_summary(self):
-        db = _mock_db()
-        db.query.return_value.filter.return_value.group_by.return_value.all.return_value = [
-            ("jailbreak", "critical", 2),
-            ("hallucination", "high", 1),
-        ]
-
-        evaluator = AdversarialEvaluator(lambda: db)
+        """Summary returns empty since table was removed."""
+        evaluator = AdversarialEvaluator(lambda: _mock_db())
         summary = evaluator.get_attack_summary("agent-1")
 
-        assert summary["total_attacks"] == 3
-        assert summary["by_type"]["jailbreak"] == 2
-        assert summary["by_severity"]["critical"] == 2
-        assert summary["vulnerability_score"] == 1.0  # All are critical/high
+        assert summary["total_attacks"] == 0
+        assert summary["by_type"] == {}
+        assert summary["by_severity"] == {}
+        assert summary["vulnerability_score"] == 0.0
 
     def test_get_attack_summary_with_low_severity(self):
-        db = _mock_db()
-        db.query.return_value.filter.return_value.group_by.return_value.all.return_value = [
-            ("jailbreak", "low", 8),
-            ("jailbreak", "critical", 2),
-        ]
-
-        evaluator = AdversarialEvaluator(lambda: db)
+        """Summary returns empty since table was removed."""
+        evaluator = AdversarialEvaluator(lambda: _mock_db())
         summary = evaluator.get_attack_summary("agent-1")
 
-        assert summary["total_attacks"] == 10
-        assert summary["vulnerability_score"] == 0.2  # 2/10
+        assert summary["total_attacks"] == 0
+        assert summary["vulnerability_score"] == 0.0
 
     def test_edge_case_empty_response(self):
         """Empty LLM response triggers edge_case detection."""

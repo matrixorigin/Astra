@@ -419,14 +419,14 @@ class TestScenarioC_BulkAndClosedLoop:
         # (In production, auto-scoring does this; here we simulate)
         for sid in session_ids:
             rows = db_session.execute(text(
-                "SELECT event_id FROM conversation_events "
+                "SELECT event_id FROM agent_events "
                 "WHERE session_id = :sid AND event_type = 'llm_response'"
             ), {"sid": sid}).fetchall()
             for row in rows:
                 # Alternate between low and high quality to create variance
                 score = 2.0 if session_ids.index(sid) < 2 else 4.5
                 db_session.execute(text(
-                    "UPDATE conversation_events SET quality_score = :qs WHERE event_id = :eid"
+                    "UPDATE agent_events SET quality_score = :qs WHERE event_id = :eid"
                 ), {"qs": score, "eid": row[0]})
         db_session.commit()
 

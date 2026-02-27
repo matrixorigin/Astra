@@ -1,13 +1,13 @@
 """Auth & identity models."""
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, SmallInteger, String
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, SmallInteger, String
 from sqlalchemy.sql import func
 
 from api.base import Base
 
 
 class User(Base):
-    __tablename__ = "users"
+    __tablename__ = "auth_users"
     user_id = Column(String(36), primary_key=True)
     username = Column(String(50), unique=True, nullable=False, index=True)
     email = Column(String(255), unique=True, nullable=False, index=True)
@@ -19,7 +19,7 @@ class User(Base):
 
 
 class Role(Base):
-    __tablename__ = "roles"
+    __tablename__ = "auth_roles"
     role_id = Column(String(36), primary_key=True)
     role_name = Column(String(50), unique=True, nullable=False)
     description = Column(String(255))
@@ -27,18 +27,45 @@ class Role(Base):
 
 
 class UserRole(Base):
-    __tablename__ = "user_roles"
+    __tablename__ = "auth_user_roles"
     id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(36), ForeignKey("users.user_id"), nullable=False, index=True)
-    role_id = Column(String(36), ForeignKey("roles.role_id"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("auth_users.user_id"), nullable=False, index=True)
+    role_id = Column(String(36), ForeignKey("auth_roles.role_id"), nullable=False, index=True)
     created_at = Column(DateTime, default=func.now())
 
 
 class RefreshToken(Base):
-    __tablename__ = "refresh_tokens"
+    __tablename__ = "auth_refresh_tokens"
     token_id = Column(String(36), primary_key=True)
     user_id = Column(String(36), nullable=False, index=True)
     token_hash = Column(String(255), nullable=False)
     expires_at = Column(DateTime, nullable=False)
     is_revoked = Column(SmallInteger, default=0, nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
+
+
+class AuditLog(Base):
+    __tablename__ = "auth_audit_logs"
+    log_id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False, index=True)
+    action = Column(String(50), nullable=False)
+    resource_type = Column(String(50))
+    resource_id = Column(String(64))
+    details = Column(JSON)
+    ip_address = Column(String(45))
+    created_at = Column(DateTime, default=func.now())
+
+
+class Token(Base):
+    __tablename__ = "auth_tokens"
+    token_id = Column(String(36), primary_key=True)
+    type = Column(String(50), nullable=False)
+    provider = Column(String(50), nullable=False)
+    encrypted_value = Column(String(255), nullable=True)
+    secret_ref = Column(String(255))
+    is_active = Column(SmallInteger, default=1)
+    scope_user_id = Column(String(36), index=True)
+    scope_repo = Column(String(255), index=True)
+    created_at = Column(DateTime, default=func.now())
+    expires_at = Column(DateTime, nullable=True)
+    token_metadata = Column("metadata", JSON)

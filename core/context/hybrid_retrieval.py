@@ -81,8 +81,8 @@ class HybridRetriever(DbConsumer):
                                 ELSE 0.0 
                             END
                         ) AS vector_score
-                    FROM conversation_events e
-                    JOIN event_embeddings ee ON e.event_id = ee.event_id
+                    FROM agent_events e
+                    JOIN ctx_event_embeddings ee ON e.event_id = ee.event_id
                     WHERE e.session_id = :session_id
                     ORDER BY vector_score DESC
                     LIMIT :limit
@@ -129,7 +129,7 @@ class HybridRetriever(DbConsumer):
                         causal_chain_id,
                         parent_event_id,
                         metadata
-                    FROM conversation_events
+                    FROM agent_events
                     WHERE MATCH(content, session_id) AGAINST(:query_text IN BOOLEAN MODE)
                         AND session_id = :session_id
                     LIMIT :limit

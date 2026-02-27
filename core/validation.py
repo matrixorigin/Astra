@@ -26,7 +26,7 @@ def validate_identifier(name: str, max_length: int = 64, allow_dot: bool = False
         'my_table'
         >>> validate_identifier("dev_agent.events", allow_dot=True)
         'dev_agent.events'
-        >>> validate_identifier("'; DROP TABLE users--")
+        >>> validate_identifier("'; DROP TABLE auth_users--")
         ValueError: Invalid identifier
     """
     if not name:

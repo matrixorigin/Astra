@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from core.agent.run import AgentRun, RunStatus, RunTrigger
 from core.agent.run_engine import (
-    RunEngine, _active_runs, _run_events, _run_waiters, _run_tasks,
+    RunEngine, _active_runs, _agent_run_events, _run_waiters, _run_tasks,
     _child_runs, _MAX_RESUME_INPUT_CHARS,
     _MAX_COMPLETED_RUNS, cleanup_fan_in_tasks,
 )
@@ -46,14 +46,14 @@ def engine(mock_db_factory):
 def clean_state():
     """Clean global state before each test."""
     _active_runs.clear()
-    _run_events.clear()
+    _agent_run_events.clear()
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
     cleanup_fan_in_tasks()
     yield
     _active_runs.clear()
-    _run_events.clear()
+    _agent_run_events.clear()
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
@@ -68,7 +68,7 @@ class TestRunEngineCreate:
         )
         assert run.status == RunStatus.PENDING
         assert run.run_id in _active_runs
-        assert run.run_id in _run_events
+        assert run.run_id in _agent_run_events
         assert run.run_id in _run_waiters
 
     def test_create_run_with_parent(self, engine):
@@ -117,7 +117,7 @@ class TestRunEngineStartRun:
                 await engine.start_run(run)
 
         assert run.status == RunStatus.FAILED
-        events = _run_events[run.run_id]
+        events = _agent_run_events[run.run_id]
         assert any("LLM exploded" in str(e.get("data", {})) for e in events)
 
     @pytest.mark.asyncio
@@ -141,7 +141,7 @@ class TestRunEngineStartRun:
                 await engine.start_run(run)
 
         assert run.status == RunStatus.FAILED
-        events = _run_events[run.run_id]
+        events = _agent_run_events[run.run_id]
         assert any("timed out" in str(e.get("data", {})) for e in events)
 
     @pytest.mark.asyncio
@@ -234,7 +234,7 @@ class TestRunEngineCancel:
         assert run.run_id not in _run_tasks
 
     def test_cancel_propagates_to_workflow(self, engine, mock_db):
-        from core.agent.async_tools import _workflow_runs, _workflow_waits
+        from core.agent.async_tools import _wf_runs, _workflow_waits
 
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
         run.status = RunStatus.WAITING
@@ -244,14 +244,14 @@ class TestRunEngineCancel:
         mock_engine = MagicMock()
         mock_wf = MagicMock()
         mock_wf.name = "test_wf"
-        _workflow_runs["wf_123"] = {"workflow": mock_wf, "engine": mock_engine, "wf_run": None}
+        _wf_runs["wf_123"] = {"workflow": mock_wf, "engine": mock_engine, "wf_run": None}
         _workflow_waits["inner:handle"] = "wf_123"
 
         engine.cancel_run(run.run_id)
 
         assert run.status == RunStatus.CANCELLED
         mock_engine.cancel.assert_called_once_with("test_wf")
-        assert "wf_123" not in _workflow_runs
+        assert "wf_123" not in _wf_runs
         assert "inner:handle" not in _workflow_waits
 
     @pytest.mark.asyncio
@@ -605,7 +605,7 @@ class TestFanInDBFallback:
                     (EventType.RUN_STARTED.value, child.to_event_content(), '{"run_id":"' + child_id + '"}'),
                     (EventType.RUN_COMPLETED.value, child.to_event_content(), '{"run_id":"' + child_id + '"}'),
                 ]
-            elif "run_events" in q and "SELECT" in q:
+            elif "agent_run_events" in q and "SELECT" in q:
                 # _load_events_from_db
                 result.fetchall.return_value = [
                     ("text_delta", '{"text":"review done"}', None, "reviewer"),
@@ -705,12 +705,12 @@ class TestEventPersistWarning:
         mock_db.execute.side_effect = RuntimeError("disk full")
         with caplog.at_level(logging.WARNING):
             engine._append_event(run.run_id, {"event_type": "test", "data": {}})
-            engine._flush_run_events()  # Triggers write → fail → retry → fail → error
+            engine._flush_agent_run_events()  # Triggers write → fail → retry → fail → error
         # First attempt logs warning, second logs error with "after retry"
         assert "retrying" in caplog.text.lower()
         assert "after retry" in caplog.text.lower()
         # Event should still be in local buffer (in-memory)
-        assert len(_run_events[run.run_id]) == 1
+        assert len(_agent_run_events[run.run_id]) == 1
         # Pending inserts should be empty — dropped after retry exhausted
         assert len(engine._pending_inserts) == 0
 
@@ -724,7 +724,7 @@ class TestEventPersistWarning:
                                    for i in range(_MAX_PENDING_EVENTS + 100)]
         mock_db.execute.side_effect = RuntimeError("db down")
         with caplog.at_level(logging.WARNING):
-            engine._flush_run_events()
+            engine._flush_agent_run_events()
         # After retry failure, buffer is dropped (retry also fails)
         # But during the retry merge, it was capped
         assert "capped" in caplog.text.lower()
@@ -945,23 +945,23 @@ class TestConsumeStreamCancellation:
 
 
 class TestStreamRunEventsBounded:
-    """Test stream_run_events timeout and local flag re-check."""
+    """Test stream_agent_run_events timeout and local flag re-check."""
 
     @pytest.mark.asyncio
     async def test_stream_exits_on_max_idle(self, engine, mock_db):
-        """stream_run_events should exit after max_idle_polls."""
+        """stream_agent_run_events should exit after max_idle_polls."""
         run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
         run.status = RunStatus.RUNNING
 
         # Monkey-patch to use tiny max_idle for test speed
-        original = engine.stream_run_events
+        original = engine.stream_agent_run_events
 
         async def fast_stream(run_id, last_index=0):
             idx = last_index
             max_idle = 3  # Very small for test
             idle = 0
             while idle < max_idle:
-                events = _run_events.get(run_id, [])
+                events = _agent_run_events.get(run_id, [])
                 if idx < len(events):
                     for i in range(idx, len(events)):
                         yield events[i]
@@ -986,7 +986,7 @@ class TestStreamRunEventsBounded:
         run.completed_at = datetime.now(timezone.utc)
 
         # Simulate GC: remove from memory
-        _run_events.pop(run.run_id)
+        _agent_run_events.pop(run.run_id)
         _active_runs.pop(run.run_id)
 
         # Mock DB to return the event
@@ -995,7 +995,7 @@ class TestStreamRunEventsBounded:
         ]
 
         collected = []
-        async for ev in engine.stream_run_events(run.run_id):
+        async for ev in engine.stream_agent_run_events(run.run_id):
             collected.append(ev)
             break  # Just need one to prove DB fallback works
 
@@ -1028,7 +1028,7 @@ class TestFanInAgentIdFallback:
         engine.resume_run = AsyncMock()
 
         # Provide events for the child
-        _run_events[child_id] = [{"event_type": "text_delta", "data": {"chunk": "looks good"}}]
+        _agent_run_events[child_id] = [{"event_type": "text_delta", "data": {"chunk": "looks good"}}]
 
         await engine._check_fan_in(parent.run_id)
 

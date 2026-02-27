@@ -11,7 +11,7 @@ from core.utils.id_generator import generate_log_id
 
 
 class AuditLogger:
-    """Log admin operations to audit_logs table.
+    """Log admin operations to auth_audit_logs table.
 
     Accepts a ``db_factory`` that returns the *current* request-scoped session.
     The logger does NOT own the session lifecycle — the caller (FastAPI
@@ -140,7 +140,7 @@ class AuditLogger:
         where_clause = " AND ".join(conditions) if conditions else "1=1"
 
         query = text(f"""
-        SELECT * FROM audit_logs
+        SELECT * FROM auth_audit_logs
         WHERE {where_clause}
         ORDER BY created_at DESC
         LIMIT {limit}

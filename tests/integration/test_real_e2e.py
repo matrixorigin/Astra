@@ -504,7 +504,7 @@ class TestAdminCLIRealE2E:
         tokens = db.query(Token).filter(Token.provider == "openai").all()
         assert len(tokens) > 0
 
-    def test_audit_logs_retrieves_real_logs(self, authenticated_admin_runner, admin_user, db):
+    def test_auth_audit_logs_retrieves_real_logs(self, authenticated_admin_runner, admin_user, db):
         """Test audit logs retrieves real audit data."""
         # Create audit log
         log = AuditLog(
@@ -719,13 +719,13 @@ class TestChatTurnRealE2E:
         assert events[-1]["has_tool_calls"] is False
 
     def test_chat_turn_persists_events(self, client, db):
-        """Events are persisted to conversation_events table."""
+        """Events are persisted to agent_events table."""
         headers = self._get_auth_headers(client, db)
         from sqlalchemy import text as sql_text
 
         # Count events before
         before = db.execute(sql_text(
-            "SELECT COUNT(*) FROM conversation_events WHERE user_id = 'edge_user'"
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = 'edge_user'"
         )).scalar()
 
         with patch("core.llm.client.LLMClient.chat_stream", return_value=_fake_stream([
@@ -738,7 +738,7 @@ class TestChatTurnRealE2E:
         from api.routers.chat import _flush_persist_threads
         _flush_persist_threads()
         after = db.execute(sql_text(
-            "SELECT COUNT(*) FROM conversation_events WHERE user_id = 'edge_user'"
+            "SELECT COUNT(*) FROM agent_events WHERE user_id = 'edge_user'"
         )).scalar()
         assert after > before, f"Expected new events: before={before}, after={after}"
 

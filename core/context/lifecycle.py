@@ -143,7 +143,7 @@ class MemoryGovernanceEngine(DbConsumer):
             reported = set()
             if dedup_keys:
                 rows = db.execute(
-                    text("""SELECT dedup_key FROM conversation_events
+                    text("""SELECT dedup_key FROM agent_events
                             WHERE event_type = 'contradiction_detected'
                             AND dedup_key IN :keys"""),
                     {"keys": tuple(dedup_keys)},
@@ -178,7 +178,7 @@ class MemoryGovernanceEngine(DbConsumer):
             eid = str(uuid7())
             try:
                 db.execute(
-                    text("""INSERT INTO conversation_events
+                    text("""INSERT INTO agent_events
                             (event_id, session_id, user_id, agent_id, agent_version,
                              event_type, content, causal_chain_id, dedup_key, created_at)
                             VALUES (:eid, 'system_governance', 'system', 'governance', '1.0',

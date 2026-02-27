@@ -201,7 +201,7 @@ def list_tokens(
 
 
 @router.get("/audit", response_model=list[AuditLogResponse])
-def get_audit_logs(
+def get_auth_audit_logs(
     user_id: str | None = None,
     since: str | None = None,
     limit: int = 100,
@@ -306,25 +306,25 @@ def grant_role(
     try:
         _check_admin(current_user["user_id"], db)
         user = db.execute(
-            text("SELECT user_id FROM users WHERE username = :username"),
+            text("SELECT user_id FROM auth_users WHERE username = :username"),
             {"username": request.username},
         ).fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         role = db.execute(
-            text("SELECT role_id FROM roles WHERE role_name = :role_name"),
+            text("SELECT role_id FROM auth_roles WHERE role_name = :role_name"),
             {"role_name": request.role_name},
         ).fetchone()
         if not role:
             raise HTTPException(status_code=404, detail="Role not found")
         existing = db.execute(
-            text("SELECT 1 FROM user_roles WHERE user_id = :uid AND role_id = :rid"),
+            text("SELECT 1 FROM auth_user_roles WHERE user_id = :uid AND role_id = :rid"),
             {"uid": user[0], "rid": role[0]},
         ).fetchone()
         if existing:
             return UserRoleResponse(username=request.username, role_name=request.role_name, message="User already has this role")
         db.execute(
-            text("INSERT INTO user_roles (user_id, role_id) VALUES (:uid, :rid)"),
+            text("INSERT INTO auth_user_roles (user_id, role_id) VALUES (:uid, :rid)"),
             {"uid": user[0], "rid": role[0]},
         )
         db.commit()
@@ -342,19 +342,19 @@ def revoke_role(
     try:
         _check_admin(current_user["user_id"], db)
         user = db.execute(
-            text("SELECT user_id FROM users WHERE username = :username"),
+            text("SELECT user_id FROM auth_users WHERE username = :username"),
             {"username": request.username},
         ).fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         role = db.execute(
-            text("SELECT role_id FROM roles WHERE role_name = :role_name"),
+            text("SELECT role_id FROM auth_roles WHERE role_name = :role_name"),
             {"role_name": request.role_name},
         ).fetchone()
         if not role:
             raise HTTPException(status_code=404, detail="Role not found")
         result = db.execute(
-            text("DELETE FROM user_roles WHERE user_id = :uid AND role_id = :rid"),
+            text("DELETE FROM auth_user_roles WHERE user_id = :uid AND role_id = :rid"),
             {"uid": user[0], "rid": role[0]},
         )
         db.commit()

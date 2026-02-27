@@ -42,7 +42,7 @@ DURABLE_TYPES = {
 
 
 def _to_ce_values(e: ConversationEvent) -> dict[str, Any]:
-    """Convert event to conversation_events column dict (no embedding)."""
+    """Convert event to agent_events column dict (no embedding)."""
     metadata = e.metadata or {}
     return {
         "event_id": e.event_id,
@@ -67,7 +67,7 @@ def _to_ce_values(e: ConversationEvent) -> dict[str, Any]:
 
 
 def _to_re_values(e: ConversationEvent, run_id: str, idx: int) -> dict[str, Any]:
-    """Convert event to run_events column dict."""
+    """Convert event to agent_run_events column dict."""
     et = e.event_type if isinstance(e.event_type, str) else e.event_type.value
     return {
         "run_id": run_id,
@@ -81,7 +81,7 @@ def _to_re_values(e: ConversationEvent, run_id: str, idx: int) -> dict[str, Any]
 
 # SQL templates for bulk insert
 _CE_INSERT = text("""
-    INSERT INTO conversation_events (
+    INSERT INTO agent_events (
         event_id, user_id, session_id, agent_id, agent_version,
         event_type, content, parent_event_id, causal_chain_id,
         created_at, metadata, token_usage, context_snapshot,
@@ -95,7 +95,7 @@ _CE_INSERT = text("""
 """)
 
 _RE_INSERT = text("""
-    INSERT INTO run_events (run_id, idx, event_type, data, event_id, agent_id)
+    INSERT INTO agent_run_events (run_id, idx, event_type, data, event_id, agent_id)
     VALUES (:run_id, :idx, :event_type, :data, :event_id, :agent_id)
 """)
 
@@ -289,11 +289,11 @@ class EventPipeline:
             except ValueError:
                 et_enum = None
 
-            # conversation_events: critical + durable
+            # agent_events: critical + durable
             if et_enum in CRITICAL_TYPES or et_enum in DURABLE_TYPES:
                 ce_rows.append(_to_ce_values(ev))
 
-            # run_events: anything with run_id (orthogonal to tier)
+            # agent_run_events: anything with run_id (orthogonal to tier)
             run_id = (ev.metadata or {}).get("run_id")
             if run_id:
                 with self._lock:

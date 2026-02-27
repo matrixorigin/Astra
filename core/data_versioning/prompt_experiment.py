@@ -116,7 +116,7 @@ class PromptExperiment(DbConsumer):
         self.source_db = source_db
     
     def create_experiment(self, config: ExperimentConfig) -> str:
-        """Create new experiment with sandbox and branched conversation_events.
+        """Create new experiment with sandbox and branched agent_events.
         
         Args:
             config: Experiment configuration
@@ -132,7 +132,7 @@ class PromptExperiment(DbConsumer):
                 name=exp_id,
                 description=f"Experiment: {config.name}",
                 created_by="system",
-                tables=["conversation_events"],  # Branch conversation_events
+                tables=["agent_events"],  # Branch agent_events
             )
         
             # 2. Create experiment_config table in sandbox
@@ -624,5 +624,5 @@ class PromptExperiment(DbConsumer):
             """), {"status": ExperimentStatus.ARCHIVED.value, "exp_id": experiment_id})
             db.commit()
         
-            # Delete sandbox (includes branched conversation_events)
+            # Delete sandbox (includes branched agent_events)
             self.sandbox.delete(experiment_id)

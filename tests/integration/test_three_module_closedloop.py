@@ -104,7 +104,7 @@ class TestGovernanceStructuredOutputs:
         engine._quarantine_low_confidence(threshold=0.3)
 
         row = db_session.execute(text("""
-            SELECT content FROM conversation_events
+            SELECT content FROM agent_events
             WHERE event_type = 'governance_quarantine'
             ORDER BY created_at DESC LIMIT 1
         """)).fetchone()
@@ -134,7 +134,7 @@ class TestGovernanceStructuredOutputs:
         assert count >= 1
 
         row = db_session.execute(text("""
-            SELECT content FROM conversation_events
+            SELECT content FROM agent_events
             WHERE event_type = 'contradiction_detected'
             AND content LIKE :pat
             ORDER BY created_at DESC LIMIT 1
@@ -176,7 +176,7 @@ class TestSkillRollback:
         assert inst.skill_version == "1.0"
 
         db_session.execute(text(
-            "UPDATE skills_registry SET version = '2.0' WHERE skill_name = :n"
+            "UPDATE skill_registry SET version = '2.0' WHERE skill_name = :n"
         ), {"n": skill})
         db_session.commit()
 
@@ -197,7 +197,7 @@ class TestSkillRollback:
         mgr.install(uid, skill)
 
         db_session.execute(text(
-            "UPDATE skills_registry SET version = '2.0' WHERE skill_name = :n"
+            "UPDATE skill_registry SET version = '2.0' WHERE skill_name = :n"
         ), {"n": skill})
         db_session.commit()
         mgr.upgrade(uid, skill)

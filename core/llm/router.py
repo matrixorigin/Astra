@@ -170,20 +170,20 @@ class CostOptimizedStrategy(RoutingStrategy):
 
 
 class ModelRegistry:
-    """In-memory model registry loaded from llm_models table."""
+    """In-memory model registry loaded from infra_llm_models table."""
 
     def __init__(self):
         self._models: dict[str, ModelConfig] = {}
 
     def load_from_db(self, db, user_id: str | None = None):
-        """Load active models from llm_models table."""
+        """Load active models from infra_llm_models table."""
         try:
             rows = db.execute(
                 text(
                     "SELECT model_name, provider, context_window, max_completion_tokens, "
                     "input_modalities, output_modalities, supported_parameters, "
                     "pricing, architecture, tags, is_active, base_url "
-                    "FROM llm_models WHERE is_active = 1"
+                    "FROM infra_llm_models WHERE is_active = 1"
                 )
             ).fetchall()
             for row in rows:

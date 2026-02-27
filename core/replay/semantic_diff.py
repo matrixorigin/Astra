@@ -72,7 +72,7 @@ class SemanticDiff(DbConsumer):
 
             query1 = text(f"""
                 SELECT {_EVENT_COLUMNS}
-                FROM conversation_events {{SNAPSHOT = '{checkpoint1}'}}
+                FROM agent_events {{SNAPSHOT = '{checkpoint1}'}}
                 WHERE session_id = :session_id
                 ORDER BY created_at ASC
             """)
@@ -81,7 +81,7 @@ class SemanticDiff(DbConsumer):
 
             query2 = text(f"""
                 SELECT {_EVENT_COLUMNS}
-                FROM conversation_events {{SNAPSHOT = '{checkpoint2}'}}
+                FROM agent_events {{SNAPSHOT = '{checkpoint2}'}}
                 WHERE session_id = :session_id
                 ORDER BY created_at ASC
             """)

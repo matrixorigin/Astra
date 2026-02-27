@@ -2,8 +2,8 @@
 
 Tests the real end-to-end flow:
 1. Events written WITHOUT inline embedding (EventLogger no longer embeds)
-2. EmbeddingWorker picks up unembedded events and writes to event_embeddings
-3. HybridRetriever reads from event_embeddings JOIN (not conversation_events.embedding)
+2. EmbeddingWorker picks up unembedded events and writes to ctx_event_embeddings
+3. HybridRetriever reads from ctx_event_embeddings JOIN (not agent_events.embedding)
 4. Fulltext fallback works when zero embeddings exist
 """
 
@@ -58,11 +58,11 @@ def cleanup_events(db_session, session_id):
     try:
         # Delete embeddings first (FK-like dependency)
         db_session.execute(text(
-            "DELETE FROM event_embeddings WHERE event_id IN "
-            "(SELECT event_id FROM conversation_events WHERE session_id = :sid)"
+            "DELETE FROM ctx_event_embeddings WHERE event_id IN "
+            "(SELECT event_id FROM agent_events WHERE session_id = :sid)"
         ), {"sid": session_id})
         db_session.execute(text(
-            "DELETE FROM conversation_events WHERE session_id = :sid"
+            "DELETE FROM agent_events WHERE session_id = :sid"
         ), {"sid": session_id})
         db_session.commit()
     except Exception:
@@ -79,7 +79,7 @@ class TestEventLoggerNoInlineEmbedding:
         logger.log_event(ev)
 
         row = db_session.execute(
-            text("SELECT embedding FROM conversation_events WHERE event_id = :eid"),
+            text("SELECT embedding FROM agent_events WHERE event_id = :eid"),
             {"eid": ev.event_id},
         ).fetchone()
 
@@ -88,7 +88,7 @@ class TestEventLoggerNoInlineEmbedding:
 
 
 class TestEmbeddingWorker:
-    """Verify EmbeddingWorker picks up events and writes to event_embeddings."""
+    """Verify EmbeddingWorker picks up events and writes to ctx_event_embeddings."""
 
     def test_worker_embeds_eligible_events(self, db_session, session_id, cleanup_events):
         """Worker should embed user_query and llm_response, skip others."""
@@ -112,14 +112,14 @@ class TestEmbeddingWorker:
 
         # Verify our eligible events got embedded
         embedded = db_session.execute(
-            text("SELECT event_id FROM event_embeddings WHERE event_id IN (:e1, :e2)"),
+            text("SELECT event_id FROM ctx_event_embeddings WHERE event_id IN (:e1, :e2)"),
             {"e1": ev_query.event_id, "e2": ev_response.event_id},
         ).fetchall()
         assert len(embedded) == 2
 
         # Verify non-eligible events were NOT embedded
         not_embedded = db_session.execute(
-            text("SELECT event_id FROM event_embeddings WHERE event_id IN (:e1, :e2)"),
+            text("SELECT event_id FROM ctx_event_embeddings WHERE event_id IN (:e1, :e2)"),
             {"e1": ev_tool.event_id, "e2": ev_stream.event_id},
         ).fetchall()
         assert len(not_embedded) == 0
@@ -154,7 +154,7 @@ class TestEmbeddingWorker:
         # Wait for worker to process
         for _ in range(20):
             row = db_session.execute(
-                text("SELECT 1 FROM event_embeddings WHERE event_id = :eid"),
+                text("SELECT 1 FROM ctx_event_embeddings WHERE event_id = :eid"),
                 {"eid": ev.event_id},
             ).fetchone()
             if row:
@@ -167,17 +167,17 @@ class TestEmbeddingWorker:
 
         # Verify embedding was created
         row = db_session.execute(
-            text("SELECT model_name FROM event_embeddings WHERE event_id = :eid"),
+            text("SELECT model_name FROM ctx_event_embeddings WHERE event_id = :eid"),
             {"eid": ev.event_id},
         ).fetchone()
         assert row is not None, "Worker should have embedded the event"
 
 
 class TestHybridRetrieverJoinPath:
-    """Verify HybridRetriever reads from event_embeddings JOIN."""
+    """Verify HybridRetriever reads from ctx_event_embeddings JOIN."""
 
-    def test_retrieval_uses_event_embeddings(self, db_session, session_id, cleanup_events):
-        """Vector search should find events via event_embeddings JOIN."""
+    def test_retrieval_uses_ctx_event_embeddings(self, db_session, session_id, cleanup_events):
+        """Vector search should find events via ctx_event_embeddings JOIN."""
         from core.context.hybrid_retrieval import HybridRetriever
         from core.context.embeddings import EmbeddingService
 
@@ -185,7 +185,7 @@ class TestHybridRetrieverJoinPath:
         ev = _make_event(session_id, EventType.USER_QUERY, "What is event sourcing?")
         logger.log_event(ev)
 
-        # Generate and store embedding in event_embeddings (simulating worker)
+        # Generate and store embedding in ctx_event_embeddings (simulating worker)
         svc = EmbeddingService(lambda: db_session, provider="mock")
         svc.store_embedding(ev.event_id, svc.embed_text(ev.content))
 
@@ -199,7 +199,7 @@ class TestHybridRetrieverJoinPath:
         )
 
         event_ids = [r["event_id"] for r in results]
-        assert ev.event_id in event_ids, "Should find event via event_embeddings JOIN"
+        assert ev.event_id in event_ids, "Should find event via ctx_event_embeddings JOIN"
 
     def test_fulltext_fallback_with_zero_embeddings(self, db_session, session_id, cleanup_events):
         """When no embeddings exist, fulltext search should still return results."""
@@ -268,24 +268,24 @@ class TestEndToEndDecoupled:
         ev = _make_event(session_id, EventType.USER_QUERY, "How does MVCC work in MatrixOne?")
         logger.log_event(ev)
 
-        # Verify no embedding in conversation_events
+        # Verify no embedding in agent_events
         row = db_session.execute(
-            text("SELECT embedding FROM conversation_events WHERE event_id = :eid"),
+            text("SELECT embedding FROM agent_events WHERE event_id = :eid"),
             {"eid": ev.event_id},
         ).fetchone()
-        assert row[0] is None, "conversation_events.embedding should be NULL"
+        assert row[0] is None, "agent_events.embedding should be NULL"
 
-        # 2. Worker generates embedding into event_embeddings
+        # 2. Worker generates embedding into ctx_event_embeddings
         worker = EmbeddingWorker(SessionLocal, embedding_provider="mock")
         count = _drain_worker(worker, db_session)
         assert count >= 1
 
-        # Verify embedding in event_embeddings
+        # Verify embedding in ctx_event_embeddings
         emb_row = db_session.execute(
-            text("SELECT model_name FROM event_embeddings WHERE event_id = :eid"),
+            text("SELECT model_name FROM ctx_event_embeddings WHERE event_id = :eid"),
             {"eid": ev.event_id},
         ).fetchone()
-        assert emb_row is not None, "event_embeddings should have the embedding"
+        assert emb_row is not None, "ctx_event_embeddings should have the embedding"
 
         # 3. Retriever finds it via JOIN
         svc = EmbeddingService(lambda: db_session, provider="mock")
@@ -297,4 +297,4 @@ class TestEndToEndDecoupled:
         )
 
         assert any(r["event_id"] == ev.event_id for r in results), \
-            "Retriever should find the event via event_embeddings JOIN"
+            "Retriever should find the event via ctx_event_embeddings JOIN"

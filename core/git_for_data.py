@@ -93,7 +93,7 @@ class GitForData(DbConsumer):
         Example:
             >>> git = GitForData()
             >>> results = git.query_at_snapshot(
-            ...     "SELECT * FROM conversation_events WHERE session_id = :session_id",
+            ...     "SELECT * FROM agent_events WHERE session_id = :session_id",
             ...     "my_checkpoint",
             ...     {"session_id": "session_123"}
             ... )

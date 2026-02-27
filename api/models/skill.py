@@ -11,7 +11,7 @@ from api.models._constants import EMBEDDING_DIM
 
 
 class SkillRegistry(Base):
-    __tablename__ = "skills_registry"
+    __tablename__ = "skill_registry"
     skill_id = Column(String(255), primary_key=True)  # skill_name@version
     skill_name = Column(String(255), nullable=False, index=True)
     version = Column(String(32), nullable=False)
@@ -20,7 +20,7 @@ class SkillRegistry(Base):
     code_hash = Column(String(64))
     git_commit_hash = Column(String(64))
     is_active = Column(SmallInteger, default=1)
-    status = Column(String(20), default="active")  # draft/active/deprecated/archived
+    status = Column(String(20), default="active")
     category = Column(String(50))
     subcategory = Column(String(50))
     triggers = Column(JSON)
@@ -28,7 +28,7 @@ class SkillRegistry(Base):
     priority = Column(Integer)
     cost_estimate = Column(String(20))
     side_effect_profile = Column(JSON)
-    source = Column(String(20), default="builtin")  # builtin/marketplace/user
+    source = Column(String(20), default="builtin")
     manifest = Column(JSON)
     is_public = Column(SmallInteger, default=0)
     created_by = Column(String(36))
@@ -37,7 +37,6 @@ class SkillRegistry(Base):
 
 
 class SkillInstallation(Base):
-    """Per-user skill installation state."""
     __tablename__ = "skill_installations"
     __table_args__ = (
         UniqueConstraint("user_id", "skill_name", name="uq_user_skill"),
@@ -54,9 +53,8 @@ class SkillInstallation(Base):
     updated_at = Column(DateTime, onupdate=func.now())
 
 
-class UserCredential(Base):
-    """Per-user encrypted skill credentials."""
-    __tablename__ = "user_credentials"
+class SkillUserCredential(Base):
+    __tablename__ = "skill_user_credentials"
     __table_args__ = (
         UniqueConstraint("user_id", "skill_name", "credential_name",
                          name="uq_user_skill_cred"),
@@ -72,7 +70,6 @@ class UserCredential(Base):
 
 
 class SkillPermission(Base):
-    """Skill RBAC — who can install which skill."""
     __tablename__ = "skill_permissions"
     __table_args__ = (
         UniqueConstraint("skill_name", "grantee_type", "grantee_id",
@@ -114,7 +111,7 @@ class SkillSelectionEvent(Base):
 
 
 class SkillSelectionLearning(Base):
-    __tablename__ = "skill_selection_learning"
+    __tablename__ = "skill_selection_learnings"
     learning_id = Column(String(36), primary_key=True)
     query_pattern = Column(String(255), nullable=False, index=True)
     query_embedding = Column(VectorType(EMBEDDING_DIM, VectorPrecision.F32))
@@ -134,7 +131,6 @@ class SkillSelectionLearning(Base):
 
 
 class SkillLearningSignal(Base):
-    """Raw learning signals collected from skill selection events."""
     __tablename__ = "skill_learning_signals"
     signal_id = Column(String(36), primary_key=True)
     selection_event_id = Column(String(36), index=True, nullable=False)
@@ -144,7 +140,6 @@ class SkillLearningSignal(Base):
 
 
 class SkillExecutionMetric(Base):
-    """Records execution metrics for skills to enable multi-dimensional learning."""
     __tablename__ = "skill_execution_metrics"
     metric_id = Column(String(36), primary_key=True)
     session_id = Column(String(36), index=True, nullable=False)

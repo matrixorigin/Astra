@@ -1,4 +1,4 @@
-"""Infrastructure models: LLM, config, repo, sandbox, tokens, locks."""
+"""Infrastructure models: LLM, config, repo, sandbox, locks."""
 
 from sqlalchemy import (
     JSON, Column, DateTime, Integer, SmallInteger, String, Text, UniqueConstraint,
@@ -9,8 +9,7 @@ from api.base import Base
 
 
 class LLMModel(Base):
-    """Registered LLM model — each row is one usable model with its API key."""
-    __tablename__ = "llm_models"
+    __tablename__ = "infra_llm_models"
     __table_args__ = (
         UniqueConstraint('model_name', 'provider', name='uq_llm_model_name_provider'),
     )
@@ -34,7 +33,7 @@ class LLMModel(Base):
 
 
 class Config(Base):
-    __tablename__ = "configs"
+    __tablename__ = "infra_configs"
     __table_args__ = (
         UniqueConstraint('key_name', 'scope_type', 'scope_user_id', name='uq_config_scope'),
     )
@@ -49,7 +48,7 @@ class Config(Base):
 
 
 class Repo(Base):
-    __tablename__ = "repos"
+    __tablename__ = "infra_repos"
     repo_id = Column(String(36), primary_key=True)
     user_id = Column(String(36), nullable=False, index=True)
     repo_url = Column(String(255), nullable=False)
@@ -66,7 +65,7 @@ class Repo(Base):
 
 
 class SandboxMetadata(Base):
-    __tablename__ = "sandbox_metadata"
+    __tablename__ = "infra_sandbox_metadata"
     sandbox_name = Column(String(64), primary_key=True)
     user_id = Column(String(36))
     data_source = Column(JSON)
@@ -84,36 +83,8 @@ class SandboxMetadata(Base):
     terminated_at = Column(DateTime, nullable=True)
 
 
-class AuditLog(Base):
-    __tablename__ = "audit_logs"
-    log_id = Column(String(36), primary_key=True)
-    user_id = Column(String(36), nullable=False, index=True)
-    action = Column(String(50), nullable=False)
-    resource_type = Column(String(50))
-    resource_id = Column(String(64))
-    details = Column(JSON)
-    ip_address = Column(String(45))
-    created_at = Column(DateTime, default=func.now())
-
-
-class Token(Base):
-    __tablename__ = "tokens"
-    token_id = Column(String(36), primary_key=True)
-    type = Column(String(50), nullable=False)
-    provider = Column(String(50), nullable=False)
-    encrypted_value = Column(String(255), nullable=True)
-    secret_ref = Column(String(255))
-    is_active = Column(SmallInteger, default=1)
-    scope_user_id = Column(String(36), index=True)
-    scope_repo = Column(String(255), index=True)
-    created_at = Column(DateTime, default=func.now())
-    expires_at = Column(DateTime, nullable=True)
-    token_metadata = Column("metadata", JSON)
-
-
 class DistributedLock(Base):
-    """Distributed lock for multi-instance governance tasks."""
-    __tablename__ = "distributed_locks"
+    __tablename__ = "infra_distributed_locks"
     lock_name = Column(String(64), primary_key=True)
     instance_id = Column(String(64), nullable=False)
     acquired_at = Column(DateTime, default=func.now(), nullable=False)

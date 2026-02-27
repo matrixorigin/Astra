@@ -153,7 +153,7 @@ class TestToolMockingLayer:
         )
         
         # Verify database was updated
-        result = db.execute(text("SELECT * FROM conversation_events WHERE event_id = :event_id"), {"event_id": event_id})
+        result = db.execute(text("SELECT * FROM agent_events WHERE event_id = :event_id"), {"event_id": event_id})
         events = list(result)
         assert len(events) > 0
         assert events[0]._mapping["skill_result"] is not None

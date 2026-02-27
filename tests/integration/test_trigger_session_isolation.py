@@ -43,8 +43,8 @@ def session_id(db):
         user_id="test-user", metadata={"source": "trigger_isolation"},
     ).session_id
     yield sid
-    db.execute(text("DELETE FROM triggers WHERE session_id = :sid"), {"sid": sid})
-    db.execute(text("DELETE FROM sessions WHERE session_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM wf_triggers WHERE session_id = :sid"), {"sid": sid})
+    db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
     db.commit()
 
 
@@ -60,7 +60,7 @@ def _make_due_trigger(db, session_id, name_suffix=""):
     )
     # Force next_fire_at into the past so get_due_triggers picks it up.
     db.execute(
-        text("UPDATE triggers SET next_fire_at = :past WHERE trigger_id = :tid"),
+        text("UPDATE wf_triggers SET next_fire_at = :past WHERE trigger_id = :tid"),
         {"past": datetime(2020, 1, 1), "tid": trig["trigger_id"]},
     )
     db.commit()
@@ -256,7 +256,7 @@ class TestAutoSessionUsesFactory:
         assert len(close_calls) == 1, "_auto_session must open and close exactly one session"
 
         # Clean up the auto-created session.
-        db.execute(text("DELETE FROM sessions WHERE session_id = :sid"), {"sid": result_sid})
+        db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": result_sid})
         db.commit()
 
 
@@ -290,7 +290,7 @@ class TestGetDueTriggersRealDB:
         """Inactive triggers are never returned even if due."""
         tid = _make_due_trigger(db, session_id, "-inactive")
         db.execute(
-            text("UPDATE triggers SET is_active = 0 WHERE trigger_id = :tid"),
+            text("UPDATE wf_triggers SET is_active = 0 WHERE trigger_id = :tid"),
             {"tid": tid},
         )
         db.commit()

@@ -1,9 +1,10 @@
-"""Agent, session, event, and working-memory models."""
+"""Agent, session, event, working-memory, and run-event models."""
 
 from matrixone import VectorPrecision, VectorType
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy import (
     JSON, Column, DateTime, Float, Index, Integer, SmallInteger, String, Text,
+    UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
@@ -12,7 +13,7 @@ from api.models._constants import EMBEDDING_DIM
 
 
 class Agent(Base):
-    __tablename__ = "agents"
+    __tablename__ = "agent_agents"
     agent_id = Column(String(36), primary_key=True)
     agent_name = Column(String(100), nullable=False)
     agent_type = Column(String(50), nullable=False)
@@ -25,7 +26,7 @@ class Agent(Base):
 
 
 class Session(Base):
-    __tablename__ = "sessions"
+    __tablename__ = "agent_sessions"
     session_id = Column(String(36), primary_key=True)
     user_id = Column(String(36), nullable=False, index=True)
     agent_id = Column(String(36), nullable=True, index=True)
@@ -44,7 +45,7 @@ class Session(Base):
 
 
 class Event(Base):
-    __tablename__ = "conversation_events"
+    __tablename__ = "agent_events"
     __table_args__ = (
         FulltextIndex("ft_content_session", ["content", "session_id"], parser=FulltextParserType.NGRAM),
     )
@@ -83,7 +84,7 @@ class Event(Base):
 
 class AgentScratchpad(Base):
     """Working memory: structured notes for long-horizon tasks."""
-    __tablename__ = "agent_scratchpad"
+    __tablename__ = "agent_scratchpads"
     __table_args__ = (
         Index('idx_scratchpad_session', 'session_id'),
         Index('idx_scratchpad_user', 'user_id'),
@@ -101,3 +102,19 @@ class AgentScratchpad(Base):
     related_note_ids = Column(JSON)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class RunEvent(Base):
+    """Persisted SSE events for cross-worker streaming."""
+    __tablename__ = "agent_run_events"
+    __table_args__ = (
+        UniqueConstraint("run_id", "idx", name="uq_run_event_run_idx"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(255), nullable=False, index=True)
+    idx = Column(Integer, nullable=False)
+    event_type = Column(String(64), nullable=False)
+    data = Column(JSON, nullable=False)
+    event_id = Column(String(255))
+    agent_id = Column(String(255))
+    created_at = Column(DateTime, default=func.now())

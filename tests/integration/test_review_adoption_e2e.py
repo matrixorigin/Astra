@@ -41,7 +41,7 @@ class TestDataVersioningAPI:
 
         for eid, pid in [(parent_id, None), (child_id, parent_id)]:
             db_session.execute(text("""
-                INSERT INTO conversation_events
+                INSERT INTO agent_events
                     (event_id, session_id, user_id, agent_id, agent_version,
                      event_type, content, parent_event_id, causal_chain_id, created_at)
                 VALUES (:eid, :sid, 'test', 'test', '1.0', 'user_query', 'test',
@@ -77,7 +77,7 @@ class TestDataVersioningAPI:
             eid = f"ev_cc_{os.urandom(4).hex()}"
             ids.append(eid)
             db_session.execute(text("""
-                INSERT INTO conversation_events
+                INSERT INTO agent_events
                     (event_id, session_id, user_id, agent_id, agent_version,
                      event_type, content, causal_chain_id, created_at)
                 VALUES (:eid, :sid, 'test', 'test', '1.0', 'user_query', :c, :cid, NOW())
@@ -232,14 +232,14 @@ class TestSLODashboard:
             db.commit()
 
             row = db.execute(text("""
-                SELECT event_type FROM conversation_events
+                SELECT event_type FROM agent_events
                 WHERE agent_id = :aid AND event_type = 'slo_monitoring_increased'
                 LIMIT 1
             """), {"aid": agent_id}).fetchone()
             assert row is not None
         finally:
             db.execute(text(
-                "DELETE FROM conversation_events WHERE agent_id = :aid"
+                "DELETE FROM agent_events WHERE agent_id = :aid"
             ), {"aid": agent_id})
             db.commit()
             db.close()
@@ -270,7 +270,7 @@ class TestSLODashboard:
             assert kwargs["change_content"]["agent_id"] == agent_id
         finally:
             db_session.execute(text(
-                "DELETE FROM conversation_events WHERE agent_id = :aid"
+                "DELETE FROM agent_events WHERE agent_id = :aid"
             ), {"aid": agent_id})
             db_session.commit()
 
@@ -293,7 +293,7 @@ class TestSLODashboard:
             db.commit()
 
             rows = db.execute(text("""
-                SELECT event_type FROM conversation_events
+                SELECT event_type FROM agent_events
                 WHERE agent_id = :aid
                   AND event_type IN ('slo_post_mortem', 'slo_model_escalation', 'slo_hitl_tightened')
                 ORDER BY event_type
@@ -304,7 +304,7 @@ class TestSLODashboard:
             assert "slo_hitl_tightened" in event_types
         finally:
             db.execute(text(
-                "DELETE FROM conversation_events WHERE agent_id = :aid"
+                "DELETE FROM agent_events WHERE agent_id = :aid"
             ), {"aid": agent_id})
             db.commit()
             db.close()
@@ -314,7 +314,7 @@ class TestSLODashboard:
         # Decision layer query
         row = db_session.execute(text("""
             SELECT AVG(quality_score) as avg_quality, COUNT(*) as total
-            FROM conversation_events
+            FROM agent_events
             WHERE agent_id = 'test_obs' AND event_type = 'llm_response'
               AND created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
         """)).fetchone()
@@ -338,7 +338,7 @@ class TestSLODashboard:
 
         # Write escalation event directly
         db_session.execute(text("""
-            INSERT INTO conversation_events
+            INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, causal_chain_id, created_at)
             VALUES (:eid, 'system_slo', 'system', :aid, '1.0.0',
@@ -376,7 +376,7 @@ class TestSLODashboard:
 
         agent_id = f"hitl_{os.urandom(4).hex()}"
         db_session.execute(text("""
-            INSERT INTO conversation_events
+            INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, causal_chain_id, created_at)
             VALUES (:eid, 'system_slo', 'system', :aid, '1.0.0',
@@ -399,9 +399,9 @@ class TestPromptEvolutionGate:
 
     @pytest.fixture(autouse=True)
     def ensure_tables(self, db_session):
-        """Ensure prompt_variants table exists (may not be in test DB schema yet)."""
+        """Ensure ctx_prompt_variants table exists (may not be in test DB schema yet)."""
         db_session.execute(text("""
-            CREATE TABLE IF NOT EXISTS prompt_variants (
+            CREATE TABLE IF NOT EXISTS ctx_prompt_variants (
                 variant_id VARCHAR(64) PRIMARY KEY,
                 prompt_template_id VARCHAR(64) NOT NULL,
                 version INT NOT NULL,
@@ -423,11 +423,11 @@ class TestPromptEvolutionGate:
 
         # Seed template and variant
         db_session.execute(text("""
-            INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+            INSERT INTO ctx_prompt_templates (template_id, version, content, is_active, created_at, updated_at)
             VALUES (:tid, 1, 'old content', 1, NOW(), NOW())
         """), {"tid": template_id})
         db_session.execute(text("""
-            INSERT INTO prompt_variants
+            INSERT INTO ctx_prompt_variants
                 (variant_id, prompt_template_id, version, content, quality_score, created_at)
             VALUES (:vid, :tid, 1, 'new content', 4.5, NOW())
         """), {"vid": variant_id, "tid": template_id})
@@ -437,7 +437,7 @@ class TestPromptEvolutionGate:
         assert result["promoted"] is True
 
         row = db_session.execute(text(
-            "SELECT content FROM prompt_templates WHERE template_id = :tid"
+            "SELECT content FROM ctx_prompt_templates WHERE template_id = :tid"
         ), {"tid": template_id}).fetchone()
         assert row[0] == "new content"
 
@@ -453,11 +453,11 @@ class TestPromptEvolutionGate:
         template_id = f"tmpl_{os.urandom(4).hex()}"
         variant_id = f"var_{os.urandom(4).hex()}"
         db_session.execute(text("""
-            INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+            INSERT INTO ctx_prompt_templates (template_id, version, content, is_active, created_at, updated_at)
             VALUES (:tid, 1, 'old', 1, NOW(), NOW())
         """), {"tid": template_id})
         db_session.execute(text("""
-            INSERT INTO prompt_variants
+            INSERT INTO ctx_prompt_variants
                 (variant_id, prompt_template_id, version, content, quality_score, created_at)
             VALUES (:vid, :tid, 1, 'improved', 4.8, NOW())
         """), {"vid": variant_id, "tid": template_id})
@@ -468,7 +468,7 @@ class TestPromptEvolutionGate:
         gate.validate_change.assert_called_once()
         # Verify template was updated
         row = db_session.execute(text(
-            "SELECT content FROM prompt_templates WHERE template_id = :tid"
+            "SELECT content FROM ctx_prompt_templates WHERE template_id = :tid"
         ), {"tid": template_id}).fetchone()
         assert row[0] == "improved"
 
@@ -484,11 +484,11 @@ class TestPromptEvolutionGate:
         template_id = f"tmpl_{os.urandom(4).hex()}"
         variant_id = f"var_{os.urandom(4).hex()}"
         db_session.execute(text("""
-            INSERT INTO prompt_templates (template_id, version, content, is_active, created_at, updated_at)
+            INSERT INTO ctx_prompt_templates (template_id, version, content, is_active, created_at, updated_at)
             VALUES (:tid, 1, 'original', 1, NOW(), NOW())
         """), {"tid": template_id})
         db_session.execute(text("""
-            INSERT INTO prompt_variants
+            INSERT INTO ctx_prompt_variants
                 (variant_id, prompt_template_id, version, content, quality_score, created_at)
             VALUES (:vid, :tid, 1, 'worse variant', 2.0, NOW())
         """), {"vid": variant_id, "tid": template_id})
@@ -499,6 +499,6 @@ class TestPromptEvolutionGate:
         assert result["reason"] == "gate_rejected"
         # Template must be unchanged
         row = db_session.execute(text(
-            "SELECT content FROM prompt_templates WHERE template_id = :tid"
+            "SELECT content FROM ctx_prompt_templates WHERE template_id = :tid"
         ), {"tid": template_id}).fetchone()
         assert row[0] == "original"

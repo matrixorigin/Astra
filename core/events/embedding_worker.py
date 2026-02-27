@@ -1,7 +1,7 @@
 """Async embedding worker — decoupled from the write path.
 
-Polls conversation_events LEFT JOIN event_embeddings for events that
-need embeddings, generates them, and writes to event_embeddings.
+Polls agent_events LEFT JOIN ctx_event_embeddings for events that
+need embeddings, generates them, and writes to ctx_event_embeddings.
 
 Only embeds: user_query, llm_response, plan_created, knowledge_extracted.
 """
@@ -28,7 +28,7 @@ class EmbeddingWorker:
     """Background worker that generates embeddings for new events.
 
     Runs as an asyncio task. Polls for events missing embeddings,
-    generates them via EmbeddingService, and writes to event_embeddings.
+    generates them via EmbeddingService, and writes to ctx_event_embeddings.
     """
 
     def __init__(
@@ -84,7 +84,7 @@ class EmbeddingWorker:
             db.close()
 
     def _process_batch(self, db: Session, svc) -> int:
-        """Find unembedded events, generate embeddings, write to event_embeddings.
+        """Find unembedded events, generate embeddings, write to ctx_event_embeddings.
 
         Returns number of events processed.
         """
@@ -95,8 +95,8 @@ class EmbeddingWorker:
         rows = db.execute(
             text(f"""
                 SELECT ce.event_id, ce.content
-                FROM conversation_events ce
-                LEFT JOIN event_embeddings ee ON ce.event_id = ee.event_id
+                FROM agent_events ce
+                LEFT JOIN ctx_event_embeddings ee ON ce.event_id = ee.event_id
                 WHERE ee.event_id IS NULL
                   AND ce.event_type IN ({type_placeholders})
                   AND ce.content IS NOT NULL
@@ -116,7 +116,7 @@ class EmbeddingWorker:
                 vec_str = "[" + ",".join(str(v) for v in vec) + "]"
                 db.execute(
                     text("""
-                        INSERT INTO event_embeddings
+                        INSERT INTO ctx_event_embeddings
                         (event_id, embedding, model_name, model_version, metadata, created_at, updated_at)
                         VALUES (:event_id, :embedding, :model, '1.0', '{}', NOW(), NOW())
                     """),

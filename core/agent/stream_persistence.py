@@ -2,7 +2,7 @@
 
 Every streamed chunk is simultaneously:
 1. Delivered to the client in real-time
-2. Logged to conversation_events for audit and replay
+2. Logged to agent_events for audit and replay
 """
 
 import json

@@ -26,7 +26,7 @@ class RunTrigger(str, Enum):
 
 
 class AgentRun(BaseModel):
-    """A durable unit of agent work. State is persisted as conversation_events."""
+    """A durable unit of agent work. State is persisted as agent_events."""
 
     run_id: str = Field(default_factory=lambda: str(uuid4()))
     session_id: str

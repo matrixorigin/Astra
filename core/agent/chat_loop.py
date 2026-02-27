@@ -1910,7 +1910,7 @@ class ChatLoop:
             from sqlalchemy import text
             with self.event_logger._db() as _slo_db:
                 row = _slo_db.execute(text("""
-                    SELECT 1 FROM conversation_events
+                    SELECT 1 FROM agent_events
                     WHERE agent_id = :aid AND event_type = 'slo_model_escalation'
                       AND created_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
                     LIMIT 1

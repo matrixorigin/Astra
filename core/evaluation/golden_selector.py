@@ -2,7 +2,7 @@
 
 Selects high-quality sessions for regression testing:
 - Query high-confidence, high-satisfaction sessions
-- Tag as golden in conversation_events
+- Tag as golden in agent_events
 - Version golden set with timestamp
 - Support filtering by skill/prompt/config
 """
@@ -68,7 +68,7 @@ class GoldenSessionSelector(DbConsumer):
                     e.created_at,
                     e.metadata,
                     e.skills_snapshot
-                FROM conversation_events e
+                FROM agent_events e
                 WHERE e.event_type = 'llm_response'
                 AND e.quality_score >= :min_quality
             """
@@ -135,7 +135,7 @@ class GoldenSessionSelector(DbConsumer):
             try:
                 # Get existing metadata
                 result = db.execute(
-                    text("SELECT metadata FROM conversation_events WHERE event_id = :event_id"),
+                    text("SELECT metadata FROM agent_events WHERE event_id = :event_id"),
                     {"event_id": event_id},
                 ).fetchone()
             
@@ -170,7 +170,7 @@ class GoldenSessionSelector(DbConsumer):
             
                 # Update metadata
                 db.execute(
-                    text("UPDATE conversation_events SET metadata = :metadata WHERE event_id = :event_id"),
+                    text("UPDATE agent_events SET metadata = :metadata WHERE event_id = :event_id"),
                     {
                         "event_id": event_id,
                         "metadata": json.dumps(metadata),
@@ -249,7 +249,7 @@ class GoldenSessionSelector(DbConsumer):
                         quality_score,
                         created_at,
                         metadata
-                    FROM conversation_events
+                    FROM agent_events
                     ORDER BY created_at DESC
                 """
             
@@ -292,7 +292,7 @@ class GoldenSessionSelector(DbConsumer):
                         event_id,
                         metadata,
                         created_at
-                    FROM conversation_events
+                    FROM agent_events
                     WHERE metadata IS NOT NULL
                     ORDER BY created_at DESC
                 """

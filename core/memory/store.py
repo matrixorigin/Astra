@@ -128,7 +128,7 @@ class MemoryStore(DbConsumer):
         with self._db() as db:
             from sqlalchemy import text as sa_text
             result = db.execute(sa_text("""
-                UPDATE memories SET is_active = 0, updated_at = NOW()
+                UPDATE mem_memories SET is_active = 0, updated_at = NOW()
                 WHERE session_id = :sid AND memory_type = 'working' AND is_active = 1
             """), {"sid": session_id})
             db.commit()

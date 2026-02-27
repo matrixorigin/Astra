@@ -70,15 +70,15 @@ def admin_user(client, db_session):
     # Ensure mo_agent_admin role exists
     db_session.execute(
         text("""
-            INSERT IGNORE INTO roles (role_id, role_name, description)
+            INSERT IGNORE INTO auth_roles (role_id, role_name, description)
             VALUES ('mo-agent-admin-role', 'mo_agent_admin', 'Administrator role')
         """)
     )
     # Assign role to user
     db_session.execute(
         text("""
-            INSERT INTO user_roles (user_id, role_id)
-            SELECT :user_id, role_id FROM roles WHERE role_name = 'mo_agent_admin'
+            INSERT INTO auth_user_roles (user_id, role_id)
+            SELECT :user_id, role_id FROM auth_roles WHERE role_name = 'mo_agent_admin'
         """),
         {"user_id": user_id},
     )
@@ -219,7 +219,7 @@ def test_list_tokens_with_filters(client, admin_user):
     assert all(t["scope"] == "global" for t in tokens)
 
 
-def test_audit_logs_requires_admin(client, regular_user):
+def test_auth_audit_logs_requires_admin(client, regular_user):
     """Test that audit logs require admin role."""
     response = client.get(
         "/admin/audit",
@@ -228,7 +228,7 @@ def test_audit_logs_requires_admin(client, regular_user):
     assert response.status_code == 403
 
 
-def test_get_audit_logs(client, admin_user):
+def test_get_auth_audit_logs(client, admin_user):
     """Test getting audit logs."""
     response = client.get(
         "/admin/audit",
@@ -355,9 +355,9 @@ def test_grant_and_revoke_role_success(client, admin_user, db_session):
     # Verify user has role
     result = db_session.execute(
         text("""
-            SELECT 1 FROM user_roles ur
-            JOIN users u ON ur.user_id = u.user_id
-            JOIN roles r ON ur.role_id = r.role_id
+            SELECT 1 FROM auth_user_roles ur
+            JOIN auth_users u ON ur.user_id = u.user_id
+            JOIN auth_roles r ON ur.role_id = r.role_id
             WHERE u.username = :username AND r.role_name = :role_name
         """),
         {"username": username, "role_name": "mo_agent_admin"},
@@ -386,9 +386,9 @@ def test_grant_and_revoke_role_success(client, admin_user, db_session):
     # Verify role was revoked
     result = db_session.execute(
         text("""
-            SELECT 1 FROM user_roles ur
-            JOIN users u ON ur.user_id = u.user_id
-            JOIN roles r ON ur.role_id = r.role_id
+            SELECT 1 FROM auth_user_roles ur
+            JOIN auth_users u ON ur.user_id = u.user_id
+            JOIN auth_roles r ON ur.role_id = r.role_id
             WHERE u.username = :username AND r.role_name = :role_name
         """),
         {"username": username, "role_name": "mo_agent_admin"},
@@ -408,8 +408,8 @@ def test_grant_and_revoke_role_success(client, admin_user, db_session):
 def test_first_user_becomes_admin(client, db_session):
     """Test that first registered user automatically becomes admin."""
     # Clear all users
-    db_session.execute(text("DELETE FROM user_roles"))
-    db_session.execute(text("DELETE FROM users"))
+    db_session.execute(text("DELETE FROM auth_user_roles"))
+    db_session.execute(text("DELETE FROM auth_users"))
     db_session.commit()
 
     # Register first user
@@ -431,9 +431,9 @@ def test_first_user_becomes_admin(client, db_session):
     # Verify user has admin role
     result = db_session.execute(
         text("""
-            SELECT r.role_name FROM user_roles ur
-            JOIN users u ON ur.user_id = u.user_id
-            JOIN roles r ON ur.role_id = r.role_id
+            SELECT r.role_name FROM auth_user_roles ur
+            JOIN auth_users u ON ur.user_id = u.user_id
+            JOIN auth_roles r ON ur.role_id = r.role_id
             WHERE u.username = :username
         """),
         {"username": username},
@@ -456,9 +456,9 @@ def test_first_user_becomes_admin(client, db_session):
     # Verify second user does NOT have admin role
     result = db_session.execute(
         text("""
-            SELECT r.role_name FROM user_roles ur
-            JOIN users u ON ur.user_id = u.user_id
-            JOIN roles r ON ur.role_id = r.role_id
+            SELECT r.role_name FROM auth_user_roles ur
+            JOIN auth_users u ON ur.user_id = u.user_id
+            JOIN auth_roles r ON ur.role_id = r.role_id
             WHERE u.username = :username
         """),
         {"username": username2},

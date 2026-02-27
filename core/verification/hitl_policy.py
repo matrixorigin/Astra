@@ -154,7 +154,7 @@ class HITLPolicyEngine(DbConsumer):
                 return
             try:
                 row = db.execute(text("""
-                    SELECT 1 FROM conversation_events
+                    SELECT 1 FROM agent_events
                     WHERE agent_id = :aid AND event_type = 'slo_hitl_tightened'
                       AND created_at > DATE_SUB(NOW(), INTERVAL 7 DAY)
                     LIMIT 1
@@ -257,7 +257,7 @@ class HITLPolicyEngine(DbConsumer):
                 from core.utils.id_generator import generate_id
                 eid = generate_id()
                 db.execute(text("""
-                    INSERT INTO conversation_events
+                    INSERT INTO agent_events
                         (event_id, session_id, user_id, agent_id, agent_version,
                          event_type, content, causal_chain_id, created_at)
                     VALUES

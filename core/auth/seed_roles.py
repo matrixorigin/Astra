@@ -24,7 +24,7 @@ def seed_roles(db: Session) -> int:
     count = 0
     for role in SEED_ROLES:
         existing = db.execute(
-            text("SELECT 1 FROM roles WHERE role_name = :name"),
+            text("SELECT 1 FROM auth_roles WHERE role_name = :name"),
             {"name": role["role_name"]},
         ).fetchone()
         if existing:
@@ -32,7 +32,7 @@ def seed_roles(db: Session) -> int:
         
         db.execute(
             text(
-                "INSERT INTO roles (role_id, role_name, description) "
+                "INSERT INTO auth_roles (role_id, role_name, description) "
                 "VALUES (:id, :name, :desc)"
             ),
             {

@@ -19,7 +19,7 @@ class TestConfigSchemaConsistency:
     
     def test_config_table_has_scope_fields(self, db):
         """Config table must have scope_type and scope_user_id columns."""
-        result = db.execute(text("SHOW COLUMNS FROM configs")).fetchall()
+        result = db.execute(text("SHOW COLUMNS FROM infra_configs")).fetchall()
         columns = {row[0] for row in result}
         
         assert "scope_type" in columns, "Missing scope_type column"
@@ -32,14 +32,14 @@ class TestConfigSchemaConsistency:
     
     def test_config_primary_key_is_config_id(self, db):
         """Config table primary key should be config_id."""
-        result = db.execute(text("SHOW CREATE TABLE configs")).fetchone()
+        result = db.execute(text("SHOW CREATE TABLE infra_configs")).fetchone()
         create_table = result[1]
         
         assert "PRIMARY KEY (`config_id`)" in create_table, "config_id is not primary key"
     
     def test_config_unique_constraint_exists(self, db):
         """Config table should have unique constraint on logical key."""
-        result = db.execute(text("SHOW CREATE TABLE configs")).fetchone()
+        result = db.execute(text("SHOW CREATE TABLE infra_configs")).fetchone()
         create_table = result[1]
         
         # Check for unique constraint on (key_name, scope_type, scope_user_id)
@@ -52,7 +52,7 @@ class TestTokenSchemaConsistency:
     
     def test_token_table_has_scope_fields(self, db):
         """Token table must have scope fields."""
-        result = db.execute(text("SHOW COLUMNS FROM tokens")).fetchall()
+        result = db.execute(text("SHOW COLUMNS FROM auth_tokens")).fetchall()
         columns = {row[0] for row in result}
         
         assert "scope_user_id" in columns, "Missing scope_user_id column"
@@ -61,9 +61,9 @@ class TestTokenSchemaConsistency:
 class TestLLMCallLogSchemaConsistency:
     """Verify LLMCallLog model matches database schema."""
     
-    def test_llm_call_logs_has_metadata_column(self, db):
+    def test_eval_llm_call_logs_has_metadata_column(self, db):
         """LLM call logs table must have metadata column."""
-        result = db.execute(text("SHOW COLUMNS FROM llm_call_logs")).fetchall()
+        result = db.execute(text("SHOW COLUMNS FROM eval_llm_call_logs")).fetchall()
         columns = {row[0] for row in result}
         
         assert "metadata" in columns, "Missing metadata column"
@@ -77,7 +77,7 @@ class TestModelQueryConsistency:
         # Test that we can query using scope fields
         try:
             db.execute(text("""
-                SELECT * FROM configs 
+                SELECT * FROM infra_configs 
                 WHERE scope_type = 'global' AND scope_user_id IS NULL
                 LIMIT 1
             """)).fetchone()
@@ -91,7 +91,7 @@ class TestModelQueryConsistency:
         config_id = str(uuid7())
         try:
             db.execute(text("""
-                INSERT INTO configs (config_id, key_name, scope_type, scope_user_id, value)
+                INSERT INTO infra_configs (config_id, key_name, scope_type, scope_user_id, value)
                 VALUES (:config_id, :key_name, :scope_type, :scope_user_id, :value)
             """), {
                 "config_id": config_id,
@@ -103,7 +103,7 @@ class TestModelQueryConsistency:
             db.commit()
             
             # Cleanup
-            db.execute(text("DELETE FROM configs WHERE config_id = :id"), {"id": config_id})
+            db.execute(text("DELETE FROM infra_configs WHERE config_id = :id"), {"id": config_id})
             db.commit()
         except Exception as e:
             db.rollback()

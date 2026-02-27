@@ -231,7 +231,7 @@ async def test_ci_status_skill(db_session, github, monkeypatch):
     """Test ci_status skill execution"""
 
     # Mock GitHub API call
-    async def mock_list_workflow_runs(repo_id, limit):
+    async def mock_list_wf_runs(repo_id, limit):
         return [
             {
                 "name": f"Workflow {i}",
@@ -243,7 +243,7 @@ async def test_ci_status_skill(db_session, github, monkeypatch):
             for i in range(1, limit + 1)
         ]
 
-    monkeypatch.setattr(github, "list_workflow_runs", mock_list_workflow_runs)
+    monkeypatch.setattr(github, "list_wf_runs", mock_list_wf_runs)
 
     skill = CIStatusSkill(github, db_session)
 

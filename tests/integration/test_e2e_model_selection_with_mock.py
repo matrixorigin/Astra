@@ -50,9 +50,9 @@ def auth_headers_e2e(client):
     
     # Grant admin role
     db = next(get_db_session())
-    role = db.execute(text("SELECT role_id FROM roles WHERE role_name = 'mo_agent_admin' LIMIT 1")).fetchone()
+    role = db.execute(text("SELECT role_id FROM auth_roles WHERE role_name = 'mo_agent_admin' LIMIT 1")).fetchone()
     if role:
-        db.execute(text("INSERT INTO user_roles (user_id, role_id) VALUES (:uid, :rid)"), {"uid": user_id, "rid": role[0]})
+        db.execute(text("INSERT INTO auth_user_roles (user_id, role_id) VALUES (:uid, :rid)"), {"uid": user_id, "rid": role[0]})
         db.commit()
     db.close()
     

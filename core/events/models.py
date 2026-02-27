@@ -203,7 +203,7 @@ class ConversationEvent(BaseModel):
     token_usage: TokenUsage | None = Field(default=None, description="Token usage statistics")
     embedding_ref: str | None = Field(default=None, description="External vector store chunk ID")
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    prompt_template_id: str | None = Field(default=None, description="References prompt_templates")
+    prompt_template_id: str | None = Field(default=None, description="References ctx_prompt_templates")
     skills_snapshot: list[dict[str, Any]] | None = Field(
         default=None, description="Skills used with versions"
     )
