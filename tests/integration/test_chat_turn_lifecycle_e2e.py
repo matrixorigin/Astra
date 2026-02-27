@@ -949,3 +949,93 @@ async def _collect_async(agen):
     async for item in agen:
         items.append(item)
     return items
+
+
+# ============================================================================
+# Observer E2E: POST /chat/turn → Observer extraction → mem_memories DB
+# ============================================================================
+
+
+class TestObserverExtractionE2E:
+    """True end-to-end: /chat/turn final reply triggers Observer → memories in DB.
+
+    The Observer runs inside the persist thread (Phase 4 of _persist_turn_events).
+    To make assertions deterministic, we patch run_observer to execute the
+    pipeline synchronously (no nested daemon thread) so flush_persist_threads()
+    guarantees completion.
+    """
+
+    def test_final_reply_extracts_memory_to_db(self, client, db):
+        """POST /chat/turn (text reply, no tool_calls) → Observer extracts
+        a procedural memory → mem_memories row exists with correct fields."""
+        headers, user_id = _unique_auth(client, db, "obs")
+
+        from api.models._constants import EMBEDDING_DIM
+
+        # Deterministic embedding for test
+        def _fake_embed(text):
+            h = hash(text) % 1000
+            return [h / 1000.0] * EMBEDDING_DIM
+
+        # Observer LLM mock: return a JSON array of extracted memories
+        observer_llm_response = json.dumps([{
+            "type": "procedural",
+            "content": "Always run linter before committing code",
+            "confidence": 0.8,
+        }])
+
+        mock_llm = MagicMock()
+        # Observer calls chat_with_tools (sync) for memory extraction
+        mock_llm.chat_with_tools.return_value = {"content": observer_llm_response}
+        # Main chat uses chat_stream (async generator) — no tools in this request
+        mock_llm.chat_stream = MagicMock(
+            return_value=fake_llm_stream([{"type": "text", "content": "Sure, always lint first."}])
+        )
+        mock_llm.request_context = MagicMock(return_value=MagicMock(
+            __enter__=MagicMock(), __exit__=MagicMock(return_value=False),
+        ))
+        mock_llm.resolve_model_name = MagicMock(return_value="test-model")
+
+        # Patch run_observer to execute synchronously (no daemon thread)
+        # so flush_persist_threads() guarantees observer completion.
+        def _sync_run_observer(self, session_id, user_id, messages, turn_count=0, session_start=None):
+            from core.memory.typed_pipeline import run_typed_memory_pipeline
+            try:
+                run_typed_memory_pipeline(
+                    db_factory=self._db_factory,
+                    user_id=user_id,
+                    messages=messages,
+                    llm_client=self._llm_client,
+                    embed_fn=self._embed_fn,
+                )
+            except Exception:
+                pass
+
+        # Patches must stay active through flush_persist_threads() because
+        # the persist thread (and observer inside it) runs after client.post().
+        with patch("api.routers.chat._get_shared_llm_client", return_value=mock_llm), \
+             patch("api.routers.chat._get_shared_embed_fn", return_value=_fake_embed), \
+             patch("core.agent.turn_hooks.TurnHooks.run_observer", _sync_run_observer):
+            r = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "What should I do before committing?"}],
+            }, headers=headers)
+
+            assert r.status_code == 200
+            events = parse_sse_events(r.text)
+            assert any(e["type"] == "text_delta" for e in events)
+
+            flush_persist_threads()
+
+        # Verify mem_memories row written by Observer
+        row = db.execute(sql_text(
+            "SELECT content, memory_type, initial_confidence, is_active, user_id "
+            "FROM mem_memories WHERE user_id = :uid AND content LIKE '%linter%' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ), {"uid": user_id}).fetchone()
+
+        assert row is not None, "Observer should have persisted a memory to mem_memories"
+        assert row[0] == "Always run linter before committing code"
+        assert row[1] == "procedural"
+        assert abs(row[2] - 0.8) < 0.01
+        assert row[3] == 1  # is_active
+        assert row[4] == user_id
