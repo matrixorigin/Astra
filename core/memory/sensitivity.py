@@ -1,9 +1,20 @@
-"""Sensitivity filter — block PII and credentials from long-term memory."""
+"""Sensitivity filter — block PII and credentials from long-term memory.
+
+Design decision: block-only, no redaction. If content contains PII/credentials,
+the entire memory is rejected. This is safer than partial redaction which risks
+incomplete removal.
+
+Audit: blocked content is logged with content_hash (no raw content in logs).
+"""
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 # Patterns that should never be persisted into memories.
 _PATTERNS: list[tuple[str, re.Pattern]] = [
@@ -27,4 +38,11 @@ class SensitivityResult:
 def check_sensitivity(text: str) -> SensitivityResult:
     """Return which sensitivity patterns matched. Empty = safe to persist."""
     matched = [label for label, pat in _PATTERNS if pat.search(text)]
-    return SensitivityResult(blocked=bool(matched), matched_labels=matched)
+    result = SensitivityResult(blocked=bool(matched), matched_labels=matched)
+    if result.blocked:
+        content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+        logger.warning(
+            "sensitivity_blocked",
+            extra={"labels": matched, "content_hash": content_hash},
+        )
+    return result

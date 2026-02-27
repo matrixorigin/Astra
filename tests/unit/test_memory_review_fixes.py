@@ -25,8 +25,8 @@ from core.memory.metrics import MemoryMetrics
 
 # --- Helpers ---
 
-MemRow = namedtuple("MemRow", ["memory_id", "content", "memory_type", "initial_confidence", "observed_at", "session_id"])
-VecRow = namedtuple("VecRow", ["memory_id", "content", "memory_type", "initial_confidence", "observed_at", "session_id", "l2_dist"])
+MemRow = namedtuple("MemRow", ["memory_id", "content", "memory_type", "initial_confidence", "observed_at", "session_id", "trust_tier"])
+VecRow = namedtuple("VecRow", ["memory_id", "content", "memory_type", "initial_confidence", "observed_at", "session_id", "trust_tier", "l2_dist"])
 
 
 def _mem(mid="m1", uid="u1", mtype=MemoryType.PROFILE, content="test", **kw):
@@ -50,8 +50,8 @@ class TestVectorRetrieval:
         return MemoryRetriever(db_factory=lambda: mock_db)
 
     def test_vector_sql_executed_when_embedding_provided(self, retriever, mock_db):
-        phase1_rows = [MemRow("m1", "Go testing", "semantic", 0.9, datetime(2026, 2, 26), None)]
-        vec_rows = [VecRow("m2", "Go patterns", "semantic", 0.8, datetime(2026, 2, 26), None, 0.3)]
+        phase1_rows = [MemRow("m1", "Go testing", "semantic", 0.9, datetime(2026, 2, 26), None, "T3")]
+        vec_rows = [VecRow("m2", "Go patterns", "semantic", 0.8, datetime(2026, 2, 26), None, "T3", 0.3)]
 
         call_count = [0]
         def mock_execute(sql, params=None):
@@ -81,7 +81,7 @@ class TestVectorRetrieval:
                 result.fetchall.return_value = []
             elif call_count[0] == 2:
                 result.fetchall.return_value = [
-                    VecRow("vec1", "vector-only memory", "semantic", 0.7, datetime(2026, 2, 26), None, 0.1)
+                    VecRow("vec1", "vector-only memory", "semantic", 0.7, datetime(2026, 2, 26), None, "T3", 0.1)
                 ]
             else:
                 result.fetchall.return_value = []
@@ -93,8 +93,8 @@ class TestVectorRetrieval:
 
     def test_merge_ranks_by_weighted_score(self, retriever, mock_db):
         now = datetime.utcnow()
-        phase1_rows = [MemRow("m1", "old keyword", "semantic", 0.5, now - timedelta(days=30), None)]
-        vec_rows = [VecRow("m2", "recent vector", "semantic", 0.9, now, None, 0.01)]
+        phase1_rows = [MemRow("m1", "old keyword", "semantic", 0.5, now - timedelta(days=30), None, "T3")]
+        vec_rows = [VecRow("m2", "recent vector", "semantic", 0.9, now, None, "T3", 0.01)]
 
         call_count = [0]
         def mock_execute(sql, params=None):
@@ -117,7 +117,7 @@ class TestVectorRetrieval:
 
     def test_no_embedding_skips_vector_phase(self, retriever, mock_db):
         mock_db.execute.return_value.fetchall.return_value = [
-            MemRow("m1", "test", "semantic", 0.8, datetime(2026, 2, 26), None)
+            MemRow("m1", "test", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
         ]
         results, _ = retriever.retrieve("u1", "test", session_id="s1")
         assert mock_db.execute.call_count == 1
@@ -130,7 +130,7 @@ class TestVectorRetrieval:
             result = MagicMock()
             if call_count[0] == 1:
                 result.fetchall.return_value = [
-                    MemRow("m1", "fallback", "semantic", 0.8, datetime(2026, 2, 26), None)
+                    MemRow("m1", "fallback", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
                 ]
             else:
                 raise Exception("Vector index not available")
@@ -153,7 +153,7 @@ class TestVectorRetrieval:
                 result.fetchall.return_value = []
             else:
                 result.fetchall.return_value = [
-                    VecRow("v1", "vector hit", "semantic", 0.8, datetime(2026, 2, 26), None, 0.1)
+                    VecRow("v1", "vector hit", "semantic", 0.8, datetime(2026, 2, 26), None, "T3", 0.1)
                 ]
             return result
 
@@ -175,7 +175,7 @@ class TestVectorRetrieval:
             if "MATCH" in sql_str:
                 raise Exception("Fulltext index error")
             result.fetchall.return_value = [
-                MemRow("m1", "fallback", "semantic", 0.8, datetime(2026, 2, 26), None)
+                MemRow("m1", "fallback", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
             ]
             return result
 
@@ -338,10 +338,12 @@ class TestToolResultCleanup:
     def test_governance_cycle_includes_tool_result_cleanup(self):
         scheduler = GovernanceScheduler(MagicMock())
 
-        with patch.object(scheduler, "_health_check"), \
-             patch.object(scheduler, "_cleanup_stale", return_value=0), \
+        with patch.object(scheduler, "_cleanup_stale", return_value=0), \
+             patch.object(scheduler, "_quarantine_low_confidence", return_value=0), \
+             patch.object(scheduler, "_archive_stale_working", return_value=0), \
              patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
              patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
+             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
              patch.object(scheduler, "_cleanup_tool_results", return_value=3) as mock_tool:
             result = scheduler.run_cycle("user1")
 
@@ -601,7 +603,7 @@ class TestExplainAnalyze:
     def test_retriever_explain_returns_stats(self):
         mock_db = MagicMock()
         mock_db.execute.return_value.fetchall.return_value = [
-            MemRow("m1", "test content", "semantic", 0.8, datetime(2026, 2, 26), None)
+            MemRow("m1", "test content", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
         ]
         retriever = MemoryRetriever(db_factory=lambda: mock_db)
         _, stats = retriever.retrieve("u1", "test", session_id="s1", explain=True)

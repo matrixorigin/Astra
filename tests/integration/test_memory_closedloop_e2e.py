@@ -492,3 +492,127 @@ class TestSensitivityFilterRealDB:
         stored = store.get(mem.memory_id)
         assert stored is not None
         assert "dark mode" in stored.content
+
+
+class TestSessionSummaryRealDB:
+    """Session summarizer with real DB."""
+
+    def test_incremental_summary_persists(self, db_factory, memory_cleanup):
+        """Incremental summary persists to DB with session_id set."""
+        from core.memory.session_summary import SessionSummarizer, _INCREMENTAL_TAG
+        from core.memory.config import MemoryGovernanceConfig
+
+        store = MemoryStore(db_factory)
+        config = MemoryGovernanceConfig(session_summary_turn_threshold=2)
+        summarizer = SessionSummarizer(store, config=config)
+
+        user_id = _uid()
+        session_id = _sid()
+        messages = [
+            {"role": "user", "content": "How do I use async in Python?"},
+            {"role": "assistant", "content": "Use async/await with asyncio library."},
+        ]
+
+        mem = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=2, session_start=datetime.utcnow())
+        assert mem is not None
+        memory_cleanup.append(mem.memory_id)
+
+        stored = store.get(mem.memory_id)
+        assert stored is not None
+        assert stored.session_id == session_id
+        assert _INCREMENTAL_TAG in stored.content
+
+    def test_full_summary_cross_session(self, db_factory, memory_cleanup):
+        """Full summary has session_id=NULL (cross-session)."""
+        from core.memory.session_summary import SessionSummarizer, _SESSION_SUMMARY_TAG
+
+        store = MemoryStore(db_factory)
+        summarizer = SessionSummarizer(store)
+
+        user_id = _uid()
+        session_id = _sid()
+        messages = [
+            {"role": "user", "content": "Explain dependency injection"},
+            {"role": "assistant", "content": "DI is a design pattern where dependencies are passed in..."},
+        ]
+
+        mem = summarizer.generate_full_summary(user_id, session_id, messages)
+        assert mem is not None
+        memory_cleanup.append(mem.memory_id)
+
+        stored = store.get(mem.memory_id)
+        assert stored is not None
+        assert stored.session_id is None
+        assert _SESSION_SUMMARY_TAG in stored.content
+
+    def test_full_supersedes_incrementals(self, db_factory, memory_cleanup):
+        """Full summary deactivates incremental summaries."""
+        from core.memory.session_summary import SessionSummarizer
+        from core.memory.config import MemoryGovernanceConfig
+
+        store = MemoryStore(db_factory)
+        config = MemoryGovernanceConfig(session_summary_turn_threshold=2)
+        summarizer = SessionSummarizer(store, config=config)
+
+        user_id = _uid()
+        session_id = _sid()
+        messages = [
+            {"role": "user", "content": "Question about testing"},
+            {"role": "assistant", "content": "Use pytest for Python testing..."},
+        ]
+
+        # Generate 2 incrementals
+        inc1 = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=2, session_start=datetime.utcnow())
+        inc2 = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=4, session_start=datetime.utcnow())
+        memory_cleanup.extend([inc1.memory_id, inc2.memory_id])
+
+        # Generate full
+        full = summarizer.generate_full_summary(user_id, session_id, messages)
+        memory_cleanup.append(full.memory_id)
+
+        # Incrementals should be deactivated
+        assert store.get(inc1.memory_id).is_active is False
+        assert store.get(inc2.memory_id).is_active is False
+        assert store.get(full.memory_id).is_active is True
+
+
+class TestTrustTierRealDB:
+    """Trust tier affects retrieval ranking with real DB."""
+
+    def test_t1_ranks_higher_than_t4(self, db_factory, memory_cleanup):
+        """T1 memory ranks higher than T4 at same age due to slower decay."""
+        from core.memory.types import TrustTier
+
+        store = MemoryStore(db_factory)
+        retriever = MemoryRetriever(db_factory)
+        user_id = _uid()
+        session_id = _sid()
+        age = datetime.utcnow() - timedelta(days=60)
+
+        t1 = Memory(
+            memory_id=str(uuid7()), user_id=user_id,
+            memory_type=MemoryType.SEMANTIC, content="Verified: project uses DI pattern",
+            initial_confidence=0.9, trust_tier=TrustTier.T1_VERIFIED,
+            embedding=_embed("DI pattern"), observed_at=age,
+        )
+        t4 = Memory(
+            memory_id=str(uuid7()), user_id=user_id,
+            memory_type=MemoryType.SEMANTIC, content="Unverified: project uses DI pattern",
+            initial_confidence=0.9, trust_tier=TrustTier.T4_UNVERIFIED,
+            embedding=_embed("DI pattern unverified"), observed_at=age,
+        )
+        memory_cleanup.extend([t1.memory_id, t4.memory_id])
+        store.create(t1)
+        store.create(t4)
+
+        results, _ = retriever.retrieve(
+            user_id=user_id, query_text="DI pattern",
+            session_id=session_id, query_embedding=_embed("DI pattern"),
+            limit=10,
+        )
+
+        assert len(results) >= 2
+        # T1 should rank higher (slower decay → higher confidence score)
+        t1_idx = next(i for i, r in enumerate(results) if r.memory_id == t1.memory_id)
+        t4_idx = next(i for i, r in enumerate(results) if r.memory_id == t4.memory_id)
+        assert t1_idx < t4_idx, f"T1 should rank higher than T4, got T1@{t1_idx} T4@{t4_idx}"

@@ -17,6 +17,22 @@ class MemoryType(str, enum.Enum):
     TOOL_RESULT = "tool_result"
 
 
+class TrustTier(str, enum.Enum):
+    T1_VERIFIED = "T1"
+    T2_CURATED = "T2"
+    T3_INFERRED = "T3"
+    T4_UNVERIFIED = "T4"
+
+
+# Half-life in days per trust tier
+TRUST_TIER_HALF_LIVES: dict[TrustTier, float] = {
+    TrustTier.T1_VERIFIED: 365.0,
+    TrustTier.T2_CURATED: 180.0,
+    TrustTier.T3_INFERRED: 60.0,
+    TrustTier.T4_UNVERIFIED: 30.0,
+}
+
+
 @dataclass
 class Memory:
     """In-memory representation of a memory record."""
@@ -34,11 +50,14 @@ class Memory:
     observed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    trust_tier: TrustTier = TrustTier.T3_INFERRED
 
-    def effective_confidence(self, half_life_days: float = 30.0) -> float:
-        """Query-time confidence decay. Never mutates stored value."""
+    def effective_confidence(self, half_life_days: Optional[float] = None) -> float:
+        """Query-time confidence decay. Uses tier-specific half-life if not overridden."""
         if self.observed_at is None:
             return self.initial_confidence
+        if half_life_days is None:
+            half_life_days = TRUST_TIER_HALF_LIVES.get(self.trust_tier, 60.0)
         age_days = (datetime.utcnow() - self.observed_at).total_seconds() / 86400.0
         return self.initial_confidence * math.exp(-age_days / half_life_days)
 

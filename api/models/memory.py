@@ -28,6 +28,7 @@ class MemoryRecord(Base):
     memory_type = Column(String(20), nullable=False)
     content = Column(Text, nullable=False)
     initial_confidence = Column(Float, default=0.75, nullable=False)
+    trust_tier = Column(String(10), default="T3", nullable=True)
     embedding = Column(VectorType(1536, VectorPrecision.F32))
     source_event_ids = Column(JSON, nullable=False, default=list)
     superseded_by = Column(String(64), nullable=True)

@@ -71,6 +71,28 @@
   ┌─────────────┐
   │   GOVERN    │  Decay, cleanup, quarantine, health
   └─────────────┘
+  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+  │  RETRIEVE   │────▶│   SCORE &   │────▶│  ASSEMBLE   │
+  │  (Hybrid)   │     │   SELECT    │     │   CONTEXT   │
+  └─────────────┘     └─────────────┘     └──────┬──────┘
+                                                  │
+                                                  ▼
+                                          ┌─────────────┐
+                                          │     LLM     │
+                                          │    CALL     │
+                                          └──────┬──────┘
+                                                  │
+         ┌────────────────────────────────────────┘
+         │
+         ▼
+  ┌─────────────┐
+  │   UPDATE    │  Contradiction detection → supersede
+  └──────┬──────┘
+         │
+         ▼
+  ┌─────────────┐
+  │   GOVERN    │  Decay, cleanup, quarantine, health
+  └─────────────┘
 
   ─────────────────────────────────────────────────────────────────────────────────
   STORAGE LAYERS:
@@ -102,11 +124,11 @@ experience it — and why each behavior is critical for agents.
 | **Long-term memory** | "Last month you said you prefer Go" | Without it, agent can't build relationship or accumulate knowledge across sessions. | `memories` table (semantic/profile/procedural) with confidence decay | Letta: core/archival memory. Zep, Mem0: user memory store |
 | **Forgetting** | Outdated facts fade; you stop remembering old phone numbers | Without it, stale knowledge pollutes decisions. Agent confidently uses a deprecated API. | Confidence decay: `effective_confidence = initial × 0.5^(days/half_life)`. Below threshold → quarantine. | Letta: manual eviction. Most frameworks: ❌ no decay |
 | **Recall** | "What was that restaurant name?" — retrieval from partial cue | Agent must find relevant memories from vague queries, not just exact match. | Hybrid retrieval: vector similarity + fulltext keyword + temporal recency + confidence weighting | Letta: embedding search. Standard RAG: vector-only |
-| **Reflection** | "Looking back, those three incidents were all about the same bug" | Agent must synthesize patterns from individual experiences — not just store raw facts. | Reflector: clusters similar episodic events → promotes to semantic memory via LLM condensation | Generative Agents (Park et al.): reflection. Letta: ❌. Most: ❌ |
+| **Reflection** | "Looking back, those three incidents were all about the same bug" | Agent must synthesize patterns from individual experiences — not just store raw facts. | 🔵 **Design Target** — not yet implemented. Observer extracts directly to semantic type. | Generative Agents (Park et al.): reflection. Letta: ❌. Most: ❌ |
 | **Contradiction resolution** | "Wait, you said X before but now Y — which is it?" | Without it, agent holds conflicting beliefs simultaneously. | Observer: L2_DISTANCE finds similar existing memories; if content differs → atomic supersede (deactivate old + insert new) | Letta: overwrite block. Most: ❌ silent conflict |
 | **Memory tampering protection** | You can't secretly rewrite someone's memories | Agent memories must be auditable — no silent edits, no untracked deletions. | Immutable `source_event_ids` provenance. Supersede chain (never hard delete). PITR time-travel to verify any past state. `context_snapshot` records what agent saw. | Letta: git log. Most: ❌ no audit trail |
 | **Retrospection** | "If I had known then what I know now..." | Debug bad decisions by replaying with corrected memory. | Sandbox branch → modify memories → replay session → compare outcomes. Zero-copy via MO `data branch`. | Letta: git branch. Most: ❌ |
-| **Consolidation** | Sleeping on it — short-term → long-term overnight | Raw experiences must be distilled into durable knowledge, or memory grows unbounded. | Observer (per-turn extraction) → Reflector (periodic clustering/promotion) → Governance (decay/cleanup) | EverMemOS: consolidation loop. Letta: ❌ manual. Most: ❌ |
+| **Consolidation** | Sleeping on it — short-term → long-term overnight | Raw experiences must be distilled into durable knowledge, or memory grows unbounded. | Observer (per-turn extraction) → SessionSummarizer (periodic/close) → Governance (cleanup/quarantine) | EverMemOS: consolidation loop. Letta: ❌ manual. Most: ❌ |
 | **Selective attention** | You remember what matters, not every detail | Agent can't stuff everything into context window. Must select the most relevant subset. | TieredLoader: L0 profile (always) + L1 retrieval (query-relevant). PromptAssembler enforces token budget. | Letta: core vs archival split. MemGPT: page in/out |
 
 **Key insight**: Most agent frameworks implement only 2-3 of these behaviors
@@ -163,7 +185,7 @@ Inspired by cognitive science and aligned with the latest industry research (Gen
 | Sensory Buffer | (in-memory only) | — | — | Discarded after inference turn |
 | Working Memory | `agent_scratchpad` | Direct query by `session_id` | B-tree on `session_id`, `user_id` | Task/chain scoped; archived on completion |
 | Episodic | `conversation_events` + `event_embeddings` | HybridRetriever | IVF-flat vector + fulltext on `content` | Append-only; cross-session via session summaries |
-| Semantic | `memories` (type=semantic) + `sk_knowledge_entries` | MemoryRetriever | IVF-flat vector + fulltext on `content` | Confidence decay; Reflector promotes from events |
+| Semantic | `memories` (type=semantic) + `sk_knowledge_entries` | MemoryRetriever | IVF-flat vector + fulltext on `content` | Confidence decay (query-time, per trust tier) |
 | Procedural | `memories` (type=procedural) + `skills_registry` | MemoryRetriever | Same as semantic | Versioned; permanent |
 | Profile | `memories` (type=profile) | MemoryRetriever (L0 cache via ProfileManager) | Same as semantic | Synthesized from semantic; cached |
 | Tool Result | `memories` (type=tool_result) | MemoryRetriever | Same as semantic | Session-scoped; 7-day decay |
@@ -173,9 +195,8 @@ Inspired by cognitive science and aligned with the latest industry research (Gen
 > only profile, semantic, procedural, working, and tool_result types.
 > `conversation_events` already has causal chains, event types, full metadata, and
 > async embeddings. Cross-session episodic recall is handled by session summaries
-> (type=semantic) and by HybridRetriever searching `conversation_events` directly.
-> The Reflector promotes patterns from events to semantic memories, skipping the
-> episodic intermediate state.
+> (type=semantic, generated by SessionSummarizer) and by HybridRetriever searching
+> `conversation_events` directly.
 
 ### Why Five Layers, Not Three
 
@@ -248,7 +269,7 @@ Memory is a long-lived store — sensitive information requires explicit treatme
 |---------|-----------|
 | **PII in memories** | Sensitivity filter detects and redacts PII before persistence |
 | **Credential leakage** | Sensitivity filter discards credential-containing content; `tool_result` type has 7-day decay + session scope as defense-in-depth |
-| **Cross-session leakage** | Sensitivity filter forces `session_id` on session-specific content, preventing cross-session promotion by Reflector |
+| **Cross-session leakage** | Session-scoped types (working, tool_result) have `session_id` set; cross-session types (profile, semantic, procedural) have `session_id=NULL`. Retriever enforces via SQL. |
 | **Memory deletion (right to forget)** | `is_active = 0` soft-deletes exclude from retrieval. True erasure via PITR retention expiry (configurable) |
 | **Audit trail vs privacy** | `context_snapshot` stores memory_ids, not content. Content looked up at audit time (respects current `is_active` state) |
 
@@ -264,44 +285,27 @@ Observer.extract_candidates()
 │  SENSITIVITY FILTER (pre-persist hook)                      │
 │                                                             │
 │  For each candidate memory:                                 │
-│    1. Classify: sensitivity_classifier(content)             │
-│       → returns {has_pii, is_credential, is_session_only}   │
+│    1. Classify: check_sensitivity(content)                  │
+│       → regex patterns for email, phone, SSN, credit card,  │
+│         AWS keys, private keys, bearer tokens, passwords    │
 │                                                             │
 │    2. Apply policy:                                         │
-│       if is_credential:                                     │
-│         → DISCARD (never enters memories table)             │
-│       if has_pii:                                           │
-│         → content = redact_pii(content)                     │
-│       if is_session_only:                                   │
-│         → force session_id = current_session_id             │
-│           (prevents cross-session promotion by Reflector)   │
+│       if any pattern matches:                               │
+│         → BLOCK (entire memory rejected, never persisted)   │
+│         → Structured audit log with content_hash            │
+│       else:                                                 │
+│         → PASS (memory proceeds to persistence)             │
 │                                                             │
-│  All actions logged to governance_events (auditable)        │
+│  Design decision: block-only, no redaction. Safer than      │
+│  partial redaction which risks incomplete PII removal.      │
 └─────────────────────────────────────────────────────────────┘
     ↓
 Observer.persist_with_contradiction_check()
 ```
 
-**Classification approach** (configurable, defense-in-depth):
-
-| Method | Speed | Accuracy | Use Case |
-|--------|-------|----------|----------|
-| Regex patterns | <1ms | Medium | Known formats: API keys, SSNs, emails, credit cards |
-| Small classifier model | ~10ms | High | PII detection, sensitivity scoring |
-| LLM (same call as extraction) | 0ms marginal | Highest | Add `sensitivity` field to extraction prompt |
-
-Default: regex first (fast reject), then small model for ambiguous cases.
-LLM-based classification is opt-in for high-security deployments.
-
-**Redaction strategy**:
-- Replace with type placeholder: `<EMAIL>`, `<API_KEY>`, `<SSN>`
-- Preserve semantic meaning: "user's email is <EMAIL>" still useful for recall
-- Original content never written to `memories` — redaction is irreversible
-
-**Session-only enforcement**:
-- Memories marked `is_session_only` get `session_id = current_session_id`
-- Reflector skips these during episodic→semantic promotion
-- Examples: "user is debugging a production incident right now", temporary credentials context
+**Classification approach**: Regex patterns only (fast, deterministic).
+Small classifier model and LLM-based classification are design targets for
+high-security deployments.
 
 #### Why This Matters
 
@@ -334,13 +338,13 @@ Decay, trust, and cleanup are not ad-hoc — they're a formal governance model w
 
 #### Retention Policy by Memory Type
 
-| Memory Type | Default TTL | Decay Behavior | Deletion |
-|---|---|---|---|
-| **Sensory** (raw stream chunks) | 1 hour | Auto-purge after consolidation into events | Hard delete (no audit need) |
-| **Working** (active plan state) | Session lifetime | Archived on session close | Soft delete (queryable via time-travel) |
-| **Episodic** (session summaries, events) | 90 days active | Compress: full events → summary after TTL | Never hard delete (audit requirement) |
-| **Semantic** (knowledge entries) | No TTL (explicit lifecycle) | Confidence decay over time (see below) | Quarantine → archive (never hard delete) |
-| **Procedural** (skills, prompt templates) | No TTL (versioned) | Never auto-decay | Deprecate → version tombstone |
+| Memory Type | Default TTL | Decay Behavior | Deletion | Status |
+|---|---|---|---|---|
+| **Sensory** (raw stream chunks) | 1 hour | Auto-purge after consolidation into events | Hard delete (no audit need) | 🔵 Design Target |
+| **Working** (active plan state) | Session lifetime | ✅ Archived by `run_hourly()` after 2h inactivity | Soft delete (queryable via time-travel) | ✅ Implemented |
+| **Semantic** (knowledge entries) | No TTL (explicit lifecycle) | ✅ Query-time confidence decay with per-tier half-life | ✅ Quarantine by `run_daily()` when effective_confidence < 0.3 | ✅ Implemented |
+| **Procedural** (skills, prompt templates) | No TTL (versioned) | Never auto-decay | Deprecate → version tombstone | ✅ Implemented |
+| **Tool Result** | 24 hours | ✅ TTL-based cleanup by `run_hourly()` | Hard delete | ✅ Implemented |
 
 #### Automated Confidence Decay
 
@@ -382,24 +386,27 @@ Not all information sources are equally reliable. Trust tier determines initial 
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  MEMORY GOVERNANCE ENGINE (runs continuously)           │
+│  MEMORY GOVERNANCE ENGINE (GovernanceScheduler)         │
 │                                                         │
-│  Every hour:                                            │
-│    - Purge expired sensory buffer entries                │
-│    - Archive closed working memory                      │
+│  run_hourly():                                          │
+│    - Cleanup expired TOOL_RESULT memories (TTL-based)   │
+│    - Archive stale WORKING memories (>2h inactive)      │
 │                                                         │
-│  Every day:                                             │
-│    - Quarantine entries below confidence threshold       │
-│    - Compress episodic events past TTL → summaries      │
-│    - Flag T4 entries approaching decay deadline          │
+│  run_daily(user_id):                                    │
+│    - Delete inactive low-confidence memories (stale)    │
+│    - Quarantine: deactivate memories where              │
+│      effective_confidence < threshold (per trust tier)   │
+│    - Pollution detection (supersede ratio check)        │
 │                                                         │
-│  Every week:                                            │
-│    - T1 auto-verification: re-fetch source URLs         │
-│    - Contradiction scan: semantically similar entries    │
-│      with conflicting claims                            │
-│    - Generate memory health report per user             │
+│  run_weekly():                                          │
+│    - Cleanup orphan sandbox branches                    │
+│    - Cleanup old milestone snapshots (keep last N)      │
 │                                                         │
-│  All actions logged as governance_events (auditable)    │
+│  Confidence decay is query-time only — governance       │
+│  never mutates the initial_confidence column.           │
+│                                                         │
+│  Trust tiers (T1-T4) determine per-tier half-life:      │
+│    T1=365d, T2=180d, T3=60d, T4=30d                    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -581,7 +588,7 @@ Session with 200 turns over 8 hours:
 Incremental summaries are session-scoped (only visible within that session) until
 the full summary is generated, which supersedes them and becomes cross-session.
 
-**Implementation**: `Reflector.generate_session_summary()` is called by:
+**Implementation**: `SessionSummarizer` is called by:
 1. `SessionManager.close_session()` — full summary
 2. `TurnHooks.post_turn()` — checks turn/time thresholds, generates incremental
 3. `ContextBudgetManager.on_overflow()` — emergency compaction summary
@@ -684,9 +691,9 @@ CREATE TABLE memories (
 );
 ```
 
-> **Note on `episodic`**: The `MemoryType.EPISODIC` enum value exists for backward
-> compatibility, but no new episodic rows are written to `memories`. Episodic
+> **Note**: `MemoryType.EPISODIC` has been removed from the enum. Episodic
 > memory is served exclusively from `conversation_events` via HybridRetriever.
+> No episodic rows exist in the `memories` table.
 
 ---
 
@@ -848,21 +855,16 @@ Runs post-turn. Extracts typed memories (profile/semantic/procedural) from conve
 
 ### Reflector
 
-Runs during governance cycle. Promotes clusters of similar episodic memories to semantic memories.
-
-- **Clustering**: finds groups of ≥3 similar memories
-- **LLM condensation**: synthesizes cluster into one semantic memory
-- **Atomic promotion**: deactivate all cluster members + insert semantic in single transaction
-
-Clustering uses DB-side L2_DISTANCE nearest-neighbor queries — O(n) DB queries via IVF-flat index instead of O(n²) Python comparisons.
+> 🔵 **Design Target** — TypedReflector was removed. Episodic→semantic promotion
+> is not implemented. Observer extracts directly to semantic/profile/procedural types.
+> Session summaries are handled by `SessionSummarizer` (see §Cross-Session Continuity).
 
 ### Memory Pipeline
 
 ```
-Phase 1: Observer.extract_candidates() — LLM extraction (NOT persisted)
+Phase 1: Observer.extract_candidates() — LLM extraction + sensitivity filter (NOT persisted)
 Phase 2: MemorySandbox.validate_memories() — zero-copy branch comparison (optional)
 Phase 3: Observer.persist_with_contradiction_check() — store with supersede
-Phase 4: Reflector.reflect() — episodic→semantic promotion
 ```
 
 ---
@@ -970,9 +972,9 @@ as a coherent system.
 | Memory audit | ❌ | Git log (commit-level) | ✅ Every retrieval in context_snapshot + provenance | |
 | Memory experimentation | ❌ | Git branch (full copy) | ✅ Zero-copy branch → sandbox replay → merge | MO branch = no storage overhead |
 | Automated decay | ❌ | ❌ Manual eviction | ✅ Query-time `effective_confidence` | |
-| Automated consolidation | ❌ | ❌ Manual | ✅ Observer → Reflector → Governance pipeline | |
+| Automated consolidation | ❌ | ❌ Manual | ✅ Observer → SessionSummarizer → Governance pipeline | |
 | Contradiction detection | ❌ | Overwrite block | ✅ DB-side L2_DISTANCE → atomic supersede | |
-| Cross-session continuity | Vector search only | Archival search | Session summaries (auto-generated by Reflector) + knowledge entries | |
+| Cross-session continuity | Vector search only | Archival search | Session summaries (auto-generated by SessionSummarizer) + knowledge entries | |
 | Vector + Fulltext + SQL | 3 separate systems | External vector DB | MO native (fulltext only in WHERE — 3-phase workaround) | |
 | Vector time-travel | ❌ | ❌ | ✅ Snapshot restores vector indexes too | |
 | Tool context integration | ❌ | ❌ | ✅ TOOL_RESULT type + rule-based summary + memory_read | |
@@ -1007,7 +1009,7 @@ across agents. This is a genuine innovation in agent self-management.
 | **Transactional consistency** | Git commits are manual checkpoints | MO PITR respects MVCC — captures in-flight state |
 | **Zero-cost branching** | Git copies working tree | MO `data branch` is copy-on-write at storage layer |
 | **Vector index time-travel** | Git has no concept of vector indexes | MO snapshot restores IVF-flat atomically |
-| **Automated governance** | Agent must manually manage lifecycle | Observer + Reflector + Governance run automatically |
+| **Automated governance** | Agent must manually manage lifecycle | Observer + SessionSummarizer + Governance run automatically |
 | **Automated contradiction detection** | Agent must notice conflicts | DB-side L2_DISTANCE finds contradictions on every write |
 | **Query-time decay** | No decay model | `effective_confidence` computed in every retrieval |
 | **Retrieval audit** | Git log shows writes, not reads | `context_snapshot` records exactly what was retrieved and scored |

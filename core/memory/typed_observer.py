@@ -24,7 +24,7 @@ from core.memory.metrics import MemoryMetrics
 from core.memory.prompts import OBSERVER_EXTRACTION_PROMPT
 from core.memory.sensitivity import check_sensitivity
 from core.memory.store import MemoryStore
-from core.memory.types import Memory, MemoryType
+from core.memory.types import Memory, MemoryType, TrustTier
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +173,7 @@ class TypedObserver:
         memory_type: MemoryType,
         initial_confidence: float = 0.9,
         source_event_ids: Optional[list[str]] = None,
+        trust_tier: TrustTier = TrustTier.T3_INFERRED,
         explain: bool = False,
     ) -> tuple[Memory, Optional[ContradictionStats]]:
         """Directly write a memory (from MemoryWriteTool), skipping LLM extraction."""
@@ -189,6 +190,7 @@ class TypedObserver:
             memory_type=memory_type,
             content=content,
             initial_confidence=initial_confidence,
+            trust_tier=trust_tier,
             source_event_ids=source_event_ids or [],
             observed_at=datetime.utcnow(),
         )

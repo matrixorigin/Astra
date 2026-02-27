@@ -1,7 +1,12 @@
-"""Memory Governance — scheduled cleanup, health checks.
+"""Memory Governance — frequency-separated cleanup, quarantine, health.
 
 Confidence decay removed — decay is now query-time only via effective_confidence().
 Reflector removed — no episodic→semantic promotion.
+
+Governance cycles:
+  - hourly: tool_result cleanup, working memory archival
+  - daily: stale inactive cleanup, quarantine low effective_confidence
+  - weekly: orphan branch cleanup, snapshot cleanup, health report
 """
 
 from __future__ import annotations
@@ -19,33 +24,25 @@ from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
 from core.memory.health import MemoryHealth
 from core.memory.metrics import MemoryMetrics
 from core.memory.store import MemoryStore
+from core.memory.types import TRUST_TIER_HALF_LIVES, TrustTier
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class GovernanceStepStats:
-    executed: bool = False
-    success: bool = False
-    error: Optional[str] = None
-    count: int = 0
-    elapsed_ms: float = 0.0
-
-
-@dataclass
 class GovernanceCycleResult:
+    # Hourly
+    cleaned_tool_results: int = 0
+    archived_working: int = 0
+    # Daily
     cleaned_stale: int = 0
+    quarantined: int = 0
+    # Weekly
     cleaned_branches: int = 0
     cleaned_snapshots: int = 0
-    cleaned_tool_results: int = 0
+    # Health
     pollution_detected: bool = False
     errors: list[str] = field(default_factory=list)
-
-    health_stats: Optional[GovernanceStepStats] = None
-    cleanup_stale_stats: Optional[GovernanceStepStats] = None
-    cleanup_branches_stats: Optional[GovernanceStepStats] = None
-    cleanup_snapshots_stats: Optional[GovernanceStepStats] = None
-    cleanup_tool_results_stats: Optional[GovernanceStepStats] = None
     total_ms: float = 0.0
 
 
@@ -70,105 +67,154 @@ class GovernanceScheduler(DbConsumer):
             db_factory,
             pollution_threshold=self.config.pollution_threshold,
         )
-        self._last_cycle: dict[str, datetime] = {}
 
-    def run_cycle(self, user_id: str, explain: bool = False) -> GovernanceCycleResult:
-        start = time.time() if explain else 0
+    # ── Convenience: run all ──────────────────────────────────────────
+
+    def run_cycle(self, user_id: str) -> GovernanceCycleResult:
+        """Run all governance frequencies. Convenience for single-instance deployments."""
         result = GovernanceCycleResult()
-        last_run = self._last_cycle.get(user_id, datetime.utcnow() - timedelta(days=1))
+        start = time.time()
 
-        # 1. Health check
-        self._run_step(
-            result, "health", explain,
-            lambda: self._health_check(user_id, last_run, result),
-        )
+        h = self.run_hourly()
+        result.cleaned_tool_results = h.cleaned_tool_results
+        result.archived_working = h.archived_working
+        result.errors.extend(h.errors)
 
-        # 2. Cleanup stale inactive memories
-        self._run_step(
-            result, "cleanup_stale", explain,
-            lambda: self._cleanup_stale(user_id),
-        )
+        d = self.run_daily(user_id)
+        result.cleaned_stale = d.cleaned_stale
+        result.quarantined = d.quarantined
+        result.pollution_detected = d.pollution_detected
+        result.errors.extend(d.errors)
 
-        # 3. Cleanup orphan branches
-        self._run_step(
-            result, "cleanup_branches", explain,
-            lambda: self.health.cleanup_orphan_branches(),
-        )
+        w = self.run_weekly()
+        result.cleaned_branches = w.cleaned_branches
+        result.cleaned_snapshots = w.cleaned_snapshots
+        result.errors.extend(w.errors)
 
-        # 4. Cleanup old snapshots
-        self._run_step(
-            result, "cleanup_snapshots", explain,
-            lambda: self.health.cleanup_snapshots(keep_last_n=self.config.milestone_snapshot_keep_n),
-        )
-
-        # 5. Cleanup expired TOOL_RESULT memories
-        self._run_step(
-            result, "cleanup_tool_results", explain,
-            lambda: self._cleanup_tool_results(),
-        )
-
-        if explain:
-            result.total_ms = (time.time() - start) * 1000
-        self._last_cycle[user_id] = datetime.utcnow()
+        result.total_ms = (time.time() - start) * 1000
         return result
 
-    def _run_step(self, result: GovernanceCycleResult, name: str, explain: bool, fn) -> None:
-        step_start = time.time() if explain else 0
-        try:
-            count = fn() or 0
-            if name == "health":
-                pass  # health_check sets result fields directly
-            else:
-                setattr(result, f"cleaned_{name.replace('cleanup_', '')}", count)
-            if explain:
-                setattr(result, f"{name}_stats", GovernanceStepStats(
-                    executed=True, success=True, count=count,
-                    elapsed_ms=(time.time() - step_start) * 1000,
-                ))
-        except Exception as e:
-            logger.error("Governance step %s failed: %s", name, e)
-            result.errors.append(f"{name}: {e}")
-            if explain:
-                setattr(result, f"{name}_stats", GovernanceStepStats(
-                    executed=True, success=False, error=str(e),
-                    elapsed_ms=(time.time() - step_start) * 1000,
-                ))
+    # ── Hourly ────────────────────────────────────────────────────────
 
-    def _health_check(self, user_id: str, last_run: datetime, result: GovernanceCycleResult) -> int:
-        pollution = self.health.detect_pollution(user_id, last_run)
-        result.pollution_detected = pollution.get("is_polluted", False)
-        if result.pollution_detected:
-            logger.warning("Pollution detected for %s: ratio=%.2f", user_id, pollution.get("ratio", 0))
-        return 0
+    def run_hourly(self) -> GovernanceCycleResult:
+        """Hourly: tool_result cleanup + working memory archival."""
+        result = GovernanceCycleResult()
+        try:
+            result.cleaned_tool_results = self._cleanup_tool_results()
+        except Exception as e:
+            logger.error("Tool result cleanup failed: %s", e)
+            result.errors.append(f"tool_results: {e}")
+        try:
+            result.archived_working = self._archive_stale_working()
+        except Exception as e:
+            logger.error("Working memory archival failed: %s", e)
+            result.errors.append(f"working_archival: {e}")
+        return result
+
+    # ── Daily ─────────────────────────────────────────────────────────
+
+    def run_daily(self, user_id: str) -> GovernanceCycleResult:
+        """Daily: stale cleanup + quarantine low effective_confidence."""
+        result = GovernanceCycleResult()
+        try:
+            result.cleaned_stale = self._cleanup_stale(user_id)
+        except Exception as e:
+            logger.error("Stale cleanup failed: %s", e)
+            result.errors.append(f"stale: {e}")
+        try:
+            result.quarantined = self._quarantine_low_confidence(user_id)
+        except Exception as e:
+            logger.error("Quarantine failed: %s", e)
+            result.errors.append(f"quarantine: {e}")
+        try:
+            pollution = self.health.detect_pollution(user_id, datetime.utcnow() - timedelta(days=1))
+            result.pollution_detected = pollution.get("is_polluted", False)
+        except Exception as e:
+            logger.error("Pollution detection failed: %s", e)
+            result.errors.append(f"pollution: {e}")
+        return result
+
+    # ── Weekly ────────────────────────────────────────────────────────
+
+    def run_weekly(self) -> GovernanceCycleResult:
+        """Weekly: orphan branch cleanup + snapshot cleanup."""
+        result = GovernanceCycleResult()
+        try:
+            result.cleaned_branches = self.health.cleanup_orphan_branches()
+        except Exception as e:
+            logger.error("Branch cleanup failed: %s", e)
+            result.errors.append(f"branches: {e}")
+        try:
+            result.cleaned_snapshots = self.health.cleanup_snapshots(
+                keep_last_n=self.config.milestone_snapshot_keep_n
+            )
+        except Exception as e:
+            logger.error("Snapshot cleanup failed: %s", e)
+            result.errors.append(f"snapshots: {e}")
+        return result
+
+    # ── Internal steps ────────────────────────────────────────────────
+
+    def _cleanup_tool_results(self) -> int:
+        ttl = self.config.tool_result_ttl_hours
+        with self._db() as db:
+            result = db.execute(text("""
+                DELETE FROM memories
+                WHERE memory_type = :mtype
+                  AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :ttl
+            """), {"mtype": "tool_result", "ttl": ttl})
+            db.commit()
+            count = result.rowcount
+        if count > 0:
+            logger.info("Cleaned %d expired TOOL_RESULT memories (TTL=%dh)", count, ttl)
+        return count
+
+    def _archive_stale_working(self) -> int:
+        """Archive working memories from sessions inactive > threshold hours."""
+        stale_hours = self.config.working_memory_stale_hours
+        with self._db() as db:
+            result = db.execute(text("""
+                UPDATE memories SET is_active = 0, updated_at = NOW()
+                WHERE memory_type = 'working' AND is_active = 1
+                  AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :stale_hours
+            """), {"stale_hours": stale_hours})
+            db.commit()
+            count = result.rowcount
+        if count > 0:
+            logger.info("Archived %d stale working memories (>%dh)", count, stale_hours)
+        return count
 
     def _cleanup_stale(self, user_id: str, confidence_threshold: float = 0.1) -> int:
         """Delete inactive memories with low initial_confidence (already superseded)."""
         with self._db() as db:
-            result = db.execute(
-                text("""
-                    DELETE FROM memories
-                    WHERE user_id = :uid
-                      AND is_active = 0
-                      AND initial_confidence < :threshold
-                """),
-                {"uid": user_id, "threshold": confidence_threshold},
-            )
+            result = db.execute(text("""
+                DELETE FROM memories
+                WHERE user_id = :uid
+                  AND is_active = 0
+                  AND initial_confidence < :threshold
+            """), {"uid": user_id, "threshold": confidence_threshold})
             db.commit()
             return result.rowcount
 
-    def _cleanup_tool_results(self) -> int:
-        ttl_hours = self.config.tool_result_ttl_hours
+    def _quarantine_low_confidence(self, user_id: str) -> int:
+        """Deactivate memories whose effective_confidence is below quarantine threshold.
+
+        Uses per-tier half-life: T1=365d, T2=180d, T3=60d, T4=30d.
+        Memories with no trust_tier default to T3 (60d).
+        """
+        threshold = self.config.quarantine_threshold
+        quarantined = 0
         with self._db() as db:
-            result = db.execute(
-                text("""
-                    DELETE FROM memories
-                    WHERE memory_type = :mtype
-                      AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :ttl
-                """),
-                {"mtype": "tool_result", "ttl": ttl_hours},
-            )
+            for tier in TrustTier:
+                hl = TRUST_TIER_HALF_LIVES[tier]
+                result = db.execute(text("""
+                    UPDATE memories SET is_active = 0, updated_at = NOW()
+                    WHERE user_id = :uid AND is_active = 1
+                      AND COALESCE(trust_tier, 'T3') = :tier
+                      AND (initial_confidence * EXP(-TIMESTAMPDIFF(DAY, observed_at, NOW()) / :hl)) < :threshold
+                """), {"uid": user_id, "tier": tier.value, "hl": hl, "threshold": threshold})
+                quarantined += result.rowcount
             db.commit()
-            count = result.rowcount
-            if count > 0:
-                logger.info("Cleaned %d expired TOOL_RESULT memories (TTL=%dh)", count, ttl_hours)
-            return count
+        if quarantined > 0:
+            logger.info("Quarantined %d memories below threshold %.2f", quarantined, threshold)
+        return quarantined

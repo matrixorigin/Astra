@@ -13,7 +13,7 @@ Components:
 All components support explain=True for EXPLAIN ANALYZE style execution stats.
 """
 
-from core.memory.types import Memory, MemoryType, RetrievalWeights
+from core.memory.types import Memory, MemoryType, RetrievalWeights, TrustTier, TRUST_TIER_HALF_LIVES
 from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever
 from core.memory.typed_observer import TypedObserver
@@ -27,7 +27,7 @@ from core.memory.explain import (
 )
 
 __all__ = [
-    "Memory", "MemoryType", "RetrievalWeights",
+    "Memory", "MemoryType", "RetrievalWeights", "TrustTier", "TRUST_TIER_HALF_LIVES",
     "MemoryStore", "MemoryRetriever", "TypedObserver",
     "ProfileManager", "MemoryGovernanceConfig", "DEFAULT_CONFIG",
     "check_sensitivity", "SensitivityResult",

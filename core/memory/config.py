@@ -17,10 +17,20 @@ class MemoryGovernanceConfig:
     confidence_decay_half_life_days: float = 30.0
     contradiction_similarity_threshold: float = 0.85
 
-    # TOOL_RESULT specific TTL (independent of confidence decay)
+    # TOOL_RESULT specific TTL
     tool_result_ttl_hours: int = 24
     tool_result_max_per_session: int = 100
     tool_result_cleanup_on_session_close: bool = True
+
+    # Quarantine threshold (effective_confidence below this → deactivate)
+    quarantine_threshold: float = 0.3
+
+    # Working memory archival (hours of inactivity before archival)
+    working_memory_stale_hours: int = 2
+
+    # Session summary thresholds
+    session_summary_turn_threshold: int = 50
+    session_summary_time_threshold_hours: float = 2.0
 
 
 # Default config instance

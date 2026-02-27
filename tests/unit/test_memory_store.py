@@ -106,6 +106,8 @@ class TestMemoryStoreGet:
         row.observed_at = datetime(2026, 2, 26)
         row.created_at = datetime(2026, 2, 26)
         row.updated_at = datetime(2026, 2, 26)
+        row.trust_tier = "T3"
+        row.session_id = None
         mock_db.query.return_value.filter_by.return_value.first.return_value = row
 
         result = store.get("m1")
@@ -172,3 +174,11 @@ class TestMemoryStoreDeactivate:
     def test_deactivate_missing(self, store, mock_db):
         mock_db.query.return_value.filter_by.return_value.first.return_value = None
         assert store.deactivate("nonexistent") is False
+
+
+class TestArchiveWorkingMemories:
+    def test_archive_returns_count(self, store, mock_db):
+        mock_db.execute.return_value.rowcount = 3
+        count = store.archive_working_memories("sess_1")
+        assert count == 3
+        mock_db.commit.assert_called()

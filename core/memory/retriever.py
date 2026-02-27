@@ -25,7 +25,7 @@ from sqlalchemy import text
 from core.db_consumer import DbConsumer, DbFactory
 from core.memory.explain import RetrievalStats
 from core.memory.metrics import MemoryMetrics, Timer
-from core.memory.types import Memory, MemoryType, RetrievalWeights
+from core.memory.types import Memory, MemoryType, RetrievalWeights, TrustTier, TRUST_TIER_HALF_LIVES
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ TASK_WEIGHTS: dict[str, RetrievalWeights] = {
 # Phase 1: keyword filter + temporal/confidence scoring in SQL
 # effective_confidence = initial_confidence * EXP(-age / half_life) — computed at query time, never stored
 _KEYWORD_SQL = """\
-SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id,
+SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id, m.trust_tier,
     (
         :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
         :w_conf * (m.initial_confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
@@ -56,7 +56,7 @@ LIMIT :lim
 
 # Phase 1 fallback: no keyword match, temporal/confidence only
 _FALLBACK_SQL = """\
-SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id,
+SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id, m.trust_tier,
     (
         :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
         :w_conf * (m.initial_confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
@@ -71,7 +71,7 @@ LIMIT :lim
 
 # Phase 2: vector candidates via L2_DISTANCE (over-fetch for merge)
 _VECTOR_SQL = """\
-SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id,
+SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id, m.trust_tier,
     L2_DISTANCE(m.embedding, :query_vec) AS l2_dist
 FROM memories m
 WHERE m.user_id = :uid AND m.is_active = 1
@@ -96,6 +96,7 @@ class _Candidate:
     initial_confidence: float
     observed_at: object
     session_id: Optional[str]
+    trust_tier: str = "T3"
     keyword_matched: bool = False
     l2_dist: Optional[float] = None
 
@@ -220,7 +221,8 @@ class MemoryRetriever(DbConsumer):
                         self._metrics.increment("retrieval_keyword_hits")
                         stats.keyword_hit = True
                         return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
-                                           r.observed_at, r.session_id, keyword_matched=True) for r in rows], stats
+                                           r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3",
+                                           keyword_matched=True) for r in rows], stats
                 except Exception as e:
                     logger.debug("Keyword search failed: %s", e)
                     self._metrics.increment("retrieval_keyword_errors")
@@ -229,7 +231,7 @@ class MemoryRetriever(DbConsumer):
             rows = db.execute(text(_FALLBACK_SQL.format(session_filter=session_filter)), params).fetchall()
             self._metrics.increment("retrieval_fallback_hits")
             return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
-                               r.observed_at, r.session_id) for r in rows], stats
+                               r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3") for r in rows], stats
 
     def _phase2(
         self, query_embedding: list[float], session_filter: str, base_params: dict, limit: int,
@@ -244,7 +246,8 @@ class MemoryRetriever(DbConsumer):
                 self._metrics.increment("retrieval_vector_hits")
                 stats.vector_hit = bool(rows)
                 return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
-                                   r.observed_at, r.session_id, l2_dist=float(r.l2_dist)) for r in rows], stats
+                                   r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3",
+                                   l2_dist=float(r.l2_dist)) for r in rows], stats
             except Exception as e:
                 logger.warning("Vector search failed: %s", e)
                 self._metrics.increment("retrieval_vector_errors")
@@ -278,7 +281,8 @@ class MemoryRetriever(DbConsumer):
                 age_hours = (now_ts - c.observed_at.timestamp()) / 3600.0
                 time_score = _safe_exp(-age_hours / self.decay_hours)
                 age_days = age_hours / 24.0
-                conf_score = c.initial_confidence * _safe_exp(-age_days / self.half_life_days)
+                tier_half_life = TRUST_TIER_HALF_LIVES.get(TrustTier(c.trust_tier), self.half_life_days)
+                conf_score = c.initial_confidence * _safe_exp(-age_days / tier_half_life)
             else:
                 time_score, conf_score = 0.0, c.initial_confidence
 
@@ -296,4 +300,5 @@ class MemoryRetriever(DbConsumer):
             memory_type=MemoryType(c.memory_type), content=c.content,
             initial_confidence=c.initial_confidence, session_id=c.session_id,
             observed_at=c.observed_at,
+            trust_tier=TrustTier(c.trust_tier) if c.trust_tier else TrustTier.T3_INFERRED,
         )

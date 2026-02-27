@@ -120,6 +120,16 @@ class TestSensitivityFilter:
         results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
         assert len(results) == 1
 
+    def test_audit_log_emitted(self, observer, mock_llm, caplog):
+        """Sensitivity block emits structured audit log with content_hash."""
+        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
+            {"type": "profile", "content": "email is user@example.com", "confidence": 0.9},
+        ])}
+        import logging
+        with caplog.at_level(logging.WARNING):
+            observer.observe("u1", [{"role": "user", "content": "test"}])
+        assert any("sensitivity_blocked" in r.message or "Sensitivity filter" in r.message for r in caplog.records)
+
 
 class TestContradictionDetection:
     def test_contradiction_supersedes(self, mock_llm, mock_store):

@@ -10,7 +10,7 @@ from core.memory.retriever import MemoryRetriever, TASK_WEIGHTS, _KEYWORD_SQL, _
 from core.memory.types import MemoryType, RetrievalWeights
 
 
-MemRow = namedtuple("MemRow", ["memory_id", "content", "memory_type", "initial_confidence", "observed_at", "session_id"])
+MemRow = namedtuple("MemRow", ["memory_id", "content", "memory_type", "initial_confidence", "observed_at", "session_id", "trust_tier"])
 
 
 @pytest.fixture
@@ -41,8 +41,8 @@ class TestTaskWeights:
 class TestRetrieveWithEmbedding:
     def test_returns_memories(self, retriever, mock_db):
         mock_db.execute.return_value.fetchall.return_value = [
-            MemRow("m1", "Go testing", "semantic", 0.9, datetime(2026, 2, 26), None),
-            MemRow("m2", "Python flask", "semantic", 0.7, datetime(2026, 2, 25), None),
+            MemRow("m1", "Go testing", "semantic", 0.9, datetime(2026, 2, 26), None, "T3"),
+            MemRow("m2", "Python flask", "semantic", 0.7, datetime(2026, 2, 25), None, "T3"),
         ]
         results, _ = retriever.retrieve("u1", "Go testing", session_id="s1")
         assert len(results) == 2
@@ -96,7 +96,7 @@ class TestRetrieveWithoutEmbedding:
 
     def test_returns_memories(self, retriever, mock_db):
         mock_db.execute.return_value.fetchall.return_value = [
-            MemRow("m1", "Go testing", "procedural", 0.8, datetime(2026, 2, 26), None),
+            MemRow("m1", "Go testing", "procedural", 0.8, datetime(2026, 2, 26), None, "T3"),
         ]
         results, _ = retriever.retrieve("u1", "Go", session_id="s1")
         assert len(results) == 1

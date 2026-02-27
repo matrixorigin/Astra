@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from api.models.memory import MemoryRecord
 from core.db_consumer import DbConsumer, DbFactory
 from core.memory.metrics import MemoryMetrics, Timer
-from core.memory.types import Memory, MemoryType
+from core.memory.types import Memory, MemoryType, TrustTier
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,7 @@ def _to_domain(row: MemoryRecord) -> Memory:
         observed_at=row.observed_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        trust_tier=TrustTier(row.trust_tier) if row.trust_tier else TrustTier.T3_INFERRED,
     )
 
 
@@ -58,6 +59,7 @@ class MemoryStore(DbConsumer):
                     memory_type=memory.memory_type.value,
                     content=memory.content,
                     initial_confidence=memory.initial_confidence,
+                    trust_tier=memory.trust_tier.value,
                     embedding=memory.embedding,
                     source_event_ids=memory.source_event_ids,
                     is_active=1,
@@ -110,6 +112,7 @@ class MemoryStore(DbConsumer):
                 memory_type=new_memory.memory_type.value,
                 content=new_memory.content,
                 initial_confidence=new_memory.initial_confidence,
+                trust_tier=new_memory.trust_tier.value,
                 embedding=new_memory.embedding,
                 source_event_ids=new_memory.source_event_ids,
                 is_active=1,
@@ -119,6 +122,17 @@ class MemoryStore(DbConsumer):
             db.commit()
             new_memory.created_at = row.created_at
         return new_memory
+
+    def archive_working_memories(self, session_id: str) -> int:
+        """Archive all WORKING memories for a session (set is_active=0)."""
+        with self._db() as db:
+            from sqlalchemy import text as sa_text
+            result = db.execute(sa_text("""
+                UPDATE memories SET is_active = 0, updated_at = NOW()
+                WHERE session_id = :sid AND memory_type = 'working' AND is_active = 1
+            """), {"sid": session_id})
+            db.commit()
+            return result.rowcount
 
     def deactivate(self, memory_id: str) -> bool:
         with self._db() as db:
