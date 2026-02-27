@@ -1,7 +1,7 @@
 # Edge-Cloud Split Execution
 
 > **Status**: Core Design — single source of truth for edge-cloud execution model
-> **Last Updated**: 2026-02-25
+> **Last Updated**: 2026-02-27
 > **Related**: [deployment-architecture.md §1.1](deployment-architecture.md), [skills-and-tools.md](skills-and-tools.md), [agents-and-orchestration.md](agents-and-orchestration.md)
 
 ---
@@ -127,11 +127,33 @@ data: {"type": "turn_complete", "has_tool_calls": true}
 - `has_tool_calls: true` → edge must execute tools and call `/chat/turn` again with results
 - `has_tool_calls: false` → final answer, conversation turn complete
 
-**Incomplete turn handling**: If edge disconnects before sending tool_results
-(max turns, crash, network), cloud auto-heals the history on the next request
-by scanning the entire history and injecting placeholder tool messages for any
-orphaned tool_calls (including partial results). Cloud owns
-history integrity — edge is not required to "flush" pending results.
+**History integrity** (merge-then-heal): Cloud guarantees a valid OpenAI
+message sequence regardless of edge or cloud failures.  On every `/chat/turn`,
+cloud runs a two-phase process before calling the LLM:
+
+1. **Merge**: Incoming `tool_results` are matched by `tool_call_id` to the
+   assistant message that requested them and inserted in the correct position
+   (right after the assistant's tool_call block).  This handles cloud restart
+   (edge still has results), partial results, and normal operation.
+
+2. **Heal**: Any assistant `tool_calls` that *still* lack matching tool
+   messages after merging are filled with placeholders (`[not executed --
+   edge disconnected]`).  These are truly abandoned (edge disconnected,
+   max-turns, crash).
+
+This covers all failure combinations:
+
+| Scenario | Phase 1 (Merge) | Phase 2 (Heal) |
+|---|---|---|
+| Edge disconnects, never sends results | no-op | heals all |
+| Edge sends partial results | merges available | heals rest |
+| Cloud restarts, edge sends results normally | merges into correct position | no-op |
+| Cloud restarts, edge sends partial results | merges available | heals rest |
+| Cloud restarts, edge already gave up | no-op | heals all |
+| DB has trailing tool_calls (cloud crashed mid-execution) | merges if edge retries | heals rest |
+| tool_results for unknown tool_call_ids | ignored (not consumed) | n/a |
+
+Cloud owns history integrity — edge is not required to track cloud state.
 
 ### Edge loop pseudocode
 

@@ -931,7 +931,7 @@ class TestCloudHistoryHealing:
         session_id = parse_sse(r1.text)[0]["session_id"]
 
         # Turn 2: edge sends user message without tool_results.
-        # Patch _heal_orphaned_tool_calls to a no-op → history stays broken.
+        # Patch _merge_tool_results_into_history to a no-op → history stays broken.
         captured_messages = []
 
         async def turn2_stream(messages, tools, *args, **kwargs):
@@ -941,8 +941,11 @@ class TestCloudHistoryHealing:
             ]):
                 yield chunk
 
+        def _noop_merge(history, tool_results):
+            return set()
+
         with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn2_stream), \
-             patch("api.routers.chat._heal_orphaned_tool_calls"):  # no-op
+             patch("api.routers.chat._merge_tool_results_into_history", side_effect=_noop_merge):
             client.post("/chat/turn", json={
                 "messages": [{"role": "user", "content": "continue"}],
                 "session_id": session_id,
@@ -965,3 +968,156 @@ class TestCloudHistoryHealing:
             "Without healing, history should have orphaned tool_calls — "
             "this proves the healing code is necessary"
         )
+
+
+    # ── Cloud restart scenarios ──
+
+    def test_cloud_restart_edge_sends_tool_results(self, client, auth_headers):
+        """THE BUG: Turn 1 returns tool_calls → cloud restarts → Turn 2 edge
+        sends tool_results normally.  Cloud must merge results into the correct
+        position, not produce orphaned tool messages.
+
+        Before fix: cloud healed with placeholders, then appended real results
+        at end → LLM API rejected with 400 'tool must follow tool_calls'.
+        """
+        # Turn 1: LLM returns tool_call
+        async def turn1_stream(messages, tools, *args, **kwargs):
+            async for chunk in fake_stream_gen([
+                {"type": "tool_call", "data": {
+                    "id": "tc_restart", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+                }},
+            ]):
+                yield chunk
+
+        edge_tools = [{"type": "function", "function": {
+            "name": "read_file", "description": "r",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }}]
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn1_stream):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "read a.py"}],
+                "edge_tools": edge_tools,
+            }, headers=auth_headers)
+        session_id = parse_sse(r1.text)[0]["session_id"]
+
+        # Wait for persistence, then simulate cloud restart
+        flush_persist_threads()
+        from api.routers.chat import _session_cache
+        _session_cache.clear()
+
+        # Turn 2: edge sends tool_results (it executed the tool normally)
+        captured_messages = []
+
+        async def turn2_stream(messages, tools, *args, **kwargs):
+            captured_messages.extend(messages)
+            # Validate: every assistant with tool_calls has matching tool messages
+            for i, msg in enumerate(messages):
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    expected_ids = {tc["id"] for tc in msg["tool_calls"]}
+                    found_ids = set()
+                    for j in range(i + 1, len(messages)):
+                        if messages[j].get("role") == "tool":
+                            found_ids.add(messages[j].get("tool_call_id"))
+                        else:
+                            break
+                    missing = expected_ids - found_ids
+                    assert not missing, (
+                        f"Invalid sequence: assistant at {i} has tool_calls "
+                        f"{expected_ids} but missing {missing}. "
+                        f"Full history: {messages}"
+                    )
+            async for chunk in fake_stream_gen([
+                {"type": "text", "content": "file contents are..."},
+            ]):
+                yield chunk
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn2_stream):
+            r2 = client.post("/chat/turn", json={
+                "tool_results": [{"tool_call_id": "tc_restart", "name": "read_file",
+                                  "result": "def main(): pass"}],
+                "messages": [],
+                "session_id": session_id,
+                "edge_tools": edge_tools,
+            }, headers=auth_headers)
+
+        assert r2.status_code == 200
+        assert captured_messages, "Turn 2 should have reached the LLM"
+
+        # The real result should be in history, not a placeholder
+        tool_msgs = [m for m in captured_messages if m.get("role") == "tool"]
+        tc_restart_msg = next(m for m in tool_msgs if m["tool_call_id"] == "tc_restart")
+        assert tc_restart_msg["content"] == "def main(): pass"
+        assert "[not executed" not in tc_restart_msg["content"]
+
+    def test_cloud_restart_partial_tool_results(self, client, auth_headers):
+        """Cloud restarts. Edge sends results for 1 of 2 tool_calls.
+        The delivered result should be merged; the missing one healed."""
+        async def turn1_stream(messages, tools, *args, **kwargs):
+            async for chunk in fake_stream_gen([
+                {"type": "tool_call", "data": {
+                    "id": "tc_p1", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "a.py"}'},
+                }},
+                {"type": "tool_call", "data": {
+                    "id": "tc_p2", "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "b.py"}'},
+                }},
+            ]):
+                yield chunk
+
+        edge_tools = [{"type": "function", "function": {
+            "name": "read_file", "description": "r",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }}]
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn1_stream):
+            r1 = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "read both"}],
+                "edge_tools": edge_tools,
+            }, headers=auth_headers)
+        session_id = parse_sse(r1.text)[0]["session_id"]
+
+        # Simulate cloud restart
+        flush_persist_threads()
+        from api.routers.chat import _session_cache
+        _session_cache.clear()
+
+        # Edge only sends result for tc_p1 (tc_p2 timed out on edge)
+        captured_messages = []
+
+        async def turn2_stream(messages, tools, *args, **kwargs):
+            captured_messages.extend(messages)
+            # Validate sequence
+            for i, msg in enumerate(messages):
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    expected = {tc["id"] for tc in msg["tool_calls"]}
+                    found = set()
+                    for j in range(i + 1, len(messages)):
+                        if messages[j].get("role") == "tool":
+                            found.add(messages[j].get("tool_call_id"))
+                        else:
+                            break
+                    assert expected == found, (
+                        f"Sequence invalid: expected {expected}, found {found}"
+                    )
+            async for chunk in fake_stream_gen([
+                {"type": "text", "content": "ok"},
+            ]):
+                yield chunk
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=turn2_stream):
+            r2 = client.post("/chat/turn", json={
+                "tool_results": [{"tool_call_id": "tc_p1", "name": "read_file",
+                                  "result": "content of a.py"}],
+                "messages": [],
+                "session_id": session_id,
+                "edge_tools": edge_tools,
+            }, headers=auth_headers)
+
+        assert r2.status_code == 200
+        tool_msgs = {m["tool_call_id"]: m for m in captured_messages
+                     if m.get("role") == "tool"}
+        assert tool_msgs["tc_p1"]["content"] == "content of a.py"
+        assert "[not executed" in tool_msgs["tc_p2"]["content"]

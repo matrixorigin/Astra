@@ -86,6 +86,54 @@ class TestRecoverHistory:
 
 
 # ---------------------------------------------------------------------------
+# _append_recovered_events — trailing tool_calls
+# ---------------------------------------------------------------------------
+
+class TestAppendRecoveredEvents:
+    """Verify _append_recovered_events handles edge cases in DB event reconstruction."""
+
+    def _make_row(self, event_type, content, metadata=None):
+        return (event_type, content, json.dumps(metadata or {}))
+
+    def test_trailing_tool_calls_flushed(self):
+        """DB ends with tool_call events (no tool_result) — API crashed mid-execution.
+        The pending tool_calls must be flushed as an assistant message so
+        _merge_tool_results_into_history can heal or merge them later."""
+        from core.history_utils import append_recovered_events as _append_recovered_events
+        history = [{"role": "system", "content": "sys"}]
+        rows = [
+            self._make_row("user_query", "do something"),
+            self._make_row("tool_call",
+                           json.dumps({"tool_call_id": "tc_trail", "name": "bash", "arguments": "{}"}),
+                           {"tool_call_id": "tc_trail", "name": "bash"}),
+        ]
+        result = _append_recovered_events(history, rows)
+        # Should have: system, user, assistant(tool_calls)
+        assert len(result) == 3
+        assert result[2]["role"] == "assistant"
+        assert len(result[2]["tool_calls"]) == 1
+        assert result[2]["tool_calls"][0]["id"] == "tc_trail"
+
+    def test_trailing_multiple_tool_calls_flushed(self):
+        """Multiple trailing tool_calls flushed as one assistant message."""
+        from core.history_utils import append_recovered_events as _append_recovered_events
+        history = [{"role": "system", "content": "sys"}]
+        rows = [
+            self._make_row("user_query", "read files"),
+            self._make_row("tool_call",
+                           json.dumps({"tool_call_id": "tc_a", "name": "read_file"}),
+                           {"tool_call_id": "tc_a"}),
+            self._make_row("tool_call",
+                           json.dumps({"tool_call_id": "tc_b", "name": "read_file"}),
+                           {"tool_call_id": "tc_b"}),
+        ]
+        result = _append_recovered_events(history, rows)
+        assert result[2]["role"] == "assistant"
+        tc_ids = {tc["id"] for tc in result[2]["tool_calls"]}
+        assert tc_ids == {"tc_a", "tc_b"}
+
+
+# ---------------------------------------------------------------------------
 # _persist_turn_events
 # ---------------------------------------------------------------------------
 

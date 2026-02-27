@@ -960,7 +960,9 @@ class TestRecoverHistoryToolCalls:
         assert "tool" not in roles
 
     def test_trailing_tool_call_start_discarded(self):
-        """tool_call_start with no following tool_result (cancelled run) is discarded."""
+        """tool_call_start with no following tool_result (cancelled run) is
+        flushed as an assistant message.  _merge_tool_results_into_history
+        will heal it with a placeholder on the next /chat/turn call."""
         _insert_event(self.db, self.sid, self.uid, self.cid,
                       "user_query", "start", seq=0)
         _insert_event(self.db, self.sid, self.uid, self.cid,
@@ -972,8 +974,10 @@ class TestRecoverHistoryToolCalls:
 
         history = self._recover()
         roles = [m["role"] for m in history]
-        # system, user — dangling tool_call_start discarded
-        assert roles == ["system", "user"]
+        # system, user, assistant(tool_calls) — trailing tool_call flushed
+        assert roles == ["system", "user", "assistant"]
+        assert history[2].get("tool_calls")
+        assert history[2]["tool_calls"][0]["id"] == "tc_dangling"
 
     def test_two_rounds_of_tool_use(self):
         """user → tools → response → user → tools → response: two independent tool batches."""

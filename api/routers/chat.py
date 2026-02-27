@@ -15,6 +15,10 @@ from sqlalchemy.orm import Session
 
 from api.database import SessionLocal
 from api.dependencies import get_current_user
+from core.history_utils import (
+    merge_tool_results_into_history as _merge_tool_results_into_history,
+    append_recovered_events as _append_recovered_events,
+)
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -516,48 +520,6 @@ def _classify_task(messages: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def _heal_orphaned_tool_calls(history: list[dict[str, Any]]) -> None:
-    """Scan history and inject placeholder tool messages for any assistant
-    tool_calls that lack matching tool responses.
-
-    OpenAI-compatible APIs require every tool_call to be followed (before the
-    next non-tool message) by a tool message with the same tool_call_id.
-    Edge may skip tool_results due to max-turns, crash, Ctrl-C, or network
-    disconnect.  Cloud heals these gaps so the LLM API never rejects history.
-
-    Mutates *history* in-place.  Inserts are done in reverse index order so
-    earlier indices remain valid while we splice.
-    """
-    # Collect (insert_position, placeholder_msg) pairs.
-    inserts: list[tuple[int, dict[str, Any]]] = []
-    for i, msg in enumerate(history):
-        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
-            continue
-        expected = {tc["id"] for tc in msg["tool_calls"]}
-        found: set[str] = set()
-        for j in range(i + 1, len(history)):
-            if history[j].get("role") == "tool":
-                found.add(history[j].get("tool_call_id", ""))
-            else:
-                break
-        missing = expected - found
-        if missing:
-            # Insert right after the last existing tool message (or after
-            # the assistant message itself if there are none).
-            insert_at = i + 1 + len(found)
-            for tc in msg["tool_calls"]:
-                if tc["id"] in missing:
-                    inserts.append((insert_at, {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": "[not executed -- edge disconnected]",
-                    }))
-                    insert_at += 1
-    # Splice in reverse so indices stay valid.
-    for pos, placeholder in reversed(inserts):
-        history.insert(pos, placeholder)
-
-
 def _build_turn_messages(
     db: Session,
     user_id: str,
@@ -649,28 +611,35 @@ def _build_turn_messages(
                 except Exception as e:
                     logger.debug("Memory refresh failed (non-fatal): %s", e)
 
-    # History integrity: cloud guarantees a valid OpenAI message sequence
-    # regardless of edge behavior.  Scan the *entire* history for orphaned
-    # tool_calls (assistant has tool_calls but no matching tool messages
-    # follow).  This handles: max-turns, crash, Ctrl-C, network disconnect,
-    # and partial tool_results (edge sent results for some calls but not all).
-    # We collect placeholders first, then splice them in reverse order so
-    # indices stay valid.
-    _heal_orphaned_tool_calls(history)
+    # History integrity: merge incoming tool_results into the correct
+    # position in history, then heal any remaining orphaned tool_calls.
+    # This unified operation handles all edge-cloud failure combinations:
+    # edge disconnect, cloud restart, partial results, etc.
+    consumed = _merge_tool_results_into_history(history, tool_results)
 
     # Append new user messages from edge
     for msg in messages:
         if msg.get("role") and msg.get("content"):
             history.append(msg)
 
-    # Append tool results as tool messages (OpenAI format)
+    # Append unconsumed tool_results only if their tool_call_id exists in the
+    # last assistant message's tool_calls (normal in-memory path).  Unknown
+    # IDs are dropped — appending them would create orphaned tool messages
+    # that violate the OpenAI message sequence contract.
     if tool_results:
+        last_tc_ids: set[str] = set()
+        for m in reversed(history):
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                last_tc_ids = {tc["id"] for tc in m["tool_calls"]}
+                break
         for tr in tool_results:
-            history.append({
-                "role": "tool",
-                "tool_call_id": tr["tool_call_id"],
-                "content": tr.get("result", ""),
-            })
+            tc_id = tr.get("tool_call_id", "")
+            if tc_id not in consumed and tc_id in last_tc_ids:
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": tr.get("result", ""),
+                })
 
     entry["history"] = history
     if cached_sections:
@@ -685,78 +654,6 @@ def _build_turn_messages(
 # `LIMIT '50'` → syntax error. SQLAlchemy bindparam() has the same issue.
 # Safe: this is a module-level int constant, not user input.
 _MAX_RECOVERY_EVENTS = 50
-
-
-def _append_recovered_events(
-    history: list[dict[str, Any]], rows: list,
-) -> list[dict[str, Any]]:
-    """Append DB event rows to an existing history list (OpenAI message format).
-
-    Used by both snapshot post-fill and full event-by-event reconstruction.
-    Handles tool_call batching: accumulates tool_call events, flushes them as
-    one assistant message when the first tool_result arrives.
-    """
-    pending_tool_calls: list[dict[str, Any]] = []
-    in_tool_batch = False
-
-    for row in rows:
-        etype, content = row[0], row[1] or ""
-        meta = row[2] if len(row) > 2 else None
-        if isinstance(meta, str):
-            try:
-                meta = json.loads(meta)
-            except (json.JSONDecodeError, TypeError):
-                meta = {}
-        meta = meta or {}
-
-        if etype == "user_query":
-            in_tool_batch = False
-            history.append({"role": "user", "content": content})
-        elif etype == "tool_call":
-            try:
-                tc_data = json.loads(content) if isinstance(content, str) else {}
-            except (json.JSONDecodeError, TypeError):
-                tc_data = {}
-            pending_tool_calls.append({
-                "id": tc_data.get("tool_call_id", meta.get("tool_call_id", "")),
-                "type": "function",
-                "function": {
-                    "name": tc_data.get("name", meta.get("name", "")),
-                    "arguments": tc_data.get("arguments", "{}"),
-                },
-            })
-        elif etype == "tool_result":
-            tool_call_id = meta.get("tool_call_id", "")
-            tool_name = meta.get("name", "")
-            if pending_tool_calls:
-                history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
-                pending_tool_calls = []
-                in_tool_batch = True
-            elif not in_tool_batch:
-                if not tool_call_id:
-                    continue
-                history.append({"role": "assistant", "content": "", "tool_calls": [{
-                    "id": tool_call_id, "type": "function",
-                    "function": {"name": tool_name, "arguments": "{}"},
-                }]})
-                in_tool_batch = True
-            try:
-                result_data = json.loads(content) if isinstance(content, str) else {}
-            except (json.JSONDecodeError, TypeError):
-                result_data = {}
-            history.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": result_data.get("result", content)[:4000] if isinstance(result_data, dict) else str(content)[:4000],
-            })
-        elif etype == "llm_response":
-            in_tool_batch = False
-            if pending_tool_calls:
-                history.append({"role": "assistant", "content": "", "tool_calls": pending_tool_calls})
-                pending_tool_calls = []
-            history.append({"role": "assistant", "content": content})
-
-    return history
 
 
 def _recover_history_from_db(
