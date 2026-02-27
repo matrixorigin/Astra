@@ -195,3 +195,96 @@ class TestSessionCache:
         # t=104.1: >2s since last access at t=102, expired
         with patch("time.monotonic", return_value=104.1):
             assert cache.get("s1") is None
+
+
+# ---------------------------------------------------------------------------
+# Observer receives correct messages in edge-cloud /chat/turn path
+# ---------------------------------------------------------------------------
+
+class TestObserverReceivesMessages:
+    """Verify observer gets user+assistant pair, not empty incremental messages."""
+
+    def test_observer_gets_user_and_assistant(self):
+        """Observer should receive both user query and LLM response text."""
+        observer_messages = []
+
+        with patch("api.routers.chat.SessionLocal"), \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks") as mock_hooks_cls:
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_stream_event.return_value = MagicMock()
+            mock_el.create_llm_response.return_value = MagicMock()
+            mock_el_cls.return_value = mock_el
+
+            mock_hooks = MagicMock()
+            mock_hooks.run_observer.side_effect = lambda sid, uid, msgs: observer_messages.extend(msgs)
+            mock_hooks_cls.return_value = mock_hooks
+
+            from api.routers.chat import _persist_turn_events
+            _persist_turn_events(
+                "u1", "s1",
+                [{"role": "user", "content": "What is event sourcing?"}], None,
+                "Event sourcing is a pattern...", [],
+            )
+
+        assert len(observer_messages) == 2
+        assert observer_messages[0] == {"role": "user", "content": "What is event sourcing?"}
+        assert observer_messages[1] == {"role": "assistant", "content": "Event sourcing is a pattern..."}
+
+    def test_observer_runs_on_tool_result_turn_with_llm_text(self):
+        """On a tool-result-only turn (no user message), observer should still
+        run if LLM produced text — this is the turn where the assistant summarizes
+        tool output, which is valuable for memory extraction."""
+        observer_messages = []
+
+        with patch("api.routers.chat.SessionLocal"), \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks") as mock_hooks_cls:
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_stream_event.return_value = MagicMock()
+            mock_el.create_llm_response.return_value = MagicMock()
+            mock_el_cls.return_value = mock_el
+
+            mock_hooks = MagicMock()
+            mock_hooks.run_observer.side_effect = lambda sid, uid, msgs: observer_messages.extend(msgs)
+            mock_hooks_cls.return_value = mock_hooks
+
+            from api.routers.chat import _persist_turn_events
+            # Simulate turn 2: edge sends empty messages + tool_results,
+            # LLM responds with summary text
+            _persist_turn_events(
+                "u1", "s1",
+                [], [{"tool_call_id": "tc1", "name": "read_file", "result": "file content"}],
+                "The file contains configuration settings.", [],
+            )
+
+        # Observer should still run with the assistant's summary
+        assert len(observer_messages) == 1
+        assert observer_messages[0]["role"] == "assistant"
+        assert "configuration" in observer_messages[0]["content"]
+
+    def test_observer_skipped_when_no_content(self):
+        """Observer should NOT run when there's no user content and no LLM text."""
+        with patch("api.routers.chat.SessionLocal"), \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks") as mock_hooks_cls:
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_stream_event.return_value = MagicMock()
+            mock_el.create_llm_response.return_value = MagicMock()
+            mock_el_cls.return_value = mock_el
+
+            mock_hooks = MagicMock()
+            mock_hooks_cls.return_value = mock_hooks
+
+            from api.routers.chat import _persist_turn_events
+            # Tool-call-only turn: LLM returned tool_calls but no text
+            _persist_turn_events(
+                "u1", "s1",
+                [], [{"tool_call_id": "tc1", "name": "read_file", "result": "data"}],
+                "", [{"id": "tc2", "function": {"name": "write_file", "arguments": "{}"}}],
+            )
+
+        mock_hooks.run_observer.assert_not_called()

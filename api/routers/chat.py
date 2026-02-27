@@ -907,8 +907,19 @@ def _persist_turn_events(
             )
             hooks.record_skill_selection(session_id, user_content or "", tool_calls)
 
+        # Build the current turn's messages for observer: user query + LLM reply.
+        # `messages` from edge is incremental (empty on turn 1+), so we reconstruct
+        # the turn pair from persisted data. Without this, observer sees nothing on
+        # tool-result-only turns and extracts zero memories.
+        observer_messages: list[dict[str, Any]] = []
         if user_content:
-            hooks.run_observer(session_id, user_id, messages)
+            observer_messages.append({"role": "user", "content": user_content})
+        if full_text:
+            observer_messages.append({"role": "assistant", "content": full_text})
+        if observer_messages:
+            hooks.run_observer(session_id, user_id, observer_messages)
+
+        if user_content:
             hooks.detect_implicit_feedback(user_content, messages, parent_event_id)
     except Exception as e:
         logger.warning("Phase 4 (TurnHooks) failed: %s", e)
