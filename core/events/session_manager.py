@@ -168,6 +168,29 @@ class SessionManager:
                 except Exception as e:
                     logger.error(f"on_close callback failed for session {session_id}: {e}")
 
+            # Generate full session summary (memories table)
+            try:
+                from api.database import SessionLocal
+                from core.memory.store import MemoryStore
+                from core.memory.session_summary import SessionSummarizer
+                from api.models import Event
+
+                events = db.query(Event).filter(
+                    Event.session_id == session_id,
+                    Event.event_type.in_(["user_query", "llm_response"]),
+                ).order_by(Event.created_at).limit(200).all()
+                messages = [
+                    {"role": "user" if e.event_type == "user_query" else "assistant",
+                     "content": e.content or ""}
+                    for e in events
+                ]
+                if messages:
+                    store = MemoryStore(SessionLocal)
+                    summarizer = SessionSummarizer(store)
+                    summarizer.generate_full_summary(db_session.user_id, session_id, messages)
+            except Exception as e:
+                logger.debug("Session summary generation failed (non-fatal): %s", e)
+
     def get_user_sessions(
         self, user_id: str, status: SessionStatus | None = None, limit: int = 10
     ) -> list[Session]:

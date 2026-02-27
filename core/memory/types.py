@@ -32,6 +32,26 @@ TRUST_TIER_HALF_LIVES: dict[TrustTier, float] = {
     TrustTier.T4_UNVERIFIED: 30.0,
 }
 
+# Initial confidence per trust tier (from architecture §1)
+TRUST_TIER_INITIAL_CONFIDENCE: dict[TrustTier, float] = {
+    TrustTier.T1_VERIFIED: 0.95,
+    TrustTier.T2_CURATED: 0.85,
+    TrustTier.T3_INFERRED: 0.65,
+    TrustTier.T4_UNVERIFIED: 0.40,
+}
+
+
+def trust_tier_defaults(tier: str) -> dict[str, float]:
+    """Return initial_confidence and half_life_days for a trust tier string."""
+    try:
+        t = TrustTier(tier)
+    except ValueError:
+        t = TrustTier.T3_INFERRED
+    return {
+        "initial_confidence": TRUST_TIER_INITIAL_CONFIDENCE[t],
+        "half_life_days": TRUST_TIER_HALF_LIVES[t],
+    }
+
 
 @dataclass
 class Memory:

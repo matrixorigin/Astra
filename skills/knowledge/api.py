@@ -302,7 +302,7 @@ class KnowledgeExtractor:
 
     def _extract_via_llm(self, events, user_id: str) -> list[dict[str, Any]]:
         from core.memory.typed_observer import _parse_json_array
-        from core.context.lifecycle import trust_tier_defaults
+        from core.memory.types import trust_tier_defaults
 
         conv_text = "\n".join(
             f"[{e.event_type}]: {e.content[:500]}" for e in events if e.content
@@ -360,7 +360,7 @@ class KnowledgeExtractor:
     def _extract_preference(self, event, user_id: str) -> dict[str, Any] | None:
         content = event.content
         if "typescript" in content.lower():
-            from core.context.lifecycle import trust_tier_defaults
+            from core.memory.types import trust_tier_defaults
             defaults = trust_tier_defaults("T3")
             return {
                 "user_id": user_id,
@@ -377,7 +377,7 @@ class KnowledgeExtractor:
     def _extract_pattern(self, event, user_id: str) -> dict[str, Any] | None:
         content = event.content.lower()
         if "dependency injection" in content:
-            from core.context.lifecycle import trust_tier_defaults
+            from core.memory.types import trust_tier_defaults
             defaults = trust_tier_defaults("T3")
             return {
                 "user_id": user_id,
@@ -497,7 +497,7 @@ class KnowledgeExtractor:
     def decay_confidence(self, user_id: str, half_life_days: int = 60) -> int:
         """Apply confidence decay to knowledge entries."""
         from api.models import KnowledgeEntry
-        from core.context.lifecycle import TRUST_TIER_HALF_LIVES
+        from core.memory.types import TRUST_TIER_HALF_LIVES, TrustTier
 
         entries = self.db.query(KnowledgeEntry).filter(
             KnowledgeEntry.user_id == user_id,
@@ -510,7 +510,7 @@ class KnowledgeExtractor:
             anchor = entry.last_validated_at or entry.created_at
             if anchor is None:
                 continue
-            hl = TRUST_TIER_HALF_LIVES.get(entry.trust_tier, half_life_days)
+            hl = TRUST_TIER_HALF_LIVES.get(TrustTier(entry.trust_tier), half_life_days) if entry.trust_tier else half_life_days
             days_since = (now - anchor).days
             new_conf = entry.initial_confidence * (0.5 ** (days_since / hl))
             if new_conf != entry.confidence:

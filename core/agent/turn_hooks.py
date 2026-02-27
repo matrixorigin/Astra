@@ -105,6 +105,8 @@ class TurnHooks(DbConsumer):
         session_id: str,
         user_id: str,
         messages: list[dict[str, Any]],
+        turn_count: int = 0,
+        session_start: Any = None,
     ) -> None:
         """Run TypedObserver in a background thread."""
         from core.memory.typed_pipeline import run_typed_memory_pipeline
@@ -124,6 +126,19 @@ class TurnHooks(DbConsumer):
                 )
             except Exception as e:
                 logger.debug("Observer failed (non-fatal): %s", e)
+
+            # Check incremental summary thresholds
+            if turn_count > 0 and session_start is not None:
+                try:
+                    from core.memory.store import MemoryStore
+                    from core.memory.session_summary import SessionSummarizer
+                    store = MemoryStore(db_factory)
+                    summarizer = SessionSummarizer(store, llm_client=llm, embed_fn=embed_fn)
+                    summarizer.check_and_summarize(
+                        user_id, session_id, messages, turn_count, session_start,
+                    )
+                except Exception as e:
+                    logger.debug("Incremental summary failed (non-fatal): %s", e)
 
         try:
             threading.Thread(target=_bg, daemon=True).start()

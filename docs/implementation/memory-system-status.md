@@ -1,11 +1,25 @@
 # Memory System — Implementation Status
 
-> **Last Updated**: 2026-02-27 (Phase 2 complete)
+> **Last Updated**: 2026-02-27 (Phase 3 complete)
 > **Design Doc**: [memory-architecture.md](../design/memory-architecture.md)
 > **Phase 1 Plan**: [memory-system-refactoring-2026-02-27.md](../../plans/memory-system-refactoring-2026-02-27.md)
 > **Phase 2 Plan**: [memory-system-phase2-2026-02-27.md](../../plans/memory-system-phase2-2026-02-27.md)
+> **Phase 3 Plan**: [memory-system-phase3-2026-02-27.md](../../plans/memory-system-phase3-2026-02-27.md)
 
 ---
+
+## Phase 3 Changelog (2026-02-27)
+
+| Change | Rationale |
+|--------|-----------|
+| **Wired `GovernanceScheduler` into production scheduler** | `scheduler.py:_dispatch()` now calls both `MemoryGovernanceEngine` (knowledge entries) and `GovernanceScheduler` (memories table) |
+| **Added `run_daily_all()`** | Iterates all users for scheduled daily governance |
+| **Wired `SessionSummarizer` into session close** | `session_manager.close_session()` generates full summary |
+| **Wired `SessionSummarizer` into turn hooks** | `turn_hooks.run_observer()` checks incremental summary thresholds |
+| **Consolidated trust tier constants** | `trust_tier_defaults()` and `TRUST_TIER_INITIAL_CONFIDENCE` canonical in `types.py`; `lifecycle.py` re-exports for backward compat |
+| **Migrated `knowledge/api.py` imports** | 4 imports moved from `lifecycle.py` to `types.py` |
+| **Removed dead code from `lifecycle.py`** | `_apply_confidence_decay()` (double-decay bug), `_compress_episodic_events()` (replaced by SessionSummarizer), `_run_reflector()` (no-op), duplicate constants |
+| **Fixed tests** | Updated `test_lifecycle.py` (removed 3 decay tests, updated daily/rollback), removed `test_compress_episodic_writes_summary` |
 
 ## Phase 2 Changelog (2026-02-27)
 
@@ -78,9 +92,9 @@
 | **G4** | Episodic compression (90-day TTL → summary) | 🔵 Design Target — events table, not memories |
 | **G5** | Pollution detection simplified | 🔵 Supersede ratio only — cascade analysis is Design Target |
 | **G6** | Governance frequency separation | ✅ Implemented — hourly/daily/weekly |
-| **G7** | Distributed lock not implemented | Open — required for multi-instance |
+| **G7** | Distributed lock not implemented | ✅ Scheduler has `distributed_locks` table + heartbeat; `GovernanceScheduler` wired in |
 | **G11** | Sensitivity filter | ✅ Implemented — block-only, regex, audit logging |
-| **G12** | Session summaries | ✅ Implemented — `SessionSummarizer` with incremental + full |
+| **G12** | Session summaries | ✅ Implemented + wired — `SessionSummarizer` called on session close + turn hooks |
 
 ---
 
@@ -88,7 +102,6 @@
 
 | Priority | Item | Notes |
 |----------|------|-------|
-| P2 | G7: Distributed governance lock | Required for multi-instance deployment |
 | P2 | Reflector (clustering/promotion) | Design Target — would enable episodic→semantic synthesis |
 | P3 | G4: Episodic compression | Compress old `conversation_events` to summaries |
 | P3 | G5: Cascade impact analysis | Trace contamination graph from polluted memories |

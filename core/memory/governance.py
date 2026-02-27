@@ -113,6 +113,18 @@ class GovernanceScheduler(DbConsumer):
 
     # ── Daily ─────────────────────────────────────────────────────────
 
+    def run_daily_all(self) -> GovernanceCycleResult:
+        """Daily governance for ALL users. Used by scheduler."""
+        combined = GovernanceCycleResult()
+        with self._db() as db:
+            rows = db.execute(text("SELECT DISTINCT user_id FROM memories WHERE is_active = 1")).fetchall()
+        for (uid,) in rows:
+            r = self.run_daily(uid)
+            combined.cleaned_stale += r.cleaned_stale
+            combined.quarantined += r.quarantined
+            combined.errors.extend(r.errors)
+        return combined
+
     def run_daily(self, user_id: str) -> GovernanceCycleResult:
         """Daily: stale cleanup + quarantine low effective_confidence."""
         result = GovernanceCycleResult()

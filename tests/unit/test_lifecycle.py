@@ -5,7 +5,7 @@ import pytest
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 from sqlalchemy.exc import IntegrityError
-from core.context.lifecycle import MemoryGovernanceEngine, TRUST_TIER_HALF_LIVES
+from core.context.lifecycle import MemoryGovernanceEngine
 
 
 class TestMemoryGovernanceEngine:
@@ -34,16 +34,12 @@ class TestMemoryGovernanceEngine:
     
     def test_daily_tasks(self, engine, mock_db):
         """Test daily governance tasks."""
-        # Mock knowledge entries query
+        # Mock quarantine query — no entries below threshold
         mock_db.query.return_value.filter.return_value.all.return_value = []
-        # Mock events query for compression
-        mock_db.query.return_value.filter.return_value.limit.return_value.all.return_value = []
-        
+
         results = engine.run_daily_tasks()
-        
-        assert "decayed_entries" in results
+
         assert "quarantined" in results
-        assert "compressed_events" in results
     
     def test_weekly_tasks(self, engine, mock_db):
         """Test weekly governance tasks."""
@@ -59,23 +55,6 @@ class TestMemoryGovernanceEngine:
         
         assert "contradictions_found" in results
         assert "health_reports" in results
-    
-    def test_confidence_decay_calculation(self, engine, mock_db):
-        """Test confidence decay formula."""
-        # Create mock entry
-        entry = Mock()
-        entry.trust_tier = "T3"
-        entry.initial_confidence = 1.0
-        entry.confidence = 1.0
-        entry.last_validated_at = datetime.now() - timedelta(days=60)
-        
-        mock_db.query.return_value.filter.return_value.all.return_value = [entry]
-        
-        count = engine._apply_confidence_decay()
-        
-        # After 60 days with T3 half-life (60 days), confidence should be 0.5
-        assert entry.confidence == pytest.approx(0.5, rel=0.01)
-        assert count == 1
     
     def test_quarantine_low_confidence(self, engine, mock_db):
         """Test quarantine sets confidence to 0 and logs entry_ids."""
@@ -93,38 +72,6 @@ class TestMemoryGovernanceEngine:
         assert count == 2
         assert mock_db.commit.call_count >= 1  # quarantine + governance event
 
-    def test_decay_skips_entry_with_no_dates(self, engine, mock_db):
-        """Entry with both last_validated_at and created_at as None is skipped."""
-        entry = Mock()
-        entry.trust_tier = "T3"
-        entry.initial_confidence = 1.0
-        entry.confidence = 1.0
-        entry.last_validated_at = None
-        entry.created_at = None
-
-        mock_db.query.return_value.filter.return_value.all.return_value = [entry]
-
-        count = engine._apply_confidence_decay()
-
-        assert count == 0
-        assert entry.confidence == 1.0  # unchanged
-
-    def test_decay_uses_created_at_fallback(self, engine, mock_db):
-        """When last_validated_at is None, created_at is used for decay calc."""
-        entry = Mock()
-        entry.trust_tier = "T3"
-        entry.initial_confidence = 1.0
-        entry.confidence = 1.0
-        entry.last_validated_at = None
-        entry.created_at = datetime.now() - timedelta(days=60)
-
-        mock_db.query.return_value.filter.return_value.all.return_value = [entry]
-
-        count = engine._apply_confidence_decay()
-
-        assert count == 1
-        assert entry.confidence == pytest.approx(0.5, rel=0.01)
-    
     def test_contradiction_scan(self, engine, mock_db):
         """Test contradiction detection."""
         from unittest.mock import Mock
@@ -250,7 +197,7 @@ class TestGovernanceTaskRunner:
         assert "archived_notes" in result
 
     def test_run_rollback_on_task_error(self, mock_db_ctx):
-        """Task runner rolls back DB and releases lock on task exception."""
+        """Task runner catches lifecycle error and still runs memory governance."""
         from core.context.scheduler import GovernanceTaskRunner
 
         factory, db = mock_db_ctx
@@ -261,8 +208,9 @@ class TestGovernanceTaskRunner:
             runner = GovernanceTaskRunner(factory)
             result = runner.run("hourly")
 
-            assert result is None
-            assert db.rollback.called
+            # Lifecycle failed but memory governance still ran
+            assert result is not None
+            assert "mem_cleaned_tool_results" in result
 
     def test_governance_disabled_via_env(self):
         """Scheduler respects GOVERNANCE_ENABLED=false."""

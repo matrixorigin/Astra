@@ -144,44 +144,6 @@ class TestGovernanceStructuredOutputs:
         assert data["category"] == cat
         assert len(data["entry_ids"]) == 2
 
-    def test_compress_episodic_writes_summary(self, db_session):
-        """Episodic compression writes session_summary and marks originals."""
-        from core.context.lifecycle import MemoryGovernanceEngine
-        from uuid_utils import uuid7
-
-        engine = MemoryGovernanceEngine(lambda: db_session)
-        sid = f"sess_{os.urandom(4).hex()}"
-        old_ts = datetime.now() - timedelta(days=100)
-
-        for i in range(3):
-            eid = str(uuid7())
-            db_session.execute(text("""
-                INSERT INTO conversation_events
-                    (event_id, session_id, user_id, agent_id, agent_version,
-                     event_type, content, causal_chain_id, created_at)
-                VALUES (:eid, :sid, 'test', 'test', '1.0', :etype, :content, :cid, :ts)
-            """), {
-                "eid": eid, "sid": sid, "cid": eid,
-                "etype": "user_query" if i % 2 == 0 else "llm_response",
-                "content": f"message {i}", "ts": old_ts,
-            })
-        db_session.commit()
-
-        count = engine._compress_episodic_events(ttl_days=90)
-        assert count >= 3
-
-        summary = db_session.execute(text("""
-            SELECT content FROM conversation_events
-            WHERE session_id = :sid AND event_type = 'session_summary'
-        """), {"sid": sid}).fetchone()
-        assert summary is not None
-
-        compressed = db_session.execute(text("""
-            SELECT COUNT(*) FROM conversation_events
-            WHERE session_id = :sid AND event_type = 'compressed'
-        """), {"sid": sid}).fetchone()
-        assert compressed[0] == 3
-
 
 # ── P3: Skill-as-Package Rollback ──────────────────────────────────
 

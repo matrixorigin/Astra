@@ -124,16 +124,49 @@ class GovernanceTaskRunner:
     def _dispatch(task_name: str, db: Session, db_factory: Callable) -> dict[str, int]:
         """Route task_name to the appropriate executor.
 
+        Runs both:
+        - MemoryGovernanceEngine (sk_knowledge_entries governance)
+        - GovernanceScheduler (memories table governance)
+
         Args:
             db: Lock-holding session (for MemoryGovernanceEngine tasks).
-            db_factory: Factory for independent sessions (for eval_daily phases).
+            db_factory: Factory for independent sessions.
         """
         if task_name == "eval_daily":
             return GovernanceTaskRunner._run_eval_daily(db_factory)
-        from core.context.lifecycle import MemoryGovernanceEngine
-        engine = MemoryGovernanceEngine(db_factory)
-        return getattr(engine, f"run_{task_name}_tasks")()
 
+        results: dict[str, int] = {}
+
+        # 1. Knowledge entries governance (lifecycle.py)
+        try:
+            from core.context.lifecycle import MemoryGovernanceEngine
+            engine = MemoryGovernanceEngine(db_factory)
+            ke_results = getattr(engine, f"run_{task_name}_tasks")()
+            results.update(ke_results)
+        except Exception as e:
+            logger.error("Knowledge governance [%s] failed: %s", task_name, e)
+
+        # 2. Memories table governance (governance.py)
+        try:
+            from core.memory.governance import GovernanceScheduler
+            scheduler = GovernanceScheduler(db_factory)
+            if task_name == "hourly":
+                r = scheduler.run_hourly()
+                results["mem_cleaned_tool_results"] = r.cleaned_tool_results
+                results["mem_archived_working"] = r.archived_working
+            elif task_name == "daily":
+                r = scheduler.run_daily_all()
+                results["mem_cleaned_stale"] = r.cleaned_stale
+                results["mem_quarantined"] = r.quarantined
+            elif task_name == "weekly":
+                r = scheduler.run_weekly()
+                results["mem_cleaned_branches"] = r.cleaned_branches
+                results["mem_cleaned_snapshots"] = r.cleaned_snapshots
+            results.update({f"mem_{k}": v for k, v in r.__dict__.items() if k == "errors" and v})
+        except Exception as e:
+            logger.error("Memory governance [%s] failed: %s", task_name, e)
+
+        return results
     @staticmethod
     def _run_eval_daily(db_factory: Callable) -> dict[str, int]:
         """Run daily evaluation closed-loop: drift → calibration → learning.
