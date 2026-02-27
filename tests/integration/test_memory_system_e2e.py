@@ -35,7 +35,7 @@ class TestL0ProfileInPrompt:
         db_factory = lambda: mock_db
 
         loader = TieredMemoryLoader(db_factory)
-        section = loader.build_section(uid(), session_id="test_session", query="test")
+        section, _ = loader.build_section(uid(), session_id="test_session", query="test")
 
         # Should always return something (profile or default)
         assert section is not None
@@ -88,7 +88,7 @@ class TestContradictionDetection:
             observed_at=datetime.utcnow(),
         )
 
-        contradiction = observer._find_contradiction(new_mem)
+        contradiction, _ = observer._find_contradiction(new_mem)
         assert contradiction is not None
         assert contradiction.memory_id == "old1"
 
@@ -115,7 +115,7 @@ class TestContradictionDetection:
             observed_at=datetime.utcnow(),
         )
 
-        contradiction = observer._find_contradiction(rust_mem)
+        contradiction, _ = observer._find_contradiction(rust_mem)
         assert contradiction is None
 
     def test_no_db_factory_skips_contradiction_detection(self):
@@ -130,7 +130,7 @@ class TestContradictionDetection:
             observed_at=datetime.utcnow(),
         )
 
-        contradiction = observer._find_contradiction(new_mem)
+        contradiction, _ = observer._find_contradiction(new_mem)
         assert contradiction is None
 
 

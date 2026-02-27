@@ -33,6 +33,7 @@ class ChatRequest(BaseModel):
     model: str | None = Field(default=None, description="Model to use for this request")
     context: dict | None = Field(default=None, description="Optional context")
     max_candidates: int = Field(default=5, description="Max skill candidates")
+    explain: bool = Field(default=False, description="Return execution stats (like EXPLAIN ANALYZE)")
 
 
 class EdgeProfileModel(BaseModel):
@@ -65,6 +66,7 @@ class ChatResponse(BaseModel):
     session_id: str
     run_id: str
     status: str
+    explain: dict | None = Field(default=None, description="Execution stats when explain=true")
 
 
 class RunStatusResponse(BaseModel):

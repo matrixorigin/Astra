@@ -71,7 +71,7 @@ class TestVectorRetrieval:
 
         mock_db.execute.side_effect = mock_execute
 
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             "u1", "Go testing", session_id="s1",
             query_embedding=[0.1] * 10,
         )
@@ -103,7 +103,7 @@ class TestVectorRetrieval:
 
         mock_db.execute.side_effect = mock_execute
 
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             "u1", "", session_id="s1",
             query_embedding=[0.1] * 10,
         )
@@ -133,7 +133,7 @@ class TestVectorRetrieval:
         mock_db.execute.side_effect = mock_execute
 
         # Use weights that heavily favor vector
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             "u1", "keyword", session_id="s1",
             query_embedding=[0.1] * 10,
             weights=RetrievalWeights(vector=0.7, keyword=0.1, temporal=0.1, confidence=0.1),
@@ -148,7 +148,7 @@ class TestVectorRetrieval:
             MemRow("m1", "test", "episodic", 0.8, datetime(2026, 2, 26), None)
         ]
 
-        results = retriever.retrieve("u1", "test", session_id="s1")
+        results, _ = retriever.retrieve("u1", "test", session_id="s1")
 
         # Only 1 SQL call (fallback), no vector SQL
         assert mock_db.execute.call_count == 1
@@ -174,7 +174,7 @@ class TestVectorRetrieval:
 
         mock_db.execute.side_effect = mock_execute
 
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             "u1", "test", session_id="s1",
             query_embedding=[0.1] * 10,
         )
@@ -205,7 +205,7 @@ class TestVectorRetrieval:
 
         mock_db.execute.side_effect = mock_execute
 
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             "u1", "test", session_id="s1",
             query_embedding=[0.1] * 10,
         )
@@ -236,7 +236,7 @@ class TestVectorRetrieval:
 
         mock_db.execute.side_effect = mock_execute
 
-        results = retriever.retrieve("u1", "test query", session_id="s1")
+        results, _ = retriever.retrieve("u1", "test query", session_id="s1")
 
         # Verify fallback worked
         assert len(results) >= 1
@@ -474,7 +474,7 @@ class TestDBContradictionDetection:
         )
 
         new_mem = _mem(mid="new1", content="prefers spaces", embedding=[0.1] * 10)
-        result = observer._find_contradiction(new_mem)
+        result, _ = observer._find_contradiction(new_mem)
 
         assert result is not None
         assert result.memory_id == "old1"
@@ -497,7 +497,7 @@ class TestDBContradictionDetection:
         )
 
         new_mem = _mem(mid="new1", content="likes Rust", embedding=[0.1] * 10)
-        result = observer._find_contradiction(new_mem)
+        result, _ = observer._find_contradiction(new_mem)
 
         assert result is None
 
@@ -527,7 +527,7 @@ class TestDBContradictionDetection:
         )
 
         new_mem = _mem(mid="new1", content="prefers spaces", embedding=[0.5] * 10)
-        result = observer._find_contradiction(new_mem)
+        result, _ = observer._find_contradiction(new_mem)
 
         assert result is None
         # store.list_active should NOT be called (no in-memory fallback)
@@ -670,7 +670,7 @@ class TestObserverExtractVsObserve:
         ])}
 
         observer = TypedObserver(store=mock_store, llm_client=mock_llm)
-        results = observer.observe("u1", [{"role": "user", "content": "I like Go"}])
+        results, _ = observer.observe("u1", [{"role": "user", "content": "I like Go"}])
 
         assert len(results) == 1
         mock_store.create.assert_called_once()
@@ -683,7 +683,7 @@ class TestObserverExtractVsObserve:
 
         observer = TypedObserver(store=mock_store, llm_client=None)
         mem = _mem(content="test memory")
-        result = observer.persist_with_contradiction_check(mem)
+        result, _ = observer.persist_with_contradiction_check(mem)
 
         assert result.content == "test memory"
         mock_store.create.assert_called_once()
@@ -747,7 +747,7 @@ class TestTieredLoaderFallbackMetrics:
             loader._retriever = MagicMock()
             loader._retriever.retrieve.side_effect = Exception("Retrieval failed")
             
-            result = loader.load_l1("u1", "s1", "query")
+            result, _ = loader.load_l1("u1", "s1", "query")
         
         assert result == ""
         final_errors = metrics._counters.get("tiered_loader_l1_errors", 0)
@@ -767,12 +767,12 @@ class TestTieredLoaderFallbackMetrics:
             loader._profile_mgr = MagicMock()
             loader._profile_mgr.get_profile.return_value = "User Profile: likes Python"
             loader._retriever = MagicMock()
-            loader._retriever.retrieve.return_value = [
+            loader._retriever.retrieve.return_value = ([
                 _mem(content="relevant memory")
-            ]
+            ], None)
             
             l0 = loader.load_l0("u1")
-            l1 = loader.load_l1("u1", "s1", "query")
+            l1, _ = loader.load_l1("u1", "s1", "query")
         
         assert "Python" in l0
         assert "relevant memory" in l1
@@ -840,3 +840,94 @@ class TestSandboxDirectFallbackMetrics:
         
         # Error counter should NOT have changed
         assert metrics._counters.get("sandbox_validation_errors", 0) == initial_errors
+
+
+# =============================================================================
+# EXPLAIN ANALYZE Tests
+# =============================================================================
+
+class TestExplainAnalyze:
+    """Test EXPLAIN ANALYZE functionality for memory operations."""
+
+    def test_retriever_explain_returns_stats(self):
+        """Retriever with explain=True returns execution stats."""
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchall.return_value = [
+            MemRow("m1", "test content", "episodic", 0.8, datetime(2026, 2, 26), None)
+        ]
+        
+        retriever = MemoryRetriever(db_factory=lambda: mock_db)
+        results, stats = retriever.retrieve(
+            "u1", "test", session_id="s1", explain=True
+        )
+        
+        assert stats is not None
+        assert stats.phase1_candidates >= 0
+        assert stats.total_ms >= 0
+
+    def test_retriever_no_explain_returns_none_stats(self):
+        """Retriever with explain=False returns None stats."""
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchall.return_value = []
+        
+        retriever = MemoryRetriever(db_factory=lambda: mock_db)
+        results, stats = retriever.retrieve(
+            "u1", "test", session_id="s1", explain=False
+        )
+        
+        assert stats is None
+
+    def test_observer_explain_returns_stats(self):
+        """Observer with explain=True returns execution stats."""
+        mock_store = MagicMock()
+        mock_store.create.side_effect = lambda m: m
+        mock_llm = MagicMock()
+        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
+            {"type": "profile", "content": "test", "confidence": 0.9},
+        ])}
+        
+        observer = TypedObserver(store=mock_store, llm_client=mock_llm)
+        results, stats = observer.observe("u1", [{"role": "user", "content": "test"}], explain=True)
+        
+        assert stats is not None
+        assert stats.memories_extracted >= 0
+        assert stats.total_ms >= 0
+
+    def test_tiered_loader_explain_returns_stats(self):
+        """TieredMemoryLoader with explain=True returns execution stats."""
+        from core.memory.tiered_loader import TieredMemoryLoader, TieredLoaderStats
+        
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchall.return_value = []
+        
+        loader = TieredMemoryLoader(lambda: mock_db)
+        
+        with patch.object(loader, "_ensure_initialized", return_value=True):
+            loader._profile_mgr = MagicMock()
+            loader._profile_mgr.get_profile.return_value = "User Profile"
+            loader._retriever = MagicMock()
+            loader._retriever.retrieve.return_value = ([], None)
+            
+            section, stats = loader.build_section("u1", "s1", "query", explain=True)
+        
+        assert stats is not None
+        assert isinstance(stats, TieredLoaderStats)
+        assert stats.total_ms >= 0
+
+    def test_pipeline_explain_returns_stats(self):
+        """Pipeline with explain=True returns execution stats in result."""
+        from core.memory.typed_pipeline import run_typed_memory_pipeline
+        
+        mock_db = MagicMock()
+        mock_db.execute.return_value.fetchall.return_value = []
+        
+        result = run_typed_memory_pipeline(
+            db_factory=lambda: mock_db,
+            user_id="u1",
+            messages=[{"role": "user", "content": "test"}],
+            llm_client=None,
+            explain=True,
+        )
+        
+        assert result.stats is not None
+        assert result.stats.total_ms >= 0

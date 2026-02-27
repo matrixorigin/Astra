@@ -8,6 +8,8 @@ Scoring strategy (3 phases):
 MO Fulltext Limitation: MATCH() AGAINST() can only be used in WHERE clause
 for filtering, not in SELECT for arithmetic scoring. So keyword presence is
 a binary signal (1.0 if matched, 0.0 if not) rather than a continuous score.
+
+Supports EXPLAIN ANALYZE mode: pass explain=True to get execution stats.
 """
 
 from __future__ import annotations
@@ -15,11 +17,13 @@ from __future__ import annotations
 import logging
 import math
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 from sqlalchemy import text
 
 from core.db_consumer import DbConsumer, DbFactory
+from core.memory.explain import RetrievalStats
 from core.memory.metrics import metrics, Timer
 from core.memory.types import Memory, MemoryType, RetrievalWeights
 
@@ -83,12 +87,39 @@ def _safe_exp(x: float) -> float:
     return math.exp(max(-500.0, min(500.0, x)))
 
 
+# --- Internal data carriers ---
+
+@dataclass
+class _Candidate:
+    memory_id: str
+    content: str
+    memory_type: str
+    confidence: float
+    observed_at: object
+    session_id: Optional[str]
+    keyword_matched: bool = False
+    l2_dist: Optional[float] = None
+
+
+@dataclass
+class _PhaseStats:
+    """Stats from a single phase."""
+    keyword_attempted: bool = False
+    keyword_hit: bool = False
+    keyword_error: Optional[str] = None
+    vector_attempted: bool = False
+    vector_hit: bool = False
+    vector_error: Optional[str] = None
+
+
 class MemoryRetriever(DbConsumer):
     """Query-aware hybrid retrieval over the memories table.
 
     When query_embedding is provided, runs true 4-dimensional hybrid scoring:
     vector similarity, keyword match, temporal recency, confidence decay.
     When no embedding, falls back to keyword + temporal + confidence (3-dim).
+    
+    Supports explain=True for EXPLAIN ANALYZE style execution stats.
     """
 
     def __init__(self, db_factory: DbFactory, decay_hours: float = 720.0, half_life_days: float = 30.0):
@@ -107,259 +138,174 @@ class MemoryRetriever(DbConsumer):
         task_hint: Optional[str] = None,
         weights: Optional[RetrievalWeights] = None,
         include_cross_session: bool = True,
-    ) -> list[Memory]:
+        explain: bool = False,
+    ) -> tuple[list[Memory], Optional[RetrievalStats]]:
         """Retrieve memories ranked by multi-dimensional relevance.
-
-        When query_embedding is provided:
-          Phase 1: keyword/fallback SQL → candidates with temporal+confidence scores
-          Phase 2: vector SQL → candidates with L2 distance
-          Phase 3: merge both sets, re-rank by weighted 4-dim score, return top-K
-
-        When no embedding:
-          Phase 1 only, weights redistributed across temporal+confidence.
+        
+        Args:
+            explain: If True, return execution stats (like EXPLAIN ANALYZE).
+            
+        Returns:
+            (memories, stats) — stats is None when explain=False.
         """
-        if weights is None:
-            weights = TASK_WEIGHTS.get(task_hint or "default", TASK_WEIGHTS["default"])
+        start = time.time() if explain else 0
+        stats = RetrievalStats() if explain else None
 
-        if memory_types is None:
-            memory_types = [MemoryType.PROFILE, MemoryType.EPISODIC, MemoryType.SEMANTIC, MemoryType.PROCEDURAL]
-
+        weights = weights or TASK_WEIGHTS.get(task_hint or "default", TASK_WEIGHTS["default"])
+        memory_types = memory_types or [MemoryType.PROFILE, MemoryType.EPISODIC, MemoryType.SEMANTIC, MemoryType.PROCEDURAL]
         type_values = tuple(t.value for t in memory_types)
 
-        if include_cross_session:
-            session_filter = "AND (m.session_id = :session_id OR m.session_id IS NULL)"
-        else:
-            session_filter = "AND m.session_id = :session_id"
-
+        session_filter = (
+            "AND (m.session_id = :session_id OR m.session_id IS NULL)"
+            if include_cross_session else "AND m.session_id = :session_id"
+        )
         base_params = {
-            "uid": user_id,
-            "types": type_values,
-            "decay_hours": self.decay_hours,
-            "half_life": self.half_life_days,
+            "uid": user_id, "types": type_values,
+            "decay_hours": self.decay_hours, "half_life": self.half_life_days,
             "session_id": session_id,
         }
 
         with Timer("retriever_retrieve"):
-            # Phase 1: keyword/fallback candidates (over-fetch for merge headroom)
-            phase1_limit = limit * 2 if query_embedding else limit
-            phase1 = self._phase1_keyword_or_fallback(
-                query_text, session_filter, base_params, weights, phase1_limit,
+            # Phase 1
+            p1_start = time.time() if explain else 0
+            phase1, p1_stats = self._phase1(
+                query_text, session_filter, base_params, weights,
+                limit * 2 if query_embedding else limit,
             )
+            if stats:
+                stats.keyword_attempted = p1_stats.keyword_attempted
+                stats.keyword_hit = p1_stats.keyword_hit
+                stats.keyword_error = p1_stats.keyword_error
+                stats.phase1_candidates = len(phase1)
+                stats.phase1_ms = (time.time() - p1_start) * 1000
 
-            # No embedding → redistribute weights to temporal+confidence, return phase 1
+            # No embedding → phase 1 only
             if not query_embedding:
-                return [self._to_memory(c, user_id) for c in phase1[:limit]]
+                memories = [self._to_memory(c, user_id) for c in phase1[:limit]]
+                if stats:
+                    stats.final_count = len(memories)
+                    stats.total_ms = (time.time() - start) * 1000
+                return memories, stats
 
-            # Phase 2: vector candidates
-            phase2 = self._phase2_vector(
-                query_embedding, session_filter, base_params, type_values, limit * 2,
-            )
+            # Phase 2
+            p2_start = time.time() if explain else 0
+            phase2, p2_stats = self._phase2(query_embedding, session_filter, base_params, limit * 2)
+            if stats:
+                stats.vector_attempted = p2_stats.vector_attempted
+                stats.vector_hit = p2_stats.vector_hit
+                stats.vector_error = p2_stats.vector_error
+                stats.phase2_candidates = len(phase2)
+                stats.phase2_ms = (time.time() - p2_start) * 1000
 
-            # Phase 3: merge + re-rank with full 4-dim scoring
-            return self._merge_and_rerank(
-                phase1, phase2, user_id, weights, limit,
-            )
+            # Phase 3: merge
+            merge_start = time.time() if explain else 0
+            memories = self._merge(phase1, phase2, user_id, weights, limit)
+            if stats:
+                stats.merged_candidates = len({c.memory_id for c in phase1} | {c.memory_id for c in phase2})
+                stats.final_count = len(memories)
+                stats.merge_ms = (time.time() - merge_start) * 1000
+                stats.total_ms = (time.time() - start) * 1000
 
-    def _phase1_keyword_or_fallback(
-        self,
-        query_text: str,
-        session_filter: str,
-        base_params: dict,
-        weights: RetrievalWeights,
-        limit: int,
-    ) -> list[_CandidateRow]:
-        """Phase 1: keyword filter or fallback, scored by temporal + confidence."""
-        # Normalize weights for the 2 SQL-side dimensions
+            return memories, stats
+
+    def _phase1(
+        self, query_text: str, session_filter: str, base_params: dict,
+        weights: RetrievalWeights, limit: int,
+    ) -> tuple[list[_Candidate], _PhaseStats]:
+        """Phase 1: keyword or fallback."""
         total = weights.temporal + weights.confidence
         w_time = weights.temporal / total if total > 0 else 0.5
         w_conf = weights.confidence / total if total > 0 else 0.5
-
         params = {**base_params, "w_time": w_time, "w_conf": w_conf, "lim": limit}
+        stats = _PhaseStats()
 
         with self._db() as db:
+            # Try keyword search
             if query_text and query_text.strip():
+                stats.keyword_attempted = True
                 params["query_text"] = query_text
                 try:
-                    sql = text(_KEYWORD_SQL.format(session_filter=session_filter))
-                    rows = db.execute(sql, params).fetchall()
+                    rows = db.execute(text(_KEYWORD_SQL.format(session_filter=session_filter)), params).fetchall()
                     if rows:
                         metrics.increment("retrieval_keyword_hits")
-                        return [
-                            _CandidateRow(r.memory_id, r.content, r.memory_type,
-                                          r.confidence, r.observed_at, r.session_id,
-                                          keyword_matched=True)
-                            for r in rows
-                        ]
+                        stats.keyword_hit = True
+                        return [_Candidate(r.memory_id, r.content, r.memory_type, r.confidence,
+                                           r.observed_at, r.session_id, keyword_matched=True) for r in rows], stats
                 except Exception as e:
-                    logger.debug("Keyword search failed, falling back: %s", e)
+                    logger.debug("Keyword search failed: %s", e)
                     metrics.increment("retrieval_keyword_errors")
+                    stats.keyword_error = str(e)
 
-            sql = text(_FALLBACK_SQL.format(session_filter=session_filter))
-            rows = db.execute(sql, params).fetchall()
+            # Fallback
+            rows = db.execute(text(_FALLBACK_SQL.format(session_filter=session_filter)), params).fetchall()
             metrics.increment("retrieval_fallback_hits")
-            return [
-                _CandidateRow(r.memory_id, r.content, r.memory_type,
-                              r.confidence, r.observed_at, r.session_id,
-                              keyword_matched=False)
-                for r in rows
-            ]
+            return [_Candidate(r.memory_id, r.content, r.memory_type, r.confidence,
+                               r.observed_at, r.session_id) for r in rows], stats
 
-    def _phase2_vector(
-        self,
-        query_embedding: list[float],
-        session_filter: str,
-        base_params: dict,
-        type_values: tuple,
-        limit: int,
-    ) -> list[_VectorRow]:
-        """Phase 2: vector nearest-neighbor candidates via L2_DISTANCE."""
+    def _phase2(
+        self, query_embedding: list[float], session_filter: str, base_params: dict, limit: int,
+    ) -> tuple[list[_Candidate], _PhaseStats]:
+        """Phase 2: vector search."""
         vec_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
         params = {**base_params, "query_vec": vec_str, "lim": limit}
+        stats = _PhaseStats(vector_attempted=True)
 
         with self._db() as db:
             try:
-                sql = text(_VECTOR_SQL.format(session_filter=session_filter))
-                rows = db.execute(sql, params).fetchall()
+                rows = db.execute(text(_VECTOR_SQL.format(session_filter=session_filter)), params).fetchall()
                 metrics.increment("retrieval_vector_hits")
-                return [
-                    _VectorRow(r.memory_id, r.content, r.memory_type,
-                               r.confidence, r.observed_at, r.session_id,
-                               l2_dist=float(r.l2_dist))
-                    for r in rows
-                ]
+                stats.vector_hit = bool(rows)
+                return [_Candidate(r.memory_id, r.content, r.memory_type, r.confidence,
+                                   r.observed_at, r.session_id, l2_dist=float(r.l2_dist)) for r in rows], stats
             except Exception as e:
                 logger.warning("Vector search failed: %s", e)
                 metrics.increment("retrieval_vector_errors")
-                return []
+                stats.vector_error = str(e)
+                return [], stats
 
-    def _merge_and_rerank(
-        self,
-        phase1: list[_CandidateRow],
-        phase2: list[_VectorRow],
-        user_id: str,
-        weights: RetrievalWeights,
-        limit: int,
+    def _merge(
+        self, phase1: list[_Candidate], phase2: list[_Candidate],
+        user_id: str, weights: RetrievalWeights, limit: int,
     ) -> list[Memory]:
-        """Phase 3: merge phase1+phase2 candidates, score all 4 dimensions, return top-K."""
-        merged: dict[str, _MergedCandidate] = {}
-
+        """Phase 3: merge and re-rank."""
+        merged: dict[str, _Candidate] = {}
         for c in phase1:
-            merged[c.memory_id] = _MergedCandidate(
-                memory_id=c.memory_id, content=c.content, memory_type=c.memory_type,
-                confidence=c.confidence, observed_at=c.observed_at, session_id=c.session_id,
-                keyword_matched=c.keyword_matched, l2_dist=None,
-            )
-
-        for v in phase2:
-            if v.memory_id in merged:
-                merged[v.memory_id].l2_dist = v.l2_dist
+            merged[c.memory_id] = c
+        for c in phase2:
+            if c.memory_id in merged:
+                merged[c.memory_id].l2_dist = c.l2_dist
             else:
-                merged[v.memory_id] = _MergedCandidate(
-                    memory_id=v.memory_id, content=v.content, memory_type=v.memory_type,
-                    confidence=v.confidence, observed_at=v.observed_at, session_id=v.session_id,
-                    keyword_matched=False, l2_dist=v.l2_dist,
-                )
+                merged[c.memory_id] = c
 
         if not merged:
             return []
 
         now_ts = time.time()
-        scored: list[tuple[float, _MergedCandidate]] = []
+        scored: list[tuple[float, _Candidate]] = []
 
         for c in merged.values():
-            # Vector: 1 / (1 + l2_dist) — 1.0 for identical, decays toward 0
             vec_score = 1.0 / (1.0 + c.l2_dist) if c.l2_dist is not None else 0.0
-
-            # Keyword: binary (MO limitation — MATCH only usable in WHERE)
             kw_score = 1.0 if c.keyword_matched else 0.0
 
-            # Temporal recency: exponential decay
             if c.observed_at:
                 age_hours = (now_ts - c.observed_at.timestamp()) / 3600.0
                 time_score = _safe_exp(-age_hours / self.decay_hours)
-            else:
-                time_score = 0.0
-
-            # Confidence with age-based decay
-            if c.observed_at:
-                age_days = (now_ts - c.observed_at.timestamp()) / 86400.0
+                age_days = age_hours / 24.0
                 conf_score = c.confidence * _safe_exp(-age_days / self.half_life_days)
             else:
-                conf_score = c.confidence
+                time_score, conf_score = 0.0, c.confidence
 
-            final = (
-                weights.vector * vec_score
-                + weights.keyword * kw_score
-                + weights.temporal * time_score
-                + weights.confidence * conf_score
-            )
+            final = (weights.vector * vec_score + weights.keyword * kw_score +
+                     weights.temporal * time_score + weights.confidence * conf_score)
             scored.append((final, c))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-
-        return [
-            Memory(
-                memory_id=c.memory_id,
-                user_id=user_id,
-                memory_type=MemoryType(c.memory_type),
-                content=c.content,
-                confidence=c.confidence,
-                session_id=c.session_id,
-                observed_at=c.observed_at,
-            )
-            for _, c in scored[:limit]
-        ]
+        return [self._to_memory(c, user_id) for _, c in scored[:limit]]
 
     @staticmethod
-    def _to_memory(c: _CandidateRow, user_id: str) -> Memory:
+    def _to_memory(c: _Candidate, user_id: str) -> Memory:
         return Memory(
-            memory_id=c.memory_id,
-            user_id=user_id,
-            memory_type=MemoryType(c.memory_type),
-            content=c.content,
-            confidence=c.confidence,
-            session_id=c.session_id,
-            observed_at=c.observed_at,
+            memory_id=c.memory_id, user_id=user_id,
+            memory_type=MemoryType(c.memory_type), content=c.content,
+            confidence=c.confidence, session_id=c.session_id, observed_at=c.observed_at,
         )
-
-
-# --- Internal data carriers (not exported) ---
-
-class _CandidateRow:
-    __slots__ = ("memory_id", "content", "memory_type", "confidence", "observed_at", "session_id", "keyword_matched")
-
-    def __init__(self, memory_id, content, memory_type, confidence, observed_at, session_id, keyword_matched):
-        self.memory_id = memory_id
-        self.content = content
-        self.memory_type = memory_type
-        self.confidence = confidence
-        self.observed_at = observed_at
-        self.session_id = session_id
-        self.keyword_matched = keyword_matched
-
-
-class _VectorRow:
-    __slots__ = ("memory_id", "content", "memory_type", "confidence", "observed_at", "session_id", "l2_dist")
-
-    def __init__(self, memory_id, content, memory_type, confidence, observed_at, session_id, l2_dist):
-        self.memory_id = memory_id
-        self.content = content
-        self.memory_type = memory_type
-        self.confidence = confidence
-        self.observed_at = observed_at
-        self.session_id = session_id
-        self.l2_dist = l2_dist
-
-
-class _MergedCandidate:
-    __slots__ = ("memory_id", "content", "memory_type", "confidence", "observed_at", "session_id", "keyword_matched", "l2_dist")
-
-    def __init__(self, memory_id, content, memory_type, confidence, observed_at, session_id, keyword_matched, l2_dist):
-        self.memory_id = memory_id
-        self.content = content
-        self.memory_type = memory_type
-        self.confidence = confidence
-        self.observed_at = observed_at
-        self.session_id = session_id
-        self.keyword_matched = keyword_matched
-        self.l2_dist = l2_dist

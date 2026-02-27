@@ -168,7 +168,7 @@ class TestMemoryRetrieverRealDB:
         store.create(mem)
         
         # Retrieve with keyword query
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             user_id=user_id,
             session_id="test_session",
             query_text="Golang concurrency",
@@ -211,7 +211,7 @@ class TestMemoryRetrieverRealDB:
         
         # Query with embedding close to [0.1]*1536
         query_emb = [0.1] * 1536
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             user_id=user_id,
             session_id="test_session",
             query_text="vector test",
@@ -283,7 +283,7 @@ class TestMemoryExtractionFromGolden:
         store.list_active.return_value = []
         
         observer = TypedObserver(store=store, llm_client=mock_llm)
-        memories = observer.observe(user_id=_uid(), messages=code_review_messages)
+        memories, _ = observer.observe(user_id=_uid(), messages=code_review_messages)
         
         assert len(memories) == 2
         assert any("SQL injection" in m.content for m in memories)
@@ -361,7 +361,7 @@ class TestTieredLoaderWithRealDB:
         store.create(mem)
         
         # Build section
-        section = loader.build_section(user_id, session_id="test_session", query="How to design a distributed cache?")
+        section, _ = loader.build_section(user_id, session_id="test_session", query="How to design a distributed cache?")
         
         assert section is not None
         assert len(section) > 0
@@ -521,7 +521,7 @@ class TestContradictionRealDB:
         store.create(old_mem)
 
         # Write contradicting memory via observe_explicit
-        new_mem = observer.observe_explicit(
+        new_mem, _ = observer.observe_explicit(
             user_id=user_id,
             content="User prefers spaces",
             memory_type=MemoryType.PROFILE,
@@ -572,7 +572,7 @@ class TestTaskAwareWeightsRealDB:
         store.create(other_mem)
 
         # Retrieve with code task hint
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             user_id=user_id,
             session_id="test_session",
             query_text="Python async",

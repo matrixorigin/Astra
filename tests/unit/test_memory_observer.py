@@ -72,7 +72,7 @@ class TestTypedExtraction:
             {"type": "profile", "content": "prefers Go", "confidence": 0.9},
             {"type": "episodic", "content": "discussed testing", "confidence": 0.7},
         ])}
-        results = observer.observe("u1", [{"role": "user", "content": "I prefer Go"}])
+        results, _ = observer.observe("u1", [{"role": "user", "content": "I prefer Go"}])
         assert len(results) == 2
         assert results[0].memory_type == MemoryType.PROFILE
         assert results[1].memory_type == MemoryType.EPISODIC
@@ -81,32 +81,33 @@ class TestTypedExtraction:
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "invalid_type", "content": "something", "confidence": 0.5},
         ])}
-        results = observer.observe("u1", [{"role": "user", "content": "test"}])
+        results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
         assert results[0].memory_type == MemoryType.EPISODIC
 
     def test_skips_empty_content(self, observer, mock_llm):
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "profile", "content": "", "confidence": 0.9},
         ])}
-        results = observer.observe("u1", [{"role": "user", "content": "test"}])
+        results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
         assert len(results) == 0
 
     def test_clamps_confidence(self, observer, mock_llm):
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "profile", "content": "test", "confidence": 1.5},
         ])}
-        results = observer.observe("u1", [{"role": "user", "content": "test"}])
+        results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
         assert results[0].confidence == 1.0
 
     def test_no_llm_returns_empty(self, mock_store):
         obs = TypedObserver(store=mock_store, llm_client=None)
-        assert obs.observe("u1", [{"role": "user", "content": "test"}]) == []
+        results, _ = obs.observe("u1", [{"role": "user", "content": "test"}])
+        assert results == []
 
     def test_records_observed_at(self, observer, mock_llm):
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "semantic", "content": "fact", "confidence": 0.8},
         ])}
-        results = observer.observe("u1", [{"role": "user", "content": "test"}])
+        results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
         assert results[0].observed_at is not None
 
 
@@ -136,7 +137,7 @@ class TestContradictionDetection:
             {"type": "profile", "content": "prefers spaces", "confidence": 0.9},
         ])}
 
-        results = observer.observe("u1", [{"role": "user", "content": "I prefer spaces"}])
+        results, _ = observer.observe("u1", [{"role": "user", "content": "I prefer spaces"}])
 
         assert len(results) == 1
         mock_store.supersede.assert_called_once()
@@ -163,7 +164,7 @@ class TestContradictionDetection:
             {"type": "profile", "content": "likes Rust", "confidence": 0.8},
         ])}
 
-        results = observer.observe("u1", [{"role": "user", "content": "I also like Rust"}])
+        results, _ = observer.observe("u1", [{"role": "user", "content": "I also like Rust"}])
 
         assert len(results) == 1
         mock_store.create.assert_called_once()
@@ -174,7 +175,7 @@ class TestContradictionDetection:
         mock_llm.chat_with_tools.return_value = {"content": json.dumps([
             {"type": "profile", "content": "test", "confidence": 0.8},
         ])}
-        results = observer.observe("u1", [{"role": "user", "content": "test"}])
+        results, _ = observer.observe("u1", [{"role": "user", "content": "test"}])
         assert len(results) == 1
         mock_store.create.assert_called_once()
 
@@ -185,7 +186,7 @@ class TestContradictionDetection:
 
 class TestObserveExplicit:
     def test_writes_directly(self, observer, mock_store):
-        result = observer.observe_explicit("u1", "remember this", MemoryType.SEMANTIC)
+        result, _ = observer.observe_explicit("u1", "remember this", MemoryType.SEMANTIC)
         assert result.content == "remember this"
         assert result.memory_type == MemoryType.SEMANTIC
         assert result.confidence == 0.9

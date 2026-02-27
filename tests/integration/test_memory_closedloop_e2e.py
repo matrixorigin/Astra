@@ -69,7 +69,7 @@ class TestObserverToPromptClosedLoop:
         )
         
         # User says they prefer Python
-        mem = observer.observe_explicit(
+        mem, _ = observer.observe_explicit(
             user_id=user_id,
             content="User strongly prefers Python for data analysis",
             memory_type=MemoryType.PROFILE,
@@ -83,7 +83,7 @@ class TestObserverToPromptClosedLoop:
         assert stored.is_active is True
         
         # Verify retrievable
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             user_id=user_id,
             query_text="What language should I use?",
             session_id=session_id,
@@ -120,7 +120,7 @@ class TestObserverToPromptClosedLoop:
             store.create(mem)
         
         # Query about ML
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             user_id=user_id,
             query_text="machine learning project",
             session_id=session_id,
@@ -144,7 +144,7 @@ class TestMultiTurnMemoryAccumulation:
         retriever = MemoryRetriever(db_factory)
         
         # Turn 1: PROFILE memory
-        mem1 = observer.observe_explicit(
+        mem1, _ = observer.observe_explicit(
             user_id=user_id,
             content="User prefers functional programming",
             memory_type=MemoryType.PROFILE,
@@ -153,7 +153,7 @@ class TestMultiTurnMemoryAccumulation:
         memory_cleanup.append(mem1.memory_id)
         
         # Turn 2: EPISODIC memory (different type, no contradiction with mem1)
-        mem2 = observer.observe_explicit(
+        mem2, _ = observer.observe_explicit(
             user_id=user_id,
             content="User asked about Haskell monads",
             memory_type=MemoryType.EPISODIC,
@@ -162,7 +162,7 @@ class TestMultiTurnMemoryAccumulation:
         memory_cleanup.append(mem2.memory_id)
         
         # Turn 3: SEMANTIC memory (different type from mem1, no contradiction)
-        mem3 = observer.observe_explicit(
+        mem3, _ = observer.observe_explicit(
             user_id=user_id,
             content="User dislikes mutable state",
             memory_type=MemoryType.SEMANTIC,
@@ -171,7 +171,7 @@ class TestMultiTurnMemoryAccumulation:
         memory_cleanup.append(mem3.memory_id)
         
         # All 3 retrievable (may not all match query equally)
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             user_id=user_id,
             query_text="functional programming style",
             session_id=session_id,
@@ -209,7 +209,7 @@ class TestContradictionAndSupersede:
         )
         
         # Old preference
-        old = observer.observe_explicit(
+        old, _ = observer.observe_explicit(
             user_id=user_id,
             content="User prefers tabs",
             memory_type=MemoryType.PROFILE,
@@ -218,7 +218,7 @@ class TestContradictionAndSupersede:
         memory_cleanup.append(old.memory_id)
         
         # New contradicting
-        new = observer.observe_explicit(
+        new, _ = observer.observe_explicit(
             user_id=user_id,
             content="User prefers spaces",
             memory_type=MemoryType.PROFILE,
@@ -244,13 +244,13 @@ class TestContradictionAndSupersede:
             db_factory=db_factory,
         )
         
-        mem_a = observer.observe_explicit(user_id, "Version A", MemoryType.PROFILE, 0.7)
+        mem_a, _ = observer.observe_explicit(user_id, "Version A", MemoryType.PROFILE, 0.7)
         memory_cleanup.append(mem_a.memory_id)
         
-        mem_b = observer.observe_explicit(user_id, "Version B", MemoryType.PROFILE, 0.8)
+        mem_b, _ = observer.observe_explicit(user_id, "Version B", MemoryType.PROFILE, 0.8)
         memory_cleanup.append(mem_b.memory_id)
         
-        mem_c = observer.observe_explicit(user_id, "Version C", MemoryType.PROFILE, 0.9)
+        mem_c, _ = observer.observe_explicit(user_id, "Version C", MemoryType.PROFILE, 0.9)
         memory_cleanup.append(mem_c.memory_id)
         
         a = store.get(mem_a.memory_id)
@@ -310,7 +310,7 @@ class TestProfileAndL0:
         memory_cleanup.append(mem.memory_id)
         store.create(mem)
         
-        section = loader.build_section(
+        section, _ = loader.build_section(
             user_id=user_id,
             session_id=session_id,
             query="random query",
@@ -425,7 +425,7 @@ class TestTaskAwareRetrieval:
         memory_cleanup.append(mem.memory_id)
         store.create(mem)
         
-        results = retriever.retrieve(
+        results, _ = retriever.retrieve(
             user_id=user_id,
             query_text="How should I commit code?",
             session_id=session_id,

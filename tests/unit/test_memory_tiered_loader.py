@@ -35,40 +35,41 @@ class TestLoadL1:
     def test_returns_memories(self, loader):
         with patch.object(loader, '_ensure_initialized', return_value=True):
             loader._retriever = MagicMock()
-            loader._retriever.retrieve.return_value = [
+            loader._retriever.retrieve.return_value = ([
                 Memory(memory_id="m1", user_id="u1", memory_type=MemoryType.EPISODIC,
                        content="discussed testing", confidence=0.8),
-            ]
-            result = loader.load_l1("u1", "s1", "testing")
+            ], None)
+            result, _ = loader.load_l1("u1", "s1", "testing")
             assert "discussed testing" in result
             assert "[episodic]" in result
 
     def test_returns_empty_when_no_memories(self, loader):
         with patch.object(loader, '_ensure_initialized', return_value=True):
             loader._retriever = MagicMock()
-            loader._retriever.retrieve.return_value = []
-            assert loader.load_l1("u1", "s1", "query") == ""
+            loader._retriever.retrieve.return_value = ([], None)
+            result, _ = loader.load_l1("u1", "s1", "query")
+            assert result == ""
 
 
 class TestBuildSection:
     def test_combines_l0_and_l1(self, loader):
         loader.load_l0 = MagicMock(return_value="User Profile:\n- likes Go")
-        loader.load_l1 = MagicMock(return_value="Relevant Memories:\n- [episodic] test")
-        result = loader.build_section("u1", "s1", "query")
+        loader.load_l1 = MagicMock(return_value=("Relevant Memories:\n- [episodic] test", None))
+        result, _ = loader.build_section("u1", "s1", "query")
         assert "User Profile" in result
         assert "Relevant Memories" in result
 
     def test_handles_empty_l0(self, loader):
         loader.load_l0 = MagicMock(return_value="")
-        loader.load_l1 = MagicMock(return_value="Relevant Memories:\n- test")
-        result = loader.build_section("u1", "s1", "query")
+        loader.load_l1 = MagicMock(return_value=("Relevant Memories:\n- test", None))
+        result, _ = loader.build_section("u1", "s1", "query")
         assert "Relevant Memories" in result
         assert "User Profile" not in result
 
     def test_handles_both_empty(self, loader):
         loader.load_l0 = MagicMock(return_value="")
-        loader.load_l1 = MagicMock(return_value="")
-        result = loader.build_section("u1", "s1", "query")
+        loader.load_l1 = MagicMock(return_value=("", None))
+        result, _ = loader.build_section("u1", "s1", "query")
         assert result == ""
 
 

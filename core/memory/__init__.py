@@ -9,6 +9,8 @@ Components:
 - MemorySandbox: write-ahead validation
 - MemoryProvenance: PITR queries and rollback
 - MemoryHealth: pollution detection
+
+All components support explain=True for EXPLAIN ANALYZE style execution stats.
 """
 
 from core.memory.types import Memory, MemoryType, RetrievalWeights
@@ -18,9 +20,18 @@ from core.memory.typed_observer import TypedObserver
 from core.memory.typed_reflector import TypedReflector
 from core.memory.profile import ProfileManager
 from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
+from core.memory.explain import (
+    RetrievalStats, ContradictionStats, ObserverStats,
+    SandboxStats, GovernanceStats, PipelineStats,
+    MemoryStats, ExplainResult,
+)
 
 __all__ = [
     "Memory", "MemoryType", "RetrievalWeights",
     "MemoryStore", "MemoryRetriever", "TypedObserver", "TypedReflector",
     "ProfileManager", "MemoryGovernanceConfig", "DEFAULT_CONFIG",
+    # Explain stats
+    "RetrievalStats", "ContradictionStats", "ObserverStats",
+    "SandboxStats", "GovernanceStats", "PipelineStats",
+    "MemoryStats", "ExplainResult",
 ]

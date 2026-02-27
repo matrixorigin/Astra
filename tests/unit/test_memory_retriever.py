@@ -44,7 +44,7 @@ class TestRetrieveWithEmbedding:
             MemRow("m1", "Go testing", "episodic", 0.9, datetime(2026, 2, 26), None),
             MemRow("m2", "Python flask", "semantic", 0.7, datetime(2026, 2, 25), None),
         ]
-        results = retriever.retrieve("u1", "Go testing", session_id="s1")
+        results, _ = retriever.retrieve("u1", "Go testing", session_id="s1")
         assert len(results) == 2
         assert results[0].memory_id == "m1"
         assert results[0].memory_type == MemoryType.EPISODIC
@@ -98,7 +98,7 @@ class TestRetrieveWithoutEmbedding:
         mock_db.execute.return_value.fetchall.return_value = [
             MemRow("m1", "Go testing", "procedural", 0.8, datetime(2026, 2, 26), None),
         ]
-        results = retriever.retrieve("u1", "Go", session_id="s1")
+        results, _ = retriever.retrieve("u1", "Go", session_id="s1")
         assert len(results) == 1
         assert results[0].memory_type == MemoryType.PROCEDURAL
 
