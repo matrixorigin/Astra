@@ -242,6 +242,9 @@ class TestSemanticMatching:
             ),
         ]
 
+        # Inject mock embed_fn so apply_learnings generates embeddings consistent
+        # with the mock embeddings stored in DB above.
+        self_improving._embed_fn = service.embed_text
         self_improving._runtime_config_cache = None
         self_improving._runtime_config_loaded_at = None
         self_improving.apply_learnings(query_text, candidates)

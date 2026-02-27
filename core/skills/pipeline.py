@@ -180,7 +180,7 @@ class SkillPipeline:
         self._modern = ModernSkillSelector(db_factory, llm_client, embed_fn=embed_fn)
         self._improver: SelfImprovingSelector | None = None
         if learning:
-            self._improver = SelfImprovingSelector(db_factory, llm_client, weights=learning_weights)
+            self._improver = SelfImprovingSelector(db_factory, llm_client, weights=learning_weights, embed_fn=embed_fn)
 
         self._feedback = _FeedbackBuffer(db_factory)
 

@@ -147,21 +147,32 @@ def init_db():
                     except Exception as e:
                         logger.warning("Migration: failed to add column %s: %s", col, e)
 
-    # Create IVF-flat vector index on memories.embedding for L2_DISTANCE queries.
-    # SQLAlchemy Index doesn't support USING ivfflat syntax, so we create it via raw DDL.
+    # Create IVF-flat vector indexes for L2_DISTANCE queries.
+    # SQLAlchemy Index doesn't support USING ivfflat syntax, so we create via raw DDL.
     # MatrixOne doesn't support IF NOT EXISTS for CREATE INDEX, so check first.
-    if "memories" in existing or "memories" in {t.name for t in tables_to_create}:
-        try:
-            with engine.begin() as conn:
-                idx_rows = conn.execute(text("SHOW INDEX FROM memories")).fetchall()
-                has_vec_idx = any("idx_memory_embedding" in str(r) for r in idx_rows)
-                if not has_vec_idx:
-                    conn.execute(text(
-                        "CREATE INDEX idx_memory_embedding "
-                        "USING ivfflat ON memories(embedding) lists=100 op_type 'vector_l2_ops'"
-                    ))
-        except Exception as e:
-            logger.warning("Migration: failed to create vector index: %s", e)
+    #
+    # lists parameter: controls IVF-flat partitioning. Should be ~sqrt(N) for optimal
+    # recall/speed tradeoff. We use lists=10 as a safe default for early-stage data
+    # (works well up to ~10K rows). Revisit when any table exceeds 10K embeddings.
+    _VECTOR_INDEXES = [
+        ("memories", "idx_memory_embedding", "memories(embedding)"),
+        ("event_embeddings", "idx_event_emb_vec", "event_embeddings(embedding)"),
+        ("sk_knowledge_entries", "idx_knowledge_emb_vec", "sk_knowledge_entries(embedding)"),
+        ("skill_selection_learning", "idx_learning_emb_vec", "skill_selection_learning(query_embedding)"),
+    ]
+    for tbl, idx_name, idx_target in _VECTOR_INDEXES:
+        if tbl in existing or tbl in {t.name for t in tables_to_create}:
+            try:
+                with engine.begin() as conn:
+                    idx_rows = conn.execute(text(f"SHOW INDEX FROM {tbl}")).fetchall()
+                    has_vec_idx = any(idx_name in str(r) for r in idx_rows)
+                    if not has_vec_idx:
+                        conn.execute(text(
+                            f"CREATE INDEX {idx_name} "
+                            f"USING ivfflat ON {idx_target} lists=10 op_type 'vector_l2_ops'"
+                        ))
+            except Exception as e:
+                logger.warning("Migration: failed to create vector index %s: %s", idx_name, e)
 
 
 def _import_skill_models():

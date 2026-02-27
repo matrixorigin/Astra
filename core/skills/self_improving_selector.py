@@ -61,7 +61,7 @@ class SelfImprovingSelector(DbConsumer):
     test corrections, and update selection strategy.
     """
 
-    def __init__(self, db_factory: DbFactory, llm_client=None, account: str = "sys", weights: SignalWeights | None = None, thresholds: SignalThresholds | None = None):
+    def __init__(self, db_factory: DbFactory, llm_client=None, account: str = "sys", weights: SignalWeights | None = None, thresholds: SignalThresholds | None = None, embed_fn=None):
         super().__init__(db_factory)
         self.llm = llm_client
         self.account = account
@@ -69,6 +69,7 @@ class SelfImprovingSelector(DbConsumer):
         self.thresholds = thresholds or SignalThresholds()
         self.sandbox = Sandbox(db_factory=self._db_factory, account=account)
         self.embedding_service: EmbeddingService | None = None
+        self._embed_fn = embed_fn  # Injected embed_fn takes priority over EmbeddingService
         self._runtime_config_cache: dict[str, Any] | None = None
         self._runtime_config_loaded_at: datetime | None = None
         self._runtime_config_last_updated_at: datetime | None = None
@@ -523,6 +524,13 @@ class SelfImprovingSelector(DbConsumer):
     def _embed_query(self, query: str) -> list[float] | None:
         if not query:
             return None
+        # Prefer injected embed_fn (ensures consistency with stored embeddings)
+        if self._embed_fn is not None:
+            try:
+                return self._embed_fn(query)
+            except Exception as exc:
+                logger.warning(f"Injected embed_fn failed: {exc}")
+                return None
         try:
             if self.embedding_service is None:
                 try:

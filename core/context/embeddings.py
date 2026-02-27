@@ -1,6 +1,14 @@
 """Embedding service for semantic search.
 
-Provides text embedding generation and similarity search.
+Provider resolution order:
+1. OpenAI-compatible API (from llm_models or tokens table) — best quality
+2. Local sentence-transformers model — free, good quality, ~100ms/embed
+3. Mock (hash-based) — deterministic but no semantic similarity
+
+The DB schema uses vecf32(1536). Local models with smaller native dimensions
+(e.g. 384 for all-MiniLM-L6-v2) are zero-padded to 1536. This is mathematically
+safe: L2_DISTANCE on zero-padded vectors equals L2_DISTANCE on the original
+dimensions because zeros contribute 0 to the sum of squares.
 """
 
 import json
@@ -12,172 +20,163 @@ from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+# Providers whose API does not expose an embeddings endpoint.
+_NO_EMBED_API = {"deepseek", "groq"}
+
 
 class EmbeddingService(DbConsumer):
     """Generate and manage text embeddings."""
 
-    DIMENSION = 1536  # OpenAI text-embedding-3-small dimension
+    DIMENSION = 1536  # DB column width (vecf32(1536))
 
     def __init__(
         self, db_factory: DbFactory, provider: str = "openai", model: str = "text-embedding-3-small"
     ):
-        """Initialize embedding service.
-
-        Args:
-            db_factory: Callable returning a new SQLAlchemy Session
-            provider: Embedding provider (openai, mock)
-            model: Model name
-        """
         super().__init__(db_factory)
         self.provider = provider
         self.model = model
+        self._local_model = None
+        self._local_dim = 0
         self._init_provider()
-        logger.info(
-            f"EmbeddingService initialized: provider={provider}, model={model}, dim={self.DIMENSION}"
-        )
+        logger.info("EmbeddingService: provider=%s, model=%s, dim=%d", self.provider, self.model, self.DIMENSION)
+
+    # ------------------------------------------------------------------
+    # Provider init
+    # ------------------------------------------------------------------
 
     def _init_provider(self):
-        """Initialize embedding provider."""
         if self.provider == "openai":
-            try:
-                import openai
+            self._try_openai_provider()
 
-                from core.auth.encryption import decrypt_token
-
-                api_key = None
-                base_url = None
-                actual_provider = None
-                if self._db_factory:
-                    try:
-                        from sqlalchemy import text
-                        with self._db() as db:
-                            # Try llm_models first (primary source), then tokens table (legacy)
-                            row = db.execute(
-                                text("SELECT api_key_encrypted, provider, base_url FROM llm_models WHERE is_active=1 ORDER BY created_at LIMIT 1")
-                            ).first()
-                            if row:
-                                api_key = decrypt_token(row[0]) if row[0] else None
-                                actual_provider = row[1]
-                                base_url = row[2]
-                            else:
-                                # Fallback: tokens table (legacy path)
-                                for prov in ("openai", None):
-                                    if prov:
-                                        row = db.execute(
-                                            text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE AND provider=:provider ORDER BY created_at DESC LIMIT 1"),
-                                            {"provider": prov}
-                                        ).first()
-                                    else:
-                                        row = db.execute(
-                                            text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
-                                        ).first()
-                                    if row:
-                                        encrypted_value = row[0]
-                                        api_key = decrypt_token(encrypted_value) if encrypted_value else None
-                                        actual_provider = row[1]
-                                        meta = row[2]
-                                        if meta:
-                                            import json as _json
-                                            try:
-                                                meta_dict = _json.loads(meta) if isinstance(meta, str) else meta
-                                                base_url = meta_dict.get("base_url")
-                                            except Exception:
-                                                pass
-                                        break
-                    except Exception:
-                        pass
-                # Providers that don't support OpenAI-compatible embeddings
-                _NO_EMBED = {"groq"}
-                if not api_key:
-                    logger.info("No embedding-capable API key found, using mock")
-                    self.provider = "mock"
-                elif actual_provider in {"deepseek"}:
-                    # Deepseek doesn't support embeddings API — use mock (hash-based, deterministic).
-                    # Mock embeddings still enable the pipeline: contradiction detection works for
-                    # exact/near-exact duplicates, governance runs, memories get stored with embeddings.
-                    logger.info(f"Provider '{actual_provider}' does not support embeddings, using mock (pipeline still active)")
-                    self.provider = "mock"
-                elif actual_provider in _NO_EMBED:
-                    logger.info(f"Provider '{actual_provider}' does not support embeddings, using mock")
-                    self.provider = "mock"
-                else:
-                    kwargs = {"api_key": api_key}
-                    if base_url:
-                        kwargs["base_url"] = base_url
-                    self.client = openai.OpenAI(**kwargs)
-            except ImportError:
-                # Only warn in production, not in tests
-                if not os.getenv("PYTEST_CURRENT_TEST"):
-                    logger.warning("OpenAI not available, falling back to mock")
-                self.provider = "mock"
+        # Fallback chain: openai failed or unavailable → local → mock
+        if self.provider == "local":
+            self._try_local_provider()
 
         if self.provider == "mock":
-            logger.info("Using mock embeddings (hash-based)")
+            logger.info("Using mock embeddings (hash-based, no semantic similarity)")
+
+    def _try_openai_provider(self):
+        """Try to initialize an OpenAI-compatible embedding client."""
+        try:
+            import openai
+            from core.auth.encryption import decrypt_token
+        except ImportError:
+            if not os.getenv("PYTEST_CURRENT_TEST"):
+                logger.warning("openai package not installed, trying local embeddings")
+            self.provider = "local"
+            return
+
+        api_key, base_url, actual_provider = self._load_api_credentials()
+
+        if not api_key or actual_provider in _NO_EMBED_API:
+            self.provider = "local"
+            return
+
+        kwargs = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        self.client = openai.OpenAI(**kwargs)
+
+    def _load_api_credentials(self):
+        """Load API key from llm_models (primary) or tokens table (legacy)."""
+        from core.auth.encryption import decrypt_token
+
+        if not self._db_factory:
+            return None, None, None
+        try:
+            from sqlalchemy import text
+            with self._db() as db:
+                # Primary: llm_models table
+                row = db.execute(
+                    text("SELECT api_key_encrypted, provider, base_url FROM llm_models WHERE is_active=1 ORDER BY created_at LIMIT 1")
+                ).first()
+                if row:
+                    return decrypt_token(row[0]) if row[0] else None, row[2], row[1]
+
+                # Legacy: tokens table
+                row = db.execute(
+                    text("SELECT encrypted_value, provider, metadata FROM tokens WHERE type='llm' AND is_active=TRUE ORDER BY created_at DESC LIMIT 1")
+                ).first()
+                if row:
+                    api_key = decrypt_token(row[0]) if row[0] else None
+                    meta = row[2]
+                    base_url = None
+                    if meta:
+                        try:
+                            meta_dict = json.loads(meta) if isinstance(meta, str) else meta
+                            base_url = meta_dict.get("base_url")
+                        except Exception:
+                            pass
+                    return api_key, base_url, row[1]
+        except Exception:
+            pass
+        return None, None, None
+
+    def _try_local_provider(self):
+        """Try to initialize sentence-transformers for local embeddings."""
+        try:
+            from sentence_transformers import SentenceTransformer
+            self._local_model = SentenceTransformer("all-MiniLM-L6-v2")
+            self._local_dim = self._local_model.get_sentence_embedding_dimension()
+            self.model = "all-MiniLM-L6-v2"
+            logger.info("Using local embeddings: %s (native dim=%d, padded to %d)", self.model, self._local_dim, self.DIMENSION)
+        except ImportError:
+            logger.info("sentence-transformers not installed, falling back to mock")
+            self.provider = "mock"
+
+    # ------------------------------------------------------------------
+    # Embed
+    # ------------------------------------------------------------------
 
     def embed_text(self, text: str) -> list[float]:
-        """Generate embedding for text.
-
-        Args:
-            text: Input text
-
-        Returns:
-            Embedding vector ({DIMENSION} dimensions)
-        """
+        """Generate embedding vector (always DIMENSION=1536)."""
         if self.provider == "openai":
             return self._embed_openai(text)
+        elif self.provider == "local":
+            return self._embed_local(text)
         else:
             return self._embed_mock(text)
 
     def _embed_openai(self, text: str) -> list[float]:
-        """Generate OpenAI embedding."""
         try:
-            response = self.client.embeddings.create(
-                model=self.model,
-                input=text,
-                dimensions=self.DIMENSION,  # Request specific dimension
-            )
-            embedding: list[float] = response.data[0].embedding
-            return embedding
+            response = self.client.embeddings.create(model=self.model, input=text, dimensions=self.DIMENSION)
+            return response.data[0].embedding
         except Exception as e:
-            logger.error(f"OpenAI embedding failed: {e}")
+            logger.error("OpenAI embedding failed: %s", e)
             return self._embed_mock(text)
 
+    def _embed_local(self, text: str) -> list[float]:
+        """Encode with local model, zero-pad to DIMENSION.
+
+        Zero-padding is safe for L2_DISTANCE: the padded zeros contribute 0 to
+        the distance calculation, so ranking is identical to native-dim L2.
+        """
+        raw = self._local_model.encode(text).tolist()
+        if len(raw) < self.DIMENSION:
+            raw.extend([0.0] * (self.DIMENSION - len(raw)))
+        return raw[: self.DIMENSION]
+
     def _embed_mock(self, text: str) -> list[float]:
-        """Generate mock embedding (deterministic hash-based)."""
+        """Deterministic hash-based embedding (no semantic similarity)."""
         import hashlib
-
-        hash_obj = hashlib.sha256(text.encode())
-        hash_bytes = hash_obj.digest()
-
-        # Convert to float vector
+        hash_bytes = hashlib.sha256(text.encode()).digest()
         vector = []
         for i in range(0, len(hash_bytes), 2):
             val = (hash_bytes[i] * 256 + hash_bytes[i + 1]) / 65535.0
-            vector.append(val * 2 - 1)  # Normalize to [-1, 1]
-
-        # Extend to DIMENSION
+            vector.append(val * 2 - 1)
         while len(vector) < self.DIMENSION:
             vector.extend(vector[: self.DIMENSION - len(vector)])
-
         return vector[: self.DIMENSION]
 
-    def store_embedding(
-        self, event_id: str, embedding: list[float], metadata: dict[str, Any] | None = None
-    ):
-        """Store embedding in database.
+    # ------------------------------------------------------------------
+    # Store & search (event_embeddings table)
+    # ------------------------------------------------------------------
 
-        Args:
-            event_id: Event identifier
-            embedding: Embedding vector (must match DIMENSION)
-            metadata: Optional metadata
-        """
+    def store_embedding(self, event_id: str, embedding: list[float], metadata: dict[str, Any] | None = None):
         if len(embedding) != self.DIMENSION:
             raise ValueError(f"Embedding must be {self.DIMENSION} dimensions, got {len(embedding)}")
-
-        # Convert to MatrixOne vecf32 format: "[0.1, 0.2, ...]"
         vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
         metadata_json = json.dumps(metadata or {})
-
         from sqlalchemy import text
         with self._db() as db:
             db.execute(
@@ -185,88 +184,46 @@ class EmbeddingService(DbConsumer):
                 INSERT INTO event_embeddings
                 (event_id, embedding, model_name, model_version, metadata, created_at, updated_at)
                 VALUES (:event_id, :embedding, :model_name, :model_version, :metadata, NOW(), NOW())
-                ON DUPLICATE KEY UPDATE
-                embedding = VALUES(embedding),
-                metadata = VALUES(metadata),
-                updated_at = NOW()
-            """),
+                ON DUPLICATE KEY UPDATE embedding = VALUES(embedding), metadata = VALUES(metadata), updated_at = NOW()
+                """),
                 {"event_id": event_id, "embedding": vec_str, "model_name": self.model, "model_version": "1.0", "metadata": metadata_json},
             )
             db.commit()
 
     def search_similar(
-        self,
-        query_embedding: list[float],
-        limit: int = 10,
-        session_id: str | None = None,
-        filters: dict[str, Any] | None = None,
+        self, query_embedding: list[float], limit: int = 10,
+        session_id: str | None = None, filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Search for similar events using L2_DISTANCE.
-
-        Args:
-            query_embedding: Query vector (must match DIMENSION)
-            limit: Max results
-            session_id: Optional session filter
-            filters: Optional metadata filters
-
-        Returns:
-            List of similar events with distances
-        """
         if len(query_embedding) != self.DIMENSION:
-            raise ValueError(
-                f"Query embedding must be {self.DIMENSION} dimensions, got {len(query_embedding)}"
-            )
-
-        # Convert to MatrixOne vecf32 format
+            raise ValueError(f"Query must be {self.DIMENSION} dimensions, got {len(query_embedding)}")
         vec_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
-
         where_clauses = []
-
         if session_id:
             where_clauses.append("e.session_id = :session_id")
-
         if filters:
             for i, (key, value) in enumerate(filters.items()):
                 param_name = f"filter_{i}"
                 if key == "event_type":
                     where_clauses.append(f"e.event_type = :{param_name}")
                 else:
-                    where_clauses.append(
-                        f"JSON_UNQUOTE(JSON_EXTRACT(emb.metadata, '$.{key}')) = :{param_name}"
-                    )
-
+                    where_clauses.append(f"JSON_UNQUOTE(JSON_EXTRACT(emb.metadata, '$.{key}')) = :{param_name}")
         where_clause = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
-
-        # Use MatrixOne's native L2_DISTANCE function with vecf32
         query = f"""
-            SELECT
-                e.event_id,
-                e.session_id,
-                e.content,
-                e.event_type,
-                e.created_at,
-                L2_DISTANCE(CAST(emb.embedding AS vecf32), CAST(:vec1 AS vecf32)) AS distance,
-                1.0 / (1.0 + L2_DISTANCE(CAST(emb.embedding AS vecf32), CAST(:vec2 AS vecf32))) AS similarity
+            SELECT e.event_id, e.session_id, e.content, e.event_type, e.created_at,
+                L2_DISTANCE(emb.embedding, :vec1) AS distance,
+                1.0 / (1.0 + L2_DISTANCE(emb.embedding, :vec2)) AS similarity
             FROM conversation_events e
             JOIN event_embeddings emb ON e.event_id = emb.event_id
             {where_clause}
-            ORDER BY distance ASC
-            LIMIT :limit
+            ORDER BY distance ASC LIMIT :limit
         """
-
         from sqlalchemy import text
-        # Build params dict
-        params_dict = {"vec1": vec_str, "vec2": vec_str, "limit": limit}
-
-        # Add session_id and filters params
+        params = {"vec1": vec_str, "vec2": vec_str, "limit": limit}
         if session_id:
-            params_dict["session_id"] = session_id
-
+            params["session_id"] = session_id
         if filters:
             for i, (key, value) in enumerate(filters.items()):
-                param_name = f"filter_{i}"
-                params_dict[param_name] = value
-
+                params[f"filter_{i}"] = value
         with self._db() as db:
-            result = db.execute(text(query), params_dict)
+            result = db.execute(text(query), params)
             return [dict(row._mapping) for row in result.fetchall()]

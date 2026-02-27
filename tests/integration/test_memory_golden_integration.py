@@ -235,7 +235,7 @@ class TestMemoryRetrieverRealDB:
             assert len(ivf_indexes) > 0, (
                 "ivfflat index on memories.embedding not found. "
                 "Run init_db() or manually create: "
-                "CREATE INDEX idx_memory_embedding USING ivfflat ON memories(embedding) lists=100 op_type 'vector_l2_ops'"
+                "CREATE INDEX idx_memory_embedding USING ivfflat ON memories(embedding) lists=10 op_type 'vector_l2_ops'"
             )
         finally:
             db.close()
