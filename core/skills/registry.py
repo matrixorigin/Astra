@@ -425,3 +425,64 @@ class SkillRegistry:
         finally:
             db.close()
         self._get_cached.cache_clear()
+
+    def rollback(self, skill_name: str) -> str:
+        """Rollback to the previous version of a skill.
+
+        Deactivates the current active version and reactivates the most recent
+        non-active version. Returns the version that was activated.
+        """
+        db = self._db_factory()
+        try:
+            current = db.query(SkillModel).filter(
+                SkillModel.skill_name == skill_name, SkillModel.is_active == 1,
+            ).first()
+            if not current:
+                raise ValueError(f"No active version of '{skill_name}' to rollback")
+
+            previous = db.query(SkillModel).filter(
+                SkillModel.skill_name == skill_name,
+                SkillModel.is_active == 0,
+                SkillModel.status.in_(("active", "deprecated")),
+            ).order_by(SkillModel.created_at.desc()).first()
+            if not previous:
+                raise ValueError(f"No previous version of '{skill_name}' to rollback to")
+
+            current.is_active = 0
+            current.status = "deprecated"
+            previous.is_active = 1
+            previous.status = "active"
+            activated_version = previous.version
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        self._skills.pop(skill_name, None)
+        self._get_cached.cache_clear()
+        logger.info("Rolled back %s: %s → %s", skill_name, current.version, activated_version)
+        return activated_version
+
+    def uninstall(self, skill_name: str) -> int:
+        """Remove all versions of a skill. Returns count of versions removed."""
+        db = self._db_factory()
+        try:
+            count = db.query(SkillModel).filter(
+                SkillModel.skill_name == skill_name,
+            ).delete(synchronize_session="fetch")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+        # Clean in-memory cache
+        keys_to_remove = [k for k in self._skills if k == skill_name or k.startswith(f"{skill_name}@")]
+        for k in keys_to_remove:
+            del self._skills[k]
+        self._get_cached.cache_clear()
+        logger.info("Uninstalled %s (%d versions)", skill_name, count)
+        return count
