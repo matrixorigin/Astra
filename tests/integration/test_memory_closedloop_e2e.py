@@ -8,6 +8,8 @@ import json
 from datetime import datetime, timedelta
 
 import pytest
+
+from api.models._constants import EMBEDDING_DIM
 from uuid_utils import uuid7
 
 from core.memory.store import MemoryStore
@@ -32,9 +34,9 @@ def _sid():
 def _embed(text: str) -> list[float]:
     """Deterministic embedding based on text hash."""
     h = hash(text) % 1000
-    base = [h / 1000.0] * 1536
+    base = [h / 1000.0] * EMBEDDING_DIM
     for i, c in enumerate(text[:100]):
-        base[i % 1536] += ord(c) / 10000.0
+        base[i % EMBEDDING_DIM] += ord(c) / 10000.0
     return base
 
 
@@ -198,7 +200,7 @@ class TestContradictionAndSupersede:
         user_id = _uid()
         store = MemoryStore(db_factory)
         
-        fixed_embed = [0.5] * 1536
+        fixed_embed = [0.5] * EMBEDDING_DIM
         observer = TypedObserver(
             store=store,
             llm_client=None,
@@ -234,7 +236,7 @@ class TestContradictionAndSupersede:
         """Supersede chain: A → B → C."""
         user_id = _uid()
         store = MemoryStore(db_factory)
-        fixed_embed = [0.3] * 1536
+        fixed_embed = [0.3] * EMBEDDING_DIM
         
         observer = TypedObserver(
             store=store, llm_client=None,

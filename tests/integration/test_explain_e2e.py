@@ -7,6 +7,8 @@ from uuid import uuid4
 
 import pytest
 
+from api.models._constants import EMBEDDING_DIM
+
 from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever
 from core.memory.typed_observer import TypedObserver
@@ -21,7 +23,7 @@ def _uid():
 
 def _embed(text: str) -> list[float]:
     """Deterministic embedding for testing."""
-    return [hash(text) % 100 / 100.0] * 1536
+    return [hash(text) % 100 / 100.0] * EMBEDDING_DIM
 
 
 class TestExplainE2E:
@@ -116,7 +118,7 @@ class TestExplainE2E:
             memory_type=MemoryType.PROFILE,
             content="User prefers tabs",
             initial_confidence=0.8,
-            embedding=[0.5] * 1536,
+            embedding=[0.5] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(old_mem.memory_id)
@@ -126,7 +128,7 @@ class TestExplainE2E:
         observer = TypedObserver(
             store=store,
             llm_client=None,  # Skip LLM extraction
-            embed_fn=lambda x: [0.5] * 1536,  # Same embedding → contradiction
+            embed_fn=lambda x: [0.5] * EMBEDDING_DIM,  # Same embedding → contradiction
             db_factory=db_factory,
         )
 
@@ -287,7 +289,7 @@ class TestExplainE2E:
             memory_type=MemoryType.SEMANTIC,
             content="Vector search test memory",
             initial_confidence=0.9,
-            embedding=[0.1] * 1536,
+            embedding=[0.1] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -298,7 +300,7 @@ class TestExplainE2E:
             user_id=user_id,
             query_text="vector search",
             session_id=session_id,
-            query_embedding=[0.1] * 1536,
+            query_embedding=[0.1] * EMBEDDING_DIM,
             explain=True,
         )
 

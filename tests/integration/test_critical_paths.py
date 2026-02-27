@@ -15,6 +15,8 @@ from uuid import uuid4
 
 import pytest
 
+from api.models._constants import EMBEDDING_DIM
+
 from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever
 from core.memory.typed_observer import TypedObserver
@@ -27,7 +29,7 @@ def _uid():
 
 
 def _embed(text: str) -> list[float]:
-    return [hash(text) % 100 / 100.0] * 1536
+    return [hash(text) % 100 / 100.0] * EMBEDDING_DIM
 
 
 class TestCriticalPathVerification:
@@ -67,7 +69,7 @@ class TestCriticalPathVerification:
             memory_type=MemoryType.SEMANTIC,
             content="Vector search verification memory",
             initial_confidence=0.9,
-            embedding=[0.1] * 1536,
+            embedding=[0.1] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -78,7 +80,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             query_text="vector",
             session_id="test",
-            query_embedding=[0.1] * 1536,
+            query_embedding=[0.1] * EMBEDDING_DIM,
             explain=True,
         )
 
@@ -133,7 +135,7 @@ class TestCriticalPathVerification:
             memory_type=MemoryType.PROFILE,
             content="Base memory for sandbox test",
             initial_confidence=0.8,
-            embedding=[0.5] * 1536,
+            embedding=[0.5] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -146,7 +148,7 @@ class TestCriticalPathVerification:
             memory_type=MemoryType.PROFILE,
             content="New memory to validate in sandbox",
             initial_confidence=0.9,
-            embedding=[0.5] * 1536,
+            embedding=[0.5] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
 
@@ -155,7 +157,7 @@ class TestCriticalPathVerification:
             user_id=user_id,
             new_memories=[new_mem],
             query_text="test",
-            query_embedding=[0.5] * 1536,
+            query_embedding=[0.5] * EMBEDDING_DIM,
             explain=True,
         )
 
@@ -177,7 +179,7 @@ class TestCriticalPathVerification:
             memory_type=MemoryType.PROFILE,
             content="User prefers tabs",
             initial_confidence=0.8,
-            embedding=[0.5] * 1536,
+            embedding=[0.5] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(old_mem.memory_id)
@@ -187,7 +189,7 @@ class TestCriticalPathVerification:
         observer = TypedObserver(
             store=store,
             llm_client=None,
-            embed_fn=lambda x: [0.5] * 1536,  # Same embedding → should find contradiction
+            embed_fn=lambda x: [0.5] * EMBEDDING_DIM,  # Same embedding → should find contradiction
             db_factory=db_factory,
         )
 
@@ -223,7 +225,7 @@ class TestCriticalPathVerification:
             memory_type=MemoryType.SEMANTIC,
             content="Summary test memory for all paths",
             initial_confidence=0.9,
-            embedding=[0.3] * 1536,
+            embedding=[0.3] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -236,7 +238,7 @@ class TestCriticalPathVerification:
         # 1. Vector search
         _, stats = retriever.retrieve(
             user_id=user_id, query_text="test", session_id="s",
-            query_embedding=[0.3] * 1536, explain=True,
+            query_embedding=[0.3] * EMBEDDING_DIM, explain=True,
         )
         vec_ok = stats.vector_attempted and stats.vector_error is None
         print(f"[{'✓' if vec_ok else '✗'}] Vector Search (L2_DISTANCE): {'OK' if vec_ok else stats.vector_error}")
@@ -256,12 +258,12 @@ class TestCriticalPathVerification:
             memory_type=MemoryType.PROFILE,
             content="Sandbox test",
             initial_confidence=0.9,
-            embedding=[0.3] * 1536,
+            embedding=[0.3] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
         _, stats = sandbox.validate_memories(
             user_id=user_id, new_memories=[new_mem],
-            query_text="test", query_embedding=[0.3] * 1536,
+            query_text="test", query_embedding=[0.3] * EMBEDDING_DIM,
             explain=True,
         )
         sb_ok = stats.enabled and stats.error is None
@@ -270,7 +272,7 @@ class TestCriticalPathVerification:
         # 4. Contradiction detection
         observer = TypedObserver(
             store=store, llm_client=None,
-            embed_fn=lambda x: [0.3] * 1536,
+            embed_fn=lambda x: [0.3] * EMBEDDING_DIM,
             db_factory=db_factory,
         )
         _, stats = observer.observe_explicit(

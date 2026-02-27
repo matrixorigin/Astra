@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+from api.models._constants import EMBEDDING_DIM
 from sqlalchemy import text
 from uuid_utils import uuid7
 
@@ -188,9 +190,9 @@ class TestMemoryRetrieverRealDB:
         
         # Create memories with embeddings
         embeddings = [
-            [0.1] * 1536,  # close to query
-            [0.9] * 1536,  # far from query
-            [0.2] * 1536,  # medium distance
+            [0.1] * EMBEDDING_DIM,  # close to query
+            [0.9] * EMBEDDING_DIM,  # far from query
+            [0.2] * EMBEDDING_DIM,  # medium distance
         ]
         for i, emb in enumerate(embeddings):
             mem = Memory(
@@ -205,8 +207,8 @@ class TestMemoryRetrieverRealDB:
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
         
-        # Query with embedding close to [0.1]*1536 and explain=True
-        query_emb = [0.1] * 1536
+        # Query with embedding close to [0.1]*EMBEDDING_DIM and explain=True
+        query_emb = [0.1] * EMBEDDING_DIM
         results, stats = retriever.retrieve(
             user_id=user_id,
             session_id="test_session",
@@ -223,7 +225,7 @@ class TestMemoryRetrieverRealDB:
         
         # Verify: results are ordered by vector similarity (closest first)
         assert len(results) >= 1
-        # The memory with [0.1]*1536 embedding should be first (closest to query)
+        # The memory with [0.1]*EMBEDDING_DIM embedding should be first (closest to query)
         assert "memory 0" in results[0].content
 
     def test_vector_index_exists(self, db_factory):
@@ -387,7 +389,7 @@ class TestSandboxRealDB:
             memory_type=MemoryType.PROFILE,
             content="Base memory for sandbox test",
             initial_confidence=0.8,
-            embedding=[0.5] * 1536,
+            embedding=[0.5] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(mem.memory_id)
@@ -400,7 +402,7 @@ class TestSandboxRealDB:
             memory_type=MemoryType.SEMANTIC,
             content="New memory to validate",
             initial_confidence=0.7,
-            embedding=[0.5] * 1536,
+            embedding=[0.5] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
 
@@ -408,7 +410,7 @@ class TestSandboxRealDB:
             user_id=user_id,
             new_memories=[new_mem],
             query_text="test query",
-            query_embedding=[0.5] * 1536,
+            query_embedding=[0.5] * EMBEDDING_DIM,
             explain=True,
         )
 
@@ -493,7 +495,7 @@ class TestContradictionRealDB:
         observer = TypedObserver(
             store=store,
             llm_client=None,
-            embed_fn=lambda x: [0.1] * 1536,  # Same embedding = high similarity
+            embed_fn=lambda x: [0.1] * EMBEDDING_DIM,  # Same embedding = high similarity
             contradiction_threshold=0.85,
             db_factory=db_factory,
         )
@@ -506,7 +508,7 @@ class TestContradictionRealDB:
             memory_type=MemoryType.PROFILE,
             content="User prefers tabs",
             initial_confidence=0.8,
-            embedding=[0.1] * 1536,
+            embedding=[0.1] * EMBEDDING_DIM,
             observed_at=datetime.utcnow(),
         )
         cleanup_memories.append(old_mem.memory_id)
