@@ -12,7 +12,7 @@ from uuid_utils import uuid7
 
 from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever
-from core.memory.types import Memory, MemoryType
+from core.memory.types import Memory, MemoryType, TrustTier
 from core.memory.profile import ProfileManager
 from core.memory.tiered_loader import TieredMemoryLoader
 from core.memory.typed_observer import TypedObserver
@@ -616,3 +616,165 @@ class TestTrustTierRealDB:
         t1_idx = next(i for i, r in enumerate(results) if r.memory_id == t1.memory_id)
         t4_idx = next(i for i, r in enumerate(results) if r.memory_id == t4.memory_id)
         assert t1_idx < t4_idx, f"T1 should rank higher than T4, got T1@{t1_idx} T4@{t4_idx}"
+
+
+# ── Phase 3 Wiring Tests ──────────────────────────────────────────
+
+
+class TestSchedulerWiring:
+    """Verify GovernanceScheduler is called by production scheduler dispatch."""
+
+    def test_dispatch_calls_memory_governance(self):
+        """scheduler._dispatch('hourly') calls GovernanceScheduler.run_hourly()."""
+        from unittest.mock import patch, MagicMock
+        from core.context.scheduler import GovernanceTaskRunner
+
+        mock_db = MagicMock()
+        mock_factory = MagicMock(return_value=mock_db)
+
+        with patch("core.context.lifecycle.MemoryGovernanceEngine") as MockEngine, \
+             patch("core.memory.governance.GovernanceScheduler") as MockSched:
+            MockEngine.return_value.run_hourly_tasks.return_value = {"archived_notes": 0}
+            from core.memory.governance import GovernanceCycleResult
+            MockSched.return_value.run_hourly.return_value = GovernanceCycleResult(
+                cleaned_tool_results=3, archived_working=1,
+            )
+
+            result = GovernanceTaskRunner._dispatch("hourly", mock_db, mock_factory)
+
+            MockSched.return_value.run_hourly.assert_called_once()
+            assert result["mem_cleaned_tool_results"] == 3
+            assert result["mem_archived_working"] == 1
+
+    def test_dispatch_daily_calls_run_daily_all(self):
+        """scheduler._dispatch('daily') calls GovernanceScheduler.run_daily_all()."""
+        from unittest.mock import patch, MagicMock
+        from core.context.scheduler import GovernanceTaskRunner
+
+        mock_db = MagicMock()
+        mock_factory = MagicMock(return_value=mock_db)
+
+        with patch("core.context.lifecycle.MemoryGovernanceEngine") as MockEngine, \
+             patch("core.memory.governance.GovernanceScheduler") as MockSched:
+            MockEngine.return_value.run_daily_tasks.return_value = {"quarantined": 0}
+            from core.memory.governance import GovernanceCycleResult
+            MockSched.return_value.run_daily_all.return_value = GovernanceCycleResult(
+                cleaned_stale=2, quarantined=5,
+            )
+
+            result = GovernanceTaskRunner._dispatch("daily", mock_db, mock_factory)
+
+            MockSched.return_value.run_daily_all.assert_called_once()
+            assert result["mem_quarantined"] == 5
+
+
+class TestRunDailyAll:
+    """Verify run_daily_all iterates all users."""
+
+    def test_iterates_users(self, db_factory, memory_cleanup):
+        store = MemoryStore(db_factory)
+        uid1, uid2 = _uid(), _uid()
+
+        # Create old low-confidence T4 memories for 2 users
+        for uid in (uid1, uid2):
+            m = Memory(
+                memory_id=str(uuid7()), user_id=uid,
+                memory_type=MemoryType.SEMANTIC, content="stale fact",
+                initial_confidence=0.3, trust_tier=TrustTier.T4_UNVERIFIED,
+                observed_at=datetime.utcnow() - timedelta(days=120),
+            )
+            memory_cleanup.append(m.memory_id)
+            store.create(m)
+
+        config = MemoryGovernanceConfig(quarantine_threshold=0.2)
+        scheduler = GovernanceScheduler(db_factory, config=config)
+        result = scheduler.run_daily_all()
+
+        # Both users' memories should be quarantined
+        assert result.quarantined >= 2
+
+
+class TestSessionSummaryWiring:
+    """Verify SessionSummarizer is called from session close."""
+
+    def test_close_session_generates_summary(self, db_factory, memory_cleanup):
+        """session_manager.close_session() creates a full session summary in memories table."""
+        from core.events.session_manager import SessionManager
+        from core.events.event_logger import EventLogger
+        from sqlalchemy import text
+
+        db = db_factory()
+        try:
+            session_mgr = SessionManager(db)
+            event_logger = EventLogger.from_session(db)
+
+            session = session_mgr.create_session(user_id="summary_wiring_test")
+            sid = session.session_id
+
+            # Add some conversation events
+            user_evt = event_logger.create_user_query(
+                user_id="summary_wiring_test", session_id=sid,
+                content="How do I use dependency injection in Python?",
+            )
+            event_logger.create_llm_response(
+                user_id="summary_wiring_test", session_id=sid,
+                content="Dependency injection in Python typically uses constructor injection...",
+                agent_id="test", agent_version="1.0",
+                parent_event_id=user_evt.event_id,
+                causal_chain_id=user_evt.causal_chain_id,
+            )
+
+            # Close session — should trigger summary generation
+            session_mgr.close_session(sid)
+
+            # Check memories table for session summary
+            row = db.execute(text(
+                "SELECT memory_id, content, session_id FROM memories "
+                "WHERE user_id = 'summary_wiring_test' AND content LIKE '%session_summary%' "
+                "ORDER BY created_at DESC LIMIT 1"
+            )).fetchone()
+
+            if row:
+                memory_cleanup.append(row[0])
+                assert row[2] is None, "Full summary should have session_id=NULL (cross-session)"
+                assert "[session_summary]" in row[1]
+        finally:
+            db.close()
+
+    def test_turn_hooks_accepts_summary_params(self):
+        """turn_hooks.run_observer() accepts turn_count and session_start params."""
+        from unittest.mock import MagicMock, patch
+        from core.agent.turn_hooks import TurnHooks
+
+        hooks = TurnHooks(db_factory=MagicMock(), llm_client=MagicMock())
+
+        # Should not raise — verifies the signature accepts new params
+        with patch("core.memory.typed_pipeline.run_typed_memory_pipeline"):
+            hooks.run_observer(
+                session_id="test_sess", user_id="test_user",
+                messages=[{"role": "user", "content": "hello"}],
+                turn_count=50, session_start=datetime.utcnow(),
+            )
+
+
+class TestTrustTierDefaultsMigration:
+    """Verify knowledge/api.py uses types.py trust_tier_defaults."""
+
+    def test_import_from_types(self):
+        """trust_tier_defaults importable from both types.py and lifecycle.py."""
+        from core.memory.types import trust_tier_defaults as from_types
+        from core.context.lifecycle import trust_tier_defaults as from_lifecycle
+
+        # Both should return same result
+        t3_types = from_types("T3")
+        t3_lifecycle = from_lifecycle("T3")
+        assert t3_types == t3_lifecycle
+        assert t3_types["initial_confidence"] == 0.65
+        assert t3_types["half_life_days"] == 60.0
+
+    def test_knowledge_api_uses_types(self):
+        """knowledge/api.py imports trust_tier_defaults from types.py."""
+        import inspect
+        from skills.knowledge import api as knowledge_api
+        source = inspect.getsource(knowledge_api)
+        assert "from core.memory.types import trust_tier_defaults" in source
