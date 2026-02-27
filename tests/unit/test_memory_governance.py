@@ -6,7 +6,7 @@ from uuid import uuid4
 
 import pytest
 
-from core.memory.governance import GovernanceScheduler, GovernanceCycleResult
+from core.memory.governance import GovernanceScheduler, GovernanceCycleResult, GovernanceStepStats
 from core.memory.config import MemoryGovernanceConfig
 
 
@@ -157,6 +157,77 @@ class TestGovernanceScheduler:
         assert "user1" in scheduler._last_cycle
         assert "user2" in scheduler._last_cycle
         assert scheduler._last_cycle["user1"] != scheduler._last_cycle["user2"] or True  # timestamps close
+
+    def test_explain_populates_step_stats(self, mock_db_factory, config):
+        """explain=True populates detailed stats for each step."""
+        scheduler = GovernanceScheduler(mock_db_factory, config)
+
+        with patch.object(scheduler, "_apply_decay", return_value=2), \
+             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 1}), \
+             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
+             patch.object(scheduler, "_cleanup_stale", return_value=3), \
+             patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
+             patch.object(scheduler.health, "cleanup_snapshots", return_value=1), \
+             patch.object(scheduler, "_cleanup_tool_results", return_value=2):
+
+            result = scheduler.run_cycle("user123", explain=True)
+
+        # All step stats populated
+        assert result.decay_stats is not None
+        assert result.decay_stats.executed is True
+        assert result.decay_stats.success is True
+        assert result.decay_stats.count == 2
+        assert result.decay_stats.elapsed_ms > 0
+
+        assert result.reflector_stats.success is True
+        assert result.reflector_stats.count == 1
+
+        assert result.health_stats.success is True
+        assert result.cleanup_stale_stats.count == 3
+        assert result.cleanup_snapshots_stats.count == 1
+        assert result.cleanup_tool_results_stats.count == 2
+
+        assert result.total_ms > 0
+
+    def test_explain_captures_step_errors(self, mock_db_factory, config):
+        """explain=True captures error details per step."""
+        scheduler = GovernanceScheduler(mock_db_factory, config)
+
+        with patch.object(scheduler, "_apply_decay", side_effect=Exception("decay failed")), \
+             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 1}), \
+             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
+             patch.object(scheduler, "_cleanup_stale", return_value=0), \
+             patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
+             patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
+             patch.object(scheduler, "_cleanup_tool_results", return_value=0):
+
+            result = scheduler.run_cycle("user123", explain=True)
+
+        # Decay failed
+        assert result.decay_stats.executed is True
+        assert result.decay_stats.success is False
+        assert result.decay_stats.error == "decay failed"
+
+        # Other steps succeeded
+        assert result.reflector_stats.success is True
+
+    def test_explain_false_no_stats(self, mock_db_factory, config):
+        """explain=False leaves stats as None."""
+        scheduler = GovernanceScheduler(mock_db_factory, config)
+
+        with patch.object(scheduler, "_apply_decay", return_value=1), \
+             patch.object(scheduler.reflector, "reflect", return_value={"promoted": 0}), \
+             patch.object(scheduler.health, "detect_pollution", return_value={"is_polluted": False}), \
+             patch.object(scheduler, "_cleanup_stale", return_value=0), \
+             patch.object(scheduler.health, "cleanup_orphan_branches", return_value=0), \
+             patch.object(scheduler.health, "cleanup_snapshots", return_value=0), \
+             patch.object(scheduler, "_cleanup_tool_results", return_value=0):
+
+            result = scheduler.run_cycle("user123", explain=False)
+
+        assert result.decay_stats is None
+        assert result.reflector_stats is None
+        assert result.total_ms == 0
 
 
 class TestMemoryHealthExtensions:
