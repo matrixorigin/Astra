@@ -436,6 +436,61 @@ class TestTaskAwareRetrieval:
         assert any("tests" in r.content for r in results)
 
 
+class TestProceduralMemoryLifecycle:
+    """Procedural memory: write to mem_memories → verify DB fields → retrieve."""
+
+    def test_store_and_retrieve_procedural(self, db_factory, memory_cleanup):
+        """Full lifecycle: create → DB field check → retriever returns it."""
+        user_id = _uid()
+        session_id = _sid()
+        store = MemoryStore(db_factory)
+        now = datetime.utcnow().replace(microsecond=0)
+        mid = str(uuid7())
+
+        mem = Memory(
+            memory_id=mid,
+            user_id=user_id,
+            memory_type=MemoryType.PROCEDURAL,
+            content="Always run tests before commit",
+            initial_confidence=0.85,
+            embedding=_embed("Always run tests before commit"),
+            observed_at=now,
+            trust_tier=TrustTier.T3_INFERRED,
+        )
+        memory_cleanup.append(mid)
+        store.create(mem)
+
+        # Re-read from DB — verify all meaningful fields
+        stored = store.get(mid)
+        assert stored is not None
+        assert stored.memory_id == mid
+        assert stored.user_id == user_id
+        assert stored.memory_type == MemoryType.PROCEDURAL
+        assert stored.content == "Always run tests before commit"
+        assert stored.initial_confidence == 0.85
+        assert stored.is_active is True
+        assert stored.observed_at == now
+        assert stored.trust_tier == TrustTier.T3_INFERRED
+        assert stored.superseded_by is None
+
+        # Retrieve via MemoryRetriever — verify it surfaces
+        retriever = MemoryRetriever(db_factory)
+        results, _ = retriever.retrieve(
+            user_id=user_id,
+            query_text="How should I commit code?",
+            session_id=session_id,
+            query_embedding=_embed("How should I commit code?"),
+            memory_types=[MemoryType.PROCEDURAL],
+            limit=5,
+        )
+        assert any(r.memory_id == mid for r in results)
+        retrieved = next(r for r in results if r.memory_id == mid)
+        assert retrieved.memory_type == MemoryType.PROCEDURAL
+        assert retrieved.content == "Always run tests before commit"
+        assert retrieved.initial_confidence == 0.85
+        assert retrieved.trust_tier == TrustTier.T3_INFERRED
+
+
 class TestSensitivityFilterRealDB:
     """Sensitivity filter blocks PII from reaching the database."""
 

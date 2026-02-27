@@ -1,7 +1,13 @@
 """Bridge: expose skill_selection_learnings as procedural Memory objects.
 
-This lets the memory retriever and governance system treat skill learnings
-as procedural memories without physically moving data into mem_memories.
+Type-layer adapter for the Skill Selector subsystem. Converts learning rows
+into Memory domain objects so the selector can use memory-system APIs
+(governance, confidence decay, trust tiers) without duplicating data.
+
+This bridge is NOT wired into MemoryRetriever. Skill selection learnings
+are internal correction rules for the Skill Selector, not general-purpose
+procedural memory. They are consumed only during skill selection, not
+during general memory retrieval for prompt assembly.
 
 Storage stays in skill_selection_learnings (indexed, typed columns).
 Type unification happens here — every learning can be viewed as a Memory.
@@ -47,7 +53,12 @@ def learning_to_memory(row: SkillSelectionLearning) -> Memory:
 
 
 def list_as_memories(db: Session, *, active_only: bool = True) -> list[Memory]:
-    """Query all learnings and return them as Memory objects."""
+    """Query learnings and return them as Memory objects.
+
+    No LIMIT: skill_selection_learnings is naturally bounded — one row per
+    unique (query_pattern, signal_type) pair, so the table stays small
+    (typically tens to low hundreds of rows).
+    """
     q = db.query(SkillSelectionLearning)
     if active_only:
         q = q.filter(SkillSelectionLearning.is_active == 1)

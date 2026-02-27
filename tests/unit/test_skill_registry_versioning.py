@@ -420,7 +420,9 @@ class TestSkillRollback:
         v1 = mock_db.query(SkillModel).filter(SkillModel.skill_id == "rb_skill@1.0.0").first()
         v2 = mock_db.query(SkillModel).filter(SkillModel.skill_id == "rb_skill@2.0.0").first()
         assert v1.is_active == 1 and v1.status == "active"
+        assert v1.skill_name == "rb_skill" and v1.version == "1.0.0"
         assert v2.is_active == 0 and v2.status == "deprecated"
+        assert v2.skill_name == "rb_skill" and v2.version == "2.0.0"
 
     def test_rollback_consecutive(self, registry, mock_db):
         """v3 → v2 → v1: consecutive rollbacks through the version chain."""
@@ -446,10 +448,17 @@ class TestSkillRollback:
             registry.rollback("nonexistent_skill")
 
     def test_rollback_no_previous_raises(self, registry, mock_db):
+        from api.models import SkillRegistry as SkillModel
+
         registry.register(MockSkill("rb_single", "1.0.0"), is_active=True)
 
         with pytest.raises(ValueError, match="No previous version"):
             registry.rollback("rb_single")
+
+        # Verify the single version is still active after failed rollback
+        mock_db.expire_all()
+        v1 = mock_db.query(SkillModel).filter(SkillModel.skill_id == "rb_single@1.0.0").first()
+        assert v1.is_active == 1 and v1.status == "active"
 
 
 class TestSkillUninstall:
@@ -470,6 +479,10 @@ class TestSkillUninstall:
         registry.register(MockSkill("un_skill", "1.0.0"), is_active=False)
         registry.register(MockSkill("un_skill", "2.0.0"), is_active=True)
 
+        # Verify both exist before uninstall
+        mock_db.expire_all()
+        assert mock_db.query(SkillModel).filter(SkillModel.skill_name == "un_skill").count() == 2
+
         count = registry.uninstall("un_skill")
         assert count == 2
 
@@ -481,8 +494,14 @@ class TestSkillUninstall:
         assert count == 0
 
     def test_uninstall_clears_memory_cache(self, registry, mock_db):
+        from api.models import SkillRegistry as SkillModel
+
         registry.register(MockSkill("un_cache", "1.0.0"), is_active=True)
         assert "un_cache" in registry._skills
 
         registry.uninstall("un_cache")
         assert "un_cache" not in registry._skills
+
+        # Verify DB row is also gone
+        mock_db.expire_all()
+        assert mock_db.query(SkillModel).filter(SkillModel.skill_name == "un_cache").count() == 0

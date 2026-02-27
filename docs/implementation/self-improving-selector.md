@@ -56,10 +56,26 @@ Signals accumulate in skill_learning_signals table
     → Analyze: group signals by query pattern
     → Propose: correction rules (wrong_skill → correct_skill)
     → Validate: RegressionGate replays golden sessions
-    → Deploy: store in selector_learnings, apply at selection time
+    → Deploy: store in skill_selection_learnings, apply at selection time
 ```
 
 Corrections are applied as score adjustments during selection — boosting correct skills and penalizing wrong ones for matching query patterns.
+
+## Procedural Memory Bridge
+
+`core/skills/procedural_memory.py` provides a type-layer adapter that converts `skill_selection_learnings` rows into `Memory` domain objects. This enables the Skill Selector to use memory-system APIs (governance, confidence decay, trust tiers) without duplicating data.
+
+**Design boundary**: skill selection learnings are Skill Selector internal correction rules, NOT general-purpose procedural memory. The bridge is consumed only during skill selection — it is NOT injected into `MemoryRetriever`. This keeps a clean separation:
+
+- `MemoryRetriever` → queries `memories` table only (general memory retrieval for prompt assembly)
+- `SelfImprovingSelector` → queries `skill_selection_learnings` directly (skill selection decisions), with optional `learning_to_memory()` for type unification
+
+```
+skill_selection_learnings (DB)
+  → learning_to_memory()        # type adapter: ORM row → Memory object
+  → list_as_memories()          # batch query + convert
+  → consumed by Skill Selector  # NOT by MemoryRetriever
+```
 
 ## Multi-Factor Scoring
 
@@ -87,7 +103,7 @@ Weights and decay rates are configurable per signal type.
 ## Database Tables
 
 - `skill_selection_events` — every selection decision with query, selected skills, method
-- `selector_learnings` — learned correction rules with confidence and evidence count
+- `skill_selection_learnings` — learned correction rules with confidence and evidence count (type-bridged to Memory objects for Skill Selector internal use)
 - `skill_learning_signals` — raw feedback signals per execution
 - `gate_results` — regression gate verdicts for learning changes
 

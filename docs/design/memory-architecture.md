@@ -174,7 +174,11 @@ Inspired by cognitive science and aligned with the latest industry research (Gen
 │  Learned behaviors: "how to do things"                      │
 │  Skill selection patterns, prompt improvements, tool chains │
 │  Lifetime: permanent, versioned                             │
-│  Storage: skills_registry + prompt_templates + learnings    │
+│  Storage: memories (type=procedural) + skills_registry +    │
+│           prompt_templates                                  │
+│  Note: skill_selection_learnings are Skill Selector internal│
+│        state, bridged via procedural_memory.py for type     │
+│        unification but NOT injected into MemoryRetriever    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -186,7 +190,7 @@ Inspired by cognitive science and aligned with the latest industry research (Gen
 | Working Memory | `agent_scratchpad` | Direct query by `session_id` | B-tree on `session_id`, `user_id` | Task/chain scoped; archived on completion |
 | Episodic | `conversation_events` + `event_embeddings` | HybridRetriever | IVF-flat vector + fulltext on `content` | Append-only; cross-session via session summaries |
 | Semantic | `memories` (type=semantic) + `sk_knowledge_entries` | MemoryRetriever | IVF-flat vector + fulltext on `content` | Confidence decay (query-time, per trust tier) |
-| Procedural | `memories` (type=procedural) + `skills_registry` | MemoryRetriever | Same as semantic | Versioned; permanent |
+| Procedural | `memories` (type=procedural) | MemoryRetriever | Same as semantic | Versioned; permanent |
 | Profile | `memories` (type=profile) | MemoryRetriever (L0 cache via ProfileManager) | Same as semantic | Synthesized from semantic; cached |
 | Tool Result | `memories` (type=tool_result) | MemoryRetriever | Same as semantic | Session-scoped; 7-day decay |
 
@@ -644,7 +648,7 @@ CREATE TABLE knowledge_entry_sources (
 );
 ```
 
-### Procedural Memory: skills_registry + prompt_templates + selector_learnings
+### Procedural Memory: skills_registry + prompt_templates + skill_selection_learnings
 
 Procedural memory is **how the agent has learned to behave**: versioned skill definitions, versioned system prompts, and patterns learned from skill selection failures.
 

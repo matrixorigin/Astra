@@ -93,9 +93,12 @@ class TestTask1UnifiedSkill:
         tools = [ReadFileTool("."), WriteFileTool("."), BashTool("."), GrepTool(".")]
         for t in tools:
             assert isinstance(t, Skill), f"{t.name} not a Skill"
-            assert hasattr(t, "requirements")
-            assert hasattr(t, "side_effect_profile")
-            assert hasattr(t, "to_openai_schema")
+            assert isinstance(t.requirements, SkillRequirement), f"{t.name} requirements not SkillRequirement"
+            assert isinstance(t.side_effect_profile, SideEffectProfile), f"{t.name} missing SideEffectProfile"
+            assert len(t.requirements.runtime) > 0, f"{t.name} has no runtime requirements"
+            schema = t.to_openai_schema()
+            assert schema["type"] == "function", f"{t.name} schema type wrong"
+            assert schema["function"]["name"] == t.name, f"{t.name} schema name mismatch"
 
     def test_to_openai_schema_structure(self):
         from cli.tools.file_ops import ReadFileTool
@@ -275,10 +278,22 @@ class TestTask3ProceduralMemoryBridge:
         assert f"{prefix}_a" in all_ids
         assert f"{prefix}_i" in all_ids
 
-        # Verify Memory fields on the active one
+        # Verify all meaningful fields on the active one
         mem = next(m for m in active if m.memory_id == f"{prefix}_a")
         assert mem.memory_type == MemoryType.PROCEDURAL
+        assert mem.user_id == "__system__"
         assert mem.initial_confidence == 0.8
+        assert mem.trust_tier == TrustTier.T3_INFERRED
+        assert mem.is_active is True
+        assert mem.session_id is None
+        assert "wrong_skill" in mem.content
+        assert f"{prefix}_active" in mem.content
+
+        # Verify inactive one preserves fields but is_active=False
+        inactive_mem = next(m for m in all_mems if m.memory_id == f"{prefix}_i")
+        assert inactive_mem.is_active is False
+        assert inactive_mem.initial_confidence == 0.5
+        assert inactive_mem.memory_type == MemoryType.PROCEDURAL
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +412,15 @@ class TestGoldenSession:
         )
         db.expire_all()
         row = db.query(SkillModel).filter(SkillModel.skill_id == "e2e_test_skill@1.0.0").first()
+        assert row is not None
         assert row.is_active == 1
+        assert row.status == "active"
+        assert row.skill_name == "e2e_test_skill"
+        assert row.version == "1.0.0"
+        assert row.description == "E2E test skill v1"
+        assert row.category == "test"
+        assert row.triggers == ["e2e_golden"]
+        assert row.code_hash is not None and len(row.code_hash) == 64
 
         # 2. Simulate selection event (what SkillPipeline.get_tools_schema does)
         event_id = str(uuid7())
@@ -417,9 +440,12 @@ class TestGoldenSession:
         # Verify selection event in DB
         evt = db.query(SkillSelectionEvent).filter(SkillSelectionEvent.event_id == event_id).first()
         assert evt is not None
+        assert evt.session_id == "e2e_golden_session"
+        assert evt.user_query == "e2e_golden test query"
         assert evt.skill_name == "e2e_test_skill"
         assert evt.skill_version == "1.0.0"
         assert evt.selection_method == "semantic"
+        assert evt.created_at is not None
 
         # 3. Execute skill
         result = await _TestSkill().execute(SkillInput())
@@ -452,10 +478,14 @@ class TestGoldenSession:
         db.expire_all()
         v1 = db.query(SkillModel).filter(SkillModel.skill_id == "e2e_test_skill@1.0.0").first()
         v2 = db.query(SkillModel).filter(SkillModel.skill_id == "e2e_test_skill@2.0.0").first()
-        assert v1.is_active == 1
-        assert v2.is_active == 0
+        assert v1.is_active == 1 and v1.status == "active"
+        assert v2.is_active == 0 and v2.status == "deprecated"
 
-        # 6. Verify procedural memory bridge sees learnings
+        # 6. Verify procedural memory bridge converts learnings correctly.
+        #    The bridge (procedural_memory.py) is a type-layer adapter for
+        #    Skill Selector internals — it is NOT injected into MemoryRetriever.
+        #    Skill learnings are Skill Selector's internal correction rules,
+        #    consumed only during skill selection, not general memory retrieval.
         lid = str(uuid7())
         db.add(SkillSelectionLearning(
             learning_id=lid,
@@ -471,8 +501,15 @@ class TestGoldenSession:
         golden_mem = next((m for m in mems if m.memory_id == lid), None)
         assert golden_mem is not None
         assert golden_mem.memory_type == MemoryType.PROCEDURAL
+        assert golden_mem.user_id == "__system__"
         assert golden_mem.initial_confidence == 0.7
+        assert golden_mem.trust_tier == TrustTier.T3_INFERRED
+        assert golden_mem.is_active is True
+        assert golden_mem.observed_at is not None
+        assert "wrong_skill" in golden_mem.content
         assert "e2e_golden test query" in golden_mem.content
+        assert "e2e_test_skill" in golden_mem.content
+        assert "better_skill" in golden_mem.content
 
         # 7. Uninstall
         count = registry.uninstall("e2e_test_skill")
