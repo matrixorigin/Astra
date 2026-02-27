@@ -465,7 +465,7 @@ _session_cache: _SessionCache = _SessionCache(_MAX_CACHED_SESSIONS)
 _persist_threads: list[threading.Thread] = []
 
 
-def _flush_persist_threads(timeout: float = 5.0) -> None:
+def _flush_persist_threads(timeout: float = 15.0) -> None:
     """Join all pending persistence threads. Used by tests for deterministic assertions."""
     while _persist_threads:
         t = _persist_threads.pop(0)
@@ -970,6 +970,9 @@ async def chat_turn(
             db.close()
 
     llm_messages, snapshot_id = await asyncio.to_thread(_build_sync)
+    # Eagerly warm shared singletons so the background persist thread
+    # doesn't block on first-time model loading (~8s for sentence-transformers).
+    _get_shared_embed_fn()
 
     model = request.model
     task_hint = _classify_task(request.messages)
