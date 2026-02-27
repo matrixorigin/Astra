@@ -7,6 +7,7 @@ from sqlalchemy import (
 from sqlalchemy.sql import func
 
 from api.base import Base
+from api.models._constants import EMBEDDING_DIM
 
 
 class ContextSnapshot(Base):
@@ -50,7 +51,7 @@ class DecisionAudit(Base):
 class EventEmbedding(Base):
     __tablename__ = "event_embeddings"
     event_id = Column(String(36), primary_key=True)
-    embedding = Column(VectorType(1536, VectorPrecision.F32))
+    embedding = Column(VectorType(EMBEDDING_DIM, VectorPrecision.F32))
     model_name = Column(String(50))
     model_version = Column(String(32))
     embedding_metadata = Column("metadata", JSON)

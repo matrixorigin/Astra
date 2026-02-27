@@ -30,7 +30,7 @@ from core.db_consumer import DbConsumer, DbFactory
 from uuid_utils import uuid7
 
 from api.models import SkillSelectionEvent as EventModel, SkillSelectionLearning as LearningModel
-from core.context.embeddings import EmbeddingService
+from core.context.embeddings import get_embedding_client
 from core.logging_config import get_logger
 from core.sandbox import Sandbox
 from core.skills.learning_config import (
@@ -68,8 +68,8 @@ class SelfImprovingSelector(DbConsumer):
         self.weights = weights or SignalWeights()
         self.thresholds = thresholds or SignalThresholds()
         self.sandbox = Sandbox(db_factory=self._db_factory, account=account)
-        self.embedding_service: EmbeddingService | None = None
-        self._embed_fn = embed_fn  # Injected embed_fn takes priority over EmbeddingService
+        self.embedding_service = None
+        self._embed_fn = embed_fn  # Injected embed_fn takes priority
         self._runtime_config_cache: dict[str, Any] | None = None
         self._runtime_config_loaded_at: datetime | None = None
         self._runtime_config_last_updated_at: datetime | None = None
@@ -532,13 +532,7 @@ class SelfImprovingSelector(DbConsumer):
                 logger.warning(f"Injected embed_fn failed: {exc}")
                 return None
         try:
-            if self.embedding_service is None:
-                try:
-                    self.embedding_service = EmbeddingService(self._db_factory)
-                except Exception as exc:
-                    logger.warning(f"Embedding service init failed: {exc}")
-                    return None
-            return self.embedding_service.embed_text(query)
+            return get_embedding_client().embed(query)
         except Exception as exc:
             logger.warning(f"Embedding generation failed: {exc}")
             return None

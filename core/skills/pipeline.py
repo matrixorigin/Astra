@@ -167,12 +167,11 @@ class SkillPipeline:
         self._audit = audit
         self._learning = learning
 
-        # Resolve embed_fn: explicit > EmbeddingService > None
+        # Resolve embed_fn: explicit > EmbeddingClient singleton > None
         if embed_fn is None:
             try:
-                from core.context.embeddings import EmbeddingService
-                _svc = EmbeddingService(db_factory)
-                embed_fn = _svc.embed_text
+                from core.context.embeddings import get_embedding_client
+                embed_fn = get_embedding_client().embed
             except Exception:  # noqa: BLE001
                 pass  # no embeddings available — keyword fallback
 

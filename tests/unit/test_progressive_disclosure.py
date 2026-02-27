@@ -411,8 +411,8 @@ class TestPipelineEmbedIntegration:
         """Pipeline should work even if no embed_fn is available."""
         from core.skills.pipeline import SkillPipeline
 
-        # Patch the module-level import target so EmbeddingService raises
-        with patch("core.context.embeddings.EmbeddingService", side_effect=Exception("no embeddings")):
+        # Patch get_embedding_client so it raises — pipeline should fall back to None
+        with patch("core.context.embeddings.get_embedding_client", side_effect=Exception("no embeddings")):
             pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False,
                                      embed_fn=None)
         # Should have fallen back to None

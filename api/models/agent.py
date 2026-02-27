@@ -8,6 +8,7 @@ from sqlalchemy import (
 from sqlalchemy.sql import func
 
 from api.base import Base
+from api.models._constants import EMBEDDING_DIM
 
 
 class Agent(Base):
@@ -63,7 +64,7 @@ class Event(Base):
     context_snapshot = Column(JSON)
     token_usage = Column(JSON)
     embedding_ref = Column(String(128))
-    embedding = Column(VectorType(1536, VectorPrecision.F32))
+    embedding = Column(VectorType(EMBEDDING_DIM, VectorPrecision.F32))
     prompt_template_id = Column(String(64))
     skills_snapshot = Column(JSON)
     quality_score = Column(Float)

@@ -1897,10 +1897,8 @@ class ChatLoop:
     def _get_embed_fn(self):
         """Lazy-init embedding function for memory pipeline."""
         try:
-            from api.database import SessionLocal
-            from core.context.embeddings import EmbeddingService
-            svc = EmbeddingService(SessionLocal)
-            return svc.embed_text
+            from core.context.embeddings import get_embedding_client
+            return get_embedding_client().embed
         except Exception:
             return None
 

@@ -1,0 +1,152 @@
+"""Tests for EmbeddingClient and providers."""
+
+import math
+import pytest
+from unittest.mock import MagicMock, patch
+
+from core.embedding.client import EmbeddingClient
+from core.embedding.providers import LocalProvider, MockProvider, OpenAIProvider
+
+
+# ── MockProvider ──────────────────────────────────────────────────────
+
+class TestMockProvider:
+    def test_deterministic(self):
+        c = EmbeddingClient(provider="mock", model="mock", dim=384)
+        assert c.embed("hello") == c.embed("hello")
+
+    def test_correct_dimension(self):
+        c = EmbeddingClient(provider="mock", model="mock", dim=384)
+        assert len(c.embed("hello")) == 384
+        assert c.dimension == 384
+
+    def test_different_texts_differ(self):
+        c = EmbeddingClient(provider="mock", model="mock", dim=384)
+        assert c.embed("hello") != c.embed("goodbye")
+
+    def test_custom_dimension(self):
+        c = EmbeddingClient(provider="mock", model="mock", dim=128)
+        assert len(c.embed("test")) == 128
+        assert c.dimension == 128
+
+    def test_model_name(self):
+        c = EmbeddingClient(provider="mock", model="mock", dim=384)
+        assert c.model_name == "mock"
+
+
+# ── Fail fast ─────────────────────────────────────────────────────────
+
+class TestFailFast:
+    def test_unknown_provider_raises(self):
+        with pytest.raises(ValueError, match="Unknown embedding provider"):
+            EmbeddingClient(provider="nonexistent", model="x", dim=384)
+
+    def test_openai_missing_api_key_raises(self):
+        with pytest.raises(ValueError, match="requires api_key"):
+            EmbeddingClient(provider="openai", model="text-embedding-3-small", dim=1536, api_key="")
+
+    def test_local_dimension_mismatch_raises(self):
+        """If model outputs different dim than config, fail fast."""
+        with pytest.raises(ValueError, match="produces 384-dim.*config says 512"):
+            EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=512)
+
+
+# ── LocalProvider ─────────────────────────────────────────────────────
+
+class TestLocalProvider:
+    def test_correct_dimension(self):
+        c = EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384)
+        vec = c.embed("hello world")
+        assert len(vec) == 384
+        assert c.dimension == 384
+
+    def test_semantic_quality(self):
+        """Similar texts should be closer than unrelated texts."""
+        c = EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384)
+        v_py = c.embed("Python programming language")
+        v_go = c.embed("Go programming language")
+        v_weather = c.embed("The weather is sunny today")
+
+        def l2(a, b):
+            return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+        assert l2(v_py, v_go) < l2(v_py, v_weather)
+
+    def test_model_cache_reuse(self):
+        """Second instantiation should reuse cached model."""
+        from core.embedding.providers import _local_model_cache
+        c1 = EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384)
+        assert "all-MiniLM-L6-v2" in _local_model_cache
+        c2 = EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384)
+        # Same underlying model object
+        assert c1._provider._model is c2._provider._model
+
+    def test_model_name(self):
+        c = EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384)
+        assert c.model_name == "all-MiniLM-L6-v2"
+
+
+# ── OpenAIProvider ────────────────────────────────────────────────────
+
+class TestOpenAIProvider:
+    def test_calls_api_with_correct_params(self):
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.data = [MagicMock(embedding=[0.1] * 1536)]
+        mock_client.embeddings.create.return_value = mock_resp
+
+        with patch("openai.OpenAI", return_value=mock_client):
+            c = EmbeddingClient(
+                provider="openai", model="text-embedding-3-small",
+                dim=1536, api_key="sk-test",
+            )
+            vec = c.embed("hello")
+
+        mock_client.embeddings.create.assert_called_once_with(
+            model="text-embedding-3-small", input="hello", dimensions=1536,
+        )
+        assert len(vec) == 1536
+
+    def test_api_error_propagates(self):
+        """No silent fallback — API errors must propagate."""
+        mock_client = MagicMock()
+        mock_client.embeddings.create.side_effect = RuntimeError("API down")
+
+        with patch("openai.OpenAI", return_value=mock_client):
+            c = EmbeddingClient(
+                provider="openai", model="text-embedding-3-small",
+                dim=1536, api_key="sk-test",
+            )
+            with pytest.raises(RuntimeError, match="API down"):
+                c.embed("hello")
+
+    def test_base_url_passed(self):
+        mock_cls = MagicMock()
+        with patch("openai.OpenAI", mock_cls):
+            EmbeddingClient(
+                provider="openai", model="m", dim=1536,
+                api_key="sk-test", base_url="https://custom.api/v1",
+            )
+        mock_cls.assert_called_once_with(api_key="sk-test", base_url="https://custom.api/v1")
+
+
+# ── Startup validation ────────────────────────────────────────────────
+
+class TestStartupValidation:
+    def test_local_provider_without_sentence_transformers(self):
+        """If sentence-transformers is not installed, local provider should fail fast."""
+        with patch.dict("sys.modules", {"sentence_transformers": None}):
+            from core.embedding.providers import _local_model_cache
+            # Clear cache to force reload attempt
+            old = _local_model_cache.copy()
+            _local_model_cache.clear()
+            try:
+                with pytest.raises((ImportError, ModuleNotFoundError)):
+                    EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384)
+            finally:
+                _local_model_cache.update(old)
+
+    def test_valid_config_succeeds(self):
+        """Valid local config should work."""
+        c = EmbeddingClient(provider="local", model="all-MiniLM-L6-v2", dim=384)
+        assert len(c.embed("test")) == 384

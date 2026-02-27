@@ -232,10 +232,10 @@ class HallucinationFirewall(DbConsumer):
 
         # Slow path: embedding similarity (if available)
         try:
-            from core.context.embeddings import EmbeddingService
-            svc = EmbeddingService(self._db_factory)
-            claim_vec = svc.embed_text(claim.value)
-            ctx_vec = svc.embed_text(context_text[:2000])  # cap context length
+            from core.context.embeddings import get_embedding_client
+            client = get_embedding_client()
+            claim_vec = client.embed(claim.value)
+            ctx_vec = client.embed(context_text[:2000])  # cap context length
             dot = sum(a * b for a, b in zip(claim_vec, ctx_vec))
             norm_a = sum(a * a for a in claim_vec) ** 0.5
             norm_b = sum(b * b for b in ctx_vec) ** 0.5
@@ -323,10 +323,10 @@ class HallucinationFirewall(DbConsumer):
 
             # Primary: embedding cosine similarity
             try:
-                from core.context.embeddings import EmbeddingService
-                svc = EmbeddingService(self._db_factory)
-                resp_vec = svc.embed_text(response[:2000])
-                ctx_vec = svc.embed_text(ctx_text[:2000])
+                from core.context.embeddings import get_embedding_client
+                client = get_embedding_client()
+                resp_vec = client.embed(response[:2000])
+                ctx_vec = client.embed(ctx_text[:2000])
                 dot = sum(a * b for a, b in zip(resp_vec, ctx_vec))
                 norm_a = sum(a * a for a in resp_vec) ** 0.5
                 norm_b = sum(b * b for b in ctx_vec) ** 0.5

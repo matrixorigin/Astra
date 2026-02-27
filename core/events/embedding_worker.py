@@ -66,7 +66,7 @@ class EmbeddingWorker:
         db = self._db_factory()
         try:
             from core.context.embeddings import EmbeddingService
-            svc = EmbeddingService(self._db_factory, provider=self._provider)
+            svc = EmbeddingService(self._db_factory)
 
             while not self._closed:
                 try:
@@ -143,7 +143,7 @@ class EmbeddingWorker:
             db = self._db_factory()
         try:
             from core.context.embeddings import EmbeddingService
-            svc = EmbeddingService(self._db_factory, provider=self._provider)
+            svc = EmbeddingService(self._db_factory)
             return self._process_batch(db, svc)
         finally:
             if own_db:

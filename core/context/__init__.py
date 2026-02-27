@@ -1,6 +1,6 @@
 """Context management package."""
 
-from core.context.embeddings import EmbeddingService
+from core.context.embeddings import EmbeddingService, get_embedding_client
 from core.context.hybrid_retrieval import HybridRetriever
 from skills.knowledge.api import KnowledgeExtractor
 from core.context.lifecycle import MemoryGovernanceEngine

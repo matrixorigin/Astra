@@ -920,9 +920,8 @@ def _get_shared_embed_fn():
         with _shared_embed_lock:
             if _shared_embed_fn is _UNSET:
                 try:
-                    from core.context.embeddings import EmbeddingService
-                    svc = EmbeddingService(SessionLocal)
-                    _shared_embed_fn = svc.embed_text
+                    from core.context.embeddings import get_embedding_client
+                    _shared_embed_fn = get_embedding_client().embed
                 except Exception:
                     _shared_embed_fn = None
     return _shared_embed_fn

@@ -29,7 +29,7 @@ def test_mock_embedding_deterministic(db):
     emb2 = service.embed_text(text)
 
     assert emb1 == emb2
-    assert len(emb1) == 1536
+    assert len(emb1) == service.DIMENSION
 
 
 def test_mock_embedding_different_texts(db):
@@ -61,7 +61,7 @@ def test_store_and_retrieve_embedding(db, db_factory):
     ).fetchone()
 
     assert row is not None
-    assert row.model_name == "text-embedding-3-small"
+    assert row.model_name == service.model
 
     import json
 

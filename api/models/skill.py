@@ -7,6 +7,7 @@ from sqlalchemy import (
 from sqlalchemy.sql import func
 
 from api.base import Base
+from api.models._constants import EMBEDDING_DIM
 
 
 class SkillRegistry(Base):
@@ -116,7 +117,7 @@ class SkillSelectionLearning(Base):
     __tablename__ = "skill_selection_learning"
     learning_id = Column(String(36), primary_key=True)
     query_pattern = Column(String(255), nullable=False, index=True)
-    query_embedding = Column(VectorType(1536, VectorPrecision.F32))
+    query_embedding = Column(VectorType(EMBEDDING_DIM, VectorPrecision.F32))
     wrong_skills = Column(JSON)
     correct_skills = Column(JSON)
     improvement_score = Column(Float)

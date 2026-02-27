@@ -8,6 +8,11 @@ import os
 # Set test encryption key
 os.environ["TOKEN_ENCRYPTION_KEY"] = "test-encryption-key-for-unit-tests-only"
 
+# Embedding: use local model with native 384 dimensions for dev/test
+os.environ.setdefault("EMBEDDING_PROVIDER", "local")
+os.environ.setdefault("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+os.environ.setdefault("EMBEDDING_DIM", "384")
+
 # Disable EventPipeline in tests to prevent background DB sessions from leaking
 os.environ["EVENT_PIPELINE_ENABLED"] = "false"
 
@@ -194,6 +199,7 @@ def _clear_chat_module_state():
     if mod is not None:
         mod._session_cache.clear()
         mod._shared_llm_client = None
+        mod._shared_embed_fn = mod._UNSET
         mod._flush_persist_threads()
     yield
     mod = sys.modules.get("api.routers.chat")
@@ -201,6 +207,7 @@ def _clear_chat_module_state():
         mod._flush_persist_threads()
         mod._session_cache.clear()
         mod._shared_llm_client = None
+        mod._shared_embed_fn = mod._UNSET
     # Clean up run_engine tasks to avoid "Task was destroyed but pending" warnings
     engine_mod = sys.modules.get("core.agent.run_engine")
     if engine_mod is not None:

@@ -40,6 +40,11 @@ class Settings(BaseSettings):
         description="Secret key for encryption",
     )
     
+    # Embedding
+    embedding_provider: str = Field(default="local", description="Embedding provider: local, openai, mock")
+    embedding_model: str = Field(default="all-MiniLM-L6-v2", description="Embedding model name")
+    embedding_dim: int = Field(default=384, description="Embedding vector dimension")
+
     # External Services
     github_token: str | None = Field(default=None, description="GitHub API token")
 
