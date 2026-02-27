@@ -45,7 +45,7 @@
          │
          ▼
   ┌─────────────┐
-  │ CONSOLIDATE │  Reflector: cluster → promote → session summaries
+  │ CONSOLIDATE │  SessionSummarizer: incremental + full summaries
   └──────┬──────┘
          │
          ▼
@@ -355,7 +355,7 @@ effective_confidence(t) = initial_confidence × decay_factor^(days_since_validat
 
 where:
   decay_factor = 0.5  (halves every half_life period)
-  half_life = 30 days (single value for now; trust tiers deferred)
+  half_life = per trust tier: T1=365d, T2=180d, T3=60d, T4=30d
 ```
 
 Confidence decay is **query-time only**. The `memories` table stores
