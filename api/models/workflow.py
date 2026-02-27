@@ -1,11 +1,12 @@
 """Workflow, trigger models."""
 
 from sqlalchemy import (
-    JSON, Column, DateTime, Integer, SmallInteger, String, Text,
+    Column, DateTime, Integer, SmallInteger, String, Text,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
+from api.models._types import NullableJSON as JSON
 
 
 class WorkflowDefinition(Base):

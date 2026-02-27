@@ -3,12 +3,13 @@
 from matrixone import VectorPrecision, VectorType
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy import (
-    Column, DateTime, Float, Index, Integer, JSON, SmallInteger, String, Text,
+    Column, DateTime, Float, Index, Integer, SmallInteger, String, Text,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
 from api.models._constants import EMBEDDING_DIM
+from api.models._types import NullableJSON as JSON
 
 
 class MemoryRecord(Base):

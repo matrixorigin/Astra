@@ -1,11 +1,12 @@
 """Infrastructure models: LLM, config, repo, sandbox, locks."""
 
 from sqlalchemy import (
-    JSON, Column, DateTime, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column, DateTime, Integer, SmallInteger, String, Text, UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
+from api.models._types import NullableJSON as JSON
 
 
 class LLMModel(Base):

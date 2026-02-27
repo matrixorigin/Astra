@@ -2,12 +2,13 @@
 
 from matrixone import VectorPrecision, VectorType
 from sqlalchemy import (
-    JSON, Column, DateTime, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column, DateTime, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
 from api.models._constants import EMBEDDING_DIM
+from api.models._types import NullableJSON as JSON
 
 
 class SkillRegistry(Base):

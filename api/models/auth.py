@@ -1,9 +1,10 @@
 """Auth & identity models."""
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, SmallInteger, String
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, SmallInteger, String
 from sqlalchemy.sql import func
 
 from api.base import Base
+from api.models._types import NullableJSON as JSON
 
 
 class User(Base):

@@ -1,11 +1,12 @@
 """Evaluation, quality, feedback, and training models."""
 
 from sqlalchemy import (
-    JSON, Column, DateTime, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column, DateTime, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
+from api.models._types import NullableJSON as JSON
 
 
 class QualityAssessment(Base):

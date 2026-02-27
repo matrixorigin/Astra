@@ -7,6 +7,7 @@ Covers:
 - _persist_turn_events: tool_result events get correct metadata
 - record_ctx_decision_audits: model_used column is set
 - record_skill_selection: required fields are populated
+- NullableJSON: None stored as SQL NULL, not JSON 'null'
 """
 
 import json
@@ -326,3 +327,42 @@ class TestSkillSelectionFields:
         c = self._run_selection(tc)
         assert c["event_id"] is not None
         assert len(c["event_id"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# NullableJSON type — None → SQL NULL, not JSON 'null'
+# ---------------------------------------------------------------------------
+
+class TestNullableJSON:
+    """Verify NullableJSON stores Python None as SQL NULL."""
+
+    def test_none_returns_none_from_bind_processor(self):
+        """bind_processor(None) must return None (SQL NULL)."""
+        from api.models._types import NullableJSON
+        from unittest.mock import MagicMock
+
+        nj = NullableJSON()
+        dialect = MagicMock()
+        nj.impl_instance = MagicMock()
+        nj.impl_instance.bind_processor.return_value = lambda v: "null" if v is None else str(v)
+
+        processor = nj.bind_processor(dialect)
+        assert processor(None) is None  # SQL NULL, not 'null'
+
+    def test_dict_passes_through_bind_processor(self):
+        """bind_processor({'key': 'val'}) delegates to impl."""
+        from api.models._types import NullableJSON
+        from unittest.mock import MagicMock
+
+        nj = NullableJSON()
+        dialect = MagicMock()
+        nj.impl_instance = MagicMock()
+        nj.impl_instance.bind_processor.return_value = lambda v: f"json:{v}"
+
+        processor = nj.bind_processor(dialect)
+        assert processor({"key": "val"}) == "json:{'key': 'val'}"
+
+    def test_no_process_result_value_override(self):
+        """NullableJSON must NOT override process_result_value — no backward compat."""
+        from api.models._types import NullableJSON
+        assert "process_result_value" not in NullableJSON.__dict__
