@@ -1,6 +1,6 @@
 """Context compaction for long-horizon tasks.
 
-Design ref: memory-and-context.md §2 "Compaction for Long-Horizon Tasks"
+Design ref: memory-architecture.md §2 "Compaction for Long-Horizon Tasks"
 
 When the message chain approaches the context window limit:
 1. Clear raw tool outputs deep in history (already processed)

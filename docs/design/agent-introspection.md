@@ -2,7 +2,7 @@
 
 > **Status**: Core Design — single source of truth for agent self-awareness and meta-cognition  
 > **Last Updated**: 2026-02-25 (revised per review feedback)  
-> **Related**: [skills-and-tools.md](skills-and-tools.md), [memory-and-context.md](memory-and-context.md), [edge-cloud-execution.md](edge-cloud-execution.md), [agents-and-orchestration.md](agents-and-orchestration.md), [prompt-lifecycle.md](prompt-lifecycle.md)
+> **Related**: [skills-and-tools.md](skills-and-tools.md), [memory-architecture.md](memory-architecture.md), [edge-cloud-execution.md](edge-cloud-execution.md), [agents-and-orchestration.md](agents-and-orchestration.md), [prompt-lifecycle.md](prompt-lifecycle.md)
 
 ---
 

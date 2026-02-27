@@ -34,7 +34,7 @@ Welcome to mo-agent documentation! This guide will help you find the information
 **Understand the system design:**
 
 - [Architecture](design/ARCHITECTURE.md) - System overview and data flow
-- [Memory and Context](design/memory-and-context.md) - Cognitive memory and context engineering
+- [Memory Architecture](design/memory-architecture.md) - Cognitive memory and context engineering
 - [Trust and Safety](design/trust-and-safety.md) - Audit, guardrails, and robustness
 - [Skills and Tools](design/skills-and-tools.md) - Skill architecture and marketplace
 - [Agents and Orchestration](design/agents-and-orchestration.md) - ChatLoop, planning, and teams

@@ -29,7 +29,7 @@ The breakthrough feature that enables automatic learning from failures.
 docs/
 ├── design/                          # High-level design documents
 │   ├── ARCHITECTURE.md
-│   ├── memory-and-context.md
+│   ├── memory-architecture.md
 │   ├── trust-and-safety.md
 │   ├── skills-and-tools.md
 │   ├── agents-and-orchestration.md

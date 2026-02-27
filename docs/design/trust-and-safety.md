@@ -41,7 +41,7 @@ Every agent decision binds to a versioned data snapshot. The complete chain of i
 Decision Record = {
   decision_id,
   event_id,                    -- The LLM response event
-  context_snapshot_id,         -- Exactly what the LLM saw (see memory-and-context.md)
+  context_snapshot_id,         -- Exactly what the LLM saw (see memory-architecture.md)
   prompt_template_id@version,  -- Which instructions
   skills_used: [{id, version}],-- Which capabilities
   llm_model_used,              -- Which model (including checkpoint)

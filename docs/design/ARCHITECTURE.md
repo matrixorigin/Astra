@@ -95,7 +95,7 @@ This is the index. Each document is the **single source of truth** for its domai
 
 | Document | Scope |
 |----------|-------|
-| [Memory and Context](memory-and-context.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
+| [Memory Architecture](memory-architecture.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
 | [Trust and Safety](trust-and-safety.md) | Decision audit, hallucination firewall, uncertainty quantification, regression gate, observability, guardrails |
 | [Skills and Tools](skills-and-tools.md) | Skill system, MCP compatibility, tool design, side-effect profiles, progressive disclosure, marketplace |
 | [Skill-as-Package](skill-as-package.md) | Stateful skill architecture: platform-defined schema, install lifecycle, skill API layer, credential management, `sk_` table naming |
@@ -134,13 +134,13 @@ This is the index. Each document is the **single source of truth** for its domai
 
 Industry trend: Anthropic's context engineering, Letta/MemGPT's memory OS, EverMemOS's dual-layer architecture, Observational Memory's 95% LongMemEval score — all point to memory as **the** differentiator for production agents.
 
-Our position: Memory is not "RAG bolted on later." It is a cognitive architecture with distinct layers (sensory → working → episodic → semantic → procedural), each with its own storage, retrieval, and lifecycle. See [Memory and Context](memory-and-context.md).
+Our position: Memory is not "RAG bolted on later." It is a cognitive architecture with distinct layers (sensory → working → episodic → semantic → procedural), each with its own storage, retrieval, and lifecycle. See [Memory Architecture](memory-architecture.md).
 
 ### 2. Context Engineering Over Prompt Engineering
 
 Following Anthropic's insight: the question is not "how to write a better prompt" but "what configuration of context maximizes desired behavior." Context is a finite attention budget. Every token must earn its place.
 
-Our implementation: task-aware budget allocation, just-in-time retrieval, compaction for long-horizon tasks, structured note-taking for cross-session persistence. See [Memory and Context](memory-and-context.md).
+Our implementation: task-aware budget allocation, just-in-time retrieval, compaction for long-horizon tasks, structured note-taking for cross-session persistence. See [Memory Architecture](memory-architecture.md).
 
 ### 3. Skills Are Stateful Packages
 

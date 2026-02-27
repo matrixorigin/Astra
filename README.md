@@ -115,7 +115,7 @@ make dev-stop          # Stop everything
 
 **Design & Architecture:**
 - [Architecture](docs/design/ARCHITECTURE.md)
-- [Memory and Context](docs/design/memory-and-context.md)
+- [Memory Architecture](docs/design/memory-architecture.md)
 - [Trust and Safety](docs/design/trust-and-safety.md)
 - [All Design Docs](docs/design/)
 
