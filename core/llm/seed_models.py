@@ -2,7 +2,7 @@
 
 import json
 
-from sqlalchemy import text
+
 from sqlalchemy.orm import Session
 from uuid_utils import uuid7
 
@@ -65,18 +65,12 @@ SEED_MODELS = [
 
 def seed_models(db: Session) -> int:
     """Insert default models if registry is empty. Returns count of seeded models."""
-    existing = db.execute(
-        text("SELECT 1 FROM infra_configs WHERE key_name = 'model_registry' AND scope_type = 'global' LIMIT 1")
-    ).fetchone()
-    if existing:
+    from api.models import Config
+    if db.query(Config).filter(Config.key_name == "model_registry", Config.scope_type == "global").first():
         return 0
-
-    db.execute(
-        text(
-            "INSERT INTO infra_configs (config_id, key_name, value, scope_type, scope_user_id) "
-            "VALUES (:id, 'model_registry', :value, 'global', NULL)"
-        ),
-        {"id": str(uuid7()), "value": json.dumps(SEED_MODELS)},
-    )
+    db.add(Config(
+        config_id=str(uuid7()), key_name="model_registry",
+        value=json.dumps(SEED_MODELS), scope_type="global", scope_user_id=None,
+    ))
     db.commit()
     return len(SEED_MODELS)

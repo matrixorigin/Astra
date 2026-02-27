@@ -1,6 +1,6 @@
 """Trigger management — webhook + cron schedule → AgentRun creation.
 
-Triggers are persisted in the `triggers` table. Each trigger defines:
+Triggers are persisted in the `wf_triggers` table. Each trigger defines:
 - What agent to run, with what input/context
 - How it's activated: webhook (external POST) or schedule (cron)
 - Owner (user_id) for authorization
@@ -13,9 +13,9 @@ from typing import Callable
 from uuid import uuid4
 
 from croniter import croniter
-from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from api.models import Trigger
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -48,27 +48,17 @@ def create_trigger(
     secret = str(uuid4()) if trigger_type == "webhook" else None
     now = datetime.now(timezone.utc)
 
-    # Compute next_fire for schedule triggers
     next_fire = None
     if trigger_type == "schedule":
         next_fire = croniter(cron_expr, now).get_next(datetime)
 
-    db.execute(
-        text(
-            "INSERT INTO wf_triggers "
-            "(trigger_id, user_id, agent_id, trigger_type, name, user_input, context, "
-            " cron_expr, secret, session_id, next_fire_at, is_active, created_at) "
-            "VALUES (:tid, :uid, :aid, :tt, :name, :input, :ctx, "
-            " :cron, :secret, :sid, :nf, 1, :now)"
-        ),
-        {
-            "tid": trigger_id, "uid": user_id, "aid": agent_id,
-            "tt": trigger_type, "name": name, "input": user_input,
-            "ctx": json.dumps(context) if context else None,
-            "cron": cron_expr, "secret": secret, "sid": session_id,
-            "nf": next_fire, "now": now,
-        },
-    )
+    db.add(Trigger(
+        trigger_id=trigger_id, user_id=user_id, agent_id=agent_id,
+        trigger_type=trigger_type, name=name, user_input=user_input,
+        context=json.dumps(context) if context else None,
+        cron_expr=cron_expr, secret=secret, session_id=session_id,
+        next_fire_at=next_fire, is_active=1, created_at=now,
+    ))
     db.commit()
 
     result = {
@@ -84,29 +74,21 @@ def create_trigger(
 
 
 def get_trigger(db: Session, trigger_id: str) -> dict | None:
-    row = db.execute(
-        text("SELECT * FROM wf_triggers WHERE trigger_id = :tid"),
-        {"tid": trigger_id},
-    ).mappings().first()
-    return dict(row) if row else None
+    row = db.query(Trigger).filter(Trigger.trigger_id == trigger_id).first()
+    if not row:
+        return None
+    return {c.name: getattr(row, c.name) for c in row.__table__.columns}
 
 
 def list_triggers(db: Session, user_id: str) -> list[dict]:
-    rows = db.execute(
-        text("SELECT trigger_id, trigger_type, name, agent_id, is_active, cron_expr, next_fire_at "
-             "FROM wf_triggers WHERE user_id = :uid ORDER BY created_at DESC"),
-        {"uid": user_id},
-    ).mappings().fetchall()
-    return [dict(r) for r in rows]
+    rows = db.query(Trigger).filter(Trigger.user_id == user_id).order_by(Trigger.created_at.desc()).all()
+    return [{c.name: getattr(r, c.name) for c in r.__table__.columns} for r in rows]
 
 
 def delete_trigger(db: Session, trigger_id: str) -> bool:
-    result = db.execute(
-        text("DELETE FROM wf_triggers WHERE trigger_id = :tid"),
-        {"tid": trigger_id},
-    )
+    count = db.query(Trigger).filter(Trigger.trigger_id == trigger_id).delete()
     db.commit()
-    return result.rowcount > 0
+    return count > 0
 
 
 def fire_trigger(
@@ -124,7 +106,6 @@ def fire_trigger(
     from core.agent.run_engine import RunEngine, _run_tasks
     import asyncio
 
-    # Read trigger metadata with a short-lived session.
     db = db_factory()
     try:
         trig = get_trigger(db, trigger_id)
@@ -165,10 +146,7 @@ def advance_schedule(db: Session, trigger_id: str) -> None:
         return
     now = datetime.now(timezone.utc)
     next_fire = croniter(trig["cron_expr"], now).get_next(datetime)
-    db.execute(
-        text("UPDATE wf_triggers SET next_fire_at = :nf WHERE trigger_id = :tid"),
-        {"nf": next_fire, "tid": trigger_id},
-    )
+    db.query(Trigger).filter(Trigger.trigger_id == trigger_id).update({"next_fire_at": next_fire})
     db.commit()
 
 
@@ -183,15 +161,12 @@ def claim_and_advance(db: Session, trigger_id: str) -> bool:
         return False
     now = datetime.now(timezone.utc)
     next_fire = croniter(trig["cron_expr"], now).get_next(datetime)
-    result = db.execute(
-        text(
-            "UPDATE wf_triggers SET next_fire_at = :nf "
-            "WHERE trigger_id = :tid AND next_fire_at <= :now"
-        ),
-        {"nf": next_fire, "tid": trigger_id, "now": now},
-    )
+    count = db.query(Trigger).filter(
+        Trigger.trigger_id == trigger_id,
+        Trigger.next_fire_at <= now,
+    ).update({"next_fire_at": next_fire})
     db.commit()
-    return result.rowcount > 0
+    return count > 0
 
 
 def verify_secret(provided: str, expected: str) -> bool:
@@ -201,14 +176,11 @@ def verify_secret(provided: str, expected: str) -> bool:
 
 def get_due_triggers(db: Session) -> list[str]:
     """Get all active schedule triggers whose next_fire_at <= now."""
-    rows = db.execute(
-        text(
-            "SELECT trigger_id FROM wf_triggers "
-            "WHERE trigger_type = 'schedule' AND is_active = 1 "
-            "AND next_fire_at <= :now"
-        ),
-        {"now": datetime.now(timezone.utc)},
-    ).fetchall()
+    rows = db.query(Trigger.trigger_id).filter(
+        Trigger.trigger_type == "schedule",
+        Trigger.is_active == 1,
+        Trigger.next_fire_at <= datetime.now(timezone.utc),
+    ).all()
     return [row[0] for row in rows]
 
 

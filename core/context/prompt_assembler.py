@@ -328,13 +328,10 @@ class PromptAssembler(DbConsumer):
         with self._db() as db:
             if agent_id:
                 try:
-                    row = db.execute(
-                        text("SELECT agent_config FROM agent_agents WHERE agent_id = :aid"),
-                        {"aid": agent_id},
-                    ).fetchone()
+                    from api.models import Agent
+                    row = db.query(Agent.agent_config).filter(Agent.agent_id == agent_id).first()
                     if row and row[0]:
                         raw = row[0]
-                        # Guard against empty/whitespace-only strings from DB
                         config = raw if isinstance(raw, dict) else json.loads(raw) if isinstance(raw, str) and raw.strip() else None
                         if config and config.get("system_prompt"):
                             return config["system_prompt"]
@@ -349,10 +346,8 @@ class PromptAssembler(DbConsumer):
             if not agent_id:
                 return "default"
             try:
-                row = db.execute(
-                    text("SELECT agent_type FROM agent_agents WHERE agent_id = :aid"),
-                    {"aid": agent_id},
-                ).fetchone()
+                from api.models import Agent
+                row = db.query(Agent.agent_type).filter(Agent.agent_id == agent_id).first()
                 return row[0] if row and row[0] else "default"
             except SQLAlchemyError:
                 return "default"
@@ -382,9 +377,8 @@ class PromptAssembler(DbConsumer):
 
             # Cloud skills
             try:
-                rows = db.execute(
-                    text("SELECT skill_name FROM skill_registry WHERE is_active = 1 LIMIT 20")
-                ).fetchall()
+                from api.models import SkillRegistry
+                rows = db.query(SkillRegistry.skill_name).filter(SkillRegistry.is_active == 1).limit(20).all()
                 if rows:
                     names = [r[0] for r in rows]
                     parts.append(f"- Cloud skills: {', '.join(names)}")
@@ -394,10 +388,8 @@ class PromptAssembler(DbConsumer):
             # Delegation
             if agent_id:
                 try:
-                    row = db.execute(
-                        text("SELECT agent_config FROM agent_agents WHERE agent_id = :aid"),
-                        {"aid": agent_id},
-                    ).fetchone()
+                    from api.models import Agent
+                    row = db.query(Agent.agent_config).filter(Agent.agent_id == agent_id).first()
                     if row and row[0]:
                         config = row[0] if isinstance(row[0], dict) else json.loads(row[0])
                         delegates = config.get("delegate_to") or config.get("allowed_delegates")

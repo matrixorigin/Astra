@@ -75,28 +75,16 @@ SEED_AGENTS = [
 
 def seed_agents(db) -> int:
     """Insert seed agents if they don't exist. Returns count of inserted agents."""
-    from sqlalchemy import text
+    from api.models import Agent
     count = 0
     for agent in SEED_AGENTS:
-        existing = db.execute(
-            text("SELECT 1 FROM agent_agents WHERE agent_id = :aid"),
-            {"aid": agent["agent_id"]},
-        ).fetchone()
-        if existing:
+        if db.query(Agent).filter(Agent.agent_id == agent["agent_id"]).first():
             continue
-        db.execute(
-            text(
-                "INSERT INTO agent_agents (agent_id, agent_name, agent_type, owner_user_id, agent_config) "
-                "VALUES (:aid, :name, :type, :owner, :config)"
-            ),
-            {
-                "aid": agent["agent_id"],
-                "name": agent["agent_name"],
-                "type": agent["agent_type"],
-                "owner": "system",
-                "config": json.dumps(agent["agent_config"]),
-            },
-        )
+        db.add(Agent(
+            agent_id=agent["agent_id"], agent_name=agent["agent_name"],
+            agent_type=agent["agent_type"], owner_user_id="system",
+            agent_config=agent["agent_config"],
+        ))
         count += 1
     db.commit()
     return count

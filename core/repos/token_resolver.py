@@ -177,9 +177,8 @@ class TokenResolver(DbConsumer):
         """Check if global token fallback is allowed using ORM."""
 
         with self._db() as db:
-            result = db.execute(
-                text("SELECT value FROM infra_configs WHERE key_name = 'allow_global_repo_token'")
-            ).first()
+            from api.models import Config
+            result = db.query(Config.value).filter(Config.key_name == "allow_global_repo_token").first()
 
             if not result:
                 return False

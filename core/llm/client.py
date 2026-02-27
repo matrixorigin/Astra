@@ -109,23 +109,21 @@ class LLMClient(DbConsumer):
         with self._db() as db:
             config = None
             try:
-                result = db.execute(
-                    text("SELECT value FROM infra_configs WHERE key_name = 'llm_config' LIMIT 1")
-                )
-                row = result.first()
+                from api.models import Config
+                row = db.query(Config.value).filter(Config.key_name == "llm_config").first()
                 if row:
-                    config = json.loads(row.value)
+                    config = json.loads(row[0])
             except Exception:
                 pass
             if not config:
-                # Auto-detect from infra_llm_models table (first active model)
                 provider = os.getenv("LLM_PROVIDER", "")
                 model = os.getenv("LLM_MODEL", "")
                 if not provider or not model:
                     try:
-                        row = db.execute(
-                            text("SELECT model_name, provider FROM infra_llm_models WHERE is_active=1 ORDER BY created_at LIMIT 1")
-                        ).first()
+                        from api.models import LLMModel
+                        row = db.query(LLMModel.model_name, LLMModel.provider).filter(
+                            LLMModel.is_active == 1
+                        ).order_by(LLMModel.created_at).first()
                         if row:
                             model = model or row[0]
                             provider = provider or row[1]
@@ -183,9 +181,8 @@ class LLMClient(DbConsumer):
 
             # Load active models and init their providers (per-model keys)
             try:
-                rows = db.execute(
-                    text("SELECT model_name, provider, api_key_encrypted, base_url FROM infra_llm_models WHERE is_active = 1")
-                ).fetchall()
+                from api.models import LLMModel
+                rows = db.query(LLMModel).filter(LLMModel.is_active == 1).all()
             except Exception as e:
                 logger.debug(f"Failed to load infra_llm_models: {e}")
                 return
@@ -224,12 +221,12 @@ class LLMClient(DbConsumer):
         with self._db() as db:
             from core.llm.constants import PROVIDER_BASE_URLS
             try:
-                row = db.execute(
-                    text("SELECT base_url FROM infra_llm_models WHERE provider = :provider AND is_active = 1 LIMIT 1"),
-                    {"provider": provider},
+                from api.models import LLMModel
+                row = db.query(LLMModel.base_url).filter(
+                    LLMModel.provider == provider, LLMModel.is_active == 1
                 ).first()
-                if row and row.base_url:
-                    return row.base_url
+                if row and row[0]:
+                    return row[0]
             except Exception:
                 pass
             return PROVIDER_BASE_URLS.get(provider)
@@ -636,40 +633,29 @@ class LLMClient(DbConsumer):
             log_id = str(uuid7())
             provider_str = provider.value if isinstance(provider, LLMProvider) else str(provider)
             try:
+                from api.models import LLMCallLog as LLMCallLogModel
                 if response:
-                    db.execute(
-                        text("""INSERT INTO eval_llm_call_logs (
-                            log_id, event_id, user_id, provider, model,
-                            tokens_prompt, tokens_completion, tokens_total,
-                            cost_usd, latency_ms, status, metadata, created_at
-                        ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
-                            :tp, :tc, :tt, :cost, :lat, :status, :meta, :ts)"""),
-                        {
-                            "log_id": log_id, "event_id": event_id, "user_id": user_id,
-                            "provider": provider_str, "model": response.model,
-                            "tp": response.tokens_prompt, "tc": response.tokens_completion,
-                            "tt": response.tokens_total, "cost": response.cost_usd,
-                            "lat": response.latency_ms, "status": status,
-                            "meta": json.dumps(metadata) if metadata else None,
-                            "ts": datetime.now(timezone.utc),
-                        },
-                    )
+                    db.add(LLMCallLogModel(
+                        log_id=log_id, event_id=event_id, user_id=user_id,
+                        provider=provider_str, model=response.model,
+                        tokens_prompt=response.tokens_prompt,
+                        tokens_completion=response.tokens_completion,
+                        tokens_total=response.tokens_total,
+                        cost_usd=response.cost_usd, latency_ms=response.latency_ms,
+                        status=status,
+                        metadata=json.dumps(metadata) if metadata else None,
+                        created_at=datetime.now(timezone.utc),
+                    ))
                 else:
-                    db.execute(
-                        text("""INSERT INTO eval_llm_call_logs (
-                            log_id, event_id, user_id, provider, model,
-                            tokens_prompt, tokens_completion, tokens_total,
-                            cost_usd, latency_ms, status, error_message, metadata, created_at
-                        ) VALUES (:log_id, :event_id, :user_id, :provider, :model,
-                            0, 0, 0, 0.0, :lat, :status, :err, :meta, :ts)"""),
-                        {
-                            "log_id": log_id, "event_id": event_id, "user_id": user_id,
-                            "provider": provider_str, "model": "unknown",
-                            "lat": latency_ms, "status": status, "err": error_message,
-                            "meta": json.dumps(metadata) if metadata else None,
-                            "ts": datetime.now(timezone.utc),
-                        },
-                    )
+                    db.add(LLMCallLogModel(
+                        log_id=log_id, event_id=event_id, user_id=user_id,
+                        provider=provider_str, model="unknown",
+                        tokens_prompt=0, tokens_completion=0, tokens_total=0,
+                        cost_usd=0.0, latency_ms=latency_ms, status=status,
+                        error_message=error_message,
+                        metadata=json.dumps(metadata) if metadata else None,
+                        created_at=datetime.now(timezone.utc),
+                    ))
                 db.commit()
             except Exception as e:
                 db.rollback()
@@ -677,23 +663,15 @@ class LLMClient(DbConsumer):
 
     def get_call_logs(self, event_id=None, user_id=None) -> list[LLMCallLog]:
         with self._db() as db:
+            from api.models import LLMCallLog as LLMCallLogModel
+            q = db.query(LLMCallLogModel).order_by(LLMCallLogModel.created_at.desc())
             if event_id:
-                result = db.execute(
-                    text("SELECT * FROM eval_llm_call_logs WHERE event_id = :event_id ORDER BY created_at DESC"),
-                    {"event_id": event_id}
-                )
-                results = result.fetchall()
+                q = q.filter(LLMCallLogModel.event_id == event_id)
             elif user_id:
-                result = db.execute(
-                    text("SELECT * FROM eval_llm_call_logs WHERE user_id = :user_id ORDER BY created_at DESC LIMIT 100"),
-                    {"user_id": user_id}
-                )
-                results = result.fetchall()
+                q = q.filter(LLMCallLogModel.user_id == user_id).limit(100)
             else:
-                result = db.execute(
-                    text("SELECT * FROM eval_llm_call_logs ORDER BY created_at DESC LIMIT 100")
-                )
-                results = result.fetchall()
+                q = q.limit(100)
+            results = q.all()
             return [
                 LLMCallLog(
                     log_id=r.log_id,

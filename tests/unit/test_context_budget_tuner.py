@@ -115,9 +115,7 @@ class TestContextManagerBudgetOverride:
 
         db = Mock()
         override = {"debugging": {"logs": 0.50, "code": 0.25, "history": 0.15, "docs": 0.10}}
-        mock_result = Mock()
-        mock_result.first.return_value = (json.dumps(override),)
-        db.execute.return_value = mock_result
+        db.query.return_value.filter.return_value.first.return_value = (json.dumps(override),)
 
         with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
              patch("core.context.prompts.PromptManager.__init__", return_value=None), \
@@ -131,7 +129,7 @@ class TestContextManagerBudgetOverride:
         from core.context.manager import ContextManager, TaskType, _BUDGET_RATIOS
 
         db = Mock()
-        db.execute.return_value.first.return_value = None
+        db.query.return_value.filter.return_value.first.return_value = None
 
         with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
              patch("core.context.prompts.PromptManager.__init__", return_value=None), \
@@ -146,9 +144,7 @@ class TestContextManagerBudgetOverride:
 
         db = Mock()
         override = {"debugging": {"logs": 0.50, "code": 0.25, "history": 0.15, "docs": 0.10}}
-        mock_result = Mock()
-        mock_result.first.return_value = (json.dumps(override),)
-        db.execute.return_value = mock_result
+        db.query.return_value.filter.return_value.first.return_value = (json.dumps(override),)
 
         with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
              patch("core.context.prompts.PromptManager.__init__", return_value=None), \
@@ -158,13 +154,13 @@ class TestContextManagerBudgetOverride:
             mgr._load_budget_ratios(TaskType.DEBUGGING)  # second call should use cache
 
         # Only one DB query despite two calls
-        assert db.execute.call_count == 1
+        assert db.query.call_count == 1
 
     def test_load_budget_ratios_logs_on_exception(self):
         from core.context.manager import ContextManager, TaskType
 
         db = Mock()
-        db.execute.side_effect = Exception("connection lost")
+        db.query.side_effect = Exception("connection lost")
 
         with patch("core.context.embeddings.EmbeddingService.__init__", return_value=None), \
              patch("core.context.prompts.PromptManager.__init__", return_value=None), \

@@ -259,8 +259,7 @@ class TestMultiAgentE2E:
     @pytest.mark.asyncio
     async def test_agent_config_injection(self, engine, mock_db):
         """Child run should receive system_prompt from agent config."""
-        # Mock DB to return agent config
-        mock_db.execute.return_value.fetchone.return_value = (
+        mock_db.query.return_value.filter.return_value.first.return_value = (
             json.dumps({
                 "system_prompt": "You are a security expert.",
                 "allowed_tools": ["read_file"],
@@ -340,8 +339,7 @@ class TestSeedAgents:
     def test_seed_inserts_agents(self):
         from core.agent.seed_agents import seed_agents, SEED_AGENTS
         db = MagicMock()
-        # No existing agents
-        db.execute.return_value.fetchone.return_value = None
+        db.query.return_value.filter.return_value.first.return_value = None
         count = seed_agents(db)
         assert count == len(SEED_AGENTS)
         db.commit.assert_called_once()
@@ -349,8 +347,7 @@ class TestSeedAgents:
     def test_seed_skips_existing(self):
         from core.agent.seed_agents import seed_agents
         db = MagicMock()
-        # All agents already exist
-        db.execute.return_value.fetchone.return_value = (1,)
+        db.query.return_value.filter.return_value.first.return_value = MagicMock()
         count = seed_agents(db)
         assert count == 0
 

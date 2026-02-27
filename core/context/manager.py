@@ -263,9 +263,8 @@ class ContextManager(DbConsumer):
         try:
             import json
             with self._db() as db:
-                row = db.execute(
-                    text("SELECT value FROM infra_configs WHERE key_name = 'context_budget_ratios' LIMIT 1"),
-                ).first()
+                from api.models import Config
+                row = db.query(Config.value).filter(Config.key_name == "context_budget_ratios").first()
             if row:
                 overrides = json.loads(row[0]) if isinstance(row[0], str) else row[0]
                 self._budget_cache = overrides

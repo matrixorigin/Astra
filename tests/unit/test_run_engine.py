@@ -683,14 +683,14 @@ class TestAgentConfigLogging:
 
     def test_load_config_success(self, engine, mock_db):
         import json
-        mock_db.execute.return_value.fetchone.return_value = (
+        mock_db.query.return_value.filter.return_value.first.return_value = (
             json.dumps({"system_prompt": "You are helpful"}),
         )
         result = engine._load_agent_config("test-agent")
         assert result == {"system_prompt": "You are helpful"}
 
     def test_load_config_no_row(self, engine, mock_db):
-        mock_db.execute.return_value.fetchone.return_value = None
+        mock_db.query.return_value.filter.return_value.first.return_value = None
         result = engine._load_agent_config("test-agent")
         assert result is None
 

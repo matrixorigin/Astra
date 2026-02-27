@@ -15,10 +15,11 @@ from core.agent.triggers import (
 @pytest.fixture
 def mock_db():
     db = MagicMock()
-    db.execute.return_value.mappings.return_value.first.return_value = None
-    db.execute.return_value.mappings.return_value.fetchall.return_value = []
-    db.execute.return_value.fetchall.return_value = []
-    db.execute.return_value.rowcount = 1
+    db.query.return_value.filter.return_value.first.return_value = None
+    db.query.return_value.filter.return_value.all.return_value = []
+    db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
+    db.query.return_value.filter.return_value.delete.return_value = 1
+    db.query.return_value.filter.return_value.update.return_value = 1
     return db
 
 
@@ -81,14 +82,12 @@ class TestFireTrigger:
             "context": None, "is_active": 1, "session_id": None,
             "cron_expr": None, "secret": "s1",
         }
-        mock_db.execute.return_value.mappings.return_value.first.return_value = trig
 
         def factory():
-            m = MagicMock()
-            m.execute.return_value.mappings.return_value.first.return_value = trig
-            return m
+            return MagicMock()
 
-        with patch("core.agent.run_engine.RunEngine") as MockEngine, \
+        with patch("core.agent.triggers.get_trigger", return_value=trig), \
+             patch("core.agent.run_engine.RunEngine") as MockEngine, \
              patch("core.agent.triggers._auto_session", return_value="sess-1"), \
              patch("asyncio.create_task"):
             mock_run = MagicMock()
@@ -103,32 +102,29 @@ class TestFireTrigger:
 
     def test_fire_inactive_trigger(self, mock_db):
         trig = {"trigger_id": "t1", "is_active": 0, "trigger_type": "webhook"}
-        mock_db.execute.return_value.mappings.return_value.first.return_value = trig
 
         def factory():
-            m = MagicMock()
-            m.execute.return_value.mappings.return_value.first.return_value = trig
-            return m
+            return MagicMock()
 
-        with pytest.raises(ValueError, match="disabled"):
-            fire_trigger(factory, "t1")
+        with patch("core.agent.triggers.get_trigger", return_value=trig):
+            with pytest.raises(ValueError, match="disabled"):
+                fire_trigger(factory, "t1")
 
     def test_fire_nonexistent_trigger(self, mock_db):
         mock_db.execute.return_value.mappings.return_value.first.return_value = None
 
         def factory():
-            m = MagicMock()
-            m.execute.return_value.mappings.return_value.first.return_value = None
-            return m
+            return MagicMock()
 
-        with pytest.raises(ValueError, match="not found"):
-            fire_trigger(factory, "nope")
+        with patch("core.agent.triggers.get_trigger", return_value=None):
+            with pytest.raises(ValueError, match="not found"):
+                fire_trigger(factory, "nope")
 
 
 class TestGetDueTriggers:
 
     def test_returns_due_trigger_ids(self, mock_db):
-        mock_db.execute.return_value.fetchall.return_value = [("t1",), ("t2",)]
+        mock_db.query.return_value.filter.return_value.all.return_value = [("t1",), ("t2",)]
         result = get_due_triggers(mock_db)
         assert result == ["t1", "t2"]
 
@@ -140,18 +136,21 @@ class TestAdvanceSchedule:
             "trigger_id": "t1", "cron_expr": "0 9 * * *",
             "trigger_type": "schedule", "is_active": 1,
         }
-        mock_db.execute.return_value.mappings.return_value.first.return_value = trig
-        advance_schedule(mock_db, "t1")
+        with patch("core.agent.triggers.get_trigger", return_value=trig):
+            advance_schedule(mock_db, "t1")
         mock_db.commit.assert_called()
 
 
 class TestListAndDelete:
 
     def test_list_triggers(self, mock_db):
-        mock_db.execute.return_value.mappings.return_value.fetchall.return_value = [
-            {"trigger_id": "t1", "name": "hook1", "trigger_type": "webhook",
-             "agent_id": "dev-agent", "is_active": 1, "cron_expr": None, "next_fire_at": None},
-        ]
+        row = MagicMock()
+        row.__table__ = MagicMock()
+        col = MagicMock()
+        col.name = "trigger_id"
+        row.__table__.columns = [col]
+        row.trigger_id = "t1"
+        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [row]
         result = list_triggers(mock_db, "u1")
         assert len(result) == 1
         assert result[0]["trigger_id"] == "t1"
@@ -165,19 +164,18 @@ class TestClaimAndAdvance:
 
     def test_claim_succeeds_when_due(self, mock_db):
         trig = {"trigger_id": "t1", "cron_expr": "0 9 * * *", "is_active": 1}
-        mock_db.execute.return_value.mappings.return_value.first.return_value = trig
-        mock_db.execute.return_value.rowcount = 1
-        assert claim_and_advance(mock_db, "t1") is True
+        with patch("core.agent.triggers.get_trigger", return_value=trig):
+            assert claim_and_advance(mock_db, "t1") is True
 
     def test_claim_fails_when_already_claimed(self, mock_db):
         trig = {"trigger_id": "t1", "cron_expr": "0 9 * * *", "is_active": 1}
-        mock_db.execute.return_value.mappings.return_value.first.return_value = trig
-        mock_db.execute.return_value.rowcount = 0
-        assert claim_and_advance(mock_db, "t1") is False
+        mock_db.query.return_value.filter.return_value.update.return_value = 0
+        with patch("core.agent.triggers.get_trigger", return_value=trig):
+            assert claim_and_advance(mock_db, "t1") is False
 
     def test_claim_returns_false_for_missing_trigger(self, mock_db):
-        mock_db.execute.return_value.mappings.return_value.first.return_value = None
-        assert claim_and_advance(mock_db, "nope") is False
+        with patch("core.agent.triggers.get_trigger", return_value=None):
+            assert claim_and_advance(mock_db, "nope") is False
 
 
 class TestVerifySecret:

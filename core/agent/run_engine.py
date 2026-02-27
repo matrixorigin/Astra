@@ -209,10 +209,8 @@ class RunEngine(DbConsumer):
         """Load agent_config from agent_agents table."""
         try:
             with self._db() as db:
-                row = db.execute(
-                    text("SELECT agent_config FROM agent_agents WHERE agent_id = :aid"),
-                    {"aid": agent_id},
-                ).fetchone()
+                from api.models import Agent
+                row = db.query(Agent.agent_config).filter(Agent.agent_id == agent_id).first()
                 if row and row[0]:
                     return row[0] if isinstance(row[0], dict) else json.loads(row[0])
         except Exception as e:
