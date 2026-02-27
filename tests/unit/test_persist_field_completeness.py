@@ -125,6 +125,7 @@ class TestPersistFieldCompleteness:
         assert len(tc_events) == 1
         assert tc_events[0]["metadata"]["tool_call_id"] == "tc1"
         assert tc_events[0]["metadata"]["name"] == "read_file"
+        assert tc_events[0]["skill_name"] == "read_file"
 
     def test_tool_call_event_content_is_valid_json(self):
         """tool_call event content must be parseable JSON with expected keys."""
@@ -155,6 +156,7 @@ class TestPersistFieldCompleteness:
         assert meta["source"] == "edge"
         assert meta["tool_call_id"] == "tc1"
         assert meta["name"] == "read_file"
+        assert tr_events[0]["skill_name"] == "read_file"
 
     def test_tool_result_content_truncated_at_2000(self):
         """tool_result content should truncate result to 2000 chars."""

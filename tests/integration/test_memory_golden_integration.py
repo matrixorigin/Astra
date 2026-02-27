@@ -6,6 +6,7 @@ Tests memory extraction, storage, and retrieval using:
 """
 
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -378,7 +379,7 @@ class TestSandboxRealDB:
         from core.memory.metrics import MemoryMetrics
 
         store = MemoryStore(db_factory)
-        sandbox = MemorySandbox(db_factory, db_name="test_dev_agent_v3")
+        sandbox = MemorySandbox(db_factory, db_name=os.environ["MATRIXONE_DATABASE"])
         user_id = _uid()
 
         # Create base memory with embedding for vector comparison
@@ -430,22 +431,21 @@ class TestProvenanceRealDB:
     def test_setup_pitr(self, db_factory):
         """PITR setup works with real DB."""
         from core.memory.provenance import MemoryProvenance
+        import os
         import pymysql
 
-        prov = MemoryProvenance(db_factory, db_name="dev_agent")
+        db_name = os.environ["MATRIXONE_DATABASE"]
+        prov = MemoryProvenance(db_factory, db_name=db_name)
 
-        # Use raw connection for cleanup
         conn = pymysql.connect(
             host='localhost', port=6001, user='root', password='111',
-            database='dev_agent', autocommit=True
+            database=db_name, autocommit=True
         )
         cursor = conn.cursor()
 
         try:
-            # Setup PITR
             prov.setup_pitr(range_value=1, range_unit="h")
 
-            # Verify it exists
             cursor.execute("show pitr")
             rows = cursor.fetchall()
             pitr_names = [r[0] for r in rows]
@@ -459,14 +459,16 @@ class TestProvenanceRealDB:
         """Snapshot creation works with real DB."""
         from core.memory.provenance import MemoryProvenance
         from core.memory.health import MemoryHealth
+        import os
         import pymysql
 
-        prov = MemoryProvenance(db_factory, db_name="dev_agent")
+        db_name = os.environ["MATRIXONE_DATABASE"]
+        prov = MemoryProvenance(db_factory, db_name=db_name)
         health = MemoryHealth(db_factory)
 
         conn = pymysql.connect(
             host='localhost', port=6001, user='root', password='111',
-            database='dev_agent', autocommit=True
+            database=db_name, autocommit=True
         )
         cursor = conn.cursor()
 

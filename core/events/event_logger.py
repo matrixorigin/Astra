@@ -115,6 +115,9 @@ class EventLogger(DbConsumer):
             causal_chain_id=event.causal_chain_id,
             llm_model_used=event.llm_model_used,
             llm_params=event.llm_params,
+            skill_name=event.skill_name,
+            skill_version=event.skill_version,
+            skill_result=event.skill_result,
             # High-frequency query fields
             run_id=run_id,
             parent_run_id=parent_run_id,
@@ -201,6 +204,7 @@ class EventLogger(DbConsumer):
         parent_event_id: str | None = None,
         causal_chain_id: str | None = None,
         metadata: dict | None = None,
+        skill_name: str | None = None,
     ) -> ConversationEvent:
         """Create and log a stream event to the database.
 
@@ -235,6 +239,7 @@ class EventLogger(DbConsumer):
             parent_event_id=parent_event_id,
             causal_chain_id=causal_chain_id or str(uuid7()),
             metadata=metadata,
+            skill_name=skill_name,
         )
         self.log_event(event)
         return event

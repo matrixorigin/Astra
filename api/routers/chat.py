@@ -804,16 +804,18 @@ def _persist_turn_events(
     try:
         if tool_results:
             for tr in tool_results:
-                meta = {"source": "edge", "tool_call_id": tr.get("tool_call_id"), "name": tr.get("name", "")}
-                if tr.get("name") == "get_agent_info":
+                tr_name = tr.get("name", "")
+                meta = {"source": "edge", "tool_call_id": tr.get("tool_call_id"), "name": tr_name}
+                if tr_name == "get_agent_info":
                     meta["introspection"] = True
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
                     event_type="tool_result",
-                    content=json.dumps({"name": tr.get("name", ""), "result": tr.get("result", "")[:2000]}),
+                    content=json.dumps({"name": tr_name, "result": tr.get("result", "")[:2000]}),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
                     metadata=meta,
+                    skill_name=tr_name,
                 )
             # Backfill execution metrics on the most recent skill_selection_event
             try:
@@ -831,13 +833,15 @@ def _persist_turn_events(
             for tc in tool_calls:
                 tc_id = tc.get("id", "")
                 tc_func = tc.get("function", {})
+                tc_name = tc_func.get("name", "")
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
                     event_type="tool_call",
-                    content=json.dumps({"tool_call_id": tc_id, "name": tc_func.get("name", ""), "arguments": tc_func.get("arguments", "{}")}),
+                    content=json.dumps({"tool_call_id": tc_id, "name": tc_name, "arguments": tc_func.get("arguments", "{}")}),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
-                    metadata={"tool_call_id": tc_id, "name": tc_func.get("name", "")},
+                    metadata={"tool_call_id": tc_id, "name": tc_name},
+                    skill_name=tc_name,
                 )
 
         if full_text or tool_calls:
