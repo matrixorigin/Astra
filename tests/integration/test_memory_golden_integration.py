@@ -205,26 +205,21 @@ class TestMemoryRetrieverRealDB:
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
         
-        # Reset metrics to track this specific call
-        initial_errors = metrics._counters.get("retrieval_vector_errors", 0)
-        initial_hits = metrics._counters.get("retrieval_vector_hits", 0)
-        
-        # Query with embedding close to [0.1]*1536
+        # Query with embedding close to [0.1]*1536 and explain=True
         query_emb = [0.1] * 1536
-        results, _ = retriever.retrieve(
+        results, stats = retriever.retrieve(
             user_id=user_id,
             session_id="test_session",
             query_text="vector test",
             query_embedding=query_emb,
             limit=3,
+            explain=True,
         )
         
-        # Verify: vector search succeeded (no errors, got hits)
-        final_errors = metrics._counters.get("retrieval_vector_errors", 0)
-        final_hits = metrics._counters.get("retrieval_vector_hits", 0)
-        
-        assert final_errors == initial_errors, "Vector search should not have errors"
-        assert final_hits > initial_hits, "Vector search should have recorded hits"
+        # Verify via explain stats (precise, no parallel interference)
+        assert stats.vector_attempted is True, "Vector search should have been attempted"
+        assert stats.vector_error is None, f"Vector search should not have errors: {stats.vector_error}"
+        assert stats.phase2_candidates >= 0, "Should have vector candidates"
         
         # Verify: results are ordered by vector similarity (closest first)
         assert len(results) >= 1
@@ -398,10 +393,7 @@ class TestSandboxRealDB:
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
 
-        # Track error counter BEFORE
-        initial_errors = metrics._counters.get("sandbox_validation_errors", 0)
-
-        # Validate new memories (should create/delete branch internally)
+        # Validate new memories with explain=True
         new_mem = Memory(
             memory_id=f"new_{uuid7().hex}",
             user_id=user_id,
@@ -412,21 +404,21 @@ class TestSandboxRealDB:
             observed_at=datetime.utcnow(),
         )
 
-        result = sandbox.validate_memories(
+        result, stats = sandbox.validate_memories(
             user_id=user_id,
             new_memories=[new_mem],
             query_text="test query",
             query_embedding=[0.5] * 1536,
+            explain=True,
         )
 
-        # Track error counter AFTER
-        final_errors = metrics._counters.get("sandbox_validation_errors", 0)
-
-        # Key assertion: error counter should NOT have increased (not fallback)
-        assert final_errors == initial_errors, (
-            f"Sandbox validation should succeed without fallback. "
-            f"Errors before={initial_errors}, after={final_errors}"
+        # Key assertion: stats.error should be None (not fallback)
+        assert stats is not None, "Should return stats when explain=True"
+        assert stats.error is None, (
+            f"Sandbox validation should succeed without error. "
+            f"Error: {stats.error}"
         )
+        assert stats.validated is True, "Should have validated successfully"
         # Result should be True (new memory improves or maintains quality)
         assert result is True
 

@@ -31,7 +31,8 @@ def _mem(mid="m1", content="test", embedding=None):
 
 class TestSandboxValidation:
     def test_empty_memories_returns_true(self, sandbox):
-        assert sandbox.validate_memories("u1", [], "query") is True
+        result, _ = sandbox.validate_memories("u1", [], "query")
+        assert result is True
 
     def test_creates_and_drops_branch(self, sandbox, mock_db):
         sandbox.validate_memories("u1", [_mem()], "query")
@@ -51,20 +52,21 @@ class TestSandboxValidation:
         # Mock _retrieval_score directly
         scores = [0.3, 0.9]  # main low, branch high
         sandbox._retrieval_score = MagicMock(side_effect=scores)
-        result = sandbox.validate_memories("u1", [_mem()], "query", [0.1] * 10)
+        result, _ = sandbox.validate_memories("u1", [_mem()], "query", [0.1] * 10)
         assert result is True
 
     def test_returns_false_when_branch_worse(self, sandbox, mock_db):
         scores = [0.9, 0.3]  # main high, branch low
         sandbox._retrieval_score = MagicMock(side_effect=scores)
-        result = sandbox.validate_memories("u1", [_mem()], "query", [0.1] * 10)
+        result, _ = sandbox.validate_memories("u1", [_mem()], "query", [0.1] * 10)
         assert result is False
 
     def test_fails_open_on_error(self, sandbox, mock_db):
         mock_db.execute.side_effect = Exception("DB error")
         # Should return True (fail open) when validation errors
-        result = sandbox.validate_memories("u1", [_mem()], "query")
+        result, stats = sandbox.validate_memories("u1", [_mem()], "query", explain=True)
         assert result is True
+        assert stats.error is not None
 
     def test_drops_branch_even_on_error(self, sandbox, mock_db):
         # First call succeeds (create), second fails

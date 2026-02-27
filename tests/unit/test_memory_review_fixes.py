@@ -154,12 +154,8 @@ class TestVectorRetrieval:
         assert mock_db.execute.call_count == 1
         assert len(results) == 1
 
-    def test_vector_phase_failure_increments_error_counter(self, retriever, mock_db):
-        """Vector SQL failure must increment retrieval_vector_errors counter."""
-        # Use unique counter check: record before, trigger error, check delta is exactly 1
-        # Note: parallel tests may also increment, so we verify delta >= 1
-        initial_errors = metrics._counters.get("retrieval_vector_errors", 0)
-        
+    def test_vector_phase_failure_recorded_in_stats(self, retriever, mock_db):
+        """Vector SQL failure is recorded in explain stats (not just metrics)."""
         call_count = [0]
         def mock_execute(sql, params=None):
             call_count[0] += 1
@@ -174,23 +170,23 @@ class TestVectorRetrieval:
 
         mock_db.execute.side_effect = mock_execute
 
-        results, _ = retriever.retrieve(
+        results, stats = retriever.retrieve(
             "u1", "test", session_id="s1",
             query_embedding=[0.1] * 10,
+            explain=True,
         )
 
         # Verify fallback worked
         assert len(results) == 1
         assert results[0].memory_id == "m1"
         
-        # Verify error counter incremented (at least +1, may be more in parallel)
-        final_errors = metrics._counters.get("retrieval_vector_errors", 0)
-        assert final_errors >= initial_errors + 1, "Vector error should increment counter"
+        # Verify stats captured the error (precise, no parallel interference)
+        assert stats.vector_attempted is True
+        assert stats.vector_error is not None
+        assert "Vector index not available" in stats.vector_error
 
-    def test_vector_success_increments_hits_counter(self, retriever, mock_db):
-        """Successful vector search must increment retrieval_vector_hits counter."""
-        initial_hits = metrics._counters.get("retrieval_vector_hits", 0)
-        
+    def test_vector_success_recorded_in_stats(self, retriever, mock_db):
+        """Successful vector search is recorded in explain stats."""
         call_count = [0]
         def mock_execute(sql, params=None):
             call_count[0] += 1
@@ -205,22 +201,23 @@ class TestVectorRetrieval:
 
         mock_db.execute.side_effect = mock_execute
 
-        results, _ = retriever.retrieve(
+        results, stats = retriever.retrieve(
             "u1", "test", session_id="s1",
             query_embedding=[0.1] * 10,
+            explain=True,
         )
 
         # Verify vector search worked
         assert any(r.memory_id == "v1" for r in results)
         
-        # Verify hits counter incremented (at least +1)
-        final_hits = metrics._counters.get("retrieval_vector_hits", 0)
-        assert final_hits >= initial_hits + 1, "Vector success should increment hits counter"
+        # Verify stats captured success (precise)
+        assert stats.vector_attempted is True
+        assert stats.vector_hit is True
+        assert stats.vector_error is None
+        assert stats.phase2_candidates == 1
 
-    def test_keyword_failure_increments_error_counter(self, retriever, mock_db):
-        """Keyword SQL failure must increment retrieval_keyword_errors counter."""
-        initial_errors = metrics._counters.get("retrieval_keyword_errors", 0)
-        
+    def test_keyword_failure_recorded_in_stats(self, retriever, mock_db):
+        """Keyword SQL failure is recorded in explain stats."""
         call_count = [0]
         def mock_execute(sql, params=None):
             call_count[0] += 1
@@ -236,14 +233,19 @@ class TestVectorRetrieval:
 
         mock_db.execute.side_effect = mock_execute
 
-        results, _ = retriever.retrieve("u1", "test query", session_id="s1")
+        results, stats = retriever.retrieve(
+            "u1", "test query", session_id="s1",
+            explain=True,
+        )
 
         # Verify fallback worked
         assert len(results) >= 1
         
-        # Verify error counter incremented (at least +1)
-        final_errors = metrics._counters.get("retrieval_keyword_errors", 0)
-        assert final_errors >= initial_errors + 1, "Keyword error should increment counter"
+        # Verify stats captured the error (precise)
+        assert stats.keyword_attempted is True
+        assert stats.keyword_hit is False
+        assert stats.keyword_error is not None
+        assert "Fulltext index error" in stats.keyword_error
 
 
 # =============================================================================
@@ -270,7 +272,7 @@ class TestPipelineSandboxRejection:
             MockStore.return_value = mock_store
 
             mock_sandbox = MagicMock()
-            mock_sandbox.validate_memories.return_value = False  # Reject!
+            mock_sandbox.validate_memories.return_value = (False, None)  # Reject!
             MockSandbox.return_value = mock_sandbox
 
             result = run_typed_memory_pipeline(
@@ -305,7 +307,7 @@ class TestPipelineSandboxRejection:
             MockStore.return_value = mock_store
 
             mock_sandbox = MagicMock()
-            mock_sandbox.validate_memories.return_value = True  # Accept
+            mock_sandbox.validate_memories.return_value = (True, None)  # Accept
             MockSandbox.return_value = mock_sandbox
 
             result = run_typed_memory_pipeline(
@@ -340,7 +342,7 @@ class TestPipelineSandboxRejection:
             MockStore.return_value = mock_store
 
             mock_sandbox = MagicMock()
-            mock_sandbox.validate_memories.return_value = False  # Would reject
+            mock_sandbox.validate_memories.return_value = (False, None)  # Would reject
             MockSandbox.return_value = mock_sandbox
 
             result = run_typed_memory_pipeline(
@@ -783,44 +785,40 @@ class TestTieredLoaderFallbackMetrics:
 
 
 # =============================================================================
-# 10. Sandbox direct fallback metrics
+# 10. Sandbox direct fallback metrics — now using explain stats
 # =============================================================================
 
 class TestSandboxDirectFallbackMetrics:
-    """Verify MemorySandbox.validate_memories failure increments counter."""
+    """Verify MemorySandbox.validate_memories error handling via explain stats."""
 
-    def test_sandbox_exception_increments_counter(self):
-        """Sandbox internal exception must increment error counter."""
+    def test_sandbox_exception_recorded_in_stats(self):
+        """Sandbox internal exception is recorded in explain stats."""
         from core.memory.sandbox import MemorySandbox
-        
-        initial_errors = metrics._counters.get("sandbox_validation_errors", 0)
         
         mock_db = MagicMock()
         mock_db.execute.side_effect = Exception("Branch creation failed")
         
         sandbox = MemorySandbox(lambda: mock_db)
-        result = sandbox.validate_memories(
+        result, stats = sandbox.validate_memories(
             user_id="u1",
             new_memories=[_mem(content="test")],
             query_text="test query",
+            explain=True,
         )
         
         # Fail open: returns True
         assert result is True
         
-        # Error counter incremented (at least +1)
-        final_errors = metrics._counters.get("sandbox_validation_errors", 0)
-        assert final_errors >= initial_errors + 1, "Sandbox error should increment counter"
+        # Stats captured the error (precise, no parallel interference)
+        assert stats is not None
+        assert stats.error is not None
+        assert "Branch creation failed" in stats.error
 
-    def test_sandbox_success_does_not_increment_error_counter(self):
-        """Successful sandbox validation should NOT increment error counter."""
+    def test_sandbox_success_has_no_error_in_stats(self):
+        """Successful sandbox validation has no error in stats."""
         from core.memory.sandbox import MemorySandbox
         
-        initial_errors = metrics._counters.get("sandbox_validation_errors", 0)
-        
         mock_db = MagicMock()
-        # Mock successful branch operations
-        mock_db.execute.return_value.fetchall.return_value = [MagicMock(sim=0.9)]
         
         sandbox = MemorySandbox(lambda: mock_db)
         
@@ -829,17 +827,20 @@ class TestSandboxDirectFallbackMetrics:
              patch.object(sandbox, "_insert_to_branch"), \
              patch.object(sandbox, "_retrieval_score", return_value=0.8), \
              patch.object(sandbox, "_drop_branch"):
-            result = sandbox.validate_memories(
+            result, stats = sandbox.validate_memories(
                 user_id="u1",
                 new_memories=[_mem(content="test")],
                 query_text="test query",
+                explain=True,
             )
         
         # Success
         assert result is True
         
-        # Error counter should NOT have changed
-        assert metrics._counters.get("sandbox_validation_errors", 0) == initial_errors
+        # Stats show success (no error)
+        assert stats is not None
+        assert stats.error is None
+        assert stats.validated is True
 
 
 # =============================================================================

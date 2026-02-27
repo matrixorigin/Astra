@@ -2,11 +2,14 @@
 
 Validates new memories in an isolated branch before committing to main table.
 All SQL uses parameterized queries — no f-string interpolation of user data.
+
+Supports explain=True for EXPLAIN ANALYZE style execution stats.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -14,6 +17,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from core.db_consumer import DbConsumer, DbFactory
+from core.memory.explain import SandboxStats
 from core.memory.metrics import metrics
 from core.memory.types import Memory
 
@@ -33,7 +37,8 @@ class MemorySandbox(DbConsumer):
         new_memories: list[Memory],
         query_text: str,
         query_embedding: Optional[list[float]] = None,
-    ) -> bool:
+        explain: bool = False,
+    ) -> tuple[bool, Optional[SandboxStats]]:
         """Validate that new memories improve retrieval quality.
 
         Flow:
@@ -42,12 +47,21 @@ class MemorySandbox(DbConsumer):
         3. Compare retrieval quality: branch vs main
         4. Drop branch (always, regardless of result)
 
-        Returns True if new memories improve quality, False otherwise.
+        Returns:
+            (improved, stats) — stats is None when explain=False.
         """
+        start = time.time() if explain else 0
+        stats = SandboxStats(enabled=True) if explain else None
+        
         if not new_memories:
-            return True
+            if stats:
+                stats.validated = True
+                stats.total_ms = 0
+            return True, stats
 
         branch_name = f"memories_sandbox_{uuid.uuid4().hex[:8]}"
+        if stats:
+            stats.branch_name = branch_name
 
         try:
             self._create_branch(branch_name)
@@ -65,12 +79,18 @@ class MemorySandbox(DbConsumer):
                 "Sandbox validation: main=%.3f branch=%.3f improved=%s",
                 score_main, score_branch, improved,
             )
-            return improved
+            if stats:
+                stats.validated = True
+                stats.total_ms = (time.time() - start) * 1000
+            return improved, stats
 
         except Exception as e:
             logger.warning("Sandbox validation failed: %s", e)
             metrics.increment("sandbox_validation_errors")
-            return True  # Fail open: allow write if validation errors
+            if stats:
+                stats.error = str(e)
+                stats.total_ms = (time.time() - start) * 1000
+            return True, stats  # Fail open: allow write if validation errors
 
         finally:
             self._drop_branch(branch_name)

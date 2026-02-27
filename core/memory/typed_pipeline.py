@@ -97,12 +97,9 @@ def run_typed_memory_pipeline(
         return result
 
     # Phase 2: Sandbox validation (optional, for configured types)
-    sandbox_start = time.time() if explain else 0
     sandbox_stats: Optional[SandboxStats] = None
     validated = candidates  # default: all pass
     if query_for_sandbox:
-        if explain:
-            sandbox_stats = SandboxStats(enabled=True)
         validated = []
         try:
             sandbox = MemorySandbox(db_factory)
@@ -115,17 +112,16 @@ def run_typed_memory_pipeline(
                     validated.append(mem)
 
             if needs_validation:
-                passed = sandbox.validate_memories(
+                passed, sandbox_stats = sandbox.validate_memories(
                     user_id=user_id,
                     new_memories=needs_validation,
                     query_text=query_for_sandbox,
                     query_embedding=needs_validation[0].embedding,
+                    explain=explain,
                 )
                 if passed:
                     validated.extend(needs_validation)
                     result.memories_validated = len(needs_validation)
-                    if sandbox_stats:
-                        sandbox_stats.validated = True
                 else:
                     result.memories_rejected = len(needs_validation)
                     if sandbox_stats:
@@ -139,12 +135,11 @@ def run_typed_memory_pipeline(
         except Exception as e:
             logger.warning("Sandbox validation failed, accepting all: %s", e)
             metrics.increment("sandbox_validation_errors")
-            if sandbox_stats:
+            if explain and sandbox_stats is None:
+                sandbox_stats = SandboxStats(enabled=True, error=str(e))
+            elif sandbox_stats:
                 sandbox_stats.error = str(e)
             validated = candidates
-        
-        if sandbox_stats:
-            sandbox_stats.total_ms = (time.time() - sandbox_start) * 1000
 
     # Phase 3: Persist validated memories (with contradiction check)
     persisted: list[Memory] = []
