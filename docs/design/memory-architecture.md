@@ -847,7 +847,7 @@ Inspired by Mastra's Observational Memory (95% on LongMemEval), we implement two
 
 ### Observer
 
-Runs post-turn. Extracts typed memories (profile/semantic/procedural) from conversation turns via LLM.
+Runs on final reply (when LLM returns text without tool_calls). Extracts typed memories (profile/semantic/procedural) from user query + assistant final answer via LLM.
 
 - **Typed extraction**: LLM returns `[{type, content, confidence}]` → each becomes a Memory record
 - **Contradiction detection**: DB-side L2_DISTANCE finds semantically similar existing memories; if content differs → atomic supersede

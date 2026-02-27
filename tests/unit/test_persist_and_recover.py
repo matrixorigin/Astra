@@ -202,10 +202,10 @@ class TestSessionCache:
 # ---------------------------------------------------------------------------
 
 class TestObserverReceivesMessages:
-    """Verify observer gets user+assistant pair, not empty incremental messages."""
+    """Observer runs only on final reply (no tool_calls + has full_text)."""
 
-    def test_observer_gets_user_and_assistant(self):
-        """Observer should receive both user query and LLM response text."""
+    def test_observer_gets_user_and_assistant_on_final_reply(self):
+        """Final reply (no tool_calls): observer gets user query + assistant text."""
         observer_messages = []
 
         with patch("api.routers.chat.SessionLocal"), \
@@ -225,17 +225,42 @@ class TestObserverReceivesMessages:
             _persist_turn_events(
                 "u1", "s1",
                 [{"role": "user", "content": "What is event sourcing?"}], None,
-                "Event sourcing is a pattern...", [],
+                "Event sourcing is a pattern...", [],  # no tool_calls = final reply
             )
 
         assert len(observer_messages) == 2
         assert observer_messages[0] == {"role": "user", "content": "What is event sourcing?"}
         assert observer_messages[1] == {"role": "assistant", "content": "Event sourcing is a pattern..."}
 
-    def test_observer_runs_on_tool_result_turn_with_llm_text(self):
-        """On a tool-result-only turn (no user message), observer should still
-        run if LLM produced text — this is the turn where the assistant summarizes
-        tool output, which is valuable for memory extraction."""
+    def test_observer_skipped_on_intermediate_tool_turn(self):
+        """Intermediate turn (has tool_calls): observer should NOT run,
+        even if there's full_text."""
+        with patch("api.routers.chat.SessionLocal"), \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks") as mock_hooks_cls:
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_stream_event.return_value = MagicMock()
+            mock_el.create_llm_response.return_value = MagicMock()
+            mock_el_cls.return_value = mock_el
+
+            mock_hooks = MagicMock()
+            mock_hooks_cls.return_value = mock_hooks
+
+            from api.routers.chat import _persist_turn_events
+            # LLM returned text AND tool_calls — intermediate turn
+            _persist_turn_events(
+                "u1", "s1",
+                [{"role": "user", "content": "fix the bug"}], None,
+                "Let me read the file first.",
+                [{"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}],
+            )
+
+        mock_hooks.run_observer.assert_not_called()
+
+    def test_observer_runs_on_final_reply_without_user_content(self):
+        """Final reply on a tool-result-only turn (no user message but has
+        full_text and no tool_calls): observer should run with assistant text."""
         observer_messages = []
 
         with patch("api.routers.chat.SessionLocal"), \
@@ -252,21 +277,18 @@ class TestObserverReceivesMessages:
             mock_hooks_cls.return_value = mock_hooks
 
             from api.routers.chat import _persist_turn_events
-            # Simulate turn 2: edge sends empty messages + tool_results,
-            # LLM responds with summary text
+            # Tool-result turn, LLM gives final answer (no more tool_calls)
             _persist_turn_events(
                 "u1", "s1",
-                [], [{"tool_call_id": "tc1", "name": "read_file", "result": "file content"}],
-                "The file contains configuration settings.", [],
+                [], [{"tool_call_id": "tc1", "name": "read_file", "result": "content"}],
+                "The file contains configuration settings.", [],  # no tool_calls = final
             )
 
-        # Observer should still run with the assistant's summary
         assert len(observer_messages) == 1
         assert observer_messages[0]["role"] == "assistant"
-        assert "configuration" in observer_messages[0]["content"]
 
-    def test_observer_skipped_when_no_content(self):
-        """Observer should NOT run when there's no user content and no LLM text."""
+    def test_observer_skipped_when_no_text(self):
+        """No full_text at all: observer should NOT run."""
         with patch("api.routers.chat.SessionLocal"), \
              patch("core.events.event_logger.EventLogger") as mock_el_cls, \
              patch("core.agent.turn_hooks.TurnHooks") as mock_hooks_cls:
@@ -280,7 +302,6 @@ class TestObserverReceivesMessages:
             mock_hooks_cls.return_value = mock_hooks
 
             from api.routers.chat import _persist_turn_events
-            # Tool-call-only turn: LLM returned tool_calls but no text
             _persist_turn_events(
                 "u1", "s1",
                 [], [{"tool_call_id": "tc1", "name": "read_file", "result": "data"}],

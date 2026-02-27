@@ -607,6 +607,20 @@ def _build_turn_messages(
                 except Exception as e:
                     logger.debug("Memory refresh failed (non-fatal): %s", e)
 
+    # History integrity: cloud guarantees a valid OpenAI message sequence
+    # regardless of edge behavior. If the last assistant message has tool_calls
+    # but edge never sent tool_results (max-turns, crash, Ctrl-C, network),
+    # inject placeholder tool messages so the LLM API accepts the history.
+    if (history and not tool_results
+            and history[-1].get("role") == "assistant"
+            and history[-1].get("tool_calls")):
+        for tc in history[-1]["tool_calls"]:
+            history.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": "[not executed — edge turn limit reached]",
+            })
+
     # Append new user messages from edge
     for msg in messages:
         if msg.get("role") and msg.get("content"):
@@ -907,16 +921,15 @@ def _persist_turn_events(
             )
             hooks.record_skill_selection(session_id, user_content or "", tool_calls)
 
-        # Build the current turn's messages for observer: user query + LLM reply.
-        # `messages` from edge is incremental (empty on turn 1+), so we reconstruct
-        # the turn pair from persisted data. Without this, observer sees nothing on
-        # tool-result-only turns and extracts zero memories.
-        observer_messages: list[dict[str, Any]] = []
-        if user_content:
-            observer_messages.append({"role": "user", "content": user_content})
-        if full_text:
+        # Observer: only on final reply (no tool_calls, has text).
+        # Intermediate turns (tool_call→tool_result cycles) have no meaningful
+        # content for memory extraction. Aligns with Mastra/Claude Code approach.
+        is_final_reply = bool(full_text) and not tool_calls
+        if is_final_reply:
+            observer_messages: list[dict[str, Any]] = []
+            if user_content:
+                observer_messages.append({"role": "user", "content": user_content})
             observer_messages.append({"role": "assistant", "content": full_text})
-        if observer_messages:
             hooks.run_observer(session_id, user_id, observer_messages)
 
         if user_content:

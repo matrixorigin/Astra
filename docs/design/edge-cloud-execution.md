@@ -127,6 +127,11 @@ data: {"type": "turn_complete", "has_tool_calls": true}
 - `has_tool_calls: true` → edge must execute tools and call `/chat/turn` again with results
 - `has_tool_calls: false` → final answer, conversation turn complete
 
+**Incomplete turn handling**: If edge disconnects before sending tool_results
+(max turns, crash, network), cloud auto-heals the history on the next request
+by injecting placeholder tool messages for orphaned tool_calls. Cloud owns
+history integrity — edge is not required to "flush" pending results.
+
 ### Edge loop pseudocode
 
 ```python

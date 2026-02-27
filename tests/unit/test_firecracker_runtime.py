@@ -124,13 +124,11 @@ class TestCreateRuntimeWithFirecracker:
             assert rt is mock_rt
 
     def test_firecracker_skipped_when_unhealthy(self):
-        """Falls through to Docker/Subprocess when Firecracker unavailable."""
+        """Falls through to Subprocess when Firecracker unavailable."""
         from core.runtime import create_runtime
         from core.runtime.subprocess_runtime import SubprocessRuntime
-        with patch("core.runtime.firecracker_runtime.FirecrackerRuntime") as MockFC, \
-             patch("core.runtime.docker_runtime.DockerRuntime") as MockDocker:
+        with patch("core.runtime.firecracker_runtime.FirecrackerRuntime") as MockFC:
             MockFC.return_value.health_check.return_value = False
-            MockDocker.return_value.health_check.return_value = False
             rt = create_runtime(min_isolation=IsolationLevel.PROCESS)
             assert isinstance(rt, SubprocessRuntime)
 
