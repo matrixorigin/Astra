@@ -1,5 +1,8 @@
 """Tests for review-identified gaps: vector retrieval, sandbox rejection,
-TOOL_RESULT cleanup, DB contradiction, profile sort, supersede session_id."""
+TOOL_RESULT cleanup, DB contradiction, profile sort, supersede session_id.
+
+Also verifies fallback paths are observable via metrics counters.
+"""
 
 import json
 import math
@@ -17,6 +20,7 @@ from core.memory.profile import ProfileManager
 from core.memory.store import MemoryStore
 from core.memory.config import MemoryGovernanceConfig
 from core.memory.types import Memory, MemoryType, RetrievalWeights
+from core.memory.metrics import metrics
 
 
 # --- Helpers ---
@@ -150,8 +154,10 @@ class TestVectorRetrieval:
         assert mock_db.execute.call_count == 1
         assert len(results) == 1
 
-    def test_vector_phase_failure_degrades_gracefully(self, retriever, mock_db):
-        """If vector SQL fails, results still come from phase 1."""
+    def test_vector_phase_failure_increments_error_counter(self, retriever, mock_db):
+        """Vector SQL failure must increment retrieval_vector_errors counter."""
+        initial_errors = metrics._counters.get("retrieval_vector_errors", 0)
+        
         call_count = [0]
         def mock_execute(sql, params=None):
             call_count[0] += 1
@@ -171,9 +177,71 @@ class TestVectorRetrieval:
             query_embedding=[0.1] * 10,
         )
 
-        # Should still return phase 1 results
+        # Verify fallback worked
         assert len(results) == 1
         assert results[0].memory_id == "m1"
+        
+        # Verify error counter incremented (fallback is observable)
+        final_errors = metrics._counters.get("retrieval_vector_errors", 0)
+        assert final_errors == initial_errors + 1, "Vector error should increment counter"
+
+    def test_vector_success_increments_hits_counter(self, retriever, mock_db):
+        """Successful vector search must increment retrieval_vector_hits counter."""
+        initial_hits = metrics._counters.get("retrieval_vector_hits", 0)
+        
+        call_count = [0]
+        def mock_execute(sql, params=None):
+            call_count[0] += 1
+            result = MagicMock()
+            if call_count[0] == 1:
+                result.fetchall.return_value = []  # phase 1 empty
+            else:
+                result.fetchall.return_value = [
+                    VecRow("v1", "vector hit", "semantic", 0.8, datetime(2026, 2, 26), None, 0.1)
+                ]
+            return result
+
+        mock_db.execute.side_effect = mock_execute
+
+        results = retriever.retrieve(
+            "u1", "test", session_id="s1",
+            query_embedding=[0.1] * 10,
+        )
+
+        # Verify vector search worked
+        assert any(r.memory_id == "v1" for r in results)
+        
+        # Verify hits counter incremented (success is observable)
+        final_hits = metrics._counters.get("retrieval_vector_hits", 0)
+        assert final_hits == initial_hits + 1, "Vector success should increment hits counter"
+
+    def test_keyword_failure_increments_error_counter(self, retriever, mock_db):
+        """Keyword SQL failure must increment retrieval_keyword_errors counter."""
+        initial_errors = metrics._counters.get("retrieval_keyword_errors", 0)
+        
+        call_count = [0]
+        def mock_execute(sql, params=None):
+            call_count[0] += 1
+            result = MagicMock()
+            sql_str = str(sql)
+            if "MATCH" in sql_str:
+                raise Exception("Fulltext index error")
+            # Fallback SQL succeeds
+            result.fetchall.return_value = [
+                MemRow("m1", "fallback", "episodic", 0.8, datetime(2026, 2, 26), None)
+            ]
+            return result
+
+        mock_db.execute.side_effect = mock_execute
+
+        results = retriever.retrieve("u1", "test query", session_id="s1")
+
+        # Verify fallback worked
+        assert len(results) >= 1
+        
+        # Verify error counter incremented
+        final_errors = metrics._counters.get("retrieval_keyword_errors", 0)
+        assert final_errors == initial_errors + 1, "Keyword error should increment counter"
 
 
 # =============================================================================
@@ -286,6 +354,45 @@ class TestPipelineSandboxRejection:
         assert result.memories_extracted == 1
         assert result.memories_rejected == 0
         mock_store.create.assert_called_once()
+
+    def test_sandbox_failure_increments_error_counter(self):
+        """Sandbox validation failure must increment sandbox_validation_errors counter."""
+        initial_errors = metrics._counters.get("sandbox_validation_errors", 0)
+        
+        mock_llm = MagicMock()
+        mock_llm.chat_with_tools.return_value = {"content": json.dumps([
+            {"type": "profile", "content": "test memory", "confidence": 0.9},
+        ])}
+
+        mock_db = MagicMock()
+
+        with patch("core.memory.typed_pipeline.MemoryStore") as MockStore, \
+             patch("core.memory.typed_pipeline.MemorySandbox") as MockSandbox:
+            mock_store = MagicMock()
+            mock_store.create.side_effect = lambda m: m
+            mock_store.list_active.return_value = []
+            MockStore.return_value = mock_store
+
+            mock_sandbox = MagicMock()
+            mock_sandbox.validate_memories.side_effect = Exception("Sandbox DB error")
+            MockSandbox.return_value = mock_sandbox
+
+            result = run_typed_memory_pipeline(
+                db_factory=lambda: mock_db,
+                user_id="u1",
+                messages=[{"role": "user", "content": "test"}],
+                llm_client=mock_llm,
+                config=MemoryGovernanceConfig(sandbox_enabled_types=("profile",)),
+                query_for_sandbox="test query",
+            )
+
+        # Verify fallback worked (memories accepted despite sandbox error)
+        assert result.memories_extracted == 1
+        mock_store.create.assert_called_once()
+        
+        # Verify error counter incremented (fallback is observable)
+        final_errors = metrics._counters.get("sandbox_validation_errors", 0)
+        assert final_errors == initial_errors + 1, "Sandbox error should increment counter"
 
 
 # =============================================================================
@@ -578,3 +685,156 @@ class TestObserverExtractVsObserve:
 
         assert result.content == "test memory"
         mock_store.create.assert_called_once()
+
+
+# =============================================================================
+# 9. TieredLoader fallback metrics
+# =============================================================================
+
+class TestTieredLoaderFallbackMetrics:
+    """Verify TieredMemoryLoader failures increment error counters."""
+
+    def test_init_failure_increments_counter(self):
+        """TieredMemoryLoader init failure must increment error counter."""
+        from core.memory.tiered_loader import TieredMemoryLoader
+        
+        initial_errors = metrics._counters.get("tiered_loader_init_errors", 0)
+        
+        # Make MemoryStore constructor raise
+        with patch("core.memory.tiered_loader.MemoryStore") as MockStore:
+            MockStore.side_effect = Exception("DB connection failed")
+            
+            loader = TieredMemoryLoader(lambda: MagicMock())
+            result = loader._ensure_initialized()
+        
+        assert result is False
+        final_errors = metrics._counters.get("tiered_loader_init_errors", 0)
+        assert final_errors == initial_errors + 1, "Init error should increment counter"
+
+    def test_l0_failure_increments_counter(self):
+        """L0 load failure must increment error counter."""
+        from core.memory.tiered_loader import TieredMemoryLoader
+        
+        initial_errors = metrics._counters.get("tiered_loader_l0_errors", 0)
+        
+        mock_db = MagicMock()
+        loader = TieredMemoryLoader(lambda: mock_db)
+        
+        # Force init to succeed but profile load to fail
+        with patch.object(loader, "_ensure_initialized", return_value=True):
+            loader._profile_mgr = MagicMock()
+            loader._profile_mgr.get_profile.side_effect = Exception("Profile load failed")
+            
+            result = loader.load_l0("u1")
+        
+        assert result == ""
+        final_errors = metrics._counters.get("tiered_loader_l0_errors", 0)
+        assert final_errors == initial_errors + 1, "L0 error should increment counter"
+
+    def test_l1_failure_increments_counter(self):
+        """L1 load failure must increment error counter."""
+        from core.memory.tiered_loader import TieredMemoryLoader
+        
+        initial_errors = metrics._counters.get("tiered_loader_l1_errors", 0)
+        
+        mock_db = MagicMock()
+        loader = TieredMemoryLoader(lambda: mock_db)
+        
+        # Force init to succeed but retriever to fail
+        with patch.object(loader, "_ensure_initialized", return_value=True):
+            loader._retriever = MagicMock()
+            loader._retriever.retrieve.side_effect = Exception("Retrieval failed")
+            
+            result = loader.load_l1("u1", "s1", "query")
+        
+        assert result == ""
+        final_errors = metrics._counters.get("tiered_loader_l1_errors", 0)
+        assert final_errors == initial_errors + 1, "L1 error should increment counter"
+
+    def test_success_does_not_increment_error_counters(self):
+        """Successful operations should NOT increment error counters."""
+        from core.memory.tiered_loader import TieredMemoryLoader
+        
+        initial_l0_errors = metrics._counters.get("tiered_loader_l0_errors", 0)
+        initial_l1_errors = metrics._counters.get("tiered_loader_l1_errors", 0)
+        
+        mock_db = MagicMock()
+        loader = TieredMemoryLoader(lambda: mock_db)
+        
+        with patch.object(loader, "_ensure_initialized", return_value=True):
+            loader._profile_mgr = MagicMock()
+            loader._profile_mgr.get_profile.return_value = "User Profile: likes Python"
+            loader._retriever = MagicMock()
+            loader._retriever.retrieve.return_value = [
+                _mem(content="relevant memory")
+            ]
+            
+            l0 = loader.load_l0("u1")
+            l1 = loader.load_l1("u1", "s1", "query")
+        
+        assert "Python" in l0
+        assert "relevant memory" in l1
+        
+        # Error counters should NOT have changed
+        assert metrics._counters.get("tiered_loader_l0_errors", 0) == initial_l0_errors
+        assert metrics._counters.get("tiered_loader_l1_errors", 0) == initial_l1_errors
+
+
+# =============================================================================
+# 10. Sandbox direct fallback metrics
+# =============================================================================
+
+class TestSandboxDirectFallbackMetrics:
+    """Verify MemorySandbox.validate_memories failure increments counter."""
+
+    def test_sandbox_exception_increments_counter(self):
+        """Sandbox internal exception must increment error counter."""
+        from core.memory.sandbox import MemorySandbox
+        
+        initial_errors = metrics._counters.get("sandbox_validation_errors", 0)
+        
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = Exception("Branch creation failed")
+        
+        sandbox = MemorySandbox(lambda: mock_db)
+        result = sandbox.validate_memories(
+            user_id="u1",
+            new_memories=[_mem(content="test")],
+            query_text="test query",
+        )
+        
+        # Fail open: returns True
+        assert result is True
+        
+        # Error counter incremented
+        final_errors = metrics._counters.get("sandbox_validation_errors", 0)
+        assert final_errors == initial_errors + 1, "Sandbox error should increment counter"
+
+    def test_sandbox_success_does_not_increment_error_counter(self):
+        """Successful sandbox validation should NOT increment error counter."""
+        from core.memory.sandbox import MemorySandbox
+        
+        initial_errors = metrics._counters.get("sandbox_validation_errors", 0)
+        
+        mock_db = MagicMock()
+        # Mock successful branch operations
+        mock_db.execute.return_value.fetchall.return_value = [MagicMock(sim=0.9)]
+        
+        sandbox = MemorySandbox(lambda: mock_db)
+        
+        # Mock _create_branch, _insert_to_branch, _retrieval_score, _drop_branch
+        with patch.object(sandbox, "_create_branch"), \
+             patch.object(sandbox, "_insert_to_branch"), \
+             patch.object(sandbox, "_retrieval_score", return_value=0.8), \
+             patch.object(sandbox, "_drop_branch"):
+            result = sandbox.validate_memories(
+                user_id="u1",
+                new_memories=[_mem(content="test")],
+                query_text="test query",
+            )
+        
+        # Success
+        assert result is True
+        
+        # Error counter should NOT have changed
+        assert metrics._counters.get("sandbox_validation_errors", 0) == initial_errors
