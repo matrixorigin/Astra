@@ -23,6 +23,10 @@ logger = get_logger(__name__)
 # Providers whose API does not expose an embeddings endpoint.
 _NO_EMBED_API = {"deepseek", "groq"}
 
+# Module-level cache: load the local model once across all EmbeddingService instances.
+_local_model_cache = None
+_local_model_dim = 0
+
 
 class EmbeddingService(DbConsumer):
     """Generate and manage text embeddings."""
@@ -114,12 +118,16 @@ class EmbeddingService(DbConsumer):
 
     def _try_local_provider(self):
         """Try to initialize sentence-transformers for local embeddings."""
+        global _local_model_cache, _local_model_dim
         try:
-            from sentence_transformers import SentenceTransformer
-            self._local_model = SentenceTransformer("all-MiniLM-L6-v2")
-            self._local_dim = self._local_model.get_sentence_embedding_dimension()
+            if _local_model_cache is None:
+                from sentence_transformers import SentenceTransformer
+                _local_model_cache = SentenceTransformer("all-MiniLM-L6-v2")
+                _local_model_dim = _local_model_cache.get_sentence_embedding_dimension()
+                logger.info("Loaded local model all-MiniLM-L6-v2 (dim=%d)", _local_model_dim)
+            self._local_model = _local_model_cache
+            self._local_dim = _local_model_dim
             self.model = "all-MiniLM-L6-v2"
-            logger.info("Using local embeddings: %s (native dim=%d, padded to %d)", self.model, self._local_dim, self.DIMENSION)
         except ImportError:
             logger.info("sentence-transformers not installed, falling back to mock")
             self.provider = "mock"
