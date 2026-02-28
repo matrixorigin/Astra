@@ -153,25 +153,16 @@ class TokenResolver(DbConsumer):
             return self._to_model(result) if result else None
 
     def _get_global_token(self) -> Token | None:
-        """Get global fallback token."""
+        """Get global fallback token (no user, no repo scope)."""
         with self._db() as db:
-            query = """
-                SELECT * FROM auth_tokens
-                WHERE type = 'repo'
-                  AND scope_user_id IS NULL
-                  AND scope_repo IS NULL
-                  AND is_active = TRUE
-                ORDER BY created_at DESC
-                LIMIT 1
-            """
-            result = db.query(Token).filter(
-                Token.token_type == token_type,
-                Token.provider == provider,
-                Token.scope_type == scope_type,
-                Token.is_active == True
-            ).order_by(Token.created_at.desc()).first()
-
-            return result if result else None
+            from api.models import Token as TokenModel
+            result = db.query(TokenModel).filter(
+                TokenModel.type == "repo",
+                TokenModel.scope_user_id.is_(None),
+                TokenModel.scope_repo.is_(None),
+                TokenModel.is_active == 1,
+            ).order_by(TokenModel.created_at.desc()).first()
+            return self._to_model(result) if result else None
 
     def _allow_global_token(self) -> bool:
         """Check if global token fallback is allowed using ORM."""

@@ -13,15 +13,18 @@ def cleanup_skills():
     """Clean up test skills before and after each test."""
     from sqlalchemy.orm import Session
     from sqlalchemy import text
+    from api.routers.skills import reset_catalog
     db = next(get_db_session())
     
     # Clean before
+    reset_catalog()
     db.execute(text('DELETE FROM skill_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
     db.commit()
     
     yield
     
     # Clean after
+    reset_catalog()
     db.execute(text('DELETE FROM skill_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
     db.commit()
     db.close()

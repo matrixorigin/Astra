@@ -49,7 +49,7 @@ def format_validation_error(exc) -> str:
     Produces a concise, client-friendly message like "message: Field required"
     instead of leaking raw Pydantic internals and pydantic.dev URLs.
     """
-    parts = [f"{'.'.join(str(l) for l in e['loc'])}: {e['msg']}" for e in exc.errors()]
+    parts = [f"{'.'.join(str(loc_item) for loc_item in e['loc'])}: {e['msg']}" for e in exc.errors()]
     return "; ".join(parts) or "Validation error"
 
 

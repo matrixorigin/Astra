@@ -8,12 +8,17 @@ from .base import (
     SkillOutput,
     SkillRequirement,
 )
-from .registry import SkillRegistry
+from .catalog import NameConflictError, SkillCatalog
+
+# Backward-compat alias — existing code imports SkillRegistry
+SkillRegistry = SkillCatalog
 
 __all__ = [
     "AccessScope",
+    "NameConflictError",
     "RepoType",
     "Skill",
+    "SkillCatalog",
     "SkillInput",
     "SkillOutput",
     "SkillRegistry",

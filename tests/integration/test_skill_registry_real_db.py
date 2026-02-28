@@ -134,22 +134,20 @@ class TestSkillRegistryRealDB:
         assert result["is_active"] == 1
 
     def test_cache_hit_on_repeated_query(self, registry):
-        """Test LRU cache hit on repeated queries."""
+        """Test metadata cache hit on repeated queries."""
         skill = DummySkill("test_skill_cache", "1.0.0")
         registry.register(skill, is_active=True, git_commit_hash="abc123")
 
-        # First query - cache miss
-        cache_info_before = registry._get_cached.cache_info()
+        # First query - cache miss, populates _metadata_cache
         result1 = registry.get_as_of("test_skill_cache", as_of_commit="abc123")
+        cache_size_after_first = len(registry._metadata_cache)
 
-        # Second query - cache hit
+        # Second query - cache hit (same key, no new entry)
         result2 = registry.get_as_of("test_skill_cache", as_of_commit="abc123")
-
-        cache_info_after = registry._get_cached.cache_info()
+        cache_size_after_second = len(registry._metadata_cache)
 
         assert result1 == result2
-        # Cache should have 1 hit
-        assert cache_info_after.hits > cache_info_before.hits
+        assert cache_size_after_first == cache_size_after_second
 
     def test_cache_cleared_on_new_registration(self, registry):
         """Test cache is cleared when new skill is registered."""
@@ -158,16 +156,14 @@ class TestSkillRegistryRealDB:
 
         # Populate cache
         registry.get_as_of("test_skill_clear")
-        cache_info_before = registry._get_cached.cache_info()
-        assert cache_info_before.currsize > 0
+        assert len(registry._metadata_cache) > 0
 
         # Register new version
         skill_v2 = DummySkill("test_skill_clear", "2.0.0")
         registry.register(skill_v2, is_active=True, git_commit_hash="abc222")
 
         # Cache should be cleared
-        cache_info_after = registry._get_cached.cache_info()
-        assert cache_info_after.currsize == 0
+        assert len(registry._metadata_cache) == 0
 
     def test_git_commit_hash_persisted(self, registry, db_session):
         """Test git_commit_hash is persisted correctly."""
@@ -279,8 +275,7 @@ class TestSkillRegistryRealDB:
         assert result3["version"] == "2.0.0"
 
         # All should be cached
-        cache_info = registry._get_cached.cache_info()
-        assert cache_info.currsize >= 3
+        assert len(registry._metadata_cache) >= 3
 
 
 class TestReplayScenario:

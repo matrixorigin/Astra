@@ -124,6 +124,8 @@ class TestGateTriggerProductionWiring:
         skill.description = "E2E test"
         skill.requirements = Mock()
         skill.requirements.model_dump.return_value = {"repo_types": ["code"]}
+        skill.side_effect_profile = Mock()
+        skill.side_effect_profile.model_dump.return_value = {"category": "read"}
 
         with patch.object(registry, "_compute_code_hash", return_value="hash123"):
             registry.register(skill, is_active=True)
@@ -193,6 +195,8 @@ class TestGateTriggerProductionWiring:
         skill.description = "test"
         skill.requirements = Mock()
         skill.requirements.model_dump.return_value = {}
+        skill.side_effect_profile = Mock()
+        skill.side_effect_profile.model_dump.return_value = {"category": "read"}
 
         with patch.object(registry, "_compute_code_hash", return_value="h"):
             registry.register(skill, is_active=False)
@@ -211,6 +215,8 @@ class TestGateTriggerProductionWiring:
         skill.description = "test"
         skill.requirements = Mock()
         skill.requirements.model_dump.return_value = {}
+        skill.side_effect_profile = Mock()
+        skill.side_effect_profile.model_dump.return_value = {"category": "read"}
 
         with patch.object(registry, "_compute_code_hash", return_value="h"):
             registry.register(skill, is_active=True)  # must not raise
@@ -637,6 +643,8 @@ class TestFullClosedLoopScenario:
             skill.description = "new version"
             skill.requirements = Mock()
             skill.requirements.model_dump.return_value = {}
+            skill.side_effect_profile = Mock()
+            skill.side_effect_profile.model_dump.return_value = {"category": "read"}
 
             with patch.object(registry, "_compute_code_hash", return_value="new_hash"):
                 registry.register(skill, is_active=True)

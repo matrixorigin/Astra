@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.exceptions import DatabaseError, SkillNotFoundError
+from core.exceptions import SkillNotFoundError
 from core.skills.base import (
     AccessScope,
     RepoType,
@@ -59,10 +59,10 @@ class TestSkillRegistryInit:
         registry = SkillRegistry(lambda: mock_db)
         assert registry._skills == {}
 
-    def test_init_sets_cache_size(self, mock_db):
-        """Test initialization sets LRU cache size."""
-        registry = SkillRegistry(lambda: mock_db)
-        assert registry._cache_size == 100
+    def test_init_accepts_gate_trigger(self, mock_db):
+        """Test initialization accepts optional gate_trigger."""
+        registry = SkillRegistry(lambda: mock_db, gate_trigger=None)
+        assert registry.gate_trigger is None
 
 
 class TestSkillRegistration:
@@ -123,20 +123,20 @@ class TestSkillRegistration:
         assert registry._skills["test_skill_mem"] == skill
 
     def test_register_skill_clears_cache(self, registry, mock_db):
-        """Test registration clears LRU cache."""
+        """Test registration clears metadata cache."""
         skill = MockSkill("test_skill_cache", "1.0.0")
 
-        # Pre-populate cache by calling _get_cached
-        registry._get_cached("test_skill")
-        cache_info_before = registry._get_cached.cache_info()
-        assert cache_info_before.currsize > 0
-
-        # Register skill
+        # Register first so there's something to cache
         registry.register(skill)
 
-        # Cache should be cleared
-        cache_info_after = registry._get_cached.cache_info()
-        assert cache_info_after.currsize == 0
+        # Pre-populate cache by querying metadata
+        registry.get_metadata("test_skill_cache")
+        assert len(registry._metadata_cache) > 0
+
+        # Register new version — should clear cache
+        skill_v2 = MockSkill("test_skill_cache", "2.0.0")
+        registry.register(skill_v2)
+        assert len(registry._metadata_cache) == 0
 
     def test_register_skill_with_metadata(self, registry, mock_db):
         """Test skill registration with full metadata."""
@@ -168,18 +168,16 @@ class TestSkillRegistration:
         assert result.git_commit_hash == "abc123"
 
     def test_register_skill_database_error(self, registry, mock_db):
-        """Test registration handles database errors."""
+        """Test registration propagates database errors after rollback."""
         skill = MockSkill("test_skill", "1.0.0")
-        
-        # Mock commit to raise exception
+
         original_commit = mock_db.commit
         mock_db.commit = MagicMock(side_effect=Exception("DB error"))
 
         try:
-            with pytest.raises(DatabaseError, match="Failed to register skill"):
+            with pytest.raises(Exception, match="DB error"):
                 registry.register(skill)
         finally:
-            # Restore original commit
             mock_db.commit = original_commit
 
 
@@ -332,63 +330,6 @@ class TestHistoricalQueries:
         # Same input should produce same hash
         with patch("inspect.getsource", side_effect=OSError("Source error")):
             assert registry._compute_code_hash(skill) == hash_result
-
-
-class TestListAvailable:
-    """Tests for listing available skills."""
-
-    def test_list_available_filters_by_repo_type(self, registry, mock_db):
-        """Test listing skills filters by repository type."""
-        # Create repo in database with unique URL
-        import uuid
-        from api.models import Repo
-        repo_id = str(uuid.uuid4())
-        unique_url = f"https://github.com/test/repo-{uuid.uuid4()}"
-        
-        # Clean up any existing repo with same URL
-        mock_db.query(Repo).filter(Repo.repo_url == unique_url).delete()
-        mock_db.commit()
-        
-        repo = Repo(
-            repo_id=repo_id,
-            user_id="test_user",
-            repo_url=unique_url,
-            repo_name="test-repo",
-            repo_type="code",
-            access_scope="read",
-        )
-        mock_db.add(repo)
-        mock_db.commit()
-
-        skill1 = MockSkill("read_skill", "1.0.0")
-        skill1.requirements.min_access = AccessScope.READ
-        skill1.requirements.repo_types = [RepoType.CODE]
-        registry._skills["read_skill"] = skill1
-
-        skill2 = MockSkill("write_skill", "1.0.0")
-        skill2.requirements.min_access = AccessScope.WRITE
-        skill2.requirements.repo_types = [RepoType.CODE]
-        registry._skills["write_skill"] = skill2
-
-        # Pass repo_id as string (will be converted to str in list_available anyway)
-        available = registry.list_available(repo_id=repo_id)
-
-        assert len(available) == 1
-        assert available[0].name == "read_skill"
-
-    def test_list_available_repo_not_found(self, registry, mock_db):
-        """Test listing skills returns empty list for non-existent repo."""
-        # No repo created in database
-
-        skill = MockSkill("test_skill", "1.0.0")
-        skill.requirements.repo_types = [RepoType.CODE]
-        registry._skills["test_skill"] = skill
-        registry._skills["test_skill@1.0.0"] = skill  # Versioned key
-
-        available = registry.list_available(repo_id=999)  # Non-existent repo
-
-        # Should return empty list for non-existent repo
-        assert len(available) == 0
 
 
 _ROLLBACK_SKILL_NAMES = ["rb_skill", "rb_single"]

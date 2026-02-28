@@ -167,6 +167,19 @@ async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, a
     register_git_tools(router, project_root)
     register_search_tools(router, project_root)
 
+    # Load local SKILL.md skills
+    import logging
+    from core.skills.loader import SkillLoader
+    _loader_logger = logging.getLogger(__name__)
+    builtin_names = {t.name for t in router.list_tools()}
+    for local in SkillLoader.discover(SkillLoader.default_paths(project_root)):
+        if local.skill.name in builtin_names:
+            _loader_logger.warning(
+                "Local skill '%s' skipped — conflicts with built-in tool", local.skill.name,
+            )
+            continue
+        router.register(local.skill)
+
     # Introspection tool — session info populated with what we know at startup
     from cli.tools.introspection import GetAgentInfoTool
     session_info = {"session_id": session_id, "agent_id": agent_id, "model": model, "turn": 0}

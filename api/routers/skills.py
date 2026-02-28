@@ -1,4 +1,9 @@
-"""Skill API Router - 技能管理"""
+"""Skill API Router — skill registration, listing, versioning, publish/unpublish.
+
+Route ordering note: static path segments (/status, /publish) MUST be defined
+before parameterized segments (/{skill_id}, /{skill_name}/...) to avoid
+FastAPI matching "status" as a skill_id.
+"""
 
 from typing import Any
 
@@ -7,14 +12,33 @@ from pydantic import BaseModel
 
 from api.database import SessionLocal
 from api.dependencies import get_current_user
-from api.services.exceptions import ResourceNotFoundError
-from api.services.skill_service import SkillService
+from core.exceptions import SkillNotFoundError
+from core.skills.catalog import NameConflictError, SkillCatalog
 
 router = APIRouter()
 
+# Module-level singleton — the in-memory _skills dict and metadata cache
+# only provide value when the same instance is reused across requests.
+_catalog_instance: SkillCatalog | None = None
+
+
+def _catalog() -> SkillCatalog:
+    global _catalog_instance
+    if _catalog_instance is None:
+        _catalog_instance = SkillCatalog(SessionLocal)
+    return _catalog_instance
+
+
+def reset_catalog() -> None:
+    """Reset the singleton for testing. Not for production use."""
+    global _catalog_instance
+    _catalog_instance = None
+
+
+# ── Request / Response models ─────────────────────────────────────────────────
+
 
 class RegisterSkillRequest(BaseModel):
-    """注册技能请求"""
     skill_id: str
     skill_name: str
     skill_version: str
@@ -23,18 +47,27 @@ class RegisterSkillRequest(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class PublishSkillRequest(BaseModel):
+    name: str
+    version: str
+    description: str
+    triggers: list[str] | None = None
+    dependencies: list[str] | None = None
+    manifest: dict[str, Any] | None = None
+    category: str = "user"
+    priority: int = 5
+
+
 class SkillResponse(BaseModel):
-    """技能响应"""
     skill_id: str
     skill_name: str
     version: str
-    description: str
-    metadata: dict[str, Any]
+    description: str | None = None
+    metadata: dict[str, Any] | None = None
     created_at: str | None = None
 
 
 class SkillListResponse(BaseModel):
-    """技能列表响应"""
     skills: list[dict[str, Any]]
     total: int
     limit: int
@@ -42,84 +75,166 @@ class SkillListResponse(BaseModel):
 
 
 class SkillVersionResponse(BaseModel):
-    """技能版本响应"""
     version: str
-    description: str
+    status: str | None = None
+    is_active: int | None = None
     created_at: str | None = None
 
 
-@router.post(
-    "",
-    response_model=SkillResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="注册技能"
-)
+class SkillInfoResponse(BaseModel):
+    skill_name: str
+    version: str
+    description: str | None = None
+    source: str | None = None
+    status: str | None = None
+    created_by: str | None = None
+    category: str | None = None
+    install_count: int = 0
+    created_at: str | None = None
+
+
+class SkillStatusResponse(BaseModel):
+    builtin: list[dict[str, Any]]
+    marketplace: list[dict[str, Any]]
+    user: list[dict[str, Any]]
+
+
+# ── CRUD endpoints ────────────────────────────────────────────────────────────
+
+
+@router.post("", response_model=SkillResponse, status_code=status.HTTP_201_CREATED)
 async def register_skill(
     request: RegisterSkillRequest,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    """注册技能"""
+    """Register a skill (admin/platform use)."""
     try:
-        service = SkillService(SessionLocal)
-        result = service.register_skill(
-            user_id=current_user["user_id"],
+        result = _catalog().register_from_api(
             skill_id=request.skill_id,
             skill_name=request.skill_name,
-            skill_version=request.skill_version,
+            version=request.skill_version,
             skill_code=request.skill_code,
-            description=request.description,
-            metadata=request.metadata
+            description=request.description or "",
+            metadata=request.metadata,
+            created_by=current_user.get("user_id"),
         )
-        return result
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"注册技能失败: {e!s}"
-        )
+        return SkillResponse(**result)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except NameConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
 
-@router.get(
-    "",
-    response_model=SkillListResponse,
-    summary="列出技能"
-)
+@router.get("", response_model=SkillListResponse)
 async def list_skills(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    """列出技能"""
-    service = SkillService(SessionLocal)
-    return service.list_skills(limit=limit, offset=offset)
+    """List active skills."""
+    return _catalog().list_active(limit=limit, offset=offset)
 
 
-@router.get(
-    "/{skill_id}",
-    response_model=SkillResponse,
-    summary="获取技能"
-)
+# Static routes BEFORE parameterized routes — see module docstring.
+
+@router.get("/status", response_model=SkillStatusResponse)
+async def get_skill_status(
+    current_user: dict = Depends(get_current_user),
+):
+    """Get all skills visible to the current user, grouped by source."""
+    return _catalog().get_visible_skills(current_user["user_id"])
+
+
+@router.post("/publish", status_code=status.HTTP_201_CREATED)
+async def publish_skill(
+    req: PublishSkillRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Publish a user-created skill to the platform."""
+    try:
+        return _catalog().publish_user_skill(
+            user_id=current_user["user_id"],
+            name=req.name,
+            version=req.version,
+            description=req.description,
+            triggers=req.triggers,
+            dependencies=req.dependencies,
+            manifest=req.manifest,
+            category=req.category,
+            priority=req.priority,
+        )
+    except NameConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+
+# Parameterized routes AFTER static routes.
+
+@router.get("/{skill_name}/info", response_model=SkillInfoResponse)
+async def get_skill_info(
+    skill_name: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get detailed skill info including install count."""
+    info = _catalog().get_skill_info(skill_name, current_user["user_id"])
+    if not info:
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
+    return info
+
+
+@router.get("/{skill_id}", response_model=SkillResponse)
 async def get_skill(
     skill_id: str,
     version: str | None = Query(None),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    """获取技能"""
-    try:
-        service = SkillService(SessionLocal)
-        return service.get_skill(skill_id=skill_id, version=version)
-    except ResourceNotFoundError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    """Get skill by ID or name.
+
+    The path param may be a full skill_id (primary key, e.g. "name@1.0.0"),
+    a bare skill name, or an opaque ID assigned at registration time.
+    We try: exact skill_id match first, then active-version-by-name.
+    """
+    catalog = _catalog()
+
+    # 1. Try exact skill_id match (primary key lookup)
+    meta = catalog.get_metadata_by_id(skill_id)
+
+    # 2. Fall back to name-based lookup (active version)
+    if meta is None:
+        name = skill_id.split("@")[0] if "@" in skill_id else skill_id
+        meta = catalog.get_metadata(name)
+
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_id}' not found")
+    return SkillResponse(
+        skill_id=meta.get("skill_id", skill_id),
+        skill_name=meta["skill_name"],
+        version=meta["version"],
+        description=meta.get("description"),
+        metadata=meta.get("skill_definition"),
+        created_at=meta.get("created_at"),
+    )
 
 
-@router.get(
-    "/{skill_id}/versions",
-    response_model=list[SkillVersionResponse],
-    summary="列出技能版本"
-)
+@router.get("/{skill_id}/versions", response_model=list[SkillVersionResponse])
 async def list_skill_versions(
     skill_id: str,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    """列出技能版本"""
-    service = SkillService(SessionLocal)
-    return service.list_skill_versions(skill_id=skill_id)
+    """List all versions of a skill."""
+    name = skill_id.split("@")[0] if "@" in skill_id else skill_id
+    return _catalog().list_versions(name)
+
+
+# Unpublish is a state transition (may deprecate instead of delete),
+# so POST is more appropriate than DELETE.
+@router.post("/{skill_name}/unpublish")
+async def unpublish_skill(
+    skill_name: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Unpublish a user skill."""
+    try:
+        result = _catalog().unpublish_user_skill(current_user["user_id"], skill_name)
+        return {"skill_name": skill_name, "result": result}
+    except SkillNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found")
