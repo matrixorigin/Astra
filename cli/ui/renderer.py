@@ -102,6 +102,7 @@ class RichRenderer:
         if "total_tokens" in usage:
             parts.append(f"total:{usage['total_tokens']}")
         if parts:
+            self._console.print()
             self._console.print(f"  [dim]{' · '.join(parts)}[/dim]")
 
 

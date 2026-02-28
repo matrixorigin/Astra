@@ -12,7 +12,9 @@ from typing import Any, Protocol
 
 from cli.api_client import AuthenticationError
 from cli.permissions import Decision, PermissionManager
+from cli.tools.base import SideEffect
 from cli.tools.router import ToolCall, ToolResult, ToolRouter
+from core.skills.base import SideEffectCategory
 
 MAX_TURNS = 25
 
@@ -260,7 +262,21 @@ async def edge_chat_loop(
 
             for tc in parsed:
                 tool = tool_router.get_tool(tc.name)
-                side_effect = tool.side_effect if tool else None
+                # Resolve SideEffect for the permission system.  EdgeTools have
+                # a ``side_effect`` attribute directly; typed Skills loaded from
+                # skill.py only carry ``side_effect_profile`` (core enum).  Fall
+                # back to deriving from side_effect_profile so both work.
+                if tool is None:
+                    side_effect = None
+                elif hasattr(tool, "side_effect"):
+                    side_effect = tool.side_effect
+                else:
+                    _cat = getattr(getattr(tool, "side_effect_profile", None), "category", None)
+                    side_effect = {
+                        SideEffectCategory.READ: SideEffect.READ,
+                        SideEffectCategory.WRITE: SideEffect.WRITE,
+                        SideEffectCategory.EXECUTE: SideEffect.EXECUTE,
+                    }.get(_cat, SideEffect.READ)
 
                 if side_effect is None:
                     tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": f"Unknown tool: {tc.name}"})

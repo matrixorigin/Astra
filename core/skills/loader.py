@@ -83,8 +83,32 @@ def load_manifests(skills_root: Path | None = None) -> list[SkillManifest]:
 @dataclass
 class LocalSkill:
     """A discovered local skill."""
-    spec: SkillMd
-    skill: MarkdownSkill
+    spec: SkillMd | None
+    skill: Any  # MarkdownSkill or typed Skill from skill.py
+
+
+def _load_skill_py(skill_dir: Path) -> Any | None:
+    """Try to import a Skill subclass from skill_dir/skill.py."""
+    py_path = skill_dir / "skill.py"
+    if not py_path.is_file():
+        return None
+    import importlib.util
+    try:
+        spec = importlib.util.spec_from_file_location(f"_skill_{skill_dir.name}", py_path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        # Find the Skill subclass (not base classes)
+        from core.skills.base import Skill as SkillBase
+        for attr in vars(mod).values():
+            if (isinstance(attr, type) and issubclass(attr, SkillBase)
+                    and attr is not SkillBase and not attr.__name__.startswith("_")):
+                return attr()
+        return None
+    except Exception as e:
+        logger.warning("Failed to load skill.py from %s: %s", skill_dir, e)
+        return None
 
 
 class SkillLoader:
@@ -96,7 +120,7 @@ class SkillLoader:
 
     @staticmethod
     def discover(paths: list[Path]) -> list[LocalSkill]:
-        """Scan directories for SKILL.md files. Earlier paths have higher priority."""
+        """Scan directories for skills. Prefers skill.py over SKILL.md."""
         seen: dict[str, LocalSkill] = {}
 
         for base in paths:
@@ -105,6 +129,17 @@ class SkillLoader:
             for skill_dir in sorted(base.iterdir()):
                 if not skill_dir.is_dir():
                     continue
+
+                # Try skill.py first
+                typed_skill = _load_skill_py(skill_dir)
+                if typed_skill is not None:
+                    if typed_skill.name in seen:
+                        continue
+                    seen[typed_skill.name] = LocalSkill(spec=None, skill=typed_skill)
+                    logger.info("Loaded typed skill: %s from %s/skill.py", typed_skill.name, skill_dir)
+                    continue
+
+                # Fall back to SKILL.md
                 md_path = skill_dir / SKILL_FILENAME
                 if not md_path.is_file():
                     continue

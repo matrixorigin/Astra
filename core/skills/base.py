@@ -99,7 +99,7 @@ class SkillOutput(BaseModel):
     """Base class for skill outputs."""
 
     success: bool
-    result: Any
+    result: Any = None
     error: str | None = None
     cost: float = 0.0
 

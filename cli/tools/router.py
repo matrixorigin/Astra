@@ -85,10 +85,12 @@ class ToolRouter:
                     and not isinstance(tool, EdgeTool):
                 validated = tool.validate_input(tc.arguments)
                 output = await tool.execute(validated)
-                result = output.result if hasattr(output, 'result') else str(output)
-                if hasattr(output, 'error') and output.error:
-                    raise RuntimeError(output.error)
-                result = str(result)
+                # Serialize full output as JSON so LLM sees all fields
+                if hasattr(output, 'model_dump'):
+                    data = output.model_dump(exclude={"cost"}, exclude_none=True)
+                    result = json.dumps(data, ensure_ascii=False, default=str)
+                else:
+                    result = str(output.result) if hasattr(output, 'result') else str(output)
             else:
                 result = await tool.execute(**tc.arguments)
             elapsed = int((time.monotonic() - t0) * 1000)
