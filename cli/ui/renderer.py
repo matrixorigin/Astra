@@ -64,6 +64,11 @@ class RichRenderer:
             self._md.start()
         self._md.feed(chunk)
 
+    def thinking(self) -> None:
+        """Show a thinking indicator during long pauses in LLM output."""
+        if self._md is not None:
+            self._md.show_thinking()
+
     def tool_start(self, name: str, args: dict[str, Any]) -> None:
         self._stop_spinner()
         if self._md is not None:

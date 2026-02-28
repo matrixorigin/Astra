@@ -317,6 +317,9 @@ class TestHelpers:
         assert "# code" in ctx
         assert "# docs" in ctx
         assert "Framework" in ctx
+        # Must include full paths for str_replace
+        assert str(skill_dir / "skill.py") in ctx
+        assert "full path" in ctx.lower()
 
     def test_build_skill_dev_context_skips_unreadable(self, tmp_path):
         """Unreadable files don't crash _build_skill_dev_context."""

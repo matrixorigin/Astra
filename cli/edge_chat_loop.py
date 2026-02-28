@@ -161,7 +161,11 @@ async def _consume_turn(sse_stream, renderer: Renderer, *, timeout: float = MAX_
                     result.error = event
                     renderer.error(event.get("message", "Unknown cloud error"))
                 elif etype == "ping":
-                    pass  # heartbeat — connection kept alive, nothing to render
+                    # Heartbeat — connection alive.  If text is already
+                    # streaming, show a thinking indicator so the user
+                    # knows the LLM is still working during long pauses.
+                    if result.text and hasattr(renderer, "thinking"):
+                        renderer.thinking()
     except TimeoutError:
         if deadline.expired():
             # Our wall-clock deadline fired — report as client timeout.

@@ -95,7 +95,20 @@ class TestDataVersioningAPI:
 class TestSkillLifecycle:
     """Verify draft→active→deprecated lifecycle transitions."""
 
+    @pytest.fixture(autouse=True)
+    def _cleanup(self, db_session):
+        """Track and remove skills created during each test."""
+        self._created_names: list[str] = []
+        yield
+        for name in self._created_names:
+            db_session.execute(
+                text("DELETE FROM skills_registry WHERE skill_name = :n"),
+                {"n": name},
+            )
+        db_session.commit()
+
     def _create_skill(self, db, name, status="active"):
+        self._created_names.append(name)
         skill = SkillRegistryModel(
             skill_id=f"sk_{os.urandom(4).hex()}",
             skill_name=name,

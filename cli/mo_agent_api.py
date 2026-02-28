@@ -479,8 +479,10 @@ def _build_skill_dev_context(name: str, skill_dir: Path) -> str:
         f"# SKILL DEV MODE: {name}",
         "",
         "You are helping develop a local skill. The user describes what the skill should do.",
-        "Write/modify skill.py using the str_replace or write_file tool.",
-        f"Skill directory: {skill_dir}",
+        "",
+        "## File Paths (use these exact paths for str_replace)",
+        f"- skill.py: {skill_dir / 'skill.py'}",
+        f"- SKILL.md: {skill_dir / 'SKILL.md'}",
         "",
         _SKILL_FRAMEWORK_GUIDE,
         "",
@@ -490,9 +492,10 @@ def _build_skill_dev_context(name: str, skill_dir: Path) -> str:
         if f.is_file() and f.suffix in (".py", ".md", ".yaml", ".yml"):
             try:
                 content = f.read_text().rstrip()
-                parts.append(f"\n### {f.name}\n```{f.suffix.lstrip('.')}\n{content}\n```")
+                # Show full path so AI knows exactly where to write
+                parts.append(f"\n### {f} (full path)\n```{f.suffix.lstrip('.')}\n{content}\n```")
             except OSError:
-                parts.append(f"\n### {f.name}\n(unreadable)")
+                parts.append(f"\n### {f}\n(unreadable)")
     return "\n".join(parts)
 
 

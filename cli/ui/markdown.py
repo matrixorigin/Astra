@@ -44,6 +44,7 @@ class StreamingMarkdown:
         # chunks that arrive without a trailing newline are handled correctly
         # when the *next* chunk continues the same visual line.
         self._current_line_width = 0
+        self._thinking_shown = False
 
     def start(self) -> None:
         self._live = True
@@ -80,7 +81,28 @@ class StreamingMarkdown:
                         self._current_line_width = self._current_line_width - width
         return lines
 
+    def show_thinking(self) -> None:
+        """Display a transient thinking indicator below the current text."""
+        if not self._live or not self._console.is_terminal or self._thinking_shown:
+            return
+        f = self._console.file
+        # Save cursor position so _hide_thinking can restore exactly,
+        # even if the newline triggers a terminal scroll.
+        f.write("\033[s\n\033[2m  ⏳ Thinking…\033[0m")
+        f.flush()
+        self._thinking_shown = True
+
+    def _hide_thinking(self) -> None:
+        if not self._thinking_shown:
+            return
+        f = self._console.file
+        # Erase the thinking line, then restore saved cursor position.
+        f.write("\r\033[2K\033[u")
+        f.flush()
+        self._thinking_shown = False
+
     def feed(self, chunk: str) -> None:
+        self._hide_thinking()
         self._buffer += chunk
         if self._live:
             f = self._console.file
@@ -90,6 +112,7 @@ class StreamingMarkdown:
 
     def finish(self) -> str:
         """Stop streaming. On terminals, replace raw text with rendered markdown."""
+        self._hide_thinking()
         if self._live:
             self._live = False
             f = self._console.file

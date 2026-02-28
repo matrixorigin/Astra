@@ -420,7 +420,9 @@ class PromptAssembler(DbConsumer):
             # Capped at 10; full catalog available via get_agent_info tool.
             try:
                 from api.models import SkillRegistry
-                query = db.query(SkillRegistry.skill_name, SkillRegistry.description).filter(SkillRegistry.is_active == 1)
+                query = db.query(SkillRegistry.skill_name, SkillRegistry.description).filter(
+                    SkillRegistry.is_active == 1,
+                ).order_by(SkillRegistry.skill_name)
                 rows = query.limit(30).all()
                 if rows:
                     # Deduplicate multi-version rows and exclude installed skills.
