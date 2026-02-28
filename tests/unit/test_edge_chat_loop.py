@@ -339,6 +339,43 @@ class TestEdgeChatLoop:
         assert len(api.calls) == 25  # MAX_TURNS, no flush
         assert any("maximum turns" in e.lower() for e in renderer.errors)
 
+    @pytest.mark.asyncio
+    async def test_extra_rules_merged_into_project_rules(
+        self, tmp_path, router, perms, renderer,
+    ):
+        """extra_rules are merged with project_rules and sent on turn 0."""
+        (tmp_path / ".mo-agent").mkdir()
+        (tmp_path / ".mo-agent" / "rules.md").write_text("base rule")
+
+        api = MockAPIClient([
+            [{"type": "turn_complete", "has_tool_calls": False}],
+        ])
+        await edge_chat_loop(
+            "hi", api, router, perms,
+            project_root=str(tmp_path),
+            renderer=renderer,
+            extra_rules="SKILL DEV MODE: my_tool",
+        )
+        sent_rules = api.calls[0]["project_rules"]
+        assert "base rule" in sent_rules
+        assert "SKILL DEV MODE: my_tool" in sent_rules
+
+    @pytest.mark.asyncio
+    async def test_extra_rules_alone_when_no_project_rules(
+        self, tmp_path, router, perms, renderer,
+    ):
+        """extra_rules work even when there are no project rule files."""
+        api = MockAPIClient([
+            [{"type": "turn_complete", "has_tool_calls": False}],
+        ])
+        await edge_chat_loop(
+            "hi", api, router, perms,
+            project_root=str(tmp_path),
+            renderer=renderer,
+            extra_rules="SKILL DEV MODE: echo",
+        )
+        sent_rules = api.calls[0]["project_rules"]
+        assert sent_rules == "SKILL DEV MODE: echo"
 
 
 # ============================================================================

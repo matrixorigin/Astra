@@ -681,3 +681,103 @@ class TestRealisticScenarios:
         assert "Test Project" in tool_results[0]["result"]
         # Verify JSON-serializable
         json.dumps(tool_results)
+
+
+# ============================================================================
+# resolve_side_effect — bridges EdgeTool.side_effect and Skill.side_effect_profile
+# ============================================================================
+
+class TestResolveSideEffect:
+    """Verify resolve_side_effect works for EdgeTools, typed Skills, and unknowns.
+
+    This function fixed an AttributeError crash: typed Skills loaded from
+    skill.py have side_effect_profile (core enum) but no side_effect attr.
+    The permission system and introspection tool both need SideEffect (cli enum).
+    """
+
+    def test_edge_tool_returns_direct_side_effect(self):
+        """EdgeTool has side_effect attr → return it directly."""
+        from cli.tools.base import resolve_side_effect, SideEffect
+        from cli.tools.file_ops import ReadFileTool
+        tool = ReadFileTool(project_root="/tmp")
+        assert resolve_side_effect(tool) == SideEffect.READ
+
+    def test_edge_tool_write(self):
+        from cli.tools.base import resolve_side_effect, SideEffect
+        from cli.tools.file_ops import WriteFileTool
+        tool = WriteFileTool(project_root="/tmp")
+        assert resolve_side_effect(tool) == SideEffect.WRITE
+
+    def test_edge_tool_execute(self):
+        from cli.tools.base import resolve_side_effect, SideEffect
+        from cli.tools.shell import BashTool
+        tool = BashTool(project_root="/tmp")
+        assert resolve_side_effect(tool) == SideEffect.EXECUTE
+
+    def test_typed_skill_from_skill_py(self, tmp_path):
+        """Typed Skill loaded from skill.py has no side_effect attr.
+
+        This is the exact bug that caused AttributeError — the Skill base
+        class only has side_effect_profile (SideEffectCategory.READ default).
+        resolve_side_effect must bridge to SideEffect.READ.
+        """
+        from cli.tools.base import resolve_side_effect, SideEffect
+        from core.skills.loader import SkillLoader
+
+        skill_dir = tmp_path / "echo"
+        skill_dir.mkdir()
+        (skill_dir / "skill.py").write_text(
+            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            'class I(SkillInput):\n    pass\n'
+            'class O(SkillOutput):\n    pass\n'
+            'class EchoSkill(Skill[I, O]):\n'
+            '    name = "echo"\n'
+            '    version = "1.0.0"\n'
+            '    description = "echo"\n'
+            '    async def execute(self, input): '
+            'return O(success=True)\n'
+        )
+        loaded = SkillLoader.discover([tmp_path])
+        skill = loaded[0].skill
+        # Confirm the bug scenario: no side_effect attr
+        assert not hasattr(skill, "side_effect")
+        assert hasattr(skill, "side_effect_profile")
+        # resolve_side_effect bridges correctly
+        assert resolve_side_effect(skill) == SideEffect.READ
+
+    def test_typed_skill_with_write_profile(self, tmp_path):
+        """Typed Skill with WRITE side_effect_profile bridges correctly."""
+        from cli.tools.base import resolve_side_effect, SideEffect
+        from core.skills.loader import SkillLoader
+
+        skill_dir = tmp_path / "writer"
+        skill_dir.mkdir()
+        (skill_dir / "skill.py").write_text(
+            'from core.skills.base import (\n'
+            '    Skill, SkillInput, SkillOutput,\n'
+            '    SideEffectProfile, SideEffectCategory,\n'
+            ')\n'
+            'class I(SkillInput):\n    pass\n'
+            'class O(SkillOutput):\n    pass\n'
+            'class WriterSkill(Skill[I, O]):\n'
+            '    name = "writer"\n'
+            '    version = "1.0.0"\n'
+            '    description = "writes"\n'
+            '    side_effect_profile = SideEffectProfile(\n'
+            '        category=SideEffectCategory.WRITE\n'
+            '    )\n'
+            '    async def execute(self, input): '
+            'return O(success=True)\n'
+        )
+        loaded = SkillLoader.discover([tmp_path])
+        skill = loaded[0].skill
+        assert resolve_side_effect(skill) == SideEffect.WRITE
+
+    def test_unknown_object_defaults_to_read(self):
+        """Object with neither side_effect nor side_effect_profile → READ."""
+        from cli.tools.base import resolve_side_effect, SideEffect
+
+        class Mystery:
+            name = "mystery"
+
+        assert resolve_side_effect(Mystery()) == SideEffect.READ

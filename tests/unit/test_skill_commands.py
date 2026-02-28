@@ -143,6 +143,29 @@ class TestSkillTest:
         assert "ERROR" in output or "EXCEPTION" in output
         assert "boom" in output
 
+    def test_empty_output_shows_warning(self, tmp_path, monkeypatch):
+        """Skill returning all-empty fields triggers validation warning."""
+        monkeypatch.chdir(tmp_path)
+        skill_dir = tmp_path / ".mo-agent" / "skills" / "empty"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "skill.py").write_text(
+            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            'class I(SkillInput):\n    query: str = ""\n'
+            'class O(SkillOutput):\n    data: dict = {}\n'
+            'class EmptySkill(Skill[I, O]):\n'
+            '    name = "empty"\n'
+            '    version = "1.0.0"\n'
+            '    description = "returns empty"\n'
+            '    async def execute(self, input):\n'
+            '        return O(success=True)\n'
+        )
+        console, buf = _console()
+        cmd_skill(console, cmd_arg="test empty")
+        output = buf.getvalue()
+        assert "OUTPUT" in output
+        # _validate_skill_output detects all-empty custom fields
+        assert "empty" in output.lower()
+
 
 # ============================================================================
 # /skill dev
