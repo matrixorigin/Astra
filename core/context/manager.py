@@ -721,7 +721,7 @@ class ContextManager(DbConsumer):
 
     @staticmethod
     def update_snapshot_llm_ids(
-        db_factory, context_capture_id: str,
+        db_factory: DbFactory, context_capture_id: str,
         llm_request_id: str | None = None, llm_response_id: str | None = None,
     ) -> None:
         """Update context capture with LLM request/response IDs (async).

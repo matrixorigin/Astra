@@ -147,6 +147,10 @@ class TestPersistFieldCompleteness:
 
     def test_tool_events_have_skill_version_when_registry_available(self):
         """tool_call and tool_result events must include skill_version from registry."""
+        # Clear module-level cache to ensure this test hits the mocked DB
+        import api.routers.chat as _chat_mod
+        _chat_mod._SKILL_VERSION_CACHE.clear()
+
         captured = {"stream_events": []}
 
         # Mock ORM query: db.query(SR.skill_name, SR.version).filter(...).order_by(...).all()

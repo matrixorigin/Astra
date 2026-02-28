@@ -1,6 +1,7 @@
 """Chat API endpoints — unified conversation entry point with durable AgentRun."""
 
 import json
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -84,6 +85,53 @@ class RunStatusResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Skill version cache: {skill_name: (version | None, timestamp)}.
+# TTL-based per-entry cache avoids repeated DB queries on high-frequency turns.
+# Versions change rarely (deploy-time), so a 60s TTL is safe.
+# None means the skill is not in the registry (negative cache).
+#
+# Thread safety: accessed from background persist threads. CPython GIL makes
+# individual dict read/write atomic. Worst case under concurrency: duplicate
+# DB query on simultaneous cache miss — harmless. If free-threaded Python is
+# adopted, wrap with a threading.Lock.
+_SKILL_VERSION_CACHE: dict[str, tuple[str | None, float]] = {}
+_SKILL_VERSION_TTL = float(os.environ.get("SKILL_VERSION_CACHE_TTL", "60"))  # seconds
+
+
+def _resolve_skill_versions(names: set[str]) -> dict[str, str]:
+    """Return {skill_name: latest_version} for the given names, with TTL cache."""
+    now = time.monotonic()
+    result: dict[str, str] = {}
+    miss: set[str] = set()
+
+    for n in names:
+        entry = _SKILL_VERSION_CACHE.get(n)
+        if entry and (now - entry[1]) < _SKILL_VERSION_TTL:
+            if entry[0] is not None:
+                result[n] = entry[0]
+            # else: negative cache hit — skill not in registry, skip
+        else:
+            miss.add(n)
+
+    if miss:
+        from api.models.skill import SkillRegistry as SR
+        with SessionLocal() as db:
+            rows = db.query(SR.skill_name, SR.version).filter(
+                SR.skill_name.in_(miss), SR.is_active == 1,
+            ).order_by(SR.skill_name, SR.version.desc()).all()
+            found: set[str] = set()
+            for name, ver in rows:
+                if name not in found:  # first row per skill = latest (ORDER BY version DESC)
+                    result[name] = ver
+                    found.add(name)
+                    _SKILL_VERSION_CACHE[name] = (ver, now)
+            # Negative cache: remember unregistered names to avoid repeated DB misses
+            for name in miss - found:
+                _SKILL_VERSION_CACHE[name] = (None, now)
+
+    return result
+
 
 def _ensure_session(db: Session, user_id: str, session_id: str | None, agent_id: str | None) -> str:
     """Return existing session_id or create a new one."""
@@ -794,6 +842,7 @@ def _persist_turn_events(
 
     # Resolve skill versions for tool events (best-effort, single query).
     # Returns the latest active version per skill name.
+    # Uses a module-level TTL cache to avoid repeated DB hits on high-frequency turns.
     skill_versions: dict[str, str] = {}
     try:
         all_names = set()
@@ -803,17 +852,9 @@ def _persist_turn_events(
             all_names.add(tc.get("function", {}).get("name", ""))
         all_names.discard("")
         if all_names:
-            from api.models.skill import SkillRegistry as SR
-            with SessionLocal() as db:
-                rows = db.query(SR.skill_name, SR.version).filter(
-                    SR.skill_name.in_(all_names), SR.is_active == 1,
-                ).order_by(SR.skill_name, SR.version.desc()).all()
-                # Keep only the first (latest) version per skill
-                for name, ver in rows:
-                    if name not in skill_versions:
-                        skill_versions[name] = ver
-    except Exception:
-        logger.debug("Skill version resolution failed", exc_info=True)
+            skill_versions = _resolve_skill_versions(all_names)
+    except SQLAlchemyError:
+        logger.warning("Skill version resolution failed", exc_info=True)
 
     # Phase 1: persist user query
     try:
