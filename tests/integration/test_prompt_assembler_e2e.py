@@ -774,6 +774,25 @@ class TestGetAgentInfoTool:
         assert "installed_skills" not in result["capability"]
         assert result["capability"]["tool_count"] == 0
 
+    @pytest.mark.asyncio
+    async def test_memory_graceful_on_api_failure(self):
+        """Cloud memory enrichment failure doesn't break memory dimension."""
+        from unittest.mock import AsyncMock
+        from cli.tools.introspection import GetAgentInfoTool
+
+        mock_api = AsyncMock()
+        mock_api.get_introspection_memory.side_effect = ConnectionError("offline")
+        tool = GetAgentInfoTool(
+            tool_router=None,
+            session_info={"session_id": "ses_1", "has_project_rules": True},
+            api_client=mock_api,
+        )
+        result = json.loads(await tool.execute(dimension="memory"))
+        # Local data preserved despite cloud failure
+        assert result["memory"]["has_project_rules"] is True
+        # Cloud fields not present
+        assert "episodic" not in result["memory"]
+
 
 # ============================================================================
 # 7. Edge Profile Detection
