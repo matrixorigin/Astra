@@ -61,6 +61,8 @@ class SelfImprovingSelector(DbConsumer):
     test corrections, and update selection strategy.
     """
 
+    MAX_ACTIVE_LEARNINGS = 200
+
     def __init__(self, db_factory: DbFactory, llm_client=None, account: str = "sys", weights: SignalWeights | None = None, thresholds: SignalThresholds | None = None, embed_fn=None):
         super().__init__(db_factory)
         self.llm = llm_client
@@ -156,6 +158,7 @@ class SelfImprovingSelector(DbConsumer):
 
         if learned_count > 0:
             self._persist_learning_updates()
+            self._evict_low_confidence_learnings()
 
         return {
             "learned": learned_count,
@@ -409,7 +412,7 @@ class SelfImprovingSelector(DbConsumer):
             )
             learnings = db.query(LearningModel).filter(
                 LearningModel.is_active == 1
-            ).all()
+            ).order_by(LearningModel.confidence.desc()).limit(self.MAX_ACTIVE_LEARNINGS).all()
             matched = []
             semantic_matches = 0
             substring_matches = 0
@@ -550,6 +553,29 @@ class SelfImprovingSelector(DbConsumer):
             except Exception:
                 db.rollback()
                 raise
+
+    def _evict_low_confidence_learnings(self) -> None:
+        """Deactivate lowest-confidence learnings when count exceeds MAX_ACTIVE_LEARNINGS."""
+        with self._db() as db:
+            count = db.query(LearningModel).filter(LearningModel.is_active == 1).count()
+            if count <= self.MAX_ACTIVE_LEARNINGS:
+                return
+            excess = count - self.MAX_ACTIVE_LEARNINGS
+            to_evict = (
+                db.query(LearningModel.learning_id)
+                .filter(LearningModel.is_active == 1)
+                .order_by(LearningModel.confidence.asc())
+                .limit(excess)
+                .all()
+            )
+            ids = [row[0] for row in to_evict]
+            if ids:
+                db.query(LearningModel).filter(
+                    LearningModel.learning_id.in_(ids)
+                ).update({"is_active": 0}, synchronize_session="fetch")
+                db.commit()
+                logger.info("Evicted %d low-confidence learnings (cap=%d)",
+                            len(ids), self.MAX_ACTIVE_LEARNINGS)
 
     def _is_high_confidence_value(self, normalized_value: float | None) -> bool:
         if normalized_value is None:

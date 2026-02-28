@@ -72,6 +72,9 @@ class _FeedbackBuffer:
     caller's Session when multiple threads add/flush concurrently.
     """
 
+    _MAX_BUFFER_SIZE = 10_000
+    _MAX_RETRIES = 3
+
     def __init__(self, db_factory: DbFactory, *, batch_size: int = 50, flush_interval: float = 2.0):
         _tmp = db_factory()
         self._engine = _tmp.get_bind()  # Engine is thread-safe; extract once
@@ -79,13 +82,22 @@ class _FeedbackBuffer:
         self._batch_size = batch_size
         self._flush_interval = flush_interval
         self._buffer: list[dict[str, Any]] = []
+        self._retry_counts: dict[str, int] = {}  # signal_id → retry count
         self._lock = threading.Lock()
         self._last_flush = time.time()
 
     def add(self, event_id: str, signal: SignalType, data: dict[str, Any]) -> None:
         with self._lock:
+            if len(self._buffer) >= self._MAX_BUFFER_SIZE:
+                dropped = self._buffer[:self._batch_size]
+                self._buffer = self._buffer[self._batch_size:]
+                for d in dropped:
+                    self._retry_counts.pop(d["signal_id"], None)
+                logger.warning("Feedback buffer full (%d), dropped %d oldest signals",
+                               self._MAX_BUFFER_SIZE, len(dropped))
+            sid = str(uuid7())
             self._buffer.append({
-                "signal_id": str(uuid7()),
+                "signal_id": sid,
                 "selection_event_id": event_id,
                 "signal_type": signal.value,
                 "signal_data": json.dumps(data),
@@ -129,11 +141,27 @@ class _FeedbackBuffer:
                     )
                 conn.execute(text("COMMIT"))
             logger.debug("Flushed %d feedback signals", len(batch))
+            for row in batch:
+                self._retry_counts.pop(row["signal_id"], None)
             return len(batch)
         except Exception as e:
             logger.error("Feedback flush failed: %s", e)
-            # Re-queue
-            self._buffer.extend(batch)
+            # Re-queue with retry limit
+            requeued = []
+            for row in batch:
+                sid = row["signal_id"]
+                count = self._retry_counts.get(sid, 0) + 1
+                if count <= self._MAX_RETRIES:
+                    self._retry_counts[sid] = count
+                    requeued.append(row)
+                else:
+                    self._retry_counts.pop(sid, None)
+            if requeued:
+                self._buffer.extend(requeued)
+            dropped = len(batch) - len(requeued)
+            if dropped:
+                logger.warning("Dropped %d feedback signals after %d retries",
+                               dropped, self._MAX_RETRIES)
             return 0
 
 

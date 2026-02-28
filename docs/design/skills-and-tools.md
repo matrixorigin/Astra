@@ -234,13 +234,17 @@ Execute  → Record skill_name + skill_version in conversation_events
          → Result logged with full provenance
 
 Replay   → Load exact version from event metadata
-         → Execute with historical skill logic
-         → Reproduce exact behavior
+         → Verify code_hash matches current skill code
+         → ⚠️ If mismatch: warn that skill code changed since original execution
+         → Execute with current skill logic (historical code loading not yet supported)
+         → Compare results for drift detection
 
 Upgrade  → New version triggers regression gate (see trust-and-safety.md)
          → Gate passes → activate new version
          → Gate fails → reject, keep old version
 ```
+
+> **Known limitation**: Replay currently uses the live skill code, not the historical version. `code_hash` and `git_commit_hash` are recorded for audit but not used to load historical code. If skill logic changed between executions, replay results may differ. Short-term mitigation: replay warns on `code_hash` mismatch. Long-term: skill code versioning via artifact registry or git tags.
 
 ### Declarative Skill Definition
 
@@ -279,9 +283,8 @@ side_effects:
   external_apis: [github]
 
 progressive_disclosure:
-  tier1_tokens: 25
-  tier2_tokens: 120
-  tier3_tokens: 500
+  index_tokens: 25       # embedding index (never in LLM context)
+  full_schema_tokens: 500 # complete tool schema (budget-gated)
 
 mcp_compatible: true
 ```
@@ -345,29 +348,27 @@ async def execute_skill(user_id, skill_name, params):
 Following Anthropic's Agent Skills pattern and RAG-MCP research (Gan & Sun, 2025), skills load in two tiers with **real token accounting** and **semantic retrieval**:
 
 ```
-Tier 1: INDEX (always available, never in LLM context)
+Index Tier: EMBEDDING INDEX (always available, never in LLM context)
   Embedding vector of name + description + triggers
   Used by semantic retriever to find candidates — LLM never sees this tier.
   Cost: 0 prompt tokens (lives in vector index only)
 
-Tier 2: FULL SCHEMA (injected only for LLM-selected skills, measured tokens)
+Schema Tier: FULL TOOL SCHEMA (injected for budget-available candidates)
   Complete OpenAI tool JSON schema (from Pydantic model or default)
   Includes: name, description, parameters, detailed_instructions, examples, edge_cases
   Token cost: measured per-skill via len(json) // 4
-
-  Note: The schema's name + description fields serve as the "summary" tier
-        for LLM candidate ranking. There is no separate Tier 2 LLM ranking pass —
-        semantic retrieval filters candidates, then LLM sees full schemas and
-        selects via native function calling in a single pass.
+  LLM sees full schemas and selects via native function calling in a single pass.
 ```
 
+Note: Anthropic's Agent Skills uses a three-tier model (name → summary → full). We collapse summary and full into one tier because OpenAI-style function calling requires full parameter schemas — a summary-only ranking pass would double LLM latency for marginal benefit. The schema's `name` + `description` fields serve as the implicit summary during LLM candidate ranking.
+
 **Key design principles** (learned from industry):
-- **Real token measurement, not constants**: Each skill's Tier 2 cost is computed from actual serialized size, not hardcoded estimates. Schema sizes vary 3-5× across skills.
+- **Real token measurement, not constants**: Each skill's schema cost is computed from actual serialized size, not hardcoded estimates. Schema sizes vary 3-5× across skills.
 - **Budget is a hard cap**: If a skill doesn't fit the remaining budget, it is **excluded entirely** — no empty stubs. An empty-parameter stub wastes tokens and confuses the LLM.
 - **Semantic retrieval is mandatory at scale**: RAG-MCP (arXiv:2505.03275) empirically shows keyword matching collapses beyond ~30 tools. Embedding-based retrieval achieves 3.2× accuracy improvement.
 - **Semantic retrieval replaces LLM ranking**: The vector index does the candidate filtering (zero LLM cost). The LLM only sees budget-capped full schemas and selects via native function calling in a single pass.
 
-**Why this matters**: With 50+ skills, putting all details in context wastes attention budget. Tier 1 embeddings let the retriever find candidates without any prompt tokens. Tier 2 full schemas are loaded only for budget-available skills, and the LLM selects directly.
+**Why this matters**: With 50+ skills, putting all details in context wastes attention budget. Index Tier embeddings let the retriever find candidates without any prompt tokens. Schema Tier full schemas are loaded only for budget-available skills, and the LLM selects directly.
 
 ### Skill Types
 
@@ -564,9 +565,14 @@ score = accuracy_weight × accuracy_score + speed_weight × speed_score
 
 **Database tables**:
 - `skill_selection_events` — every selection decision with query, selected skills, method
-- `skill_selection_learnings` — learned correction rules with confidence and evidence count
+- `skill_selection_learnings` — learned correction rules with confidence and evidence count (capped at 200 active; lowest-confidence evicted)
 - `skill_learning_signals` — raw feedback signals per execution
 - `gate_results` — regression gate verdicts for learning changes
+
+**Reliability**:
+- Feedback buffer: in-memory with `max_buffer_size=10,000`, oldest signals evicted on overflow
+- Retry limit: 3 retries per signal on flush failure, then dropped with warning
+- Process crash = buffered signals lost (acceptable: feedback is optimization data, not correctness-critical)
 
 **Performance**:
 | Operation | Latency | Storage |
@@ -744,9 +750,14 @@ class SkillPermission(Base):
     skill_name = Column(String(100), nullable=False)
     grantee_type = Column(String(10), nullable=False)  # "user" | "role"
     grantee_id = Column(String(36), nullable=False)
+    permission_type = Column(String(10), nullable=False, default="install")  # "install" | "execute" | "admin"
+    tenant_id = Column(String(36), nullable=True)  # NULL = platform-wide
     granted_by = Column(String(36), nullable=False)
     granted_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=True)  # NULL = no expiry
 ```
+
+> **Multi-tenancy**: When `tenant_id` is set, the permission is scoped to that tenant. `is_public=1` skills are visible to all tenants but still require per-tenant install permission. Platform-wide permissions (`tenant_id=NULL`) are admin-only.
 
 ### Install / Uninstall Lifecycle
 
@@ -902,6 +913,10 @@ Comparison focuses on **stateful skill management** — persistent data, lifecyc
 
 2. **Schema evolution**: how to handle ALTER TABLE when platform upgrades a skill?
    - Same as any other migration — platform-level, applied by operator
+
+3. **Skill cost → budget gate integration**: `SignalWeights.cost` (0.2) drives learning, but skill execution cost doesn't flow back to the budget control system in [Deployment Architecture](deployment-architecture.md). Need: execution cost recorded per-skill → aggregated per-session → checked against session budget before next skill call.
+
+4. **Prompt evolution → skill regression gate**: `InputFaceLearner` can modify prompts, but prompt changes may alter which skills the LLM selects. Should prompt changes trigger the skill selection regression gate? Current answer: no (they are independent input faces). May need cross-face regression testing.
 
 ---
 
