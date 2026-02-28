@@ -1,7 +1,6 @@
-"""Streaming markdown — accumulates chunks and re-renders via rich.Live."""
+"""Streaming markdown — streams raw text, renders final markdown on finish."""
 
 from rich.console import Console, ConsoleOptions, RenderResult
-from rich.live import Live
 from rich.markdown import CodeBlock, Markdown
 from rich.syntax import Syntax
 from rich.text import Text
@@ -28,35 +27,37 @@ install_prettier_code_blocks()
 
 
 class StreamingMarkdown:
-    """Accumulates text chunks and re-renders markdown via rich.Live."""
+    """Streams raw text chunks during generation, renders markdown on finish.
+
+    During streaming: writes raw text directly (no Live, no cursor tricks).
+    On finish: clears the raw output and prints a single rich Markdown render.
+    """
 
     def __init__(self, console: Console | None = None) -> None:
         self._console = console or Console()
         self._buffer = ""
-        self._live: Live | None = None
+        self._live = False  # just a flag now, not a Live object
+        self._line_count = 0  # track lines written for cleanup
 
     def start(self) -> None:
-        self._live = Live("", console=self._console, vertical_overflow="visible")
-        self._live.start()
+        self._live = True
 
     def feed(self, chunk: str) -> None:
         self._buffer += chunk
-        if self._live is not None:
-            try:
-                self._live.update(Markdown(self._buffer))
-            except Exception:
-                # Partial markdown (e.g. incomplete fence) — render as-is
-                self._live.update(Text(self._buffer))
+        if self._live:
+            # Write raw text directly — no Live re-rendering
+            self._console.file.write(chunk)
+            self._console.file.flush()
+            self._line_count += chunk.count("\n")
 
     def finish(self) -> str:
-        """Stop live rendering and return accumulated text."""
-        if self._live is not None:
-            try:
-                self._live.update(Markdown(self._buffer))
-            except Exception:
-                self._live.update(Text(self._buffer))
-            self._live.stop()
-            self._live = None
+        """Stop streaming and return accumulated text."""
+        if self._live:
+            self._live = False
+            # Ensure trailing newline after raw stream
+            if self._buffer and not self._buffer.endswith("\n"):
+                self._console.file.write("\n")
+                self._console.file.flush()
         return self._buffer
 
     @property

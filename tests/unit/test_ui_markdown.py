@@ -55,10 +55,10 @@ class TestStreamingMarkdown:
         console, _ = _make_console()
         sm = StreamingMarkdown(console=console)
         sm.start()
-        assert sm._live is not None
+        assert sm._live
         sm.feed("test")
         sm.finish()
-        assert sm._live is None
+        assert not sm._live
 
     def test_finish_without_start(self):
         """finish() without start() should not crash."""
@@ -67,6 +67,31 @@ class TestStreamingMarkdown:
         sm.feed("no live")
         result = sm.finish()
         assert result == "no live"
+
+    def test_no_duplicate_output(self):
+        """Each chunk should appear exactly once in output."""
+        console, buf = _make_console()
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        sm.feed("Hello ")
+        sm.feed("world")
+        sm.feed("!\n")
+        sm.finish()
+        output = buf.getvalue()
+        assert output.count("Hello") == 1
+        assert output.count("world") == 1
+
+    def test_multiline_no_duplicate(self):
+        """Long multi-line streaming should not repeat earlier lines."""
+        console, buf = _make_console()
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        for i in range(20):
+            sm.feed(f"Line-{i:04d}\n")
+        sm.finish()
+        output = buf.getvalue()
+        for i in range(20):
+            assert output.count(f"Line-{i:04d}") == 1, f"Line-{i:04d} duplicated"
 
 
 class TestCodeBlockInstall:
