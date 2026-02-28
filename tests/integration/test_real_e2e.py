@@ -13,6 +13,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete
 from unittest.mock import patch
 
+from tests.conftest import parse_sse_events
+
 # Set required environment variables before importing app
 os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
 os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
@@ -769,9 +771,14 @@ class TestChatTurnRealE2E:
         mock_tools_stream.assert_called_once()
 
     def test_chat_turn_requires_auth(self, client):
-        """Unauthenticated requests are rejected."""
+        """Unauthenticated requests return SSE error (SSE endpoints always return 200)."""
         resp = client.post("/chat/turn", json={"messages": [{"role": "user", "content": "hi"}]})
-        assert resp.status_code == 401
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        events = parse_sse_events(resp.text)
+        assert len(events) >= 1
+        assert events[0]["type"] == "error"
+        assert events[0]["code"] == "AUTH_ERROR"
 
 
 async def _fake_stream_gen(chunks):

@@ -2,11 +2,13 @@
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from api.database import init_db
+from api.sse_errors import format_validation_error, is_sse_endpoint, sse_error_response
 from api.routers import (
     admin,
     agents,
@@ -161,12 +163,35 @@ app = FastAPI(
 # Global exception handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    """Handle unexpected exceptions."""
+    """Handle unexpected exceptions — SSE endpoints get SSE errors."""
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    if is_sse_endpoint(request.url.path):
+        return sse_error_response(500, "Internal server error")
     return JSONResponse(
         status_code=500,
         content={"detail": "Internal server error"},
     )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """HTTPException — SSE endpoints get SSE errors instead of JSON."""
+    if is_sse_endpoint(request.url.path):
+        return sse_error_response(exc.status_code, exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers,  # preserve WWW-Authenticate etc.
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Pydantic validation — SSE endpoints get SSE errors instead of JSON 422."""
+    if is_sse_endpoint(request.url.path):
+        return sse_error_response(422, format_validation_error(exc))
+    from fastapi.encoders import jsonable_encoder
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
 # Request logging middleware

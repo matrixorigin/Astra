@@ -818,6 +818,20 @@ class TestStructuredErrors:
         assert errs[0]["code"] == "INTERNAL_ERROR"
         assert errs[0]["retryable"] is False
 
+    def test_invalid_session_returns_sse_error(self, client, db):
+        """POST /chat/turn with nonexistent session_id → SSE error, not JSON 404."""
+        headers, _ = self._auth(client, db, "badsess")
+        r = client.post("/chat/turn", json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "session_id": "nonexistent_session_id",
+        }, headers=headers)
+        assert r.status_code == 200
+        assert "text/event-stream" in r.headers["content-type"]
+        errs = [e for e in parse_sse_events(r.text) if e["type"] == "error"]
+        assert len(errs) >= 1
+        assert "not found" in errs[0]["message"].lower()
+        assert errs[0]["code"] == "NOT_FOUND"
+
 
 class TestPhasePersistenceIsolation:
     """Task 3c: One phase failing doesn't block subsequent phases."""

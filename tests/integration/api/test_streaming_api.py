@@ -1,8 +1,9 @@
 """Integration tests for streaming API with real database."""
 
-import json
 import pytest
 from starlette.testclient import TestClient
+
+from tests.conftest import parse_sse_events
 
 
 @pytest.fixture
@@ -47,7 +48,7 @@ def test_session(client, auth_token):
 
 
 def test_stream_chat_session_not_found(client, auth_token):
-    """Test streaming with non-existent session."""
+    """Test streaming with non-existent session returns SSE error."""
     headers = {"Authorization": f"Bearer {auth_token}"}
     
     response = client.post("/chat/stream", headers=headers, json={
@@ -55,15 +56,28 @@ def test_stream_chat_session_not_found(client, auth_token):
         "message": "Hello"
     })
     
-    assert response.status_code == 404
-    assert "not found" in response.json()["detail"].lower()
+    # SSE endpoints always return 200 with text/event-stream
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    events = parse_sse_events(response.text)
+    assert len(events) >= 1
+    err = events[0]
+    assert err["type"] == "error"
+    assert err["code"] == "NOT_FOUND"
+    assert "not found" in err["message"].lower()
 
 
 def test_stream_chat_unauthorized(client):
-    """Test streaming without authentication."""
+    """Test streaming without authentication returns SSE error."""
     response = client.post("/chat/stream", json={
         "session_id": "sess_123",
         "message": "Hello"
     })
     
-    assert response.status_code == 401  # FastAPI returns 403 for missing auth
+    # SSE endpoints always return 200 with text/event-stream (even auth errors)
+    assert response.status_code == 200
+    assert "text/event-stream" in response.headers["content-type"]
+    events = parse_sse_events(response.text)
+    assert len(events) >= 1
+    assert events[0]["type"] == "error"
+    assert events[0]["code"] == "AUTH_ERROR"

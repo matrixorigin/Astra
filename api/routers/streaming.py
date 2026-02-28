@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.routers.chat import _build_chat_loop, _ensure_session
+from api.sse_errors import SSE_HEADERS
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -29,16 +30,18 @@ async def stream_chat(
     current_user: dict = Depends(get_current_user),
 ):
     """Deprecated — use /chat/stream from chat router instead."""
-    user_id = current_user["user_id"]
-    db = SessionLocal()
-    try:
-        session_id = _ensure_session(db, user_id, request.session_id, None)
-    finally:
-        db.close()
-    loop = _build_chat_loop(SessionLocal)
 
     async def event_generator():
+        loop = None
         try:
+            user_id = current_user["user_id"]
+            db = SessionLocal()
+            try:
+                session_id = _ensure_session(db, user_id, request.session_id, None)
+            finally:
+                db.close()
+            loop = _build_chat_loop(SessionLocal)
+
             async for stream_event in loop.run_step_stream(
                 user_input=request.message,
                 session_id=session_id,
@@ -56,18 +59,15 @@ async def stream_chat(
                 yield f"data: {json.dumps(event_data)}\n\n"
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
-            yield f"data: {json.dumps({'event_type': 'run_error', 'data': {'error': str(e)}})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e), 'code': 'INTERNAL_ERROR', 'retryable': False})}\n\n"
         finally:
-            _pipeline = getattr(getattr(loop, 'event_logger', None), '_pipeline', None)
-            if _pipeline:
-                _pipeline.shutdown()
+            if loop:
+                _pipeline = getattr(getattr(loop, 'event_logger', None), '_pipeline', None)
+                if _pipeline:
+                    _pipeline.shutdown()
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        headers=SSE_HEADERS,
     )

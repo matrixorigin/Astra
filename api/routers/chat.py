@@ -14,6 +14,8 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from api.sse_errors import SSE_HEADERS, status_to_error_code
+
 from api.database import SessionLocal
 from api.dependencies import get_current_user
 from core.history_utils import (
@@ -279,47 +281,52 @@ async def chat_stream(
     current_user: Annotated[dict, Depends(get_current_user)],
 ):
     """Stream chat response as SSE. Returns run_id in first event."""
-    user_id = current_user["user_id"]
-    db = SessionLocal()
-    try:
-        session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
-    finally:
-        db.close()
 
-    engine = _get_engine()
-    
-    # Pass model to context if specified
-    context = request.context or {}
-    if request.model:
-        context["model"] = request.model
-    
-    run = engine.create_run(
-        session_id=session_id,
-        user_id=user_id,
-        user_input=request.message,
-        agent_id=request.agent_id or "dev-agent",  # Pass agent_id for model lookup
-        context=context,
-    )
-
-    import asyncio
-    task = asyncio.create_task(engine.start_run(run))
-    from core.agent.run_engine import _run_tasks
-    _run_tasks[run.run_id] = task
-
+    # Auth/validation errors are caught by exception handlers in main.py
+    # (Depends(get_current_user) and Pydantic fire before this handler runs).
+    # The generator-internal try/except handles errors during streaming.
     async def event_generator():
-        yield f"data: {json.dumps({'event_type': 'session_info', 'data': {'session_id': session_id, 'run_id': run.run_id}})}\n\n"
-
         try:
+            user_id = current_user["user_id"]
+            db = SessionLocal()
+            try:
+                session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
+            finally:
+                db.close()
+
+            engine = _get_engine()
+
+            context = request.context or {}
+            if request.model:
+                context["model"] = request.model
+
+            run = engine.create_run(
+                session_id=session_id,
+                user_id=user_id,
+                user_input=request.message,
+                agent_id=request.agent_id or "dev-agent",
+                context=context,
+            )
+
+            import asyncio
+            task = asyncio.create_task(engine.start_run(run))
+            from core.agent.run_engine import _run_tasks
+            _run_tasks[run.run_id] = task
+
+            yield f"data: {json.dumps({'event_type': 'session_info', 'data': {'session_id': session_id, 'run_id': run.run_id}})}\n\n"
+
             async for event in engine.stream_agent_run_events(run.run_id):
                 yield f"data: {json.dumps(event)}\n\n"
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
-            yield f"data: {json.dumps({'event_type': 'run_error', 'data': {'error': str(e)}})}\n\n"
+            code = status_to_error_code(e.status_code) if isinstance(e, HTTPException) else "INTERNAL_ERROR"
+            msg = e.detail if isinstance(e, HTTPException) else str(e)
+            yield f"data: {json.dumps({'type': 'error', 'message': msg, 'code': code, 'retryable': False})}\n\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
 
 
@@ -355,21 +362,30 @@ async def stream_run(
     last_index: int = Query(default=0, description="Resume from event index (for reconnection)"),
 ):
     """Stream run events as SSE. Supports reconnection via last_index."""
-    engine = _get_engine()
-    run = engine.get_run(run_id) or engine.restore_run(run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Run not found")
-    if run.user_id != current_user["user_id"]:
-        raise HTTPException(status_code=403, detail="Not authorized to view this run")
 
+    # Auth errors handled by exception handlers in main.py.
+    # Generator handles run-lookup and streaming errors.
     async def event_generator():
-        async for event in engine.stream_agent_run_events(run_id, last_index=last_index):
-            yield f"data: {json.dumps(event)}\n\n"
+        try:
+            engine = _get_engine()
+            run = engine.get_run(run_id) or engine.restore_run(run_id)
+            if not run:
+                raise HTTPException(status_code=404, detail="Run not found")
+            if run.user_id != current_user["user_id"]:
+                raise HTTPException(status_code=403, detail="Not authorized to view this run")
+
+            async for event in engine.stream_agent_run_events(run_id, last_index=last_index):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            logger.error(f"Stream run error: {e}", exc_info=True)
+            code = status_to_error_code(e.status_code) if isinstance(e, HTTPException) else "INTERNAL_ERROR"
+            msg = e.detail if isinstance(e, HTTPException) else str(e)
+            yield f"data: {json.dumps({'type': 'error', 'message': msg, 'code': code, 'retryable': False})}\n\n"
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
 
 
@@ -1027,59 +1043,55 @@ async def chat_turn(
     Edge sends messages + tool_results → cloud does context enrichment + LLM call →
     returns SSE stream of text_delta, tool_call, usage, turn_complete events.
     """
-    user_id = current_user["user_id"]
-    db = SessionLocal()
-    try:
-        session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
-    finally:
-        db.close()
 
-    # Detect tool changes: compare new edge_tools with cached set.
-    # On change, we rebuild the system prompt (with new Self-Model) but preserve
-    # conversation history — see force_rebuild_system in _build_turn_messages.
-    tools_changed = False
-    existing = _peek_session_entry(session_id)
-    if request.edge_tools:
-        cached = (existing or {}).get("tools", [])
-        if cached and _tool_names(request.edge_tools) != _tool_names(cached):
-            tools_changed = True
-        entry = _get_or_create_session_entry(session_id)
-        entry["tools"] = request.edge_tools
-        _session_cache[session_id] = entry
-    tools_schema = (existing or {}).get("tools", []) if not request.edge_tools else request.edge_tools
-
-    # Build conversation messages with context enrichment.
-    # Runs in a thread to avoid blocking the event loop — _build_turn_messages
-    # does synchronous DB queries (recovery, PromptAssembler, snapshot save).
-    import asyncio
-
-    def _build_sync():
-        db = SessionLocal()
-        try:
-            return _build_turn_messages(
-                db, user_id, session_id,
-                request.messages, request.tool_results, request.project_rules,
-                agent_id=request.agent_id,
-                edge_tools=request.edge_tools,
-                edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
-                force_rebuild_system=tools_changed,
-                username=current_user.get("username"),
-            )
-        finally:
-            db.close()
-
-    llm_messages, snapshot_id = await asyncio.to_thread(_build_sync)
-    # Eagerly warm shared singletons so the background persist thread
-    # doesn't block on first-time model loading (~8s for sentence-transformers).
-    _get_shared_embed_fn()
-
-    model = request.model
-    task_hint = _classify_task(request.messages)
-
+    # Auth/validation errors are caught by exception handlers in main.py.
+    # The generator-internal try/except handles session lookup, LLM, and DB errors.
     async def event_generator():
-        yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id})}\n\n"
-
         try:
+            user_id = current_user["user_id"]
+            db = SessionLocal()
+            try:
+                session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
+            finally:
+                db.close()
+
+            # Detect tool changes: compare new edge_tools with cached set.
+            tools_changed = False
+            existing = _peek_session_entry(session_id)
+            if request.edge_tools:
+                cached = (existing or {}).get("tools", [])
+                if cached and _tool_names(request.edge_tools) != _tool_names(cached):
+                    tools_changed = True
+                entry = _get_or_create_session_entry(session_id)
+                entry["tools"] = request.edge_tools
+                _session_cache[session_id] = entry
+            tools_schema = (existing or {}).get("tools", []) if not request.edge_tools else request.edge_tools
+
+            import asyncio
+
+            def _build_sync():
+                db = SessionLocal()
+                try:
+                    return _build_turn_messages(
+                        db, user_id, session_id,
+                        request.messages, request.tool_results, request.project_rules,
+                        agent_id=request.agent_id,
+                        edge_tools=request.edge_tools,
+                        edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
+                        force_rebuild_system=tools_changed,
+                        username=current_user.get("username"),
+                    )
+                finally:
+                    db.close()
+
+            llm_messages, snapshot_id = await asyncio.to_thread(_build_sync)
+            _get_shared_embed_fn()
+
+            model = request.model
+            task_hint = _classify_task(request.messages)
+
+            yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id})}\n\n"
+
             llm = _get_shared_llm_client()
             with llm.request_context(user_id=user_id):
 
@@ -1184,7 +1196,10 @@ async def chat_turn(
             from core.exceptions import LLMRateLimitError, LLMTimeoutError, TransientError
             from sqlalchemy.exc import SQLAlchemyError
             err: dict[str, Any] = {"type": "error", "message": str(e)}
-            if isinstance(e, BudgetExceededError):
+            if isinstance(e, HTTPException):
+                err["message"] = e.detail
+                err.update(code=status_to_error_code(e.status_code), retryable=False)
+            elif isinstance(e, BudgetExceededError):
                 err.update(code="BUDGET_EXCEEDED", retryable=False)
             elif isinstance(e, LLMRateLimitError):
                 err.update(code="LLM_RATE_LIMIT", retryable=True, retry_after_ms=5000)
@@ -1199,5 +1214,5 @@ async def chat_turn(
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )

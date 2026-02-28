@@ -11,6 +11,7 @@ from api.database import get_db_session
 from api.repositories.user_repository import UserRepository
 from core.agent.run import AgentRun, RunStatus
 from core.events.models import StreamEvent, StreamEventType
+from tests.conftest import parse_sse_events
 
 
 @pytest.fixture
@@ -165,3 +166,42 @@ class TestChatAPI:
         mock_get_engine.return_value = engine
         resp = client.delete("/chat/runs/test_run_123", headers=auth_headers)
         assert resp.status_code == 409
+
+
+class TestSSEProtocolCompliance:
+    """SSE endpoints return text/event-stream errors, not JSON."""
+
+    def test_stream_nonexistent_session_returns_sse_error(self, client, auth_headers):
+        """POST /chat/stream with bad session_id → SSE error event."""
+        resp = client.post("/chat/stream", json={"session_id": "no_such_id", "message": "hi"}, headers=auth_headers)
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        events = parse_sse_events(resp.text)
+        assert any(e.get("type") == "error" and "not found" in e.get("message", "").lower() for e in events)
+
+    @patch("api.routers.chat._get_engine")
+    def test_stream_run_not_found_returns_sse_error(self, mock_get_engine, client, auth_headers):
+        """GET /chat/runs/{run_id}/stream with bad run_id → SSE error event."""
+        engine = _mock_engine()
+        engine.get_run.return_value = None
+        engine.restore_run.return_value = None
+        mock_get_engine.return_value = engine
+        resp = client.get("/chat/runs/nonexistent_run/stream", headers=auth_headers)
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        events = parse_sse_events(resp.text)
+        assert any(e.get("type") == "error" and e.get("code") == "NOT_FOUND" for e in events)
+
+    @patch("api.routers.chat._get_engine")
+    def test_stream_run_wrong_user_returns_sse_error(self, mock_get_engine, client, auth_headers):
+        """GET /chat/runs/{run_id}/stream for another user's run → SSE error."""
+        engine = _mock_engine()
+        run = AgentRun(session_id="test", user_id="other_user_id", user_input="hi")
+        engine.get_run.return_value = run
+        engine.restore_run.return_value = run
+        mock_get_engine.return_value = engine
+        resp = client.get("/chat/runs/test_run/stream", headers=auth_headers)
+        assert resp.status_code == 200
+        assert "text/event-stream" in resp.headers["content-type"]
+        events = parse_sse_events(resp.text)
+        assert any(e.get("type") == "error" and e.get("code") == "AUTH_ERROR" for e in events)
