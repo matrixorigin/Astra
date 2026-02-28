@@ -7,10 +7,12 @@ from rich.console import Console
 
 from cli.mo_agent_api import (
     _build_skill_dev_context,
+    _generate_skill_template,
     _normalize_skill_name,
     _to_class,
     _to_slug,
     _validate_skill_output,
+    _validate_skill_source,
     cmd_skill,
 )
 
@@ -328,3 +330,289 @@ class TestHelpers:
             assert "unreadable" in ctx
         finally:
             f.chmod(0o644)  # restore for cleanup
+
+
+# ============================================================================
+# /skill validate
+# ============================================================================
+
+class TestSkillValidate:
+    """Tests for /skill validate command and _validate_skill_source."""
+
+    def test_valid_skill_no_issues(self, tmp_path, monkeypatch):
+        """Well-formed skill passes validation."""
+        monkeypatch.chdir(tmp_path)
+        skill_dir = tmp_path / ".mo-agent" / "skills" / "good"
+        skill_dir.mkdir(parents=True)
+        # Use Field(description=...) for input, and default for output
+        (skill_dir / "skill.py").write_text(
+            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            'from pydantic import Field\n'
+            'class GI(SkillInput):\n    query: str = Field(description="test query")\n'
+            'class GO(SkillOutput):\n    data: str = ""\n'
+            'class GoodSkill(Skill[GI, GO]):\n'
+            '    name = "good"\n    version = "1.0.0"\n    description = "A good skill"\n'
+            '    async def execute(self, input: GI) -> GO:\n'
+            '        return GO(success=True, data=input.query)\n'
+        )
+        console, buf = _console()
+        cmd_skill(console, cmd_arg="validate good")
+        output = buf.getvalue()
+        assert "no issues" in output or "✓" in output
+
+    def test_sync_execute_error(self, tmp_path):
+        """Non-async execute() is flagged as error."""
+        skill_dir = tmp_path / "sync-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "skill.py").write_text(
+            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            'class I(SkillInput):\n    pass\n'
+            'class O(SkillOutput):\n    pass\n'
+            'class SyncSkill(Skill[I, O]):\n'
+            '    name = "sync"\n    version = "1.0.0"\n    description = "sync"\n'
+            '    def execute(self, input):\n'  # Missing async!
+            '        return O(success=True)\n'
+        )
+        issues = _validate_skill_source(skill_dir)
+        errors = [msg for level, msg in issues if level == "error"]
+        assert any("async" in msg for msg in errors)
+
+    def test_raise_in_execute_warning(self, tmp_path):
+        """raise inside execute() triggers warning."""
+        skill_dir = tmp_path / "raise-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "skill.py").write_text(
+            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            'class I(SkillInput):\n    pass\n'
+            'class O(SkillOutput):\n    pass\n'
+            'class RaiseSkill(Skill[I, O]):\n'
+            '    name = "raise_test"\n    version = "1.0.0"\n    description = "test"\n'
+            '    async def execute(self, input):\n'
+            '        raise ValueError("boom")\n'
+        )
+        issues = _validate_skill_source(skill_dir)
+        warnings = [msg for level, msg in issues if level == "warning"]
+        assert any("raise" in msg.lower() for msg in warnings)
+
+    def test_missing_field_description_warning(self, tmp_path):
+        """Fields without Field(description=...) trigger warning."""
+        skill_dir = tmp_path / "no-desc-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "skill.py").write_text(
+            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            'class I(SkillInput):\n    query: str\n'  # No Field(description=...)
+            'class O(SkillOutput):\n    data: str = ""\n'
+            'class NoDescSkill(Skill[I, O]):\n'
+            '    name = "no_desc"\n    version = "1.0.0"\n    description = "test"\n'
+            '    async def execute(self, input):\n'
+            '        return O(success=True)\n'
+        )
+        issues = _validate_skill_source(skill_dir)
+        warnings = [msg for level, msg in issues if level == "warning"]
+        assert any("query" in msg for msg in warnings)
+
+    def test_missing_output_default_warning(self, tmp_path):
+        """Output fields without defaults trigger warning."""
+        skill_dir = tmp_path / "no-default-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "skill.py").write_text(
+            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            'from pydantic import Field\n'
+            'class I(SkillInput):\n    query: str = Field(description="q")\n'
+            'class O(SkillOutput):\n    data: str\n'  # No default!
+            'class NoDefaultSkill(Skill[I, O]):\n'
+            '    name = "no_default"\n    version = "1.0.0"\n    description = "test"\n'
+            '    async def execute(self, input):\n'
+            '        return O(success=True, data="x")\n'
+        )
+        issues = _validate_skill_source(skill_dir)
+        warnings = [msg for level, msg in issues if level == "warning"]
+        assert any("data" in msg for msg in warnings)
+
+    def test_syntax_error(self, tmp_path):
+        """Syntax errors are caught."""
+        skill_dir = tmp_path / "syntax-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "skill.py").write_text("def broken(:\n")
+        issues = _validate_skill_source(skill_dir)
+        errors = [msg for level, msg in issues if level == "error"]
+        assert any("syntax" in msg.lower() or "Syntax" in msg for msg in errors)
+
+    def test_no_skill_class_error(self, tmp_path):
+        """File without Skill subclass is flagged."""
+        skill_dir = tmp_path / "no-class-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "skill.py").write_text("# just a comment\nx = 1\n")
+        issues = _validate_skill_source(skill_dir)
+        errors = [msg for level, msg in issues if level == "error"]
+        assert any("Skill" in msg for msg in errors)
+
+    def test_missing_skill_py(self, tmp_path):
+        """Missing skill.py is flagged."""
+        skill_dir = tmp_path / "empty-skill"
+        skill_dir.mkdir(parents=True)
+        issues = _validate_skill_source(skill_dir)
+        errors = [msg for level, msg in issues if level == "error"]
+        assert any("not found" in msg for msg in errors)
+
+    def test_todo_description_warning(self, tmp_path):
+        """TODO in description triggers warning."""
+        skill_dir = tmp_path / "todo-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "skill.py").write_text(
+            'from core.skills.base import Skill, SkillInput, SkillOutput\n'
+            'from pydantic import Field\n'
+            'class I(SkillInput):\n    query: str = Field(description="q")\n'
+            'class O(SkillOutput):\n    data: str = ""\n'
+            'class TodoSkill(Skill[I, O]):\n'
+            '    name = "todo"\n    version = "1.0.0"\n'
+            '    description = "TODO: fill this in"\n'
+            '    async def execute(self, input):\n'
+            '        return O(success=True)\n'
+        )
+        issues = _validate_skill_source(skill_dir)
+        warnings = [msg for level, msg in issues if level == "warning"]
+        assert any("TODO" in msg or "description" in msg for msg in warnings)
+
+    def test_validate_command_not_found(self, tmp_path, monkeypatch):
+        """validate command shows error for nonexistent skill."""
+        monkeypatch.chdir(tmp_path)
+        console, buf = _console()
+        cmd_skill(console, cmd_arg="validate nonexistent")
+        assert "not found" in buf.getvalue()
+
+    def test_validate_command_no_name(self, tmp_path, monkeypatch):
+        """validate command shows usage when no name given."""
+        monkeypatch.chdir(tmp_path)
+        console, buf = _console()
+        cmd_skill(console, cmd_arg="validate")
+        assert "Usage" in buf.getvalue()
+
+
+# ============================================================================
+# /skill example
+# ============================================================================
+
+class TestSkillExample:
+    """Tests for /skill example command."""
+
+    def test_shows_example(self, tmp_path, monkeypatch):
+        """example command shows complete skill example."""
+        monkeypatch.chdir(tmp_path)
+        console, buf = _console()
+        cmd_skill(console, cmd_arg="example")
+        output = buf.getvalue()
+        assert "StockInfo" in output or "stock_info" in output
+        assert "async def execute" in output
+        assert "Field(description=" in output
+
+
+# ============================================================================
+# Template generation
+# ============================================================================
+
+class TestGenerateSkillTemplate:
+    """Tests for _generate_skill_template."""
+
+    def test_generates_valid_python(self, tmp_path):
+        """Generated template is valid Python that can be imported."""
+        template = _generate_skill_template("my_tool", "MyTool")
+        skill_py = tmp_path / "skill.py"
+        skill_py.write_text(template)
+
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_test_skill", skill_py)
+        assert spec is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # Should have the expected classes
+        assert hasattr(mod, "MyToolInput")
+        assert hasattr(mod, "MyToolOutput")
+        assert hasattr(mod, "MyToolSkill")
+
+    def test_template_passes_validation(self, tmp_path):
+        """Generated template passes _validate_skill_source with no errors."""
+        template = _generate_skill_template("test_skill", "TestSkill")
+        skill_dir = tmp_path / "test-skill"
+        skill_dir.mkdir()
+        (skill_dir / "skill.py").write_text(template)
+
+        issues = _validate_skill_source(skill_dir)
+        errors = [msg for level, msg in issues if level == "error"]
+        assert not errors, f"Template has errors: {errors}"
+
+    def test_template_is_loadable(self, tmp_path):
+        """Generated skill can be loaded by SkillLoader."""
+        template = _generate_skill_template("loadable", "Loadable")
+        skill_dir = tmp_path / "loadable"
+        skill_dir.mkdir()
+        (skill_dir / "skill.py").write_text(template)
+
+        from core.skills.loader import SkillLoader
+        skills = SkillLoader.discover([tmp_path])
+        assert len(skills) == 1
+        assert skills[0].skill.name == "loadable"
+
+    def test_template_has_field_descriptions(self):
+        """Generated template includes Field(description=...)."""
+        template = _generate_skill_template("desc_test", "DescTest")
+        assert 'Field(description=' in template
+
+    def test_template_has_async_execute(self):
+        """Generated template has async execute method."""
+        template = _generate_skill_template("async_test", "AsyncTest")
+        assert "async def execute" in template
+
+    def test_template_has_try_except(self):
+        """Generated template wraps logic in try/except."""
+        template = _generate_skill_template("safe_test", "SafeTest")
+        assert "try:" in template
+        assert "except Exception" in template
+        assert "success=False" in template
+
+
+# ============================================================================
+# Enhanced dev context
+# ============================================================================
+
+class TestEnhancedDevContext:
+    """Tests for enhanced _build_skill_dev_context."""
+
+    def test_includes_framework_guide(self, tmp_path):
+        """Dev context includes comprehensive framework guide."""
+        skill_dir = tmp_path / "test-skill"
+        skill_dir.mkdir()
+        (skill_dir / "skill.py").write_text("# code")
+
+        ctx = _build_skill_dev_context("test_skill", skill_dir)
+
+        # Should include key framework concepts
+        assert "SkillInput" in ctx
+        assert "SkillOutput" in ctx
+        assert "async def execute" in ctx
+        assert "Field(description=" in ctx
+        assert "success=False" in ctx
+
+    def test_includes_common_mistakes(self, tmp_path):
+        """Dev context includes common mistakes to avoid."""
+        skill_dir = tmp_path / "test-skill"
+        skill_dir.mkdir()
+        (skill_dir / "skill.py").write_text("# code")
+
+        ctx = _build_skill_dev_context("test_skill", skill_dir)
+
+        # Should warn about common mistakes
+        assert "raise" in ctx.lower() or "NEVER raise" in ctx
+        assert "async" in ctx
+
+    def test_includes_example_patterns(self, tmp_path):
+        """Dev context includes example patterns."""
+        skill_dir = tmp_path / "test-skill"
+        skill_dir.mkdir()
+        (skill_dir / "skill.py").write_text("# code")
+
+        ctx = _build_skill_dev_context("test_skill", skill_dir)
+
+        # Should include practical examples
+        assert "httpx" in ctx or "akshare" in ctx or "API" in ctx

@@ -305,28 +305,7 @@ def cmd_skill(console, cmd_arg=None, client=None, state=None, **kw):
             return
         skill_dir.mkdir(parents=True)
         cls = _to_class(name)
-        (skill_dir / "skill.py").write_text(
-            f'''from core.skills.base import Skill, SkillInput, SkillOutput
-from pydantic import Field
-
-
-class {cls}Input(SkillInput):
-    query: str = Field(description="User query")
-
-
-class {cls}Output(SkillOutput):
-    data: dict = {{}}
-
-
-class {cls}Skill(Skill[{cls}Input, {cls}Output]):
-    name = "{name}"
-    version = "1.0.0"
-    description = "TODO: describe what this skill does"
-
-    async def execute(self, input: {cls}Input) -> {cls}Output:
-        # TODO: implement
-        return {cls}Output(success=True, data={{"query": input.query}})
-''')
+        (skill_dir / "skill.py").write_text(_generate_skill_template(name, cls))
         (skill_dir / "SKILL.md").write_text(
             f'''---
 name: {name}
@@ -420,7 +399,10 @@ TODO: describe this skill for the LLM.
             return
         skill_dir = skills_root / _to_slug(name)
         if not skill_dir.exists():
-            console.print(f"[red]✗[/red] Skill '{name}' not found. Create it first: [cyan]/skill new {name}[/cyan]")
+            console.print(
+                f"[red]✗[/red] Skill '{name}' not found. "
+                f"Create it first: [cyan]/skill new {name}[/cyan]"
+            )
             return
         # state=None means cmd_skill was called outside the chat REPL (e.g. tests
         # that don't pass state).  Still print success so the user sees feedback.
@@ -435,7 +417,45 @@ TODO: describe this skill for the LLM.
         console.print(f"  [dim]Test: /skill test {name}    Exit: /skill dev off[/dim]")
         return
 
-    console.print("[dim]Usage: /skill list | new <name> | test <name> [args] | dev <name> | dev off[/dim]")
+    # --- /skill validate <name> ---
+    if sub == "validate":
+        name = _normalize_skill_name(rest.strip())
+        if not name:
+            console.print("[red]Usage: /skill validate <name>[/red]")
+            return
+        skill_dir = skills_root / _to_slug(name)
+        if not skill_dir.exists():
+            console.print(f"[red]✗[/red] Skill '{name}' not found")
+            return
+        issues = _validate_skill_source(skill_dir)
+        if not issues:
+            console.print(f"[green]✓[/green] {name} — no issues found")
+        else:
+            errors = [msg for level, msg in issues if level == "error"]
+            warnings = [msg for level, msg in issues if level == "warning"]
+            if errors:
+                console.print(
+                    f"[red]✗[/red] {name} — "
+                    f"{len(errors)} error(s), {len(warnings)} warning(s)"
+                )
+                for msg in errors:
+                    console.print(f"  [red]ERROR[/red]: {msg}")
+            else:
+                console.print(f"[yellow]⚠[/yellow] {name} — {len(warnings)} warning(s)")
+            for msg in warnings:
+                console.print(f"  [yellow]WARN[/yellow]: {msg}")
+        return
+
+    # --- /skill example ---
+    if sub == "example":
+        console.print("[bold]Complete Skill Example[/bold]\n")
+        console.print(_SKILL_EXAMPLE)
+        return
+
+    console.print(
+        "[dim]Usage: /skill list | new <name> | test <name> [args] "
+        "| validate <name> | dev <name> | example[/dim]"
+    )
 
 
 def _normalize_skill_name(name: str) -> str:
@@ -462,24 +482,404 @@ def _build_skill_dev_context(name: str, skill_dir: Path) -> str:
         "Write/modify skill.py using the str_replace or write_file tool.",
         f"Skill directory: {skill_dir}",
         "",
-        "## Skill Framework Rules",
-        "- Inherit `Skill[InputType, OutputType]` from `core.skills.base`",
-        "- Input: subclass `SkillInput`, add fields with `Field(description=...)`",
-        "- Output: subclass `SkillOutput`, add custom fields",
-        "- `execute()` is async, return Output with `success=True/False`",
-        "- On error: return `Output(success=False, error='message')` — never raise",
-        "- The ToolRouter serializes the full Output as JSON for the LLM",
-        "- User tests with `/skill test <name> {json_args}`",
+        _SKILL_FRAMEWORK_GUIDE,
         "",
         "## Current Skill Files",
     ]
     for f in sorted(skill_dir.iterdir()):
         if f.is_file() and f.suffix in (".py", ".md", ".yaml", ".yml"):
             try:
-                parts.append(f"\n### {f.name}\n```{f.suffix.lstrip('.')}\n{f.read_text().rstrip()}\n```")
+                content = f.read_text().rstrip()
+                parts.append(f"\n### {f.name}\n```{f.suffix.lstrip('.')}\n{content}\n```")
             except OSError:
                 parts.append(f"\n### {f.name}\n(unreadable)")
     return "\n".join(parts)
+
+
+# ── Skill Framework Guide ────────────────────────────────────────────────────
+# Comprehensive guide injected into skill dev context to help AI understand
+# the skill framework structure, patterns, and common pitfalls.
+
+_SKILL_FRAMEWORK_GUIDE = '''## Skill Framework Guide
+
+### Core Structure (MUST follow)
+
+```python
+from pydantic import Field
+from core.skills.base import (
+    Skill, SkillInput, SkillOutput, SkillRequirement,
+    RuntimeRequirement, SideEffectCategory, SideEffectProfile,
+)
+
+class MyInput(SkillInput):
+    """Input fields — each MUST have Field(description=...) for LLM."""
+    query: str = Field(description="What to search for")
+    limit: int = Field(default=10, description="Max results", ge=1, le=100)
+
+class MyOutput(SkillOutput):
+    """Output fields — add business data here. Always provide defaults."""
+    items: list[dict] = []
+    total: int = 0
+
+class MySkill(Skill[MyInput, MyOutput]):
+    """Skill class — the name/version/description are exposed to LLM."""
+    name = "my_skill"  # snake_case, matches directory name
+    version = "1.0.0"
+    description = "One-line description for LLM to understand when to use this"
+    requirements = SkillRequirement(
+        runtime=[RuntimeRequirement.NETWORK],  # NETWORK, FILESYSTEM, DATABASE, NONE
+        timeout_seconds=30,
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ,  # READ, WRITE, EXECUTE, DESTRUCTIVE
+    )
+
+    async def execute(self, input: MyInput) -> MyOutput:
+        """Execute the skill. MUST be async. NEVER raise — return error in Output."""
+        try:
+            # Your implementation here
+            result = await self._do_work(input.query, input.limit)
+            return MyOutput(success=True, items=result, total=len(result))
+        except Exception as e:
+            return MyOutput(success=False, error=str(e))
+```
+
+### Critical Rules
+
+1. **NEVER raise exceptions** — return `Output(success=False, error="message")`
+2. **ALWAYS async** — `async def execute(self, input) -> Output`
+3. **ALWAYS Field(description=...)** — LLM needs this to fill parameters correctly
+4. **ALWAYS default values on Output fields** — prevents Pydantic validation errors
+5. **name must be snake_case** — matches the directory name (kebab-case → snake_case)
+
+### Common Patterns
+
+**Network API call:**
+```python
+async def execute(self, input: MyInput) -> MyOutput:
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(f"https://api.example.com/{input.query}")
+            resp.raise_for_status()
+            return MyOutput(success=True, data=resp.json())
+    except httpx.HTTPError as e:
+        return MyOutput(success=False, error=f"API error: {e}")
+    except Exception as e:
+        return MyOutput(success=False, error=str(e))
+```
+
+**Data processing with akshare (stock data):**
+```python
+async def execute(self, input: StockInput) -> StockOutput:
+    try:
+        import akshare as ak
+        df = ak.stock_individual_info_em(symbol=input.stock_code)
+        name = df.loc[df["item"] == "股票简称", "value"].values[0]
+        price = float(df.loc[df["item"] == "最新价", "value"].values[0])
+        return StockOutput(success=True, name=name, price=price)
+    except Exception as e:
+        return StockOutput(success=False, error=str(e))
+```
+
+### Common Mistakes to AVOID
+
+❌ `raise ValueError("bad input")` → ✅ `return Output(success=False, error="bad input")`
+❌ `def execute(...)` → ✅ `async def execute(...)`
+❌ `query: str` (no description) → ✅ `query: str = Field(description="...")`
+❌ `items: list[dict]` (no default) → ✅ `items: list[dict] = []`
+❌ `name = "my-skill"` (kebab) → ✅ `name = "my_skill"` (snake_case)
+
+### Testing
+
+User tests with: `/skill test {name} {{"param": "value"}}`
+Example: `/skill test stock_info {"stock_code": "300355"}`'''
+
+
+# Complete example shown by /skill example
+_SKILL_EXAMPLE = '''```python
+"""stock_info skill — fetch real-time stock data from akshare."""
+
+from pydantic import Field
+
+from core.skills.base import (
+    Skill, SkillInput, SkillOutput, SkillRequirement,
+    RuntimeRequirement, SideEffectCategory, SideEffectProfile,
+)
+
+
+class StockInfoInput(SkillInput):
+    """Input: stock code is required, market is optional."""
+    stock_code: str = Field(description="Stock code, e.g. 300355 or 600519")
+    market: str = Field(default="A", description="Market: A (A-share) or HK (Hong Kong)")
+
+
+class StockInfoOutput(SkillOutput):
+    """Output: basic stock information."""
+    name: str = ""
+    price: float = 0.0
+    change_pct: float = 0.0
+    volume: int = 0
+    market_cap: float = 0.0
+
+
+class StockInfoSkill(Skill[StockInfoInput, StockInfoOutput]):
+    """Fetch real-time stock information."""
+
+    name = "stock_info"
+    version = "1.0.0"
+    description = "Get real-time stock price, change, volume for A-share stocks"
+
+    requirements = SkillRequirement(
+        runtime=[RuntimeRequirement.NETWORK],
+        timeout_seconds=30,
+    )
+    side_effect_profile = SideEffectProfile(category=SideEffectCategory.READ)
+
+    async def execute(self, input: StockInfoInput) -> StockInfoOutput:
+        try:
+            import akshare as ak
+
+            # Fetch stock info
+            df = ak.stock_individual_info_em(symbol=input.stock_code)
+
+            # Extract fields (akshare returns item/value pairs)
+            def get_value(item_name: str, default=""):
+                row = df.loc[df["item"] == item_name, "value"]
+                return row.values[0] if len(row) > 0 else default
+
+            return StockInfoOutput(
+                success=True,
+                name=get_value("股票简称"),
+                price=float(get_value("最新价", "0")),
+                change_pct=float(get_value("涨跌幅", "0").rstrip("%")),
+                volume=int(float(get_value("成交量", "0"))),
+                market_cap=float(get_value("总市值", "0")) / 1e8,  # Convert to 亿
+            )
+        except Exception as e:
+            return StockInfoOutput(success=False, error=str(e))
+```
+
+**Test it:**
+```
+/skill test stock_info {"stock_code": "300355"}
+```
+
+**Key points:**
+1. All Input fields have `Field(description=...)` — LLM knows what to fill
+2. All Output fields have defaults — no Pydantic errors
+3. `execute()` is async and never raises — errors returned in Output
+4. `requirements.runtime` declares NETWORK dependency
+5. `description` is clear — LLM knows when to use this skill'''
+
+
+def _generate_skill_template(name: str, cls: str) -> str:
+    """Generate a complete, runnable skill template with best practices."""
+    return f'''"""Skill: {name}
+
+TODO: Describe what this skill does and when to use it.
+"""
+
+from pydantic import Field
+
+from core.skills.base import (
+    Skill,
+    SkillInput,
+    SkillOutput,
+    SkillRequirement,
+    RuntimeRequirement,
+    SideEffectCategory,
+    SideEffectProfile,
+)
+
+
+class {cls}Input(SkillInput):
+    """Input parameters for {name}.
+
+    Each field MUST have Field(description=...) so the LLM knows how to fill it.
+    """
+
+    query: str = Field(description="The user's query or request")
+    # Add more parameters as needed:
+    # limit: int = Field(default=10, description="Maximum results to return", ge=1, le=100)
+
+
+class {cls}Output(SkillOutput):
+    """Output of {name}.
+
+    All fields MUST have default values to prevent Pydantic validation errors.
+    """
+
+    data: dict = {{}}
+    # Add more output fields as needed:
+    # items: list[dict] = []
+    # total: int = 0
+
+
+class {cls}Skill(Skill[{cls}Input, {cls}Output]):
+    """{name} skill.
+
+    The description is shown to the LLM to help it decide when to use this skill.
+    """
+
+    name = "{name}"
+    version = "1.0.0"
+    description = "TODO: One-line description for LLM"
+
+    # Adjust requirements based on what your skill needs:
+    # - NETWORK: makes HTTP/API calls
+    # - FILESYSTEM: reads/writes local files
+    # - DATABASE: accesses platform database
+    # - NONE: pure computation
+    requirements = SkillRequirement(
+        runtime=[RuntimeRequirement.NONE],
+        timeout_seconds=30,
+    )
+
+    # Side effect category for permission checking:
+    # - READ: only reads data
+    # - WRITE: modifies data
+    # - EXECUTE: runs external commands
+    # - DESTRUCTIVE: deletes data
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ,
+    )
+
+    async def execute(self, input: {cls}Input) -> {cls}Output:
+        """Execute the skill.
+
+        IMPORTANT:
+        - This method MUST be async
+        - NEVER raise exceptions — return Output(success=False, error="...")
+        - Always wrap external calls in try/except
+        """
+        try:
+            # TODO: Implement your skill logic here
+            # Example:
+            # result = await self._fetch_data(input.query)
+            # return {cls}Output(success=True, data=result)
+
+            return {cls}Output(
+                success=True,
+                data={{"query": input.query, "message": "TODO: implement"}},
+            )
+        except Exception as e:
+            # Always return error in Output, never raise
+            return {cls}Output(success=False, error=str(e))
+'''
+
+
+def _validate_skill_source(skill_dir: Path) -> list[tuple[str, str]]:
+    """Validate skill.py against framework requirements.
+
+    Returns list of (level, message) tuples where level is 'error' or 'warning'.
+    """
+    issues: list[tuple[str, str]] = []
+    skill_py = skill_dir / "skill.py"
+
+    if not skill_py.exists():
+        issues.append(("error", "skill.py not found"))
+        return issues
+
+    try:
+        source = skill_py.read_text()
+    except OSError as e:
+        issues.append(("error", f"Cannot read skill.py: {e}"))
+        return issues
+
+    # Check for common mistakes
+    if "def execute(" in source and "async def execute(" not in source:
+        issues.append(("error", "execute() must be async — use 'async def execute(...)'"))
+
+    if "raise " in source:
+        # Check if raise is inside execute method (rough heuristic)
+        lines = source.split("\n")
+        in_execute = False
+        for line in lines:
+            if "async def execute(" in line or "def execute(" in line:
+                in_execute = True
+            elif in_execute and line.strip() and not line.startswith(" "):
+                if not line.startswith("\t"):
+                    in_execute = False
+            elif in_execute and "raise " in line:
+                issues.append((
+                    "warning",
+                    "Avoid 'raise' in execute() — return Output(success=False, error=...)",
+                ))
+                break
+
+    # Check for Field descriptions in SkillInput subclasses
+    if "SkillInput" in source:
+        import re
+        # Find SkillInput subclass section
+        input_section = re.search(r"class \w+\(SkillInput\):.*?(?=class |\Z)", source, re.DOTALL)
+        if input_section:
+            input_code = input_section.group()
+            # Match field definitions: "name: type" or "name: type = value"
+            # but NOT "name: type = Field(...)"
+            all_fields = re.findall(r"^\s+(\w+):\s*\w+", input_code, re.MULTILINE)
+            fields_with_field = re.findall(
+                r"^\s+(\w+):\s*\w+.*=\s*Field\(", input_code, re.MULTILINE
+            )
+            skip = {"success", "result", "error", "cost", "repo_id", "user_id", "session_id"}
+            missing_desc = [f for f in all_fields if f not in skip and f not in fields_with_field]
+            if missing_desc:
+                issues.append((
+                    "warning",
+                    f"Fields without Field(description=...): {', '.join(missing_desc[:3])}",
+                ))
+
+    # Check for Output fields without defaults
+    if "SkillOutput" in source:
+        import re
+        # Find any class that inherits from SkillOutput
+        output_section = re.search(
+            r"class \w+\(SkillOutput\):.*?(?=\nclass |\Z)", source, re.DOTALL
+        )
+        if output_section:
+            output_code = output_section.group()
+            # Match "field: type" without "= default" (line ends after type annotation)
+            no_default = re.findall(r"^\s+(\w+):\s*\w+(?:\[.*?\])?\s*$", output_code, re.MULTILINE)
+            skip = {"success", "result", "error", "cost"}
+            missing_default = [f for f in no_default if f not in skip]
+            if missing_default:
+                issues.append((
+                    "warning",
+                    f"Output fields without defaults: {', '.join(missing_default[:3])}",
+                ))
+
+    # Try to actually load the skill
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_skill_validate", skill_py)
+        if spec and spec.loader:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            # Find Skill subclass
+            from core.skills.base import Skill as SkillBase
+            skill_cls = None
+            for attr in vars(mod).values():
+                if isinstance(attr, type) and issubclass(attr, SkillBase) and attr is not SkillBase:
+                    skill_cls = attr
+                    break
+            if skill_cls is None:
+                issues.append(("error", "No Skill subclass found"))
+            else:
+                # Instantiate and check
+                try:
+                    instance = skill_cls()
+                    if not instance.name:
+                        issues.append(("error", "Skill.name is empty"))
+                    if not instance.description or instance.description.startswith("TODO"):
+                        issues.append(("warning", "Skill.description is missing or TODO"))
+                except Exception as e:
+                    issues.append(("error", f"Cannot instantiate skill: {e}"))
+    except SyntaxError as e:
+        issues.append(("error", f"Syntax error: {e}"))
+    except Exception as e:
+        issues.append(("error", f"Import error: {e}"))
+
+    return issues
 
 
 def _validate_skill_output(data: dict) -> list[str]:
