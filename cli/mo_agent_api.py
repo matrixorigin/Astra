@@ -94,6 +94,8 @@ def cmd_help(console, **_):
         ("/model <name>", "Select a model"),
         ("/session", "Show current session info"),
         ("/clear", "Start a new session"),
+        ("/login", "Login to API"),
+        ("/logout", "Logout"),
         ("/verbose", "Show status bar"),
         ("/compact", "Hide status bar"),
         ("/history", "Show recent turns"),
@@ -220,6 +222,25 @@ def cmd_version(console, **_):
         pass
 
 
+def cmd_login(console, client=None, **_):
+    import click as _click
+    username = _click.prompt("Username")
+    password = _click.prompt("Password", hide_input=True)
+    try:
+        client.login(username, password)
+        console.print(f"[green]✓[/green] Logged in as {username}")
+    except Exception as e:
+        console.print(f"[red]✗[/red] Login failed: {e}")
+
+
+def cmd_logout(console, client=None, **_):
+    try:
+        client.logout()
+        console.print("[green]✓[/green] Logged out — use [cyan]/login[/cyan] to re-authenticate")
+    except Exception as e:
+        console.print(f"[red]✗[/red] {e}")
+
+
 SLASH_COMMANDS = {
     "/help": cmd_help,
     "/model": cmd_model,
@@ -231,6 +252,8 @@ SLASH_COMMANDS = {
     "/copy": cmd_copy,
     "/doctor": cmd_doctor,
     "/version": cmd_version,
+    "/login": cmd_login,
+    "/logout": cmd_logout,
 }
 
 
@@ -369,26 +392,37 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
     # --- Auth ---
     auth_result = client.ensure_authenticated()
     if auth_result == "session_expired" or not auth_result:
-        console.print("[red]Not logged in[/red]")
         if not is_tty:
+            console.print("[red]Not logged in[/red]")
             sys.exit(1)
-        choice = click.prompt("1) Login  2) Register  3) Exit", type=click.IntRange(1, 3), default=1)
+        console.print()
+        console.print("[yellow]⚠  Not logged in[/yellow]")
+        console.print()
+        console.print("  [green]1[/green]  Login")
+        console.print("  [cyan]2[/cyan]  Register")
+        console.print("  [dim]3[/dim]  Exit")
+        console.print()
+        choice = console.input("[dim]Choose [1/2/3]:[/dim] ").strip()
+        choice = int(choice) if choice in ("1", "2", "3") else 1
         if choice == 3:
             sys.exit(0)
-        username = click.prompt("Username")
+        console.print()
+        username = console.input("[bold]Username:[/bold] ").strip()
         password = click.prompt("Password", hide_input=True)
         if choice == 2:
-            email = click.prompt("Email")
+            email = console.input("[bold]Email:[/bold] ").strip()
             try:
                 client.register(username, password, email)
             except Exception as e:
-                console.print(f"[red]Registration failed: {e}[/red]")
+                console.print(f"\n[red]✗ Registration failed:[/red] {e}")
                 sys.exit(1)
         try:
             client.login(username, password)
+            console.print(f"[green]✓[/green] Logged in as [bold]{username}[/bold]")
         except Exception as e:
-            console.print(f"[red]Login failed: {e}[/red]")
+            console.print(f"\n[red]✗ Login failed:[/red] {e}")
             sys.exit(1)
+        console.print()
 
     try:
         user_info = client.get_current_user()
@@ -519,8 +553,23 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
                 if status_bar:
                     status_bar.update(turn=turn_count)
             except AuthenticationError:
-                console.print("[red]Session expired — please login again: mo-agent login[/red]")
-                break
+                if hasattr(renderer, "end_response"):
+                    renderer.end_response()
+                if not is_tty:
+                    console.print("[red]Session expired[/red]")
+                    break
+                console.print("\n[yellow]⚠  Session expired — re-login required[/yellow]\n")
+                try:
+                    _username = console.input("[bold]Username:[/bold] ").strip()
+                    _password = click.prompt("Password", hide_input=True)
+                    client.login(_username, _password)
+                    console.print(f"[green]✓[/green] Logged in as [bold]{_username}[/bold]\n")
+                    console.print("[dim]Re-send your message.[/dim]")
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[dim]Cancelled[/dim]")
+                except Exception as e:
+                    console.print(f"[red]✗ Login failed:[/red] {e}")
+                    break
             except KeyboardInterrupt:
                 if hasattr(renderer, "end_response"):
                     renderer.end_response()

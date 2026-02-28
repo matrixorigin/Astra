@@ -133,11 +133,11 @@ class TestStateManagement:
         assert not sb.verbose
 
 
-class TestAuthErrorBreaksRepl:
-    """AuthenticationError should break the REPL loop, not sys.exit."""
+class TestAuthErrorInRepl:
+    """AuthenticationError triggers re-login or clean exit."""
 
-    def test_auth_error_exits_gracefully(self):
-        """Chat REPL prints message and exits cleanly on AuthenticationError."""
+    def test_auth_error_non_tty_exits_cleanly(self):
+        """Non-TTY: auth error prints message and exits (no re-login prompt)."""
         from cli.api_client import AuthenticationError
 
         runner = CliRunner()
@@ -152,5 +152,4 @@ class TestAuthErrorBreaksRepl:
                 result = runner.invoke(agent_cli, ["chat"], input="hello\n")
 
             assert "Session expired" in result.output
-            # Should NOT be a hard crash — exit_code 0 because we break cleanly
             assert result.exit_code == 0

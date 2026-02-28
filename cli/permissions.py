@@ -99,8 +99,11 @@ class PermissionManager:
                     self.format_prompt(tool_name, args),
                     border_style="yellow", title="Permission", title_align="left",
                 ))
-                console.print("[Y]es  [N]o  [A]lways  [D]eny always", style="dim", end="")
-                choice = input("  > ").strip().lower()
+                console.print(
+                    "  [green]\\[Y]es[/green]  [red]\\[N]o[/red]  "
+                    "[cyan]\\[A]lways[/cyan]  [red]\\[D]eny always[/red]",
+                )
+                choice = console.input("[dim]  >[/dim] ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 return Decision.DENY
         else:

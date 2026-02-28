@@ -13,6 +13,8 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/model", "List or select model"),
     ("/session", "Show current session info"),
     ("/clear", "Start a new session"),
+    ("/login", "Login to API"),
+    ("/logout", "Logout"),
     ("/verbose", "Show status bar"),
     ("/compact", "Hide status bar"),
     ("/history", "Show recent turns"),
