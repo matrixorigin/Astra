@@ -18,59 +18,76 @@ VERSION = "0.1.0"
 
 
 class SyncAPIClient:
-    """Synchronous wrapper for APIClient."""
+    """Synchronous wrapper for APIClient.
+
+    Holds a single long-lived APIClient so tokens stay in memory across calls.
+    The old design created a new APIClient per call, relying on the credentials
+    file as the only shared state — any write inconsistency caused auth failures.
+    """
 
     def __init__(self, base_url: str, profile: str | None = None):
         self.base_url = base_url
         self.profile = profile
+        self._api: APIClient | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def _ensure_client(self) -> APIClient:
+        """Lazily create and enter the persistent APIClient."""
+        if self._api is None:
+            self._loop = asyncio.new_event_loop()
+            self._api = APIClient(base_url=self.base_url, profile=self.profile)
+            self._loop.run_until_complete(self._api.__aenter__())
+        return self._api
+
+    def close(self) -> None:
+        """Clean up the persistent client."""
+        if self._api and self._loop:
+            try:
+                self._loop.run_until_complete(self._api.__aexit__(None, None, None))
+            except Exception:
+                pass
+        self._api = None
+        if self._loop:
+            self._loop.close()
+            self._loop = None
 
     def _run(self, coro):
-        try:
-            asyncio.get_running_loop()
-            raise RuntimeError("Cannot run sync client in async context")
-        except RuntimeError:
-            return asyncio.run(coro)
+        self._ensure_client()
+        assert self._loop is not None
+        return self._loop.run_until_complete(coro)
 
     def chat_stream(self, message, session_id=None, agent_id=None, model=None):
-        async def _stream():
-            async with APIClient(base_url=self.base_url, profile=self.profile) as client:
-                async for chunk in client.chat_stream(message, session_id=session_id, agent_id=agent_id, model=model):
-                    yield chunk
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        api = self._ensure_client()
+        assert self._loop is not None
+        gen = api.chat_stream(message, session_id=session_id, agent_id=agent_id, model=model)
         try:
-            gen = _stream()
             while True:
                 try:
-                    yield loop.run_until_complete(gen.__anext__())
+                    yield self._loop.run_until_complete(gen.__anext__())
                 except StopAsyncIteration:
                     break
         finally:
-            loop.close()
+            pass
 
     def stream_agent_run_events(self, run_id):
-        async def _stream():
-            async with APIClient(base_url=self.base_url, profile=self.profile) as client:
-                async for event in client.stream_agent_run_events(run_id):
-                    yield event
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        api = self._ensure_client()
+        assert self._loop is not None
+        gen = api.stream_agent_run_events(run_id)
         try:
-            gen = _stream()
             while True:
                 try:
-                    yield loop.run_until_complete(gen.__anext__())
+                    yield self._loop.run_until_complete(gen.__anext__())
                 except StopAsyncIteration:
                     break
         finally:
-            loop.close()
+            pass
 
     def __getattr__(self, name):
-        async def wrapper(*args, **kwargs):
-            async with APIClient(base_url=self.base_url, profile=self.profile) as client:
-                method = getattr(client, name)
-                return await method(*args, **kwargs)
-        return lambda *args, **kwargs: self._run(wrapper(*args, **kwargs))
+        def wrapper(*args, **kwargs):
+            api = self._ensure_client()
+            method = getattr(api, name)
+            return self._run(method(*args, **kwargs))
+        return wrapper
 
 
 # ============================================================================
@@ -322,8 +339,8 @@ SLASH_COMMANDS = {
 # Edge turn runner
 # ============================================================================
 
-async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, auto_approve, renderer=None):
-    """Run one edge chat loop turn using the async APIClient."""
+async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None):
+    """Run one edge chat loop turn using the provided APIClient."""
     import os
     from cli.edge_chat_loop import edge_chat_loop
     from cli.permissions import PermissionManager
@@ -352,15 +369,14 @@ async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, a
     session_info = {"session_id": session_id, "agent_id": agent_id, "model": model, "turn": 0}
     perms = PermissionManager(auto_approve=auto_approve)
 
-    async with APIClient(base_url=sync_client.base_url, profile=sync_client.profile) as api:
-        router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api))
-        return await edge_chat_loop(
-            user_input, api, router, perms,
-            session_id=session_id, project_root=project_root,
-            model=model, agent_id=agent_id,
-            session_info=session_info,
-            renderer=renderer,
-        )
+    router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client))
+    return await edge_chat_loop(
+        user_input, api_client, router, perms,
+        session_id=session_id, project_root=project_root,
+        model=model, agent_id=agent_id,
+        session_info=session_info,
+        renderer=renderer,
+    )
 
 
 # ============================================================================
@@ -600,8 +616,8 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
             try:
                 if hasattr(renderer, "begin_response"):
                     renderer.begin_response()
-                result_text = asyncio.run(_run_edge_turn(
-                    user_input, client, state["session_id"],
+                result_text = client._run(_run_edge_turn(
+                    user_input, client._ensure_client(), state["session_id"],
                     state.get("selected_model"), user_id, auto_approve,
                     renderer=renderer,
                 ))

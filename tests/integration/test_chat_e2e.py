@@ -112,6 +112,7 @@ class TestChatE2E:
 
     def test_chat_with_mocked_api_client(self, runner):
         """Test chat command with mocked API client."""
+        import asyncio
         from uuid_utils import uuid7
         
         session_id = str(uuid7())
@@ -130,11 +131,12 @@ class TestChatE2E:
                 "status": "active"
             }
             
-            # Mock chat response
-            mock_client.chat.return_value = {
-                "response": "Hello! How can I help you?",
-                "run_id": "run_123"
-            }
+            # Close coroutine args to avoid "was never awaited" warning
+            def _run_close(coro):
+                if asyncio.iscoroutine(coro):
+                    coro.close()
+                return None
+            mock_client._run.side_effect = _run_close
             
             # Mock session close
             mock_client.close_session.return_value = None
@@ -469,14 +471,21 @@ class TestChatErrorRecovery:
 
     def test_chat_session_cleanup_on_error(self, runner):
         """Test that session is cleaned up even if error occurs."""
+        import asyncio
+
         with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             
             mock_client.ensure_authenticated.return_value = True
             mock_client.create_session.return_value = {"session_id": "s1"}
-            mock_client.chat.side_effect = Exception("Chat error")
             mock_client.close_session.return_value = None
+
+            def _run_close(coro):
+                if asyncio.iscoroutine(coro):
+                    coro.close()
+                raise Exception("Chat error")
+            mock_client._run.side_effect = _run_close
             
             result = runner.invoke(
                 agent_cli,

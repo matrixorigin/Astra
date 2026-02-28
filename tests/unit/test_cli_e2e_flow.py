@@ -138,6 +138,7 @@ class TestAuthErrorInRepl:
 
     def test_auth_error_non_tty_exits_cleanly(self):
         """Non-TTY: auth error prints message and exits (no re-login prompt)."""
+        import asyncio
         from cli.api_client import AuthenticationError
 
         runner = CliRunner()
@@ -147,6 +148,8 @@ class TestAuthErrorInRepl:
             client.get_current_user.return_value = {"username": "alice"}
             client.create_session.return_value = {"session_id": "s1"}
             client.close_session.return_value = {}
+            client._run.side_effect = lambda coro: asyncio.run(coro)
+            client._ensure_client.return_value = client
 
             with patch("cli.mo_agent_api._run_edge_turn", side_effect=AuthenticationError("expired")):
                 result = runner.invoke(agent_cli, ["chat"], input="hello\n")

@@ -1,11 +1,20 @@
 """Tests for API-mode CLI commands."""
 
+import asyncio
 import pytest
 from click.testing import CliRunner
 from unittest.mock import patch, MagicMock, AsyncMock
 
 from cli.mo_agent_api import cli as agent_cli
 from cli.mo_admin_api import cli as admin_cli
+
+
+def _make_chat_mock(mock_client):
+    """Configure a MagicMock SyncAPIClient for chat command tests."""
+    import asyncio
+    mock_client._run.side_effect = lambda coro: asyncio.run(coro)
+    mock_client._ensure_client.return_value = mock_client
+    return mock_client
 
 
 @pytest.fixture
@@ -376,19 +385,11 @@ class TestCLIEdgeMode:
             captured["auto_approve"] = perms._auto_approve
             captured["kwargs"] = kwargs
 
-        mock_client = MagicMock()
-        mock_client.base_url = "http://localhost:8000"
-        mock_client.profile = None
+        mock_api = AsyncMock()
 
-        with patch("cli.mo_agent_api.APIClient") as MockAPI, \
-             patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop), \
+        with patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop), \
              patch("core.skills.loader.SkillLoader.discover", return_value=[]):
-            # Make APIClient context manager work
-            mock_api_instance = AsyncMock()
-            MockAPI.return_value.__aenter__ = AsyncMock(return_value=mock_api_instance)
-            MockAPI.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            asyncio.run(_run_edge_turn("test", mock_client, "ses_1", "gpt-4", "agent-1", True))
+            asyncio.run(_run_edge_turn("test", mock_api, "ses_1", "gpt-4", "agent-1", True))
 
         expected_tools = {
             "read_file", "write_file", "str_replace", "list_dir",
@@ -403,11 +404,9 @@ class TestCLIEdgeMode:
 
     def test_chat_uses_edge_path(self, runner):
         """Chat always uses _run_edge_turn."""
-        from unittest.mock import patch, MagicMock, AsyncMock
-
         with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
              patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
-            mock_client = MagicMock()
+            mock_client = _make_chat_mock(MagicMock())
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = True
             mock_client.get_current_user.return_value = {"username": "alice"}
@@ -418,11 +417,9 @@ class TestCLIEdgeMode:
 
     def test_auto_approve_flag_passed(self, runner):
         """--auto-approve flag is forwarded to _run_edge_turn."""
-        from unittest.mock import patch, MagicMock, AsyncMock
-
         with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
              patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
-            mock_client = MagicMock()
+            mock_client = _make_chat_mock(MagicMock())
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = True
             mock_client.get_current_user.return_value = {"username": "alice"}
@@ -433,12 +430,10 @@ class TestCLIEdgeMode:
 
     def test_debug_flag_shows_traceback(self, runner):
         """--debug prints full traceback on error."""
-        from unittest.mock import patch, MagicMock, AsyncMock
-
         with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
              patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
             mock_edge.side_effect = ValueError("test boom")
-            mock_client = MagicMock()
+            mock_client = _make_chat_mock(MagicMock())
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = True
             mock_client.get_current_user.return_value = {"username": "alice"}

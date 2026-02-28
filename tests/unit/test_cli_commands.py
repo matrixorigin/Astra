@@ -38,6 +38,10 @@ def mock_api_client():
     """Mock API client to verify CLI → API calls."""
     with patch("cli.mo_agent_api.SyncAPIClient") as mock:
         client_instance = MagicMock()
+        # _run must actually execute coroutines for chat tests
+        import asyncio
+        client_instance._run.side_effect = lambda coro: asyncio.run(coro)
+        client_instance._ensure_client.return_value = client_instance
         mock.return_value = client_instance
         yield client_instance
 
