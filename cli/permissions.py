@@ -68,22 +68,48 @@ class PermissionManager:
         return any(p.search(command) for p in DANGEROUS_PATTERNS)
 
     def format_prompt(self, tool_name: str, args: dict[str, Any]) -> str:
-        """Format an interactive permission prompt."""
+        """Format an interactive permission prompt (rich markup)."""
         if tool_name == "bash":
             detail = args.get("command", "")
         elif tool_name in ("write_file", "str_replace"):
             detail = args.get("path", "")
         else:
             detail = str(args)[:100]
-        return f"🔧 {tool_name}: {detail}\n[Y]es  [N]o  [A]lways allow {tool_name}  [D]eny always  > "
+        return f"⚡ [bold]{tool_name}[/bold]: [dim]{detail}[/dim]"
+
+    def format_prompt_plain(self, tool_name: str, args: dict[str, Any]) -> str:
+        """Format prompt as plain text (non-TTY fallback)."""
+        if tool_name == "bash":
+            detail = args.get("command", "")
+        elif tool_name in ("write_file", "str_replace"):
+            detail = args.get("path", "")
+        else:
+            detail = str(args)[:100]
+        return f"⚡ {tool_name}: {detail}"
 
     def prompt_user(self, tool_name: str, side_effect: SideEffect, args: dict[str, Any]) -> Decision:
-        """Interactive permission prompt. Returns Decision and sets session override if requested."""
-        prompt = self.format_prompt(tool_name, args)
-        try:
-            choice = input(prompt).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            return Decision.DENY
+        """Interactive permission prompt with rich formatting when available."""
+        import sys
+        if sys.stdin.isatty():
+            try:
+                from rich.console import Console
+                from rich.panel import Panel
+                console = Console(stderr=True)
+                console.print(Panel(
+                    self.format_prompt(tool_name, args),
+                    border_style="yellow", title="Permission", title_align="left",
+                ))
+                console.print("[Y]es  [N]o  [A]lways  [D]eny always", style="dim", end="")
+                choice = input("  > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return Decision.DENY
+        else:
+            prompt = self.format_prompt_plain(tool_name, args)
+            try:
+                choice = input(f"{prompt}\n[Y/n/a/d] > ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return Decision.DENY
+
         if choice in ("y", "yes", ""):
             return Decision.ALLOW
         if choice in ("a", "always"):

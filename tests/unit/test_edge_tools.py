@@ -512,7 +512,6 @@ class TestPermissions:
         prompt = pm.format_prompt("bash", {"command": "make test"})
         assert "bash" in prompt
         assert "make test" in prompt
-        assert "[Y]es" in prompt
 
     def test_format_prompt_write(self):
         pm = PermissionManager()

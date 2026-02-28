@@ -27,6 +27,7 @@ _run_waiters: dict[str, asyncio.Event] = {}
 _run_tasks: dict[str, asyncio.Task] = {}
 _child_runs: dict[str, set[str]] = {}  # parent_run_id → {child_run_ids}
 _fan_in_tasks: set[asyncio.Task] = set()  # Track fan-in tasks for cleanup
+_cancel_pending: set[asyncio.Task] = set()  # Hold refs to cancelled tasks until done
 
 
 def cleanup_fan_in_tasks() -> None:
@@ -69,6 +70,7 @@ def cleanup_run_tasks() -> None:
     _agent_run_events.clear()
     _run_waiters.clear()
     _child_runs.clear()
+    _cancel_pending.clear()
 
 
 # Max size for resume user_input to prevent token explosion on adversarial loops
@@ -422,10 +424,13 @@ class RunEngine(DbConsumer):
         run.status = RunStatus.CANCELLED
         self._log_run_event(run, EventType.RUN_CANCELLED)
 
-        # Cancel the asyncio task
+        # Cancel the asyncio task (keep ref in _cancel_pending until done
+        # to prevent "Task was destroyed but it is pending!" warnings)
         task = _run_tasks.pop(run_id, None)
         if task and not task.done():
             task.cancel()
+            _cancel_pending.add(task)
+            task.add_done_callback(_cancel_pending.discard)
 
         # Cancel children (local + write DB for cross-worker)
         children = _child_runs.pop(run_id, set())
@@ -436,6 +441,8 @@ class RunEngine(DbConsumer):
             child_task = _run_tasks.pop(cid, None)
             if child_task and not child_task.done():
                 child_task.cancel()
+                _cancel_pending.add(child_task)
+                child_task.add_done_callback(_cancel_pending.discard)
             child = _active_runs.get(cid)
             if child and child.status not in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                 child.status = RunStatus.CANCELLED

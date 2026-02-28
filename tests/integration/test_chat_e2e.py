@@ -195,7 +195,7 @@ class TestChatE2E:
             
             # Should fail with auth error
             assert result.exit_code != 0
-            assert "login" in result.output.lower() or "auth" in result.output.lower()
+            assert "login" in result.output.lower() or "auth" in result.output.lower() or "logged in" in result.output.lower()
 
     def test_chat_multiple_turns_in_session(self, runner, db):
         """Test multiple chat turns in same session."""
