@@ -300,3 +300,77 @@ class TestEdgeCases:
         })
         models = generate_files(spec)["models.py"]
         assert "from sqlalchemy.sql import func" in models
+
+
+# ── CLI ──────────────────────────────────────────────────────────
+
+class TestScaffoldCLI:
+    def test_scaffold_creates_files(self, jira_yaml, tmp_path):
+        from click.testing import CliRunner
+        from cli.mo_agent_api import cli as agent_cli
+
+        yaml_path = tmp_path / "skill.yaml"
+        yaml_path.write_text(yaml.dump(jira_yaml))
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+        runner = CliRunner()
+        result = runner.invoke(agent_cli, [
+            "skill", "scaffold", str(yaml_path), "--output-dir", str(output_dir),
+        ])
+        assert result.exit_code == 0
+        assert "Generated skill package" in result.output
+        assert (output_dir / "jira" / "manifest.yaml").exists()
+        assert (output_dir / "jira" / "models.py").exists()
+        assert (output_dir / "jira" / "actions.py").exists()
+
+    def test_scaffold_refuses_overwrite(self, jira_yaml, tmp_path):
+        from click.testing import CliRunner
+        from cli.mo_agent_api import cli as agent_cli
+
+        yaml_path = tmp_path / "skill.yaml"
+        yaml_path.write_text(yaml.dump(jira_yaml))
+        (tmp_path / "out" / "jira").mkdir(parents=True)
+
+        runner = CliRunner()
+        result = runner.invoke(agent_cli, [
+            "skill", "scaffold", str(yaml_path), "--output-dir", str(tmp_path / "out"),
+        ])
+        assert "already exists" in result.output
+
+    def test_scaffold_invalid_yaml(self, tmp_path):
+        from click.testing import CliRunner
+        from cli.mo_agent_api import cli as agent_cli
+
+        yaml_path = tmp_path / "bad.yaml"
+        yaml_path.write_text("name: Bad-Name\nversion: '1.0'\ndescription: x\n")
+
+        runner = CliRunner()
+        result = runner.invoke(agent_cli, ["skill", "scaffold", str(yaml_path)])
+        assert "Error" in result.output
+
+
+# ── API endpoint ─────────────────────────────────────────────────
+
+class TestScaffoldAPI:
+    def test_scaffold_endpoint_returns_files(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        client = TestClient(app)
+        resp = client.post("/skills/scaffold", json={
+            "name": "demo", "version": "1.0", "description": "Demo skill",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "__init__.py" in data
+        assert "manifest.yaml" in data
+        assert "models.py" in data
+
+    def test_scaffold_endpoint_422_on_invalid(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+
+        client = TestClient(app)
+        resp = client.post("/skills/scaffold", json={"version": "1.0"})
+        assert resp.status_code == 422
