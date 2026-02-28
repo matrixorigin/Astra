@@ -1,10 +1,12 @@
 """Chat API endpoints — unified conversation entry point with durable AgentRun."""
 
+import asyncio
 import json
 import os
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -26,6 +28,61 @@ from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+# ---------------------------------------------------------------------------
+# SSE Heartbeat (§3.1 of edge-cloud-execution.md)
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_INTERVAL_S = 15
+SERVER_TURN_TIMEOUT_S = 240
+
+_HEARTBEAT_SENTINEL = object()
+
+
+def _sse_ping() -> str:
+    return f"data: {json.dumps({'type': 'ping', 'ts': int(time.time() * 1000)})}\n\n"
+
+
+async def _with_heartbeat(sse_generator: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Wrap an SSE generator with periodic ping events."""
+    queue: asyncio.Queue[str | BaseException | object] = asyncio.Queue()
+
+    async def _drain() -> None:
+        try:
+            async for line in sse_generator:
+                await queue.put(line)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            await queue.put(exc)
+        finally:
+            await queue.put(_HEARTBEAT_SENTINEL)
+
+    task = asyncio.create_task(_drain())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(
+                    queue.get(), timeout=HEARTBEAT_INTERVAL_S,
+                )
+            except asyncio.TimeoutError:
+                yield _sse_ping()
+                continue
+            if item is _HEARTBEAT_SENTINEL:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        # No explicit aclose() needed: _drain() consumes sse_generator via
+        # async-for, which guarantees aclose() on both normal exit and
+        # cancellation (CancelledError propagates through the for-body and
+        # triggers the implicit finally of the async-for protocol).
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +381,7 @@ async def chat_stream(
             yield f"data: {json.dumps({'type': 'error', 'message': msg, 'code': code, 'retryable': False})}\n\n"
 
     return StreamingResponse(
-        event_generator(),
+        _with_heartbeat(event_generator()),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
@@ -383,7 +440,7 @@ async def stream_run(
             yield f"data: {json.dumps({'type': 'error', 'message': msg, 'code': code, 'retryable': False})}\n\n"
 
     return StreamingResponse(
-        event_generator(),
+        _with_heartbeat(event_generator()),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
@@ -1048,6 +1105,7 @@ async def chat_turn(
     # The generator-internal try/except handles session lookup, LLM, and DB errors.
     async def event_generator():
         try:
+            _turn_start = time.monotonic()
             user_id = current_user["user_id"]
             db = SessionLocal()
             try:
@@ -1107,10 +1165,27 @@ async def chat_turn(
                     }.items() if v is not None
                 }
 
-                if tools_schema:
-                    async for chunk in llm.chat_with_tools_stream(
+                # Server timeout (240s) < client timeout (300s) so the server
+                # can send an error event before the client gives up.
+                _deadline = _turn_start + SERVER_TURN_TIMEOUT_S
+
+                async def _next_with_timeout(aiter: AsyncIterator) -> Any:
+                    remaining = _deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    return await asyncio.wait_for(aiter.__anext__(), timeout=remaining)
+
+                stream: AsyncIterator = (
+                    llm.chat_with_tools_stream(
                         llm_messages, tools_schema, model=model, task_hint=task_hint,
-                    ):
+                    ) if tools_schema else
+                    llm.chat_stream(
+                        llm_messages, user_id, session_id, model=model,
+                    )
+                )
+                try:
+                    while True:
+                        chunk = await _next_with_timeout(stream)
                         if chunk["type"] == "text":
                             full_text += chunk["content"]
                             yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
@@ -1119,13 +1194,11 @@ async def chat_turn(
                         elif chunk["type"] == "usage":
                             usage = {"prompt": chunk.get("prompt", 0), "completion": chunk.get("completion", 0), "total": chunk.get("prompt", 0) + chunk.get("completion", 0)}
                             yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
-                else:
-                    async for chunk in llm.chat_stream(
-                        llm_messages, user_id, session_id, model=model,
-                    ):
-                        if chunk["type"] == "text":
-                            full_text += chunk["content"]
-                            yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
+                except StopAsyncIteration:
+                    pass
+                except (asyncio.TimeoutError, TimeoutError):
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Turn exceeded server time limit', 'code': 'turn_timeout', 'retryable': False})}\n\n"
+                    return
 
                 # Emit accumulated tool calls
                 for tc in tool_calls:
@@ -1212,7 +1285,7 @@ async def chat_turn(
             yield f"data: {json.dumps(err)}\n\n"
 
     return StreamingResponse(
-        event_generator(),
+        _with_heartbeat(event_generator()),
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )

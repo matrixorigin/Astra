@@ -15,10 +15,15 @@ from api.database import get_db_session
 
 @pytest.fixture
 def client():
-    """Test client with gate trigger disabled."""
+    """Test client with gate trigger disabled.
+
+    Uses context manager so the event loop persists across requests — required
+    for background tasks created via asyncio.create_task (e.g. RunEngine).
+    """
     import os
     os.environ['DISABLE_GATE_TRIGGER'] = '1'
-    yield TestClient(app)
+    with TestClient(app) as c:
+        yield c
     os.environ.pop('DISABLE_GATE_TRIGGER', None)
 
 

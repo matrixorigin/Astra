@@ -16,6 +16,7 @@ from cli.tools.base import resolve_side_effect
 from cli.tools.router import ToolCall, ToolResult, ToolRouter
 
 MAX_TURNS = 25
+MAX_TURN_WALL_CLOCK_S = 300
 
 
 class Renderer(Protocol):
@@ -133,27 +134,40 @@ def detect_edge_profile(project_root: str) -> dict[str, Any]:
     return profile
 
 
-async def _consume_turn(sse_stream, renderer: Renderer) -> TurnResult:
+async def _consume_turn(sse_stream, renderer: Renderer, *, timeout: float = MAX_TURN_WALL_CLOCK_S) -> TurnResult:
     """Consume one /chat/turn SSE stream, render text, collect tool_calls."""
     result = TurnResult()
-    async for event in sse_stream:
-        etype = event.get("type", "")
-        if etype == "text_delta":
-            chunk = event.get("content", "")
-            result.text += chunk
-            renderer.text(chunk)
-        elif etype == "tool_call":
-            result.tool_calls.append(event)
-        elif etype == "session_info":
-            result.session_id = event.get("session_id")
-            result.run_id = event.get("run_id")
-        elif etype == "usage":
-            result.usage = {k: v for k, v in event.items() if k != "type"}
-        elif etype == "turn_complete":
-            result.has_tool_calls = event.get("has_tool_calls", False)
-        elif etype == "error":
-            result.error = event
-            renderer.error(event.get("message", "Unknown cloud error"))
+    deadline = asyncio.timeout(timeout)
+    try:
+        async with deadline:
+            async for event in sse_stream:
+                etype = event.get("type", "")
+                if etype == "text_delta":
+                    chunk = event.get("content", "")
+                    result.text += chunk
+                    renderer.text(chunk)
+                elif etype == "tool_call":
+                    result.tool_calls.append(event)
+                elif etype == "session_info":
+                    result.session_id = event.get("session_id")
+                    result.run_id = event.get("run_id")
+                elif etype == "usage":
+                    result.usage = {k: v for k, v in event.items() if k != "type"}
+                elif etype == "turn_complete":
+                    result.has_tool_calls = event.get("has_tool_calls", False)
+                elif etype == "error":
+                    result.error = event
+                    renderer.error(event.get("message", "Unknown cloud error"))
+                elif etype == "ping":
+                    pass  # heartbeat — connection kept alive, nothing to render
+    except TimeoutError:
+        if deadline.expired():
+            # Our wall-clock deadline fired — report as client timeout.
+            result.error = {"type": "error", "message": "Turn timed out", "code": "CLIENT_TIMEOUT"}
+            renderer.error("Turn timed out")
+        else:
+            # TimeoutError from the stream itself (e.g. network) — let caller handle.
+            raise
     return result
 
 

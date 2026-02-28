@@ -1,5 +1,6 @@
 """LLM client with provider abstraction, routing, rate limiting, circuit breaker, and call logging."""
 
+import asyncio
 import json
 import logging
 import os
@@ -20,6 +21,9 @@ from core.auth.encryption import decrypt_token
 from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
+
+# Sentinel for asyncio.to_thread(next, iter, _END) — distinct from StopIteration.
+_END = object()
 
 
 class BudgetExceededError(Exception):
@@ -488,9 +492,13 @@ class LLMClient(DbConsumer):
                 provider = self._get_provider(model_cfg.provider)
                 usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}
 
-                for chunk in provider.complete_stream(
+                sync_iter = provider.complete_stream(
                     messages, model_cfg.model_name, temp, max_tok
-                ):
+                )
+                while True:
+                    chunk = await asyncio.to_thread(next, sync_iter, _END)
+                    if chunk is _END:
+                        break
                     if chunk["type"] == "text":
                         yield {"type": "text", "content": chunk["content"]}
                     elif chunk["type"] == "reasoning":
@@ -570,9 +578,13 @@ class LLMClient(DbConsumer):
                 if hasattr(provider, 'cache_enabled'):
                     provider.cache_enabled = model_cfg.enable_cache
                 usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}
-                for chunk in provider.complete_with_tools_stream(
+                sync_iter = provider.complete_with_tools_stream(
                     messages, tools, model_cfg.model_name, tool_choice, temp, max_tok
-                ):
+                )
+                while True:
+                    chunk = await asyncio.to_thread(next, sync_iter, _END)
+                    if chunk is _END:
+                        break
                     if chunk["type"] == "usage":
                         usage["prompt"] = chunk.get("prompt", 0)
                         usage["completion"] = chunk.get("completion", 0)

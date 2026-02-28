@@ -665,3 +665,43 @@ class TestLoadProjectRules:
         rules = load_project_rules(str(tmp_path))
         assert "Main rules" in rules
         assert "Claude compat" in rules
+
+
+# ============================================================================
+# Heartbeat / ping / timeout tests
+# ============================================================================
+
+class TestPingAndTimeout:
+    """Tests for ping event handling and app-level timeout in _consume_turn."""
+
+    @pytest.mark.asyncio
+    async def test_ping_events_ignored_by_consume_turn(self):
+        """Ping events are silently ignored — no effect on TurnResult."""
+        async def stream():
+            yield {"type": "ping", "ts": 1234567890}
+            yield {"type": "text_delta", "content": "hello"}
+            yield {"type": "ping", "ts": 1234567891}
+            yield {"type": "turn_complete", "has_tool_calls": False}
+
+        renderer = RecordingRenderer()
+        result = await _consume_turn(stream(), renderer)
+        assert result.text == "hello"
+        assert result.has_tool_calls is False
+        assert result.error is None
+        assert len(renderer.texts) == 1
+
+    @pytest.mark.asyncio
+    async def test_app_level_timeout_breaks_turn(self):
+        """Turn times out when stream hangs — asyncio.timeout fires."""
+        async def slow_stream():
+            yield {"type": "text_delta", "content": "a"}
+            await asyncio.sleep(5)  # far exceeds timeout — 500x margin
+            yield {"type": "text_delta", "content": "b"}
+            yield {"type": "turn_complete", "has_tool_calls": False}
+
+        renderer = RecordingRenderer()
+        result = await _consume_turn(slow_stream(), renderer, timeout=0.01)
+        assert result.text == "a"
+        assert result.error is not None
+        assert result.error["code"] == "CLIENT_TIMEOUT"
+        assert len(renderer.errors) == 1

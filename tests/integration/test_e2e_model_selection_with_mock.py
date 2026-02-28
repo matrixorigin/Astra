@@ -11,13 +11,16 @@ from api.database import get_db_session
 
 @pytest.fixture
 def client():
-    """Create test client without database override to avoid concurrency issues."""
-    # Disable gate trigger in tests
+    """Create test client without database override to avoid concurrency issues.
+
+    Uses context manager so the event loop persists across requests — required
+    for background tasks created via asyncio.create_task (e.g. RunEngine).
+    """
     import os
     os.environ['DISABLE_GATE_TRIGGER'] = '1'
     
-    # Use real database connections (not shared session)
-    yield TestClient(app)
+    with TestClient(app) as c:
+        yield c
     
     # Cleanup
     os.environ.pop('DISABLE_GATE_TRIGGER', None)
