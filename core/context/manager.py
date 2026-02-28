@@ -642,8 +642,7 @@ class ContextManager(DbConsumer):
             "llm_response_id": llm_response_id,
         }
 
-        from api.database import SessionLocal
-        _write_pool.submit(self._write_snapshot, SessionLocal, payload)
+        _write_pool.submit(self._write_snapshot, self._db_factory, payload)
 
         logger.info(f"Context snapshot queued: {context_capture_id}")
         return context_capture_id
@@ -703,8 +702,9 @@ class ContextManager(DbConsumer):
             )
         except Exception:
             db.rollback()
-            _logging.getLogger(__name__).exception(
-                "Failed to update snapshot %s", context_capture_id
+            _logging.getLogger(__name__).warning(
+                "Failed to update snapshot %s", context_capture_id,
+                exc_info=True,
             )
         finally:
             db.close()
@@ -719,10 +719,16 @@ class ContextManager(DbConsumer):
         _write_pool.shutdown(wait=True)
         _write_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ctx_snapshot")
 
+    @staticmethod
     def update_snapshot_llm_ids(
-        self, context_capture_id: str, llm_request_id: str | None = None, llm_response_id: str | None = None
+        db_factory, context_capture_id: str,
+        llm_request_id: str | None = None, llm_response_id: str | None = None,
     ) -> None:
         """Update context capture with LLM request/response IDs (async).
+
+        Accepts db_factory directly — no need to instantiate the full
+        ContextManager (which creates EmbeddingService, PromptManager, etc.)
+        just for a metadata update.
 
         Offloaded to background thread — fire-and-forget.
         """
@@ -734,9 +740,8 @@ class ContextManager(DbConsumer):
         if not update_dict:
             return
 
-        from api.database import SessionLocal
         _write_pool.submit(
-            self._update_snapshot, SessionLocal, context_capture_id, update_dict
+            ContextManager._update_snapshot, db_factory, context_capture_id, update_dict
         )
 
     def load_snapshot(self, context_capture_id: str) -> Context:

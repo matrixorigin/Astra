@@ -53,24 +53,20 @@ def _flush_pool():
 class TestSaveSnapshot:
     """Tests for save_snapshot method."""
 
-    def test_save_snapshot_basic(self, context_manager, sample_context):
+    def test_save_snapshot_basic(self, context_manager, mock_db, sample_context):
         """Test basic snapshot saving."""
-        mock_session = MagicMock()
-        mock_factory = MagicMock(return_value=mock_session)
-
-        with patch("api.database.SessionLocal", mock_factory):
-            context_capture_id = context_manager.save_snapshot(
-                context=sample_context,
-                session_id="session-123",
-                event_id="event-456",
-            )
-            _flush_pool()
+        context_capture_id = context_manager.save_snapshot(
+            context=sample_context,
+            session_id="session-123",
+            event_id="event-456",
+        )
+        _flush_pool()
 
         assert context_capture_id is not None
-        assert mock_session.add.called
-        assert mock_session.commit.called
+        assert mock_db.add.called
+        assert mock_db.commit.called
 
-        snapshot = mock_session.add.call_args[0][0]
+        snapshot = mock_db.add.call_args[0][0]
         assert snapshot.session_id == "session-123"
         assert snapshot.event_id == "event-456"
 
@@ -81,68 +77,55 @@ class TestSaveSnapshot:
         assert skills_used[1]["skill_name"] == "skill2"
         assert skills_used[1]["version"] == "latest"
 
-    def test_save_snapshot_with_llm_ids(self, context_manager, sample_context):
+    def test_save_snapshot_with_llm_ids(self, context_manager, mock_db, sample_context):
         """Test snapshot saving with LLM IDs."""
-        mock_session = MagicMock()
-        mock_factory = MagicMock(return_value=mock_session)
+        context_manager.save_snapshot(
+            context=sample_context,
+            session_id="session-123",
+            llm_request_id="req-1",
+            llm_response_id="res-1",
+        )
+        _flush_pool()
 
-        with patch("api.database.SessionLocal", mock_factory):
-            context_manager.save_snapshot(
-                context=sample_context,
-                session_id="session-123",
-                llm_request_id="req-1",
-                llm_response_id="res-1",
-            )
-            _flush_pool()
-
-        snapshot = mock_session.add.call_args[0][0]
+        snapshot = mock_db.add.call_args[0][0]
         assert snapshot.llm_request_id == "req-1"
         assert snapshot.llm_response_id == "res-1"
 
 
 class TestUpdateSnapshotLlmIds:
-    """Tests for update_snapshot_llm_ids method."""
+    """Tests for update_snapshot_llm_ids static method."""
 
-    def test_update_snapshot_ids(self, context_manager):
+    def test_update_snapshot_ids(self, mock_db):
         """Test updating LLM IDs."""
-        mock_session = MagicMock()
-        mock_factory = MagicMock(return_value=mock_session)
-        mock_filter = mock_session.query.return_value.filter.return_value
+        mock_filter = mock_db.query.return_value.filter.return_value
+        mock_filter.update.return_value = 1  # rows updated
 
-        with patch("api.database.SessionLocal", mock_factory):
-            context_manager.update_snapshot_llm_ids(
-                context_capture_id="snap-123",
-                llm_request_id="req-1",
-                llm_response_id="res-1",
-            )
-            _flush_pool()
+        ContextManager.update_snapshot_llm_ids(
+            lambda: mock_db,
+            context_capture_id="snap-123",
+            llm_request_id="req-1",
+            llm_response_id="res-1",
+        )
+        _flush_pool()
 
-        # Wait for async pool to complete
-        import time
-        for _ in range(10):
-            if mock_filter.update.called:
-                break
-            time.sleep(0.01)
-
-        assert mock_session.query.called
+        assert mock_db.query.called
         mock_filter.update.assert_called_once()
         update_dict = mock_filter.update.call_args[0][0]
         assert update_dict["llm_request_id"] == "req-1"
         assert update_dict["llm_response_id"] == "res-1"
-        assert mock_session.commit.called
+        assert mock_db.commit.called
 
-    def test_update_snapshot_ids_partial(self, context_manager):
+    def test_update_snapshot_ids_partial(self, mock_db):
         """Test updating with only one ID."""
-        mock_session = MagicMock()
-        mock_factory = MagicMock(return_value=mock_session)
-        mock_filter = mock_session.query.return_value.filter.return_value
+        mock_filter = mock_db.query.return_value.filter.return_value
+        mock_filter.update.return_value = 1
 
-        with patch("api.database.SessionLocal", mock_factory):
-            context_manager.update_snapshot_llm_ids(
-                context_capture_id="snap-123",
-                llm_request_id="req-1",
-            )
-            _flush_pool()
+        ContextManager.update_snapshot_llm_ids(
+            lambda: mock_db,
+            context_capture_id="snap-123",
+            llm_request_id="req-1",
+        )
+        _flush_pool()
 
         update_dict = mock_filter.update.call_args[0][0]
         assert "llm_request_id" in update_dict

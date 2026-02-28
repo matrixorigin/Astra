@@ -7,9 +7,9 @@ from core.events.event_logger import EventLogger
 
 
 @pytest.fixture
-def context_manager(db_session):
+def context_manager(test_session_factory):
     """Context manager fixture."""
-    return ContextManager(lambda: db_session, embedding_provider="mock")
+    return ContextManager(test_session_factory, embedding_provider="mock")
 
 
 @pytest.fixture
@@ -160,7 +160,7 @@ def test_context_snapshot_relevance_scores(db_session, context_manager, event_lo
     assert isinstance(loaded.relevance_scores, dict)
 
 
-def test_context_snapshot_update_llm_ids(db_session, context_manager, event_logger):
+def test_context_snapshot_update_llm_ids(db_session, test_session_factory, context_manager, event_logger):
     """Test updating snapshot with LLM request/response IDs."""
     session_id = "test_session_006"
     user_id = "test_user"
@@ -179,7 +179,10 @@ def test_context_snapshot_update_llm_ids(db_session, context_manager, event_logg
     context_capture_id = context_manager.save_snapshot(context, session_id, event.event_id)
 
     # Update with LLM IDs
-    context_manager.update_snapshot_llm_ids(context_capture_id, llm_request_id="req_004", llm_response_id="resp_004")
+    ContextManager.update_snapshot_llm_ids(
+        test_session_factory, context_capture_id,
+        llm_request_id="req_004", llm_response_id="resp_004",
+    )
 
     # Wait for both async writes to complete
     context_manager.flush_writes()

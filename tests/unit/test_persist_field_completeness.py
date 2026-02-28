@@ -11,6 +11,7 @@ Covers:
 """
 
 import json
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -143,6 +144,48 @@ class TestPersistFieldCompleteness:
         c = self._run_persist(tool_calls=tc)
         tc_events = [e for e in c["stream_events"] if e["event_type"] == "tool_call"]
         assert tc_events[0]["causal_chain_id"] == "cc1"
+
+    def test_tool_events_have_skill_version_when_registry_available(self):
+        """tool_call and tool_result events must include skill_version from registry."""
+        captured = {"stream_events": []}
+
+        # Mock ORM query: db.query(SR.skill_name, SR.version).filter(...).order_by(...).all()
+        mock_db = MagicMock()
+        mock_query_chain = mock_db.query.return_value.filter.return_value.order_by.return_value
+        mock_query_chain.all.return_value = [("read_file", "1.2.0")]
+
+        mock_session_local = MagicMock()
+        mock_session_local.return_value.__enter__ = MagicMock(return_value=mock_db)
+        mock_session_local.return_value.__exit__ = MagicMock(return_value=False)
+
+        with patch("api.routers.chat.SessionLocal", mock_session_local), \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks"), \
+             patch("core.context.manager.ContextManager.update_snapshot_llm_ids"):
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_llm_response.return_value = MagicMock(event_id="ev_llm")
+
+            def capture_stream(**kw):
+                captured["stream_events"].append(kw)
+                return MagicMock()
+            mock_el.create_stream_event.side_effect = capture_stream
+            mock_el_cls.return_value = mock_el
+
+            from api.routers.chat import _persist_turn_events
+            _persist_turn_events(
+                "u1", "s1",
+                [{"role": "user", "content": "hi"}],
+                [{"tool_call_id": "tc1", "name": "read_file", "result": "ok"}],
+                "done",
+                [{"id": "tc1", "function": {"name": "read_file", "arguments": "{}"}}],
+                context_capture_id="snap1", model_used="gpt-4o",
+            )
+
+        tc_events = [e for e in captured["stream_events"] if e["event_type"] == "tool_call"]
+        tr_events = [e for e in captured["stream_events"] if e["event_type"] == "tool_result"]
+        assert tc_events[0]["skill_version"] == "1.2.0"
+        assert tr_events[0]["skill_version"] == "1.2.0"
 
     # -- tool_result event fields --
 
@@ -334,6 +377,88 @@ class TestSkillSelectionFields:
 # ---------------------------------------------------------------------------
 # NullableJSON type — None → SQL NULL, not JSON 'null'
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# _persist_turn_events — context snapshot linking
+# ---------------------------------------------------------------------------
+
+class TestSnapshotLinking:
+    """Verify _persist_turn_events links LLM IDs to context snapshot."""
+
+    def test_snapshot_llm_ids_linked(self):
+        """update_snapshot_llm_ids called with correct snapshot_id and event IDs."""
+        called_with: dict[str, Any] = {}
+
+        with patch("api.routers.chat.SessionLocal") as mock_sl, \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks"), \
+             patch("core.context.manager.ContextManager.update_snapshot_llm_ids") as mock_link:
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_llm_response.return_value = MagicMock(event_id="ev_llm")
+            mock_el_cls.return_value = mock_el
+
+            def capture_link(*a, **kw):
+                called_with["args"] = a
+                called_with.update(kw)
+            mock_link.side_effect = capture_link
+
+            from api.routers.chat import _persist_turn_events
+            _persist_turn_events(
+                "u1", "s1",
+                [{"role": "user", "content": "hi"}], None,
+                "response", [],
+                context_capture_id="snap1",
+            )
+
+        mock_link.assert_called_once()
+        # Verify db_factory and snapshot_id positional args
+        assert called_with["args"][0] is mock_sl  # db_factory
+        assert called_with["args"][1] == "snap1"  # context_capture_id
+        assert called_with["llm_request_id"] == "ev1"
+        assert called_with["llm_response_id"] == "ev_llm"
+
+    def test_snapshot_not_linked_when_no_snapshot(self):
+        """No linking when context_capture_id is None."""
+        with patch("api.routers.chat.SessionLocal"), \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks"), \
+             patch("core.context.manager.ContextManager.update_snapshot_llm_ids") as mock_link:
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(event_id="ev1", causal_chain_id="cc1")
+            mock_el.create_llm_response.return_value = MagicMock(event_id="ev_llm")
+            mock_el_cls.return_value = mock_el
+
+            from api.routers.chat import _persist_turn_events
+            _persist_turn_events(
+                "u1", "s1",
+                [{"role": "user", "content": "hi"}], None,
+                "response", [],
+                context_capture_id=None,
+            )
+
+        mock_link.assert_not_called()
+
+    def test_snapshot_not_linked_when_no_user_query(self):
+        """No linking when parent_event_id is None (no user content)."""
+        with patch("api.routers.chat.SessionLocal"), \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks"), \
+             patch("core.context.manager.ContextManager.update_snapshot_llm_ids") as mock_link:
+            mock_el = MagicMock()
+            mock_el.create_llm_response.return_value = MagicMock(event_id="ev_llm")
+            mock_el_cls.return_value = mock_el
+
+            from api.routers.chat import _persist_turn_events
+            _persist_turn_events(
+                "u1", "s1",
+                [{"role": "system", "content": "you are helpful"}], None,
+                "response", [],
+                context_capture_id="snap1",
+            )
+
+        mock_link.assert_not_called()
 
 class TestNullableJSON:
     """Verify NullableJSON stores Python None as SQL NULL."""

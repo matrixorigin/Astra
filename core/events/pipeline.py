@@ -61,6 +61,7 @@ def _to_ce_values(e: ConversationEvent) -> dict[str, Any]:
         "llm_model_used": e.llm_model_used,
         "llm_params": e.llm_params,
         "skill_name": e.skill_name,
+        "skill_version": e.skill_version,
         "run_id": metadata.get("run_id"),
         "parent_run_id": metadata.get("parent_run_id"),
         "waiting_for": metadata.get("waiting_for"),
@@ -86,13 +87,13 @@ _CE_INSERT = text("""
         event_id, user_id, session_id, agent_id, agent_version,
         event_type, content, parent_event_id, causal_chain_id,
         created_at, metadata, token_usage, context_snapshot,
-        llm_model_used, llm_params, skill_name,
+        llm_model_used, llm_params, skill_name, skill_version,
         run_id, parent_run_id, waiting_for
     ) VALUES (
         :event_id, :user_id, :session_id, :agent_id, :agent_version,
         :event_type, :content, :parent_event_id, :causal_chain_id,
         :created_at, :metadata, :token_usage, :context_snapshot,
-        :llm_model_used, :llm_params, :skill_name,
+        :llm_model_used, :llm_params, :skill_name, :skill_version,
         :run_id, :parent_run_id, :waiting_for
     )
 """)

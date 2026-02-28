@@ -205,6 +205,7 @@ class EventLogger(DbConsumer):
         causal_chain_id: str | None = None,
         metadata: dict | None = None,
         skill_name: str | None = None,
+        skill_version: str | None = None,
     ) -> ConversationEvent:
         """Create and log a stream event to the database.
 
@@ -240,6 +241,7 @@ class EventLogger(DbConsumer):
             causal_chain_id=causal_chain_id or str(uuid7()),
             metadata=metadata,
             skill_name=skill_name,
+            skill_version=skill_version,
         )
         self.log_event(event)
         return event

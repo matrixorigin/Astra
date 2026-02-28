@@ -770,6 +770,7 @@ def _persist_turn_events(
     context_capture_id: str | None = None,
     model_used: str | None = None,
     token_usage: dict[str, int] | None = None,
+    llm_params: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
     turn_count: int = 0,
 ) -> None:
@@ -790,6 +791,29 @@ def _persist_turn_events(
     el = EventLogger(SessionLocal)
     parent_event_id = None
     causal_chain_id = str(uuid7())
+
+    # Resolve skill versions for tool events (best-effort, single query).
+    # Returns the latest active version per skill name.
+    skill_versions: dict[str, str] = {}
+    try:
+        all_names = set()
+        for tr in (tool_results or []):
+            all_names.add(tr.get("name", ""))
+        for tc in (tool_calls or []):
+            all_names.add(tc.get("function", {}).get("name", ""))
+        all_names.discard("")
+        if all_names:
+            from api.models.skill import SkillRegistry as SR
+            with SessionLocal() as db:
+                rows = db.query(SR.skill_name, SR.version).filter(
+                    SR.skill_name.in_(all_names), SR.is_active == 1,
+                ).order_by(SR.skill_name, SR.version.desc()).all()
+                # Keep only the first (latest) version per skill
+                for name, ver in rows:
+                    if name not in skill_versions:
+                        skill_versions[name] = ver
+    except Exception:
+        logger.debug("Skill version resolution failed", exc_info=True)
 
     # Phase 1: persist user query
     try:
@@ -816,6 +840,7 @@ def _persist_turn_events(
                     causal_chain_id=causal_chain_id,
                     metadata=meta,
                     skill_name=tr_name,
+                    skill_version=skill_versions.get(tr_name),
                 )
             # Backfill execution metrics on the most recent skill_selection_event
             try:
@@ -823,7 +848,7 @@ def _persist_turn_events(
                 _bh = TurnHooks(SessionLocal)
                 _bh.backfill_selection_metrics(session_id, tool_results)
             except Exception:
-                pass
+                logger.debug("Backfill selection metrics failed", exc_info=True)
     except Exception as e:
         logger.warning("Phase 2 (tool_results) failed: %s", e)
 
@@ -842,10 +867,13 @@ def _persist_turn_events(
                     causal_chain_id=causal_chain_id,
                     metadata={"tool_call_id": tc_id, "name": tc_name},
                     skill_name=tc_name,
+                    skill_version=skill_versions.get(tc_name),
                 )
 
+        # Track LLM response event_id for snapshot linking
+        llm_response_event_id: str | None = None
         if full_text or tool_calls:
-            el.create_llm_response(
+            llm_resp_ev = el.create_llm_response(
                 user_id=user_id, session_id=session_id,
                 content=full_text,
                 agent_id="dev-agent", agent_version="0.1.0",
@@ -853,7 +881,9 @@ def _persist_turn_events(
                 causal_chain_id=causal_chain_id,
                 llm_model_used=model_used,
                 token_usage=token_usage,
+                llm_params=llm_params,
             )
+            llm_response_event_id = llm_resp_ev.event_id
 
         if history and turn_count > 0 and turn_count % _SNAPSHOT_TURN_INTERVAL == 0:
             el.create_stream_event(
@@ -863,6 +893,18 @@ def _persist_turn_events(
                 parent_event_id=parent_event_id,
                 causal_chain_id=causal_chain_id,
                 metadata={"turn_count": turn_count},
+            )
+
+        # Link event IDs to context snapshot so audit can trace
+        # snapshot → user query (request) → LLM response.
+        # parent_event_id = user query event; llm_response_event_id = LLM reply.
+        if context_capture_id and parent_event_id:
+            from core.context.manager import ContextManager
+            ContextManager.update_snapshot_llm_ids(
+                SessionLocal,
+                context_capture_id,
+                llm_request_id=parent_event_id,
+                llm_response_id=llm_response_event_id,
             )
     except Exception as e:
         logger.warning("Phase 3 (llm_response/snapshot) failed: %s", e)
@@ -1003,6 +1045,14 @@ async def chat_turn(
                 full_text = ""
                 tool_calls: list[dict[str, Any]] = []
                 usage: dict[str, int] = {}
+                # Requested LLM params — these are what we sent to the provider,
+                # not necessarily what the provider used (it may override/clamp).
+                llm_params: dict[str, Any] = {
+                    k: v for k, v in {
+                        "temperature": llm.config.get("temperature", 0.7),
+                        "max_tokens": llm.config.get("max_tokens"),
+                    }.items() if v is not None
+                }
 
                 if tools_schema:
                     async for chunk in llm.chat_with_tools_stream(
@@ -1058,6 +1108,7 @@ async def chat_turn(
                 full_text=full_text, tool_calls=copy.deepcopy(tool_calls),
                 context_capture_id=snapshot_id, model_used=resolved_model,
                 token_usage=usage if usage else None,
+                llm_params=llm_params,
                 history=copy.deepcopy(current_history),
                 turn_count=current_turn_count,
             )
