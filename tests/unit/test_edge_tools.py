@@ -156,6 +156,30 @@ class TestToolRouter:
         parsed = ToolRouter.parse_tool_calls(raw)
         assert parsed[0].arguments == {"path": "a.py"}
 
+    @pytest.mark.asyncio
+    async def test_missing_required_param_returns_error(self, router: ToolRouter):
+        """EdgeTool with missing required param → clear error, not TypeError.
+
+        Regression: before the fix, missing params caused a Python TypeError
+        traceback that was unhelpful to the LLM.
+        """
+        results = await router.execute([
+            ToolCall(id="1", name="write_file", arguments={"content": "hello"}),
+        ])
+        assert results[0].error
+        assert "missing required" in results[0].result.lower()
+        assert "path" in results[0].result.lower()
+
+    @pytest.mark.asyncio
+    async def test_all_required_params_present_succeeds(self, router: ToolRouter, project: Path):
+        """Sanity: tool with all required params executes normally."""
+        results = await router.execute([
+            ToolCall(id="1", name="write_file",
+                     arguments={"path": "test_out.txt", "content": "ok"}),
+        ])
+        assert not results[0].error
+        assert (project / "test_out.txt").read_text() == "ok"
+
 
 # ============================================================================
 # File Operations

@@ -65,13 +65,19 @@ class StreamingMarkdown:
                 lines += 1
                 self._current_line_width = 0
             else:
-                self._current_line_width += cell_len(ch)
-                if self._current_line_width >= width:
-                    # Terminal wraps: next output goes to a new visual line
+                cw = cell_len(ch)
+                # Terminals cannot split a wide (CJK/emoji) character across
+                # the right margin.  If a 2-cell char would start at the last
+                # column, the terminal pads that column and wraps the char to
+                # the next line.
+                if cw == 2 and self._current_line_width == width - 1:
                     lines += 1
-                    # Characters beyond width start on the new line.
-                    # If exactly at width, cursor is at col 0 of new line.
-                    self._current_line_width = self._current_line_width - width
+                    self._current_line_width = cw
+                else:
+                    self._current_line_width += cw
+                    if self._current_line_width >= width:
+                        lines += 1
+                        self._current_line_width = self._current_line_width - width
         return lines
 
     def feed(self, chunk: str) -> None:
@@ -88,14 +94,11 @@ class StreamingMarkdown:
             self._live = False
             f = self._console.file
             if self._console.is_terminal and self._buffer:
-                # The last visual line (partial or full) is on screen but not
-                # counted by _count_lines as a "completed" line.  Add 1 so the
-                # erase loop covers it.
-                total = self._raw_lines + 1
-                # Erase raw output: move cursor up and clear each line
-                for _ in range(total):
-                    f.write("\033[A\033[2K")
+                # Erase raw output: clear the current (last) line first,
+                # then move up through each wrapped line and clear it.
                 f.write("\r\033[2K")
+                for _ in range(self._raw_lines):
+                    f.write("\033[A\033[2K")
                 f.flush()
                 # Render final markdown
                 self._console.print(Markdown(self._buffer))

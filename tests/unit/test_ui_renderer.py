@@ -76,6 +76,30 @@ class TestRichRendererOutput:
         output = buf.getvalue()
         assert "✗" in output
 
+    def test_tool_done_error_shows_detail(self):
+        """Regression: tool_done must display the error message, not just ✗.
+
+        Before the fix, error details were silently discarded — users saw
+        only "✗" with no indication of what went wrong.
+        """
+        console, buf = _make_console()
+        r = RichRenderer(console=console)
+        r.tool_done("write_file", "Missing required: path", error=True)
+        output = buf.getvalue()
+        assert "✗" in output
+        assert "path" in output
+
+    def test_tool_done_error_empty_result_no_extra_line(self):
+        """Empty error result should not print a blank detail line."""
+        console, buf = _make_console()
+        r = RichRenderer(console=console)
+        r.tool_done("bash", "", error=True)
+        output = buf.getvalue()
+        assert "✗" in output
+        # Should only have the ✗ line, no extra blank detail line
+        lines = [l for l in output.split("\n") if l.strip()]
+        assert len(lines) == 1
+
     def test_error_contains_message(self):
         console, buf = _make_console()
         r = RichRenderer(console=console)

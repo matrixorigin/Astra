@@ -77,6 +77,16 @@ class ToolRouter:
                 tool_call_id=tc.id, name=tc.name,
                 result=f"Unknown tool: {tc.name}", error=True,
             )
+        # Validate required parameters before execution so the LLM gets
+        # a clear error instead of a Python TypeError traceback.
+        if isinstance(tool, EdgeTool):
+            required = tool.parameters.get("required", [])
+            missing = [p for p in required if p not in tc.arguments]
+            if missing:
+                msg = f"Missing required parameter(s): {', '.join(missing)}"
+                return ToolResult(
+                    tool_call_id=tc.id, name=tc.name, result=msg, error=True,
+                )
         t0 = time.monotonic()
         try:
             # EdgeTool: execute(**kwargs) -> str

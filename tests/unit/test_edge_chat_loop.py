@@ -618,6 +618,68 @@ class TestRealisticScenarios:
         assert any("network error" in e.lower() for e in renderer.errors)
 
     @pytest.mark.asyncio
+    async def test_httpx_read_error_retried(self, router, perms, renderer):
+        """httpx.ReadError (proxy drops SSE) → retried, not treated as fatal.
+
+        Regression: before the fix, ReadError fell through to the generic
+        ``except Exception`` branch which broke out of the retry loop
+        immediately, showing a bare "ReadError:" with no retry.
+        """
+        import httpx
+
+        call_count = 0
+
+        class ReadErrThenOkAPI:
+            async def chat_turn(self, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise httpx.ReadError("proxy dropped connection")
+                yield {"type": "text_delta", "content": "recovered"}
+                yield {"type": "turn_complete", "has_tool_calls": False}
+
+        result = await edge_chat_loop("Hi", ReadErrThenOkAPI(), router, perms, renderer=renderer)
+        assert call_count == 2, "Should have retried after ReadError"
+        assert result == "recovered"
+        assert any("network error" in e.lower() for e in renderer.infos)
+
+    @pytest.mark.asyncio
+    async def test_httpx_read_error_exhausts_retries(self, router, perms, renderer):
+        """httpx.ReadError on all attempts → error rendered after retries exhausted."""
+        import httpx
+
+        call_count = 0
+
+        class AlwaysReadErrAPI:
+            async def chat_turn(self, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                raise httpx.ReadError("")
+                yield  # noqa: E501
+
+        result = await edge_chat_loop("Hi", AlwaysReadErrAPI(), router, perms, renderer=renderer)
+        assert call_count == 3, "Should attempt 1 + 2 retries"
+        assert any("network error" in e.lower() for e in renderer.errors)
+
+    @pytest.mark.asyncio
+    async def test_httpx_unsupported_protocol_not_retried(self, router, perms, renderer):
+        """httpx.UnsupportedProtocol is a config bug — must not retry."""
+        import httpx
+
+        call_count = 0
+
+        class BadProtoAPI:
+            async def chat_turn(self, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                raise httpx.UnsupportedProtocol("ftp:// not supported")
+                yield  # noqa: E501
+
+        result = await edge_chat_loop("Hi", BadProtoAPI(), router, perms, renderer=renderer)
+        assert call_count == 1, "Must not retry UnsupportedProtocol"
+        assert any("unsupportedprotocol" in e.lower() for e in renderer.errors)
+
+    @pytest.mark.asyncio
     async def test_keyboard_interrupt_handled(self, router, perms, renderer):
         """Ctrl+C during chat_turn → graceful exit."""
         class InterruptAPI:

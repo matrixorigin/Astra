@@ -10,6 +10,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
+import httpx
+
 from cli.api_client import AuthenticationError
 from cli.permissions import Decision, PermissionManager
 from cli.tools.base import resolve_side_effect
@@ -246,7 +248,14 @@ async def edge_chat_loop(
                         await asyncio.sleep(delay)
                         continue
                     break
-                except (ConnectionError, OSError, TimeoutError) as e:
+                # httpx.TransportError covers ReadError, ConnectError,
+                # TimeoutException, etc. — all transient network failures.
+                # Standard ConnectionError/OSError catch non-httpx sources.
+                except (ConnectionError, OSError, TimeoutError, httpx.TransportError) as e:
+                    if isinstance(e, (httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+                        # Config or client bug — not transient, don't retry.
+                        renderer.error(f"{type(e).__name__}: {e}")
+                        break
                     if attempt < _MAX_RETRIES:
                         renderer.info(f"  ⟳ Network error, retrying in {_BACKOFF[attempt]:.0f}s...")
                         await asyncio.sleep(_BACKOFF[attempt])

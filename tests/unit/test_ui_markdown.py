@@ -247,6 +247,121 @@ class TestLineCount:
         assert sm._current_line_width == 0
 
 
+class TestEraseRegression:
+    """Regression: finish() must clear ALL raw lines including the cursor's starting line.
+
+    Before the fix, the erase loop moved up N+1 times from the last line,
+    clearing lines above but never the last line itself.  This left residual
+    text that merged with subsequent tool_start output (e.g. "✓现有的技能实现。").
+    """
+
+    def test_single_line_erase(self):
+        """Single line (no wrap): the one line must be erased."""
+        console, buf = _make_console(width=80)
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        sm.feed("short text")
+        sm.finish()
+        output = buf.getvalue()
+        # Must contain a clear-current-line before any cursor-up
+        first_clear = output.index("\r\033[2K")
+        # No cursor-up needed for single line — if present, it comes after
+        if "\033[A" in output:
+            first_up = output.index("\033[A")
+            assert first_clear < first_up
+
+    def test_wrapped_line_erase_clears_last_line(self):
+        """Multi-line (wrapped): last line must be cleared first, then move up."""
+        console, buf = _make_console(width=20)
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        # 30 chars at width=20 → wraps once → 2 visual lines
+        sm.feed("A" * 30)
+        assert sm._raw_lines == 1  # one wrap counted
+        sm.finish()
+        output = buf.getvalue()
+        # Erase sequence: \r\033[2K (clear last line) then \033[A\033[2K (up+clear)
+        clear_pos = output.index("\r\033[2K")
+        up_pos = output.index("\033[A\033[2K")
+        assert clear_pos < up_pos, "Must clear current line before moving up"
+
+    def test_no_residual_after_erase(self):
+        """After finish(), the raw text region is fully erased — no leftover chars."""
+        console, buf = _make_console(width=40)
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        # Text that wraps: 60 chars at width 40 → 2 visual lines
+        sm.feed("X" * 60)
+        sm.finish()
+        output = buf.getvalue()
+        # Count erase operations: 1 clear-current + _raw_lines cursor-up-and-clear
+        assert output.count("\033[A\033[2K") == 1  # one wrap → one up+clear
+        # The \r\033[2K at the start clears the cursor's starting line
+        assert "\r\033[2K" in output
+
+
+class TestCJKBoundary:
+    """Regression: wide (CJK) chars at the terminal's right margin.
+
+    Terminals cannot split a 2-cell character across the margin.  When a
+    wide char would start at the last column, the terminal pads that column
+    and wraps the character to the next line.  _count_lines must match this
+    behaviour to avoid under-counting lines.
+    """
+
+    def test_cjk_at_last_column(self):
+        """2-cell char at col 79 of width-80 terminal → extra wrap from padding."""
+        console, _ = _make_console(width=80)
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        # 79 ASCII + 1 CJK: terminal pads col 79, wraps CJK to next line
+        text = "A" * 79 + "中"
+        lines = sm._count_lines(text)
+        assert lines == 1  # one wrap
+        # After wrap, CJK char occupies cols 0-1 on the new line
+        assert sm._current_line_width == 2
+
+    def test_cjk_not_at_boundary(self):
+        """2-cell char that fits before the margin → no extra wrap."""
+        console, _ = _make_console(width=80)
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        # 78 ASCII + 1 CJK = 80 cells → exact fit, normal wrap
+        text = "A" * 78 + "中"
+        lines = sm._count_lines(text)
+        assert lines == 1
+        assert sm._current_line_width == 0
+
+    def test_repeated_cjk_boundary_hits(self):
+        """Many CJK boundary hits: our count must match terminal behaviour."""
+        console, _ = _make_console(width=80)
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        # 'x' + 200 CJK chars: first CJK boundary at col 79, then repeats
+        text = "x" + "中" * 200
+        our_lines = sm._count_lines(text)
+
+        # Reference: terminal simulation
+        width = 80
+        clw = 0
+        term_lines = 0
+        for ch in text:
+            from rich.cells import cell_len
+            cw = cell_len(ch)
+            if cw == 2 and clw == width - 1:
+                term_lines += 1
+                clw = cw
+            elif clw + cw > width:
+                term_lines += 1
+                clw = cw
+            elif clw + cw == width:
+                term_lines += 1
+                clw = 0
+            else:
+                clw += cw
+        assert our_lines == term_lines
+
+
 class TestCodeBlockInstall:
     def test_install_idempotent(self):
         """Calling install_prettier_code_blocks multiple times is safe."""

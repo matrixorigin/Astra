@@ -77,6 +77,8 @@ class RichRenderer:
     def tool_done(self, name: str, result: str, error: bool) -> None:
         if error:
             self._console.print(f"[red]{THEME.failure}[/red]")
+            if result:
+                self._console.print(f"    [dim red]{result}[/dim red]")
         else:
             self._console.print(f"[green]{THEME.success}[/green]")
 
