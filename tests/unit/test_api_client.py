@@ -696,3 +696,64 @@ async def test_authentication_error_is_runtime_error():
     """AuthenticationError is a subclass of RuntimeError for backward compat."""
     err = AuthenticationError("test")
     assert isinstance(err, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_proactive_refresh_when_token_near_expiry(mock_credentials_path: Path):
+    """Token is refreshed proactively when < 5 min remaining."""
+    import time, jwt as pyjwt
+
+    # Create a token expiring in 2 minutes
+    near_expiry_token = pyjwt.encode(
+        {"sub": "u1", "exp": time.time() + 120}, "x" * 32, algorithm="HS256"
+    )
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        # refresh response
+        mock_refresh_resp = MagicMock()
+        mock_refresh_resp.status_code = 200
+        mock_refresh_resp.raise_for_status = MagicMock()
+        mock_refresh_resp.json.return_value = {
+            "access_token": "new_access", "refresh_token": "new_refresh",
+        }
+        # normal request response
+        mock_ok = MagicMock()
+        mock_ok.status_code = 200
+        mock_ok.json.return_value = {"ok": True}
+
+        mock_client.post.return_value = mock_refresh_resp
+        mock_client.request.return_value = mock_ok
+        mock_client_class.return_value = mock_client
+
+        async with APIClient(credentials_path=mock_credentials_path) as client:
+            client._access_token = near_expiry_token
+            client._refresh_token = "valid_refresh"
+            await client._request("GET", "/test")
+            # Should have called refresh endpoint
+            mock_client.post.assert_called_once()
+            assert client._access_token == "new_access"
+
+
+@pytest.mark.asyncio
+async def test_proactive_refresh_skipped_when_token_fresh(mock_credentials_path: Path):
+    """No proactive refresh when token has plenty of time left."""
+    import time, jwt as pyjwt
+
+    fresh_token = pyjwt.encode(
+        {"sub": "u1", "exp": time.time() + 3600}, "x" * 32, algorithm="HS256"
+    )
+
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        mock_ok = MagicMock()
+        mock_ok.status_code = 200
+        mock_client.request.return_value = mock_ok
+        mock_client_class.return_value = mock_client
+
+        async with APIClient(credentials_path=mock_credentials_path) as client:
+            client._access_token = fresh_token
+            client._refresh_token = "valid_refresh"
+            await client._request("GET", "/test")
+            # Should NOT have called refresh
+            mock_client.post.assert_not_called()

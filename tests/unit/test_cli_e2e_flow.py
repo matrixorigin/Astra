@@ -131,3 +131,26 @@ class TestStateManagement:
         assert sb.verbose
         cmd_compact(console=console, status_bar=sb)
         assert not sb.verbose
+
+
+class TestAuthErrorBreaksRepl:
+    """AuthenticationError should break the REPL loop, not sys.exit."""
+
+    def test_auth_error_exits_gracefully(self):
+        """Chat REPL prints message and exits cleanly on AuthenticationError."""
+        from cli.api_client import AuthenticationError
+
+        runner = CliRunner()
+        with patch("cli.mo_agent_api.SyncAPIClient") as mock_cls:
+            client = mock_cls.return_value
+            client.ensure_authenticated.return_value = True
+            client.get_current_user.return_value = {"username": "alice"}
+            client.create_session.return_value = {"session_id": "s1"}
+            client.close_session.return_value = {}
+
+            with patch("cli.mo_agent_api._run_edge_turn", side_effect=AuthenticationError("expired")):
+                result = runner.invoke(agent_cli, ["chat"], input="hello\n")
+
+            assert "Session expired" in result.output
+            # Should NOT be a hard crash — exit_code 0 because we break cleanly
+            assert result.exit_code == 0

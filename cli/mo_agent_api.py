@@ -517,7 +517,7 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
                     status_bar.update(turn=turn_count)
             except AuthenticationError:
                 console.print("[red]Session expired — please login again: mo-agent login[/red]")
-                sys.exit(1)
+                break
             except KeyboardInterrupt:
                 if hasattr(renderer, "end_response"):
                     renderer.end_response()

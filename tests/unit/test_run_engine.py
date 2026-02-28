@@ -233,6 +233,25 @@ class TestRunEngineCancel:
         mock_task.cancel.assert_called_once()
         assert run.run_id not in _run_tasks
 
+    def test_cancel_keeps_ref_in_cancel_pending(self, engine):
+        """Cancelled tasks are held in _cancel_pending to prevent 'Task destroyed but pending'."""
+        from core.agent.run_engine import _cancel_pending
+
+        run = engine.create_run(session_id="s1", user_id="u1", user_input="hi")
+        run.status = RunStatus.RUNNING
+        _active_runs[run.run_id] = run
+
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        _run_tasks[run.run_id] = mock_task
+
+        engine.cancel_run(run.run_id)
+        assert mock_task in _cancel_pending
+        # Simulate task completion via done callback
+        done_cb = mock_task.add_done_callback.call_args[0][0]
+        done_cb(mock_task)
+        assert mock_task not in _cancel_pending
+
     def test_cancel_propagates_to_workflow(self, engine, mock_db):
         from core.agent.async_tools import _wf_runs, _workflow_waits
 

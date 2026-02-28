@@ -6,6 +6,7 @@ and manages JWT token lifecycle.
 
 import json
 import os
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -156,6 +157,19 @@ class APIClient:
         self.credentials_path.write_text(json.dumps(data, indent=2))
         self.credentials_path.chmod(0o600)
 
+    async def _maybe_refresh_proactively(self) -> None:
+        """Refresh access token if it expires within 5 minutes."""
+        if not self._access_token or not self._refresh_token:
+            return
+        try:
+            import jwt as pyjwt
+            payload = pyjwt.decode(self._access_token, options={"verify_signature": False})
+            exp = payload.get("exp")
+            if exp and exp - time.time() < 300:  # < 5 min remaining
+                await self._refresh_access_token()
+        except Exception:
+            pass  # fall through to normal 401 handling
+
     async def _request(
         self,
         method: str,
@@ -177,6 +191,9 @@ class APIClient:
         """
         if not self._client:
             raise RuntimeError("Client not initialized. Use async context manager.")
+
+        # Proactively refresh if access token is close to expiry
+        await self._maybe_refresh_proactively()
 
         headers = kwargs.pop("headers", {})
         if self._access_token:
@@ -251,6 +268,8 @@ class APIClient:
         """
         if not self._client:
             raise RuntimeError("Client not initialized. Use async context manager.")
+
+        await self._maybe_refresh_proactively()
 
         url = f"{self.base_url}{path}"
 
