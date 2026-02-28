@@ -96,6 +96,8 @@ def cmd_help(console, **_):
         ("/clear", "Start a new session"),
         ("/login", "Login to API"),
         ("/logout", "Logout"),
+        ("/skill", "List local skills"),
+        ("/skill test <name>", "Test a skill"),
         ("/verbose", "Show status bar"),
         ("/compact", "Hide status bar"),
         ("/history", "Show recent turns"),
@@ -241,6 +243,64 @@ def cmd_logout(console, client=None, **_):
         console.print(f"[red]✗[/red] {e}")
 
 
+def cmd_skill(console, cmd_arg=None, **_):
+    """List local skills or test one by name."""
+    import asyncio, os
+    from pathlib import Path
+    from core.skills.loader import SkillLoader
+
+    project_root = os.getcwd()
+    skills = SkillLoader.discover(SkillLoader.default_paths(project_root))
+
+    if not cmd_arg or cmd_arg == "list":
+        if not skills:
+            console.print("[dim]No local skills found in .mo-agent/skills/[/dim]")
+            return
+        from rich.table import Table
+        t = Table(show_header=True, box=None)
+        t.add_column("Skill")
+        t.add_column("Version", style="dim")
+        t.add_column("Description", style="dim")
+        for s in skills:
+            t.add_row(s.skill.name, s.skill.version, s.skill.description[:60])
+        console.print(t)
+        return
+
+    # /skill test <name> [query]
+    parts = cmd_arg.split(maxsplit=1)
+    if parts[0] == "test" and len(parts) >= 1:
+        name = parts[1].split(maxsplit=1)[0] if len(parts) > 1 else None
+        query = parts[1].split(maxsplit=1)[1] if len(parts) > 1 and " " in parts[1] else "test"
+        if not name:
+            console.print("[red]Usage: /skill test <name> [query][/red]")
+            return
+        match = next((s for s in skills if s.skill.name == name), None)
+        if not match:
+            console.print(f"[red]✗[/red] Skill '{name}' not found")
+            return
+        # Validate schema
+        console.print(f"[bold]{name}[/bold] v{match.skill.version}")
+        schema = match.skill.to_openai_schema()
+        console.print(f"  schema: [green]✓[/green] {len(schema['function']['parameters'].get('properties', {}))} params")
+        # Test execute
+        try:
+            from cli.tools.router import ToolRouter, ToolCall
+            router = ToolRouter()
+            router.register(match.skill)
+            results = asyncio.run(router.execute([ToolCall(id="test", name=name, arguments={"query": query})]))
+            r = results[0]
+            if r.error:
+                console.print(f"  execute: [red]✗[/red] {r.result}")
+            else:
+                preview = r.result[:200].replace("\n", "\\n")
+                console.print(f"  execute: [green]✓[/green] ({len(r.result)} chars) {preview}…" if len(r.result) > 200 else f"  execute: [green]✓[/green] ({len(r.result)} chars)")
+                console.print(f"  time: {r.execution_time_ms}ms")
+        except Exception as e:
+            console.print(f"  execute: [red]✗[/red] {e}")
+    else:
+        console.print("[dim]Usage: /skill list | /skill test <name> [query][/dim]")
+
+
 SLASH_COMMANDS = {
     "/help": cmd_help,
     "/model": cmd_model,
@@ -254,6 +314,7 @@ SLASH_COMMANDS = {
     "/version": cmd_version,
     "/login": cmd_login,
     "/logout": cmd_logout,
+    "/skill": cmd_skill,
 }
 
 

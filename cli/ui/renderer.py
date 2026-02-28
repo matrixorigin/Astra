@@ -5,6 +5,7 @@ streaming markdown, tool spinners, and styled error/info output.
 """
 
 import sys
+import time
 from typing import Any
 
 from rich.console import Console
@@ -20,14 +21,35 @@ class RichRenderer:
     def __init__(self, console: Console | None = None) -> None:
         self._console = console or Console(stderr=True)
         self._md: StreamingMarkdown | None = None
+        self._spinner: Any = None
+        self._t0: float = 0
 
     def begin_response(self) -> None:
-        """Start streaming markdown context."""
+        """Start thinking spinner. Markdown Live starts on first text chunk."""
+        self._t0 = time.monotonic()
         self._md = StreamingMarkdown(console=self._console)
-        self._md.start()
+        try:
+            from rich.live import Live
+            from rich.spinner import Spinner
+            self._spinner = Live(
+                Spinner("dots", text="[dim]Thinking…[/dim]"),
+                console=self._console, transient=True,
+            )
+            self._spinner.start()
+        except Exception:
+            self._spinner = None
+
+    def _stop_spinner(self) -> None:
+        if self._spinner is not None:
+            try:
+                self._spinner.stop()
+            except Exception:
+                pass
+            self._spinner = None
 
     def end_response(self) -> str:
         """Stop streaming and return accumulated text."""
+        self._stop_spinner()
         if self._md is not None:
             text = self._md.finish()
             self._md = None
@@ -35,12 +57,15 @@ class RichRenderer:
         return ""
 
     def text(self, chunk: str) -> None:
+        self._stop_spinner()
         if self._md is None:
-            self.begin_response()
-        assert self._md is not None
+            self._md = StreamingMarkdown(console=self._console)
+        if not self._md._live:
+            self._md.start()
         self._md.feed(chunk)
 
     def tool_start(self, name: str, args: dict[str, Any]) -> None:
+        self._stop_spinner()
         if self._md is not None:
             self.end_response()
         detail = args.get("command", args.get("path", ""))
@@ -56,12 +81,28 @@ class RichRenderer:
             self._console.print(f"[green]{THEME.success}[/green]")
 
     def error(self, msg: str) -> None:
+        self._stop_spinner()
         if self._md is not None:
             self.end_response()
         self._console.print(Panel(msg, border_style="red", title="Error", title_align="left"))
 
     def info(self, msg: str) -> None:
         self._console.print(msg, style=THEME.info_style)
+
+    def stats(self, usage: dict[str, int]) -> None:
+        """Display token usage and elapsed time after a response."""
+        parts = []
+        if self._t0:
+            elapsed = time.monotonic() - self._t0
+            parts.append(f"{elapsed:.1f}s")
+        if "prompt_tokens" in usage:
+            parts.append(f"in:{usage['prompt_tokens']}")
+        if "completion_tokens" in usage:
+            parts.append(f"out:{usage['completion_tokens']}")
+        if "total_tokens" in usage:
+            parts.append(f"total:{usage['total_tokens']}")
+        if parts:
+            self._console.print(f"  [dim]{' · '.join(parts)}[/dim]")
 
 
 class SimpleRenderer:

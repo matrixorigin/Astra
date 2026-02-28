@@ -188,6 +188,7 @@ async def edge_chat_loop(
 
     last_sent_tools: set[str] = set()
     final_text = ""
+    total_usage: dict[str, int] = {}
 
     for turn in range(MAX_TURNS):
         # Update turn counter for introspection tool.
@@ -249,6 +250,8 @@ async def edge_chat_loop(
             session_id = result.session_id
 
         final_text = result.text
+        for k, v in result.usage.items():
+            total_usage[k] = total_usage.get(k, 0) + (v if isinstance(v, int) else 0)
 
         if not result.has_tool_calls:
             break
@@ -297,4 +300,6 @@ async def edge_chat_loop(
     else:
         renderer.error(f"Reached maximum turns ({MAX_TURNS})")
 
+    if hasattr(renderer, "stats"):
+        renderer.stats(total_usage)
     return final_text

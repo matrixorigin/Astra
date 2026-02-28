@@ -15,6 +15,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/clear", "Start a new session"),
     ("/login", "Login to API"),
     ("/logout", "Logout"),
+    ("/skill", "List or test local skills"),
     ("/verbose", "Show status bar"),
     ("/compact", "Hide status bar"),
     ("/history", "Show recent turns"),

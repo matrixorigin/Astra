@@ -52,3 +52,23 @@ class TestMarkdownSkill:
         # This is the exact access pattern used by edge_chat_loop (permissions)
         # and GetAgentInfoTool (introspection). Both crashed before the fix.
         assert tools[0].side_effect.value == "read"
+
+    @pytest.mark.asyncio
+    async def test_execute_through_router(self, skill):
+        """ToolRouter dispatches to MarkdownSkill via validate_input → execute(input)."""
+        from cli.tools.router import ToolRouter, ToolCall
+        router = ToolRouter()
+        router.register(skill)
+        results = await router.execute([ToolCall(id="tc1", name="test_skill", arguments={"query": "hello"})])
+        assert len(results) == 1
+        assert not results[0].error
+        assert "Do the thing." in results[0].result
+
+    @pytest.mark.asyncio
+    async def test_execute_through_router_empty_query(self, skill):
+        """MarkdownSkill works with empty query (query has default)."""
+        from cli.tools.router import ToolRouter, ToolCall
+        router = ToolRouter()
+        router.register(skill)
+        results = await router.execute([ToolCall(id="tc1", name="test_skill", arguments={})])
+        assert not results[0].error

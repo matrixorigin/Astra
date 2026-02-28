@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from cli.tools.base import EdgeTool
 from core.skills.base import Skill
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,18 @@ class ToolRouter:
             )
         t0 = time.monotonic()
         try:
-            result = await tool.execute(**tc.arguments)
+            # EdgeTool: execute(**kwargs) -> str
+            # Typed Skill: execute(input: SkillInput) -> SkillOutput
+            if hasattr(tool, '_input_cls') and tool._input_cls is not None \
+                    and not isinstance(tool, EdgeTool):
+                validated = tool.validate_input(tc.arguments)
+                output = await tool.execute(validated)
+                result = output.result if hasattr(output, 'result') else str(output)
+                if hasattr(output, 'error') and output.error:
+                    raise RuntimeError(output.error)
+                result = str(result)
+            else:
+                result = await tool.execute(**tc.arguments)
             elapsed = int((time.monotonic() - t0) * 1000)
             if self._hook:
                 self._hook.on_tool_executed(tc.name, elapsed, True)
