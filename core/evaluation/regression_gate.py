@@ -104,7 +104,7 @@ class RegressionGate(DbConsumer):
                 sandbox_name,
                 description=f"Gate {gate_id}",
                 created_by="system",
-                tables=["ctx_prompt_templates", "skill_registry", "infra_configs", "agent_events", "sk_knowledge_entries"],
+                tables=["ctx_prompt_templates", "skills_registry", "infra_configs", "agent_events", "sk_knowledge_entries"],
             )
             
             # 3. Apply change to sandbox
@@ -238,7 +238,7 @@ class RegressionGate(DbConsumer):
                     if skill_definition is None:
                         skill_definition = change_content.get("skill_definition", {})
                     db.execute(text(f"""
-                        INSERT INTO {sandbox_name}.skill_registry 
+                        INSERT INTO {sandbox_name}.skills_registry 
                         (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
                         VALUES (:skill_id, :skill_name, :version, :description, :definition, 1, NOW(), NOW())
                         ON DUPLICATE KEY UPDATE
@@ -317,10 +317,10 @@ class RegressionGate(DbConsumer):
                         version = suspected.get("version")
                         if skill_name and version:
                             db.execute(text(f"""
-                                INSERT INTO {sandbox_name}.skill_registry 
+                                INSERT INTO {sandbox_name}.skills_registry 
                                 (skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at)
                                 SELECT skill_id, skill_name, version, description, skill_definition, is_active, created_at, updated_at
-                                FROM skill_registry
+                                FROM skills_registry
                                 WHERE skill_name = :skill_name AND version = :version
                                 ON DUPLICATE KEY UPDATE
                                 skill_definition = VALUES(skill_definition),

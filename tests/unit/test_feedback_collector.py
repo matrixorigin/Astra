@@ -175,3 +175,78 @@ class TestSkillLearningSignalModel:
         assert 'selection_event_id' in indexed_columns
         assert 'signal_type' in indexed_columns
         assert 'created_at' in indexed_columns
+
+
+class TestFeedbackBufferReliability:
+    """Test _FeedbackBuffer overflow and retry reliability."""
+
+    def test_buffer_overflow_drops_oldest(self, db):
+        """Fill buffer beyond _MAX_BUFFER_SIZE, verify oldest signals dropped."""
+        buf = _FeedbackBuffer(lambda: db, batch_size=20000, flush_interval=9999)
+        # Inject signals directly to avoid auto-flush
+        for i in range(buf._MAX_BUFFER_SIZE):
+            buf._buffer.append({
+                "signal_id": f"old_{i}",
+                "selection_event_id": "evt",
+                "signal_type": "wrong_skill",
+                "signal_data": "{}",
+                "created_at": datetime.now(timezone.utc),
+            })
+        assert len(buf._buffer) == buf._MAX_BUFFER_SIZE
+        # Adding one more should trigger overflow
+        buf.add("evt_new", SignalType.WRONG_SKILL, {"new": True})
+        # Buffer should have dropped oldest batch_size signals
+        assert len(buf._buffer) <= buf._MAX_BUFFER_SIZE
+        ids = [s["signal_id"] for s in buf._buffer]
+        assert "old_0" not in ids  # oldest dropped
+
+    def test_buffer_overflow_preserves_newest(self, db):
+        """After overflow, newest signal is retained."""
+        buf = _FeedbackBuffer(lambda: db, batch_size=20000, flush_interval=9999)
+        for i in range(buf._MAX_BUFFER_SIZE):
+            buf._buffer.append({
+                "signal_id": f"s_{i}",
+                "selection_event_id": "evt",
+                "signal_type": "wrong_skill",
+                "signal_data": "{}",
+                "created_at": datetime.now(timezone.utc),
+            })
+        buf.add("evt_newest", SignalType.HIGH_COST, {"newest": True})
+        ids = [s["signal_id"] for s in buf._buffer]
+        # The newest signal should be present
+        assert any("evt_newest" in s["selection_event_id"] for s in buf._buffer)
+
+    def test_retry_limit_drops_after_max_retries(self, db):
+        """Signals dropped after _MAX_RETRIES flush failures."""
+        conn = db._mock_conn
+        conn.execute.side_effect = Exception("DB down")
+        buf = _FeedbackBuffer(lambda: db, batch_size=1, flush_interval=9999)
+        # Add a signal — auto-flush will fail
+        buf.add("evt1", SignalType.WRONG_SKILL, {"x": 1})
+        # After first failure, signal is re-queued with retry count 1
+        assert len(buf._buffer) == 1
+        # Flush again (retry 2)
+        buf.flush()
+        assert len(buf._buffer) == 1
+        # Flush again (retry 3)
+        buf.flush()
+        assert len(buf._buffer) == 1
+        # Flush again (retry 4 > MAX_RETRIES=3) — should be dropped
+        buf.flush()
+        assert len(buf._buffer) == 0
+
+    def test_retry_counts_cleared_on_success(self, db):
+        """Retry counts cleaned up after successful flush."""
+        conn = db._mock_conn
+        conn.execute.side_effect = Exception("DB down")
+        buf = _FeedbackBuffer(lambda: db, batch_size=1, flush_interval=9999)
+        buf.add("evt1", SignalType.WRONG_SKILL, {"x": 1})
+        # First failure — retry count = 1
+        assert len(buf._retry_counts) == 1
+        # Fix DB
+        conn.execute.side_effect = None
+        conn.execute.reset_mock()
+        buf.flush()
+        # Should succeed and clear retry counts
+        assert len(buf._buffer) == 0
+        assert len(buf._retry_counts) == 0

@@ -22,9 +22,9 @@ logger = get_logger(__name__)
 class SkillMetadata:
     """Skill metadata with progressive disclosure support.
 
-    Tier 1 (embedding index): name + description + triggers → vector.
+    Index Tier (embedding index): name + description + triggers → vector.
            Lives in SkillIndex, never in LLM context. 0 prompt tokens.
-    Tier 2 (full schema):     complete OpenAI tool JSON schema loaded
+    Schema Tier (full schema):    complete OpenAI tool JSON schema loaded
            into LLM context, budget-controlled. Token cost measured at runtime.
     """
 

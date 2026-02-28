@@ -131,9 +131,9 @@ def init_db():
     if tables_to_create:
         Base.metadata.create_all(bind=engine, tables=tables_to_create, checkfirst=True)
 
-    # Migrate: add columns merged from skill_definitions into skill_registry
-    if "skill_registry" in existing:
-        cols = {c["name"] for c in inspector.get_columns("skill_registry", schema=engine.url.database)}
+    # Migrate: add columns merged from skill_definitions into skills_registry
+    if "skills_registry" in existing:
+        cols = {c["name"] for c in inspector.get_columns("skills_registry", schema=engine.url.database)}
         with engine.begin() as conn:
             for col, ddl in [
                 ("source", "VARCHAR(20) DEFAULT 'builtin'"),
@@ -143,7 +143,7 @@ def init_db():
             ]:
                 if col not in cols:
                     try:
-                        conn.execute(text(f"ALTER TABLE skill_registry ADD COLUMN {col} {ddl}"))
+                        conn.execute(text(f"ALTER TABLE skills_registry ADD COLUMN {col} {ddl}"))
                     except Exception as e:
                         logger.warning("Migration: failed to add column %s: %s", col, e)
 

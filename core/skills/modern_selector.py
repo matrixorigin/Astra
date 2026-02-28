@@ -51,9 +51,9 @@ class ModernSkillSelector:
     ) -> tuple[list[dict[str, Any]], str]:
         """Return OpenAI tool schemas using progressive disclosure.
 
-        Stage 1 (Tier 1): Retrieve candidates via rule-based matching on
+        Stage 1 (Index Tier): Retrieve candidates via rule-based matching on
                           lightweight metadata. Zero prompt tokens.
-        Stage 2 (Tier 3): Build full schema for each candidate, measure real
+        Stage 2 (Schema Tier): Build full schema for each candidate, measure real
                           token cost, include only if within budget.
                           Skills that don't fit are excluded entirely —
                           no empty stubs (they waste tokens and confuse LLMs).
@@ -79,7 +79,7 @@ class ModernSkillSelector:
         if not candidates:
             return [], retrieval_method
 
-        # --- Stage 2: budget-aware Tier 3 expansion ---
+        # --- Stage 2: budget-aware Schema Tier expansion ---
         budget_remaining = context_budget
         tools: list[dict[str, Any]] = []
 

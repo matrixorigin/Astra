@@ -61,7 +61,7 @@ def _seed_skill(db_session):
     db_session.commit()
     yield "github"
     db_session.execute(text("DELETE FROM skill_installations WHERE skill_name = 'github'"))
-    db_session.execute(text("DELETE FROM skill_registry WHERE skill_id = :id"), {"id": skill_id})
+    db_session.execute(text("DELETE FROM skills_registry WHERE skill_id = :id"), {"id": skill_id})
     db_session.commit()
 
 
@@ -83,7 +83,7 @@ def _seed_skills_with_dep(db_session):
     yield
     db_session.execute(text("DELETE FROM skill_installations WHERE skill_name IN ('base_skill', 'dependent_skill')"))
     for sid in ids:
-        db_session.execute(text("DELETE FROM skill_registry WHERE skill_id = :id"), {"id": sid})
+        db_session.execute(text("DELETE FROM skills_registry WHERE skill_id = :id"), {"id": sid})
     db_session.commit()
 
 

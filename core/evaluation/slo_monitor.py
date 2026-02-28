@@ -309,14 +309,14 @@ class SLOMonitor(DbConsumer):
         """Find most recent skill/prompt change (global, not agent-specific).
         
         Returns change metadata to bind as suspected regression source.
-        Note: skill_registry and ctx_prompt_templates are global resources without agent_id,
+        Note: skills_registry and ctx_prompt_templates are global resources without agent_id,
         so this returns the most recent change across all agents within 7 days.
         """
         try:
             # Find most recent skill change
             skill_row = db.execute(text("""
                 SELECT skill_name, version, updated_at
-                FROM skill_registry
+                FROM skills_registry
                 WHERE updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
                 ORDER BY updated_at DESC
                 LIMIT 1

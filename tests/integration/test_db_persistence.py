@@ -103,14 +103,14 @@ class TestDatabasePersistence:
 
     def test_skill_registration_persists_to_db(self, runner, db):
         """Test skill registration data persists correctly."""
-        # Skills are stored in skill_registry table
+        # Skills are stored in skills_registry table
         # Verify the table structure exists
         result = db.execute(text(
             "SELECT COUNT(*) FROM information_schema.tables "
-            "WHERE table_schema = DATABASE() AND table_name = 'skill_registry'"
+            "WHERE table_schema = DATABASE() AND table_name = 'skills_registry'"
         )).scalar()
         
-        assert result > 0, "skill_registry table should exist"
+        assert result > 0, "skills_registry table should exist"
 
 
 class TestAdminAPIPersistence:

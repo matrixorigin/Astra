@@ -4,7 +4,7 @@ import json
 from unittest.mock import MagicMock, patch, call
 
 import pytest
-from core.context.manager import Context, ContextManager, TaskType, _write_pool
+from core.context.manager import Context, ContextManager, TaskType
 
 
 @pytest.fixture
@@ -43,10 +43,9 @@ def sample_context():
 
 def _flush_pool():
     """Wait for all pending writes to complete."""
-    _write_pool.shutdown(wait=True)
-    # Re-create pool for next test (module-level singleton)
     import core.context.manager as mod
     from concurrent.futures import ThreadPoolExecutor
+    mod._write_pool.shutdown(wait=True)
     mod._write_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ctx_snapshot")
 
 

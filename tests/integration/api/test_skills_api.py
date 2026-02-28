@@ -18,14 +18,14 @@ def cleanup_skills():
     
     # Clean before
     reset_catalog()
-    db.execute(text('DELETE FROM skill_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
+    db.execute(text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
     db.commit()
     
     yield
     
     # Clean after
     reset_catalog()
-    db.execute(text('DELETE FROM skill_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
+    db.execute(text('DELETE FROM skills_registry WHERE skill_name LIKE "Test%" OR skill_name LIKE "Get%"'))
     db.commit()
     db.close()
 

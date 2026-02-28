@@ -176,7 +176,7 @@ class TestSkillRollback:
         assert inst.skill_version == "1.0"
 
         db_session.execute(text(
-            "UPDATE skill_registry SET version = '2.0' WHERE skill_name = :n"
+            "UPDATE skills_registry SET version = '2.0' WHERE skill_name = :n"
         ), {"n": skill})
         db_session.commit()
 
@@ -197,7 +197,7 @@ class TestSkillRollback:
         mgr.install(uid, skill)
 
         db_session.execute(text(
-            "UPDATE skill_registry SET version = '2.0' WHERE skill_name = :n"
+            "UPDATE skills_registry SET version = '2.0' WHERE skill_name = :n"
         ), {"n": skill})
         db_session.commit()
         mgr.upgrade(uid, skill)

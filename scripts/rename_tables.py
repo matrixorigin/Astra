@@ -10,7 +10,7 @@ import re
 # Unambiguous renames: these strings are unique enough to do simple replacement
 SIMPLE_MAP = {
     'agent_events': 'agent_events',
-    'skill_registry': 'skill_registry',
+    'skill_registry': 'skills_registry',
     'skill_selection_learnings': 'skill_selection_learningss',
     'agent_scratchpads': 'agent_scratchpadss',
     'ctx_snapshots': 'ctx_snapshots',

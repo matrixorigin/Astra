@@ -37,7 +37,7 @@ def cleanup(db_session, session_id):
             "DELETE FROM agent_sessions WHERE session_id = :sid"
         ), {"sid": session_id})
         db_session.execute(text(
-            "DELETE FROM skill_registry WHERE skill_name = 'summarize_pr'"
+            "DELETE FROM skills_registry WHERE skill_name = 'summarize_pr'"
         ))
         db_session.commit()
     except Exception:

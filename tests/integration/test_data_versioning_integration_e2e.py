@@ -198,7 +198,7 @@ class TestSkillSelectionEventsFixes:
         # Register a skill so version can be resolved
         skill_id = f"test_ver_{datetime.utcnow().strftime('%H%M%S%f')}"
         db.execute(text("""
-            INSERT INTO skill_registry (skill_id, skill_name, version, is_active, created_at)
+            INSERT INTO skills_registry (skill_id, skill_name, version, is_active, created_at)
             VALUES (:sid, :sn, '2.1.0', 1, NOW())
         """), {"sid": f"{skill_id}@2.1.0", "sn": skill_id})
         db.commit()
@@ -214,7 +214,7 @@ class TestSkillSelectionEventsFixes:
             assert row[1] == "2.1.0"
         finally:
             db.execute(text("DELETE FROM skill_selection_events WHERE session_id = 'sess_ver'"), {})
-            db.execute(text("DELETE FROM skill_registry WHERE skill_id = :sid"), {"sid": f"{skill_id}@2.1.0"})
+            db.execute(text("DELETE FROM skills_registry WHERE skill_id = :sid"), {"sid": f"{skill_id}@2.1.0"})
             db.commit()
 
     # -- Fix 2: selection_history returns skill_name -----------------------

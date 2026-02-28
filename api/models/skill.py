@@ -12,7 +12,7 @@ from api.models._types import NullableJSON as JSON
 
 
 class SkillRegistry(Base):
-    __tablename__ = "skill_registry"
+    __tablename__ = "skills_registry"
     skill_id = Column(String(255), primary_key=True)  # skill_name@version
     skill_name = Column(String(255), nullable=False, index=True)
     version = Column(String(32), nullable=False)
@@ -73,7 +73,7 @@ class SkillUserCredential(Base):
 class SkillPermission(Base):
     __tablename__ = "skill_permissions"
     __table_args__ = (
-        UniqueConstraint("skill_name", "grantee_type", "grantee_id",
+        UniqueConstraint("skill_name", "grantee_type", "grantee_id", "permission_type",
                          name="uq_skill_grantee"),
     )
 
@@ -81,8 +81,11 @@ class SkillPermission(Base):
     skill_name = Column(String(100), nullable=False)
     grantee_type = Column(String(10), nullable=False)
     grantee_id = Column(String(36), nullable=False)
+    permission_type = Column(String(10), nullable=False, default="install")
+    tenant_id = Column(String(36), nullable=True)
     granted_by = Column(String(36), nullable=False)
     granted_at = Column(DateTime, default=func.now(), nullable=False)
+    expires_at = Column(DateTime, nullable=True)
 
 
 class SkillSelectionEvent(Base):
