@@ -78,9 +78,10 @@ class SkillCatalog(DbConsumer):
         # Manual metadata cache — avoids the memory-leak pitfall of
         # @lru_cache on an instance method (lru_cache holds a strong ref
         # to ``self``, preventing GC of the instance).
-        # Uses _CACHE_MISS sentinel for negative entries (skill not found)
-        # so repeated lookups of nonexistent skills don't hit the DB.
-        self._metadata_cache: dict[tuple, dict | None] = {}
+        # Values are either a ``dict`` (positive hit) or the ``_CACHE_MISS``
+        # sentinel (negative hit — skill not found in DB).  The sentinel
+        # prevents repeated DB queries for nonexistent skills.
+        self._metadata_cache: dict[tuple, dict | object] = {}
 
     # ── Registration (builtin / marketplace Python skills) ────────
 
@@ -112,51 +113,26 @@ class SkillCatalog(DbConsumer):
         code_hash = self._compute_code_hash(skill)
         se_profile = skill.side_effect_profile.model_dump() if skill.side_effect_profile else None
 
-        with self._db() as db:
-            if is_active:
-                db.query(SkillModel).filter(
-                    SkillModel.skill_name == skill.name,
-                ).update({"is_active": 0})
-
-            existing = db.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
-            if existing:
-                existing.description = skill.description
-                existing.skill_definition = skill.requirements.model_dump()
-                existing.code_hash = code_hash
-                existing.git_commit_hash = git_commit_hash
-                existing.is_active = 1 if is_active else 0
-                existing.status = status
-                existing.source = source
-                existing.created_by = created_by
-                existing.category = category
-                existing.subcategory = subcategory
-                existing.triggers = triggers
-                existing.dependencies = dependencies
-                existing.priority = priority
-                existing.cost_estimate = cost_estimate
-                existing.side_effect_profile = se_profile
-            else:
-                db.add(SkillModel(
-                    skill_id=skill_id,
-                    skill_name=skill.name,
-                    version=skill.version,
-                    description=skill.description,
-                    skill_definition=skill.requirements.model_dump(),
-                    code_hash=code_hash,
-                    git_commit_hash=git_commit_hash,
-                    is_active=1 if is_active else 0,
-                    status=status,
-                    source=source,
-                    created_by=created_by,
-                    category=category,
-                    subcategory=subcategory,
-                    triggers=triggers,
-                    dependencies=dependencies,
-                    priority=priority,
-                    cost_estimate=cost_estimate,
-                    side_effect_profile=se_profile,
-                ))
-            db.commit()
+        self._upsert_skill_row(
+            skill_id=skill_id,
+            skill_name=skill.name,
+            version=skill.version,
+            description=skill.description,
+            skill_definition=skill.requirements.model_dump(),
+            code_hash=code_hash,
+            git_commit_hash=git_commit_hash,
+            is_active=is_active,
+            status=status,
+            source=source,
+            created_by=created_by,
+            category=category,
+            subcategory=subcategory,
+            triggers=triggers,
+            dependencies=dependencies,
+            priority=priority,
+            cost_estimate=cost_estimate,
+            side_effect_profile=se_profile,
+        )
 
         # In-memory cache
         key = f"{skill.name}@{skill.version}"
@@ -187,7 +163,7 @@ class SkillCatalog(DbConsumer):
         """Register a skill from an API request (no in-memory Skill object).
 
         This is the correct entry point for the REST API's register endpoint.
-        It goes through the same DB logic as register() — deactivation of old
+        It goes through the same DB upsert as register() — deactivation of old
         versions, code hash, gate trigger, source/status validation — but
         accepts raw fields instead of a Skill instance.
         """
@@ -197,46 +173,28 @@ class SkillCatalog(DbConsumer):
         code_hash = hashlib.sha256(skill_code.encode()).hexdigest()
         skill_definition = metadata or {}
 
+        self._upsert_skill_row(
+            skill_id=skill_id,
+            skill_name=skill_name,
+            version=version,
+            description=description,
+            skill_definition=skill_definition,
+            code_hash=code_hash,
+            is_active=True,
+            status="active",
+            source=source,
+            created_by=created_by,
+            category=skill_definition.get("category", "general"),
+            subcategory="default",
+            triggers=[],
+            dependencies=[],
+            priority=5,
+            cost_estimate="medium",
+            side_effect_profile={"category": "read"},
+        )
+
+        # Re-read to get server-generated fields (created_at)
         with self._db() as db:
-            # Deactivate old versions of the same skill
-            db.query(SkillModel).filter(
-                SkillModel.skill_name == skill_name,
-            ).update({"is_active": 0})
-
-            existing = db.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
-            if existing:
-                existing.description = description
-                existing.skill_definition = skill_definition
-                existing.code_hash = code_hash
-                existing.is_active = 1
-                existing.status = "active"
-                existing.source = source
-                existing.created_by = created_by
-                existing.category = skill_definition.get("category", "general")
-                existing.side_effect_profile = {"category": "read"}
-            else:
-                db.add(SkillModel(
-                    skill_id=skill_id,
-                    skill_name=skill_name,
-                    version=version,
-                    description=description,
-                    skill_definition=skill_definition,
-                    code_hash=code_hash,
-                    is_active=1,
-                    status="active",
-                    source=source,
-                    created_by=created_by,
-                    category=skill_definition.get("category", "general"),
-                    subcategory="default",
-                    triggers=[],
-                    dependencies=[],
-                    priority=5,
-                    cost_estimate="medium",
-                    side_effect_profile={"category": "read"},
-                ))
-            db.commit()
-
-            # Re-read to get server-generated fields (created_at)
             row = db.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
             result = {
                 "skill_id": row.skill_id,
@@ -249,7 +207,9 @@ class SkillCatalog(DbConsumer):
 
         self._invalidate_cache()
 
-        # Gate trigger only for active skills — consistent with register()
+        # Gate trigger — register_from_api always creates active skills,
+        # but guard on status for forward-compatibility if status param is
+        # added later.  Matches the guard in register().
         if self.gate_trigger:
             self.gate_trigger.on_skill_change(
                 skill_name=skill_name,
@@ -258,6 +218,79 @@ class SkillCatalog(DbConsumer):
             )
 
         return result
+
+    def _upsert_skill_row(
+        self,
+        *,
+        skill_id: str,
+        skill_name: str,
+        version: str,
+        description: str,
+        skill_definition: dict,
+        code_hash: str,
+        is_active: bool,
+        status: str,
+        source: str,
+        created_by: str | None,
+        category: str,
+        subcategory: str,
+        triggers: list | None,
+        dependencies: list | None,
+        priority: int,
+        cost_estimate: str,
+        side_effect_profile: dict | None,
+        git_commit_hash: str | None = None,
+    ) -> None:
+        """Shared DB upsert logic for register() and register_from_api().
+
+        Deactivates old versions of the same skill (if ``is_active``),
+        then inserts or updates the row.
+        """
+        with self._db() as db:
+            if is_active:
+                db.query(SkillModel).filter(
+                    SkillModel.skill_name == skill_name,
+                ).update({"is_active": 0})
+
+            existing = db.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
+            if existing:
+                existing.description = description
+                existing.skill_definition = skill_definition
+                existing.code_hash = code_hash
+                existing.git_commit_hash = git_commit_hash
+                existing.is_active = 1 if is_active else 0
+                existing.status = status
+                existing.source = source
+                existing.created_by = created_by
+                existing.category = category
+                existing.subcategory = subcategory
+                existing.triggers = triggers
+                existing.dependencies = dependencies
+                existing.priority = priority
+                existing.cost_estimate = cost_estimate
+                existing.side_effect_profile = side_effect_profile
+            else:
+                db.add(SkillModel(
+                    skill_id=skill_id,
+                    skill_name=skill_name,
+                    version=version,
+                    description=description,
+                    skill_definition=skill_definition,
+                    code_hash=code_hash,
+                    git_commit_hash=git_commit_hash,
+                    is_active=1 if is_active else 0,
+                    status=status,
+                    source=source,
+                    created_by=created_by,
+                    category=category,
+                    subcategory=subcategory,
+                    triggers=triggers,
+                    dependencies=dependencies,
+                    priority=priority,
+                    cost_estimate=cost_estimate,
+                    side_effect_profile=side_effect_profile,
+                ))
+            db.commit()
 
     # ── User skill publish / unpublish ────────────────────────────
 
@@ -282,9 +315,9 @@ class SkillCatalog(DbConsumer):
             existing = db.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
 
             if existing:
-                # Update existing version
-                if existing.created_by != user_id:
-                    raise NameConflictError(name, "owned by another user")
+                # _check_name_conflict already verified ownership at the
+                # skill_name level, so if we reach here the existing row
+                # belongs to user_id (or is a new version of their skill).
                 existing.description = description
                 existing.triggers = triggers
                 existing.dependencies = dependencies
@@ -472,14 +505,25 @@ class SkillCatalog(DbConsumer):
         self.set_status(skill_name, target_version, "deprecated")
 
     def rollback(self, skill_name: str) -> str:
-        """Rollback to previous version. Returns activated version string.
+        """Rollback to the most recent superseded version.
 
-        Note: this does NOT delegate to ``set_status()`` because rollback is
-        an atomic two-row swap (current → deprecated, previous → active).
+        Returns the activated version string.
+
+        **Superseded vs deprecated**: when ``register()`` deactivates old
+        versions it only sets ``is_active=0`` — the ``status`` stays
+        ``"active"``.  These are "superseded" versions: they were never
+        explicitly deprecated, just replaced by a newer registration.
+        ``rollback()`` finds the most recent such version.
+
+        If a version was explicitly deprecated (via ``deprecate()`` or
+        ``set_status``), rollback skips it — the user made a deliberate
+        decision to retire that version.
+
+        Does NOT delegate to ``set_status()`` because rollback is an
+        atomic two-row swap (current → deprecated, previous → active).
         The previous version already has ``status='active'`` (just
-        ``is_active=0``), so ``set_status('active')`` would reject it as
-        an ``active → active`` no-op.  Keeping this as a dedicated method
-        preserves atomicity and avoids weakening the transition table.
+        ``is_active=0``), so ``set_status('active')`` would reject it
+        as an ``active → active`` no-op.
         """
         with self._db() as db:
             current = db.query(SkillModel).filter(
@@ -540,12 +584,28 @@ class SkillCatalog(DbConsumer):
         return self._query_metadata(skill_name)
 
     def get_metadata_by_id(self, skill_id: str) -> dict | None:
-        """Get skill metadata by exact skill_id (primary key, e.g. 'name@1.0.0' or opaque ID)."""
+        """Get skill metadata by exact skill_id (primary key).
+
+        Cached — uses a ``("__by_id__", skill_id)`` cache key to avoid
+        collisions with the ``(skill_name, timestamp, commit)`` keys used
+        by ``_query_metadata``.
+        """
+        cache_key = ("__by_id__", skill_id)
+        cached = self._metadata_cache.get(cache_key)
+        if cached is _CACHE_MISS:
+            return None
+        if cached is not None:
+            return cached
+
         with self._db() as db:
             row = db.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
             if not row:
+                self._metadata_cache[cache_key] = _CACHE_MISS
                 return None
-            return self._row_to_dict(row)
+            result = self._row_to_dict(row)
+
+        self._metadata_cache[cache_key] = result
+        return result
 
     def get_as_of(
         self,
@@ -600,22 +660,7 @@ class SkillCatalog(DbConsumer):
                 self._metadata_cache[cache_key] = _CACHE_MISS
                 return None
 
-            result: dict = {
-                "skill_id": skill.skill_id,
-                "skill_name": skill.skill_name,
-                "version": skill.version,
-                "description": skill.description,
-                "skill_definition": skill.skill_definition,
-                "git_commit_hash": skill.git_commit_hash,
-                "is_active": skill.is_active,
-                "source": skill.source,
-                "created_by": skill.created_by,
-                "created_at": skill.created_at.isoformat() if skill.created_at else None,
-            }
-            for attr in ("cost_estimate", "triggers", "dependencies", "category", "priority"):
-                val = getattr(skill, attr, None)
-                if val is not None:
-                    result[attr] = val
+            result = self._row_to_dict(skill)
 
         self._metadata_cache[cache_key] = result
         return result
@@ -764,16 +809,29 @@ class SkillCatalog(DbConsumer):
 
     @staticmethod
     def _row_to_dict(row: SkillModel) -> dict[str, Any]:
+        """Convert ORM row to a complete metadata dict.
+
+        This is the single canonical dict shape for skill metadata.
+        All query methods (``_query_metadata``, ``get_metadata_by_id``,
+        ``list_*``, ``get_skill_info``, etc.) return dicts with this shape
+        so callers never need to guess which fields are present.
+        """
         return {
             "skill_id": row.skill_id,
             "skill_name": row.skill_name,
             "version": row.version,
             "description": row.description,
+            "skill_definition": row.skill_definition,
+            "git_commit_hash": row.git_commit_hash,
             "source": row.source,
             "status": row.status,
             "is_active": row.is_active,
             "created_by": row.created_by,
-            "category": row.category,
+            "category": getattr(row, "category", None),
+            "cost_estimate": getattr(row, "cost_estimate", None),
+            "triggers": getattr(row, "triggers", None),
+            "dependencies": getattr(row, "dependencies", None),
+            "priority": getattr(row, "priority", None),
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }
 

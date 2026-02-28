@@ -35,6 +35,20 @@ def _make_gate_trigger(db_session: Session) -> GateTrigger:
     return GateTrigger(db_factory=lambda: db_session)
 
 
+def _make_mock_skill(name: str, version: str = "1.0.0", description: str = "test",
+                     definition: dict | None = None) -> Mock:
+    """Create a Mock that satisfies the Skill interface for register()."""
+    skill = Mock()
+    skill.name = name
+    skill.version = version
+    skill.description = description
+    skill.requirements = Mock()
+    skill.requirements.model_dump.return_value = definition or {}
+    skill.side_effect_profile = Mock()
+    skill.side_effect_profile.model_dump.return_value = {"category": "read"}
+    return skill
+
+
 def _seed_llm_events(db: Session, agent_id: str, n: int = 10, quality: float = 4.5):
     """Insert synthetic llm_response events for SLO / calibration queries."""
     import json
@@ -118,14 +132,8 @@ class TestGateTriggerProductionWiring:
         gate_trigger = Mock()
         registry = SkillRegistry(db_factory=lambda: db_session, gate_trigger=gate_trigger)
 
-        skill = Mock()
-        skill.name = "e2e_test_skill"
-        skill.version = "1.0.0"
-        skill.description = "E2E test"
-        skill.requirements = Mock()
-        skill.requirements.model_dump.return_value = {"repo_types": ["code"]}
-        skill.side_effect_profile = Mock()
-        skill.side_effect_profile.model_dump.return_value = {"category": "read"}
+        skill = _make_mock_skill("e2e_test_skill", "1.0.0", "E2E test",
+                                definition={"repo_types": ["code"]})
 
         with patch.object(registry, "_compute_code_hash", return_value="hash123"):
             registry.register(skill, is_active=True)
@@ -189,14 +197,7 @@ class TestGateTriggerProductionWiring:
         gate_trigger = Mock()
         registry = SkillRegistry(db_factory=lambda: db_session, gate_trigger=gate_trigger)
 
-        skill = Mock()
-        skill.name = "inactive_skill"
-        skill.version = "1.0.0"
-        skill.description = "test"
-        skill.requirements = Mock()
-        skill.requirements.model_dump.return_value = {}
-        skill.side_effect_profile = Mock()
-        skill.side_effect_profile.model_dump.return_value = {"category": "read"}
+        skill = _make_mock_skill("inactive_skill")
 
         with patch.object(registry, "_compute_code_hash", return_value="h"):
             registry.register(skill, is_active=False)
@@ -209,14 +210,7 @@ class TestGateTriggerProductionWiring:
 
         registry = SkillRegistry(db_factory=lambda: db_session, gate_trigger=None)
 
-        skill = Mock()
-        skill.name = "safe_skill"
-        skill.version = "1.0.0"
-        skill.description = "test"
-        skill.requirements = Mock()
-        skill.requirements.model_dump.return_value = {}
-        skill.side_effect_profile = Mock()
-        skill.side_effect_profile.model_dump.return_value = {"category": "read"}
+        skill = _make_mock_skill("safe_skill")
 
         with patch.object(registry, "_compute_code_hash", return_value="h"):
             registry.register(skill, is_active=True)  # must not raise
@@ -637,14 +631,7 @@ class TestFullClosedLoopScenario:
         with patch.object(gt, "_run_gate", side_effect=capture_run_gate):
             registry = SkillRegistry(db_factory=lambda: db_session, gate_trigger=gt)
 
-            skill = Mock()
-            skill.name = "deploy_test"
-            skill.version = "2.0.0"
-            skill.description = "new version"
-            skill.requirements = Mock()
-            skill.requirements.model_dump.return_value = {}
-            skill.side_effect_profile = Mock()
-            skill.side_effect_profile.model_dump.return_value = {"category": "read"}
+            skill = _make_mock_skill("deploy_test", "2.0.0", "new version")
 
             with patch.object(registry, "_compute_code_hash", return_value="new_hash"):
                 registry.register(skill, is_active=True)

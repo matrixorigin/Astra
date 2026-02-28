@@ -7,8 +7,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import asyncio
 import json
+import logging
 import click
 from cli.api_client import APIClient
+
+logger = logging.getLogger(__name__)
 
 
 class SyncAPIClient:
@@ -168,13 +171,11 @@ async def _run_edge_turn(user_input, sync_client, session_id, model, agent_id, a
     register_search_tools(router, project_root)
 
     # Load local SKILL.md skills
-    import logging
     from core.skills.loader import SkillLoader
-    _loader_logger = logging.getLogger(__name__)
     builtin_names = {t.name for t in router.list_tools()}
     for local in SkillLoader.discover(SkillLoader.default_paths(project_root)):
         if local.skill.name in builtin_names:
-            _loader_logger.warning(
+            logger.warning(
                 "Local skill '%s' skipped — conflicts with built-in tool", local.skill.name,
             )
             continue

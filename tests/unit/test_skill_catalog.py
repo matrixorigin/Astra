@@ -446,5 +446,55 @@ class TestListAvailable:
         names = [s.name for s in available]
         assert n in names
 
+    def test_excludes_incompatible_access(self, catalog, db_session):
+        """A read-only repo must NOT see skills requiring write access."""
+        from api.models import Repo as RepoModel
+
+        write_skill = StubSkill(_name())
+        write_skill.requirements = SkillRequirement(
+            repo_types=[RepoType.CODE], min_access=AccessScope.WRITE,
+        )
+        catalog.register(write_skill, source=SOURCE_BUILTIN)
+
+        rid = _uid()
+        db_session.add(RepoModel(
+            repo_id=rid,
+            user_id="test",
+            repo_url="https://example.com/repo2",
+            repo_name="read-repo",
+            repo_type="code",
+            access_scope="read",
+        ))
+        db_session.commit()
+
+        names = [s.name for s in catalog.list_available(rid)]
+        assert write_skill.name not in names
+
     def test_no_repo_returns_empty(self, catalog):
         assert catalog.list_available("nonexistent-repo-id") == []
+
+
+# ── Negative caching (_CACHE_MISS) ───────────────────────────────────────────
+
+
+class TestNegativeCaching:
+    def test_nonexistent_skill_cached_as_miss(self, catalog):
+        """First lookup of nonexistent skill hits DB; second returns None from cache."""
+        result1 = catalog.get_metadata("no_such_skill_xyz")
+        assert result1 is None
+        # Cache should now contain a _CACHE_MISS entry
+        assert len(catalog._metadata_cache) == 1
+
+        # Second lookup — same result, no new cache entry (cache hit)
+        result2 = catalog.get_metadata("no_such_skill_xyz")
+        assert result2 is None
+        assert len(catalog._metadata_cache) == 1
+
+    def test_invalidation_clears_negative_entries(self, catalog):
+        """Negative cache entries must be cleared on mutation."""
+        catalog.get_metadata("ghost_skill")
+        assert len(catalog._metadata_cache) == 1
+
+        # Register a skill — should clear all cache including negative entries
+        catalog.register(StubSkill(_name()), source=SOURCE_BUILTIN)
+        assert len(catalog._metadata_cache) == 0

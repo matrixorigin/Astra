@@ -30,7 +30,12 @@ def _catalog() -> SkillCatalog:
 
 
 def reset_catalog() -> None:
-    """Reset the singleton for testing. Not for production use."""
+    """Reset the singleton for testing.
+
+    Prefer manipulating ``_catalog_instance`` directly from test fixtures
+    instead of calling this.  Kept as a convenience for integration tests
+    that import it.
+    """
     global _catalog_instance
     _catalog_instance = None
 
