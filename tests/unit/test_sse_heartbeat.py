@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -29,8 +30,8 @@ def test_ping_format():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_ping_emitted_on_slow_generator(monkeypatch):
-    """Ping appears when inner generator pauses longer than interval."""
+async def test_pings_emitted_on_slow_generator(monkeypatch):
+    """Multiple pings appear when inner generator pauses longer than interval."""
     monkeypatch.setattr("api.routers.chat.HEARTBEAT_INTERVAL_S", 0.05)
 
     async def slow():
@@ -40,9 +41,10 @@ async def test_ping_emitted_on_slow_generator(monkeypatch):
 
     events = [e async for e in _with_heartbeat(slow())]
     types = [json.loads(e[len("data: "):-2])["type"] for e in events]
-    assert "ping" in types
+    pings = [t for t in types if t == "ping"]
     assert types[0] == "a"
     assert types[-1] == "b"
+    assert len(pings) >= 3
 
 
 @pytest.mark.asyncio
@@ -58,20 +60,6 @@ async def test_no_ping_on_fast_generator(monkeypatch):
         payload = json.loads(e[len("data: "):-2])
         assert payload["type"] != "ping"
     assert len(events) == 5
-
-
-@pytest.mark.asyncio
-async def test_multiple_pings_on_long_delay(monkeypatch):
-    monkeypatch.setattr("api.routers.chat.HEARTBEAT_INTERVAL_S", 0.05)
-
-    async def very_slow():
-        yield "data: {\"type\":\"start\"}\n\n"
-        await asyncio.sleep(0.5)
-        yield "data: {\"type\":\"end\"}\n\n"
-
-    events = [e async for e in _with_heartbeat(very_slow())]
-    pings = [e for e in events if "ping" in e]
-    assert len(pings) >= 3
 
 
 @pytest.mark.asyncio
@@ -130,6 +118,11 @@ async def test_drain_task_cancelled_on_consumer_break(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Server-side timeout (_next_with_timeout pattern used in event_generator)
+#
+# NOTE: These tests reproduce the _next_with_timeout closure from
+# chat_turn's event_generator.  They verify the *pattern* (deadline +
+# wait_for) works correctly, but do NOT exercise the real closure —
+# that requires a full chat_turn integration test with DB + LLM.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -142,8 +135,6 @@ async def test_server_timeout_fires_on_hanging_stream(monkeypatch):
         await asyncio.sleep(10)  # simulate LLM hang
         yield "data: {\"type\":\"turn_complete\"}\n\n"
 
-    # Reproduce the _next_with_timeout pattern from event_generator
-    import time
     from api.routers.chat import SERVER_TURN_TIMEOUT_S
     _deadline = time.monotonic() + SERVER_TURN_TIMEOUT_S
 
@@ -173,8 +164,6 @@ async def test_server_timeout_fires_on_hanging_stream(monkeypatch):
 @pytest.mark.asyncio
 async def test_server_timeout_fires_on_zero_remaining():
     """When remaining time is already <= 0, TimeoutError is raised immediately."""
-    import time
-
     _deadline = time.monotonic() - 1  # already expired
 
     async def _next_with_timeout(aiter):

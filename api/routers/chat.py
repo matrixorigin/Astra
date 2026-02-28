@@ -45,7 +45,7 @@ def _sse_ping() -> str:
 
 async def _with_heartbeat(sse_generator: AsyncIterator[str]) -> AsyncIterator[str]:
     """Wrap an SSE generator with periodic ping events."""
-    queue: asyncio.Queue[str | BaseException | object] = asyncio.Queue()
+    queue: asyncio.Queue[str | BaseException | object] = asyncio.Queue(maxsize=1000)
 
     async def _drain() -> None:
         try:

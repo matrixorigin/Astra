@@ -13,7 +13,7 @@ from typing import Any, Protocol
 from cli.api_client import AuthenticationError
 from cli.permissions import Decision, PermissionManager
 from cli.tools.base import resolve_side_effect
-from cli.tools.router import ToolCall, ToolResult, ToolRouter
+from cli.tools.router import ToolCall, ToolRouter
 
 MAX_TURNS = 25
 MAX_TURN_WALL_CLOCK_S = 300
