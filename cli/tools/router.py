@@ -77,6 +77,12 @@ class ToolRouter:
                 tool_call_id=tc.id, name=tc.name,
                 result=f"Unknown tool: {tc.name}", error=True,
             )
+        # Detect server-side argument parse failures (malformed JSON from LLM).
+        if "_parse_error" in tc.arguments:
+            return ToolResult(
+                tool_call_id=tc.id, name=tc.name,
+                result=tc.arguments["_parse_error"], error=True,
+            )
         # Validate required parameters before execution so the LLM gets
         # a clear error instead of a Python TypeError traceback.
         if isinstance(tool, EdgeTool):

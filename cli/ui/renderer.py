@@ -69,6 +69,11 @@ class RichRenderer:
         if self._md is not None:
             self._md.show_thinking()
 
+    def thinking_hide(self) -> None:
+        """Explicitly hide the thinking indicator."""
+        if self._md is not None:
+            self._md._hide_thinking()
+
     def tool_start(self, name: str, args: dict[str, Any]) -> None:
         self._stop_spinner()
         if self._md is not None:

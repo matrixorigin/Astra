@@ -129,6 +129,9 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
                     buf[idx]["function"]["arguments"] += tc.function.arguments
     for tc in buf.values():
         if tc["function"]["name"]:
+            if not tc["function"]["arguments"]:
+                logger.warning("LLM emitted tool_call %s with empty arguments",
+                               tc["function"]["name"])
             yield {"type": "tool_call", "data": tc}
 
 

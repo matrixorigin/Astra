@@ -1202,11 +1202,13 @@ async def chat_turn(
 
                 # Emit accumulated tool calls
                 for tc in tool_calls:
-                    args = tc.get("function", {}).get("arguments", "{}")
+                    args = tc.get("function", {}).get("arguments", "") or "{}"
                     try:
                         parsed_args = json.loads(args) if isinstance(args, str) else args
                     except json.JSONDecodeError:
-                        parsed_args = {}
+                        logger.warning("Malformed tool_call arguments for %s: %s",
+                                       tc.get("function", {}).get("name", "?"), args[:200])
+                        parsed_args = {"_parse_error": f"Malformed arguments JSON: {args[:200]}"}
                     yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc.get('function', {}).get('name', ''), 'arguments': parsed_args})}\n\n"
 
                 # Update session cache: append assistant message, increment turn_count

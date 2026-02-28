@@ -149,6 +149,10 @@ async def _consume_turn(sse_stream, renderer: Renderer, *, timeout: float = MAX_
                     result.text += chunk
                     renderer.text(chunk)
                 elif etype == "tool_call":
+                    # Hide thinking before collecting tool calls — the LLM
+                    # has decided on an action, no longer "thinking".
+                    if hasattr(renderer, "thinking_hide"):
+                        renderer.thinking_hide()
                     result.tool_calls.append(event)
                 elif etype == "session_info":
                     result.session_id = event.get("session_id")
@@ -308,6 +312,10 @@ async def edge_chat_loop(
                     continue
 
                 if decision == Decision.ASK:
+                    # End streaming markdown before showing interactive prompt,
+                    # otherwise the permission panel renders on top of raw text.
+                    if hasattr(renderer, "end_response"):
+                        renderer.end_response()
                     decision = permissions.prompt_user(tc.name, side_effect, tc.arguments)
                     if decision == Decision.DENY:
                         renderer.tool_done(tc.name, "Denied by user", True)
