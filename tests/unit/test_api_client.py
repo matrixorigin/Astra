@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from cli.api_client import APIClient
+from cli.api_client import APIClient, AuthenticationError
 
 
 @pytest.fixture
@@ -216,7 +216,7 @@ async def test_refresh_failure_raises_session_expired(mock_credentials_path: Pat
             client._access_token = "expired_access"
             client._refresh_token = "expired_refresh"
 
-            with pytest.raises(RuntimeError, match="Session expired"):
+            with pytest.raises(AuthenticationError, match="Session expired"):
                 await client._request("GET", "/test")
 
             # Tokens should be cleared
@@ -401,7 +401,7 @@ async def test_refresh_failure_clears_file_tokens(tmp_path: Path):
         mock_client_class.return_value = mock_client
 
         async with APIClient(credentials_path=creds_path) as client:
-            with pytest.raises(RuntimeError, match="Session expired"):
+            with pytest.raises(AuthenticationError, match="Session expired"):
                 await client._request("GET", "/test")
 
     # File should have None tokens
@@ -488,3 +488,211 @@ async def test_profile_name_consistency(tmp_path: Path):
     async with APIClient(credentials_path=creds_path) as client2:
         assert client2._access_token == "tok"
         assert client2._current_username == "alice"
+
+
+# ============================================================================
+# SSE auth: _sse_stream auto-refresh and AuthenticationError
+# ============================================================================
+
+
+class FakeSSE:
+    """Minimal SSE event object matching httpx_sse interface."""
+    def __init__(self, data: str):
+        self.data = data
+
+
+class FakeEventSource:
+    """Async context manager that yields FakeSSE events."""
+    def __init__(self, events: list[dict]):
+        self._events = events
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    async def aiter_sse(self):
+        for e in self._events:
+            yield FakeSSE(json.dumps(e))
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_auth_error_no_refresh_raises(mock_credentials_path: Path):
+    """AUTH_ERROR with no refresh token → AuthenticationError immediately."""
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client_class.return_value = AsyncMock()
+
+        async with APIClient(credentials_path=mock_credentials_path) as client:
+            client._access_token = "bad_token"
+            client._refresh_token = None  # no refresh available
+
+            with patch("cli.api_client.aconnect_sse") as mock_sse:
+                mock_sse.return_value = FakeEventSource([
+                    {"type": "error", "code": "AUTH_ERROR", "message": "Could not validate credentials"},
+                ])
+
+                with pytest.raises(AuthenticationError, match="Session expired"):
+                    async for _ in client._sse_stream("POST", "/chat/turn", json={}):
+                        pass
+
+            # Tokens should be cleared
+            assert client._access_token is None
+            assert client._refresh_token is None
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_auth_error_refresh_fails_raises(mock_credentials_path: Path):
+    """AUTH_ERROR + refresh fails → AuthenticationError."""
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        # Refresh endpoint returns 401
+        mock_refresh_resp = MagicMock()
+        mock_refresh_resp.status_code = 401
+        mock_refresh_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "401", request=MagicMock(), response=mock_refresh_resp,
+        )
+        mock_client.post.return_value = mock_refresh_resp
+        mock_client_class.return_value = mock_client
+
+        async with APIClient(credentials_path=mock_credentials_path) as client:
+            client._access_token = "bad_token"
+            client._refresh_token = "also_bad_refresh"
+
+            with patch("cli.api_client.aconnect_sse") as mock_sse:
+                mock_sse.return_value = FakeEventSource([
+                    {"type": "error", "code": "AUTH_ERROR", "message": "Could not validate credentials"},
+                ])
+
+                with pytest.raises(AuthenticationError, match="Session expired"):
+                    async for _ in client._sse_stream("POST", "/chat/turn", json={}):
+                        pass
+
+            assert client._access_token is None
+            assert client._refresh_token is None
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_auth_error_refresh_succeeds(mock_credentials_path: Path):
+    """AUTH_ERROR + refresh succeeds → retry with new token, yield events."""
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client = AsyncMock()
+        # Refresh endpoint returns new token
+        mock_refresh_resp = MagicMock()
+        mock_refresh_resp.status_code = 200
+        mock_refresh_resp.json.return_value = {"access_token": "new_token"}
+        mock_refresh_resp.raise_for_status = MagicMock()
+        mock_client.post.return_value = mock_refresh_resp
+        mock_client_class.return_value = mock_client
+
+        async with APIClient(credentials_path=mock_credentials_path) as client:
+            client._access_token = "expired_token"
+            client._refresh_token = "valid_refresh"
+
+            call_count = 0
+
+            def make_event_source(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    # First call: auth error
+                    return FakeEventSource([
+                        {"type": "error", "code": "AUTH_ERROR", "message": "expired"},
+                    ])
+                else:
+                    # Second call (after refresh): success
+                    return FakeEventSource([
+                        {"type": "text_delta", "content": "Hello"},
+                        {"type": "turn_complete", "has_tool_calls": False},
+                    ])
+
+            with patch("cli.api_client.aconnect_sse", side_effect=make_event_source):
+                events = []
+                async for event in client._sse_stream("POST", "/chat/turn", json={}):
+                    events.append(event)
+
+            assert client._access_token == "new_token"
+            assert len(events) == 2
+            assert events[0]["type"] == "text_delta"
+            assert events[1]["type"] == "turn_complete"
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_normal_events_pass_through(mock_credentials_path: Path):
+    """Non-error SSE events are yielded transparently."""
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client_class.return_value = AsyncMock()
+
+        async with APIClient(credentials_path=mock_credentials_path) as client:
+            client._access_token = "good_token"
+
+            with patch("cli.api_client.aconnect_sse") as mock_sse:
+                mock_sse.return_value = FakeEventSource([
+                    {"type": "session_info", "session_id": "s1"},
+                    {"type": "text_delta", "content": "Hi"},
+                    {"type": "turn_complete", "has_tool_calls": False},
+                ])
+
+                events = []
+                async for event in client._sse_stream("POST", "/chat/turn", json={}):
+                    events.append(event)
+
+            assert len(events) == 3
+            assert events[0]["type"] == "session_info"
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_non_auth_error_passes_through(mock_credentials_path: Path):
+    """Non-AUTH_ERROR error events are yielded, not intercepted."""
+    with patch("httpx.AsyncClient") as mock_client_class:
+        mock_client_class.return_value = AsyncMock()
+
+        async with APIClient(credentials_path=mock_credentials_path) as client:
+            client._access_token = "good_token"
+
+            with patch("cli.api_client.aconnect_sse") as mock_sse:
+                mock_sse.return_value = FakeEventSource([
+                    {"type": "error", "code": "RATE_LIMIT", "message": "Too many requests"},
+                ])
+
+                events = []
+                async for event in client._sse_stream("POST", "/chat/turn", json={}):
+                    events.append(event)
+
+            assert len(events) == 1
+            assert events[0]["code"] == "RATE_LIMIT"
+
+
+@pytest.mark.asyncio
+async def test_sse_stream_clears_file_tokens_on_auth_failure(tmp_path: Path):
+    """AuthenticationError also clears tokens from the credentials file."""
+    creds_path = tmp_path / "credentials.json"
+    creds_path.write_text(json.dumps({
+        "current_profile": "alice",
+        "profiles": {"alice": {
+            "username": "alice",
+            "access_token": "old_access",
+            "refresh_token": "old_refresh",
+        }}
+    }))
+
+    async with APIClient(credentials_path=creds_path) as client:
+        with patch("cli.api_client.aconnect_sse") as mock_sse:
+            mock_sse.return_value = FakeEventSource([
+                {"type": "error", "code": "AUTH_ERROR", "message": "bad"},
+            ])
+
+            with pytest.raises(AuthenticationError):
+                async for _ in client._sse_stream("POST", "/chat/turn", json={}):
+                    pass
+
+    data = json.loads(creds_path.read_text())
+    assert data["profiles"]["alice"]["access_token"] is None
+    assert data["profiles"]["alice"]["refresh_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_authentication_error_is_runtime_error():
+    """AuthenticationError is a subclass of RuntimeError for backward compat."""
+    err = AuthenticationError("test")
+    assert isinstance(err, RuntimeError)

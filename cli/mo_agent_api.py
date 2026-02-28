@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 import click
-from cli.api_client import APIClient
+from cli.api_client import APIClient, AuthenticationError
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +350,9 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
                     user_input, client, session_id,
                     selected_model, user_id, auto_approve,
                 ))
+            except AuthenticationError:
+                click.echo("\n❌ Session expired — please login again: mo-agent login")
+                sys.exit(1)
             except Exception as e:
                 if debug:
                     import traceback
@@ -360,8 +363,8 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
 
     except KeyboardInterrupt:
         click.echo("\n\nInterrupted")
-    except RuntimeError as e:
-        if "Session expired" in str(e):
+    except (AuthenticationError, RuntimeError) as e:
+        if "Session expired" in str(e) or isinstance(e, AuthenticationError):
             click.echo("\n❌ Session expired — please login again: mo-agent login")
             sys.exit(1)
         raise

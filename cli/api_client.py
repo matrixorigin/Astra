@@ -13,8 +13,16 @@ from typing import Any
 import httpx
 from httpx_sse import aconnect_sse
 
+from core.logging_config import get_logger
+
+logger = get_logger(__name__)
+
 # Sentinel to distinguish "field not loaded / not changed" from "explicitly set to None".
 _UNSET = object()
+
+
+class AuthenticationError(RuntimeError):
+    """Raised when authentication fails and cannot be recovered (refresh exhausted)."""
 
 
 class APIClient:
@@ -186,9 +194,9 @@ class APIClient:
                 self._access_token = None
                 self._refresh_token = None
                 await self._save_credentials()
-                raise RuntimeError(
+                raise AuthenticationError(
                     "Session expired — please login again: mo-agent login"
-                )
+                ) from None
             headers["Authorization"] = f"Bearer {self._access_token}"
             response = await self._client.request(method, url, headers=headers, **kwargs)
 
@@ -222,6 +230,66 @@ class APIClient:
         if "refresh_token" in data:
             self._refresh_token = data["refresh_token"]
         await self._save_credentials()
+
+    async def _sse_stream(
+        self,
+        method: str,
+        path: str,
+        **kwargs: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """SSE streaming request with auto-refresh on AUTH_ERROR.
+
+        SSE endpoints return HTTP 200 even on auth failures (required by the SSE
+        protocol — see api/sse_errors.py). Auth errors arrive as the first SSE
+        event: {"type": "error", "code": "AUTH_ERROR", ...}.
+
+        This method mirrors _request()'s auto-refresh logic:
+        1. Send request with current access token.
+        2. If the first event is AUTH_ERROR, attempt token refresh and retry once.
+        3. If refresh fails, raise AuthenticationError so the CLI can prompt re-login.
+        4. On success, yield all events to the caller transparently.
+        """
+        if not self._client:
+            raise RuntimeError("Client not initialized. Use async context manager.")
+
+        url = f"{self.base_url}{path}"
+
+        for attempt in range(2):  # at most one retry after refresh
+            headers = kwargs.pop("headers", {})
+            if self._access_token:
+                headers["Authorization"] = f"Bearer {self._access_token}"
+
+            async with aconnect_sse(
+                self._client, method, url, headers=headers, **kwargs,
+            ) as event_source:
+                first = True
+                async for sse in event_source.aiter_sse():
+                    event = json.loads(sse.data)
+
+                    if first and event.get("code") == "AUTH_ERROR":
+                        # First attempt: try refresh. Second attempt: give up.
+                        if attempt == 0 and self._refresh_token:
+                            try:
+                                await self._refresh_access_token()
+                                logger.info("SSE auth refresh succeeded, retrying")
+                                break  # break inner loop → retry outer loop
+                            except Exception:
+                                pass
+                        # Refresh unavailable or failed
+                        self._access_token = None
+                        self._refresh_token = None
+                        await self._save_credentials()
+                        raise AuthenticationError(
+                            "Session expired — please login again: mo-agent login"
+                        )
+
+                    first = False
+                    yield event
+                else:
+                    # Inner loop completed normally (no break) → all events yielded
+                    return
+        # Should not reach here, but guard against it
+        raise AuthenticationError("Session expired — please login again: mo-agent login")
 
     async def save_profile_setting(self, **kwargs: Any) -> None:
         """Update profile settings (default_model, last_session_id, etc.)."""
@@ -327,15 +395,8 @@ class APIClient:
         agent_id: str | None = None,
         model: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Stream chat response as SSE."""
-        if not self._client:
-            raise RuntimeError("Client not initialized")
-
-        headers = {}
-        if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
-
-        payload = {
+        """Stream chat response as SSE (with auto-refresh on auth failure)."""
+        payload: dict[str, Any] = {
             "message": message,
             "session_id": session_id,
             "agent_id": agent_id,
@@ -343,16 +404,8 @@ class APIClient:
         if model:
             payload["model"] = model
 
-        url = f"{self.base_url}/chat/stream"
-        async with aconnect_sse(
-            self._client,
-            "POST",
-            url,
-            json=payload,
-            headers=headers,
-        ) as event_source:
-            async for sse in event_source.aiter_sse():
-                yield json.loads(sse.data)
+        async for event in self._sse_stream("POST", "/chat/stream", json=payload):
+            yield event
 
     async def chat_turn(
         self,
@@ -365,17 +418,10 @@ class APIClient:
         edge_tools: list[dict[str, Any]] | None = None,
         edge_profile: dict[str, Any] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Call /chat/turn — one LLM turn in the edge-cloud loop.
+        """Call /chat/turn — one LLM turn in the edge-cloud loop (with auto-refresh).
 
         Returns SSE events: text_delta, tool_call, usage, turn_complete, session_info.
         """
-        if not self._client:
-            raise RuntimeError("Client not initialized")
-
-        headers = {}
-        if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
-
         payload: dict[str, Any] = {"messages": messages}
         if session_id:
             payload["session_id"] = session_id
@@ -392,12 +438,8 @@ class APIClient:
         if edge_profile:
             payload["edge_profile"] = edge_profile
 
-        url = f"{self.base_url}/chat/turn"
-        async with aconnect_sse(
-            self._client, "POST", url, json=payload, headers=headers,
-        ) as event_source:
-            async for sse in event_source.aiter_sse():
-                yield json.loads(sse.data)
+        async for event in self._sse_stream("POST", "/chat/turn", json=payload):
+            yield event
 
     async def get_pending_runs(self) -> list[dict[str, Any]]:
         """Get runs in RESUME_PENDING state for current user (mailbox pattern)."""
@@ -405,20 +447,11 @@ class APIClient:
         return response.json()
 
     async def resume_run(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
-        """Resume a RESUME_PENDING run (mailbox pattern)."""
-        if not self._client:
-            raise RuntimeError("Client not initialized")
-
-        headers = {}
-        if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
-
-        url = f"{self.base_url}/chat/turn/resume"
-        async with aconnect_sse(
-            self._client, "POST", url, json={"run_id": run_id}, headers=headers,
-        ) as event_source:
-            async for sse in event_source.aiter_sse():
-                yield json.loads(sse.data)
+        """Resume a RESUME_PENDING run (with auto-refresh)."""
+        async for event in self._sse_stream(
+            "POST", "/chat/turn/resume", json={"run_id": run_id},
+        ):
+            yield event
 
     async def get_run_status(self, run_id: str) -> dict[str, Any]:
         """Get run status and progress."""
@@ -426,18 +459,11 @@ class APIClient:
         return response.json()
 
     async def stream_agent_run_events(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
-        """Stream run events (supports reconnection)."""
-        if not self._client:
-            raise RuntimeError("Client not initialized")
-
-        headers = {}
-        if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
-
-        url = f"{self.base_url}/chat/runs/{run_id}/stream"
-        async with aconnect_sse(self._client, "GET", url, headers=headers) as event_source:
-            async for sse in event_source.aiter_sse():
-                yield json.loads(sse.data)
+        """Stream run events (with auto-refresh, supports reconnection)."""
+        async for event in self._sse_stream(
+            "GET", f"/chat/runs/{run_id}/stream",
+        ):
+            yield event
 
     async def cancel_run(self, run_id: str) -> dict[str, Any]:
         """Cancel a running task."""

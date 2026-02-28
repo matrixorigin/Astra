@@ -10,6 +10,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
+from cli.api_client import AuthenticationError
 from cli.permissions import Decision, PermissionManager
 from cli.tools.router import ToolCall, ToolResult, ToolRouter
 
@@ -237,6 +238,8 @@ async def edge_chat_loop(
             except KeyboardInterrupt:
                 renderer.error("Interrupted by user")
                 return final_text
+            except AuthenticationError:
+                raise  # propagate to CLI for re-login prompt
             except Exception as e:
                 renderer.error(f"{type(e).__name__}: {e}")
                 break

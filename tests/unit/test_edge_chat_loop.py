@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from cli.api_client import AuthenticationError
 from cli.edge_chat_loop import edge_chat_loop, load_project_rules, _consume_turn, StderrRenderer
 from cli.permissions import PermissionManager
 from cli.tools.router import ToolRouter
@@ -472,6 +473,17 @@ class TestRealisticScenarios:
         ])
         await edge_chat_loop("Hi", api, router, perms, renderer=renderer)
         assert any("rate limit" in e.lower() for e in renderer.errors)
+
+    @pytest.mark.asyncio
+    async def test_auth_error_propagates(self, router, perms, renderer):
+        """AuthenticationError from api_client propagates out of edge_chat_loop."""
+        class AuthFailAPI:
+            async def chat_turn(self, **kwargs):
+                raise AuthenticationError("Session expired — please login again")
+                yield  # noqa: E501
+
+        with pytest.raises(AuthenticationError, match="Session expired"):
+            await edge_chat_loop("Hi", AuthFailAPI(), router, perms, renderer=renderer)
 
     @pytest.mark.asyncio
     async def test_partial_deny_in_batch(self, project, renderer, monkeypatch):
