@@ -378,7 +378,11 @@ TODO: describe this skill for the LLM.
             from cli.tools.router import ToolRouter, ToolCall
             router = ToolRouter()
             router.register(match.skill)
-            results = asyncio.run(router.execute([ToolCall(id="test", name=name, arguments=args)]))
+            coro = router.execute([ToolCall(id="test", name=name, arguments=args)])
+            # Reuse the client's event loop when inside the REPL (avoids
+            # "cannot call asyncio.run() while another loop is running").
+            run = client._run if client and hasattr(client, "_run") else asyncio.run
+            results = run(coro)
             r = results[0]
             console.print(f"  time:   {r.execution_time_ms}ms")
             if r.error:

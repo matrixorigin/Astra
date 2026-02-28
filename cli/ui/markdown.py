@@ -1,5 +1,6 @@
-"""Streaming markdown — streams raw text, renders final markdown on finish."""
+"""Streaming markdown — streams raw text, renders rich Markdown on finish."""
 
+from rich.cells import cell_len
 from rich.console import Console, ConsoleOptions, RenderResult
 from rich.markdown import CodeBlock, Markdown
 from rich.syntax import Syntax
@@ -27,37 +28,81 @@ install_prettier_code_blocks()
 
 
 class StreamingMarkdown:
-    """Streams raw text chunks during generation, renders markdown on finish.
+    """Streams raw text during generation, renders rich Markdown on finish.
 
-    During streaming: writes raw text directly (no Live, no cursor tricks).
-    On finish: clears the raw output and prints a single rich Markdown render.
+    During streaming: writes raw text directly (no Live, no duplication).
+    On finish (terminal): erases raw lines, prints rich Markdown render.
+    On finish (non-terminal): just ensures trailing newline.
     """
 
     def __init__(self, console: Console | None = None) -> None:
         self._console = console or Console()
         self._buffer = ""
-        self._live = False  # just a flag now, not a Live object
-        self._line_count = 0  # track lines written for cleanup
+        self._live = False
+        self._raw_lines = 0  # terminal lines occupied (for erase)
+        # Track the display-width of the current (unterminated) line so that
+        # chunks that arrive without a trailing newline are handled correctly
+        # when the *next* chunk continues the same visual line.
+        self._current_line_width = 0
 
     def start(self) -> None:
         self._live = True
 
+    def _count_lines(self, text: str) -> int:
+        """Count terminal lines occupied by *text*, accounting for CJK width and wrapping.
+
+        Uses rich.cells.cell_len for accurate display-width (handles CJK,
+        emoji, zero-width chars).  Tracks _current_line_width across calls
+        so partial lines split across chunks are counted correctly.
+
+        Wrapping model: terminals auto-wrap when cursor reaches column
+        ``width`` (i.e. after writing ``width`` columns on a line).
+        """
+        width = self._console.width or 80
+        lines = 0
+        for ch in text:
+            if ch == "\n":
+                lines += 1
+                self._current_line_width = 0
+            else:
+                self._current_line_width += cell_len(ch)
+                if self._current_line_width >= width:
+                    # Terminal wraps: next output goes to a new visual line
+                    lines += 1
+                    # Characters beyond width start on the new line.
+                    # If exactly at width, cursor is at col 0 of new line.
+                    self._current_line_width = self._current_line_width - width
+        return lines
+
     def feed(self, chunk: str) -> None:
         self._buffer += chunk
         if self._live:
-            # Write raw text directly — no Live re-rendering
-            self._console.file.write(chunk)
-            self._console.file.flush()
-            self._line_count += chunk.count("\n")
+            f = self._console.file
+            f.write(chunk)
+            f.flush()
+            self._raw_lines += self._count_lines(chunk)
 
     def finish(self) -> str:
-        """Stop streaming and return accumulated text."""
+        """Stop streaming. On terminals, replace raw text with rendered markdown."""
         if self._live:
             self._live = False
-            # Ensure trailing newline after raw stream
-            if self._buffer and not self._buffer.endswith("\n"):
-                self._console.file.write("\n")
-                self._console.file.flush()
+            f = self._console.file
+            if self._console.is_terminal and self._buffer:
+                # The last visual line (partial or full) is on screen but not
+                # counted by _count_lines as a "completed" line.  Add 1 so the
+                # erase loop covers it.
+                total = self._raw_lines + 1
+                # Erase raw output: move cursor up and clear each line
+                for _ in range(total):
+                    f.write("\033[A\033[2K")
+                f.write("\r\033[2K")
+                f.flush()
+                # Render final markdown
+                self._console.print(Markdown(self._buffer))
+            else:
+                if self._buffer and not self._buffer.endswith("\n"):
+                    f.write("\n")
+                    f.flush()
         return self._buffer
 
     @property
