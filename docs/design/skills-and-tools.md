@@ -907,9 +907,8 @@ Comparison focuses on **stateful skill management** — persistent data, lifecyc
 
 ## 8. Open Questions
 
-1. **Cross-skill data access**: can knowledge skill read from github skill's tables?
-   - Proposed: explicit dependency in manifest, platform provides cross-skill API
-   - Since all tables are in the same DB, JOINs are trivial
+1. ~~**Cross-skill data access**: can knowledge skill read from github skill's tables?~~
+   **Resolved** — see §9 Cross-Skill Data Access below.
 
 2. **Schema evolution**: how to handle ALTER TABLE when platform upgrades a skill?
    - Same as any other migration — platform-level, applied by operator
@@ -917,6 +916,242 @@ Comparison focuses on **stateful skill management** — persistent data, lifecyc
 3. **Skill cost → budget gate integration**: `SignalWeights.cost` (0.2) drives learning, but skill execution cost doesn't flow back to the budget control system in [Deployment Architecture](deployment-architecture.md). Need: execution cost recorded per-skill → aggregated per-session → checked against session budget before next skill call.
 
 4. **Prompt evolution → skill regression gate**: `InputFaceLearner` can modify prompts, but prompt changes may alter which skills the LLM selects. Should prompt changes trigger the skill selection regression gate? Current answer: no (they are independent input faces). May need cross-face regression testing.
+
+---
+
+## 9. Cross-Skill Data Access
+
+> **Status**: Design Decision — resolves Open Question #1
+
+### Problem
+
+Skills have isolated table namespaces (`sk_{skill}_`), but real workflows need cross-skill data. Example: knowledge skill needs to index GitHub PR summaries from `sk_github_pr_cache`.
+
+### Decision: Manifest Explicit Dependency + Platform Cross-API
+
+**Two mechanisms, layered**:
+
+#### 1. Manifest `depends_on` — Declares Intent
+
+```yaml
+# skills/knowledge/manifest.yaml
+name: knowledge
+depends_on:
+  - github          # declares: I need data from the github skill
+  - code_execution  # declares: I need data from code_execution skill
+```
+
+`depends_on` is enforced at install time (`SkillManager.install()` already checks this) and at runtime (`SkillManager.require_executable()` verifies all dependencies are installed). This is already implemented.
+
+#### 2. Platform Cross-Skill API — Controls Access
+
+Skills do NOT import each other's modules or query each other's tables directly. Instead, the platform provides a typed cross-skill API:
+
+```python
+class SkillDataBridge:
+    """Platform-provided cross-skill data access.
+
+    Injected into skill API constructors. Skills call bridge methods
+    instead of importing each other's models or writing raw SQL.
+    """
+
+    def __init__(self, db: Session, requesting_skill: str, user_id: str):
+        self._db = db
+        self._skill = requesting_skill
+        self._user_id = user_id
+
+    def query(self, target_skill: str, table: str, filters: dict, limit: int = 100) -> list[dict]:
+        """Read rows from another skill's table.
+
+        Validates: requesting_skill has target_skill in depends_on.
+        Returns dicts (not ORM objects) to prevent schema coupling.
+        """
+
+    def count(self, target_skill: str, table: str, filters: dict) -> int:
+        """Count rows in another skill's table."""
+```
+
+**Why not direct JOINs?** All tables are in the same DB, so JOINs are trivially possible. But direct SQL creates implicit coupling — skill A breaks when skill B changes its schema. The bridge provides:
+- **Dependency validation**: only declared dependencies are accessible
+- **Schema decoupling**: returns dicts, not ORM objects
+- **Audit**: every cross-skill access is logged
+- **Future-proof**: if skills move to separate databases, only the bridge changes
+
+**Implementation priority**: Phase 2. Current skills (github, knowledge) don't yet need cross-skill access. When the first real use case appears, implement `SkillDataBridge`.
+
+---
+
+## 10. Low-Code Skill Template
+
+> **Status**: Design Target
+
+### Problem
+
+Creating a new skill requires writing 4 files (manifest.yaml, models.py, api.py, actions.py) with boilerplate. This friction discourages skill creation and makes the system feel heavyweight for simple use cases.
+
+### Solution: YAML Declaration → Auto-Generated Skeleton
+
+A single `skill.yaml` declares everything. The platform generates the models/api/actions skeleton:
+
+```yaml
+# skill.yaml — complete low-code skill definition
+name: jira
+version: "1.0.0"
+description: "Jira integration — issues, sprints, boards"
+table_prefix: sk_jira
+
+credentials:
+  - name: jira_token
+    type: secret
+    required: true
+  - name: jira_url
+    type: string
+    required: true
+
+tables:
+  issues:
+    columns:
+      issue_key: {type: string, max_length: 20, primary_key: true}
+      summary: {type: string, max_length: 500}
+      status: {type: string, max_length: 50}
+      assignee: {type: string, max_length: 100, nullable: true}
+      priority: {type: string, max_length: 20}
+      data: {type: json}
+      fetched_at: {type: datetime}
+    indexes:
+      - columns: [status, assignee]
+
+actions:
+  list_issues:
+    description: "List Jira issues with filters"
+    parameters:
+      project: {type: string, required: true}
+      status: {type: string, enum: [open, in_progress, done]}
+    side_effect: read
+
+  create_issue:
+    description: "Create a new Jira issue"
+    parameters:
+      project: {type: string, required: true}
+      summary: {type: string, required: true}
+      issue_type: {type: string, default: "Task"}
+    side_effect: write
+
+depends_on: []
+```
+
+### CLI Command
+
+```bash
+mo-admin skill scaffold skill.yaml
+# Generates:
+#   skills/jira/
+#     manifest.yaml      ← from skill.yaml metadata
+#     models.py           ← SQLAlchemy models from tables section
+#     api.py              ← typed API skeleton with CRUD methods
+#     actions.py          ← action classes from actions section
+#     __init__.py
+```
+
+### Type Mapping
+
+| YAML type | SQLAlchemy | Python |
+|-----------|-----------|--------|
+| `string` | `String(max_length)` | `str` |
+| `integer` | `Integer` | `int` |
+| `float` | `Float` | `float` |
+| `boolean` | `SmallInteger` | `bool` |
+| `datetime` | `DateTime` | `datetime` |
+| `json` | `JSON` | `dict` |
+| `text` | `Text` | `str` |
+
+### Design Principles
+
+- **Scaffold, not runtime codegen**: generates real Python files that developers own and can customize
+- **No magic**: generated code is readable, follows the same patterns as hand-written skills
+- **Escape hatch**: after scaffolding, developers modify generated files freely
+- **Validation**: `skill.yaml` is validated against a JSON Schema before generation
+
+---
+
+## 11. Skill Sandbox Mode
+
+> **Status**: Design Target
+> **Dependency**: [Code Execution Sandbox](code-sandbox.md)
+
+### Problem
+
+Cloud skills execute in the platform process. A buggy or malicious skill can access the full platform DB, consume unbounded resources, or crash the process.
+
+### Solution: Optional Container-Isolated Execution
+
+Skills can opt into sandbox mode via manifest:
+
+```yaml
+# skills/untrusted_analyzer/manifest.yaml
+name: untrusted_analyzer
+version: "1.0.0"
+sandbox:
+  enabled: true
+  image: mo-skill-runtime:latest   # base image with Python + skill deps
+  memory_limit: 512m
+  cpu_limit: 1.0
+  timeout_seconds: 30
+  network: none                     # no network access
+  volumes: []                       # no host mounts
+```
+
+### Execution Model
+
+```
+Normal skill:     ChatLoop → SkillExecutor → skill.execute() (in-process)
+Sandboxed skill:  ChatLoop → SkillExecutor → SandboxRunner → Docker container
+                                                  │
+                                                  ├── Mount: skill code (read-only)
+                                                  ├── Env: credentials (injected)
+                                                  ├── Stdin: JSON request
+                                                  └── Stdout: JSON response
+```
+
+### Security Tiers
+
+| Tier | Isolation | Use Case | Default |
+|------|-----------|----------|---------|
+| **Trusted** | In-process | Platform-built skills (github, knowledge) | ✅ |
+| **Sandboxed** | Docker container | Third-party / marketplace skills | |
+| **Strict** | gVisor + no-network | User-uploaded skills | |
+
+### When to Sandbox
+
+- **Always sandbox**: skills from marketplace with `source != "builtin"`
+- **Optional sandbox**: platform skills during development/testing
+- **Never sandbox**: edge tools (they already run on user's machine)
+
+### Data Access in Sandbox
+
+Sandboxed skills cannot access the platform DB directly. Instead:
+
+```
+Container                          Platform
+  │                                   │
+  ├── stdin: {action, params}  ──────►│
+  │                                   ├── Validate action against manifest
+  │                                   ├── Execute DB query on behalf of skill
+  │◄── stdout: {result}       ◄──────┤
+  │                                   │
+```
+
+The platform acts as a proxy — the skill declares what tables it needs in the manifest, and the platform executes queries on its behalf. This prevents:
+- Unauthorized table access (only declared tables)
+- SQL injection (platform builds queries, not the skill)
+- Resource abuse (timeout + memory limit enforced by Docker)
+
+### Implementation Priority
+
+Phase 3. Current skills are all platform-built (trusted). Sandbox mode becomes critical when:
+1. Marketplace opens to third-party skill authors
+2. Users can upload custom skills
+3. Skills need to execute user-provided code
 
 ---
 
