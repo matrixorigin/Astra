@@ -35,3 +35,20 @@ class TestMarkdownSkill:
         assert schema["type"] == "function"
         assert schema["function"]["name"] == "test_skill"
         assert "query" in schema["function"]["parameters"]["properties"]
+
+    def test_side_effect_is_read(self, skill):
+        """MarkdownSkill must expose side_effect for the permission system."""
+        from cli.tools.base import SideEffect
+        assert skill.side_effect == SideEffect.READ
+        assert skill.side_effect.value == "read"
+
+    def test_works_in_tool_router(self, skill):
+        """MarkdownSkill registered in ToolRouter must be introspectable."""
+        from cli.tools.router import ToolRouter
+        router = ToolRouter()
+        router.register(skill)
+        tools = router.list_tools()
+        assert len(tools) == 1
+        # This is the exact access pattern used by edge_chat_loop (permissions)
+        # and GetAgentInfoTool (introspection). Both crashed before the fix.
+        assert tools[0].side_effect.value == "read"

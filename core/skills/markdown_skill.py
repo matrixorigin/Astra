@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from cli.tools.base import SideEffect
 from core.skills.base import (
     RuntimeRequirement,
     SideEffectCategory,
@@ -12,6 +13,14 @@ from core.skills.base import (
     SkillRequirement,
 )
 from core.skills.skill_md import SkillMd
+
+# SideEffectCategory → SideEffect mapping for permission system compatibility.
+# MarkdownSkills only use READ; if new categories are added, extend this map.
+_CATEGORY_TO_SIDE_EFFECT: dict[SideEffectCategory, SideEffect] = {
+    SideEffectCategory.READ: SideEffect.READ,
+    SideEffectCategory.WRITE: SideEffect.WRITE,
+    SideEffectCategory.EXECUTE: SideEffect.EXECUTE,
+}
 
 
 class MarkdownSkillInput(SkillInput):
@@ -42,6 +51,18 @@ class MarkdownSkill(Skill[MarkdownSkillInput, MarkdownSkillOutput]):
             llm_required=spec.llm_required,
         )
         self.side_effect_profile = SideEffectProfile(category=SideEffectCategory.READ)
+
+    @property
+    def side_effect(self) -> SideEffect:
+        """Permission-system compatible side effect, derived from side_effect_profile.
+
+        The edge_chat_loop permission system requires SideEffect (cli enum),
+        not SideEffectCategory (core enum).  This property bridges the two
+        so MarkdownSkills work in the ToolRouter alongside EdgeTools.
+        """
+        return _CATEGORY_TO_SIDE_EFFECT.get(
+            self.side_effect_profile.category, SideEffect.READ,
+        )
 
     async def execute(self, input: MarkdownSkillInput) -> MarkdownSkillOutput:
         return MarkdownSkillOutput(
