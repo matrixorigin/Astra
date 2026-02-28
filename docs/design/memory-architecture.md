@@ -620,7 +620,7 @@ Retrieval: by session (recent), by causal chain (thread), by user (cross-session
 
 ### Semantic Memory: knowledge_entries
 
-> `sk_knowledge_entries` and `sk_knowledge_relations` are part of the **knowledge skill**. See [skill-as-package.md](skill-as-package.md).
+> `sk_knowledge_entries` and `sk_knowledge_relations` are part of the **knowledge skill**. See [Skills and Tools §1](skills-and-tools.md#1-skill-architecture).
 
 ```sql
 CREATE TABLE knowledge_entries (

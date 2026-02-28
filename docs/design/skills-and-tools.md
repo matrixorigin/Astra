@@ -1,7 +1,10 @@
 # Skills and Tools
 
-> **Status**: Core Design — single source of truth for skill system and tool integration  
-> **Last Updated**: 2026-02-22
+> **Status**: Core Design — single source of truth for skill system, packaging, selection, and tool integration
+> **Last Updated**: 2026-02-28
+>
+> 🔵 **Implementation Status**: `SkillManager` (install/uninstall/credential CRUD) and `SkillPipeline` (unified selection) are implemented.
+> Marketplace discovery, publishing, RBAC, and MatrixOne Publication distribution are Design Targets.
 
 ---
 
@@ -10,8 +13,6 @@
 The industry is moving from "tools as function calls" to "skills as modular expertise packages." Anthropic's Agent Skills introduces three-tier progressive loading. ElizaOS pioneered plugin schemas (plugins declare DB tables, platform auto-migrates).
 
 mo-agent-engine goes further with **Skill-as-Package**: skills are platform capabilities with platform-defined schemas and typed API layers. All skill tables live in the platform database with `sk_{skill}_{table}` naming convention. Users interact with skill data through skill APIs, not direct SQL. Each skill defines its own tables in `skills/{name}/models.py`.
-
-For the full Skill-as-Package architecture (install lifecycle, skill API layer, credential management, table naming), see **[skill-as-package.md](skill-as-package.md)**. This document focuses on skill execution, selection, and tool design.
 
 ---
 
@@ -31,9 +32,263 @@ A skill is a **versioned, stateful capability package** with:
 - **Execution logic**: the actual code
 - **Audit trail**: every invocation recorded with version, params, result
 
-Skills are platform capabilities with deterministic schemas: tables are defined in `skills/{name}/models.py` with `sk_` prefix, created by `init_db()`. Skills provide typed API layers for data access. See [skill-as-package.md](skill-as-package.md) for the full architecture.
+### Core Insight: Skills Are Platform Capabilities
 
-### Execution Model
+**Skills are platform capabilities, not user plugins.** Their table schemas are deterministic — defined by the platform, not by users. This is the same model as `knowledge_entries` and `conversation_events`: platform defines the schema, skill provides an API layer for CRUD operations.
+
+All tables — core and skill — live in the **same platform database**. Skill tables are distinguished by naming convention (`sk_{skill_name}_`), not by physical database separation.
+
+Users interact with skill data through **skill APIs**, not direct SQL:
+```python
+github.save_token(token)                    # → encrypted in user_credentials
+github.add_repo("matrixorigin/matrixone")   # → INSERT INTO sk_github_repos
+github.list_prs(repo, state="open")         # → GitHub API + cache
+github.get_pr_checks(repo, pr_number)       # → GitHub API + cache
+```
+
+### Database Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Platform Database                         │
+│                  (single DB, managed by platform)             │
+│                                                               │
+│  Core tables (no prefix):                                     │
+│    users, roles, sessions, conversation_events,               │
+│    agents, model_registry                                     │
+│                                                               │
+│  Skill infrastructure tables (no prefix, part of core):       │
+│    skills_registry, skill_permissions,                        │
+│    skill_installations, user_credentials                      │
+│                                                               │
+│  Skill business tables (sk_{skill}_ prefix):                  │
+│    sk_github_repos, sk_github_pr_cache                        │
+│    sk_knowledge_entries, sk_knowledge_relations                │
+│                                                               │
+│  All tables share the same Base, same init_db().              │
+│  Skill tables defined in skills/{name}/models.py              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Table Naming Convention
+
+| Category | Prefix | Defined in | Examples |
+|----------|--------|------------|----------|
+| Core platform | (none) | `api/models/` | `users`, `roles`, `sessions`, `agents` |
+| Skill infrastructure | (none) | `api/models/skill.py` | `skills_registry`, `skill_installations`, `skill_permissions`, `user_credentials` |
+| Skill business data | `sk_{skill}_` | `skills/{skill}/models.py` | `sk_github_repos`, `sk_github_pr_cache` |
+
+Rules:
+- Skill infrastructure tables are part of core — they manage the skill lifecycle, not skill-specific data
+- Skill business tables use `sk_{skill_name}_` prefix — matches `table_prefix` in manifest
+- All tables use the same `Base` from `api/models.py`
+- `init_db()` imports all skill models and calls `Base.metadata.create_all()`
+
+### Why No BYOD for Skill Tables
+
+Previous design (v2) had skill tables in a user-provided BYOD database. This was wrong because:
+
+1. **Skill tables are platform-defined** — the platform controls the schema, not the user
+2. **JOINs** — skill data needs to join with core tables (`users`, `conversation_events`) for audit, context, and retrieval
+3. **Complexity** — BYOD adds DDL execution on install, cross-DB query limitations, connection pooling per user
+4. **No actual need** — users don't need data sovereignty over PR cache or knowledge entries; they need the platform to manage it
+
+BYOD remains a future option for users who want to bring their own **business data** (not skill data) — but that's a separate concern from skill-as-package.
+
+### Skill Package Structure
+
+A skill is a platform-managed Python package:
+
+```
+skills/
+  github/
+    __init__.py
+    manifest.yaml          # metadata, dependencies, credentials
+    models.py              # SQLAlchemy table definitions (uses Base from api/models.py)
+    api.py                 # typed API layer for data access
+    actions.py             # skill actions (what the agent calls)
+```
+
+#### Manifest
+
+```yaml
+# skills/github/manifest.yaml
+name: github
+version: "1.0.0"
+description: "GitHub integration — PRs, issues, CI status, code search"
+author: "mo-agent-engine"
+table_prefix: sk_github
+
+tables:
+  - sk_github_repos
+  - sk_github_pr_cache
+
+credentials:
+  - name: github_token
+    type: secret
+    description: "GitHub Personal Access Token or App token"
+    required: true
+
+requires:
+  - http
+
+depends_on: []
+```
+
+#### Schema (Platform-Defined)
+
+```python
+# skills/github/models.py
+"""GitHub skill tables — platform-defined, lives in platform DB."""
+
+from api.models import Base  # same Base as all other tables
+
+class SkGithubRepo(Base):
+    __tablename__ = "sk_github_repos"
+    __table_args__ = (
+        UniqueConstraint("owner", "name", name="uq_sk_github_repo_owner_name"),
+    )
+
+    repo_id = Column(String(36), primary_key=True)
+    owner = Column(String(100), nullable=False)
+    name = Column(String(100), nullable=False)
+    full_name = Column(String(200), nullable=False)
+    default_branch = Column(String(100), default="main")
+    created_at = Column(DateTime, nullable=False)
+
+class SkGithubPRCache(Base):
+    __tablename__ = "sk_github_pr_cache"
+    __table_args__ = (
+        UniqueConstraint("repo_full_name", "pr_number", name="uq_sk_github_pr_repo_pr"),
+        Index("ix_sk_github_pr_cache_repo_state", "repo_full_name", "state"),
+    )
+
+    cache_id = Column(String(36), primary_key=True)
+    repo_full_name = Column(String(200), nullable=False)
+    pr_number = Column(Integer, nullable=False)
+    title = Column(String(500))
+    state = Column(String(20))          # open / closed / merged
+    author = Column(String(100))
+    ci_status = Column(String(20))      # success / failure / pending
+    ci_conclusion = Column(String(20))
+    data = Column(JSON)                  # full PR payload
+    fetched_at = Column(DateTime, nullable=False)
+```
+
+#### Skill API Layer
+
+```python
+# skills/github/api.py
+"""GitHub skill API — typed interface for data access."""
+
+class GitHubSkillAPI:
+    """API layer for GitHub skill data. Uses platform DB session."""
+
+    def __init__(self, db: Session, credentials: dict[str, str]):
+        self._db = db  # platform DB session
+        self._token = credentials.get("github_token")
+        self._client = Github(auth=Auth.Token(self._token)) if self._token else None
+
+    def add_repo(self, owner: str, name: str) -> dict:
+        """Register a repository for tracking."""
+
+    def list_repos(self) -> list[dict]:
+        """List registered repositories."""
+
+    def list_prs(self, repo: str, state: str = "open", limit: int = 10) -> list[dict]:
+        """List PRs. Fetches from GitHub API, caches in sk_github_pr_cache."""
+
+    def get_pr_checks(self, repo: str, pr_number: int) -> dict:
+        """Get CI/check status for a specific PR."""
+```
+
+#### Skill Actions (What the Agent Calls)
+
+```python
+# skills/github/actions.py
+"""GitHub skill actions — registered as tools for the agent."""
+
+class ListPRsAction:
+    name = "github_list_prs"
+    description = "List open/closed PRs in a repository"
+
+    async def execute(self, api: GitHubSkillAPI, repo: str, state: str = "open") -> dict:
+        return api.list_prs(repo, state)
+
+class GetPRChecksAction:
+    name = "github_get_pr_checks"
+    description = "Get CI/check status for a PR"
+
+    async def execute(self, api: GitHubSkillAPI, repo: str, pr_number: int) -> dict:
+        return api.get_pr_checks(repo, pr_number)
+```
+
+### Skill Versioning
+
+```
+Register → Store in skills_registry (with version, code_hash, git_commit_hash)
+         → Keep active version in memory
+         → Archive old versions (never delete)
+
+Execute  → Record skill_name + skill_version in conversation_events
+         → Result logged with full provenance
+
+Replay   → Load exact version from event metadata
+         → Execute with historical skill logic
+         → Reproduce exact behavior
+
+Upgrade  → New version triggers regression gate (see trust-and-safety.md)
+         → Gate passes → activate new version
+         → Gate fails → reject, keep old version
+```
+
+### Declarative Skill Definition
+
+```yaml
+# skill.yaml — declarative skill definition
+name: code_review
+version: 2.1.0
+description: Review code changes for quality, security, and style
+table_prefix: code_review    # tables: code_review_{table_name}
+
+credentials:
+  - name: github_token
+    type: secret
+    description: GitHub Personal Access Token
+    required: true
+
+triggers:
+  keywords: [review, PR, pull request, code quality]
+
+requirements:
+  access: read
+
+parameters:
+  pr_number:
+    type: integer
+    description: Pull request number to review
+    required: true
+  focus_areas:
+    type: array
+    items: {type: string, enum: [quality, security, performance, style]}
+    description: Areas to focus the review on
+    default: [quality, security]
+
+side_effects:
+  category: read
+  external_apis: [github]
+
+progressive_disclosure:
+  tier1_tokens: 25
+  tier2_tokens: 120
+  tier3_tokens: 500
+
+mcp_compatible: true
+```
+
+---
+
+## 2. Execution Model
 
 Skills execute in two locations depending on what they need access to. See [Edge-Cloud Execution](edge-cloud-execution.md) for the full design.
 
@@ -63,6 +318,28 @@ For **heavy background workloads** (model training, data collection), see
 [Deployment Architecture § Background Jobs](deployment-architecture.md#3-execution-model-tools-vs-background-jobs).
 These are NOT skills — they are jobs submitted via `/jobs` API.
 
+### Runtime Execution Flow
+
+```python
+async def execute_skill(user_id, skill_name, params):
+    # 1. Verify skill is installed
+    installation = db.query(SkillInstallation).filter_by(
+        user_id=user_id, skill_name=skill_name, status="installed"
+    ).one_or_none()
+    if not installation:
+        raise SkillNotInstalled(f"Install first: /skill install {skill_name}")
+
+    # 2. Get credentials
+    creds = get_decrypted_credentials(user_id, skill_name)
+
+    # 3. Create skill API instance (uses platform DB session)
+    api = GitHubSkillAPI(db=db, credentials=creds)
+
+    # 4. Execute action
+    action = skill.get_action(params["action_name"])
+    return await action.execute(api, **params)
+```
+
 ### Progressive Disclosure (Anthropic-Aligned)
 
 Following Anthropic's Agent Skills pattern and RAG-MCP research (Gan & Sun, 2025), skills load in two tiers with **real token accounting** and **semantic retrieval**:
@@ -77,7 +354,7 @@ Tier 2: FULL SCHEMA (injected only for LLM-selected skills, measured tokens)
   Complete OpenAI tool JSON schema (from Pydantic model or default)
   Includes: name, description, parameters, detailed_instructions, examples, edge_cases
   Token cost: measured per-skill via len(json) // 4
-  
+
   Note: The schema's name + description fields serve as the "summary" tier
         for LLM candidate ranking. There is no separate Tier 2 LLM ranking pass —
         semantic retrieval filters candidates, then LLM sees full schemas and
@@ -92,28 +369,222 @@ Tier 2: FULL SCHEMA (injected only for LLM-selected skills, measured tokens)
 
 **Why this matters**: With 50+ skills, putting all details in context wastes attention budget. Tier 1 embeddings let the retriever find candidates without any prompt tokens. Tier 2 full schemas are loaded only for budget-available skills, and the LLM selects directly.
 
-### Skill Versioning
+### Skill Types
+
+| Type | Side Effects | Approval | Examples |
+|------|-------------|----------|----------|
+| **Read** | None | Auto | code_read, ci_status, search_code |
+| **Write** | External state change | Configurable | create_pr, merge_pr, create_issue |
+| **Destructive** | Irreversible change | Always required | delete_repo, force_push |
+| **Compute** | Internal only | Auto | summarize, analyze, generate_tests |
+
+### Skill Lifecycle
 
 ```
-Register → Store in skills_registry (with version, code_hash, git_commit_hash)
-         → Keep active version in memory
-         → Archive old versions (never delete)
+Draft → Registered → Active → Deprecated → Archived
 
-Execute  → Record skill_name + skill_version in conversation_events
-         → Result logged with full provenance
-
-Replay   → Load exact version from event metadata
-         → Execute with historical skill logic
-         → Reproduce exact behavior
-
-Upgrade  → New version triggers regression gate (see trust-and-safety.md)
-         → Gate passes → activate new version
-         → Gate fails → reject, keep old version
+Draft:       Development, not available to agents
+Registered:  In registry, not yet active (pending gate)
+Active:      Available to agents, regression-tested
+Deprecated:  Still works, but new selections discouraged
+Archived:    Read-only, available for replay only
 ```
 
 ---
 
-## 2. MCP / A2A Compatibility Layer
+## 3. Skill Selection Pipeline
+
+> **Implementation**: `core/skills/pipeline.py` — `SkillPipeline` is the single public interface.
+> Internal components (`selector.py`, `modern_selector.py`, `self_improving_selector.py`) are implementation details — external code must use `SkillPipeline` only.
+
+### The Problem
+
+With 50+ skills, the LLM can't efficiently choose from a flat list. Selection must be fast, accurate, and auditable. Research shows keyword matching collapses beyond ~30 tools (RAG-MCP, 2025). Semantic retrieval is mandatory, not optional.
+
+### Unified Pipeline: Retrieve → Audit → Feedback
+
+Previously, five selector classes existed with overlapping responsibilities (`SkillSelector`, `ModernSkillSelector`, `AuditableSkillSelector`, `SelfImprovingSelector`, `AgentSkillSelector`). These have been unified into a single `SkillPipeline`:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     SkillPipeline                        │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │ Stage 1: RETRIEVE + RANK                         │   │
+│  │  Semantic vector search (<50ms, 0 prompt tokens) │   │
+│  │  → Budget-controlled full schema loading         │   │
+│  │  → Apply learned corrections                     │   │
+│  │  Output: tools_schema + candidate metadata       │   │
+│  └──────────────────────────────────────────────────┘   │
+│                         │                                │
+│  ┌──────────────────────▼───────────────────────────┐   │
+│  │ Stage 2: AUDIT                                   │   │
+│  │  Snapshot context → Record selection event        │   │
+│  │  Output: event_id (for feedback linkage)          │   │
+│  └──────────────────────────────────────────────────┘   │
+│                         │                                │
+│  ┌──────────────────────▼───────────────────────────┐   │
+│  │ Stage 3: FEEDBACK (post-execution, async)        │   │
+│  │  Collect signals → Batch write                    │   │
+│  │  Learning cycle runs periodically, not inline     │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Key design decisions**:
+
+1. **`get_tools_schema()` remains the primary interface** — ChatLoop needs tools schema for LLM function calling. The pipeline enriches this call with audit + learning, not replaces it.
+2. **Learning is separate from selection** — `SkillPipeline.get_tools_schema()` applies learned corrections synchronously. Learning cycle (`learn()`) runs asynchronously via scheduler or API call.
+3. **Feedback is batched** — `record_feedback()` writes to an in-memory buffer, flushed periodically. No synchronous DB write per tool execution.
+4. **No internal implementation leaks** — Callers never see `ModernSkillSelector` or `SelfImprovingSelector`. The pipeline is the only public interface.
+
+### Interface
+
+```python
+class SkillPipeline:
+    """Unified skill selection: retrieve → audit → feedback."""
+
+    def __init__(self, db, llm_client, *, audit=True, learning=True): ...
+
+    def get_tools_schema(self, query, session_id, *, max_candidates=5) -> ToolsResult:
+        """Select skills and return tools schema for LLM."""
+
+    def record_feedback(self, event_id, signal, data) -> None:
+        """Buffer a feedback signal (async flush)."""
+
+    def learn(self, *, days=7) -> LearningResult:
+        """Run learning cycle. Called by scheduler, not by ChatLoop."""
+
+    def stats(self) -> dict: ...
+
+@dataclass
+class ToolsResult:
+    tools: list[dict]       # OpenAI tools schema, ready for LLM
+    event_id: str | None    # Audit event ID (None if audit disabled)
+    candidates: int         # Number of candidates considered
+```
+
+### ChatLoop Integration
+
+```python
+result = self.pipeline.get_tools_schema(
+    query=user_input, session_id=session_id, max_candidates=max_candidates,
+)
+tools_schema = result.tools
+
+# After each tool execution:
+self.pipeline.record_feedback(result.event_id, SignalType.EXECUTION_TIME, {"ms": elapsed})
+```
+
+### Multi-Stage Selection Detail
+
+```
+Stage 1: RETRIEVE (semantic vector search, <50ms, 0 prompt tokens)
+  - Encode query into embedding vector
+  - Cosine similarity against skill embedding index (SkillIndex)
+  - Return top-k candidates (k = 2× max_candidates for headroom)
+  - Fallback: keyword matching if vector index unavailable
+
+Stage 2: LOAD (full schema, budget-controlled)
+  - Build full OpenAI tool schema for each candidate
+  - Measure real token cost per schema: len(json) // 4
+  - Include only if within remaining context_budget
+  - Skills that exceed budget are excluded entirely (no stubs)
+  - LLM selects + extracts parameters in a single function-calling pass
+```
+
+**Why no separate LLM ranking pass?** OpenAI-style function calling requires full parameter schemas to generate valid calls. A two-pass approach (rank with summaries → load full schemas) doubles LLM latency for marginal benefit. Semantic retrieval (zero LLM cost) does the heavy filtering; the budget cap ensures only a controlled number of full schemas reach the LLM.
+
+**Scaling behavior**:
+| Skill count | Stage 1 method | Prompt tokens (5 candidates) |
+|-------------|---------------|------------------------------|
+| <20         | keyword OK    | ~500-2000 (budget-capped)    |
+| 20-100      | semantic required | ~500-2000 (budget-capped)|
+| 100+        | semantic + hierarchical | ~500-2000 (budget-capped) |
+
+Prompt token cost stays **constant** regardless of total skill count — only the retrieval index grows.
+
+### Auditable Selection
+
+Every selection is recorded:
+
+```json
+{
+  "event_id": "sel_01...",
+  "session_id": "sess_01...",
+  "user_query": "Review PR #123",
+  "selected_skills": ["code_review", "summarize_pr"],
+  "selection_method": "semantic",
+  "created_at": "2026-02-20T12:00:00Z"
+}
+```
+
+After selection, the executor enforces approval gates based on each skill's `SideEffectCategory` (Read/Write/Destructive). See [§1 Skill Types](#skill-types) for the approval matrix.
+
+### Self-Improving Selection
+
+The `SelfImprovingSelector` (internal to `SkillPipeline`) learns from historical failures via a closed-loop:
+
+```
+PRODUCTION USAGE:
+  User query → SkillPipeline.get_tools_schema()
+    → Stage 1: Semantic retrieval + LLM ranking
+    → Stage 2: Apply learned corrections (boost/penalize skills by pattern)
+    → Stage 3: Record audit event
+  → Execution & feedback signals recorded
+
+LEARNING CYCLE (triggered manually or scheduled):
+  1. OBSERVE: Get recent failures from skill_selection_events
+  2. DIAGNOSE: Extract patterns (query_pattern → wrong_skills → correct_skills)
+  3. VALIDATE: Regression gate replays golden sessions, compares old vs new scores
+  4. DEPLOY: If improvement confirmed, activate learnings (confidence-gated)
+```
+
+**Four signal types drive learning**:
+
+| Signal | Trigger | Example |
+|--------|---------|---------|
+| `WRONG_SKILL` | User corrects skill choice | "I wanted create_pr, not list_prs" |
+| `SLOW_EXECUTION` | Execution > 5000ms | Skill took too long |
+| `HIGH_COST` | Cost > $0.10 | Expensive LLM calls in skill |
+| `LOW_SATISFACTION` | User rating < 3 | Poor result quality |
+
+**Multi-factor scoring** combines dimensions with configurable weights:
+
+```
+score = accuracy_weight × accuracy_score + speed_weight × speed_score
+      + cost_weight × cost_score + satisfaction_weight × satisfaction_score
+```
+
+**Safety mechanisms**:
+- **Regression Gate**: Tests on golden queries before deployment, requires improvement ≥ threshold
+- **Confidence Threshold**: Only applies learnings with confidence ≥ 50 (increases with evidence, capped at 99)
+- **Full Audit Trail**: Every selection, learning, and gate validation logged
+- **Reversibility**: Can disable learning per pipeline, reset learnings in database
+
+**Database tables**:
+- `skill_selection_events` — every selection decision with query, selected skills, method
+- `skill_selection_learnings` — learned correction rules with confidence and evidence count
+- `skill_learning_signals` — raw feedback signals per execution
+- `gate_results` — regression gate verdicts for learning changes
+
+**Performance**:
+| Operation | Latency | Storage |
+|-----------|---------|---------|
+| `get_tools_schema()` | ~10ms | 1KB/event |
+| `learn()` | 1-5s | 500B/learning |
+
+For usage guide (weights configuration, selective learning, troubleshooting), see [Multi-Dimensional Learning Guide](../guides/multi-dimensional-learning-guide.md).
+
+### Procedural Memory Bridge
+
+`core/skills/procedural_memory.py` provides a type-layer adapter that converts `skill_selection_learnings` rows into `Memory` domain objects. This enables the Skill Selector to use memory-system APIs (governance, confidence decay, trust tiers) without duplicating data.
+
+**Design boundary**: skill selection learnings are Skill Selector internal correction rules, NOT general-purpose procedural memory. The bridge is consumed only during skill selection — it is NOT injected into `MemoryRetriever`.
+
+---
+
+## 4. MCP / A2A Compatibility Layer
 
 > **MCP Status**: ✅ Implemented — `core/skills/mcp_bridge.py` (`MCPBridge` class), supports stdio + streamable HTTP transports, namespaced tool names, integrated into ChatLoop (3 execution paths). 12 unit tests passing.
 
@@ -164,74 +635,209 @@ Google's Agent-to-Agent protocol enables cross-platform agent collaboration. Our
 - **Message** → conversation_events with agent_id
 - **Artifact** → Skill execution results
 
-This is a future capability, but the architecture should not preclude it.
+---
+
+## 5. Skill Marketplace
+
+> 🔵 **Design Target** — Marketplace discovery, publishing, and RBAC are not yet implemented.
+> Current implementation: `SkillManager` supports install/uninstall/credential CRUD for
+> platform-defined skills. The marketplace vision below describes the target architecture.
+
+### The Vision: App Store for Agent Skills
+
+Skills are publishable, discoverable, and installable — like an app store. Admin publishes skills to the marketplace, controls visibility per user/role, and users install skills to enable capabilities.
+
+### Architecture: Publish → Authorize → Install → Use
+
+```
+ADMIN (platform operator)
+  │
+  ├── Publishes skill to marketplace (skills_registry table)
+  ├── Grants access: per-user or per-role (skill_permissions table)
+  └── Manages skill lifecycle: activate / deprecate / archive
+
+USER
+  │
+  ├── Browses available skills (filtered by permissions)
+  ├── Installs skill:
+  │     → Permission check
+  │     → User provides credentials if required (encrypted in platform DB)
+  │     → Records in skill_installations
+  ├── Uses skill in sessions (agent calls skill API, skill reads/writes platform DB)
+  └── Uninstalls skill (marks uninstalled, deletes credentials)
+```
+
+### Platform Tables
+
+#### skills_registry — unified skill catalog
+
+> ORM model: `api/models/skill.py::SkillRegistry`. Service layer: `core/skills/catalog.py::SkillCatalog` (aliased as `SkillRegistry` in `core/skills/registry.py` for backward compatibility).
+
+```python
+class SkillRegistry(Base):
+    __tablename__ = "skills_registry"
+
+    skill_id = Column(String(255), primary_key=True)  # skill_name@version
+    skill_name = Column(String(255), nullable=False, index=True)
+    version = Column(String(32), nullable=False)
+    description = Column(Text)
+    skill_definition = Column(JSON)
+    source = Column(String(20), default="builtin")  # builtin/marketplace/user
+    manifest = Column(JSON)
+    is_active = Column(SmallInteger, default=1)
+    is_public = Column(SmallInteger, default=0)
+    status = Column(String(20), default="active")
+    created_by = Column(String(36))
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+```
+
+#### skill_installations — per-user install state
+
+```python
+class SkillInstallation(Base):
+    __tablename__ = "skill_installations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "skill_name", name="uq_user_skill"),
+        Index("ix_install_user_status", "user_id", "status"),
+    )
+
+    installation_id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False)
+    skill_name = Column(String(100), nullable=False)
+    skill_version = Column(String(20), nullable=False)
+    status = Column(String(20), default="installed")  # installed | uninstalled
+    installed_at = Column(DateTime, nullable=False)
+    updated_at = Column(DateTime)
+```
+
+#### user_credentials — per-user encrypted secrets
+
+```python
+class UserCredential(Base):
+    __tablename__ = "user_credentials"
+    __table_args__ = (
+        UniqueConstraint("user_id", "skill_name", "credential_name",
+                         name="uq_user_skill_cred"),
+    )
+
+    credential_id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False)
+    skill_name = Column(String(100), nullable=False)
+    credential_name = Column(String(100), nullable=False)
+    value_encrypted = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+    rotated_at = Column(DateTime)
+```
+
+#### skill_permissions — RBAC
+
+```python
+class SkillPermission(Base):
+    __tablename__ = "skill_permissions"
+    __table_args__ = (
+        UniqueConstraint("skill_name", "grantee_type", "grantee_id",
+                         name="uq_skill_grantee"),
+    )
+
+    permission_id = Column(String(36), primary_key=True)
+    skill_name = Column(String(100), nullable=False)
+    grantee_type = Column(String(10), nullable=False)  # "user" | "role"
+    grantee_id = Column(String(36), nullable=False)
+    granted_by = Column(String(36), nullable=False)
+    granted_at = Column(DateTime, nullable=False)
+```
+
+### Install / Uninstall Lifecycle
+
+**Install Flow**:
+```
+User: "install github skill"
+  ├─ 1. Check permission → query skill_permissions
+  ├─ 2. Check dependencies → query skill_installations
+  ├─ 3. Prompt for credentials (if required) → encrypt and store in user_credentials
+  └─ 4. Record installation → INSERT INTO skill_installations
+```
+No DDL execution. Tables already exist in platform DB (created by `init_db()`).
+
+**Uninstall Flow**:
+```
+User: "uninstall github skill"
+  ├─ 1. Check: any other skills depend on this?
+  ├─ 2. Mark as uninstalled in skill_installations
+  └─ 3. Delete credentials from user_credentials
+```
+No DROP TABLE. Skill data remains in platform DB.
+
+**Upgrade Flow**:
+```
+Platform upgrades github skill v1.0.0 → v1.1.0
+  ├─ Schema change? → Platform-level migration (same as any api/models.py change)
+  └─ No schema change? → Update skill_installations.skill_version
+```
+
+### init_db() — Skill Table Discovery
+
+```python
+def init_db():
+    """Create all tables — core + skill."""
+    _import_skill_models()
+    Base.metadata.create_all(bind=engine, checkfirst=True)
+
+def _import_skill_models():
+    """Auto-discover and import skills/*/models.py."""
+    import importlib
+    from pathlib import Path
+    skills_dir = Path(__file__).parent.parent / "skills"
+    for skill_dir in skills_dir.iterdir():
+        if skill_dir.is_dir() and (skill_dir / "models.py").exists():
+            importlib.import_module(f"skills.{skill_dir.name}.models")
+```
+
+### MatrixOne-Enhanced Distribution (Design Target, opt-in)
+
+When both publisher and subscriber are on MatrixOne, skill distribution can leverage native Publication for zero-copy, auto-updating skill catalogs:
+
+```
+PUBLISHER (skill author account)
+  ├── Develops skill, tests in sandbox (CREATE CLONE → replay gate)
+  ├── Publishes: CREATE PUBLICATION skill_catalog_pub DATABASE skill_catalog TABLE ...;
+  └── Updates skill → subscribers see changes immediately (zero-copy)
+
+SUBSCRIBER (consumer account)
+  ├── Subscribes: CREATE DATABASE marketplace FROM publisher_acct PUBLICATION skill_catalog_pub;
+  ├── Agent loads skill definition from subscription DB
+  ├── Executes skill in own account context (isolation)
+  └── Invocation logged in own conversation_events (audit)
+```
+
+**Version pinning**: `CREATE CLONE pinned_skills FROM publisher_acct.skill_catalog;` for snapshot-in-time, vs subscribe for always-latest.
+
+With MatrixOne: **Publication = distribution + auto-update. Clone = version pinning. Multi-Account = access control.** The entire marketplace infrastructure collapses into 3 SQL statements.
+
+### What Moves Out of api/models.py
+
+| Current Location | Becomes | Skill |
+|-----------------|---------|-------|
+| `Repo` in `api/models.py` | `sk_github_repos` in `skills/github/models.py` | github |
+| `core/repos/` | `skills/github/api.py` | github |
+| `core/skills/github_client.py` | `skills/github/api.py` | github |
+| `KnowledgeEntry` in `api/models.py` | `sk_knowledge_entries` in `skills/knowledge/models.py` | knowledge |
+| `KnowledgeRelation` in `api/models.py` | `sk_knowledge_relations` in `skills/knowledge/models.py` | knowledge |
+| `core/context/knowledge.py` | `skills/knowledge/api.py` | knowledge |
+
+### Skill Permission Model
+
+```
+Admin publishes skill "github" to marketplace
+  ├─ Grant to role: all users with role "developer" can install
+  ├─ Grant to user: only specific user can install
+  └─ Public: all authenticated users can install
+```
 
 ---
 
-## 3. Skill Selection
-
-### The Problem
-
-With 50+ skills, the LLM can't efficiently choose from a flat list. Selection must be fast, accurate, and auditable. Research shows keyword matching collapses beyond ~30 tools (RAG-MCP, 2025). Semantic retrieval is mandatory, not optional.
-
-### Multi-Stage Selection (Retrieval → Budget-Controlled Load)
-
-```
-Stage 1: RETRIEVE (semantic vector search, <50ms, 0 prompt tokens)
-  - Encode query into embedding vector
-  - Cosine similarity against skill embedding index (SkillIndex)
-  - Return top-k candidates (k = 2× max_candidates for headroom)
-  - Fallback: keyword matching if vector index unavailable
-
-Stage 2: LOAD (Tier 3 full schema, budget-controlled)
-  - Build full OpenAI tool schema for each candidate
-  - Measure real token cost per schema: len(json) // 4
-  - Include only if within remaining context_budget
-  - Skills that exceed budget are excluded entirely (no stubs)
-  - LLM selects + extracts parameters in a single function-calling pass
-```
-
-**Why not a separate "Tier 2 ranking" LLM call?** OpenAI-style function calling requires full parameter schemas to generate valid calls. A two-pass approach (rank with summaries → load full schemas) would double LLM latency for marginal benefit. Instead, the semantic retrieval stage (zero LLM cost) does the heavy filtering, and the budget cap ensures only a controlled number of full schemas reach the LLM. This matches Anthropic's actual implementation: the meta-tool decides which skill to load (cheap), then the full skill content is injected (expensive but targeted).
-
-**Scaling behavior**:
-| Skill count | Stage 1 method | Prompt tokens (5 candidates) |
-|-------------|---------------|------------------------------|
-| <20         | keyword OK    | ~500-2000 (budget-capped)    |
-| 20-100      | semantic required | ~500-2000 (budget-capped)|
-| 100+        | semantic + hierarchical | ~500-2000 (budget-capped) |
-
-Note: prompt token cost stays **constant** regardless of total skill count — only the retrieval index grows.
-
-### Auditable Selection
-
-Every selection is recorded:
-
-```json
-{
-  "event_id": "sel_01...",
-  "session_id": "sess_01...",
-  "user_query": "Review PR #123",
-  "selected_skills": ["code_review", "summarize_pr"],
-  "selection_method": "semantic",
-  "created_at": "2026-02-20T12:00:00Z"
-}
-```
-
-### Self-Improving Selection
-
-The `SelfImprovingSelector` learns from historical failures:
-
-```
-Observe: skill selection led to poor quality_score
-  → Analyze: was the wrong skill selected? Were parameters wrong?
-  → Learn: update selection patterns (stored in procedural memory)
-  → Validate: replay failing cases in sandbox with updated patterns
-  → Deploy: if improvement confirmed, update selection weights
-```
-
----
-
-## 4. Tool Design Principles
+## 6. Tool Design Principles
 
 Following Anthropic's guidance on writing tools for agents:
 
@@ -264,213 +870,38 @@ Parameter names and descriptions are part of the tool's "prompt." They must be u
 # Bad
 {"file": "string"}
 
-# Good  
+# Good
 {"file_path": "Absolute path to the file to read, e.g. /src/auth/login.py"}
 ```
 
 ---
 
-## 5. Skill Types and Lifecycle
+## 7. Comparison with Industry
 
-### Types
+Comparison focuses on **stateful skill management** — persistent data, lifecycle, platform-level governance. All frameworks support tool/function schemas for LLM calling; that is table stakes and not compared here.
 
-| Type | Side Effects | Approval | Examples |
-|------|-------------|----------|----------|
-| **Read** | None | Auto | code_read, ci_status, search_code |
-| **Write** | External state change | Configurable | create_pr, merge_pr, create_issue |
-| **Destructive** | Irreversible change | Always required | delete_repo, force_push |
-| **Compute** | Internal only | Auto | summarize, analyze, generate_tests |
-
-### Lifecycle
-
-```
-Draft → Registered → Active → Deprecated → Archived
-
-Draft:       Development, not available to agents
-Registered:  In registry, not yet active (pending gate)
-Active:      Available to agents, regression-tested
-Deprecated:  Still works, but new selections discouraged
-Archived:    Read-only, available for replay only
-```
-
-### Skill as Stateful Package
-
-```yaml
-# skill.yaml — declarative skill definition
-name: code_review
-version: 2.1.0
-description: Review code changes for quality, security, and style
-table_prefix: code_review    # tables: code_review_{table_name}
-
-credentials:
-  - name: github_token
-    type: secret
-    description: GitHub Personal Access Token
-    required: true
-
-triggers:
-  keywords: [review, PR, pull request, code quality]
-  
-requirements:
-  access: read
-  
-parameters:
-  pr_number:
-    type: integer
-    description: Pull request number to review
-    required: true
-  focus_areas:
-    type: array
-    items: {type: string, enum: [quality, security, performance, style]}
-    description: Areas to focus the review on
-    default: [quality, security]
-
-side_effects:
-  category: read
-  external_apis: [github]
-  
-progressive_disclosure:
-  tier1_tokens: 25
-  tier2_tokens: 120
-  tier3_tokens: 500
-
-mcp_compatible: true
-```
-
-For the full package structure (schema.py, migrations/, manifest.yaml), see [skill-as-package.md](skill-as-package.md).
+| Feature | ElizaOS | LangChain | MCP | **mo-agent-engine** |
+|---------|---------|-----------|-----|---------------------|
+| Platform-managed schema | ✅ plugin schema (plugin owns) | ❌ stateless | ❌ stateless | ✅ platform-defined |
+| Table namespace | ❌ bare names | ❌ | ❌ | ✅ `sk_{skill}_{table}` |
+| Install lifecycle | ❌ | ❌ | ❌ | ✅ |
+| Skill API layer | ❌ direct SQL | ❌ | ❌ | ✅ typed API |
+| Marketplace + RBAC | ❌ | ❌ | ❌ | ✅ |
+| Per-user credentials | ❌ env vars | ❌ env vars | ❌ | ✅ encrypted |
+| Skill-local models | ❌ | ❌ | ❌ | ✅ `skills/{name}/models.py` |
+| Self-improving selection | ❌ | ❌ | ❌ | ✅ closed-loop learning |
+| Unified selection pipeline | ❌ | ❌ | ❌ | ✅ retrieve → audit → feedback |
 
 ---
 
-## 6. Skill Marketplace
+## 8. Open Questions
 
-> 🔵 **Design Target** — Marketplace discovery, publishing, and RBAC are not yet implemented.
-> Current implementation: `SkillManager` supports install/uninstall/credential CRUD for
-> platform-defined skills. The marketplace vision below describes the target architecture.
+1. **Cross-skill data access**: can knowledge skill read from github skill's tables?
+   - Proposed: explicit dependency in manifest, platform provides cross-skill API
+   - Since all tables are in the same DB, JOINs are trivial
 
-### The Vision: App Store for Agent Skills
-
-Skills are publishable, discoverable, and installable — like an app store. Admin publishes skills to the marketplace, controls visibility per user/role, and users install skills to enable capabilities.
-
-### Architecture: Publish → Authorize → Install → Use
-
-```
-ADMIN (platform operator)
-  │
-  ├── Publishes skill to marketplace (skill_definitions table)
-  ├── Grants access: per-user or per-role (skill_permissions table)
-  └── Manages skill lifecycle: activate / deprecate / archive
-
-USER
-  │
-  ├── Browses available skills (filtered by permissions)
-  ├── Installs skill:
-  │     → Permission check
-  │     → User provides credentials if required (encrypted in platform DB)
-  │     → Records in skill_installations
-  ├── Uses skill in sessions (agent calls skill API, skill reads/writes platform DB)
-  └── Uninstalls skill (marks uninstalled, deletes credentials)
-```
-
-### Platform Tables for Marketplace
-
-- `skill_definitions` — catalog of available skills (admin-managed)
-- `skill_permissions` — RBAC: which users/roles can see which skills
-- `skill_installations` — tracks what's installed per user
-- `user_credentials` — per-user encrypted secrets for skills
-
-Skill business tables (`sk_{skill}_{table}`) are defined in `skills/{name}/models.py` and created by `init_db()`.
-
-For full table schemas and install/uninstall lifecycle, see [skill-as-package.md](skill-as-package.md).
-
-### MatrixOne-Enhanced Distribution (Design Target, opt-in)
-
-When both publisher and subscriber are on MatrixOne, skill distribution can leverage native Publication for zero-copy, auto-updating skill catalogs:
-
-```
-PUBLISHER (skill author account)
-  │
-  ├── Develops skill, tests in sandbox (CREATE CLONE → replay gate)
-  │
-  ├── Publishes:
-  │     CREATE PUBLICATION skill_catalog_pub
-  │       DATABASE skill_catalog TABLE skill_listings, skill_code;
-  │     -- Subscribers specified: ALL or specific accounts
-  │
-  └── Updates skill → subscribers see changes immediately (zero-copy)
-
-SUBSCRIBER (consumer account)
-  │
-  ├── Subscribes:
-  │     CREATE DATABASE marketplace FROM publisher_acct
-  │       PUBLICATION skill_catalog_pub;
-  │     -- Read-only access to skill definitions
-  │
-  ├── Agent loads skill definition from subscription DB
-  ├── Executes skill in own account context (isolation)
-  └── Invocation logged in own conversation_events (audit)
-```
-
-**Why this works naturally**:
-- Publisher updates a skill → all subscribers see the update instantly, no sync job
-- Subscriber has read-only access → can't tamper with skill definitions
-- Each subscriber runs skills in their own account → data isolation guaranteed
-- Skill code + metadata live in the same database → no separate registry to maintain
-
-This is fundamentally different from an "app store API" — it's **data-level distribution**. The marketplace IS the database. No API layer, no download step, no version sync problem.
-
-### Skill Publishing Flow
-
-```
-Author develops skill
-  │
-  ▼
-Local testing (sandbox)
-  │
-  ▼
-Submit to marketplace
-  │
-  ▼
-Automated validation:
-  - manifest.yaml schema valid?
-  - Side-effect profile declared?
-  - Test coverage provided?
-  - Regression gate passes?
-  │
-  ▼
-Published (admin adds to skill_definitions)
-  │
-  ▼
-Admin grants access → users can install
-```
-
-### Marketplace Table Design
-
-All marketplace tables (skill_definitions, skill_permissions, skill_installations, user_credentials) are defined in [skill-as-package.md](skill-as-package.md). They live in the platform DB alongside skill business tables (`sk_{skill}_{table}`).
-
-### MatrixOne-Enhanced: Version Pinning via Clone (Design Target)
-
-Subscribers who need version stability can clone instead of subscribing:
-
-```sql
--- Pin to current version: clone the published skill (snapshot in time)
-CREATE CLONE pinned_skills FROM publisher_acct.skill_catalog;
-
--- Or subscribe for auto-updates (read-only, always latest)
-CREATE DATABASE live_skills FROM publisher_acct PUBLICATION skill_catalog_pub;
-```
-
-Two consumption modes from one mechanism: **subscribe** for always-latest, **clone** for pinned versions.
-
-### Why MatrixOne Makes This Trivial
-
-In a traditional architecture, a skill marketplace requires:
-- A registry service (API + database)
-- A distribution mechanism (download, sync, CDN)
-- Version management (semver, pinning, rollback)
-- Access control (auth, entitlements, metering)
-- Update propagation (webhooks, polling, push)
-
-With MatrixOne: **Publication = distribution + auto-update. Clone = version pinning. Multi-Account = access control.** The entire marketplace infrastructure collapses into 3 SQL statements.
+2. **Schema evolution**: how to handle ALTER TABLE when platform upgrades a skill?
+   - Same as any other migration — platform-level, applied by operator
 
 ---
 

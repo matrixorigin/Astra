@@ -346,7 +346,7 @@ docker-compose --profile full up -d
 
 **Startup sequence**: MatrixOne + Redis → healthcheck pass → Init (schema + prompts) → API + optional services.
 
-**Database connections**: The platform DB (MatrixOne) stores all state — core tables and skill business tables (with `sk_` prefix). See [skill-as-package.md](skill-as-package.md) for the architecture.
+**Database connections**: The platform DB (MatrixOne) stores all state — core tables and skill business tables (with `sk_` prefix). See [Skills and Tools §1](skills-and-tools.md#1-skill-architecture) for the architecture.
 
 **Skill execution**: Edge skills run on user's machine. Cloud skills: lightweight run in-process inside API, heavy skills (training) dispatched to skill-worker container via Redis queue.  
 **ML inference**: In-process by default. With `--profile model`, shared Model Server at `:9527`.  

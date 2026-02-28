@@ -254,6 +254,8 @@ The implicit feedback detection currently uses regex heuristics + optional LLM c
 
 ### 4.1 Feedback Classification Model (Design)
 
+> Full design: [Feedback Classification Model](feedback-classification-model.md) — data pipeline, model architecture, training, deployment, continuous learning.
+
 **Motivation**: Regex heuristics catch obvious signals but miss nuanced dissatisfaction. LLM classification is accurate but expensive. A small fine-tuned model (e.g., distilled from labeled conversation pairs) can achieve high accuracy at near-zero marginal cost.
 
 **Data pipeline:**
@@ -299,7 +301,7 @@ DIAGNOSE: Which input was the bottleneck?
     - Missing skill? → Skill gap detection
     - Insufficient context? → Context budget tuning
     - Stale knowledge? → Knowledge regression detection
-    - Wrong skill selected? → SelfImprovingSelector
+    - Wrong skill selected? → Self-improving skill selection
     ↓
 PROPOSE: Generate candidate adjustment
     ↓
@@ -315,18 +317,17 @@ RECORD: Store the learning signal for future pattern matching
 
 ### Already Implemented
 
-- **SelfImprovingSelector**: Learns from historical skill selection failures using time-travel replay
+- **Self-Improving Skill Selection**: SkillPipeline learns from historical failures via closed-loop (observe → diagnose → gate → deploy). See [Skills and Tools §3](skills-and-tools.md#3-skill-selection-pipeline) for full architecture.
 - **RegressionGate (ChangeType.SELECTOR)**: Validates selector changes before deployment via unified gate
-- **AuditableSkillSelector**: Records every selection decision with full context
 - **InputFaceLearner**: ✅ Unified meta-learning loop for prompt, context budget, and knowledge input faces (`core/learning/input_face_learner.py`)
 
 ### The Generalization
 
-Meta-learning generalizes `SelfImprovingSelector` to ALL versioned inputs:
+Meta-learning generalizes self-improving skill selection to ALL versioned inputs:
 
 | Input | Current | Meta-Learning |
 |-------|---------|---------------|
-| Skill selection | SelfImprovingSelector | ✅ Already learning |
+| Skill selection | SkillPipeline | ✅ Already learning ([details](skills-and-tools.md#3-skill-selection-pipeline)) |
 | Prompt | PromptOptimizer | ✅ Auto-diagnose + improve via InputFaceLearner |
 | Context budget | _BUDGET_RATIOS | ✅ Task-aware dynamic adjustment via InputFaceLearner |
 | Knowledge | MemoryGovernanceEngine | ✅ Stale detection + targeted quarantine via InputFaceLearner |
@@ -474,7 +475,7 @@ Layer 1 guardrails (§6 in trust-and-safety.md) catch single-turn prompt injecti
 
 The most insidious attack: inject bad data into memory, wait for the agent to retrieve it.
 
-> **Note**: This query joins `sk_knowledge_entries` with `conversation_events` — both in the same platform database. See [skill-as-package.md](skill-as-package.md) for the table naming convention.
+> **Note**: This query joins `sk_knowledge_entries` with `conversation_events` — both in the same platform database. See [Skills and Tools §1](skills-and-tools.md#1-skill-architecture) for the table naming convention.
 
 ```sql
 -- Find memory entries that were retrieved before a low-quality decision

@@ -31,12 +31,14 @@ docs/
 │   ├── ARCHITECTURE.md
 │   ├── memory-architecture.md
 │   ├── trust-and-safety.md
-│   ├── skills-and-tools.md
+│   ├── skills-and-tools.md          # Unified: skill architecture, selection pipeline, marketplace
 │   ├── agents-and-orchestration.md
 │   ├── data-versioning.md
 │   ├── evaluation-and-evolution.md
 │   ├── learning-evolution-roadmap.md    # Evolution strategy
-│   └── self-improving-selector-architecture.md
+│
+├── guides/                          # Usage guides
+│   └── multi-dimensional-learning-guide.md
 │
 └── implementation/                  # Implementation details (this directory)
     ├── README.md                    # This file
@@ -61,7 +63,7 @@ docs/
 
 ### For Self-Improving Selector
 - **Complete Guide:** [self-improving-selector.md](self-improving-selector.md) ⭐
-- **Architecture:** [../design/self-improving-selector-architecture.md](../design/self-improving-selector-architecture.md)
+- **Architecture:** [../design/skills-and-tools.md#3-skill-selection-pipeline](../design/skills-and-tools.md#3-skill-selection-pipeline)
 - **Evolution Strategy:** [../design/learning-evolution-roadmap.md](../design/learning-evolution-roadmap.md)
 
 ---

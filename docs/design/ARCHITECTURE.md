@@ -85,7 +85,7 @@ We don't compete on "smarter LLM." We compete on **trust infrastructure**: every
 2. **Platform Services (Cloud)** — API server. Handles LLM calls (API key security, context assembly, memory injection, model routing, budget control, audit). Source of truth for all state. System agents run entirely here.
 3. **Enhanced Services** — opt-in capabilities when running on MatrixOne (zero-copy clone, time-travel, hybrid search).
 
-Skills are **stateful platform capabilities** with platform-defined schemas and typed API layers. Skill tables are defined in `skills/{name}/models.py` and created by `init_db()`. See [Skill-as-Package](skill-as-package.md).
+Skills are **stateful platform capabilities** with platform-defined schemas and typed API layers. Skill tables are defined in `skills/{name}/models.py` and created by `init_db()`. See [Skills and Tools §1](skills-and-tools.md#1-skill-architecture).
 
 Adding a new User Agent = define `AgentProfile` (system_prompt + skills + model). Zero platform code.
 
@@ -97,9 +97,7 @@ This is the index. Each document is the **single source of truth** for its domai
 |----------|-------|
 | [Memory Architecture](memory-architecture.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
 | [Trust and Safety](trust-and-safety.md) | Decision audit, hallucination firewall, uncertainty quantification, regression gate, observability, guardrails |
-| [Skills and Tools](skills-and-tools.md) | Skill system, MCP compatibility, tool design, side-effect profiles, progressive disclosure, marketplace |
-| [Skill-as-Package](skill-as-package.md) | Stateful skill architecture: platform-defined schema, install lifecycle, skill API layer, credential management, `sk_` table naming |
-| [Unified Selector Pipeline](unified-selector-pipeline.md) | Skill selection: retrieve → audit → feedback pipeline |
+| [Skills and Tools](skills-and-tools.md) | Skill system: Skill-as-Package (stateful architecture, schema, install lifecycle, credential management), selection pipeline (retrieve → audit → feedback), MCP compatibility, tool design, progressive disclosure, marketplace |
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt auto-evolution, implicit feedback mining, self-improving agents, meta-learning closed loop |
@@ -146,7 +144,7 @@ Our implementation: task-aware budget allocation, just-in-time retrieval, compac
 
 Industry trend: Anthropic's Agent Skills (three-tier progressive loading), MCP as the tool protocol standard, ElizaOS plugin schemas. But no framework supports skill install lifecycle with platform-defined schemas.
 
-Our position: Skills are **stateful platform capabilities** — the platform defines skill table schemas (deterministic, like any other model). All tables live in the same platform database, with skill business tables using `sk_{skill}_{table}` naming convention. Each skill defines its own tables in `skills/{name}/models.py`. Skills expose typed API layers for data access. This goes beyond ElizaOS (plugin-owned schema, fixed PG) and far beyond LangChain/CrewAI (stateless functions). See [Skill-as-Package](skill-as-package.md) and [Skills and Tools](skills-and-tools.md).
+Our position: Skills are **stateful platform capabilities** — the platform defines skill table schemas (deterministic, like any other model). All tables live in the same platform database, with skill business tables using `sk_{skill}_{table}` naming convention. Each skill defines its own tables in `skills/{name}/models.py`. Skills expose typed API layers for data access. This goes beyond ElizaOS (plugin-owned schema, fixed PG) and far beyond LangChain/CrewAI (stateless functions). See [Skills and Tools](skills-and-tools.md).
 
 ### 4. Trust Is Built Into the Platform, Not Bolted On
 

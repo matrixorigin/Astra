@@ -1,35 +1,35 @@
-# Self-Improving Skill Selector
+# Self-Improving Skill Selector — Implementation
 
-> **Last Updated**: 2026-02-21
+> **Last Updated**: 2026-02-28
+> **Design**: [Skills and Tools §3](../design/skills-and-tools.md#3-skill-selection-pipeline)
+> **Usage Guide**: [Multi-Dimensional Learning Guide](../guides/multi-dimensional-learning-guide.md)
 
-How the skill selection pipeline learns from feedback to improve over time.
+Implementation details for the self-improving skill selection pipeline.
 
-## Architecture
+## Module Map
 
 ```
-User query
-    → SkillPipeline (unified entry point)
-        → ModernSkillSelector: semantic retrieval (cosine similarity index)
-        → SelfImprovingSelector: apply learned corrections
-        → AuditableSkillSelector: record selection decision
-    → Tools schema returned to LLM
-    → After execution: feedback signals recorded
-    → Periodic: learning cycle analyzes signals → proposes corrections → gate validates
+core/skills/pipeline.py                  ← Unified entry point (SkillPipeline); audit logic inlined here
+core/skills/modern_selector.py           ← Semantic retrieval + LLM ranking (internal)
+core/skills/self_improving_selector.py   ← Learning engine (internal)
+core/skills/selector.py                  ← SkillMetadata + rule-based retrieval (internal)
+core/skills/skill_index.py               ← Cosine similarity embedding index
+core/skills/learning_signals.py          ← SignalType, SignalWeights
+core/skills/learning_config.py           ← Per-signal decay/threshold config
+core/skills/learning_similarity.py       ← Query pattern similarity
+core/skills/procedural_memory.py         ← Type bridge: learnings → Memory objects
+core/evaluation/regression_gate.py       ← Gate validation
 ```
 
-**Module**: `core/skills/pipeline.py` → `core/skills/modern_selector.py` → `core/skills/self_improving_selector.py`
+> `AuditableSkillSelector` no longer exists — audit event creation is inlined in `pipeline.py`.
 
-## Skill Selection
-
-### Semantic Retrieval
+## Semantic Retrieval
 
 `ModernSkillSelector` uses an in-memory cosine similarity index (`core/skills/skill_index.py`) to match user queries to skill descriptions:
 
 1. Embed all skill descriptions at startup (via `EmbeddingService`)
 2. Embed user query at request time
-3. Rank by cosine similarity, apply token budget for progressive disclosure:
-   - Tier 1: skill names + descriptions (always included)
-   - Tier 2: full parameter schemas (budget-gated)
+3. Rank by cosine similarity, apply token budget for progressive disclosure
 
 Falls back to keyword matching when no embedding function is available.
 
@@ -37,18 +37,9 @@ Falls back to keyword matching when no embedding function is available.
 
 `SkillInput` defines framework-injected fields (`user_id`, `session_id`, `repo_id`) that are auto-injected by the executor. These are stripped from the LLM-visible tool schema via `_FRAMEWORK_FIELDS` ClassVar so the LLM never sees or fills them.
 
-## Learning Signals
-
-Four signal types drive learning:
-
-| Signal | Trigger | Example |
-|--------|---------|---------|
-| `WRONG_SKILL` | User corrects skill choice | "I wanted create_pr, not list_prs" |
-| `SLOW_EXECUTION` | Execution > 5000ms | Skill took too long |
-| `HIGH_COST` | Cost > $0.10 | Expensive LLM calls in skill |
-| `LOW_SATISFACTION` | User rating < 3 | Poor result quality |
-
 ## Learning Cycle
+
+> For signal types, multi-factor scoring formula, and safety mechanisms, see [Skills and Tools §3](../design/skills-and-tools.md#3-skill-selection-pipeline).
 
 ```
 Signals accumulate in skill_learning_signals table
@@ -65,30 +56,7 @@ Corrections are applied as score adjustments during selection — boosting corre
 
 `core/skills/procedural_memory.py` provides a type-layer adapter that converts `skill_selection_learnings` rows into `Memory` domain objects. This enables the Skill Selector to use memory-system APIs (governance, confidence decay, trust tiers) without duplicating data.
 
-**Design boundary**: skill selection learnings are Skill Selector internal correction rules, NOT general-purpose procedural memory. The bridge is consumed only during skill selection — it is NOT injected into `MemoryRetriever`. This keeps a clean separation:
-
-- `MemoryRetriever` → queries `memories` table only (general memory retrieval for prompt assembly)
-- `SelfImprovingSelector` → queries `skill_selection_learnings` directly (skill selection decisions), with optional `learning_to_memory()` for type unification
-
-```
-skill_selection_learnings (DB)
-  → learning_to_memory()        # type adapter: ORM row → Memory object
-  → list_as_memories()          # batch query + convert
-  → consumed by Skill Selector  # NOT by MemoryRetriever
-```
-
-## Multi-Factor Scoring
-
-Selection score combines multiple dimensions with configurable weights:
-
-```
-score = accuracy_weight  × accuracy_score
-      + speed_weight     × speed_score
-      + cost_weight      × cost_score
-      + satisfaction_weight × satisfaction_score
-```
-
-Weights and decay rates are configurable per signal type.
+**Design boundary**: skill selection learnings are Skill Selector internal correction rules, NOT general-purpose procedural memory. The bridge is consumed only during skill selection — it is NOT injected into `MemoryRetriever`.
 
 ## API
 
@@ -103,7 +71,7 @@ Weights and decay rates are configurable per signal type.
 ## Database Tables
 
 - `skill_selection_events` — every selection decision with query, selected skills, method
-- `skill_selection_learnings` — learned correction rules with confidence and evidence count (type-bridged to Memory objects for Skill Selector internal use)
+- `skill_selection_learnings` — learned correction rules with confidence and evidence count
 - `skill_learning_signals` — raw feedback signals per execution
 - `gate_results` — regression gate verdicts for learning changes
 

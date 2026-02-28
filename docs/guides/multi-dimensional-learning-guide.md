@@ -382,6 +382,6 @@ failed_gates = db.query(GateResult).filter(
 
 ## See Also
 
-- [Self-Improving Selector Architecture](self-improving-selector-architecture.md)
-- [Learning Evolution Roadmap](learning-evolution-roadmap.md)
-- [API Reference](../api-reference.md)
+- [Skills and Tools — Selection Pipeline](../design/skills-and-tools.md#3-skill-selection-pipeline)
+- [Learning Evolution Roadmap](../design/learning-evolution-roadmap.md)
+- [API Reference](../reference/api-reference.md)

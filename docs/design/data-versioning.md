@@ -3,7 +3,7 @@
 > **Status**: Core Design — single source of truth for time travel, sandbox, branching, and data lineage  
 > **Last Updated**: 2026-02-22
 
-> **Data ownership note**: Data versioning operations (sandbox, time-travel, branching) apply to the platform database. All tables — core and skill — are in the same DB. Enhanced operations (zero-copy clone, native time-travel) require MatrixOne. See [skill-as-package.md](skill-as-package.md) for the architecture.
+> **Data ownership note**: Data versioning operations (sandbox, time-travel, branching) apply to the platform database. All tables — core and skill — are in the same DB. Enhanced operations (zero-copy clone, native time-travel) require MatrixOne. See [Skills and Tools §1](skills-and-tools.md#1-skill-architecture) for the architecture.
 
 ---
 
