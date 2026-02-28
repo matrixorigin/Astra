@@ -1,6 +1,8 @@
 # Local memory / rules (do not commit)
 .local/
 
+.mo-agent/
+
 # Docker volumes (local data)
 deployment/all-in-one/data/
 

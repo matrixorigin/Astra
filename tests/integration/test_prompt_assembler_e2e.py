@@ -519,6 +519,115 @@ class TestColdStartBaselines:
 
 
 # ============================================================================
+# 5b. Self-Model — Installed & Cloud Skills
+# ============================================================================
+
+class TestSelfModelSkills:
+    """Test that Self-Model correctly shows installed vs cloud skills."""
+
+    def _seed_skills(self, db, user_id: str):
+        """Insert test skills into registry + install some for user."""
+        for suffix, desc in [("ci", "Check CI status"), ("pr", "List open PRs"), ("sum", "Summarize PR changes")]:
+            name = f"{user_id}_{suffix}"
+            db.execute(sql_text(
+                "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
+                "VALUES (:id, :n, '1.0.0', :d, 1, 'devops')"
+            ), {"id": f"{name}@1.0.0", "n": name, "d": desc})
+        # Install only first two for the user
+        for i, suffix in enumerate(["ci", "pr"], 1):
+            name = f"{user_id}_{suffix}"
+            db.execute(sql_text(
+                "INSERT INTO skill_installations (installation_id, user_id, skill_name, skill_version, status, installed_at) "
+                "VALUES (:iid, :uid, :n, '1.0.0', 'installed', NOW())"
+            ), {"iid": f"inst_{user_id}_{i}", "uid": user_id, "n": name})
+        db.commit()
+
+    def _cleanup_skills(self, db, user_id: str):
+        """Remove test data to avoid leaking into other tests."""
+        db.execute(sql_text("DELETE FROM skill_installations WHERE user_id = :uid"), {"uid": user_id})
+        db.execute(sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"), {"pat": f"{user_id}%"})
+        db.commit()
+
+    def test_installed_skills_shown_with_description(self, db_session):
+        """Installed skills appear in Self-Model with version and description."""
+        from core.context.prompt_assembler import PromptAssembler
+        uid = unique_test_id()
+        self._seed_skills(db_session, uid)
+        try:
+            pa = PromptAssembler(lambda: db_session)
+            result = pa.assemble(
+                agent_id=None, user_query="what can you do?",
+                session_id=unique_test_id(), user_id=uid,
+            )
+            sm = result.sections["self_model"]
+            assert "My installed skills" in sm
+            assert f"{uid}_ci (v1.0.0): Check CI status" in sm
+            assert f"{uid}_pr (v1.0.0): List open PRs" in sm
+        finally:
+            self._cleanup_skills(db_session, uid)
+
+    def test_cloud_skills_exclude_installed(self, db_session):
+        """Cloud skills section excludes skills the user already installed."""
+        from core.context.prompt_assembler import PromptAssembler
+        uid = unique_test_id()
+        self._seed_skills(db_session, uid)
+        try:
+            pa = PromptAssembler(lambda: db_session)
+            result = pa.assemble(
+                agent_id=None, user_query="what else?",
+                session_id=unique_test_id(), user_id=uid,
+            )
+            sm = result.sections["self_model"]
+            # _sum is NOT installed → should appear in cloud skills
+            assert f"{uid}_sum" in sm
+            # _ci IS installed → should NOT appear in cloud skills section
+            cloud_section = sm.split("Available cloud skills:")[-1] if "Available cloud skills:" in sm else ""
+            assert f"{uid}_ci" not in cloud_section
+        finally:
+            self._cleanup_skills(db_session, uid)
+
+    def test_multi_version_dedup(self, db_session):
+        """Multiple versions of same skill don't produce duplicate lines."""
+        from core.context.prompt_assembler import PromptAssembler
+        uid = unique_test_id()
+        skill_name = f"{uid}_multi"
+        db_session.execute(sql_text(
+            "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active) "
+            "VALUES (:id1, :n, '1.0.0', 'Version one', 1)"
+        ), {"id1": f"{skill_name}@1.0.0", "n": skill_name})
+        db_session.execute(sql_text(
+            "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active) "
+            "VALUES (:id2, :n, '2.0.0', 'Version two', 1)"
+        ), {"id2": f"{skill_name}@2.0.0", "n": skill_name})
+        db_session.commit()
+        try:
+            pa = PromptAssembler(lambda: db_session)
+            result = pa.assemble(
+                agent_id=None, user_query="skills?",
+                session_id=unique_test_id(), user_id=uid,
+            )
+            sm = result.sections["self_model"]
+            # skill_name should appear exactly once in cloud skills
+            cloud_section = sm.split("Available cloud skills:")[-1] if "Available cloud skills:" in sm else ""
+            assert cloud_section.count(skill_name) == 1
+        finally:
+            db_session.execute(sql_text("DELETE FROM skills_registry WHERE skill_name = :n"), {"n": skill_name})
+            db_session.commit()
+
+    def test_no_user_id_skips_installed(self, db_session):
+        """When user_id is None, installed skills section is absent."""
+        from core.context.prompt_assembler import PromptAssembler
+        pa = PromptAssembler(lambda: db_session)
+        result = pa.assemble(
+            agent_id=None, user_query="test",
+            session_id=unique_test_id(), user_id=unique_test_id(),
+        )
+        sm = result.sections["self_model"]
+        # No skills installed for a random user_id → no "My installed skills"
+        assert "My installed skills" not in sm
+
+
+# ============================================================================
 # 6. Introspection Tool — get_agent_info
 # ============================================================================
 
@@ -635,6 +744,35 @@ class TestGetAgentInfoTool:
         result = json.loads(await tool.execute(dimension="capability"))
         assert result["capability"]["tool_count"] == 0
         assert result["capability"]["tools"] == []
+
+    @pytest.mark.asyncio
+    async def test_capability_enriched_with_cloud_skills(self):
+        """When api_client is available, capability includes installed + cloud skills."""
+        from unittest.mock import AsyncMock
+        from cli.tools.introspection import GetAgentInfoTool
+
+        mock_api = AsyncMock()
+        mock_api.get_introspection_skills.return_value = {
+            "installed": [{"name": "ci_status", "version": "1.0.0", "description": "Check CI", "category": "devops"}],
+            "cloud": [{"name": "summarize_pr", "version": "1.0.0", "description": "Summarize PR", "category": "devops"}],
+        }
+        tool = GetAgentInfoTool(tool_router=None, session_info={}, api_client=mock_api)
+        result = json.loads(await tool.execute(dimension="capability"))
+        assert result["capability"]["installed_skills"][0]["name"] == "ci_status"
+        assert result["capability"]["cloud_skills"][0]["name"] == "summarize_pr"
+
+    @pytest.mark.asyncio
+    async def test_capability_graceful_on_api_failure(self):
+        """API failure doesn't break capability dimension — just omits cloud skills."""
+        from unittest.mock import AsyncMock
+        from cli.tools.introspection import GetAgentInfoTool
+
+        mock_api = AsyncMock()
+        mock_api.get_introspection_skills.side_effect = ConnectionError("offline")
+        tool = GetAgentInfoTool(tool_router=None, session_info={}, api_client=mock_api)
+        result = json.loads(await tool.execute(dimension="capability"))
+        assert "installed_skills" not in result["capability"]
+        assert result["capability"]["tool_count"] == 0
 
 
 # ============================================================================

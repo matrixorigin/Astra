@@ -68,7 +68,7 @@ _BASELINE_INSIGHTS: dict[str, str] = {
 _DEFAULT_INSIGHT = "I'm still learning about my strengths and weaknesses. I'll improve as we work together."
 
 # Budget constants (tokens)
-_FIXED_SELF_MODEL = 400
+_FIXED_SELF_MODEL = 600
 _MAX_HISTORY_RATIO = 0.50
 
 # Edge content limits (public — tests verify truncation behavior).
@@ -184,7 +184,7 @@ class PromptAssembler(DbConsumer):
 
         # §2 Self-Model
         agent_type = self._get_agent_type(agent_id)
-        self_model = self._build_self_model(agent_id, agent_type, edge_context)
+        self_model = self._build_self_model(agent_id, agent_type, edge_context, user_id=user_id)
         sections["self_model"] = self_model
         breakdown["self_model"] = _estimate_tokens(self_model)
 
@@ -357,6 +357,7 @@ class PromptAssembler(DbConsumer):
         agent_id: str | None,
         agent_type: str,
         edge_context: EdgeContext | None,
+        user_id: str | None = None,
     ) -> str:
         """§2: Agent self-awareness — capabilities, boundaries, learned insights."""
         with self._db() as db:
@@ -375,13 +376,65 @@ class PromptAssembler(DbConsumer):
             else:
                 parts.append("- Local tools: file operations, shell commands, git, search")
 
-            # Cloud skills
+            # User-installed skills — personalized to the current user.
+            # These are skills the user explicitly installed via `/skill install`,
+            # distinct from globally active cloud skills below.
+            # Capped at 10 to stay within the self-model token budget;
+            # full list available via get_agent_info tool at runtime.
+            installed_names: set[str] = set()
+            if user_id:
+                try:
+                    from api.models import SkillInstallation, SkillRegistry
+                    installed = (
+                        db.query(SkillInstallation.skill_name, SkillInstallation.skill_version)
+                        .filter(SkillInstallation.user_id == user_id, SkillInstallation.status == "installed")
+                        .limit(10)
+                        .all()
+                    )
+                    if installed:
+                        installed_names = {r[0] for r in installed}
+                        descs = (
+                            db.query(SkillRegistry.skill_name, SkillRegistry.description)
+                            .filter(
+                                SkillRegistry.skill_name.in_(list(installed_names)),
+                                SkillRegistry.is_active == 1,
+                            )
+                            .all()
+                        )
+                        # Deduplicate: keep first description per skill_name
+                        desc_map: dict[str, str] = {}
+                        for name, d in descs:
+                            if d and name not in desc_map:
+                                desc_map[name] = d
+                        lines = []
+                        for name, version in installed:
+                            desc = desc_map.get(name)
+                            lines.append(f"  - {name} (v{version})" + (f": {desc}" if desc else ""))
+                        parts.append("- My installed skills:\n" + "\n".join(lines))
+                except SQLAlchemyError:
+                    pass
+
+            # Cloud skills — globally active skills available to all users.
+            # Excludes already-installed skills to avoid redundancy and save
+            # token budget (Self-Model has a 600-token hard cap).
+            # Capped at 10; full catalog available via get_agent_info tool.
             try:
                 from api.models import SkillRegistry
-                rows = db.query(SkillRegistry.skill_name).filter(SkillRegistry.is_active == 1).limit(20).all()
+                query = db.query(SkillRegistry.skill_name, SkillRegistry.description).filter(SkillRegistry.is_active == 1)
+                rows = query.limit(30).all()
                 if rows:
-                    names = [r[0] for r in rows]
-                    parts.append(f"- Cloud skills: {', '.join(names)}")
+                    # Deduplicate multi-version rows and exclude installed skills.
+                    seen: set[str] = set()
+                    lines = []
+                    for name, desc in rows:
+                        if name in seen or name in installed_names:
+                            continue
+                        seen.add(name)
+                        lines.append(f"  - {name}" + (f": {desc}" if desc else ""))
+                        if len(lines) >= 10:
+                            break
+                    if lines:
+                        parts.append("- Available cloud skills:\n" + "\n".join(lines))
             except SQLAlchemyError:
                 pass
 

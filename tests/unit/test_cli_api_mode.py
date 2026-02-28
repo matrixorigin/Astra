@@ -381,7 +381,8 @@ class TestCLIEdgeMode:
         mock_client.profile = None
 
         with patch("cli.mo_agent_api.APIClient") as MockAPI, \
-             patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop):
+             patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop), \
+             patch("core.skills.loader.SkillLoader.discover", return_value=[]):
             # Make APIClient context manager work
             mock_api_instance = AsyncMock()
             MockAPI.return_value.__aenter__ = AsyncMock(return_value=mock_api_instance)

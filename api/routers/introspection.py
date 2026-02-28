@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from api.database import SessionLocal
@@ -111,3 +112,70 @@ def _get_procedural_stats(db: Session, session_id: str) -> dict:
     except Exception as exc:
         logger.warning("procedural stats query failed: %s", exc)
         return {"skill_selections": 0, "accuracy_rate": None}
+
+
+@router.get("/introspection/skills")
+def get_introspection_skills(
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Return user-installed skills and available cloud skills for introspection.
+
+    Two lists are returned so the LLM can distinguish personal skills
+    from the global catalog when answering capability questions.
+    Installed skills are excluded from the cloud list to avoid redundancy.
+    """
+    user_id = current_user["user_id"]
+    db = SessionLocal()
+    try:
+        # User's installed skills.  JOIN on both skill_name AND version to
+        # avoid cartesian product when multiple versions exist in the registry.
+        installed_rows = db.execute(
+            text("""
+                SELECT i.skill_name, i.skill_version, r.description, r.category
+                FROM skill_installations i
+                LEFT JOIN skills_registry r
+                    ON r.skill_name = i.skill_name
+                    AND r.version = i.skill_version
+                    AND r.is_active = 1
+                WHERE i.user_id = :uid AND i.status = 'installed'
+                LIMIT 50
+            """),
+            {"uid": user_id},
+        ).fetchall()
+        installed = [
+            {
+                "name": r[0], "version": r[1],
+                "description": r[2] or "", "category": r[3] or "",
+            }
+            for r in installed_rows
+        ]
+        installed_names = {r[0] for r in installed_rows}
+
+        # Globally active cloud skills, deduplicated by skill_name (keep latest
+        # version via ORDER BY version DESC), excluding already-installed skills.
+        cloud_rows = db.execute(
+            text("""
+                SELECT skill_name, version, description, category
+                FROM skills_registry
+                WHERE is_active = 1
+                ORDER BY skill_name, version DESC
+                LIMIT 200
+            """),
+        ).fetchall()
+        seen: set[str] = set()
+        cloud = []
+        for r in cloud_rows:
+            if r[0] in seen or r[0] in installed_names:
+                continue
+            seen.add(r[0])
+            cloud.append({
+                "name": r[0], "version": r[1],
+                "description": r[2] or "", "category": r[3] or "",
+            })
+
+        return {"installed": installed, "cloud": cloud}
+    except SQLAlchemyError as exc:
+        logger.warning("introspection skills query failed: %s", exc)
+        return {"installed": [], "cloud": []}
+    finally:
+        db.close()

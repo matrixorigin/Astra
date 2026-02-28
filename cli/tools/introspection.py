@@ -82,6 +82,16 @@ class GetAgentInfoTool(EdgeTool):
                 "tools": tools,
                 "tool_count": len(tools),
             }
+            # Enrich with cloud skills (installed + catalog) if API client available.
+            if self._api_client:
+                try:
+                    skills_data = await self._api_client.get_introspection_skills()
+                    info["capability"]["installed_skills"] = skills_data.get("installed", [])
+                    info["capability"]["cloud_skills"] = skills_data.get("cloud", [])
+                except Exception as exc:
+                    logging.getLogger(__name__).debug(
+                        "Cloud skills enrichment unavailable: %s", exc
+                    )
 
         if dimension in ("state", "all"):
             info["state"] = {

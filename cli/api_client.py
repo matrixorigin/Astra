@@ -812,3 +812,8 @@ class APIClient:
             params={"session_id": session_id},
         )
         return response.json()
+
+    async def get_introspection_skills(self) -> dict[str, Any]:
+        """Get user-installed and cloud skills for introspection tool."""
+        response = await self._request("GET", "/introspection/skills")
+        return response.json()
