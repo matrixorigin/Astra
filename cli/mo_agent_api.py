@@ -114,7 +114,9 @@ def cmd_help(console, **_):
         ("/login", "Login to API"),
         ("/logout", "Logout"),
         ("/skill", "List local skills"),
-        ("/skill test <name>", "Test a skill"),
+        ("/skill new <name>", "Create a new skill"),
+        ("/skill test <name>", "Test a skill with full output"),
+        ("/skill dev <name>", "Enter AI-assisted skill dev mode"),
         ("/verbose", "Show status bar"),
         ("/compact", "Hide status bar"),
         ("/history", "Show recent turns"),
@@ -260,62 +262,240 @@ def cmd_logout(console, client=None, **_):
         console.print(f"[red]✗[/red] {e}")
 
 
-def cmd_skill(console, cmd_arg=None, **_):
-    """List local skills or test one by name."""
-    import asyncio, os
-    from pathlib import Path
+def cmd_skill(console, cmd_arg=None, client=None, state=None, **kw):
+    """List, test, create, or develop local skills."""
+    import os
     from core.skills.loader import SkillLoader
 
     project_root = os.getcwd()
-    skills = SkillLoader.discover(SkillLoader.default_paths(project_root))
+    skills_root = Path(project_root) / ".mo-agent" / "skills"
 
-    if not cmd_arg or cmd_arg == "list":
+    parts = (cmd_arg or "").split(maxsplit=1)
+    sub = parts[0] if parts else "list"
+    rest = parts[1] if len(parts) > 1 else ""
+
+    # --- /skill list (default) ---
+    if sub in ("list", ""):
+        skills = SkillLoader.discover(SkillLoader.default_paths(project_root))
         if not skills:
             console.print("[dim]No local skills found in .mo-agent/skills/[/dim]")
             return
+        from core.skills.markdown_skill import MarkdownSkill
         from rich.table import Table
         t = Table(show_header=True, box=None)
         t.add_column("Skill")
+        t.add_column("Type", style="dim")
         t.add_column("Version", style="dim")
         t.add_column("Description", style="dim")
         for s in skills:
-            t.add_row(s.skill.name, s.skill.version, s.skill.description[:60])
+            kind = "md" if isinstance(s.skill, MarkdownSkill) else "py"
+            t.add_row(s.skill.name, kind, s.skill.version, s.skill.description[:50])
         console.print(t)
         return
 
-    # /skill test <name> [query]
-    parts = cmd_arg.split(maxsplit=1)
-    if parts[0] == "test" and len(parts) >= 1:
-        name = parts[1].split(maxsplit=1)[0] if len(parts) > 1 else None
-        query = parts[1].split(maxsplit=1)[1] if len(parts) > 1 and " " in parts[1] else "test"
+    # --- /skill new <name> ---
+    if sub == "new":
+        name = _normalize_skill_name(rest.strip())
         if not name:
-            console.print("[red]Usage: /skill test <name> [query][/red]")
+            console.print("[red]Usage: /skill new <name>[/red]")
             return
+        skill_dir = skills_root / _to_slug(name)
+        if skill_dir.exists():
+            console.print(f"[red]✗[/red] {skill_dir} already exists")
+            return
+        skill_dir.mkdir(parents=True)
+        cls = _to_class(name)
+        (skill_dir / "skill.py").write_text(
+            f'''from core.skills.base import Skill, SkillInput, SkillOutput
+from pydantic import Field
+
+
+class {cls}Input(SkillInput):
+    query: str = Field(description="User query")
+
+
+class {cls}Output(SkillOutput):
+    data: dict = {{}}
+
+
+class {cls}Skill(Skill[{cls}Input, {cls}Output]):
+    name = "{name}"
+    version = "1.0.0"
+    description = "TODO: describe what this skill does"
+
+    async def execute(self, input: {cls}Input) -> {cls}Output:
+        # TODO: implement
+        return {cls}Output(success=True, data={{"query": input.query}})
+''')
+        (skill_dir / "SKILL.md").write_text(
+            f'''---
+name: {name}
+version: 1.0.0
+description: TODO
+---
+
+# {name}
+
+TODO: describe this skill for the LLM.
+''')
+        console.print(f"[green]✓[/green] Created {skill_dir.relative_to(project_root)}/")
+        console.print("  [dim]skill.py[/dim]  — implement your logic here")
+        console.print("  [dim]SKILL.md[/dim]  — LLM-facing description (fallback if no skill.py)")
+        console.print(f"\n  Test: [cyan]/skill test {name}[/cyan]")
+        console.print(f"  Dev:  [cyan]/skill dev {name}[/cyan]")
+        return
+
+    # --- /skill test <name> [json_args] ---
+    if sub == "test":
+        test_parts = rest.split(maxsplit=1)
+        name = test_parts[0] if test_parts else None
+        raw_args = test_parts[1] if len(test_parts) > 1 else None
+        if not name:
+            console.print("[red]Usage: /skill test <name> [json_args][/red]")
+            console.print('[dim]  e.g. /skill test stock_basic_info {"stock_code": "300355"}[/dim]')
+            return
+        skills = SkillLoader.discover(SkillLoader.default_paths(project_root))
         match = next((s for s in skills if s.skill.name == name), None)
         if not match:
             console.print(f"[red]✗[/red] Skill '{name}' not found")
             return
-        # Validate schema
+
+        if raw_args:
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {"query": raw_args}
+        else:
+            args = {"query": "test"}
+
         console.print(f"[bold]{name}[/bold] v{match.skill.version}")
         schema = match.skill.to_openai_schema()
-        console.print(f"  schema: [green]✓[/green] {len(schema['function']['parameters'].get('properties', {}))} params")
-        # Test execute
+        params = schema["function"]["parameters"].get("properties", {})
+        console.print(f"  params: {', '.join(params.keys()) or '(none)'}")
+        console.print(f"  input:  {json.dumps(args, ensure_ascii=False)}")
+
         try:
             from cli.tools.router import ToolRouter, ToolCall
             router = ToolRouter()
             router.register(match.skill)
-            results = asyncio.run(router.execute([ToolCall(id="test", name=name, arguments={"query": query})]))
+            results = asyncio.run(router.execute([ToolCall(id="test", name=name, arguments=args)]))
             r = results[0]
+            console.print(f"  time:   {r.execution_time_ms}ms")
             if r.error:
-                console.print(f"  execute: [red]✗[/red] {r.result}")
+                console.print(f"  [red]✗ ERROR[/red]: {r.result}")
             else:
-                preview = r.result[:200].replace("\n", "\\n")
-                console.print(f"  execute: [green]✓[/green] ({len(r.result)} chars) {preview}…" if len(r.result) > 200 else f"  execute: [green]✓[/green] ({len(r.result)} chars)")
-                console.print(f"  time: {r.execution_time_ms}ms")
+                # Parse once, display + validate from the same parsed data
+                try:
+                    data = json.loads(r.result)
+                    formatted = json.dumps(data, indent=2, ensure_ascii=False)
+                    console.print(f"  [green]✓ OUTPUT[/green] ({len(r.result)} chars):")
+                    for line in formatted.split("\n"):
+                        console.print(f"    [dim]{line}[/dim]")
+                    for w in _validate_skill_output(data):
+                        console.print(f"  [yellow]⚠ {w}[/yellow]")
+                except json.JSONDecodeError:
+                    console.print(f"  [green]✓ OUTPUT[/green]: {r.result[:500]}")
         except Exception as e:
-            console.print(f"  execute: [red]✗[/red] {e}")
-    else:
-        console.print("[dim]Usage: /skill list | /skill test <name> [query][/dim]")
+            console.print(f"  [red]✗ EXCEPTION[/red]: {e}")
+        return
+
+    # --- /skill dev off ---
+    if sub == "dev" and rest.strip() == "off":
+        if state:
+            state.pop("skill_dev_context", None)
+            state.pop("skill_dev_name", None)
+            state.pop("skill_dev_dir", None)
+        console.print("[dim]Exited skill dev mode[/dim]")
+        return
+
+    # --- /skill dev <name> ---
+    if sub == "dev":
+        name = _normalize_skill_name(rest.strip())
+        if not name:
+            console.print("[red]Usage: /skill dev <name> | /skill dev off[/red]")
+            return
+        skill_dir = skills_root / _to_slug(name)
+        if not skill_dir.exists():
+            console.print(f"[red]✗[/red] Skill '{name}' not found. Create it first: [cyan]/skill new {name}[/cyan]")
+            return
+        # state=None means cmd_skill was called outside the chat REPL (e.g. tests
+        # that don't pass state).  Still print success so the user sees feedback.
+        state_name = _to_slug(name)  # store slug form — matches directory name
+        if state is not None:
+            state["skill_dev_name"] = state_name
+            state["skill_dev_dir"] = str(skill_dir)
+            state["skill_dev_context"] = _build_skill_dev_context(name, skill_dir)
+        console.print(f"[green]✓[/green] Entered dev mode for [bold]{name}[/bold]")
+        console.print(f"  [dim]Skill dir: {skill_dir.relative_to(project_root)}[/dim]")
+        console.print("  Describe what the skill should do. I'll write the implementation.")
+        console.print(f"  [dim]Test: /skill test {name}    Exit: /skill dev off[/dim]")
+        return
+
+    console.print("[dim]Usage: /skill list | new <name> | test <name> [args] | dev <name> | dev off[/dim]")
+
+
+def _normalize_skill_name(name: str) -> str:
+    """Normalize skill name to snake_case."""
+    return name.replace("-", "_")
+
+
+def _to_slug(name: str) -> str:
+    """Convert snake_case skill name to kebab-case directory slug."""
+    return _normalize_skill_name(name).replace("_", "-")
+
+
+def _to_class(name: str) -> str:
+    """Convert snake_case or kebab-case skill name to PascalCase."""
+    return "".join(w.capitalize() for w in _normalize_skill_name(name).split("_"))
+
+
+def _build_skill_dev_context(name: str, skill_dir: Path) -> str:
+    """Build the skill dev context string injected as project_rules."""
+    parts = [
+        f"# SKILL DEV MODE: {name}",
+        "",
+        "You are helping develop a local skill. The user describes what the skill should do.",
+        "Write/modify skill.py using the str_replace or write_file tool.",
+        f"Skill directory: {skill_dir}",
+        "",
+        "## Skill Framework Rules",
+        "- Inherit `Skill[InputType, OutputType]` from `core.skills.base`",
+        "- Input: subclass `SkillInput`, add fields with `Field(description=...)`",
+        "- Output: subclass `SkillOutput`, add custom fields",
+        "- `execute()` is async, return Output with `success=True/False`",
+        "- On error: return `Output(success=False, error='message')` — never raise",
+        "- The ToolRouter serializes the full Output as JSON for the LLM",
+        "- User tests with `/skill test <name> {json_args}`",
+        "",
+        "## Current Skill Files",
+    ]
+    for f in sorted(skill_dir.iterdir()):
+        if f.is_file() and f.suffix in (".py", ".md", ".yaml", ".yml"):
+            try:
+                parts.append(f"\n### {f.name}\n```{f.suffix.lstrip('.')}\n{f.read_text().rstrip()}\n```")
+            except OSError:
+                parts.append(f"\n### {f.name}\n(unreadable)")
+    return "\n".join(parts)
+
+
+def _validate_skill_output(data: dict) -> list[str]:
+    """Check common skill output issues, return warnings."""
+    warnings = []
+    if data.get("success") and not data.get("error"):
+        custom = {k: v for k, v in data.items() if k not in ("success", "result", "error", "cost")}
+        if custom and all(_is_empty(v) for v in custom.values()):
+            warnings.append("All output fields are empty — skill may not be returning data")
+    if not data.get("success") and not data.get("error"):
+        warnings.append("success=False but no error message — add error field for debugging")
+    return warnings
+
+
+def _is_empty(v) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, (str, list, dict)) and not v:
+        return True
+    return False
 
 
 SLASH_COMMANDS = {
@@ -339,7 +519,7 @@ SLASH_COMMANDS = {
 # Edge turn runner
 # ============================================================================
 
-async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None):
+async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None):
     """Run one edge chat loop turn using the provided APIClient."""
     import os
     from cli.edge_chat_loop import edge_chat_loop
@@ -376,6 +556,7 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
         model=model, agent_id=agent_id,
         session_info=session_info,
         renderer=renderer,
+        extra_rules=extra_rules,
     )
 
 
@@ -614,12 +795,24 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
 
             # --- Chat turn ---
             try:
+                # In skill dev mode, refresh context from disk each turn so the
+                # LLM always sees the latest file contents after edits.
+                skill_dev_rules = None
+                if state.get("skill_dev_name"):
+                    skill_dir = Path(state.get("skill_dev_dir", ""))
+                    if skill_dir.is_dir():
+                        state["skill_dev_context"] = _build_skill_dev_context(
+                            state["skill_dev_name"], skill_dir,
+                        )
+                    skill_dev_rules = state.get("skill_dev_context")
+
                 if hasattr(renderer, "begin_response"):
                     renderer.begin_response()
                 result_text = client._run(_run_edge_turn(
                     user_input, client._ensure_client(), state["session_id"],
                     state.get("selected_model"), user_id, auto_approve,
                     renderer=renderer,
+                    extra_rules=skill_dev_rules,
                 ))
                 if hasattr(renderer, "end_response"):
                     renderer.end_response()

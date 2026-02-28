@@ -13,7 +13,7 @@ import json
 import logging
 from typing import Any
 
-from cli.tools.base import EdgeTool, SideEffect
+from cli.tools.base import EdgeTool, SideEffect, resolve_side_effect
 
 
 class GetAgentInfoTool(EdgeTool):
@@ -77,7 +77,7 @@ class GetAgentInfoTool(EdgeTool):
             tools = []
             if self._router:
                 for t in self._router.list_tools():
-                    tools.append({"name": t.name, "side_effect": t.side_effect.value})
+                    tools.append({"name": t.name, "side_effect": resolve_side_effect(t).value})
             info["capability"] = {
                 "tools": tools,
                 "tool_count": len(tools),

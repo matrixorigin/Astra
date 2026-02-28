@@ -12,9 +12,8 @@ from typing import Any, Protocol
 
 from cli.api_client import AuthenticationError
 from cli.permissions import Decision, PermissionManager
-from cli.tools.base import SideEffect
+from cli.tools.base import resolve_side_effect
 from cli.tools.router import ToolCall, ToolResult, ToolRouter
-from core.skills.base import SideEffectCategory
 
 MAX_TURNS = 25
 
@@ -170,6 +169,7 @@ async def edge_chat_loop(
     agent_id: str | None = None,
     model: str | None = None,
     session_info: dict[str, Any] | None = None,
+    extra_rules: str | None = None,
 ) -> str:
     """Run the edge-cloud agentic loop until final answer or MAX_TURNS.
 
@@ -179,6 +179,10 @@ async def edge_chat_loop(
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_input}]
     tool_results: list[dict[str, Any]] = []
     project_rules = load_project_rules(project_root)
+    # extra_rules (e.g. skill dev context) are merged into project_rules here.
+    # project_rules are only sent on turn 0 — the cloud caches them for the session.
+    if extra_rules:
+        project_rules = (project_rules + "\n\n" + extra_rules) if project_rules else extra_rules
     edge_profile = detect_edge_profile(project_root)
     if session_info is not None:
         session_info["has_project_rules"] = project_rules is not None
@@ -262,25 +266,11 @@ async def edge_chat_loop(
 
             for tc in parsed:
                 tool = tool_router.get_tool(tc.name)
-                # Resolve SideEffect for the permission system.  EdgeTools have
-                # a ``side_effect`` attribute directly; typed Skills loaded from
-                # skill.py only carry ``side_effect_profile`` (core enum).  Fall
-                # back to deriving from side_effect_profile so both work.
                 if tool is None:
-                    side_effect = None
-                elif hasattr(tool, "side_effect"):
-                    side_effect = tool.side_effect
-                else:
-                    _cat = getattr(getattr(tool, "side_effect_profile", None), "category", None)
-                    side_effect = {
-                        SideEffectCategory.READ: SideEffect.READ,
-                        SideEffectCategory.WRITE: SideEffect.WRITE,
-                        SideEffectCategory.EXECUTE: SideEffect.EXECUTE,
-                    }.get(_cat, SideEffect.READ)
-
-                if side_effect is None:
                     tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": f"Unknown tool: {tc.name}"})
                     continue
+
+                side_effect = resolve_side_effect(tool)
 
                 decision = permissions.check(tc.name, side_effect, tc.arguments)
 

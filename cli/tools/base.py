@@ -39,6 +39,25 @@ _SIDE_EFFECT_MAP: dict[SideEffect, SideEffectCategory] = {
     SideEffect.EXECUTE: SideEffectCategory.EXECUTE,
 }
 
+# Reverse mapping: SideEffectCategory → SideEffect
+_CATEGORY_TO_SIDE_EFFECT: dict[SideEffectCategory, SideEffect] = {
+    v: k for k, v in _SIDE_EFFECT_MAP.items()
+}
+
+
+def resolve_side_effect(tool: Any) -> SideEffect:
+    """Get the SideEffect for any Skill/EdgeTool.
+
+    EdgeTools have ``side_effect`` directly.  Typed Skills loaded from
+    skill.py only carry ``side_effect_profile`` (core enum).  This
+    function bridges both so the permission system works uniformly.
+    """
+    se = getattr(tool, "side_effect", None)
+    if isinstance(se, SideEffect):
+        return se
+    cat = getattr(getattr(tool, "side_effect_profile", None), "category", None)
+    return _CATEGORY_TO_SIDE_EFFECT.get(cat, SideEffect.READ)
+
 
 class EdgeTool(Skill[SkillInput, SkillOutput]):
     """Skill adapter for tools that run on the user's machine.
