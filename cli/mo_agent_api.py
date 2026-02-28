@@ -107,6 +107,7 @@ def cmd_help(console, **_):
 
 
 def cmd_model(console, client=None, selected_model=None, cmd_arg=None, state=None, **_):
+    from cli.api_client import AuthenticationError
     try:
         models = client.admin_list_models()
         active = [m for m in models if m.get("is_active", True)]
@@ -135,6 +136,8 @@ def cmd_model(console, client=None, selected_model=None, cmd_arg=None, state=Non
                     marker = "→" if state.get("selected_model") == m["name"] else ""
                     t.add_row(marker, m["name"], m["provider"])
                 console.print(t)
+    except AuthenticationError:
+        console.print("[red]✗[/red] Session expired — please login again: mo-agent login")
     except Exception as e:
         console.print(f"[red]✗[/red] {e}")
 
