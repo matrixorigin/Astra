@@ -172,6 +172,18 @@ async def publish_skill(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
 
+@router.post("/scaffold")
+async def scaffold_skill(spec_data: dict[str, Any]):
+    """Generate skill package from YAML spec. Returns file contents as JSON."""
+    from core.skills.scaffold import SkillSpec, generate_files
+
+    try:
+        spec = SkillSpec.from_dict(spec_data)
+        return generate_files(spec)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
 # Parameterized routes AFTER static routes.
 
 @router.get("/{skill_name}/info", response_model=SkillInfoResponse)

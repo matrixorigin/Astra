@@ -479,6 +479,33 @@ def skill_register(ctx, skill_file):
         click.echo(f"❌ Error: {e}")
 
 
+@skill.command("scaffold")
+@click.argument("yaml_file", type=click.Path(exists=True))
+@click.option("--output-dir", default="skills/", type=click.Path(), help="Output directory")
+def skill_scaffold(yaml_file, output_dir):
+    """Generate skill package from YAML declaration."""
+    import yaml as _yaml
+    from pathlib import Path
+    from core.skills.scaffold import SkillSpec, generate_files
+
+    try:
+        data = _yaml.safe_load(Path(yaml_file).read_text())
+        spec = SkillSpec.from_dict(data)
+        target = Path(output_dir) / spec.name
+        if target.exists():
+            click.echo(f"❌ Directory already exists: {target}")
+            return
+        files = generate_files(spec)
+        target.mkdir(parents=True)
+        for fname, content in files.items():
+            (target / fname).write_text(content)
+        click.echo(f"✅ Generated skill package: {target}/")
+        for fname in files:
+            click.echo(f"   {fname}")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
 @cli.command()
 @click.argument("session_id")
 @click.pass_context
