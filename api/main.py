@@ -76,6 +76,29 @@ async def lifespan(app: FastAPI):
 
     # LLM models are registered by admin via API — no auto-seeding
 
+    # Inject schema loader for tool quality firewall
+    from core.verification import set_schema_loader
+    from api.database import SessionLocal
+    from sqlalchemy import text
+    import json as _json
+
+    def _load_schema_from_db(tool_name: str) -> dict | None:
+        try:
+            with SessionLocal() as db:
+                row = db.execute(
+                    text("SELECT quality_schema FROM skills_registry "
+                         "WHERE skill_name = :name AND is_active = 1 "
+                         "ORDER BY created_at DESC LIMIT 1"),
+                    {"name": tool_name},
+                ).first()
+                if row and row[0]:
+                    return row[0] if isinstance(row[0], dict) else _json.loads(row[0])
+        except Exception:
+            logger.debug(f"Schema load failed for {tool_name}", exc_info=True)
+        return None
+
+    set_schema_loader(_load_schema_from_db)
+
     # Periodic workflow cleanup (every hour)
     import asyncio
     async def _cleanup_loop():

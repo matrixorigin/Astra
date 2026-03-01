@@ -4,7 +4,7 @@ Assesses structural quality of tool results *before* they enter the LLM context
 window, so the model can respond honestly instead of confabulating from empty data.
 
 Three-tier assessment:
-  Tier 1: Explicit quality_schema (future — skill declares expected fields)
+  Tier 1: Explicit quality_schema (skill declares expected fields)
   Tier 2: Structural inference (default) — empty containers, null/zero clusters, staleness
   Tier 3: Pass-through for raw-data tools (file I/O, shell, etc.)
 """
@@ -153,7 +153,12 @@ def assess_tool_result(
             signals=["explicit_error: tool returned error"],
         )
 
-    # Structural inference (Tier 2)
+    # Tier 1: schema-based assessment (if skill has quality_schema)
+    schema = load_quality_schema(tool_name)
+    if schema:
+        return assess_with_schema(data, schema, tool_name, current_time=current_time)
+
+    # Tier 2: structural inference (default)
     signals: list[str] = []
     leaves = list(flatten_json(data))
     total = len(leaves)
@@ -257,3 +262,137 @@ def annotate_tool_result(
     # Fallback: add as new field
     out["_quality_annotation"] = annotation
     return out
+
+
+# ── Tier 1: Schema-based assessment ─────────────────────────────────────────
+
+def _get_nested(d: dict[str, Any], path: str) -> Any:
+    """Get nested value by dot-separated path."""
+    current: Any = d
+    for key in path.split("."):
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            return None
+    return current
+
+
+def assess_with_schema(
+    result: dict[str, Any],
+    schema: dict[str, Any],
+    tool_name: str = "",
+    *,
+    current_time: datetime | None = None,
+) -> QualityAssessment:
+    """Tier 1: Assess using explicit quality_schema from skills_registry."""
+    signals: list[str] = []
+    score = 1.0
+
+    # Required fields
+    required = schema.get("required_fields", [])
+    for spec in required:
+        path = spec["path"]
+        value = _get_nested(result, path)
+        expected_type = spec.get("type", "any")
+
+        if value is None:
+            signals.append(f"missing: '{path}'")
+            score -= 1.0 / max(len(required), 1)
+        elif expected_type == "dict" and isinstance(value, dict):
+            min_keys = spec.get("min_keys", 1)
+            if len(value) < min_keys:
+                signals.append(f"'{path}' has {len(value)} keys, need ≥{min_keys}")
+                score -= 0.5 / max(len(required), 1)
+        elif expected_type == "list" and isinstance(value, list):
+            min_length = spec.get("min_length", 1)
+            if len(value) < min_length:
+                signals.append(f"'{path}' has {len(value)} items, need ≥{min_length}")
+                score -= 0.5 / max(len(required), 1)
+
+    # Sentinel values
+    for spec in schema.get("sentinel_values", []):
+        path = spec["path"]
+        value = _get_nested(result, path)
+        if value == spec["sentinel"]:
+            meaning = spec.get("meaning", "default value")
+            signals.append(f"sentinel: '{path}' = {value} ({meaning})")
+            score -= 0.15
+
+    # Freshness
+    stale = False
+    freshness = schema.get("freshness")
+    now = current_time or datetime.now(timezone.utc)
+    if freshness and freshness.get("timestamp_field"):
+        ts_val = _get_nested(result, freshness["timestamp_field"])
+        if isinstance(ts_val, str):
+            try:
+                ts = datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
+                age = (now - ts).total_seconds()
+                max_age = freshness.get("max_age_seconds", _STALE_SECONDS)
+                if age > max_age:
+                    stale = True
+                    signals.append(f"stale: {age / 3600:.1f}h old (max {max_age / 3600:.1f}h)")
+                    score -= 0.2
+            except (ValueError, TypeError):
+                pass
+
+    score = max(0.0, round(score, 2))
+    return QualityAssessment(
+        tool_name=tool_name, score=score, grade=_score_to_grade(score),
+        signals=signals[:5], stale=stale,
+    )
+
+
+# ── Schema loader ────────────────────────────────────────────────────────────
+
+from functools import lru_cache
+from typing import Callable
+
+# Injected schema loader — set by api layer at startup
+_schema_loader: Callable[[str], dict[str, Any] | None] | None = None
+
+
+def set_schema_loader(loader: Callable[[str], dict[str, Any] | None]) -> None:
+    """Inject schema loader function. Called by api layer at startup."""
+    global _schema_loader
+    _schema_loader = loader
+
+
+@lru_cache(maxsize=128)
+def _cached_schema(tool_name: str, _cache_key: int) -> dict[str, Any] | None:
+    """Internal cached loader. _cache_key rotates to invalidate cache."""
+    if _schema_loader is None:
+        return None
+    return _schema_loader(tool_name)
+
+
+_cache_generation: int = 0
+
+
+def load_quality_schema(tool_name: str) -> dict[str, Any] | None:
+    """Load quality_schema for a tool. Uses injected loader with LRU cache."""
+    return _cached_schema(tool_name, _cache_generation)
+
+
+def invalidate_schema_cache() -> None:
+    """Invalidate schema cache (call after skill registration)."""
+    global _cache_generation
+    _cache_generation += 1
+
+
+# ── Annotation-ignored detection (Phase 4) ───────────────────────────────────
+
+_LIMITATION_KEYWORDS = frozenset({
+    "不完整", "数据缺失", "无法确认", "数据不足", "暂无数据",
+    "incomplete", "missing data", "unavailable", "insufficient",
+    "cannot confirm", "no data", "data limitation", "data quality",
+})
+
+
+def response_acknowledges_limitation(response: str) -> bool:
+    """Check if LLM response mentions data limitations.
+
+    Used by auto-scorer to determine data_quality_acknowledged.
+    """
+    lower = response.lower()
+    return any(kw in lower for kw in _LIMITATION_KEYWORDS)

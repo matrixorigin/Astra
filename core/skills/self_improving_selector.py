@@ -339,6 +339,19 @@ class SelfImprovingSelector(DbConsumer):
                 context_features=context_features,
             )
         
+        elif signal_type == SignalType.LOW_DATA_QUALITY:
+            quality_score = failure.get("tool_quality_score")
+            if quality_score is None or quality_score >= self.thresholds.low_data_quality:
+                return None
+            return LearningSignal(
+                signal_type=SignalType.LOW_DATA_QUALITY,
+                query_pattern=query,
+                wrong_skills=selected,
+                correct_skills=[],
+                target_metrics={"quality_score": self.thresholds.low_data_quality + 0.3},
+                context_features=context_features,
+            )
+        
         return None
 
     def _update_learnings(self, signal: LearningSignal):

@@ -11,6 +11,7 @@ class SignalType(str, Enum):
     SLOW_EXECUTION = "slow_execution"
     HIGH_COST = "high_cost"
     LOW_SATISFACTION = "low_satisfaction"
+    LOW_DATA_QUALITY = "low_data_quality"
     EXECUTION_TIME = "execution_time"  # Raw execution time data for learning
 
 
@@ -80,6 +81,7 @@ class SignalThresholds:
     slow_execution_ms: int = 5000  # 5 seconds
     high_cost_usd: float = 0.10  # $0.10
     low_satisfaction: int = 3  # < 3 stars (out of 5)
+    low_data_quality: float = 0.5  # quality score < 0.5 triggers signal
     
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary."""
@@ -87,4 +89,5 @@ class SignalThresholds:
             "slow_execution_ms": self.slow_execution_ms,
             "high_cost_usd": self.high_cost_usd,
             "low_satisfaction": self.low_satisfaction,
+            "low_data_quality": self.low_data_quality,
         }

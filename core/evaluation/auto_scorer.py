@@ -35,6 +35,8 @@ def compute_auto_score(
     response_tokens: int,
     actual_cost: float | None = None,
     estimated_cost: float | None = None,
+    tool_quality_score: float | None = None,
+    data_quality_acknowledged: bool | None = None,
 ) -> AutoScoreResult:
     """Compute auto-metrics from post-response signals.
 
@@ -44,6 +46,8 @@ def compute_auto_score(
         response_tokens: Number of tokens in the response
         actual_cost: Actual LLM call cost (optional)
         estimated_cost: Pre-estimated cost (optional)
+        tool_quality_score: Tool result quality score (0-1), from QualityAssessment
+        data_quality_acknowledged: True if LLM response acknowledged data limitations
 
     Returns:
         AutoScoreResult with quality_score (0-5) and training_eligible
@@ -56,11 +60,24 @@ def compute_auto_score(
 
     # Weighted score: hallucination dominates (firewall confidence is 0-1, scale to 0-5)
     # Weights: hallucination 0.6, length 0.2, budget 0.2
-    score = (
-        firewall_confidence * 5.0 * 0.6
-        + (1.0 if reasonable_length else 0.0) * 5.0 * 0.2
-        + (1.0 if within_budget else 0.0) * 5.0 * 0.2
-    )
+    # When tool quality data available, redistribute: hallucination 0.5, quality 0.15, length 0.15, budget 0.2
+    if tool_quality_score is not None:
+        # Data quality bonus: if data was degraded AND LLM acknowledged it, reward
+        quality_factor = tool_quality_score
+        if data_quality_acknowledged and tool_quality_score < 0.8:
+            quality_factor = min(1.0, tool_quality_score + 0.3)  # bonus for honesty
+        score = (
+            firewall_confidence * 5.0 * 0.50
+            + quality_factor * 5.0 * 0.15
+            + (1.0 if reasonable_length else 0.0) * 5.0 * 0.15
+            + (1.0 if within_budget else 0.0) * 5.0 * 0.20
+        )
+    else:
+        score = (
+            firewall_confidence * 5.0 * 0.6
+            + (1.0 if reasonable_length else 0.0) * 5.0 * 0.2
+            + (1.0 if within_budget else 0.0) * 5.0 * 0.2
+        )
     # Clamp
     score = max(0.0, min(5.0, round(score, 2)))
 

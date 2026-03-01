@@ -1043,28 +1043,28 @@ No schema changes needed. Works with all existing skills.
 
 ### Phase 2: Explicit Schemas (Week 2) — Precision
 
-- [ ] Add `quality_schema` column to `skills_registry`
-- [ ] Write quality schemas for top 5 skills (stock_assistant, ci_status, summarize_pr, list_prs, knowledge_search)
-- [ ] Implement `_assess_with_schema()` (Tier 1 assessment)
-- [ ] Schema validation on skill registration
+- [x] Add `quality_schema` column to `skills_registry`
+- [x] Write quality schemas for top 5 skills (stock_assistant, ci_status, summarize_pr, list_prs, knowledge_search)
+- [x] Implement `_assess_with_schema()` (Tier 1 assessment)
+- [ ] Schema validation on skill registration — deferred to Phase 5 (needs JSON Schema validator integration)
 
-**Success criteria**: Schema-based assessment catches 100% of known empty-shell patterns.
+**Success criteria**: Schema-based assessment catches 100% of known empty-shell patterns. ✅ Verified — 019ca950 detected with 5+ signals.
 
 ### Phase 3: Trust Pipeline Integration (Week 3) — Systemic
 
-- [ ] Add `tool_result_quality` dimension to `HallucinationFirewall`
-- [ ] Add `data_quality_acknowledged` to auto-scorer
-- [ ] Add `LOW_DATA_QUALITY` signal to `SelfImprovingSelector`
-- [ ] Wire quality signals to procedural memory creation
+- [x] Add `tool_result_quality` dimension to `HallucinationFirewall`
+- [x] Add `data_quality_acknowledged` to auto-scorer
+- [x] Add `LOW_DATA_QUALITY` signal to `SelfImprovingSelector`
+- [ ] Wire quality signals to procedural memory creation — deferred to Phase 5 (depends on memory governance refactor)
 
-**Success criteria**: Degraded tool results → lower confidence → learning signal → better future parameter selection.
+**Success criteria**: Degraded tool results → lower confidence → learning signal → better future parameter selection. ✅ Core pipeline verified.
 
 ### Phase 4: Observability (Week 4) — Operational
 
-- [ ] Create `tool_quality_dashboard` analytics view
-- [ ] Add quality degradation alerts
-- [ ] Add "annotation ignored" detection
-- [ ] Dashboard for skill quality trends
+- [x] Create `tool_quality_dashboard` analytics view
+- [ ] Add quality degradation alerts — deferred to Phase 5 (needs alerting infrastructure)
+- [x] Add "annotation ignored" detection
+- [ ] Dashboard for skill quality trends — deferred to Phase 5 (needs frontend)
 
 ---
 

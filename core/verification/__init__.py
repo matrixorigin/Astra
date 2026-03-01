@@ -18,6 +18,10 @@ from core.verification.tool_quality import (
     QualityAssessment,
     annotate_tool_result,
     assess_tool_result,
+    assess_with_schema,
+    load_quality_schema,
+    set_schema_loader,
+    invalidate_schema_cache,
 )
 
 __all__ = [

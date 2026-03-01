@@ -29,6 +29,7 @@ class SkillRegistry(Base):
     priority = Column(Integer)
     cost_estimate = Column(String(20))
     side_effect_profile = Column(JSON)
+    quality_schema = Column(JSON)  # Tool Result Quality Firewall — Tier 1 schema
     source = Column(String(20), default="builtin")
     manifest = Column(JSON)
     is_public = Column(SmallInteger, default=0)
