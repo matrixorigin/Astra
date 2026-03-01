@@ -1,0 +1,76 @@
+{
+  "name": "evaluate_session",
+  "version": "1.0.0",
+  "description": "Evaluate agent performance in a session",
+  "category": "analysis",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "session_id": {
+        "type": "string",
+        "description": "Session ID to evaluate"
+      },
+      "include_details": {
+        "type": "boolean",
+        "description": "Include detailed event breakdown",
+        "default": false
+      }
+    },
+    "required": ["session_id"]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "session_id": {"type": "string"},
+      "total_events": {"type": "integer"},
+      "user_queries": {"type": "integer"},
+      "llm_calls": {"type": "integer"},
+      "tokens": {
+        "type": "object",
+        "properties": {
+          "prompt": {"type": "integer"},
+          "completion": {"type": "integer"},
+          "total": {"type": "integer"},
+          "avg_per_call": {"type": "integer"}
+        }
+      },
+      "skills": {
+        "type": "object",
+        "properties": {
+          "unique": {"type": "integer"},
+          "total_calls": {"type": "integer"},
+          "breakdown": {"type": "object"}
+        }
+      },
+      "assessment": {
+        "type": "object",
+        "properties": {
+          "token_efficiency": {"type": "string"},
+          "tokens_per_query": {"type": "integer"},
+          "call_efficiency": {"type": "string"},
+          "calls_per_query": {"type": "number"},
+          "overall": {"type": "string"}
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "input": {
+        "session_id": "019ca9f1-3dc6-72b3-9813-1f38f7349c53"
+      },
+      "output": {
+        "user_queries": 3,
+        "llm_calls": 7,
+        "tokens": {
+          "total": 42532,
+          "avg_per_call": 6076
+        },
+        "assessment": {
+          "token_efficiency": "moderate",
+          "overall": "needs_improvement"
+        }
+      }
+    }
+  ]
+}
