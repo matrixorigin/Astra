@@ -424,6 +424,171 @@ class TestBuildReflectEvidence:
             db.commit()
             db.close()
 
+    def test_token_summary_present(self, reflect_session):
+        """reflect response includes token_summary with zeroes when no LLM events."""
+        sid, uid, _ = reflect_session
+        from api.routers.chat import _build_reflect_evidence
+        result = _build_reflect_evidence(sid, uid, "auto", 20)
+        ts = result["token_summary"]
+        assert ts["llm_calls"] == 0
+        assert ts["total_prompt_tokens"] == 0
+        assert ts["total_completion_tokens"] == 0
+        assert ts["total_tokens"] == 0
+        assert ts["by_model"] == {}
+
+    def test_token_summary_accumulates_llm_events(self):
+        """LLM response events with token_usage are accumulated into token_summary."""
+        from api.database import SessionLocal
+        from core.events.session_manager import SessionManager
+        from core.events.event_logger import EventLogger
+        from sqlalchemy import text
+        from api.routers.chat import _build_reflect_evidence
+
+        uid = "reflect_tok_usr"
+        mgr = SessionManager(SessionLocal())
+        session = mgr.create_session(user_id=uid)
+        sid = session.session_id
+
+        el = EventLogger(SessionLocal)
+        uq = el.create_user_query(user_id=uid, session_id=sid, content="hello")
+
+        # Insert LLM response events with token_usage
+        db = SessionLocal()
+        from api.models.agent import Event as EventModel
+        import uuid
+        for i, (p, c) in enumerate([(1000, 50), (2000, 100)]):
+            db.add(EventModel(
+                event_id=str(uuid.uuid4()), session_id=sid, user_id=uid,
+                agent_id="test", event_type="llm_response", content=f"response {i}",
+                causal_chain_id=uq.causal_chain_id,
+                llm_model_used="test-model",
+                token_usage=json.dumps({"prompt_tokens": p, "completion_tokens": c}),
+            ))
+        db.commit()
+        db.close()
+
+        try:
+            result = _build_reflect_evidence(sid, uid, "auto", 20)
+            ts = result["token_summary"]
+            assert ts["total_prompt_tokens"] == 3000
+            assert ts["total_completion_tokens"] == 150
+            assert ts["total_tokens"] == 3150
+            assert ts["llm_calls"] == 2
+            assert ts["by_model"]["test-model"]["calls"] == 2
+            assert ts["by_model"]["test-model"]["prompt_tokens"] == 3000
+        finally:
+            db = SessionLocal()
+            db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": sid})
+            db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
+            db.commit()
+            db.close()
+
+    def test_tool_quality_summary_present(self, reflect_session):
+        """reflect response includes tool_quality_summary (empty when no quality events)."""
+        sid, uid, _ = reflect_session
+        from api.routers.chat import _build_reflect_evidence
+        result = _build_reflect_evidence(sid, uid, "auto", 20)
+        assert result["tool_quality_summary"] == []
+
+    def test_tool_quality_summary_surfaces_degraded(self):
+        """tool_result_quality events with non-complete grade appear in summary."""
+        from api.database import SessionLocal
+        from core.events.session_manager import SessionManager
+        from core.events.event_logger import EventLogger
+        from sqlalchemy import text
+        from api.routers.chat import _build_reflect_evidence
+
+        uid = "reflect_tq_usr"
+        mgr = SessionManager(SessionLocal())
+        session = mgr.create_session(user_id=uid)
+        sid = session.session_id
+
+        el = EventLogger(SessionLocal)
+        uq = el.create_user_query(user_id=uid, session_id=sid, content="analyze stock")
+
+        # Insert a tool_result_quality event
+        db = SessionLocal()
+        from api.models.agent import Event as EventModel
+        import uuid
+        db.add(EventModel(
+            event_id=str(uuid.uuid4()), session_id=sid, user_id=uid,
+            agent_id="test", event_type="tool_result_quality", content="",
+            causal_chain_id=uq.causal_chain_id,
+            event_metadata={
+                "tool_name": "stock_assistant",
+                "quality_score": 0.35,
+                "quality_grade": "degraded",
+                "missing_fields": ["technical_indicators", "trend_analysis"],
+            },
+        ))
+        # Insert a complete one — should NOT appear in summary
+        db.add(EventModel(
+            event_id=str(uuid.uuid4()), session_id=sid, user_id=uid,
+            agent_id="test", event_type="tool_result_quality", content="",
+            causal_chain_id=uq.causal_chain_id,
+            event_metadata={
+                "tool_name": "bash",
+                "quality_score": 1.0,
+                "quality_grade": "complete",
+                "missing_fields": [],
+            },
+        ))
+        db.commit()
+        db.close()
+
+        try:
+            result = _build_reflect_evidence(sid, uid, "auto", 20)
+            tqs = result["tool_quality_summary"]
+            assert len(tqs) == 1
+            assert tqs[0]["tool"] == "stock_assistant"
+            assert tqs[0]["grade"] == "degraded"
+            assert tqs[0]["score"] == 0.35
+            assert "technical_indicators" in tqs[0]["missing_fields"]
+        finally:
+            db = SessionLocal()
+            db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": sid})
+            db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
+            db.commit()
+            db.close()
+
+    def test_high_token_usage_hint(self):
+        """When total tokens > 50K, a diagnosis hint is generated."""
+        from api.database import SessionLocal
+        from core.events.session_manager import SessionManager
+        from core.events.event_logger import EventLogger
+        from sqlalchemy import text
+        from api.routers.chat import _build_reflect_evidence
+
+        uid = "reflect_hightok"
+        mgr = SessionManager(SessionLocal())
+        session = mgr.create_session(user_id=uid)
+        sid = session.session_id
+
+        el = EventLogger(SessionLocal)
+        uq = el.create_user_query(user_id=uid, session_id=sid, content="big query")
+
+        db = SessionLocal()
+        from api.models.agent import Event as EventModel
+        import uuid
+        db.add(EventModel(
+            event_id=str(uuid.uuid4()), session_id=sid, user_id=uid,
+            agent_id="test", event_type="llm_response", content="big response",
+            causal_chain_id=uq.causal_chain_id, llm_model_used="gpt-4",
+            token_usage=json.dumps({"prompt_tokens": 60000, "completion_tokens": 2000}),
+        ))
+        db.commit()
+        db.close()
+
+        try:
+            result = _build_reflect_evidence(sid, uid, "auto", 20)
+            assert any("token" in h.lower() for h in result["diagnosis_hints"])
+        finally:
+            db = SessionLocal()
+            db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": sid})
+            db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
+            db.commit()
+            db.close()
+
 
 # ============================================================================
 # 3. Reflection learning — real DB Memory persistence
