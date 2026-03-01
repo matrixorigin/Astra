@@ -24,6 +24,10 @@ from core.history_utils import (
     append_recovered_events as _append_recovered_events,
 )
 from core.logging_config import get_logger
+from core.verification.tool_quality import (
+    assess_tool_result as _assess_tool_result,
+    annotate_tool_result as _annotate_tool_result,
+)
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -223,6 +227,7 @@ class RunStatusResponse(BaseModel):
 # adopted, wrap with a threading.Lock.
 _SKILL_VERSION_CACHE: dict[str, tuple[str | None, float]] = {}
 _SKILL_VERSION_TTL = float(os.environ.get("SKILL_VERSION_CACHE_TTL", "60"))  # seconds
+_TOOL_QUALITY_ENABLED = os.environ.get("ENABLE_TOOL_QUALITY_FIREWALL", "true").lower() == "true"
 
 
 def _resolve_skill_versions(names: set[str]) -> dict[str, str]:
@@ -1173,6 +1178,28 @@ def _build_turn_messages(
                 except Exception as e:
                     logger.debug("Memory refresh failed (non-fatal): %s", e)
 
+    # ── Tool Result Quality Firewall (pre-LLM gate) ─────────────────────
+    # Assess and annotate tool results BEFORE they enter the context window
+    # so the LLM can respond honestly about data limitations.
+    tool_quality_assessments: list[dict[str, Any]] = []
+    if _TOOL_QUALITY_ENABLED and tool_results:
+        for tr in tool_results:
+            tr_name = tr.get("name", "")
+            tr_data = tr.get("result", "")
+            assessment = _assess_tool_result(tr_name, tr_data)
+            if assessment.needs_annotation:
+                # Annotate in-place so merged history carries the signal
+                annotated = _annotate_tool_result(tr, assessment)
+                tr.update(annotated)
+            tool_quality_assessments.append({
+                "tool_name": assessment.tool_name,
+                "score": assessment.score,
+                "grade": assessment.grade,
+                "signals": assessment.signals,
+                "stale": assessment.stale,
+            })
+    entry["tool_quality_assessments"] = tool_quality_assessments
+
     # History integrity: merge incoming tool_results into the correct
     # position in history, then heal any remaining orphaned tool_calls.
     # This unified operation handles all edge-cloud failure combinations:
@@ -1402,6 +1429,23 @@ def _persist_turn_events(
                 logger.debug("Backfill selection metrics failed", exc_info=True)
     except Exception as e:
         logger.warning("Phase 2 (tool_results) failed: %s", e)
+
+    # Phase 2b: persist tool result quality assessments
+    try:
+        if _TOOL_QUALITY_ENABLED:
+            assessments = _session_cache.get(session_id, {}).get("tool_quality_assessments", [])
+            for qa in assessments:
+                if qa["grade"] != "complete":
+                    el.create_stream_event(
+                        user_id=user_id, session_id=session_id,
+                        event_type="tool_result_quality",
+                        content=json.dumps(qa),
+                        parent_event_id=parent_event_id,
+                        causal_chain_id=causal_chain_id,
+                        metadata=qa,
+                    )
+    except Exception as e:
+        logger.debug("Phase 2b (tool_quality) failed: %s", e)
 
     # Phase 3: persist tool calls + LLM response + history snapshot
     try:

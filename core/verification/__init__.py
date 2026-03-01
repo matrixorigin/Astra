@@ -14,6 +14,11 @@ from core.verification.structured_verifier import (
     StructuredVerifier,
     VerificationResult,
 )
+from core.verification.tool_quality import (
+    QualityAssessment,
+    annotate_tool_result,
+    assess_tool_result,
+)
 
 __all__ = [
     "HallucinationFirewall",
@@ -23,4 +28,7 @@ __all__ = [
     "Claim",
     "Evidence",
     "VerificationResult",
+    "QualityAssessment",
+    "assess_tool_result",
+    "annotate_tool_result",
 ]
