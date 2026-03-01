@@ -67,6 +67,7 @@ class TurnResult:
     usage: dict[str, int] = field(default_factory=dict)
     has_tool_calls: bool = False
     error: dict[str, Any] | None = None
+    explain: dict[str, Any] | None = None
 
 
 def load_project_rules(project_root: str) -> str | None:
@@ -206,6 +207,8 @@ async def _consume_turn(
                     result.usage = {k: v for k, v in event.items() if k != "type"}
                 elif etype == "turn_complete":
                     result.has_tool_calls = event.get("has_tool_calls", False)
+                elif etype == "explain":
+                    result.explain = event
                 elif etype == "error":
                     result.error = event
                     renderer.error(event.get("message", "Unknown cloud error"))
@@ -227,6 +230,49 @@ async def _consume_turn(
     return result
 
 
+def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
+    """Print EXPLAIN ANALYZE style execution trace.
+
+    Args:
+        file: writable file object (default: sys.stderr).
+    """
+    f = file or sys.stderr
+    w = f.write
+    w("\n\033[2m── EXPLAIN ──────────────────────────────────\033[0m\n")
+    total_ms = 0
+    total_in = 0
+    total_out = 0
+    for t in turns:
+        ms = t.get("total_ms", 0)
+        total_ms += ms
+        p = t.get("prompt_tokens", 0)
+        c = t.get("completion_tokens", 0)
+        total_in += p
+        total_out += c
+        w(f"\033[2mTurn {t['turn']}  {ms}ms  tokens: {p}→{c}\033[0m\n")
+        for s in t.get("steps", []):
+            step = s.get("step", "?")
+            dur = s.get("duration_ms", 0)
+            if step == "llm":
+                label = "LLM"
+                tok_in = s.get("in")
+                tok_out = s.get("out")
+                # None means no usage data from provider; 0 means actual zero.
+                io = f"in={tok_in if tok_in is not None else '?'} out={tok_out if tok_out is not None else '?'}"
+                tc = s.get("tool_calls", 0)
+                if tc:
+                    io += f" tool_calls={tc}"
+            elif step == "cloud_skill":
+                label = s.get("name", "?")
+                io = f"in={s.get('in_bytes', 0)}B out={s.get('out_bytes', 0)}B"
+            else:
+                label = step
+                io = ""
+            w(f"\033[2m  └─ {label}  {dur}ms  {io}\033[0m\n")
+    w(f"\033[2mTotal: {total_ms}ms  tokens: {total_in}→{total_out}\033[0m\n")
+    w("\033[2m─────────────────────────────────────────────\033[0m\n")
+
+
 async def edge_chat_loop(
     user_input: str,
     api_client: Any,
@@ -240,6 +286,7 @@ async def edge_chat_loop(
     model: str | None = None,
     session_info: dict[str, Any] | None = None,
     extra_rules: str | None = None,
+    explain: bool = False,
 ) -> str:
     """Run the edge-cloud agentic loop until final answer or MAX_TURNS.
 
@@ -261,6 +308,7 @@ async def edge_chat_loop(
     final_text = ""
     prev_turn_text = ""  # text from previous turn — used to suppress LLM repeats
     total_usage: dict[str, int] = {}
+    _explain_turns: list[dict[str, Any]] = []
 
     try:
         for turn in range(MAX_TURNS):
@@ -287,6 +335,7 @@ async def edge_chat_loop(
                         model=model,
                         edge_tools=send_edge_tools,
                         edge_profile=edge_profile if turn == 0 else None,
+                        explain=explain,
                     )
                     result = await _consume_turn(sse_stream, renderer, suppress_prefix=prev_turn_text)
                     if result.error and result.error.get("retryable") and attempt < _MAX_RETRIES:
@@ -325,6 +374,8 @@ async def edge_chat_loop(
             final_text = result.text
             for k, v in result.usage.items():
                 total_usage[k] = total_usage.get(k, 0) + (v if isinstance(v, int) else 0)
+            if result.explain:
+                _explain_turns.append({"turn": turn, **result.explain})
 
             if not result.has_tool_calls:
                 break
@@ -381,5 +432,7 @@ async def edge_chat_loop(
     finally:
         if hasattr(renderer, "stats"):
             renderer.stats(total_usage)
+        if _explain_turns:
+            _print_explain(_explain_turns)
 
     return final_text

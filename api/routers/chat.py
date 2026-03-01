@@ -189,6 +189,7 @@ class ChatTurnRequest(BaseModel):
     model: str | None = Field(default=None, description="Model override")
     edge_tools: list[dict[str, Any]] | None = Field(default=None, description="Edge tool schemas (OpenAI format)")
     edge_profile: EdgeProfileModel | None = Field(default=None, description="Edge project profile (cwd, git_branch, languages, project_type)")
+    explain: bool = Field(default=False, description="Return per-step execution trace (like EXPLAIN ANALYZE)")
 
 
 class ChatResponse(BaseModel):
@@ -697,17 +698,121 @@ def _verify_session_owner(user_id: str, session_id: str, db: Session | None = No
             _check(conn)
 
 
-_ReflectFocus = Literal["auto", "skill_failure", "unexpected_result", "data_quality"]
+_ReflectFocus = Literal["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history"]
+
+
+def _escape_like(text: str) -> str:
+    """Escape LIKE wildcards (%, _) in user-supplied text."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _gather_tool_selection(
+    session_id: str, question: str, db: Any,
+    hints: list[str], result: dict[str, Any],
+) -> None:
+    """Gather cloud skills, edge tools, and usage counts into *result*."""
+    # Cloud skills from in-memory registry.
+    # SkillCatalog._skills is the only way to iterate in-memory Skill
+    # instances — no public iterator exists.  Accessed read-only here.
+    try:
+        registry = _get_shared_skill_registry()
+        cloud_skills = []
+        seen_skills: set[str] = set()
+        if registry:
+            for key, skill in registry._skills.items():
+                if "@" in key or skill.name in seen_skills:
+                    continue
+                seen_skills.add(skill.name)
+                schema = skill.to_openai_schema()
+                cloud_skills.append({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "parameters": schema.get("function", {}).get("parameters", {}),
+                })
+        result["cloud_skills"] = cloud_skills
+    except Exception:
+        result["cloud_skills"] = []
+
+    entry = _peek_session_entry(session_id)
+    result["edge_tools"] = [
+        {"name": t.get("function", {}).get("name", "?"),
+         "description": t.get("function", {}).get("description", "")[:80]}
+        for t in (entry.get("tools", []) if entry else [])
+    ]
+
+    # Tool usage counts from events
+    from api.models.agent import Event as EventModel
+    usage_rows = (
+        db.query(EventModel.content)
+        .filter(EventModel.session_id == session_id, EventModel.event_type == "tool_call")
+        .order_by(EventModel.created_at.desc()).limit(50).all()
+    )
+    tool_usage: dict[str, int] = {}
+    for (c,) in usage_rows:
+        try:
+            name = json.loads(c).get("name", "unknown") if c else "unknown"
+            tool_usage[name] = tool_usage.get(name, 0) + 1
+        except (json.JSONDecodeError, TypeError):
+            pass
+    result["tool_usage_counts"] = tool_usage
+
+    unused = {s["name"] for s in result.get("cloud_skills", [])} - set(tool_usage)
+    if unused:
+        hints.append(f"Cloud skills available but never called: {', '.join(sorted(unused))}")
+
+    if question:
+        for s in result.get("cloud_skills", []):
+            if any(w in s["name"] for w in question.lower().split()):
+                hints.append(f"Skill '{s['name']}' params: {json.dumps(s['parameters'])[:200]}")
+
+
+def _gather_history(
+    session_id: str, user_id: str, question: str, db: Any,
+    result: dict[str, Any],
+) -> None:
+    """Find similar queries from past sessions using multi-keyword AND match."""
+    from api.models.agent import Event as EventModel
+
+    cur_query = db.query(EventModel.content).filter(
+        EventModel.session_id == session_id, EventModel.event_type == "user_query",
+    ).order_by(EventModel.created_at.desc()).first()
+    cur_text = (cur_query[0] if cur_query else question) or ""
+
+    if not cur_text:
+        result["related_history"] = []
+        return
+
+    keywords = [w for w in cur_text.lower().split() if len(w) > 3][:3]
+    if not keywords:
+        result["related_history"] = []
+        return
+
+    # Build AND filter: every keyword must appear in the query content.
+    # Escape LIKE wildcards to prevent user input from altering match semantics.
+    q = db.query(EventModel.session_id, EventModel.content, EventModel.created_at).filter(
+        EventModel.user_id == user_id,
+        EventModel.event_type == "user_query",
+        EventModel.session_id != session_id,
+    )
+    for kw in keywords:
+        escaped = _escape_like(kw)
+        q = q.filter(EventModel.content.like(f"%{escaped}%", escape="\\"))
+
+    past_rows = q.order_by(EventModel.created_at.desc()).limit(5).all()
+    result["related_history"] = [
+        {"session_id": r[0], "query": (r[1] or "")[:200], "ts": str(r[2])}
+        for r in past_rows
+    ]
 
 
 def _build_reflect_evidence(
     session_id: str, user_id: str, focus: _ReflectFocus, last_n: int,
+    question: str = "",
 ) -> dict[str, Any]:
-    """Gather diagnostic evidence from DB for agent self-reflection.
+    """Unified diagnostic evidence: events, skill decisions, tool selection, cross-session history.
 
-    Returns structured evidence the LLM cannot see in its context window:
-    event trail with timing/tokens, skill selection history, procedural
-    memories, implicit feedback signals, and deterministic diagnosis hints.
+    Dispatches to focused sub-functions (_gather_tool_selection, _gather_history)
+    that each handle one concern.  All DB queries share a single session.
     """
     result: dict[str, Any] = {"session_id": session_id, "focus": focus}
     hints: list[str] = []
@@ -818,7 +923,6 @@ def _build_reflect_evidence(
         # 4. Implicit feedback signals
         try:
             from api.models.context import PromptFeedback
-            from api.models.agent import Event as EventModel
             user_event_ids = [
                 r[0] for r in
                 db.query(EventModel.event_id)
@@ -849,6 +953,14 @@ def _build_reflect_evidence(
                 if "data_source" not in preview and evt.get("tool_name"):
                     hints.append(f"Tool '{evt['tool_name']}' result has no data_source provenance")
                     break  # one hint is enough
+
+        # 6. Tool selection: cloud skills, edge tools, usage counts
+        if focus in ("tool_selection", "auto"):
+            _gather_tool_selection(session_id, question, db, hints, result)
+
+        # 7. Cross-session history: similar queries from past sessions
+        if focus in ("history", "auto"):
+            _gather_history(session_id, user_id, question, db, result)
 
     result["diagnosis_hints"] = hints
     return result
@@ -1351,7 +1463,11 @@ def _get_shared_skill_registry():
 
 
 def _get_cloud_skill_schemas(registry) -> list[dict[str, Any]]:
-    """Get OpenAI tool schemas for all in-memory cloud skills."""
+    """Get OpenAI tool schemas for all in-memory cloud skills.
+
+    Accesses registry._skills directly — SkillCatalog has no public iterator
+    for in-memory Skill instances.  Read-only traversal.
+    """
     schemas = []
     seen: set[str] = set()
     for key, skill in registry._skills.items():
@@ -1409,137 +1525,35 @@ def _get_shared_embed_fn():
 async def reflect_session(
     session_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
-    focus: _ReflectFocus = Query(default="auto", description="Focus: auto, skill_failure, unexpected_result, data_quality"),
+    focus: _ReflectFocus = Query(default="auto", description="Focus: auto, skill_failure, unexpected_result, data_quality, tool_selection, history"),
     last_n: int = Query(default=20, ge=1, le=100),
+    question: str = Query(default="", description="Optional: what to investigate (for tool_selection focus)"),
 ):
-    """Gather diagnostic evidence from server-side data for agent self-reflection."""
+    """Unified diagnostic endpoint: event trails, skill decisions, tool selection, cross-session history."""
     user_id = current_user["user_id"]
     _verify_session_owner(user_id, session_id)
 
     import asyncio
     return await asyncio.to_thread(
-        _build_reflect_evidence, session_id, user_id, focus, last_n,
+        _build_reflect_evidence, session_id, user_id, focus, last_n, question,
     )
 
 
+# Keep decision-trace as alias for backward compatibility
 @router.get("/chat/session/{session_id}/decision-trace")
 async def decision_trace(
     session_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
     question: str = Query(default="", description="What to investigate"),
 ):
-    """Inspect tool selection decisions: available tools, cloud skills, selection history."""
+    """Alias for reflect with focus=tool_selection. Prefer /reflect."""
     user_id = current_user["user_id"]
     _verify_session_owner(user_id, session_id)
 
     import asyncio
     return await asyncio.to_thread(
-        _build_decision_trace, session_id, user_id, question,
+        _build_reflect_evidence, session_id, user_id, "tool_selection", 20, question,
     )
-
-
-def _build_decision_trace(
-    session_id: str, user_id: str, question: str,
-) -> dict[str, Any]:
-    """Build decision trace showing what tools were available and how they were used."""
-    result: dict[str, Any] = {"session_id": session_id}
-
-    # 1. Cloud skills available in registry
-    try:
-        registry = _get_shared_skill_registry()
-        cloud_skills = []
-        seen: set[str] = set()
-        for key, skill in registry._skills.items():
-            if "@" in key or skill.name in seen:
-                continue
-            seen.add(skill.name)
-            schema = skill.to_openai_schema()
-            cloud_skills.append({
-                "name": skill.name,
-                "description": skill.description,
-                "version": skill.version,
-                "parameters": schema.get("function", {}).get("parameters", {}),
-            })
-        result["cloud_skills"] = cloud_skills
-    except Exception as e:
-        result["cloud_skills"] = []
-        result["cloud_skills_error"] = str(e)
-
-    # 2. Edge tools from session cache
-    entry = _peek_session_entry(session_id)
-    if entry:
-        edge_tools = entry.get("tools", [])
-        result["edge_tools"] = [
-            {"name": t.get("function", {}).get("name", "?"),
-             "description": t.get("function", {}).get("description", "")[:80]}
-            for t in edge_tools
-        ]
-        result["edge_tool_count"] = len(edge_tools)
-    else:
-        result["edge_tools"] = []
-        result["edge_tool_count"] = 0
-
-    # 3. Tool usage in this session
-    tool_usage: dict[str, int] = {}
-    with SessionLocal() as db:
-        from api.models.agent import Event as EventModel
-        rows = (
-            db.query(EventModel.content)
-            .filter(EventModel.session_id == session_id, EventModel.event_type == "tool_call")
-            .order_by(EventModel.created_at.desc())
-            .limit(20)
-            .all()
-        )
-
-        for (content_str,) in rows:
-            try:
-                content = json.loads(content_str) if content_str else {}
-                name = content.get("name", "unknown")
-                tool_usage[name] = tool_usage.get(name, 0) + 1
-            except (json.JSONDecodeError, TypeError):
-                pass
-        result["tool_usage_counts"] = tool_usage
-
-        # 4. Skill selection events
-        from api.models.skill import SkillSelectionEvent
-        sel_rows = (
-            db.query(
-                SkillSelectionEvent.skill_name,
-                SkillSelectionEvent.selected_skills,
-                SkillSelectionEvent.selection_reasoning,
-                SkillSelectionEvent.created_at,
-            )
-            .filter(SkillSelectionEvent.session_id == session_id)
-            .order_by(SkillSelectionEvent.created_at.desc())
-            .limit(5)
-            .all()
-        )
-        result["skill_selections"] = [
-            {"skill": r[0], "selected": r[1],
-             "reasoning": (r[2] or "")[:200], "ts": str(r[3]) if r[3] else None}
-            for r in sel_rows
-        ]
-
-    # 5. Diagnosis hints
-    hints: list[str] = []
-    cloud_names = {s["name"] for s in result.get("cloud_skills", [])}
-    used_names = set(tool_usage.keys())
-
-    unused_cloud = cloud_names - used_names
-    if unused_cloud:
-        hints.append(f"Cloud skills available but never called: {', '.join(sorted(unused_cloud))}")
-
-    if question:
-        q_lower = question.lower()
-        for s in result.get("cloud_skills", []):
-            if s["name"].lower() in q_lower or any(w in s["name"].lower() for w in q_lower.split()):
-                hints.append(
-                    f"Skill '{s['name']}' exists with params: "
-                    f"{json.dumps(s['parameters'], ensure_ascii=False)[:200]}"
-                )
-
-    result["hints"] = hints
-    return result
 
 
 @router.post("/chat/turn")
@@ -1635,6 +1649,10 @@ async def chat_turn(
                 }
 
                 _deadline = _turn_start + SERVER_TURN_TIMEOUT_S
+                _explain_steps: list[dict[str, Any]] = []
+                _total_prompt_tokens = 0
+                _total_completion_tokens = 0
+                _has_usage = False
 
                 async def _next_with_timeout(aiter: AsyncIterator) -> Any:
                     remaining = _deadline - time.monotonic()
@@ -1651,6 +1669,7 @@ async def chat_turn(
                 for _cloud_loop in range(_MAX_CLOUD_LOOPS + 1):
                     _loop_text = ""
                     _loop_tool_calls: list[dict[str, Any]] = []
+                    _llm_start = time.monotonic()
 
                     stream: AsyncIterator = (
                         llm.chat_with_tools_stream(
@@ -1672,13 +1691,35 @@ async def chat_turn(
                             elif chunk["type"] == "tool_call_start":
                                 yield f"data: {json.dumps({'type': 'tool_call_start', 'name': chunk['name']})}\n\n"
                             elif chunk["type"] == "usage":
-                                usage = {"prompt": chunk.get("prompt", 0), "completion": chunk.get("completion", 0), "total": chunk.get("prompt", 0) + chunk.get("completion", 0)}
-                                yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
+                                p_tok = chunk.get("prompt", 0)
+                                c_tok = chunk.get("completion", 0)
+                                _total_prompt_tokens += p_tok
+                                _total_completion_tokens += c_tok
+                                _has_usage = True
+                                usage = {"prompt": p_tok, "completion": c_tok, "total": p_tok + c_tok}
+                                yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': p_tok, 'completion_tokens': c_tok, 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
                     except StopAsyncIteration:
                         pass
                     except (asyncio.TimeoutError, TimeoutError):
                         yield f"data: {json.dumps({'type': 'error', 'message': 'Turn exceeded server time limit', 'code': 'turn_timeout', 'retryable': False})}\n\n"
                         _timed_out = True
+
+                    _llm_elapsed = time.monotonic() - _llm_start
+                    if request.explain:
+                        # Use None for token counts when provider didn't send usage data,
+                        # so the client can distinguish "zero tokens" from "unknown".
+                        if _has_usage:
+                            _step_p = _total_prompt_tokens - sum(s.get("in", 0) for s in _explain_steps if s["step"] == "llm" and s.get("in") is not None)
+                            _step_c = _total_completion_tokens - sum(s.get("out", 0) for s in _explain_steps if s["step"] == "llm" and s.get("out") is not None)
+                        else:
+                            _step_p = None
+                            _step_c = None
+                        _explain_steps.append({
+                            "step": "llm", "loop": _cloud_loop,
+                            "duration_ms": round(_llm_elapsed * 1000),
+                            "in": _step_p, "out": _step_c,
+                            "tool_calls": len(_loop_tool_calls),
+                        })
 
                     full_text += _loop_text
 
@@ -1731,7 +1772,15 @@ async def chat_turn(
                             tc_args = {}
 
                         yield f"data: {json.dumps({'type': 'tool_call_start', 'name': tc_name})}\n\n"
+                        _skill_start = time.monotonic()
                         cloud_result = await _execute_cloud_skill(cloud_registry, tc_name, tc_args)
+                        if request.explain:
+                            _explain_steps.append({
+                                "step": "cloud_skill", "name": tc_name,
+                                "duration_ms": round((time.monotonic() - _skill_start) * 1000),
+                                "in_bytes": len(json.dumps(tc_args)),
+                                "out_bytes": len(cloud_result),
+                            })
                         # Record cloud skill execution as event for decision_trace visibility.
                         try:
                             from api.models.agent import Event as EventModel
@@ -1839,6 +1888,10 @@ async def chat_turn(
 
             if firewall_warning:
                 yield f"data: {json.dumps(firewall_warning)}\n\n"
+
+            if request.explain:
+                _total_ms = round((time.monotonic() - _turn_start) * 1000)
+                yield f"data: {json.dumps({'type': 'explain', 'total_ms': _total_ms, 'prompt_tokens': _total_prompt_tokens if _has_usage else None, 'completion_tokens': _total_completion_tokens if _has_usage else None, 'steps': _explain_steps})}\n\n"
 
             yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"
 

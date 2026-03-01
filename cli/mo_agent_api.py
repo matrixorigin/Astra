@@ -1062,7 +1062,7 @@ async def _prefetch_cloud_skills(api_client) -> str | None:
         return None
 
 
-async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None):
+async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False):
     """Run one edge chat loop turn using the provided APIClient."""
     import os
     from cli.edge_chat_loop import edge_chat_loop
@@ -1090,13 +1090,11 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
 
     from cli.tools.introspection import GetAgentInfoTool
     from cli.tools.reflect import ReflectTool
-    from cli.tools.decision_trace import DecisionTraceTool
     session_info = {"session_id": session_id, "agent_id": agent_id, "model": model, "turn": 0}
     perms = PermissionManager(auto_approve=auto_approve)
 
     router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client))
     router.register(ReflectTool(api_client=api_client, session_info=session_info))
-    router.register(DecisionTraceTool(api_client=api_client, session_info=session_info))
 
     # Prefetch cloud skill summaries so LLM knows about them on turn 0.
     cloud_hint = await _prefetch_cloud_skills(api_client)
@@ -1110,6 +1108,7 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
         session_info=session_info,
         renderer=renderer,
         extra_rules=extra_rules,
+        explain=explain,
     )
 
 
@@ -1186,8 +1185,9 @@ def logout(ctx):
 @click.option("--resume", is_flag=True, help="Resume last session")
 @click.option("--auto-approve", is_flag=True, help="Auto-approve tool execution")
 @click.option("--debug", is_flag=True, help="Print full traceback on errors")
+@click.option("--explain", is_flag=True, help="Show per-turn execution trace (like EXPLAIN ANALYZE)")
 @click.pass_context
-def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
+def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
     """Start interactive chat with edge tool execution."""
     from rich.console import Console
     from rich.panel import Panel
@@ -1374,6 +1374,7 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
                     state.get("selected_model"), user_id, auto_approve,
                     renderer=renderer,
                     extra_rules=skill_dev_rules,
+                    explain=explain,
                 ))
                 if hasattr(renderer, "end_response"):
                     renderer.end_response()

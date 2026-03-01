@@ -142,8 +142,20 @@ class TestReflectTool:
         tool = ReflectTool(api_client=mock_client, session_info={"session_id": "s1"})
         result = await tool.execute(focus="skill_failure", last_n=10)
 
-        mock_client.get_reflect.assert_called_once_with("s1", focus="skill_failure", last_n=10)
+        mock_client.get_reflect.assert_called_once_with("s1", focus="skill_failure", last_n=10, question="")
         assert json.loads(result)["session_id"] == "s1"
+
+    @pytest.mark.asyncio
+    async def test_passes_question_param(self):
+        """question parameter is forwarded to the API client."""
+        mock_client = AsyncMock()
+        mock_client.get_reflect.return_value = {"session_id": "s1"}
+
+        tool = ReflectTool(api_client=mock_client, session_info={"session_id": "s1"})
+        await tool.execute(focus="tool_selection", question="why not list_prs?")
+
+        mock_client.get_reflect.assert_called_once_with(
+            "s1", focus="tool_selection", last_n=20, question="why not list_prs?")
 
     @pytest.mark.asyncio
     async def test_handles_server_error(self):
@@ -157,7 +169,8 @@ class TestReflectTool:
         schema = ReflectTool().to_openai_schema()
         assert schema["function"]["name"] == "reflect"
         assert set(schema["function"]["parameters"]["properties"]["focus"]["enum"]) == {
-            "auto", "skill_failure", "unexpected_result", "data_quality"}
+            "auto", "skill_failure", "unexpected_result", "data_quality",
+            "tool_selection", "history"}
 
 
 # ============================================================================
@@ -305,6 +318,101 @@ class TestBuildReflectEvidence:
         result = _build_reflect_evidence(sid, uid, "auto", 20)
         assert result["feedback_signals"] == []
 
+    def test_tool_selection_returns_usage_counts(self, reflect_session):
+        """focus=tool_selection includes tool_usage_counts from session events."""
+        sid, uid, _ = reflect_session
+        from api.routers.chat import _build_reflect_evidence
+        result = _build_reflect_evidence(sid, uid, "tool_selection", 20)
+        assert "tool_usage_counts" in result
+        # reflect_session fixture creates read_file and bash tool_call events
+        assert "read_file" in result["tool_usage_counts"] or "bash" in result["tool_usage_counts"]
+        assert "edge_tools" in result
+
+    def test_tool_selection_question_hint(self, reflect_session):
+        """question param generates hint when matching a cloud skill name."""
+        sid, uid, _ = reflect_session
+        from unittest.mock import patch, MagicMock
+        from api.routers.chat import _build_reflect_evidence
+
+        mock_skill = MagicMock()
+        mock_skill.name = "list_prs"
+        mock_skill.description = "List PRs"
+        mock_skill.to_openai_schema.return_value = {
+            "function": {"parameters": {"type": "object", "properties": {"repo": {"type": "string"}}}}
+        }
+        mock_reg = MagicMock()
+        mock_reg._skills = {"list_prs": mock_skill}
+
+        with patch("api.routers.chat._get_shared_skill_registry", return_value=mock_reg):
+            result = _build_reflect_evidence(sid, uid, "tool_selection", 20, question="list_prs")
+
+        assert any("list_prs" in h for h in result["diagnosis_hints"])
+
+    def test_history_returns_related_queries(self):
+        """focus=history finds similar queries from other sessions."""
+        from api.database import SessionLocal
+        from core.events.session_manager import SessionManager
+        from core.events.event_logger import EventLogger
+        from sqlalchemy import text
+        from api.routers.chat import _build_reflect_evidence
+
+        uid = "reflect_hist_usr"
+        mgr = SessionManager(SessionLocal())
+
+        # Create an older session with a matching query
+        old_session = mgr.create_session(user_id=uid)
+        el = EventLogger(SessionLocal)
+        el.create_user_query(user_id=uid, session_id=old_session.session_id,
+                             content="database connection pool exhausted yesterday")
+
+        # Current session — keywords (len>3): "database", "connection", "pool", "exhausted"
+        # Old query contains all of them → AND match succeeds.
+        cur_session = mgr.create_session(user_id=uid)
+        el.create_user_query(user_id=uid, session_id=cur_session.session_id,
+                             content="database connection pool exhausted again")
+
+        try:
+            result = _build_reflect_evidence(cur_session.session_id, uid, "history", 20)
+            assert "related_history" in result
+            assert len(result["related_history"]) >= 1
+            assert result["related_history"][0]["session_id"] == old_session.session_id
+        finally:
+            db = SessionLocal()
+            for sid in (old_session.session_id, cur_session.session_id):
+                db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": sid})
+                db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
+            db.commit()
+            db.close()
+
+    def test_history_escapes_like_wildcards(self):
+        """LIKE wildcards in user input are escaped, not treated as patterns."""
+        from api.database import SessionLocal
+        from core.events.session_manager import SessionManager
+        from core.events.event_logger import EventLogger
+        from sqlalchemy import text
+        from api.routers.chat import _build_reflect_evidence
+
+        uid = "reflect_esc_usr"
+        mgr = SessionManager(SessionLocal())
+        session = mgr.create_session(user_id=uid)
+        el = EventLogger(SessionLocal)
+        # Query with LIKE wildcards — should not match everything
+        el.create_user_query(user_id=uid, session_id=session.session_id,
+                             content="100% match_test query")
+
+        try:
+            # Should not crash and should return empty (no other sessions)
+            result = _build_reflect_evidence(session.session_id, uid, "history", 20)
+            assert "related_history" in result
+        finally:
+            db = SessionLocal()
+            db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"),
+                       {"sid": session.session_id})
+            db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"),
+                       {"sid": session.session_id})
+            db.commit()
+            db.close()
+
 
 # ============================================================================
 # 3. Reflection learning — real DB Memory persistence
@@ -429,3 +537,177 @@ class TestSessionCache:
     def test_peek_returns_none_for_missing(self):
         from api.routers.chat import _peek_session_entry
         assert _peek_session_entry("nonexistent_session_xyz") is None
+
+
+# ============================================================================
+# 6. EXPLAIN output
+# ============================================================================
+
+class TestPrintExplain:
+
+    def test_basic_output(self):
+        """_print_explain writes structured trace to the given file object."""
+        import io
+        from cli.edge_chat_loop import _print_explain
+
+        buf = io.StringIO()
+        _print_explain([{
+            "turn": 0, "total_ms": 500,
+            "prompt_tokens": 100, "completion_tokens": 50,
+            "steps": [
+                {"step": "llm", "loop": 0, "duration_ms": 400, "in": 100, "out": 50, "tool_calls": 1},
+                {"step": "cloud_skill", "name": "list_prs", "duration_ms": 80, "in_bytes": 20, "out_bytes": 300},
+            ],
+        }], file=buf)
+
+        output = buf.getvalue()
+        assert "EXPLAIN" in output
+        assert "Turn 0" in output
+        assert "LLM" in output
+        assert "list_prs" in output
+        assert "Total: 500ms" in output
+
+    def test_none_tokens_shown_as_unknown(self):
+        """When token counts are None (no usage from provider), show '?'."""
+        import io
+        from cli.edge_chat_loop import _print_explain
+
+        buf = io.StringIO()
+        _print_explain([{
+            "turn": 0, "total_ms": 200,
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "steps": [
+                {"step": "llm", "loop": 0, "duration_ms": 200, "in": None, "out": None, "tool_calls": 0},
+            ],
+        }], file=buf)
+
+        output = buf.getvalue()
+        assert "in=?" in output
+        assert "out=?" in output
+
+    def test_defaults_to_stderr(self):
+        """When no file is given, writes to stderr (smoke test — just ensure no crash)."""
+        import io
+        import sys
+        from cli.edge_chat_loop import _print_explain
+
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        try:
+            _print_explain([{"turn": 0, "total_ms": 10, "prompt_tokens": 0, "completion_tokens": 0, "steps": []}])
+            assert "EXPLAIN" in sys.stderr.getvalue()
+        finally:
+            sys.stderr = old_stderr
+
+
+class TestExplainSSE:
+    """Verify explain=True produces an explain event in the SSE stream."""
+
+    @pytest.fixture
+    def client(self):
+        import os
+        os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
+        os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def db(self):
+        from api.database import SessionLocal
+        db = SessionLocal()
+        yield db
+        db.close()
+
+
+class TestEscapeLike:
+    """Unit tests for _escape_like helper."""
+
+    def test_escapes_percent(self):
+        from api.routers.chat import _escape_like
+        assert _escape_like("100%") == "100\\%"
+
+    def test_escapes_underscore(self):
+        from api.routers.chat import _escape_like
+        assert _escape_like("match_test") == "match\\_test"
+
+    def test_escapes_backslash(self):
+        from api.routers.chat import _escape_like
+        assert _escape_like("a\\b") == "a\\\\b"
+
+    def test_plain_text_unchanged(self):
+        from api.routers.chat import _escape_like
+        assert _escape_like("hello world") == "hello world"
+
+
+class TestExplainSSE:
+    """Verify explain=True produces an explain event in the SSE stream."""
+
+    @pytest.fixture
+    def client(self):
+        import os
+        os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
+        os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def db(self):
+        from api.database import SessionLocal
+        db = SessionLocal()
+        yield db
+        db.close()
+
+    def test_explain_event_in_stream(self, client, db):
+        """POST /chat/turn with explain=True → SSE stream contains type=explain."""
+        from unittest.mock import patch
+        from tests.conftest import get_auth_headers, parse_sse_events, fake_llm_stream
+
+        headers = get_auth_headers(client, db, username="explain_usr", user_id="explain_uid", email="ex@t.com")
+
+        stream = fake_llm_stream([
+            {"type": "text", "content": "hello"},
+            {"type": "usage", "prompt": 10, "completion": 5},
+        ])
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=stream):
+            resp = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "edge_tools": [{"type": "function", "function": {"name": "bash", "description": "sh", "parameters": {}}}],
+                "explain": True,
+            }, headers=headers)
+
+        assert resp.status_code == 200
+        events = parse_sse_events(resp.text)
+        explain_events = [e for e in events if e.get("type") == "explain"]
+        assert len(explain_events) == 1
+        ex = explain_events[0]
+        assert "total_ms" in ex
+        assert ex["prompt_tokens"] == 10
+        assert ex["completion_tokens"] == 5
+        assert isinstance(ex["steps"], list)
+
+    def test_explain_none_tokens_without_usage(self, client, db):
+        """When LLM doesn't send usage chunk, explain tokens are null."""
+        from unittest.mock import patch
+        from tests.conftest import get_auth_headers, parse_sse_events, fake_llm_stream
+
+        headers = get_auth_headers(client, db, username="explain_nu", user_id="explain_nuid", email="en@t.com")
+
+        # No usage chunk in stream
+        stream = fake_llm_stream([{"type": "text", "content": "hi"}])
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", return_value=stream):
+            resp = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "edge_tools": [{"type": "function", "function": {"name": "bash", "description": "sh", "parameters": {}}}],
+                "explain": True,
+            }, headers=headers)
+
+        assert resp.status_code == 200
+        events = parse_sse_events(resp.text)
+        explain_events = [e for e in events if e.get("type") == "explain"]
+        assert len(explain_events) == 1
+        assert explain_events[0]["prompt_tokens"] is None
+        assert explain_events[0]["completion_tokens"] is None

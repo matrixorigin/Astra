@@ -436,6 +436,7 @@ class APIClient:
         model: str | None = None,
         edge_tools: list[dict[str, Any]] | None = None,
         edge_profile: dict[str, Any] | None = None,
+        explain: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         """Call /chat/turn — one LLM turn in the edge-cloud loop (with auto-refresh).
 
@@ -456,6 +457,8 @@ class APIClient:
             payload["edge_tools"] = edge_tools
         if edge_profile:
             payload["edge_profile"] = edge_profile
+        if explain:
+            payload["explain"] = True
 
         async for event in self._sse_stream("POST", "/chat/turn", json=payload):
             yield event
@@ -863,18 +866,16 @@ class APIClient:
         response = await self._request("GET", "/introspection/skills")
         return response.json()
 
-    async def get_reflect(self, session_id: str, focus: str = "auto", last_n: int = 20) -> dict[str, Any]:
-        """Get diagnostic evidence for agent self-reflection."""
+    async def get_reflect(self, session_id: str, focus: str = "auto", last_n: int = 20, question: str = "") -> dict[str, Any]:
+        """Get unified diagnostic evidence (reflect + tool selection + history)."""
+        params: dict[str, Any] = {"focus": focus, "last_n": last_n}
+        if question:
+            params["question"] = question
         response = await self._request(
-            "GET", f"/chat/session/{session_id}/reflect",
-            params={"focus": focus, "last_n": last_n},
+            "GET", f"/chat/session/{session_id}/reflect", params=params,
         )
         return response.json()
 
     async def get_decision_trace(self, session_id: str, question: str = "") -> dict[str, Any]:
-        """Get decision trace for tool selection diagnosis."""
-        response = await self._request(
-            "GET", f"/chat/session/{session_id}/decision-trace",
-            params={"question": question} if question else {},
-        )
-        return response.json()
+        """Backward compat alias — calls reflect with focus=tool_selection."""
+        return await self.get_reflect(session_id, focus="tool_selection", question=question)

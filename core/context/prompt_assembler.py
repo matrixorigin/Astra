@@ -226,7 +226,7 @@ class PromptAssembler(DbConsumer):
             "\nTool selection rules:\n"
             "- Before using generic tools (bash, grep) for tasks that cloud skills handle (GitHub PRs, CI status), "
             "check if a specialized cloud skill is available — they are faster and more reliable\n"
-            "- If you are unsure which tool to use, call decision_trace to see all available cloud skills and their parameters\n"
+            "- If you are unsure which tool to use, call reflect(focus='tool_selection') to see all available cloud skills and their parameters\n"
             "\nReflection rules:\n"
             "- When a tool result is unexpected or a skill fails, review your recent actions before retrying\n"
             "- If a reflect tool is available, use it to inspect decision history\n"
