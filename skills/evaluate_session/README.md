@@ -10,19 +10,15 @@ This skill enables the agent to analyze its own performance by examining:
 - Skill usage patterns
 - Overall effectiveness
 
-This is the skill version of the `evaluate_session.py` script, integrated into the agent's toolset.
-
 ## Usage
 
 ### As a Tool Call
-
-The agent can call this skill directly:
 
 ```python
 {
   "tool": "evaluate_session",
   "arguments": {
-    "session_id": "019ca9f1-3dc6-72b3-9813-1f38f7349c53",
+    "target_session_id": "019ca9f1-3dc6-72b3-9813-1f38f7349c53",
     "include_details": false
   }
 }
@@ -89,17 +85,23 @@ The agent can call this skill directly:
 
 ### Efficiency Ratings
 
-**Token Efficiency:**
-- `excellent`: < 10K tokens/query
-- `good`: 10K-20K tokens/query
-- `moderate`: 20K-40K tokens/query
-- `needs_improvement`: > 40K tokens/query
+**Token Efficiency** (tokens per query):
+| Rating | Threshold |
+|--------|-----------|
+| excellent | < 10,000 |
+| good | 10,000 - 19,999 |
+| moderate | 20,000 - 39,999 |
+| needs_improvement | ≥ 40,000 |
 
-**Call Efficiency:**
-- `excellent`: ≤ 2 calls/query
-- `good`: 3-4 calls/query
-- `moderate`: 5-6 calls/query
-- `needs_improvement`: > 6 calls/query
+**Call Efficiency** (LLM calls per query):
+| Rating | Threshold |
+|--------|-----------|
+| excellent | ≤ 2 |
+| good | 2.1 - 4 |
+| moderate | 4.1 - 6 |
+| needs_improvement | > 6 |
+
+**Overall**: "good" only if both token and call efficiency are "excellent" or "good".
 
 ## Benefits
 
@@ -108,30 +110,8 @@ The agent can call this skill directly:
 3. **Debugging**: Identify inefficient patterns
 4. **Optimization**: Track improvements over time
 
-## Comparison with evaluate_session.py
-
-| Feature | Script | Skill |
-|---------|--------|-------|
-| Access | External command | Agent tool call |
-| Timing | Post-conversation | Real-time |
-| Integration | Manual | Automatic |
-| Context | None | Full agent context |
-
-## Example Conversation
-
-```
-User: "上海沪工建议买吗？"
-Agent: [Uses stock_assistant, provides analysis]
-
-User: "How efficient was that query?"
-Agent: [Uses evaluate_session skill]
-"That query used 9,568 tokens across 2 LLM calls, which is 'good' efficiency. 
-The token usage was reasonable for a stock analysis with tool calls."
-```
-
 ## Implementation Notes
 
 - Reads from `agent_events` table
-- Calculates metrics in real-time
-- No external dependencies
-- Works with any session in the database
+- Supports database session injection for testing
+- Uses `target_session_id` parameter (not `session_id`) to avoid collision with framework-injected fields

@@ -1,12 +1,12 @@
 {
   "name": "evaluate_session",
   "version": "1.0.0",
-  "description": "Evaluate agent performance in a session",
+  "description": "Evaluate agent performance metrics for a session",
   "category": "analysis",
   "input_schema": {
     "type": "object",
     "properties": {
-      "session_id": {
+      "target_session_id": {
         "type": "string",
         "description": "Session ID to evaluate"
       },
@@ -16,12 +16,14 @@
         "default": false
       }
     },
-    "required": ["session_id"]
+    "required": ["target_session_id"]
   },
   "output_schema": {
     "type": "object",
     "properties": {
-      "session_id": {"type": "string"},
+      "success": {"type": "boolean"},
+      "error": {"type": ["string", "null"]},
+      "session_id": {"type": ["string", "null"]},
       "total_events": {"type": "integer"},
       "user_queries": {"type": "integer"},
       "llm_calls": {"type": "integer"},
@@ -45,11 +47,33 @@
       "assessment": {
         "type": "object",
         "properties": {
-          "token_efficiency": {"type": "string"},
+          "token_efficiency": {
+            "type": "string",
+            "enum": ["excellent", "good", "moderate", "needs_improvement"]
+          },
           "tokens_per_query": {"type": "integer"},
-          "call_efficiency": {"type": "string"},
+          "call_efficiency": {
+            "type": "string",
+            "enum": ["excellent", "good", "moderate", "needs_improvement"]
+          },
           "calls_per_query": {"type": "number"},
-          "overall": {"type": "string"}
+          "overall": {
+            "type": "string",
+            "enum": ["good", "needs_improvement"]
+          }
+        }
+      },
+      "event_breakdown": {
+        "type": ["array", "null"],
+        "items": {
+          "type": "object",
+          "properties": {
+            "index": {"type": "integer"},
+            "type": {"type": "string"},
+            "model": {"type": ["string", "null"]},
+            "skill": {"type": ["string", "null"]},
+            "tokens": {"type": "integer"}
+          }
         }
       }
     }
@@ -60,6 +84,7 @@
         "session_id": "019ca9f1-3dc6-72b3-9813-1f38f7349c53"
       },
       "output": {
+        "success": true,
         "user_queries": 3,
         "llm_calls": 7,
         "tokens": {
