@@ -1445,7 +1445,7 @@ def _persist_turn_events(
                         metadata=qa,
                     )
     except Exception as e:
-        logger.debug("Phase 2b (tool_quality) failed: %s", e)
+        logger.warning("Phase 2b (tool_quality) failed: %s", e, exc_info=True)
 
     # Phase 3: persist tool calls + LLM response + history snapshot
     try:

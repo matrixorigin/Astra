@@ -23,9 +23,11 @@ logger = get_logger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
+# Tools that return raw data (file content, shell output) where structural
+# assessment is meaningless. get_agent_info and reflect are excluded because
+# they return structured metadata that should always be complete.
 PASSTHROUGH_TOOLS: frozenset[str] = frozenset({
     "read_file", "write_file", "bash", "grep", "glob", "list_dir", "git",
-    "get_agent_info", "reflect",
 })
 
 _MAX_DEPTH = 4
@@ -33,6 +35,13 @@ _MAX_FIELDS = 100
 _MAX_RESULT_SIZE = 32_768  # 32 KB
 
 _STALE_SECONDS = 86_400  # 24 h
+
+# Explicit timestamp field names to check for staleness
+# Only exact matches (case-insensitive) to avoid false positives like "update_date_info"
+_TIMESTAMP_FIELDS = frozenset({
+    "timestamp", "created_at", "updated_at", "date", "time",
+    "last_updated", "modified_at", "published_at", "fetched_at",
+})
 
 
 # ── Data structures ─────────────────────────────────────────────────────────
@@ -68,14 +77,31 @@ def flatten_json(
     max_depth: int = _MAX_DEPTH,
     max_fields: int = _MAX_FIELDS,
 ) -> Generator[tuple[str, Any], None, None]:
-    """Yield (dotted_path, leaf_value) pairs, depth- and field-limited."""
+    """Yield (dotted_path, leaf_value) pairs, depth- and field-limited.
+    
+    Handles circular references by tracking visited object IDs.
+    """
     count = 0
+    seen: set[int] = set()
     stack: list[tuple[str, Any, int]] = [("", d, 0)]
+    
     while stack:
         prefix, obj, depth = stack.pop()
+        
+        # Circular reference guard: skip already-visited objects
+        if isinstance(obj, (dict, list)):
+            obj_id = id(obj)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+        
         if isinstance(obj, dict) and depth < max_depth:
             for k, v in obj.items():
                 path = f"{prefix}.{k}" if prefix else k
+                stack.append((path, v, depth + 1))
+        elif isinstance(obj, list) and depth < max_depth:
+            for i, v in enumerate(obj):
+                path = f"{prefix}[{i}]"
                 stack.append((path, v, depth + 1))
         else:
             yield prefix, obj
@@ -109,12 +135,14 @@ def assess_tool_result(
     if not isinstance(data, dict):
         return QualityAssessment(tool_name=tool_name, score=1.0, grade="complete")
 
-    # Size guard
+    # Size guard: skip assessment for very large results to avoid performance issues
     try:
-        if sys.getsizeof(json.dumps(data)) > _MAX_RESULT_SIZE:
+        serialized = json.dumps(data)
+        if len(serialized) > _MAX_RESULT_SIZE:
             return QualityAssessment(tool_name=tool_name, score=1.0, grade="complete")
     except (TypeError, ValueError):
-        pass
+        # Non-serializable data, pass through
+        return QualityAssessment(tool_name=tool_name, score=1.0, grade="complete")
 
     # Explicit error
     if data.get("success") is False or (
@@ -161,11 +189,13 @@ def assess_tool_result(
         if zero_count >= 3:
             signals.append(f"zero_cluster: {zero_count} numeric fields are 0")
 
-    # Staleness check
+    # Staleness check: only check explicit timestamp fields to avoid false positives
     stale = False
     now = current_time or datetime.now(timezone.utc)
     for path, val in leaves:
-        if "timestamp" in path.lower() or "date" in path.lower():
+        # Extract the final field name from dotted path (e.g., "data.timestamp" -> "timestamp")
+        field_name = path.split(".")[-1].lower() if path else ""
+        if field_name in _TIMESTAMP_FIELDS:
             if isinstance(val, str):
                 try:
                     ts = datetime.fromisoformat(val.replace("Z", "+00:00"))
