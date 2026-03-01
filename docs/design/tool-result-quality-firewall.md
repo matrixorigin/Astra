@@ -1032,14 +1032,14 @@ alerts = {
 
 No schema changes needed. Works with all existing skills.
 
-- [ ] Implement `assess_tool_result()` with structural inference (Tier 2)
-- [ ] Implement `annotate_tool_result()` with annotation injection
-- [ ] Wire into `chat_turn` handler after tool_results received
-- [ ] Add `PASSTHROUGH_TOOLS` exemption list
-- [ ] Add quality assessment event logging
-- [ ] Feature flag: `ENABLE_TOOL_QUALITY_FIREWALL`
+- [x] Implement `assess_tool_result()` with structural inference (Tier 2)
+- [x] Implement `annotate_tool_result()` with annotation injection
+- [x] Wire into `chat_turn` handler after tool_results received
+- [x] Add `PASSTHROUGH_TOOLS` exemption list
+- [x] Add quality assessment event logging
+- [x] Feature flag: `ENABLE_TOOL_QUALITY_FIREWALL`
 
-**Success criteria**: Session 019ca950 scenario produces annotation. LLM acknowledges data gaps.
+**Success criteria**: Session 019ca950 scenario produces annotation. LLM acknowledges data gaps. ✅ Verified — 33 tests passing.
 
 ### Phase 2: Explicit Schemas (Week 2) — Precision
 
