@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,6 +24,13 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from core.db_consumer import DbConsumer, DbFactory
+
+# Context window management (feature-flagged)
+try:
+    from core.context.prompt_integration import integrate_compression_into_prompt
+    _COMPRESSION_AVAILABLE = True
+except ImportError:
+    _COMPRESSION_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -613,42 +621,91 @@ class PromptAssembler(DbConsumer):
         return None
 
     def _build_history(self, session_id: str, max_tokens: int) -> str | None:
-        """§6: Budget-capped conversation history."""
+        """§6: Budget-capped conversation history with optional compression."""
+        # Feature flag: enable reference-aware compression
+        enable_compression = os.getenv("ENABLE_HISTORY_COMPRESSION", "false").lower() == "true"
+        
         with self._db() as db:
             budget_chars = int(max_tokens * _MAX_HISTORY_RATIO) * 4
             try:
                 rows = db.execute(
-                    # Why f-string instead of parameterized LIMIT?
-                    # MySQL-compatible DBs (including MatrixOne) may quote parameterized
-                    # LIMIT values as strings: `LIMIT '20'` → syntax error.
-                    # SQLAlchemy's bindparam() has the same issue.
-                    # _MAX_HISTORY_EVENTS is a module-level int constant (not user input),
-                    # so f-string interpolation is safe from SQL injection.
                     text(f"""
-                        SELECT event_type, content FROM agent_events
-                        WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response')
+                        SELECT event_id, event_type, content, metadata FROM agent_events
+                        WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response', 'tool_result')
                         ORDER BY created_at DESC LIMIT {_MAX_HISTORY_EVENTS}
                     """),
                     {"sid": session_id},
                 ).fetchall()
                 if not rows:
                     return None
-                lines = []
-                used = 0
-                for row in reversed(rows):
-                    label = "User" if row[0] == "user_query" else "Agent"
-                    content = row[1] or ""
-                    if len(content) > 300:
-                        content = content[:300] + "..."
-                    line = f"{label}: {content}"
-                    if used + len(line) > budget_chars and lines:
-                        break
-                    lines.append(line)
-                    used += len(line)
-                return "Recent conversation:\n" + "\n".join(lines) if lines else None
+                
+                # Use compression if enabled and available
+                if enable_compression and _COMPRESSION_AVAILABLE:
+                    return self._build_history_compressed(rows, budget_chars)
+                else:
+                    return self._build_history_simple(rows, budget_chars)
+                    
             except SQLAlchemyError as e:
                 logger.debug("History skipped: %s", e)
                 return None
+    
+    def _build_history_simple(self, rows, budget_chars: int) -> str | None:
+        """Original simple history formatting."""
+        lines = []
+        used = 0
+        for row in reversed(rows):
+            event_type = row[1]
+            if event_type not in ('user_query', 'llm_response'):
+                continue
+            label = "User" if event_type == "user_query" else "Agent"
+            content = row[2] or ""
+            if len(content) > 300:
+                content = content[:300] + "..."
+            line = f"{label}: {content}"
+            if used + len(line) > budget_chars and lines:
+                break
+            lines.append(line)
+            used += len(line)
+        return "Recent conversation:\n" + "\n".join(lines) if lines else None
+    
+    def _build_history_compressed(self, rows, budget_chars: int) -> str | None:
+        """Reference-aware compressed history formatting."""
+        # Convert rows to history format
+        history = []
+        current_turn = {}
+        
+        for row in reversed(rows):
+            event_id, event_type, content, metadata = row
+            
+            if event_type == "user_query":
+                if current_turn:
+                    history.append(current_turn)
+                current_turn = {"user_query": content or ""}
+            elif event_type == "llm_response":
+                current_turn["llm_response"] = content or ""
+            elif event_type == "tool_result":
+                if "tool_results" not in current_turn:
+                    current_turn["tool_results"] = []
+                # Parse metadata for tool info
+                meta = json.loads(metadata) if metadata else {}
+                current_turn["tool_results"].append({
+                    "event_id": event_id,
+                    "tool_name": meta.get("tool_name", "unknown"),
+                    "content": content or "",
+                    "args": meta.get("args", {})
+                })
+        
+        if current_turn:
+            history.append(current_turn)
+        
+        # Use compression integration
+        return integrate_compression_into_prompt(
+            history=history,
+            current_turn_response="",  # No current response in history building
+            current_turn_tool_calls=[],
+            elastic_budget=budget_chars // 4,  # Convert chars to tokens
+            enable_compression=True
+        )
 
     # ------------------------------------------------------------------
     # Compression
