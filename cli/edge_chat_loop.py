@@ -245,8 +245,8 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
     for t in turns:
         ms = t.get("total_ms", 0)
         total_ms += ms
-        p = t.get("prompt_tokens", 0)
-        c = t.get("completion_tokens", 0)
+        p = t.get("prompt_tokens") or 0
+        c = t.get("completion_tokens") or 0
         total_in += p
         total_out += c
         w(f"\033[2mTurn {t['turn']}  {ms}ms  tokens: {p}→{c}\033[0m\n")

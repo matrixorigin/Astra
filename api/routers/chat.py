@@ -731,6 +731,7 @@ def _gather_tool_selection(
                 })
         result["cloud_skills"] = cloud_skills
     except Exception:
+        logger.debug("Failed to load cloud skills for tool_selection", exc_info=True)
         result["cloud_skills"] = []
 
     entry = _peek_session_entry(session_id)
@@ -783,6 +784,8 @@ def _gather_history(
         return
 
     keywords = [w for w in cur_text.lower().split() if len(w) > 3][:3]
+    # TODO: strip punctuation, filter stop words, handle non-space-delimited
+    # languages (Chinese, Japanese) — current impl is English-whitespace-only.
     if not keywords:
         result["related_history"] = []
         return
@@ -1891,7 +1894,14 @@ async def chat_turn(
 
             if request.explain:
                 _total_ms = round((time.monotonic() - _turn_start) * 1000)
-                yield f"data: {json.dumps({'type': 'explain', 'total_ms': _total_ms, 'prompt_tokens': _total_prompt_tokens if _has_usage else None, 'completion_tokens': _total_completion_tokens if _has_usage else None, 'steps': _explain_steps})}\n\n"
+                explain_event = {
+                    "type": "explain",
+                    "total_ms": _total_ms,
+                    "prompt_tokens": _total_prompt_tokens if _has_usage else None,
+                    "completion_tokens": _total_completion_tokens if _has_usage else None,
+                    "steps": _explain_steps,
+                }
+                yield f"data: {json.dumps(explain_event)}\n\n"
 
             yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"
 

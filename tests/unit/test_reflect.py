@@ -325,7 +325,8 @@ class TestBuildReflectEvidence:
         result = _build_reflect_evidence(sid, uid, "tool_selection", 20)
         assert "tool_usage_counts" in result
         # reflect_session fixture creates read_file and bash tool_call events
-        assert "read_file" in result["tool_usage_counts"] or "bash" in result["tool_usage_counts"]
+        assert "read_file" in result["tool_usage_counts"]
+        assert "bash" in result["tool_usage_counts"]
         assert "edge_tools" in result
 
     def test_tool_selection_question_hint(self, reflect_session):
@@ -385,7 +386,7 @@ class TestBuildReflectEvidence:
             db.close()
 
     def test_history_escapes_like_wildcards(self):
-        """LIKE wildcards in user input are escaped, not treated as patterns."""
+        """LIKE wildcards in user input must be escaped — '%' should not match everything."""
         from api.database import SessionLocal
         from core.events.session_manager import SessionManager
         from core.events.event_logger import EventLogger
@@ -394,22 +395,32 @@ class TestBuildReflectEvidence:
 
         uid = "reflect_esc_usr"
         mgr = SessionManager(SessionLocal())
-        session = mgr.create_session(user_id=uid)
         el = EventLogger(SessionLocal)
-        # Query with LIKE wildcards — should not match everything
-        el.create_user_query(user_id=uid, session_id=session.session_id,
+
+        # Old session with normal content (no % or _)
+        old_session = mgr.create_session(user_id=uid)
+        el.create_user_query(user_id=uid, session_id=old_session.session_id,
+                             content="normal query about servers")
+
+        # Current session: query contains LIKE wildcards.
+        # Without escaping, "100%" would become LIKE '%100%%' matching everything.
+        # With escaping, it becomes LIKE '%100\%%' matching only literal "100%".
+        cur_session = mgr.create_session(user_id=uid)
+        el.create_user_query(user_id=uid, session_id=cur_session.session_id,
                              content="100% match_test query")
 
         try:
-            # Should not crash and should return empty (no other sessions)
-            result = _build_reflect_evidence(session.session_id, uid, "history", 20)
+            result = _build_reflect_evidence(cur_session.session_id, uid, "history", 20)
             assert "related_history" in result
+            # Old session does NOT contain "100%" or "match_test" →
+            # with proper escaping it must NOT appear in results.
+            matched_sids = {r["session_id"] for r in result["related_history"]}
+            assert old_session.session_id not in matched_sids
         finally:
             db = SessionLocal()
-            db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"),
-                       {"sid": session.session_id})
-            db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"),
-                       {"sid": session.session_id})
+            for sid in (old_session.session_id, cur_session.session_id):
+                db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": sid})
+                db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
             db.commit()
             db.close()
 
@@ -598,26 +609,6 @@ class TestPrintExplain:
             assert "EXPLAIN" in sys.stderr.getvalue()
         finally:
             sys.stderr = old_stderr
-
-
-class TestExplainSSE:
-    """Verify explain=True produces an explain event in the SSE stream."""
-
-    @pytest.fixture
-    def client(self):
-        import os
-        os.environ.setdefault("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
-        os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
-        from fastapi.testclient import TestClient
-        from api.main import app
-        return TestClient(app)
-
-    @pytest.fixture
-    def db(self):
-        from api.database import SessionLocal
-        db = SessionLocal()
-        yield db
-        db.close()
 
 
 class TestEscapeLike:
