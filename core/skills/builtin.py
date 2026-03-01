@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 class SummarizePRInput(SkillInput):
     """Input for summarize_pr skill"""
 
+    repo: str = ""  # "owner/repo", e.g. "matrixorigin/matrixone"
     pr_number: int
     include_diff: bool = True
 
@@ -63,7 +64,8 @@ class SummarizePRSkill(Skill[SummarizePRInput, SummarizePROutput]):
     async def execute(self, input: SummarizePRInput) -> SummarizePROutput:
         """Execute the skill"""
         # 1. Fetch PR from GitHub
-        pr = await self.github.get_pr(input.repo_id, input.pr_number)
+        repo = input.repo or input.repo_id
+        pr = await self.github.get_pr(repo, input.pr_number)
 
         # 2. Build prompt
         prompt = f"""Summarize this PR concisely:
@@ -73,7 +75,7 @@ Description: {pr["body"]}
 Files changed: {pr["files_changed"]}
 """
         if input.include_diff:
-            diff = await self.github.get_pr_diff(input.repo_id, input.pr_number)
+            diff = await self.github.get_pr_diff(repo, input.pr_number)
             prompt += f"\nDiff (first 5000 chars):\n{diff[:5000]}"
 
         # 3. Call LLM
@@ -109,6 +111,7 @@ Files changed: {pr["files_changed"]}
 class ListPRsInput(SkillInput):
     """Input for list_prs skill"""
 
+    repo: str = ""  # "owner/repo", e.g. "matrixorigin/matrixone"
     state: str = "open"  # open, closed, all
     limit: int = 10
 
@@ -124,7 +127,7 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
 
     name = "list_prs"
     version = "1.0.0"
-    description = "List open/closed PRs in a repository"
+    description = "List open/closed PRs in a GitHub repository. Requires repo in 'owner/repo' format, e.g. 'matrixorigin/matrixone'"
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
     )
@@ -138,7 +141,10 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
 
     async def execute(self, input: ListPRsInput) -> ListPRsOutput:
         """Execute the skill"""
-        prs = await self.github.list_prs(input.repo_id, input.state, input.limit)
+        repo = input.repo or input.repo_id
+        if not repo:
+            return ListPRsOutput(success=False, result="repo is required (e.g. 'matrixorigin/matrixone')", prs=[])
+        prs = await self.github.list_prs(repo, input.state, input.limit)
 
         result = [
             {
@@ -162,6 +168,7 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
 class CIStatusInput(SkillInput):
     """Input for ci_status skill"""
 
+    repo: str = ""  # "owner/repo", e.g. "matrixorigin/matrixone"
     limit: int = 5
 
 
@@ -176,7 +183,7 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
 
     name = "ci_status"
     version = "1.0.0"
-    description = "Check CI workflow status in a repository"
+    description = "Check CI workflow status in a GitHub repository. Requires repo in 'owner/repo' format"
     requirements = SkillRequirement(
         repo_types=[RepoType.CI, RepoType.CODE],
         min_access=AccessScope.READ,
@@ -192,7 +199,8 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
 
     async def execute(self, input: CIStatusInput) -> CIStatusOutput:
         """Execute the skill"""
-        runs = await self.github.list_wf_runs(input.repo_id, input.limit)
+        repo = input.repo or input.repo_id
+        runs = await self.github.list_wf_runs(repo, input.limit)
 
         workflows = [
             {
@@ -316,7 +324,7 @@ def register_builtin_skills(
     # Register skills with metadata
     skills = [
         (
-            SummarizePRSkill(db_factory, llm, github),
+            SummarizePRSkill(llm, github),
             "github",
             "pr_management",
             ["summarize", "summary", "pr", "pull request"],
@@ -325,7 +333,7 @@ def register_builtin_skills(
             "medium",
         ),
         (
-            ListPRsSkill(db_factory, github),
+            ListPRsSkill(github),
             "github",
             "pr_management",
             ["list", "show", "prs", "pull requests"],
@@ -334,7 +342,7 @@ def register_builtin_skills(
             "low",
         ),
         (
-            CIStatusSkill(db_factory, github),
+            CIStatusSkill(github),
             "github",
             "ci_cd",
             ["ci", "build", "workflow", "status"],

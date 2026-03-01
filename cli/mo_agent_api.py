@@ -1044,6 +1044,24 @@ SLASH_COMMANDS = {
 # Edge turn runner
 # ============================================================================
 
+async def _prefetch_cloud_skills(api_client) -> str | None:
+    """Fetch cloud skill summaries from server for system prompt injection."""
+    try:
+        data = await api_client.get_introspection_skills()
+        skills = data.get("cloud", []) + data.get("installed", [])
+        if not skills:
+            return None
+        lines = ["# Available Cloud Skills (server-side, call directly by name)"]
+        for s in skills[:10]:
+            name = s.get("skill_name", s.get("name", ""))
+            desc = s.get("description", "")
+            if name:
+                lines.append(f"- **{name}**: {desc}")
+        return "\n".join(lines) if len(lines) > 1 else None
+    except Exception:
+        return None
+
+
 async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None):
     """Run one edge chat loop turn using the provided APIClient."""
     import os
@@ -1072,11 +1090,19 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
 
     from cli.tools.introspection import GetAgentInfoTool
     from cli.tools.reflect import ReflectTool
+    from cli.tools.decision_trace import DecisionTraceTool
     session_info = {"session_id": session_id, "agent_id": agent_id, "model": model, "turn": 0}
     perms = PermissionManager(auto_approve=auto_approve)
 
     router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client))
     router.register(ReflectTool(api_client=api_client, session_info=session_info))
+    router.register(DecisionTraceTool(api_client=api_client, session_info=session_info))
+
+    # Prefetch cloud skill summaries so LLM knows about them on turn 0.
+    cloud_hint = await _prefetch_cloud_skills(api_client)
+    if cloud_hint:
+        extra_rules = (extra_rules + "\n\n" + cloud_hint) if extra_rules else cloud_hint
+
     return await edge_chat_loop(
         user_input, api_client, router, perms,
         session_id=session_id, project_root=project_root,

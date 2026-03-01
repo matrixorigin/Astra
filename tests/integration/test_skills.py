@@ -260,3 +260,42 @@ async def test_ci_status_skill(db_session, github, monkeypatch):
     assert output.success is True
     assert len(output.workflows) == 3
     assert output.cost == 0  # No LLM call
+
+
+@pytest.mark.asyncio
+async def test_register_builtin_skills_then_execute(db_session):
+    """Skills created by register_builtin_skills must actually execute.
+
+    Regression test: register_builtin_skills previously passed db_factory as
+    the first positional arg, so self.github was a sessionmaker instead of
+    GitHubClient — only discovered at runtime.
+    """
+    from core.skills.builtin import register_builtin_skills
+
+    db_factory = lambda: db_session
+
+    # Mock GitHub methods on the client that register_builtin_skills will create
+    mock_prs = [{"number": 1, "title": "PR #1", "user": "u", "created_at": "2026-01-01", "html_url": "http://x"}]
+    mock_runs = [{"name": "CI", "status": "completed", "conclusion": "success", "html_url": "http://x", "created_at": "2026-01-01"}]
+
+    registry = SkillRegistry(db_factory)
+
+    from unittest.mock import AsyncMock, MagicMock
+    fake_gh = MagicMock()
+    fake_gh.list_prs = AsyncMock(return_value=mock_prs)
+    fake_gh.list_wf_runs = AsyncMock(return_value=mock_runs)
+
+    register_builtin_skills(registry, db_factory, github=fake_gh)
+
+    # Retrieve from registry and execute — this is the path /chat/turn uses
+    list_prs_skill = registry.get("list_prs")
+    inp = list_prs_skill.validate_input({"repo": "matrixorigin/matrixone", "state": "open", "limit": 1})
+    out = await list_prs_skill.execute(inp)
+    assert out.success is True
+    assert len(out.prs) == 1
+
+    ci_skill = registry.get("ci_status")
+    inp2 = ci_skill.validate_input({"repo": "matrixorigin/matrixone", "limit": 1})
+    out2 = await ci_skill.execute(inp2)
+    assert out2.success is True
+    assert len(out2.workflows) == 1

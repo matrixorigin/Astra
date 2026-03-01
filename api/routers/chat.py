@@ -1378,7 +1378,8 @@ async def _execute_cloud_skill(registry, tc_name: str, tc_args: dict[str, Any]) 
             return await skill.execute(**tc_args)
     except Exception as e:
         logger.warning("Cloud skill %s failed: %s", tc_name, e)
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        retryable = "rate" in str(e).lower() or "timeout" in type(e).__name__.lower()
+        return json.dumps({"error": f"{type(e).__name__}: {e}", "retryable": retryable})
 
 
 def _get_shared_embed_fn():
@@ -1410,6 +1411,123 @@ async def reflect_session(
     return await asyncio.to_thread(
         _build_reflect_evidence, session_id, user_id, focus, last_n,
     )
+
+
+@router.get("/chat/session/{session_id}/decision-trace")
+async def decision_trace(
+    session_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    question: str = Query(default="", description="What to investigate"),
+):
+    """Inspect tool selection decisions: available tools, cloud skills, selection history."""
+    user_id = current_user["user_id"]
+    _verify_session_owner(user_id, session_id)
+
+    import asyncio
+    return await asyncio.to_thread(
+        _build_decision_trace, session_id, user_id, question,
+    )
+
+
+def _build_decision_trace(
+    session_id: str, user_id: str, question: str,
+) -> dict[str, Any]:
+    """Build decision trace showing what tools were available and how they were used."""
+    result: dict[str, Any] = {"session_id": session_id}
+
+    # 1. Cloud skills available in registry
+    try:
+        registry = _get_shared_skill_registry()
+        cloud_skills = []
+        seen: set[str] = set()
+        for key, skill in registry._skills.items():
+            if "@" in key or skill.name in seen:
+                continue
+            seen.add(skill.name)
+            schema = skill.to_openai_schema()
+            cloud_skills.append({
+                "name": skill.name,
+                "description": skill.description,
+                "version": skill.version,
+                "parameters": schema.get("function", {}).get("parameters", {}),
+            })
+        result["cloud_skills"] = cloud_skills
+    except Exception as e:
+        result["cloud_skills"] = []
+        result["cloud_skills_error"] = str(e)
+
+    # 2. Edge tools from session cache
+    entry = _peek_session_entry(session_id)
+    if entry:
+        edge_tools = entry.get("tools", [])
+        result["edge_tools"] = [
+            {"name": t.get("function", {}).get("name", "?"),
+             "description": t.get("function", {}).get("description", "")[:80]}
+            for t in edge_tools
+        ]
+        result["edge_tool_count"] = len(edge_tools)
+    else:
+        result["edge_tools"] = []
+        result["edge_tool_count"] = 0
+
+    # 3. Tool usage in this session
+    tool_usage: dict[str, int] = {}
+    with SessionLocal() as db:
+        rows = db.execute(
+            text("""
+                SELECT content, created_at
+                FROM agent_events
+                WHERE session_id = :sid AND event_type = 'tool_call'
+                ORDER BY created_at DESC LIMIT 20
+            """),
+            {"sid": session_id},
+        ).fetchall()
+
+        for r in rows:
+            try:
+                content = json.loads(r[0]) if r[0] else {}
+                name = content.get("name", "unknown")
+                tool_usage[name] = tool_usage.get(name, 0) + 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+        result["tool_usage_counts"] = tool_usage
+
+        # 4. Skill selection events
+        sel_rows = db.execute(
+            text("""
+                SELECT skill_name, selected_skills, selection_reasoning, created_at
+                FROM skill_selection_events
+                WHERE session_id = :sid
+                ORDER BY created_at DESC LIMIT 5
+            """),
+            {"sid": session_id},
+        ).fetchall()
+        result["skill_selections"] = [
+            {"skill": r[0], "selected": r[1],
+             "reasoning": (r[2] or "")[:200], "ts": str(r[3]) if r[3] else None}
+            for r in sel_rows
+        ]
+
+    # 5. Diagnosis hints
+    hints: list[str] = []
+    cloud_names = {s["name"] for s in result.get("cloud_skills", [])}
+    used_names = set(tool_usage.keys())
+
+    unused_cloud = cloud_names - used_names
+    if unused_cloud:
+        hints.append(f"Cloud skills available but never called: {', '.join(sorted(unused_cloud))}")
+
+    if question:
+        q_lower = question.lower()
+        for s in result.get("cloud_skills", []):
+            if s["name"].lower() in q_lower or any(w in s["name"].lower() for w in q_lower.split()):
+                hints.append(
+                    f"Skill '{s['name']}' exists with params: "
+                    f"{json.dumps(s['parameters'], ensure_ascii=False)[:200]}"
+                )
+
+    result["hints"] = hints
+    return result
 
 
 @router.post("/chat/turn")

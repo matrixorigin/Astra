@@ -391,3 +391,33 @@ class TestCodeBlockInstall:
         install_prettier_code_blocks()
         from rich.markdown import Markdown
         assert Markdown.elements["fence"].__name__ == "SimpleCodeBlock"
+
+
+class TestThinkingIndicator:
+    def test_hide_uses_relative_movement(self):
+        """_hide_thinking uses \\033[A (relative) not \\033[u (absolute restore).
+
+        Absolute restore breaks when the terminal scrolls — the saved position
+        shifts up but the restore goes to the old (wrong) row.
+        """
+        console, buf = _make_console()
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        sm.feed("Hello")
+        sm.show_thinking()
+        sm._hide_thinking()
+        output = buf.getvalue()
+        assert "\033[u" not in output, "must not use cursor restore (scroll-unsafe)"
+        assert "\033[A" in output, "must use relative cursor-up"
+
+    def test_hide_restores_column_position(self):
+        """After hiding thinking, cursor returns to the correct column."""
+        console, buf = _make_console()
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        sm.feed("12345")  # 5 columns
+        sm.show_thinking()
+        sm._hide_thinking()
+        output = buf.getvalue()
+        # Should move right 5 columns after moving up
+        assert "\033[5C" in output

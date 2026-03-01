@@ -386,6 +386,7 @@ class TestCLIEdgeMode:
             captured["kwargs"] = kwargs
 
         mock_api = AsyncMock()
+        mock_api.get_introspection_skills = AsyncMock(return_value={"cloud": [], "installed": []})
 
         with patch("cli.edge_chat_loop.edge_chat_loop", fake_edge_chat_loop), \
              patch("core.skills.loader.SkillLoader.discover", return_value=[]):
@@ -394,7 +395,7 @@ class TestCLIEdgeMode:
         expected_tools = {
             "read_file", "write_file", "str_replace", "list_dir",
             "bash", "git_status", "git_diff", "git_log", "grep", "glob",
-            "get_agent_info", "reflect",
+            "get_agent_info", "reflect", "decision_trace",
         }
         assert set(captured["tools"]) == expected_tools
         assert captured["auto_approve"] is True

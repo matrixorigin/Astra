@@ -79,17 +79,23 @@ class GitHubClient:
             except Exception:
                 pass
 
-    async def get_pr(self, repo_id: int, pr_number: int) -> dict:
-        return await self._api.get_pr(self.default_repo, pr_number)
+    def _resolve_repo(self, repo_id) -> str:
+        """Resolve repo: if 'owner/repo' string, use directly; otherwise default_repo."""
+        if isinstance(repo_id, str) and "/" in repo_id:
+            return repo_id
+        return self.default_repo
 
-    async def get_pr_diff(self, repo_id: int, pr_number: int) -> str:
-        return await self._api.get_pr_diff(self.default_repo, pr_number)
+    async def get_pr(self, repo_id, pr_number: int) -> dict:
+        return await self._api.get_pr(self._resolve_repo(repo_id), pr_number)
 
-    async def list_prs(self, repo_id: int, state: str = "open", limit: int = 10) -> list[dict]:
-        return await self._api.list_prs(self.default_repo, state, limit)
+    async def get_pr_diff(self, repo_id, pr_number: int) -> str:
+        return await self._api.get_pr_diff(self._resolve_repo(repo_id), pr_number)
 
-    async def list_wf_runs(self, repo_id: int, limit: int = 5) -> list[dict]:
-        return await self._api.list_wf_runs(self.default_repo, limit)
+    async def list_prs(self, repo_id, state: str = "open", limit: int = 10) -> list[dict]:
+        return await self._api.list_prs(self._resolve_repo(repo_id), state, limit)
+
+    async def list_wf_runs(self, repo_id, limit: int = 5) -> list[dict]:
+        return await self._api.list_wf_runs(self._resolve_repo(repo_id), limit)
 
     def get_rate_limit(self) -> dict:
         return self._api.get_rate_limit()

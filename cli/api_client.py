@@ -870,3 +870,11 @@ class APIClient:
             params={"focus": focus, "last_n": last_n},
         )
         return response.json()
+
+    async def get_decision_trace(self, session_id: str, question: str = "") -> dict[str, Any]:
+        """Get decision trace for tool selection diagnosis."""
+        response = await self._request(
+            "GET", f"/chat/session/{session_id}/decision-trace",
+            params={"question": question} if question else {},
+        )
+        return response.json()

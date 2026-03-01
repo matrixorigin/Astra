@@ -110,9 +110,11 @@ class StreamingMarkdown:
         label = getattr(self, "_thinking_label", "Thinking…")
         f = self._console.file
         if self._thinking_shown:
+            # Update in-place: clear the thinking line and rewrite
             f.write(f"\r\033[2K\033[2m  ⏳ {label} {elapsed:.1f}s\033[0m")
         else:
-            f.write(f"\033[s\n\033[2m  ⏳ {label} {elapsed:.1f}s\033[0m")
+            # First show: move to a new line for the indicator
+            f.write(f"\n\033[2m  ⏳ {label} {elapsed:.1f}s\033[0m")
             self._thinking_shown = True
         f.flush()
 
@@ -125,7 +127,13 @@ class StreamingMarkdown:
         self._thinking_timer = None
         self._thinking_stop = None
         f = self._console.file
-        f.write("\r\033[2K\033[u")
+        # Clear thinking line, move up to restore cursor to the text line.
+        # Uses relative movement (\033[A) instead of save/restore (\033[s/u)
+        # because save/restore breaks when the terminal scrolls.
+        col = self._current_line_width
+        f.write(f"\r\033[2K\033[A")
+        if col > 0:
+            f.write(f"\033[{col}C")
         f.flush()
         self._thinking_shown = False
         self._thinking_t0 = None

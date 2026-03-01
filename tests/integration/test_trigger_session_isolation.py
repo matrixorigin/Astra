@@ -276,7 +276,12 @@ class TestGetDueTriggersRealDB:
             cron_expr="* * * * *",
             session_id=session_id,
         )
-        # next_fire_at is already in the future from create_trigger.
+        # Force next_fire_at far into the future so it's never due.
+        db.execute(
+            text("UPDATE wf_triggers SET next_fire_at = :future WHERE trigger_id = :tid"),
+            {"future": datetime(2099, 1, 1), "tid": trig_future["trigger_id"]},
+        )
+        db.commit()
 
         try:
             due = get_due_triggers(db)
