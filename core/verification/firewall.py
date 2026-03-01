@@ -83,6 +83,7 @@ class HallucinationFirewall(DbConsumer):
     def verify_response(
         self, response: str, context_capture_id: str, mode: str = "warn",
         skill_name: str | None = None,
+        tool_quality_score: float | None = None,
     ) -> FirewallResult:
         """Verify LLM response against context capture.
 
@@ -185,13 +186,29 @@ class HallucinationFirewall(DbConsumer):
         knowledge_freshness = self._knowledge_freshness(snapshot)
         skill_rel = self._skill_reliability(skill_name) if skill_name else None
 
-        # Weighted composite (design §3) — 4D when skill known, 3D otherwise
-        if skill_rel is not None:
+        # Weighted composite (design §3) — 5D/4D/3D depending on available signals
+        if skill_rel is not None and tool_quality_score is not None:
+            # 5D: all signals available
+            confidence = (
+                0.30 * claim_verifiability
+                + 0.20 * context_coverage
+                + 0.15 * knowledge_freshness
+                + 0.15 * skill_rel
+                + 0.20 * tool_quality_score
+            )
+        elif skill_rel is not None:
             confidence = (
                 0.35 * claim_verifiability
                 + 0.25 * context_coverage
                 + 0.20 * knowledge_freshness
                 + 0.20 * skill_rel
+            )
+        elif tool_quality_score is not None:
+            confidence = (
+                0.35 * claim_verifiability
+                + 0.25 * context_coverage
+                + 0.20 * knowledge_freshness
+                + 0.20 * tool_quality_score
             )
         else:
             confidence = (

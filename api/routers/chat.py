@@ -1763,6 +1763,12 @@ async def chat_turn(
 
             yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id})}\n\n"
 
+            # ── Quality Badge SSE (§5.4) — emit before LLM response ──────
+            if _TOOL_QUALITY_ENABLED:
+                for qa in _get_or_create_session_entry(session_id).get("tool_quality_assessments", []):
+                    if qa["grade"] != "complete":
+                        yield f"data: {json.dumps({'type': 'tool_result_quality', 'tool_name': qa['tool_name'], 'grade': qa['grade'], 'score': qa['score'], 'signals': qa['signals']})}\n\n"
+
             llm = _get_shared_llm_client()
             with llm.request_context(user_id=user_id):
 
@@ -1927,6 +1933,12 @@ async def chat_turn(
                         except Exception:
                             pass
                         yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': cloud_result[:500]})}\n\n"
+                        # Quality badge for cloud tool results
+                        if _TOOL_QUALITY_ENABLED:
+                            _cqa = _assess_tool_result(tc_name, cloud_result)
+                            if _cqa.needs_annotation:
+                                yield f"data: {json.dumps({'type': 'tool_result_quality', 'tool_name': tc_name, 'grade': _cqa.grade, 'score': _cqa.score, 'signals': _cqa.signals[:5]})}\n\n"
+                                cloud_result = _annotate_tool_result({"result": cloud_result}, _cqa)["result"]
                         # Append tool result to messages for next LLM call.
                         _current_llm_messages = _current_llm_messages + [
                             {"role": "tool", "tool_call_id": tc_id, "content": cloud_result}
@@ -2001,6 +2013,11 @@ async def chat_turn(
             # Pre-completion firewall verification (must arrive before turn_complete
             # because edge clients may close the connection on turn_complete).
             firewall_warning: dict[str, Any] | None = None
+            _agg_tool_quality: float | None = None
+            if _TOOL_QUALITY_ENABLED:
+                _qas = _get_or_create_session_entry(session_id).get("tool_quality_assessments", [])
+                if _qas:
+                    _agg_tool_quality = sum(q["score"] for q in _qas) / len(_qas)
             if full_text and snapshot_id:
                 try:
                     import asyncio
@@ -2008,7 +2025,8 @@ async def chat_turn(
                     from core.verification.firewall import HallucinationFirewall
                     ctx_mgr = ContextManager(SessionLocal)
                     fw = HallucinationFirewall(SessionLocal, context_manager=ctx_mgr)
-                    result = await asyncio.to_thread(fw.verify_response, full_text, snapshot_id)
+                    result = await asyncio.to_thread(fw.verify_response, full_text, snapshot_id,
+                                                      tool_quality_score=_agg_tool_quality)
                     if not result.safe_to_deliver:
                         firewall_warning = {'type': 'warning', 'message': 'Response may contain unverified claims', 'claims_failed': result.claims_failed}
                 except Exception as e:
