@@ -1316,6 +1316,71 @@ def _get_shared_llm_client():
     return _shared_llm_client
 
 
+# Lazy-initialized shared SkillRegistry for cloud skill execution in /chat/turn.
+_shared_skill_registry = None
+_shared_skill_registry_lock = threading.Lock()
+
+
+def _get_shared_skill_registry():
+    """Get or create a shared SkillRegistry with builtin cloud skills."""
+    global _shared_skill_registry
+    if _shared_skill_registry is None:
+        with _shared_skill_registry_lock:
+            if _shared_skill_registry is None:
+                from core.skills.registry import SkillRegistry
+                from core.skills.builtin import register_builtin_skills
+                from core.code_executor import CodeExecutor
+                from core.runtime import IsolationLevel, create_runtime
+                registry = SkillRegistry(SessionLocal)
+                code_executor = CodeExecutor(
+                    runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
+                    db_factory=SessionLocal,
+                )
+                register_builtin_skills(registry, SessionLocal, code_executor=code_executor)
+                _shared_skill_registry = registry
+    return _shared_skill_registry
+
+
+def _get_cloud_skill_schemas(registry) -> list[dict[str, Any]]:
+    """Get OpenAI tool schemas for all in-memory cloud skills."""
+    schemas = []
+    seen: set[str] = set()
+    for key, skill in registry._skills.items():
+        if "@" in key:  # skip versioned aliases
+            continue
+        if skill.name in seen:
+            continue
+        seen.add(skill.name)
+        try:
+            schemas.append(skill.to_openai_schema())
+        except Exception as e:
+            logger.debug("Failed to get schema for cloud skill %s: %s", skill.name, e)
+    return schemas
+
+
+async def _execute_cloud_skill(registry, tc_name: str, tc_args: dict[str, Any]) -> str:
+    """Execute a cloud skill server-side and return result as string."""
+    from core.skills.base import Skill as SkillBase
+    from core.exceptions import SkillNotFoundError
+    try:
+        skill = registry.get(tc_name)
+    except SkillNotFoundError:
+        return json.dumps({"error": f"Cloud skill '{tc_name}' not found"})
+    try:
+        if hasattr(skill, '_input_cls') and skill._input_cls is not None:
+            validated = skill.validate_input(tc_args)
+            output = await skill.execute(validated)
+            if hasattr(output, 'model_dump'):
+                data = output.model_dump(exclude={"cost"}, exclude_none=True)
+                return json.dumps(data, ensure_ascii=False, default=str)
+            return str(getattr(output, 'result', output))
+        else:
+            return await skill.execute(**tc_args)
+    except Exception as e:
+        logger.warning("Cloud skill %s failed: %s", tc_name, e)
+        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+
+
 def _get_shared_embed_fn():
     """Get or create a shared embed_fn for memory pipeline."""
     global _shared_embed_fn
@@ -1382,6 +1447,25 @@ async def chat_turn(
                 _session_cache[session_id] = entry
             tools_schema = (existing or {}).get("tools", []) if not request.edge_tools else request.edge_tools
 
+            # Merge cloud skill schemas into tools_schema so LLM can call them.
+            # Cloud skills are executed server-side (not sent to edge).
+            # Only inject when edge is in tool-calling mode (sent edge_tools).
+            cloud_skill_names: set[str] = set()
+            cloud_registry = None
+            merged_tools_schema = tools_schema
+            if tools_schema:
+                try:
+                    cloud_registry = _get_shared_skill_registry()
+                    cloud_schemas = _get_cloud_skill_schemas(cloud_registry)
+                    edge_tool_names = _tool_names(tools_schema)
+                    cloud_schemas = [s for s in cloud_schemas
+                                    if s.get("function", {}).get("name", "") not in edge_tool_names]
+                    cloud_skill_names = {s.get("function", {}).get("name", "") for s in cloud_schemas}
+                    if cloud_schemas:
+                        merged_tools_schema = tools_schema + cloud_schemas
+                except Exception as e:
+                    logger.debug("Cloud skill loading skipped: %s", e)
+
             import asyncio
 
             def _build_sync():
@@ -1391,7 +1475,7 @@ async def chat_turn(
                         db, user_id, session_id,
                         request.messages, request.tool_results, request.project_rules,
                         agent_id=request.agent_id,
-                        edge_tools=request.edge_tools,
+                        edge_tools=merged_tools_schema,
                         edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
                         force_rebuild_system=tools_changed,
                         username=current_user.get("username"),
@@ -1413,8 +1497,6 @@ async def chat_turn(
                 full_text = ""
                 tool_calls: list[dict[str, Any]] = []
                 usage: dict[str, int] = {}
-                # Requested LLM params — these are what we sent to the provider,
-                # not necessarily what the provider used (it may override/clamp).
                 llm_params: dict[str, Any] = {
                     k: v for k, v in {
                         "temperature": llm.config.get("temperature", 0.7),
@@ -1422,8 +1504,6 @@ async def chat_turn(
                     }.items() if v is not None
                 }
 
-                # Server timeout (240s) < client timeout (300s) so the server
-                # can send an error event before the client gives up.
                 _deadline = _turn_start + SERVER_TURN_TIMEOUT_S
 
                 async def _next_with_timeout(aiter: AsyncIterator) -> Any:
@@ -1432,37 +1512,116 @@ async def chat_turn(
                         raise asyncio.TimeoutError
                     return await asyncio.wait_for(aiter.__anext__(), timeout=remaining)
 
-                stream: AsyncIterator = (
-                    llm.chat_with_tools_stream(
-                        llm_messages, tools_schema, model=model, task_hint=task_hint,
-                    ) if tools_schema else
-                    llm.chat_stream(
-                        llm_messages, user_id, session_id, model=model,
-                    )
-                )
-                try:
-                    while True:
-                        chunk = await _next_with_timeout(stream)
-                        if chunk["type"] == "text":
-                            full_text += chunk["content"]
-                            yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
-                        elif chunk["type"] == "tool_call":
-                            tool_calls.append(chunk["data"])
-                        elif chunk["type"] == "tool_call_start":
-                            yield f"data: {json.dumps({'type': 'tool_call_start', 'name': chunk['name']})}\n\n"
-                        elif chunk["type"] == "usage":
-                            usage = {"prompt": chunk.get("prompt", 0), "completion": chunk.get("completion", 0), "total": chunk.get("prompt", 0) + chunk.get("completion", 0)}
-                            yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
-                except StopAsyncIteration:
-                    pass
-                except (asyncio.TimeoutError, TimeoutError):
-                    yield f"data: {json.dumps({'type': 'error', 'message': 'Turn exceeded server time limit', 'code': 'turn_timeout', 'retryable': False})}\n\n"
-                    return
+                # Inner loop: if LLM calls cloud skills, execute them server-side
+                # and feed results back to LLM. Repeat until LLM returns only
+                # edge tool_calls or a final text answer.
+                _MAX_CLOUD_LOOPS = 5
+                _current_llm_messages = llm_messages
 
-                # Emit accumulated tool calls
+                for _cloud_loop in range(_MAX_CLOUD_LOOPS + 1):
+                    _loop_text = ""
+                    _loop_tool_calls: list[dict[str, Any]] = []
+
+                    stream: AsyncIterator = (
+                        llm.chat_with_tools_stream(
+                            _current_llm_messages, merged_tools_schema, model=model, task_hint=task_hint,
+                        ) if merged_tools_schema else
+                        llm.chat_stream(
+                            _current_llm_messages, user_id, session_id, model=model,
+                        )
+                    )
+                    _timed_out = False
+                    try:
+                        while True:
+                            chunk = await _next_with_timeout(stream)
+                            if chunk["type"] == "text":
+                                _loop_text += chunk["content"]
+                                yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
+                            elif chunk["type"] == "tool_call":
+                                _loop_tool_calls.append(chunk["data"])
+                            elif chunk["type"] == "tool_call_start":
+                                yield f"data: {json.dumps({'type': 'tool_call_start', 'name': chunk['name']})}\n\n"
+                            elif chunk["type"] == "usage":
+                                usage = {"prompt": chunk.get("prompt", 0), "completion": chunk.get("completion", 0), "total": chunk.get("prompt", 0) + chunk.get("completion", 0)}
+                                yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
+                    except StopAsyncIteration:
+                        pass
+                    except (asyncio.TimeoutError, TimeoutError):
+                        yield f"data: {json.dumps({'type': 'error', 'message': 'Turn exceeded server time limit', 'code': 'turn_timeout', 'retryable': False})}\n\n"
+                        _timed_out = True
+
+                    full_text += _loop_text
+
+                    if _timed_out:
+                        return
+
+                    if not _loop_tool_calls:
+                        # No tool calls — final answer, exit loop.
+                        break
+
+                    # Partition tool_calls into cloud vs edge.
+                    cloud_tcs = []
+                    edge_tcs = []
+                    for tc in _loop_tool_calls:
+                        tc_name = tc.get("function", {}).get("name", "")
+                        if tc_name in cloud_skill_names:
+                            cloud_tcs.append(tc)
+                        else:
+                            edge_tcs.append(tc)
+
+                    if not cloud_tcs:
+                        # All tool_calls are edge — pass through to client.
+                        tool_calls = _loop_tool_calls
+                        break
+
+                    # Execute cloud skills server-side.
+                    if not cloud_registry:
+                        # Registry unavailable — treat as edge tool_calls.
+                        tool_calls = _loop_tool_calls
+                        break
+
+                    # Execute cloud skills server-side.
+                    # Build assistant message with tool_calls for conversation history.
+                    assistant_msg_loop: dict[str, Any] = {"role": "assistant"}
+                    if _loop_text:
+                        assistant_msg_loop["content"] = _loop_text
+                    assistant_msg_loop["tool_calls"] = [
+                        {"id": tc.get("id", ""), "type": "function", "function": tc.get("function", {})}
+                        for tc in cloud_tcs
+                    ]
+                    _current_llm_messages = _current_llm_messages + [assistant_msg_loop]
+
+                    for tc in cloud_tcs:
+                        tc_name = tc.get("function", {}).get("name", "?")
+                        tc_id = tc.get("id", "")
+                        args_raw = tc.get("function", {}).get("arguments", "") or "{}"
+                        try:
+                            tc_args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                        except json.JSONDecodeError:
+                            tc_args = {}
+
+                        yield f"data: {json.dumps({'type': 'tool_call_start', 'name': tc_name})}\n\n"
+                        cloud_result = await _execute_cloud_skill(cloud_registry, tc_name, tc_args)
+                        # Append tool result to messages for next LLM call.
+                        _current_llm_messages = _current_llm_messages + [
+                            {"role": "tool", "tool_call_id": tc_id, "content": cloud_result}
+                        ]
+
+                    # If there are also edge tool_calls, emit them and break.
+                    # The edge will execute them and send results in the next /chat/turn.
+                    if edge_tcs:
+                        tool_calls = edge_tcs
+                        break
+
+                    # All tool_calls were cloud — loop back to LLM with results.
+                    continue
+                else:
+                    # Exhausted cloud loop limit — break out with whatever we have.
+                    logger.warning("Cloud skill loop limit reached (%d)", _MAX_CLOUD_LOOPS)
+
+                # Emit accumulated edge tool calls to client.
                 for tc in tool_calls:
                     tc_name = tc.get("function", {}).get("name", "?")
-                    # Truncated by max_tokens — arguments JSON is incomplete.
                     if tc.get("_truncated"):
                         logger.warning("tool_call %s truncated by max_tokens", tc_name)
                         parsed_args = {"_parse_error": (
@@ -1476,7 +1635,6 @@ async def chat_turn(
                         try:
                             parsed_args = json.loads(args) if isinstance(args, str) else args
                         except json.JSONDecodeError:
-                            # Try to repair common LLM JSON errors before giving up
                             parsed_args = _try_repair_tool_args(tc_name, args)
                             if parsed_args is None:
                                 logger.warning("Malformed tool_call arguments for %s: %s",
@@ -1484,7 +1642,7 @@ async def chat_turn(
                                 parsed_args = {"_parse_error": f"Malformed arguments JSON: {args[:200]}"}
                     yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc_name, 'arguments': parsed_args})}\n\n"
 
-                # Update session cache: append assistant message, increment turn_count
+                # Update session cache
                 _entry = _get_or_create_session_entry(session_id)
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text}
                 if tool_calls:
@@ -1495,8 +1653,6 @@ async def chat_turn(
                 current_turn_count = _entry["turn_count"]
                 current_history = list(_entry.get("history", []))
 
-                # Resolve actual model name for audit (not the user's request, but
-                # what the router selected — may differ due to fallback chain).
                 resolved_model = llm.resolve_model_name(model)
 
             # Persist events in background thread (non-blocking, best-effort).
