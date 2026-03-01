@@ -106,6 +106,28 @@ class TestStreamingMarkdown:
         assert "**" not in rendered_part
         assert "bold text" in rendered_part
 
+    def test_finish_rerender_false_no_erase(self):
+        """rerender=False skips erase-and-rerender — raw text stays, no duplication."""
+        console, buf = _make_console()
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        sm.feed("现在让我查看：\n")
+        sm.finish(rerender=False)
+        output = buf.getvalue()
+        # No erase sequences
+        assert "\033[A" not in output
+        assert output.count("现在让我查看") == 1
+
+    def test_finish_rerender_false_adds_newline_if_needed(self):
+        """rerender=False ensures cursor is on a new line (no trailing newline in text)."""
+        console, buf = _make_console()
+        sm = StreamingMarkdown(console=console)
+        sm.start()
+        sm.feed("no newline")
+        sm.finish(rerender=False)
+        output = buf.getvalue()
+        assert output.endswith("\n")
+
 
 class TestLineCount:
     """Test _count_lines directly — the critical logic for correct erase."""

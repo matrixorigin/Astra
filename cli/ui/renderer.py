@@ -37,11 +37,11 @@ class RichRenderer:
             self._md._hide_thinking()
         self._spinner = None
 
-    def end_response(self) -> str:
+    def end_response(self, *, rerender: bool = True) -> str:
         """Stop streaming and return accumulated text."""
         self._stop_spinner()
         if self._md is not None:
-            text = self._md.finish()
+            text = self._md.finish(rerender=rerender)
             self._md = None
             return text
         return ""
@@ -67,7 +67,7 @@ class RichRenderer:
     def tool_start(self, name: str, args: dict[str, Any]) -> None:
         self._stop_spinner()
         if self._md is not None:
-            self.end_response()
+            self.end_response(rerender=False)
         detail = args.get("command", args.get("path", ""))
         self._console.print(
             f"  {THEME.tool} [yellow]{name}[/yellow]: {detail}… ",
@@ -85,7 +85,7 @@ class RichRenderer:
     def error(self, msg: str) -> None:
         self._stop_spinner()
         if self._md is not None:
-            self.end_response()
+            self.end_response(rerender=False)
         self._console.print(Panel(msg, border_style="red", title="Error", title_align="left"))
 
     def info(self, msg: str) -> None:

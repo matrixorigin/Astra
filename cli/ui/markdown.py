@@ -139,21 +139,32 @@ class StreamingMarkdown:
             f.flush()
             self._raw_lines += self._count_lines(chunk)
 
-    def finish(self) -> str:
-        """Stop streaming. On terminals, replace raw text with rendered markdown."""
+    def finish(self, *, rerender: bool = True) -> str:
+        """Stop streaming. On terminals, replace raw text with rendered markdown.
+
+        rerender=False skips the erase-and-rerender cycle — used when finishing
+        mid-stream (e.g. before a tool call) where the raw text is good enough
+        and erase can fail due to terminal scroll or thinking indicator state.
+        """
         self._hide_thinking()
         if self._live:
             self._live = False
             f = self._console.file
             if self._console.is_terminal and self._buffer:
-                # Erase raw output: clear the current (last) line first,
-                # then move up through each wrapped line and clear it.
-                f.write("\r\033[2K")
-                for _ in range(self._raw_lines):
-                    f.write("\033[A\033[2K")
-                f.flush()
-                # Render final markdown
-                self._console.print(Markdown(self._buffer))
+                if rerender:
+                    # Erase raw output: clear the current (last) line first,
+                    # then move up through each wrapped line and clear it.
+                    f.write("\r\033[2K")
+                    for _ in range(self._raw_lines):
+                        f.write("\033[A\033[2K")
+                    f.flush()
+                    # Render final markdown
+                    self._console.print(Markdown(self._buffer))
+                else:
+                    # Just ensure we're on a new line
+                    if self._current_line_width > 0:
+                        f.write("\n")
+                        f.flush()
             else:
                 if self._buffer and not self._buffer.endswith("\n"):
                     f.write("\n")

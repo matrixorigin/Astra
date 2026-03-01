@@ -1380,7 +1380,7 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
                     status_bar.update(turn=turn_count)
             except AuthenticationError:
                 if hasattr(renderer, "end_response"):
-                    renderer.end_response()
+                    renderer.end_response(rerender=False)
                 if not is_tty:
                     console.print("[red]Session expired[/red]")
                     break
@@ -1398,11 +1398,11 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
                     break
             except KeyboardInterrupt:
                 if hasattr(renderer, "end_response"):
-                    renderer.end_response()
+                    renderer.end_response(rerender=False)
                 console.print("\n[dim]Interrupted[/dim]")
             except Exception as e:
                 if hasattr(renderer, "end_response"):
-                    renderer.end_response()
+                    renderer.end_response(rerender=False)
                 if debug:
                     console.print_exception(show_locals=True)
                 else:

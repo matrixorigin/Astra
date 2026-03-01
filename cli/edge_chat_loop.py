@@ -357,7 +357,7 @@ async def edge_chat_loop(
                     # End streaming markdown before showing interactive prompt,
                     # otherwise the permission panel renders on top of raw text.
                     if hasattr(renderer, "end_response"):
-                        renderer.end_response()
+                        renderer.end_response(rerender=False)
                     decision = permissions.prompt_user(tc.name, side_effect, tc.arguments)
                     if decision == Decision.DENY:
                         renderer.tool_done(tc.name, "Denied by user", True)
