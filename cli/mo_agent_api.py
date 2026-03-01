@@ -429,6 +429,16 @@ TODO: describe this skill for the LLM.
                 f"Create it first: [cyan]/skill new {name}[/cyan]"
             )
             return
+
+        # Pre-flight checks before entering dev mode
+        issues = _validate_skill_source(skill_dir)
+        errors = [msg for level, msg in issues if level == "error"]
+        if errors:
+            console.print(f"[yellow]⚠ Pre-check found {len(errors)} issue(s):[/yellow]")
+            for msg in errors:
+                console.print(f"  [yellow]{msg}[/yellow]")
+            console.print("  [dim]Will fix during dev session[/dim]")
+
         # state=None means cmd_skill was called outside the chat REPL (e.g. tests
         # that don't pass state).  Still print success so the user sees feedback.
         state_name = _to_slug(name)  # store slug form — matches directory name
@@ -437,7 +447,7 @@ TODO: describe this skill for the LLM.
             state["skill_dev_dir"] = str(skill_dir)
             state["skill_dev_context"] = _build_skill_dev_context(name, skill_dir)
         console.print(f"[green]✓[/green] Entered dev mode for [bold]{name}[/bold]")
-        console.print(f"  [dim]Skill dir: {skill_dir.relative_to(project_root)}[/dim]")
+        console.print(f"  [dim]{skill_dir.relative_to(project_root)}[/dim]")
         console.print()
         console.print("  [bold]How to use:[/bold]")
         console.print("  1. Describe what the skill should do (e.g. \"fetch real-time stock price from akshare\")")
@@ -514,6 +524,12 @@ def _build_skill_dev_context(name: str, skill_dir: Path) -> str:
         f"# SKILL DEV MODE: {name}",
         "",
         "You are helping develop a local skill. The user describes what the skill should do.",
+        "",
+        "## CRITICAL: Use write_file for full rewrites",
+        "",
+        "When replacing the entire skill.py, use write_file (NOT str_replace).",
+        "str_replace with large content often produces malformed JSON. Only use",
+        "str_replace for small, targeted edits to an existing file.",
         "",
         "## MANDATORY: After Writing/Modifying skill.py",
         "",

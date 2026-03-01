@@ -25,22 +25,36 @@ class RichRenderer:
         self._t0: float = 0
 
     def begin_response(self) -> None:
-        """Start thinking spinner. Markdown Live starts on first text chunk."""
+        """Start thinking spinner with elapsed time. Markdown Live starts on first text chunk."""
         self._t0 = time.monotonic()
         self._md = StreamingMarkdown(console=self._console)
         try:
             from rich.live import Live
-            from rich.spinner import Spinner
-            self._spinner = Live(
-                Spinner("dots", text="[dim]Thinking…[/dim]"),
-                console=self._console, transient=True,
+            self._thinking_live = Live(
+                "[dim]Thinking… 0.0s[/dim]",
+                console=self._console, transient=True, refresh_per_second=4,
             )
-            self._spinner.start()
+            self._thinking_live.start()
+            # Update elapsed time in background
+            import threading
+            self._thinking_stop = threading.Event()
+            def _update():
+                while not self._thinking_stop.wait(0.25):
+                    elapsed = time.monotonic() - self._t0
+                    try:
+                        self._thinking_live.update(f"[dim]Thinking… {elapsed:.1f}s[/dim]")
+                    except Exception:
+                        break
+            self._thinking_thread = threading.Thread(target=_update, daemon=True)
+            self._thinking_thread.start()
+            self._spinner = self._thinking_live  # for _stop_spinner compat
         except Exception:
             self._spinner = None
 
     def _stop_spinner(self) -> None:
         if self._spinner is not None:
+            if hasattr(self, "_thinking_stop"):
+                self._thinking_stop.set()
             try:
                 self._spinner.stop()
             except Exception:
