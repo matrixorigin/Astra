@@ -1,6 +1,6 @@
 """Learning service API endpoints."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -289,5 +289,5 @@ async def health_check() -> dict[str, Any]:
         "status": "healthy",
         "service": "learning",
         "version": "1.0.0",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }

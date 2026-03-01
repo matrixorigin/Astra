@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
 from sqlalchemy import text
 from core.db_consumer import DbConsumer, DbFactory
+from core.memory.types import _utcnow
 
 
 class RegressionType(str, Enum):
@@ -93,7 +94,7 @@ class KnowledgeRegression(DbConsumer):
                 affected_sessions=session_count,
                 affected_decisions=decision_count,
                 confidence=1.0 if session_count > 0 else 0.0,
-                detected_at=datetime.utcnow(),
+                detected_at=_utcnow(),
                 metadata={"deprecated_at": deprecated_at.isoformat()},
             )
     
@@ -138,7 +139,7 @@ class KnowledgeRegression(DbConsumer):
                 affected_sessions=before_count + after_count,
                 affected_decisions=before_count + after_count,
                 confidence=confidence,
-                detected_at=datetime.utcnow(),
+                detected_at=_utcnow(),
                 metadata={
                     "old_version": old_version,
                     "new_version": new_version,
@@ -190,7 +191,7 @@ class KnowledgeRegression(DbConsumer):
                 affected_sessions=session_count,
                 affected_decisions=decision_count,
                 confidence=0.7 if session_count > 0 else 0.0,
-                detected_at=datetime.utcnow(),
+                detected_at=_utcnow(),
                 metadata={"entry_id": entry_id, "category": category},
             )
     
@@ -244,7 +245,7 @@ class KnowledgeRegression(DbConsumer):
                 signals=signals,
                 total_affected_sessions=total_affected_sessions,
                 total_affected_decisions=total_affected_decisions,
-                generated_at=datetime.utcnow(),
+                generated_at=_utcnow(),
             )
     
     def get_affected_sessions(

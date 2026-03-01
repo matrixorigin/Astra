@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
 from core.memory.store import MemoryStore
-from core.memory.types import Memory, MemoryType, TrustTier
+from core.memory.types import Memory, MemoryType, TrustTier, _utcnow
 
 logger = logging.getLogger(__name__)
+
 
 _SESSION_SUMMARY_TAG = "[session_summary]"
 _INCREMENTAL_TAG = "[session_summary:incremental]"
@@ -55,7 +56,7 @@ class SessionSummarizer:
             return self._generate_incremental(user_id, session_id, messages)
 
         # Check time threshold
-        hours_elapsed = (datetime.utcnow() - session_start).total_seconds() / 3600.0
+        hours_elapsed = (_utcnow() - session_start).total_seconds() / 3600.0
         time_threshold = self.config.session_summary_time_threshold_hours
         # Only trigger at first crossing (approximate via turn_count)
         if hours_elapsed >= time_threshold and turn_count == 1:
@@ -85,7 +86,7 @@ class SessionSummarizer:
             initial_confidence=0.8,
             trust_tier=TrustTier.T3_INFERRED,
             session_id=None,  # Cross-session
-            observed_at=datetime.utcnow(),
+            observed_at=_utcnow(),
         )
         if self.embed_fn:
             try:
@@ -120,7 +121,7 @@ class SessionSummarizer:
             initial_confidence=0.7,
             trust_tier=TrustTier.T3_INFERRED,
             session_id=session_id,  # Session-scoped
-            observed_at=datetime.utcnow(),
+            observed_at=_utcnow(),
         )
         if self.embed_fn:
             try:

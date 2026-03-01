@@ -5,7 +5,7 @@ NO MOCKS for core memory operations - only LLM is mocked.
 """
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 import pytest
 
@@ -115,7 +115,7 @@ class TestObserverToPromptClosedLoop:
                 content=content,
                 initial_confidence=0.8,
                 embedding=_embed(content),
-                observed_at=datetime.utcnow(),
+                observed_at=datetime.now(timezone.utc),
             )
             memory_cleanup.append(mem.memory_id)
             store.create(mem)
@@ -282,7 +282,7 @@ class TestProfileAndL0:
                 content=pref,
                 initial_confidence=0.8,
                 embedding=_embed(pref),
-                observed_at=datetime.utcnow(),
+                observed_at=datetime.now(timezone.utc),
             )
             memory_cleanup.append(mem.memory_id)
             store.create(mem)
@@ -306,7 +306,7 @@ class TestProfileAndL0:
             content="User is a senior developer",
             initial_confidence=0.9,
             embedding=_embed("User is a senior developer"),
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         memory_cleanup.append(mem.memory_id)
         store.create(mem)
@@ -336,7 +336,7 @@ class TestGovernanceRealExecution:
             content="Old event",
             initial_confidence=1.0,
             embedding=_embed("Old event"),
-            observed_at=datetime.utcnow() - timedelta(days=7),
+            observed_at=datetime.now(timezone.utc) - timedelta(days=7),
         )
         memory_cleanup.append(old_mem.memory_id)
         store.create(old_mem)
@@ -362,7 +362,7 @@ class TestGovernanceRealExecution:
                 content=f"Event {i}",
                 initial_confidence=0.8,
                 embedding=_embed(f"Event {i}"),
-                observed_at=datetime.utcnow() - timedelta(days=i),
+                observed_at=datetime.now(timezone.utc) - timedelta(days=i),
             )
             memory_cleanup.append(mem.memory_id)
             store.create(mem)
@@ -389,7 +389,7 @@ class TestHealthDetection:
                 content=f"{mtype.value} memory",
                 initial_confidence=0.7,
                 embedding=_embed(f"{mtype.value} memory"),
-                observed_at=datetime.utcnow(),
+                observed_at=datetime.now(timezone.utc),
             )
             memory_cleanup.append(mem.memory_id)
             store.create(mem)
@@ -418,7 +418,7 @@ class TestTaskAwareRetrieval:
             content="Always run tests before commit",
             initial_confidence=0.8,
             embedding=_embed("Always run tests before commit"),
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         memory_cleanup.append(mem.memory_id)
         store.create(mem)
@@ -444,7 +444,7 @@ class TestProceduralMemoryLifecycle:
         user_id = _uid()
         session_id = _sid()
         store = MemoryStore(db_factory)
-        now = datetime.utcnow().replace(microsecond=0)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
         mid = str(uuid7())
 
         mem = Memory(
@@ -469,7 +469,8 @@ class TestProceduralMemoryLifecycle:
         assert stored.content == "Always run tests before commit"
         assert stored.initial_confidence == 0.85
         assert stored.is_active is True
-        assert stored.observed_at == now
+        # DB returns naive datetime, compare without tzinfo
+        assert stored.observed_at.replace(tzinfo=None) == now.replace(tzinfo=None)
         assert stored.trust_tier == TrustTier.T3_INFERRED
         assert stored.superseded_by is None
 
@@ -570,7 +571,7 @@ class TestSessionSummaryRealDB:
             {"role": "assistant", "content": "Use async/await with asyncio library."},
         ]
 
-        mem = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=2, session_start=datetime.utcnow())
+        mem = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=2, session_start=datetime.now(timezone.utc))
         assert mem is not None
         memory_cleanup.append(mem.memory_id)
 
@@ -619,8 +620,8 @@ class TestSessionSummaryRealDB:
         ]
 
         # Generate 2 incrementals
-        inc1 = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=2, session_start=datetime.utcnow())
-        inc2 = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=4, session_start=datetime.utcnow())
+        inc1 = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=2, session_start=datetime.now(timezone.utc))
+        inc2 = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=4, session_start=datetime.now(timezone.utc))
         memory_cleanup.extend([inc1.memory_id, inc2.memory_id])
 
         # Generate full
@@ -644,7 +645,7 @@ class TestTrustTierRealDB:
         retriever = MemoryRetriever(db_factory)
         user_id = _uid()
         session_id = _sid()
-        age = datetime.utcnow() - timedelta(days=60)
+        age = datetime.now(timezone.utc) - timedelta(days=60)
 
         t1 = Memory(
             memory_id=str(uuid7()), user_id=user_id,
@@ -738,7 +739,7 @@ class TestRunDailyAll:
                 memory_id=str(uuid7()), user_id=uid,
                 memory_type=MemoryType.SEMANTIC, content="stale fact",
                 initial_confidence=0.3, trust_tier=TrustTier.T4_UNVERIFIED,
-                observed_at=datetime.utcnow() - timedelta(days=120),
+                observed_at=datetime.now(timezone.utc) - timedelta(days=120),
             )
             memory_cleanup.append(m.memory_id)
             store.create(m)
@@ -810,7 +811,7 @@ class TestSessionSummaryWiring:
             hooks.run_observer(
                 session_id="test_sess", user_id="test_user",
                 messages=[{"role": "user", "content": "hello"}],
-                turn_count=50, session_start=datetime.utcnow(),
+                turn_count=50, session_start=datetime.now(timezone.utc),
             )
 
 

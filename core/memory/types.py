@@ -5,8 +5,13 @@ from __future__ import annotations
 import enum
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
+
+
+def _utcnow() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
 
 
 class MemoryType(str, enum.Enum):
@@ -78,7 +83,12 @@ class Memory:
             return self.initial_confidence
         if half_life_days is None:
             half_life_days = TRUST_TIER_HALF_LIVES.get(self.trust_tier, 60.0)
-        age_days = (datetime.utcnow() - self.observed_at).total_seconds() / 86400.0
+        now = _utcnow()
+        observed = self.observed_at
+        # Handle naive datetime from DB (assume UTC)
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        age_days = (now - observed).total_seconds() / 86400.0
         return self.initial_confidence * math.exp(-age_days / half_life_days)
 
 

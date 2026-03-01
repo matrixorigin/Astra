@@ -198,7 +198,7 @@ class TestEdgeChatLoop:
         result = await edge_chat_loop(
             "What is the answer?", api, router, perms, renderer=renderer,
         )
-        assert result == "The answer is 42."
+        assert result.text == "The answer is 42."
         assert len(api.calls) == 1
         assert api.calls[0]["messages"] == [{"role": "user", "content": "What is the answer?"}]
 
@@ -223,7 +223,7 @@ class TestEdgeChatLoop:
             "Read hello.txt", api, router, perms,
             project_root=str(project), renderer=renderer,
         )
-        assert "Hello, world!" in result
+        assert "Hello, world!" in result.text
         assert len(api.calls) == 2
         # Second call should have tool_results
         tr = api.calls[1]["tool_results"]
@@ -251,7 +251,7 @@ class TestEdgeChatLoop:
             "Show me the project", api, router, perms,
             project_root=str(project), renderer=renderer,
         )
-        assert result == "Done."
+        assert result.text == "Done."
         tr = api.calls[1]["tool_results"]
         assert len(tr) == 2
         # tool_start and tool_done are paired: each start is immediately followed by its done
@@ -679,7 +679,7 @@ class TestRealisticScenarios:
 
         result = await edge_chat_loop("Hi", TimeoutAPI(), router, perms, renderer=renderer)
         assert any("network error" in e.lower() for e in renderer.errors)
-        assert result == ""
+        assert result.text == ""
 
     @pytest.mark.asyncio
     async def test_connection_error_handled(self, router, perms, renderer):
@@ -715,7 +715,7 @@ class TestRealisticScenarios:
 
         result = await edge_chat_loop("Hi", ReadErrThenOkAPI(), router, perms, renderer=renderer)
         assert call_count == 2, "Should have retried after ReadError"
-        assert result == "recovered"
+        assert result.text == "recovered"
         assert any("network error" in e.lower() for e in renderer.infos)
 
     @pytest.mark.asyncio
@@ -764,7 +764,7 @@ class TestRealisticScenarios:
 
         result = await edge_chat_loop("Hi", InterruptAPI(), router, perms, renderer=renderer)
         assert any("interrupt" in e.lower() for e in renderer.errors)
-        assert result == ""
+        assert result.text == ""
 
 
 # ============================================================================

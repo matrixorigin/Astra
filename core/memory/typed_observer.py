@@ -13,7 +13,7 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import text
@@ -24,7 +24,7 @@ from core.memory.metrics import MemoryMetrics
 from core.memory.prompts import OBSERVER_EXTRACTION_PROMPT
 from core.memory.sensitivity import check_sensitivity
 from core.memory.store import MemoryStore
-from core.memory.types import Memory, MemoryType, TrustTier
+from core.memory.types import Memory, MemoryType, TrustTier, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,7 @@ class TypedObserver:
         if not raw:
             return []
 
-        now = datetime.utcnow()
+        now = _utcnow()
         results = []
 
         for item in raw:
@@ -192,7 +192,7 @@ class TypedObserver:
             initial_confidence=initial_confidence,
             trust_tier=trust_tier,
             source_event_ids=source_event_ids or [],
-            observed_at=datetime.utcnow(),
+            observed_at=_utcnow(),
         )
         if self.embed_fn:
             try:

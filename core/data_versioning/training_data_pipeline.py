@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from core.sandbox import Branch
 from core.db_consumer import DbConsumer, DbFactory
+from core.memory.types import _utcnow
 
 
 class DatasetStatus(str, Enum):
@@ -231,7 +232,7 @@ class TrainingDataPipeline(DbConsumer):
                     source_branch=branch_name,
                     source_table="agent_events",
                     extraction_query=query,
-                    extracted_at=datetime.utcnow(),
+                    extracted_at=_utcnow(),
                     row_count=len(rows),
                     metadata={
                         "event_id": event_id,

@@ -1155,6 +1155,18 @@ Phase 3. Current skills are all platform-built (trusted). Sandbox mode becomes c
 
 ---
 
+## 12. Dependency Management Enhancement
+
+Current dependency management (see [Section 1](#1-skill-architecture) manifest format and [Section 3](#3-skill-selection-pipeline) resolution) only supports name-based matching (`depends_on: ["git"]`) with no version constraints, no Skill→Tool tracking, and no conflict detection at install time.
+
+A comprehensive enhancement plan covering semantic versioning, tool dependencies, conflict resolution, and upgrade impact analysis is documented in:
+
+**[Skill and Tool Dependency & Versioning Enhancement Plan](../../plans/skill-tool-dependency-versioning.md)**
+
+The enhanced format will be backward compatible with the current list-based `depends_on` syntax.
+
+---
+
 ## References
 
 - [Anthropic: Equipping Agents with Agent Skills](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)

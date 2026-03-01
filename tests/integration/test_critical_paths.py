@@ -10,7 +10,7 @@ All verifications use explain stats — if stats show error, the feature fell ba
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -70,7 +70,7 @@ class TestCriticalPathVerification:
             content="Vector search verification memory",
             initial_confidence=0.9,
             embedding=[0.1] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -102,7 +102,7 @@ class TestCriticalPathVerification:
             memory_type=MemoryType.SEMANTIC,
             content="Python programming language expertise",
             initial_confidence=0.9,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -136,7 +136,7 @@ class TestCriticalPathVerification:
             content="Base memory for sandbox test",
             initial_confidence=0.8,
             embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -149,7 +149,7 @@ class TestCriticalPathVerification:
             content="New memory to validate in sandbox",
             initial_confidence=0.9,
             embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
 
         # Validate with explain
@@ -180,7 +180,7 @@ class TestCriticalPathVerification:
             content="User prefers tabs",
             initial_confidence=0.8,
             embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(old_mem.memory_id)
         store.create(old_mem)
@@ -226,7 +226,7 @@ class TestCriticalPathVerification:
             content="Summary test memory for all paths",
             initial_confidence=0.9,
             embedding=[0.3] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -259,7 +259,7 @@ class TestCriticalPathVerification:
             content="Sandbox test",
             initial_confidence=0.9,
             embedding=[0.3] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         _, stats = sandbox.validate_memories(
             user_id=user_id, new_memories=[new_mem],

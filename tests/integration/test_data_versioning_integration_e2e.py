@@ -1,7 +1,7 @@
 """E2E tests for P3 Data Versioning integration — experiment→gate, knowledge→regression."""
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -70,7 +70,7 @@ class TestExperimentGateIntegration:
 
     def test_complete_without_gate_promotes_winner(self, db: Session):
         """Without gate, winner is promoted directly."""
-        exp_id = f"exp_no_gate_{datetime.utcnow().strftime('%H%M%S%f')}"
+        exp_id = f"exp_no_gate_{datetime.now(timezone.utc).strftime('%H%M%S%f')}"
         exp = self._create_and_populate_experiment(db, exp_id)
         try:
             winner = exp.complete_experiment(exp_id)
@@ -87,7 +87,7 @@ class TestExperimentGateIntegration:
 
     def test_complete_with_gate_pass(self, db: Session):
         """Gate passes → winner promoted."""
-        exp_id = f"exp_gp_{datetime.utcnow().strftime('%H%M%S%f')}"
+        exp_id = f"exp_gp_{datetime.now(timezone.utc).strftime('%H%M%S%f')}"
         exp = self._create_and_populate_experiment(db, exp_id)
 
         gate = MagicMock()
@@ -106,7 +106,7 @@ class TestExperimentGateIntegration:
 
     def test_complete_with_gate_fail(self, db: Session):
         """Gate fails → winner NOT promoted, status = gate_failed."""
-        exp_id = f"exp_gf_{datetime.utcnow().strftime('%H%M%S%f')}"
+        exp_id = f"exp_gf_{datetime.now(timezone.utc).strftime('%H%M%S%f')}"
         exp = self._create_and_populate_experiment(db, exp_id)
 
         gate = MagicMock()
@@ -129,7 +129,7 @@ class TestExperimentGateIntegration:
 
     def test_batch_chunking_over_limit(self, db: Session):
         """Batch > BATCH_LIMIT (100) is chunked into multiple statements, single commit."""
-        exp_id = f"exp_chunk_{datetime.utcnow().strftime('%H%M%S%f')}"
+        exp_id = f"exp_chunk_{datetime.now(timezone.utc).strftime('%H%M%S%f')}"
         exp = PromptExperiment(lambda: db, source_db=TEST_DB)
         config = ExperimentConfig(
             experiment_id=exp_id,
@@ -196,7 +196,7 @@ class TestSkillSelectionEventsFixes:
         from core.skills.pipeline import SkillPipeline
 
         # Register a skill so version can be resolved
-        skill_id = f"test_ver_{datetime.utcnow().strftime('%H%M%S%f')}"
+        skill_id = f"test_ver_{datetime.now(timezone.utc).strftime('%H%M%S%f')}"
         db.execute(text("""
             INSERT INTO skills_registry (skill_id, skill_name, version, is_active, created_at)
             VALUES (:sid, :sn, '2.1.0', 1, NOW())
@@ -224,7 +224,7 @@ class TestSkillSelectionEventsFixes:
         from unittest.mock import MagicMock
         from core.skills.pipeline import SkillPipeline
 
-        eid = f"hist_{datetime.utcnow().strftime('%H%M%S%f')}"
+        eid = f"hist_{datetime.now(timezone.utc).strftime('%H%M%S%f')}"
         sid = f"sess_hist_{eid}"
         self._seed_selection(db, eid, sid, "my_skill", "1.0.0")
 
@@ -242,7 +242,7 @@ class TestSkillSelectionEventsFixes:
 
     def test_detect_skill_update_regression_detects_drop(self, db: Session):
         """Regression detected when new version has lower success rate."""
-        ts = datetime.utcnow().strftime('%H%M%S%f')
+        ts = datetime.now(timezone.utc).strftime('%H%M%S%f')
         skill = f"regr_skill_{ts}"
 
         # Old version: 5 successes
@@ -268,7 +268,7 @@ class TestSkillSelectionEventsFixes:
 
     def test_detect_skill_update_regression_no_regression(self, db: Session):
         """No regression when both versions succeed equally."""
-        ts = datetime.utcnow().strftime('%H%M%S%f')
+        ts = datetime.now(timezone.utc).strftime('%H%M%S%f')
         skill = f"ok_skill_{ts}"
 
         for i in range(3):

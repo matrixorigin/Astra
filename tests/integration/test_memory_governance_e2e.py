@@ -4,7 +4,7 @@ Tests governance frequency separation, working memory archival,
 quarantine, tool_result cleanup, and trust tier effects.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 
 import pytest
 from uuid_utils import uuid7
@@ -55,7 +55,7 @@ class TestHourlyGovernance:
             memory_id=str(uuid7()), user_id=user_id, session_id=session_id,
             memory_type=MemoryType.WORKING, content="Current plan: refactor auth",
             initial_confidence=0.9,
-            observed_at=datetime.utcnow() - timedelta(hours=4),
+            observed_at=datetime.now(timezone.utc) - timedelta(hours=4),
         )
         cleanup.append(mem.memory_id)
         store.create(mem)
@@ -80,7 +80,7 @@ class TestHourlyGovernance:
             memory_id=str(uuid7()), user_id=user_id,
             memory_type=MemoryType.TOOL_RESULT, content="grep output: 42 matches",
             initial_confidence=0.5,
-            observed_at=datetime.utcnow() - timedelta(hours=26),
+            observed_at=datetime.now(timezone.utc) - timedelta(hours=26),
         )
         cleanup.append(mem.memory_id)
         store.create(mem)
@@ -108,7 +108,7 @@ class TestDailyGovernance:
             memory_id=str(uuid7()), user_id=user_id,
             memory_type=MemoryType.SEMANTIC, content="Old unverified fact",
             initial_confidence=0.5, trust_tier=TrustTier.T4_UNVERIFIED,
-            observed_at=datetime.utcnow() - timedelta(days=90),
+            observed_at=datetime.now(timezone.utc) - timedelta(days=90),
         )
         cleanup.append(mem.memory_id)
         store.create(mem)
@@ -131,7 +131,7 @@ class TestDailyGovernance:
             memory_id=str(uuid7()), user_id=user_id,
             memory_type=MemoryType.SEMANTIC, content="Superseded fact",
             initial_confidence=0.05,
-            observed_at=datetime.utcnow() - timedelta(days=30),
+            observed_at=datetime.now(timezone.utc) - timedelta(days=30),
         )
         cleanup.append(mem.memory_id)
         store.create(mem)
@@ -148,7 +148,7 @@ class TestTrustTierAffectsQuarantine:
         """T1 memory (365d half-life) survives 60 days; T4 (30d) gets quarantined."""
         store = MemoryStore(db_factory)
         user_id = _uid()
-        age = datetime.utcnow() - timedelta(days=60)
+        age = datetime.now(timezone.utc) - timedelta(days=60)
 
         t1 = Memory(
             memory_id=str(uuid7()), user_id=user_id,
@@ -186,7 +186,7 @@ class TestFullCycle:
             memory_id=str(uuid7()), user_id=user_id,
             memory_type=MemoryType.SEMANTIC, content="Test memory",
             initial_confidence=0.8,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup.append(mem.memory_id)
         store.create(mem)

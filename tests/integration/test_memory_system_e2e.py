@@ -5,7 +5,7 @@ Tests verify the memory system components work correctly together.
 """
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -84,7 +84,7 @@ class TestContradictionDetection:
             memory_id="new1", user_id="u", memory_type=MemoryType.PROFILE,
             content="User prefers spaces", initial_confidence=0.9,
             embedding=[0.1] * 768,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
 
         contradiction, _ = observer._find_contradiction(new_mem)
@@ -111,7 +111,7 @@ class TestContradictionDetection:
             memory_id="rust1", user_id="u", memory_type=MemoryType.PROFILE,
             content="User likes Rust", initial_confidence=0.8,
             embedding=[0.0] * 767 + [1.0],
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
 
         contradiction, _ = observer._find_contradiction(rust_mem)
@@ -126,7 +126,7 @@ class TestContradictionDetection:
             memory_id="new1", user_id="u", memory_type=MemoryType.PROFILE,
             content="User prefers spaces", initial_confidence=0.9,
             embedding=[0.1] * 768,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
 
         contradiction, _ = observer._find_contradiction(new_mem)
@@ -190,7 +190,7 @@ class TestMemoryTypes:
             memory_type=MemoryType.SEMANTIC,
             content="test content",
             initial_confidence=0.8,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
 
         assert mem.memory_id == "test"

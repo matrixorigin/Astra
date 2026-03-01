@@ -222,10 +222,10 @@ class TestChatTurnMultiTurnE2E:
 
         # ── Turn 2: new query triggers refresh_memory with different memory ──
         # Mock _build_memory to return distinctive content for the new query
-        def _mock_build_memory(self_pa, user_id, session_id, query):
+        def _mock_build_memory(self_pa, user_id, session_id, query, explain=False):
             if "explain" in query:
-                return "## Refreshed Memory\nUser previously asked about main.py and got tool results."
-            return None
+                return "## Refreshed Memory\nUser previously asked about main.py and got tool results.", None
+            return None, None
 
         with patch("core.llm.client.LLMClient.chat_stream", side_effect=_capturing_stream), \
              patch("core.context.prompt_assembler.PromptAssembler._build_memory", _mock_build_memory):
@@ -294,9 +294,9 @@ class TestChatTurnMultiTurnE2E:
         memory_queries: list[str] = []
         original_build_memory = None
 
-        def _tracking_build_memory(self_pa, user_id, session_id, query):
+        def _tracking_build_memory(self_pa, user_id, session_id, query, explain=False):
             memory_queries.append(query)
-            return f"## Memory for: {query}"
+            return f"## Memory for: {query}", None
 
         captured_messages: list[list] = []
 

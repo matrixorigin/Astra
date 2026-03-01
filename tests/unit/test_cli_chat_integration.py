@@ -69,7 +69,7 @@ class TestRichRendererWithEdgeLoop:
             session_id="s1", renderer=renderer,
         )
         renderer.end_response()
-        assert "42" in result
+        assert "42" in result.text
 
     @pytest.mark.asyncio
     async def test_tool_call_turn(self, router, perms, project):
@@ -95,7 +95,7 @@ class TestRichRendererWithEdgeLoop:
         )
         output = buf.getvalue()
         assert "read_file" in output
-        assert "Hello" in result
+        assert "Hello" in result.text
 
     @pytest.mark.asyncio
     async def test_consume_turn_with_rich(self):
@@ -137,7 +137,7 @@ class TestRichRendererWithEdgeLoop:
             "do stuff", api, router, perms,
             session_id="s1", project_root=str(project), renderer=renderer,
         )
-        assert "All done" in result
+        assert "All done" in result.text
         output = buf.getvalue()
         assert "read_file" in output
         assert "bash" in output

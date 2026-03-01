@@ -7,7 +7,7 @@ Tests memory extraction, storage, and retrieval using:
 
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pytest
@@ -80,7 +80,7 @@ class TestMemoryStoreRealDB:
             memory_type=MemoryType.PROFILE,
             content="User prefers Python for scripting",
             initial_confidence=0.85,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         
@@ -105,7 +105,7 @@ class TestMemoryStoreRealDB:
                 memory_type=MemoryType.SEMANTIC,
                 content=f"User action {i}",
                 initial_confidence=0.7,
-                observed_at=datetime.utcnow(),
+                observed_at=datetime.now(timezone.utc),
             )
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
@@ -124,7 +124,7 @@ class TestMemoryStoreRealDB:
             memory_type=MemoryType.PROFILE,
             content="User prefers tabs",
             initial_confidence=0.8,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(old_mem.memory_id)
         store.create(old_mem)
@@ -135,7 +135,7 @@ class TestMemoryStoreRealDB:
             memory_type=MemoryType.PROFILE,
             content="User prefers spaces",
             initial_confidence=0.9,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(new_mem.memory_id)
         
@@ -164,7 +164,7 @@ class TestMemoryRetrieverRealDB:
             memory_type=MemoryType.SEMANTIC,
             content="User expertise in Golang concurrency patterns",
             initial_confidence=0.9,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -202,7 +202,7 @@ class TestMemoryRetrieverRealDB:
                 content=f"Vector test memory {i}",
                 initial_confidence=0.8,
                 embedding=emb,
-                observed_at=datetime.utcnow(),
+                observed_at=datetime.now(timezone.utc),
             )
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
@@ -325,7 +325,7 @@ class TestProfileSynthesisFromGolden:
                 memory_type=MemoryType.SEMANTIC,
                 content=content,
                 initial_confidence=0.7,
-                observed_at=datetime.utcnow(),
+                observed_at=datetime.now(timezone.utc),
             )
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
@@ -352,7 +352,7 @@ class TestTieredLoaderWithRealDB:
             memory_type=MemoryType.PROFILE,
             content="User is an expert in distributed systems",
             initial_confidence=0.9,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -390,7 +390,7 @@ class TestSandboxRealDB:
             content="Base memory for sandbox test",
             initial_confidence=0.8,
             embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -403,7 +403,7 @@ class TestSandboxRealDB:
             content="New memory to validate",
             initial_confidence=0.7,
             embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
 
         result, stats = sandbox.validate_memories(
@@ -510,7 +510,7 @@ class TestContradictionRealDB:
             content="User prefers tabs",
             initial_confidence=0.8,
             embedding=[0.1] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(old_mem.memory_id)
         store.create(old_mem)
@@ -550,7 +550,7 @@ class TestTaskAwareWeightsRealDB:
             memory_type=MemoryType.SEMANTIC,
             content="User expertise in Python async programming patterns",
             initial_confidence=0.85,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(code_mem.memory_id)
         store.create(code_mem)
@@ -561,7 +561,7 @@ class TestTaskAwareWeightsRealDB:
             memory_type=MemoryType.SEMANTIC,
             content="User had lunch meeting yesterday",
             initial_confidence=0.9,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(other_mem.memory_id)
         store.create(other_mem)
@@ -600,7 +600,7 @@ class TestHealthRealDB:
                     memory_type=mtype,
                     content=f"Health test memory {mtype.value} {i}",
                     initial_confidence=0.7 + i * 0.05,
-                    observed_at=datetime.utcnow(),
+                    observed_at=datetime.now(timezone.utc),
                 )
                 cleanup_memories.append(mem.memory_id)
                 store.create(mem)
@@ -626,13 +626,13 @@ class TestHealthRealDB:
                 memory_type=MemoryType.SEMANTIC,
                 content=f"Clean memory {i}",
                 initial_confidence=0.8,
-                observed_at=datetime.utcnow(),
+                observed_at=datetime.now(timezone.utc),
             )
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
 
         # Check pollution since yesterday
-        since = datetime.utcnow() - timedelta(days=1)
+        since = datetime.now(timezone.utc) - timedelta(days=1)
         result = health.detect_pollution(user_id, since)
 
         # Should not detect pollution (no supersedes)
@@ -729,7 +729,7 @@ class TestGovernanceRealDB:
             memory_type=MemoryType.SEMANTIC,
             content="Old memory for decay test",
             initial_confidence=0.9,
-            observed_at=datetime.utcnow() - timedelta(days=60),  # 60 days old
+            observed_at=datetime.now(timezone.utc) - timedelta(days=60),  # 60 days old
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -755,7 +755,7 @@ class TestGovernanceRealDB:
             memory_type=MemoryType.SEMANTIC,
             content="Stale memory to delete",
             initial_confidence=0.05,  # Below 0.1 threshold
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -787,7 +787,7 @@ class TestGovernanceRealDB:
                 memory_type=MemoryType.SEMANTIC,
                 content=f"Stats test memory {i}",
                 initial_confidence=0.7,
-                observed_at=datetime.utcnow(),
+                observed_at=datetime.now(timezone.utc),
             )
             cleanup_memories.append(mem.memory_id)
             store.create(mem)

@@ -2,7 +2,7 @@
 
 import json
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -167,7 +167,7 @@ class TestKnowledgeRegression:
             affected_sessions=10,
             affected_decisions=15,
             confidence=0.95,
-            detected_at=datetime.utcnow(),
+            detected_at=datetime.now(timezone.utc),
             metadata={"reason": "deprecated"},
         )
         
@@ -188,7 +188,7 @@ class TestKnowledgeRegression:
                 affected_sessions=5,
                 affected_decisions=5,
                 confidence=0.9,
-                detected_at=datetime.utcnow(),
+                detected_at=datetime.now(timezone.utc),
             ),
         ]
         
@@ -197,7 +197,7 @@ class TestKnowledgeRegression:
             signals=signals,
             total_affected_sessions=5,
             total_affected_decisions=5,
-            generated_at=datetime.utcnow(),
+            generated_at=datetime.now(timezone.utc),
         )
         
         assert report.report_id == "report_001"
@@ -231,7 +231,7 @@ class TestTrainingDataPipeline:
             source_branch="dataset_dataset_001",
             source_table="agent_events",
             extraction_query="SELECT * FROM ...",
-            extracted_at=datetime.utcnow(),
+            extracted_at=datetime.now(timezone.utc),
             row_count=100,
         )
         
@@ -293,7 +293,7 @@ class TestDataVersioningIntegration:
             affected_sessions=10,
             affected_decisions=15,
             confidence=0.95,
-            detected_at=datetime.utcnow(),
+            detected_at=datetime.now(timezone.utc),
             metadata={"reason": "deprecated"},
         )
         
@@ -318,7 +318,7 @@ class TestDataVersioningIntegration:
             source_branch="dataset_dataset_001",
             source_table="agent_events",
             extraction_query="SELECT * FROM agent_events WHERE quality_score > 0.75",
-            extracted_at=datetime.utcnow(),
+            extracted_at=datetime.now(timezone.utc),
             row_count=1000,
             metadata={
                 "filter": "quality_score > 0.75",

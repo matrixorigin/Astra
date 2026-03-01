@@ -160,6 +160,7 @@ class AssembledPrompt:
     token_breakdown: dict[str, int] = field(default_factory=dict)
     cache_prefix_tokens: int = 0
     sections: dict[str, str] = field(default_factory=dict)
+    memory_stats: dict[str, Any] | None = None  # Populated when explain=True
 
 
 class PromptAssembler(DbConsumer):
@@ -180,15 +181,20 @@ class PromptAssembler(DbConsumer):
         edge_context: EdgeContext | None = None,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         username: str | None = None,
+        explain: bool = False,
     ) -> AssembledPrompt:
         """
         Assemble system prompt with zone-based budget tracking.
         
         Phase 1 Integration: Computes zone budgets based on model context size
         and tracks which zones overflow. This enables data-driven optimization.
+
+        Args:
+            explain: If True, collect memory retrieval stats in result.memory_stats.
         """
         sections: dict[str, str] = {}
         breakdown: dict[str, int] = {}
+        memory_stats: dict[str, Any] | None = None
         
         # Phase 1: Compute zone budgets based on model context size
         # This provides the foundation for measuring compression effectiveness
@@ -236,7 +242,7 @@ class PromptAssembler(DbConsumer):
             breakdown["project_context"] = _estimate_tokens(project_ctx)
 
         # §4 Memory (continuity + observations + few-shot)
-        memory = self._build_memory(user_id, session_id, user_query)
+        memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain)
         if memory:
             sections["memory"] = memory
             breakdown["memory"] = _estimate_tokens(memory)
@@ -312,6 +318,7 @@ class PromptAssembler(DbConsumer):
             token_breakdown=breakdown,
             cache_prefix_tokens=cache_prefix,
             sections=sections,
+            memory_stats=memory_stats,
         )
 
     # ------------------------------------------------------------------
@@ -325,6 +332,7 @@ class PromptAssembler(DbConsumer):
         user_query: str,
         current_sections: dict[str, str],
         max_tokens: int = _DEFAULT_MAX_TOKENS,
+        explain: bool = False,
     ) -> AssembledPrompt:
         """Refresh §4 (memory) and §5 (working memory) for turn 2+.
 
@@ -335,12 +343,15 @@ class PromptAssembler(DbConsumer):
         tools_schema is not returned (empty list) because tool definitions
         don't change during incremental refresh — the caller already has them
         cached from the initial assemble() call.
+
+        Args:
+            explain: If True, collect memory retrieval stats in result.memory_stats.
         """
         sections = dict(current_sections)
         breakdown: dict[str, int] = {}
 
         # Refresh memory
-        memory = self._build_memory(user_id, session_id, user_query)
+        memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain)
         if memory:
             sections["memory"] = memory
         else:
@@ -374,6 +385,7 @@ class PromptAssembler(DbConsumer):
             snapshot_id=snapshot_id,
             token_breakdown=breakdown,
             sections=sections,
+            memory_stats=memory_stats,
         )
 
     # ------------------------------------------------------------------
@@ -614,23 +626,38 @@ class PromptAssembler(DbConsumer):
                 parts.append("# Project Profile\n" + "\n".join(info))
         return "\n\n".join(parts) if parts else None
 
-    def _build_memory(self, user_id: str, session_id: str, query: str) -> str | None:
+    def _build_memory(
+        self, user_id: str, session_id: str, query: str, explain: bool = False,
+    ) -> tuple[str | None, dict[str, Any] | None]:
         """§4: Tiered memory (L0 profile + L1 query-relevant) + legacy fallbacks.
 
         Primary: TieredMemoryLoader (new memory system)
         Fallback: continuity + observations + few-shot (legacy)
+
+        Returns:
+            (section_text, stats) — stats is None when explain=False, otherwise a dict
+            containing only the fields that were actually populated (no None values).
         """
         parts = []
+        # Only collect stats when explain=True. Build incrementally to avoid empty fields.
+        stats: dict[str, Any] = {} if explain else {}
 
         # Primary: tiered memory system (L0 + L1)
         try:
             from core.memory.tiered_loader import TieredMemoryLoader
             loader = TieredMemoryLoader(self._db_factory)
-            tiered_section, _ = loader.build_section(user_id, session_id, query)
+            tiered_section, retrieval_stats = loader.build_section(
+                user_id, session_id, query, explain=explain,
+            )
             if tiered_section:
                 parts.append(tiered_section)
+            if explain and retrieval_stats:
+                from dataclasses import asdict
+                stats["retrieval"] = asdict(retrieval_stats)
         except Exception as e:
             logger.debug("TieredMemoryLoader skipped: %s", e)
+            if explain:
+                stats["retrieval"] = {"error": str(e)}
 
         # Few-shot examples
         try:
@@ -640,10 +667,15 @@ class PromptAssembler(DbConsumer):
             few_shot = fsr.format_for_prompt(examples)
             if few_shot:
                 parts.append(few_shot)
+            if explain:
+                stats["few_shot"] = {"count": len(examples)}
         except Exception as e:
             logger.debug("Few-shot skipped: %s", e)
+            if explain:
+                stats["few_shot"] = {"error": str(e)}
 
-        return "\n\n".join(parts) if parts else None
+        # Return None for stats when explain=False, otherwise the populated dict
+        return "\n\n".join(parts) if parts else None, stats if explain else None
 
     def _build_working_memory(self, session_id: str) -> str | None:
         """§5: Scratchpad notes."""

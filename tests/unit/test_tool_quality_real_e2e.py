@@ -75,7 +75,7 @@ class TestBuildTurnMessagesQualityAnnotation:
             mock_cache.__contains__ = lambda self, k: True
 
             from api.routers.chat import _build_turn_messages
-            history, _ = _build_turn_messages(
+            history, _, _ = _build_turn_messages(
                 db=MagicMock(),
                 user_id="test-user",
                 session_id=session_id,
@@ -134,7 +134,7 @@ class TestBuildTurnMessagesQualityAnnotation:
             mock_cache.__setitem__ = MagicMock()
 
             from api.routers.chat import _build_turn_messages
-            history, _ = _build_turn_messages(
+            history, _, _ = _build_turn_messages(
                 db=MagicMock(), user_id="u", session_id=session_id,
                 messages=[], tool_results=tool_results, project_rules=None,
             )
@@ -162,7 +162,7 @@ class TestBuildTurnMessagesQualityAnnotation:
             mock_cache.__setitem__ = MagicMock()
 
             from api.routers.chat import _build_turn_messages
-            history, _ = _build_turn_messages(
+            history, _, _ = _build_turn_messages(
                 db=MagicMock(), user_id="u", session_id=session_id,
                 messages=[], tool_results=tool_results, project_rules=None,
             )

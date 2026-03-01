@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from api.models.memory import MemoryRecord
 from core.db_consumer import DbConsumer, DbFactory
 from core.memory.metrics import MemoryMetrics, Timer
-from core.memory.types import Memory, MemoryType, TrustTier
+from core.memory.types import Memory, MemoryType, TrustTier, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class MemoryStore(DbConsumer):
     def create(self, memory: Memory) -> Memory:
         if not memory.memory_id:
             memory.memory_id = uuid.uuid4().hex
-        now = datetime.utcnow()
+        now = _utcnow()
         if not memory.observed_at:
             memory.observed_at = now
 
@@ -94,7 +94,7 @@ class MemoryStore(DbConsumer):
     def supersede(self, old_id: str, new_memory: Memory) -> Memory:
         if not new_memory.memory_id:
             new_memory.memory_id = uuid.uuid4().hex
-        now = datetime.utcnow()
+        now = _utcnow()
         if not new_memory.observed_at:
             new_memory.observed_at = now
 
@@ -140,6 +140,6 @@ class MemoryStore(DbConsumer):
             if not row:
                 return False
             row.is_active = 0
-            row.updated_at = datetime.utcnow()
+            row.updated_at = _utcnow()
             db.commit()
             return True

@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import text
@@ -23,8 +23,10 @@ from core.db_consumer import DbConsumer, DbFactory
 from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
 from core.memory.health import MemoryHealth
 from core.memory.metrics import MemoryMetrics
+
+
 from core.memory.store import MemoryStore
-from core.memory.types import TRUST_TIER_HALF_LIVES, TrustTier
+from core.memory.types import TRUST_TIER_HALF_LIVES, TrustTier, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +141,7 @@ class GovernanceScheduler(DbConsumer):
             logger.error("Quarantine failed: %s", e)
             result.errors.append(f"quarantine: {e}")
         try:
-            pollution = self.health.detect_pollution(user_id, datetime.utcnow() - timedelta(days=1))
+            pollution = self.health.detect_pollution(user_id, _utcnow() - timedelta(days=1))
             result.pollution_detected = pollution.get("is_polluted", False)
         except Exception as e:
             logger.error("Pollution detection failed: %s", e)

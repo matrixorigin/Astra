@@ -1099,12 +1099,14 @@ def _build_turn_messages(
     edge_profile: dict[str, Any] | None = None,
     force_rebuild_system: bool = False,
     username: str | None = None,
-) -> tuple[list[dict[str, Any]], str | None]:
+    explain: bool = False,
+) -> tuple[list[dict[str, Any]], str | None, dict[str, Any] | None]:
     """Build LLM messages from edge turn data + server-side history.
 
-    Returns (messages, context_capture_id).  context_capture_id is the snapshot
-    saved by PromptAssembler BEFORE the LLM call; on turn 2+ it comes from
-    incremental memory refresh.
+    Returns (messages, context_capture_id, memory_stats).
+    context_capture_id is the snapshot saved by PromptAssembler BEFORE the LLM call;
+    on turn 2+ it comes from incremental memory refresh.
+    memory_stats is populated when explain=True.
     """
     entry = _get_or_create_session_entry(session_id)
     history = entry.get("history")
@@ -1122,6 +1124,7 @@ def _build_turn_messages(
     # sent on turn 0). The rebuilt prompt will have updated tool info but stale/missing
     # project context. This is acceptable — the Self-Model tool section is the primary
     # reason for rebuild, and project context doesn't change mid-session.
+    memory_stats: dict[str, Any] | None = None
     if not history or force_rebuild_system:
         user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
 
@@ -1138,10 +1141,12 @@ def _build_turn_messages(
             user_id=user_id,
             edge_context=edge_ctx,
             username=username,
+            explain=explain,
         )
         system = assembled.system_message
         context_capture_id = assembled.snapshot_id
         cached_sections = assembled.sections
+        memory_stats = assembled.memory_stats
         logger.debug("Assembled prompt: %d tokens, snapshot=%s", sum(assembled.token_breakdown.values()), assembled.snapshot_id)
 
         if history and force_rebuild_system:
@@ -1171,10 +1176,12 @@ def _build_turn_messages(
                         user_id=user_id,
                         user_query=refresh_query,
                         current_sections=cached_sections,
+                        explain=explain,
                     )
                     history[0] = {"role": "system", "content": refreshed.system_message}
                     context_capture_id = refreshed.snapshot_id
                     cached_sections = refreshed.sections
+                    memory_stats = refreshed.memory_stats
                 except Exception as e:
                     logger.debug("Memory refresh failed (non-fatal): %s", e)
 
@@ -1235,7 +1242,7 @@ def _build_turn_messages(
     if cached_sections:
         entry["sections"] = cached_sections
     _session_cache[session_id] = entry
-    return history, context_capture_id
+    return history, context_capture_id, memory_stats
 
 
 # Max conversation events to recover on server restart.
@@ -1751,11 +1758,12 @@ async def chat_turn(
                         edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
                         force_rebuild_system=tools_changed,
                         username=current_user.get("username"),
+                        explain=request.explain,
                     )
                 finally:
                     db.close()
 
-            llm_messages, snapshot_id = await asyncio.to_thread(_build_sync)
+            llm_messages, snapshot_id, _memory_stats = await asyncio.to_thread(_build_sync)
             _get_shared_embed_fn()
 
             model = request.model
@@ -2039,13 +2047,15 @@ async def chat_turn(
 
             if request.explain:
                 _total_ms = round((time.monotonic() - _turn_start) * 1000)
-                explain_event = {
+                explain_event: dict[str, Any] = {
                     "type": "explain",
                     "total_ms": _total_ms,
                     "prompt_tokens": _total_prompt_tokens if _has_usage else None,
                     "completion_tokens": _total_completion_tokens if _has_usage else None,
                     "steps": _explain_steps,
                 }
+                if _memory_stats:
+                    explain_event["memory"] = _memory_stats
                 yield f"data: {json.dumps(explain_event)}\n\n"
 
             yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"

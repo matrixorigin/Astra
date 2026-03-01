@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import text
@@ -19,7 +19,7 @@ from sqlalchemy import text
 from core.db_consumer import DbConsumer, DbFactory
 from core.memory.explain import SandboxStats
 from core.memory.metrics import MemoryMetrics
-from core.memory.types import Memory
+from core.memory.types import Memory, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ class MemorySandbox(DbConsumer):
                     vec_literal = None
 
                 source_ids = str(m.source_event_ids).replace("'", '"') if m.source_event_ids else "[]"
-                now = m.observed_at or datetime.utcnow()
+                now = m.observed_at or _utcnow()
 
                 if vec_literal:
                     db.execute(text(f"""

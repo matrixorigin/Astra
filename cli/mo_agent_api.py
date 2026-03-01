@@ -118,6 +118,8 @@ def cmd_help(console, **_):
         ("/skill new <name>", "Create a new skill"),
         ("/skill test <name>", "Test a skill with full output"),
         ("/skill dev <name>", "Enter AI-assisted skill dev mode"),
+        ("/explain", "Toggle explain mode (show per-turn stats)"),
+        ("/explain last", "Show last turn's explain output"),
         ("/verbose", "Show status bar"),
         ("/compact", "Hide status bar"),
         ("/history", "Show recent turns"),
@@ -1023,6 +1025,43 @@ def _is_empty(v) -> bool:
     return False
 
 
+def cmd_explain(console, state=None, cmd_arg=None, **_):
+    """Toggle explain mode or show last turn's execution trace.
+
+    Usage:
+        /explain        - Toggle explain mode on/off
+        /explain on     - Enable explain mode
+        /explain off    - Disable explain mode
+        /explain last   - Show last turn's explain output
+
+    When enabled, shows per-turn stats after each response:
+        - Memory retrieval: keyword/vector hits, candidates, timing
+        - LLM: tokens in/out, tool calls
+        - Cloud skills: bytes in/out
+    """
+    if cmd_arg == "last":
+        last_explain = state.get("last_explain")
+        if not last_explain:
+            console.print("[dim]No explain data from last turn[/dim]")
+            return
+        from cli.edge_chat_loop import _print_explain
+        _print_explain(last_explain)
+    elif cmd_arg in ("on", "1", "true"):
+        state["explain_mode"] = True
+        console.print("[green]✓[/green] Explain mode [bold]ON[/bold] — will show stats after each turn")
+    elif cmd_arg in ("off", "0", "false"):
+        state["explain_mode"] = False
+        console.print("[dim]Explain mode OFF[/dim]")
+    else:
+        # Toggle
+        current = state.get("explain_mode", False)
+        state["explain_mode"] = not current
+        if state["explain_mode"]:
+            console.print("[green]✓[/green] Explain mode [bold]ON[/bold] — will show stats after each turn")
+        else:
+            console.print("[dim]Explain mode OFF[/dim]")
+
+
 SLASH_COMMANDS = {
     "/help": cmd_help,
     "/model": cmd_model,
@@ -1037,6 +1076,7 @@ SLASH_COMMANDS = {
     "/login": cmd_login,
     "/logout": cmd_logout,
     "/skill": cmd_skill,
+    "/explain": cmd_explain,
 }
 
 
@@ -1367,15 +1407,22 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                             skill_py_mtime_before = skill_py.stat().st_mtime
                     skill_dev_rules = state.get("skill_dev_context")
 
+                # Determine if explain is enabled (CLI flag or interactive toggle)
+                should_explain = explain or state.get("explain_mode", False)
+
                 if hasattr(renderer, "begin_response"):
                     renderer.begin_response()
-                result_text = client._run(_run_edge_turn(
+                loop_result = client._run(_run_edge_turn(
                     user_input, client._ensure_client(), state["session_id"],
                     state.get("selected_model"), user_id, auto_approve,
                     renderer=renderer,
                     extra_rules=skill_dev_rules,
-                    explain=explain,
+                    explain=should_explain,
                 ))
+                result_text = loop_result.text
+                # Save explain data for /explain last
+                if loop_result.explain_turns:
+                    state["last_explain"] = loop_result.explain_turns
                 if hasattr(renderer, "end_response"):
                     renderer.end_response()
 

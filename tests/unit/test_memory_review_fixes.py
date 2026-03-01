@@ -7,7 +7,7 @@ Also verifies fallback paths are observable via explain stats.
 import json
 import math
 from collections import namedtuple
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -92,7 +92,7 @@ class TestVectorRetrieval:
         assert any(r.memory_id == "vec1" for r in results)
 
     def test_merge_ranks_by_weighted_score(self, retriever, mock_db):
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         phase1_rows = [MemRow("m1", "old keyword", "semantic", 0.5, now - timedelta(days=30), None, "T3")]
         vec_rows = [VecRow("m2", "recent vector", "semantic", 0.9, now, None, "T3", 0.01)]
 
@@ -487,10 +487,10 @@ class TestConfidenceDecayPrecision:
 
     def test_effective_confidence_method(self):
         """Memory.effective_confidence() computes query-time decay correctly."""
-        m = _mem(initial_confidence=0.9, observed_at=datetime(2026, 1, 1))
-        # Patch utcnow so we get deterministic result
-        with patch("core.memory.types.datetime") as mock_dt:
-            mock_dt.utcnow.return_value = datetime(2026, 1, 31)  # 30 days later
+        m = _mem(initial_confidence=0.9, observed_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        # Patch _utcnow so we get deterministic result
+        with patch("core.memory.types._utcnow") as mock_utcnow:
+            mock_utcnow.return_value = datetime(2026, 1, 31, tzinfo=timezone.utc)  # 30 days later
             eff = m.effective_confidence(half_life_days=30.0)
         expected = 0.9 * math.exp(-1.0)
         assert abs(eff - expected) < 0.01

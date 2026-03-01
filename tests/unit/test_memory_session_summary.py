@@ -1,6 +1,6 @@
 """Unit tests for SessionSummarizer."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -32,7 +32,7 @@ class TestIncrementalSummary:
     def test_generated_at_turn_threshold(self, mock_store, messages):
         config = MemoryGovernanceConfig(session_summary_turn_threshold=5)
         s = SessionSummarizer(mock_store, config=config)
-        result = s.check_and_summarize("u1", "s1", messages, turn_count=5, session_start=datetime.utcnow())
+        result = s.check_and_summarize("u1", "s1", messages, turn_count=5, session_start=datetime.now(timezone.utc))
         assert result is not None
         assert _INCREMENTAL_TAG in result.content
         assert result.session_id == "s1"  # Session-scoped
@@ -40,13 +40,13 @@ class TestIncrementalSummary:
     def test_not_generated_below_threshold(self, mock_store, messages):
         config = MemoryGovernanceConfig(session_summary_turn_threshold=50)
         s = SessionSummarizer(mock_store, config=config)
-        result = s.check_and_summarize("u1", "s1", messages, turn_count=10, session_start=datetime.utcnow())
+        result = s.check_and_summarize("u1", "s1", messages, turn_count=10, session_start=datetime.now(timezone.utc))
         assert result is None
 
     def test_generated_at_multiple_of_threshold(self, mock_store, messages):
         config = MemoryGovernanceConfig(session_summary_turn_threshold=5)
         s = SessionSummarizer(mock_store, config=config)
-        result = s.check_and_summarize("u1", "s1", messages, turn_count=10, session_start=datetime.utcnow())
+        result = s.check_and_summarize("u1", "s1", messages, turn_count=10, session_start=datetime.now(timezone.utc))
         assert result is not None
 
 
@@ -64,8 +64,8 @@ class TestFullSummary:
         s = SessionSummarizer(mock_store, config=config)
 
         # Generate incrementals
-        s.check_and_summarize("u1", "s1", messages, turn_count=2, session_start=datetime.utcnow())
-        s.check_and_summarize("u1", "s1", messages, turn_count=4, session_start=datetime.utcnow())
+        s.check_and_summarize("u1", "s1", messages, turn_count=2, session_start=datetime.now(timezone.utc))
+        s.check_and_summarize("u1", "s1", messages, turn_count=4, session_start=datetime.now(timezone.utc))
         assert len(s._incremental_ids.get("s1", [])) == 2
 
         # Full summary supersedes

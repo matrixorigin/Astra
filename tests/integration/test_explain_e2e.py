@@ -1,7 +1,7 @@
 """End-to-end EXPLAIN ANALYZE test — verifies explain flows through entire call chain."""
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -67,7 +67,7 @@ class TestExplainE2E:
             content="User prefers Python for data analysis",
             initial_confidence=0.9,
             embedding=_embed("Python data analysis"),
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)
@@ -119,7 +119,7 @@ class TestExplainE2E:
             content="User prefers tabs",
             initial_confidence=0.8,
             embedding=[0.5] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(old_mem.memory_id)
         store.create(old_mem)
@@ -228,7 +228,7 @@ class TestExplainE2E:
             memory_type=MemoryType.PROFILE,
             content="User is a senior Python developer",
             initial_confidence=0.95,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(profile_mem.memory_id)
         store.create(profile_mem)
@@ -241,7 +241,7 @@ class TestExplainE2E:
             content="Discussed async patterns yesterday",
             initial_confidence=0.8,
             embedding=_embed("async patterns"),
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(episodic_mem.memory_id)
         store.create(episodic_mem)
@@ -290,7 +290,7 @@ class TestExplainE2E:
             content="Vector search test memory",
             initial_confidence=0.9,
             embedding=[0.1] * EMBEDDING_DIM,
-            observed_at=datetime.utcnow(),
+            observed_at=datetime.now(timezone.utc),
         )
         cleanup_memories.append(mem.memory_id)
         store.create(mem)

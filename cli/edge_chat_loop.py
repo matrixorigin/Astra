@@ -70,6 +70,13 @@ class TurnResult:
     explain: dict[str, Any] | None = None
 
 
+@dataclass
+class ChatLoopResult:
+    """Result of edge_chat_loop execution."""
+    text: str
+    explain_turns: list[dict[str, Any]] | None = None
+
+
 def load_project_rules(project_root: str) -> str | None:
     """Load project rules from local config files."""
     root = Path(project_root)
@@ -237,8 +244,13 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
         file: writable file object (default: sys.stderr).
     """
     f = file or sys.stderr
+    # Only use ANSI codes if output is a TTY
+    use_color = hasattr(f, "isatty") and f.isatty()
+    dim = "\033[2m" if use_color else ""
+    reset = "\033[0m" if use_color else ""
+
     w = f.write
-    w("\n\033[2m── EXPLAIN ──────────────────────────────────\033[0m\n")
+    w(f"\n{dim}── EXPLAIN ──────────────────────────────────{reset}\n")
     total_ms = 0
     total_in = 0
     total_out = 0
@@ -249,7 +261,24 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
         c = t.get("completion_tokens") or 0
         total_in += p
         total_out += c
-        w(f"\033[2mTurn {t['turn']}  {ms}ms  tokens: {p}→{c}\033[0m\n")
+        w(f"{dim}Turn {t['turn']}  {ms}ms  tokens: {p}→{c}{reset}\n")
+
+        # Memory retrieval stats
+        mem = t.get("memory")
+        if mem:
+            ret = mem.get("retrieval")
+            if ret and not ret.get("error"):
+                kw_hit = "✓" if ret.get("keyword_hit") else "✗"
+                vec_hit = "✓" if ret.get("vector_hit") else "✗"
+                p1 = ret.get("phase1_candidates", 0)
+                p2 = ret.get("phase2_candidates", 0)
+                merged = ret.get("merged_candidates", 0)
+                final = ret.get("final_count", 0)
+                ret_ms = ret.get("total_ms", 0)
+                w(f"{dim}  └─ memory  {ret_ms:.0f}ms  kw={kw_hit}({p1}) vec={vec_hit}({p2}) → {merged} → {final}{reset}\n")
+            elif ret and ret.get("error"):
+                w(f"{dim}  └─ memory  error: {ret.get('error')}{reset}\n")
+
         for s in t.get("steps", []):
             step = s.get("step", "?")
             dur = s.get("duration_ms", 0)
@@ -268,9 +297,14 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
             else:
                 label = step
                 io = ""
-            w(f"\033[2m  └─ {label}  {dur}ms  {io}\033[0m\n")
-    w(f"\033[2mTotal: {total_ms}ms  tokens: {total_in}→{total_out}\033[0m\n")
-    w("\033[2m─────────────────────────────────────────────\033[0m\n")
+            w(f"{dim}  └─ {label}  {dur}ms  {io}{reset}\n")
+    w(f"{dim}Total: {total_ms}ms  tokens: {total_in}→{total_out}{reset}\n")
+    w(f"{dim}─────────────────────────────────────────────{reset}\n")
+
+
+def _make_result(text: str, explain_turns: list[dict[str, Any]]) -> ChatLoopResult:
+    """Construct ChatLoopResult, converting empty list to None."""
+    return ChatLoopResult(text=text, explain_turns=explain_turns if explain_turns else None)
 
 
 async def edge_chat_loop(
@@ -287,10 +321,10 @@ async def edge_chat_loop(
     session_info: dict[str, Any] | None = None,
     extra_rules: str | None = None,
     explain: bool = False,
-) -> str:
+) -> ChatLoopResult:
     """Run the edge-cloud agentic loop until final answer or MAX_TURNS.
 
-    Returns the final assistant text.
+    Returns ChatLoopResult with final text and optional explain data.
     """
     renderer = renderer or StderrRenderer()
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_input}]
@@ -360,7 +394,7 @@ async def edge_chat_loop(
                     break
                 except KeyboardInterrupt:
                     renderer.error("Interrupted by user")
-                    return final_text
+                    return _make_result(final_text, _explain_turns)
                 except AuthenticationError:
                     raise  # propagate to CLI for re-login prompt
                 except Exception as e:
@@ -435,4 +469,4 @@ async def edge_chat_loop(
         if _explain_turns:
             _print_explain(_explain_turns)
 
-    return final_text
+    return _make_result(final_text, _explain_turns)

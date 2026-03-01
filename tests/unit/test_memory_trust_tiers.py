@@ -1,6 +1,6 @@
 """Unit tests for trust tier support."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,7 +30,7 @@ class TestTrustTierDecay:
 
     def test_t1_decays_slower_than_t4(self):
         """Same age, same initial_confidence — T1 should have higher effective_confidence."""
-        age = datetime.utcnow() - timedelta(days=60)
+        age = datetime.now(timezone.utc) - timedelta(days=60)
         t1 = Memory(memory_id="t1", user_id="u", memory_type=MemoryType.SEMANTIC,
                      content="x", initial_confidence=1.0, observed_at=age,
                      trust_tier=TrustTier.T1_VERIFIED)
@@ -46,7 +46,7 @@ class TestTrustTierDecay:
     def test_explicit_half_life_overrides_tier(self):
         mem = Memory(memory_id="m1", user_id="u", memory_type=MemoryType.SEMANTIC,
                      content="x", initial_confidence=1.0,
-                     observed_at=datetime.utcnow() - timedelta(days=30),
+                     observed_at=datetime.now(timezone.utc) - timedelta(days=30),
                      trust_tier=TrustTier.T1_VERIFIED)
         # Override T1's 365d with 30d
         ec = mem.effective_confidence(half_life_days=30.0)
