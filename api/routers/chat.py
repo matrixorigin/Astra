@@ -1933,6 +1933,8 @@ async def chat_turn(
                         except Exception:
                             pass
                         yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': cloud_result[:500]})}\n\n"
+                        # Truncate before quality assessment (assess full, truncate for LLM)
+                        from core.context.compaction import truncate_tool_result
                         # Quality badge for cloud tool results
                         if _TOOL_QUALITY_ENABLED:
                             _cqa = _assess_tool_result(tc_name, cloud_result)
@@ -1941,7 +1943,7 @@ async def chat_turn(
                                 cloud_result = _annotate_tool_result({"result": cloud_result}, _cqa)["result"]
                         # Append tool result to messages for next LLM call.
                         _current_llm_messages = _current_llm_messages + [
-                            {"role": "tool", "tool_call_id": tc_id, "content": cloud_result}
+                            {"role": "tool", "tool_call_id": tc_id, "content": truncate_tool_result(cloud_result)}
                         ]
 
                     # If there are also edge tool_calls, emit them and break.

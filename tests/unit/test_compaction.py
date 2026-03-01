@@ -46,14 +46,14 @@ class TestNeedsCompaction:
         assert not needs_compaction(msgs, 1000)
 
     def test_over_threshold(self):
-        # 80% of 100 = 80 tokens → need >320 chars
+        # 50% of 100 = 50 tokens → need >200 chars
         msgs = [_msg("user", _long_content(400))]
         assert needs_compaction(msgs, 100)
 
     def test_exactly_at_threshold(self):
-        # 80 tokens = 320 chars, estimate_tokens(320 chars) = 80
-        msgs = [_msg("user", "x" * 320)]
-        assert not needs_compaction(msgs, 100)  # 80 == 80, not >
+        # 50 tokens = 200 chars, estimate_tokens(200 chars) = 50
+        msgs = [_msg("user", "x" * 200)]
+        assert not needs_compaction(msgs, 100)  # 50 == 50, not >
 
 
 class TestClearOldToolResults:

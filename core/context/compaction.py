@@ -26,6 +26,20 @@ _PRESERVE_RECENT = 6
 # Placeholder for cleared tool results
 _TOOL_CLEARED = "[tool output cleared — already processed]"
 
+# Max chars for a single tool result in the message chain (~2K tokens)
+MAX_TOOL_RESULT_CHARS = 8000
+
+
+def truncate_tool_result(content: str) -> str:
+    """Truncate tool result content with a clear marker.
+
+    Avoids breaking JSON mid-value by appending a truncation notice
+    rather than silently cutting.
+    """
+    if len(content) <= MAX_TOOL_RESULT_CHARS:
+        return content
+    return content[:MAX_TOOL_RESULT_CHARS] + "\n...[truncated — full output stored in memory]"
+
 
 def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     """Estimate total tokens in a message chain."""
@@ -40,8 +54,13 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
 
 
 def needs_compaction(messages: list[dict[str, Any]], token_limit: int) -> bool:
-    """Check if message chain needs compaction (>80% of limit)."""
-    return estimate_tokens(messages) > int(token_limit * 0.8)
+    """Check if message chain needs compaction (>50% of limit).
+
+    Compact proactively to avoid wasting tokens on stale tool results
+    deep in history. Prompt caching means the system prompt is cheap
+    to re-send, so compaction cost is low.
+    """
+    return estimate_tokens(messages) > int(token_limit * 0.5)
 
 
 def compact(
@@ -73,7 +92,7 @@ def compact(
     # Phase 1: Clear old tool results (keep recent ones)
     result = _clear_old_tool_results(result, preserve_recent)
 
-    if estimate_tokens(result) <= int(token_limit * 0.8):
+    if estimate_tokens(result) <= int(token_limit * 0.5):
         logger.info("Compaction phase 1 sufficient (tool result clearing)")
         return result
 

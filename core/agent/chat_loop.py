@@ -525,6 +525,9 @@ class ChatLoop:
                     
                     # Record usage after processing (use processed size)
                     self._turn_budget.record(len(result_str))
+                else:
+                    from core.context.compaction import truncate_tool_result
+                    result_str = truncate_tool_result(result_str)
                 
                 messages.append(
                     {
