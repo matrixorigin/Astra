@@ -140,7 +140,7 @@ class LLMClient(DbConsumer):
                     "provider": provider,
                     "model": model,
                     "temperature": float(os.getenv("LLM_TEMPERATURE", "0.7")),
-                    "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2000")),
+                    "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "8192")),
                     "budget_usd": float(os.getenv("LLM_BUDGET_USD", "0")),
                 }
             self.config = config

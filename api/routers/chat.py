@@ -1202,14 +1202,25 @@ async def chat_turn(
 
                 # Emit accumulated tool calls
                 for tc in tool_calls:
-                    args = tc.get("function", {}).get("arguments", "") or "{}"
-                    try:
-                        parsed_args = json.loads(args) if isinstance(args, str) else args
-                    except json.JSONDecodeError:
-                        logger.warning("Malformed tool_call arguments for %s: %s",
-                                       tc.get("function", {}).get("name", "?"), args[:200])
-                        parsed_args = {"_parse_error": f"Malformed arguments JSON: {args[:200]}"}
-                    yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc.get('function', {}).get('name', ''), 'arguments': parsed_args})}\n\n"
+                    tc_name = tc.get("function", {}).get("name", "?")
+                    # Truncated by max_tokens — arguments JSON is incomplete.
+                    if tc.get("_truncated"):
+                        logger.warning("tool_call %s truncated by max_tokens", tc_name)
+                        parsed_args = {"_parse_error": (
+                            "Your output was truncated by max_tokens before the tool_call "
+                            "arguments were complete. The JSON is cut off and cannot be parsed. "
+                            "Please retry with a shorter approach — for example, write smaller "
+                            "sections of code at a time instead of the entire file at once."
+                        )}
+                    else:
+                        args = tc.get("function", {}).get("arguments", "") or "{}"
+                        try:
+                            parsed_args = json.loads(args) if isinstance(args, str) else args
+                        except json.JSONDecodeError:
+                            logger.warning("Malformed tool_call arguments for %s: %s",
+                                           tc_name, args[:200])
+                            parsed_args = {"_parse_error": f"Malformed arguments JSON: {args[:200]}"}
+                    yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc_name, 'arguments': parsed_args})}\n\n"
 
                 # Update session cache: append assistant message, increment turn_count
                 _entry = _get_or_create_session_entry(session_id)

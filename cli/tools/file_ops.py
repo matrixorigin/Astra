@@ -64,11 +64,15 @@ class WriteFileTool(EdgeTool):
         self._root = project_root
 
     name = "write_file"
-    description = "Create or overwrite a file with the given content."
+    description = (
+        "Create a NEW file with the given content. "
+        "For editing existing files, use str_replace instead — "
+        "write_file on large existing files will fail due to output token limits."
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "File path"},
+            "path": {"type": "string", "description": "File path (must not already exist, use str_replace to edit existing files)"},
             "content": {"type": "string", "description": "File content"},
         },
         "required": ["path", "content"],
@@ -87,13 +91,18 @@ class StrReplaceTool(EdgeTool):
         self._root = project_root
 
     name = "str_replace"
-    description = "Replace an exact string in a file. old_str must match exactly one occurrence."
+    description = (
+        "The primary tool for editing files. Replaces an exact string occurrence in a file. "
+        "old_str must match exactly one location in the file (include enough context lines to be unique). "
+        "To delete code, set new_str to empty string. "
+        "For multiple edits to the same file, call this tool multiple times."
+    )
     parameters = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path"},
-            "old_str": {"type": "string", "description": "Exact string to find (must be unique in file)"},
-            "new_str": {"type": "string", "description": "Replacement string"},
+            "old_str": {"type": "string", "description": "Exact string to find (must be unique in file). Include surrounding lines for uniqueness."},
+            "new_str": {"type": "string", "description": "Replacement string. Use empty string to delete the matched text."},
         },
         "required": ["path", "old_str", "new_str"],
     }
@@ -106,9 +115,16 @@ class StrReplaceTool(EdgeTool):
         text = resolved.read_text(errors="replace")
         count = text.count(old_str)
         if count == 0:
-            return f"Error: old_str not found in {path}"
+            # Provide a helpful snippet of the file for the LLM to retry
+            lines = text.splitlines()
+            snippet = "\n".join(lines[:30]) if len(lines) > 30 else text
+            return (
+                f"Error: old_str not found in {path}. "
+                f"Make sure it matches the file content exactly (including whitespace). "
+                f"First 30 lines of file:\n{snippet}"
+            )
         if count > 1:
-            return f"Error: old_str found {count} times in {path}, must be unique"
+            return f"Error: old_str found {count} times in {path}. Include more surrounding context to make it unique."
         resolved.write_text(text.replace(old_str, new_str, 1))
         return f"Replaced in {path}"
 

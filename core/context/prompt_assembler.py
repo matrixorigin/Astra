@@ -218,7 +218,12 @@ class PromptAssembler(DbConsumer):
             "- Think step-by-step before acting\n"
             "- Verify changes before presenting\n"
             "- If uncertain, say so rather than guess\n"
-            "- For questions about YOUR capabilities, answer from Self-Model — don't explore files"
+            "- For questions about YOUR capabilities, answer from Self-Model — don't explore files\n"
+            "\nFile editing rules:\n"
+            "- To edit existing files, ALWAYS use str_replace — never rewrite the entire file with write_file\n"
+            "- Use write_file ONLY to create new files that don't exist yet\n"
+            "- For multiple changes to one file, call str_replace once per change\n"
+            "- Include enough context in old_str to match exactly one location"
         )
         sections["constraints"] = constraints
         breakdown["constraints"] = _estimate_tokens(constraints)

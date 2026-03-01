@@ -94,6 +94,7 @@ def _extract_openai_cached_tokens(usage) -> int:
 def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
     """Shared tool call accumulation for OpenAI-compatible streaming."""
     buf: dict[int, dict] = {}
+    truncated = False
     for chunk in response_iter:
         if chunk.usage:
             yield {
@@ -105,7 +106,11 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
             continue
         if not chunk.choices:
             continue
-        delta = chunk.choices[0].delta
+        choice = chunk.choices[0]
+        # Detect output truncation (max_tokens reached).
+        if choice.finish_reason == "length":
+            truncated = True
+        delta = choice.delta
         # OpenAI o-series reasoning tokens
         reasoning = getattr(delta, "reasoning_content", None)
         if reasoning:
@@ -129,7 +134,11 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
                     buf[idx]["function"]["arguments"] += tc.function.arguments
     for tc in buf.values():
         if tc["function"]["name"]:
-            if not tc["function"]["arguments"]:
+            if truncated:
+                logger.warning("tool_call %s truncated by max_tokens, arguments incomplete",
+                               tc["function"]["name"])
+                tc["_truncated"] = True
+            elif not tc["function"]["arguments"]:
                 logger.warning("LLM emitted tool_call %s with empty arguments",
                                tc["function"]["name"])
             yield {"type": "tool_call", "data": tc}

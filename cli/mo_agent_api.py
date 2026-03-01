@@ -384,10 +384,35 @@ TODO: describe this skill for the LLM.
 
     # --- /skill dev off ---
     if sub == "dev" and rest.strip() == "off":
-        if state:
+        # Run validation before exiting dev mode
+        if state and state.get("skill_dev_dir"):
+            dev_dir = Path(state["skill_dev_dir"])
+            dev_name = state.get("skill_dev_name", "")
+            if dev_dir.is_dir():
+                issues = _validate_skill_source(dev_dir)
+                errors = [msg for level, msg in issues if level == "error"]
+                warnings = [msg for level, msg in issues if level == "warning"]
+                if errors:
+                    console.print(f"[red]⚠ {len(errors)} error(s) found — skill may not work correctly:[/red]")
+                    for msg in errors:
+                        console.print(f"  [red]ERROR[/red]: {msg}")
+                    console.print(f"  [dim]Fix with: /skill dev {dev_name}[/dim]")
+                elif warnings:
+                    console.print(f"[yellow]⚠ {len(warnings)} warning(s):[/yellow]")
+                    for msg in warnings:
+                        console.print(f"  [yellow]WARN[/yellow]: {msg}")
+                else:
+                    console.print(f"[green]✓[/green] Validation passed")
             state.pop("skill_dev_context", None)
             state.pop("skill_dev_name", None)
             state.pop("skill_dev_dir", None)
+        elif state:
+            state.pop("skill_dev_context", None)
+            state.pop("skill_dev_name", None)
+            state.pop("skill_dev_dir", None)
+        sb = kw.get("status_bar")
+        if sb:
+            sb.update(skill_dev="")
         console.print("[dim]Exited skill dev mode[/dim]")
         return
 
@@ -413,8 +438,18 @@ TODO: describe this skill for the LLM.
             state["skill_dev_context"] = _build_skill_dev_context(name, skill_dir)
         console.print(f"[green]✓[/green] Entered dev mode for [bold]{name}[/bold]")
         console.print(f"  [dim]Skill dir: {skill_dir.relative_to(project_root)}[/dim]")
-        console.print("  Describe what the skill should do. I'll write the implementation.")
-        console.print(f"  [dim]Test: /skill test {name}    Exit: /skill dev off[/dim]")
+        console.print()
+        console.print("  [bold]How to use:[/bold]")
+        console.print("  1. Describe what the skill should do (e.g. \"fetch real-time stock price from akshare\")")
+        console.print("  2. AI will write the code, then auto-test it")
+        console.print("  3. Review the output, ask for changes if needed")
+        console.print()
+        console.print(f"  [dim]Test manually:  /skill test {name} {{\"param\": \"value\"}}[/dim]")
+        console.print(f"  [dim]Validate:       /skill validate {name}[/dim]")
+        console.print(f"  [dim]Exit dev mode:  /skill dev off[/dim]")
+        sb = kw.get("status_bar")
+        if sb:
+            sb.update(skill_dev=state_name)
         return
 
     # --- /skill validate <name> ---
@@ -479,6 +514,31 @@ def _build_skill_dev_context(name: str, skill_dir: Path) -> str:
         f"# SKILL DEV MODE: {name}",
         "",
         "You are helping develop a local skill. The user describes what the skill should do.",
+        "",
+        "## MANDATORY: After Writing/Modifying skill.py",
+        "",
+        "Every time you write or modify skill.py, you MUST immediately:",
+        "1. Run the skill with a realistic test input to verify it works",
+        "2. Check that the output contains real data (not empty/placeholder values)",
+        "3. If the skill calls external APIs, verify the API response is valid",
+        "4. If the test fails or returns empty data, fix the code and re-test",
+        "",
+        "Use the shell tool to test:",
+        f'```bash',
+        f'cd {skill_dir.parent.parent.parent} && python -c "',
+        f'import asyncio, json',
+        f'from core.skills.loader import SkillLoader',
+        f'from pathlib import Path',
+        f'skills = SkillLoader.discover([Path(\"{skill_dir.parent}\")])',
+        f's = next((s for s in skills if s.skill.name == \"{name}\"), None)',
+        f'if s:',
+        f'    inp = s.skill.validate_input({{\"query\": \"test\"}})',
+        f'    r = asyncio.run(s.skill.execute(inp))',
+        f'    print(json.dumps(r.model_dump(), indent=2, ensure_ascii=False, default=str))',
+        f'"',
+        f'```',
+        "",
+        "DO NOT consider the skill done until you have seen a successful test output with real data.",
         "",
         "## File Paths (use these exact paths for str_replace)",
         f"- skill.py: {skill_dir / 'skill.py'}",
@@ -875,6 +935,18 @@ def _validate_skill_source(skill_dir: Path) -> list[tuple[str, str]]:
                         issues.append(("error", "Skill.name is empty"))
                     if not instance.description or instance.description.startswith("TODO"):
                         issues.append(("warning", "Skill.description is missing or TODO"))
+                    # Check Output class has business fields beyond base SkillOutput
+                    from core.skills.base import SkillOutput as SkillOutputBase
+                    output_cls = None
+                    for attr in vars(mod).values():
+                        if isinstance(attr, type) and issubclass(attr, SkillOutputBase) and attr is not SkillOutputBase:
+                            output_cls = attr
+                            break
+                    if output_cls:
+                        base_fields = {"success", "result", "error", "cost"}
+                        custom_fields = [f for f in output_cls.model_fields if f not in base_fields]
+                        if not custom_fields:
+                            issues.append(("warning", "Output has no business fields — skill returns no useful data to LLM"))
                 except Exception as e:
                     issues.append(("error", f"Cannot instantiate skill: {e}"))
     except SyntaxError as e:
@@ -1156,7 +1228,8 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
         while True:
             # --- Input ---
             if is_tty:
-                inp = get_input(repl_session, "❯ ")
+                prompt = f"🔧 {state['skill_dev_name']}> " if state.get("skill_dev_name") else "❯ "
+                inp = get_input(repl_session, prompt)
                 if inp.eof:
                     break
                 if inp.interrupted:
@@ -1192,7 +1265,10 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
                     session_id = state["session_id"]
                     selected_model = state.get("selected_model")
                     if status_bar:
-                        status_bar.update(session_id=session_id, model=selected_model or "")
+                        status_bar.update(
+                            session_id=session_id, model=selected_model or "",
+                            skill_dev=state.get("skill_dev_name", ""),
+                        )
                 else:
                     console.print(f"[red]Unknown command.[/red] Type [cyan]/help[/cyan]")
                 continue
@@ -1205,12 +1281,16 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
                 # In skill dev mode, refresh context from disk each turn so the
                 # LLM always sees the latest file contents after edits.
                 skill_dev_rules = None
+                skill_py_mtime_before = None
                 if state.get("skill_dev_name"):
                     skill_dir = Path(state.get("skill_dev_dir", ""))
                     if skill_dir.is_dir():
                         state["skill_dev_context"] = _build_skill_dev_context(
                             state["skill_dev_name"], skill_dir,
                         )
+                        skill_py = skill_dir / "skill.py"
+                        if skill_py.is_file():
+                            skill_py_mtime_before = skill_py.stat().st_mtime
                     skill_dev_rules = state.get("skill_dev_context")
 
                 if hasattr(renderer, "begin_response"):
@@ -1223,6 +1303,27 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug):
                 ))
                 if hasattr(renderer, "end_response"):
                     renderer.end_response()
+
+                # Post-turn: auto-validate if skill.py was modified
+                if state.get("skill_dev_dir") and skill_py_mtime_before is not None:
+                    skill_py = Path(state["skill_dev_dir"]) / "skill.py"
+                    if skill_py.is_file() and skill_py.stat().st_mtime != skill_py_mtime_before:
+                        console.print()
+                        issues = _validate_skill_source(Path(state["skill_dev_dir"]))
+                        errors = [msg for level, msg in issues if level == "error"]
+                        warnings = [msg for level, msg in issues if level == "warning"]
+                        if errors:
+                            console.print(f"  [red]⚠ Auto-validate: {len(errors)} error(s)[/red]")
+                            for msg in errors:
+                                console.print(f"    [red]ERROR[/red]: {msg}")
+                        elif warnings:
+                            console.print(f"  [yellow]⚠ Auto-validate: {len(warnings)} warning(s)[/yellow]")
+                            for msg in warnings:
+                                console.print(f"    [yellow]WARN[/yellow]: {msg}")
+                        else:
+                            console.print(f"  [green]✓ Auto-validate: passed[/green]")
+                            console.print(f"    [dim]Test it: /skill test {state.get('skill_dev_name', '')} {{\"param\": \"value\"}}[/dim]")
+
                 turn_count += 1
                 state["last_response"] = result_text or ""
                 state["turn_history"].append({"role": "user", "preview": user_input[:80]})

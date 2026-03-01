@@ -212,11 +212,6 @@ async def edge_chat_loop(
         session_info["has_project_rules"] = project_rules is not None
         session_info["has_edge_profile"] = bool(edge_profile)
 
-    # Track sent tools to detect mid-session changes
-    def _tool_names(schemas: list[dict]) -> set[str]:
-        return {t.get("function", {}).get("name", "") for t in schemas}
-
-    last_sent_tools: set[str] = set()
     final_text = ""
     total_usage: dict[str, int] = {}
 
@@ -225,13 +220,10 @@ async def edge_chat_loop(
             if session_info is not None:
                 session_info["turn"] = turn
 
-            # Detect tool changes: send edge_tools on turn 0 or when tools changed
+            # Always send edge_tools so the server has them even after
+            # a restart (server-side session cache is in-memory only).
             current_schemas = tool_router.get_schemas()
-            current_tool_names = _tool_names(current_schemas)
-            tools_changed = current_tool_names != last_sent_tools
-            send_edge_tools = current_schemas if (turn == 0 or tools_changed) else None
-            if send_edge_tools:
-                last_sent_tools = current_tool_names
+            send_edge_tools = current_schemas
 
             # Call cloud with retry for transient errors
             _MAX_RETRIES = 2

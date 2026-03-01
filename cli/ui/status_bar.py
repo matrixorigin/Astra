@@ -19,6 +19,7 @@ class StatusBar:
         self._model: str = ""
         self._turn: int = 0
         self._tokens: int = 0
+        self._skill_dev: str = ""
 
     def update(
         self,
@@ -26,6 +27,7 @@ class StatusBar:
         model: str | None = None,
         turn: int | None = None,
         tokens_used: int | None = None,
+        skill_dev: str | None = None,
     ) -> None:
         if session_id is not None:
             self._session_id = session_id
@@ -35,14 +37,19 @@ class StatusBar:
             self._turn = turn
         if tokens_used is not None:
             self._tokens = tokens_used
+        if skill_dev is not None:
+            self._skill_dev = skill_dev
 
     def toolbar(self) -> str | None:
         """Return toolbar text for prompt_toolkit, or None if compact mode."""
-        if not self.verbose:
+        if not self.verbose and not self._skill_dev:
             return None
         sid = self._session_id[:12] if self._session_id else "—"
         model = self._model or "(default)"
-        return (
+        base = (
             f" session:{sid} │ model:{model} │ "
             f"turn:{self._turn} │ tokens:{_format_tokens(self._tokens)}"
         )
+        if self._skill_dev:
+            base = f" 🔧 SKILL DEV: {self._skill_dev} │" + base
+        return base
