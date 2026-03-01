@@ -118,8 +118,7 @@ def cmd_help(console, **_):
         ("/skill new <name>", "Create a new skill"),
         ("/skill test <name>", "Test a skill with full output"),
         ("/skill dev <name>", "Enter AI-assisted skill dev mode"),
-        ("/explain", "Toggle explain mode (show per-turn stats)"),
-        ("/explain last", "Show last turn's explain output"),
+        ("/explain", "Toggle explain mode (auto-show stats after each turn)"),
         ("/verbose", "Show status bar"),
         ("/compact", "Hide status bar"),
         ("/history", "Show recent turns"),
@@ -1026,27 +1025,19 @@ def _is_empty(v) -> bool:
 
 
 def cmd_explain(console, state=None, cmd_arg=None, **_):
-    """Toggle explain mode or show last turn's execution trace.
+    """Toggle explain mode to show per-turn execution stats.
 
     Usage:
         /explain        - Toggle explain mode on/off
         /explain on     - Enable explain mode
         /explain off    - Disable explain mode
-        /explain last   - Show last turn's explain output
 
-    When enabled, shows per-turn stats after each response:
+    When enabled, shows stats after each response:
         - Memory retrieval: keyword/vector hits, candidates, timing
         - LLM: tokens in/out, tool calls
         - Cloud skills: bytes in/out
     """
-    if cmd_arg == "last":
-        last_explain = state.get("last_explain")
-        if not last_explain:
-            console.print("[dim]No explain data from last turn[/dim]")
-            return
-        from cli.edge_chat_loop import _print_explain
-        _print_explain(last_explain)
-    elif cmd_arg in ("on", "1", "true"):
+    if cmd_arg in ("on", "1", "true"):
         state["explain_mode"] = True
         console.print("[green]✓[/green] Explain mode [bold]ON[/bold] — will show stats after each turn")
     elif cmd_arg in ("off", "0", "false"):
@@ -1420,11 +1411,12 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                     explain=should_explain,
                 ))
                 result_text = loop_result.text
-                # Save explain data for /explain last
-                if loop_result.explain_turns:
-                    state["last_explain"] = loop_result.explain_turns
                 if hasattr(renderer, "end_response"):
                     renderer.end_response()
+                # Auto-print explain after rendered response
+                if should_explain and loop_result.explain_turns:
+                    from cli.edge_chat_loop import _print_explain
+                    _print_explain(loop_result.explain_turns)
 
                 # Post-turn: auto-validate if skill.py was modified
                 if state.get("skill_dev_dir") and skill_py_mtime_before is not None:
