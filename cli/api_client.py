@@ -862,3 +862,11 @@ class APIClient:
         """Get user-installed and cloud skills for introspection tool."""
         response = await self._request("GET", "/introspection/skills")
         return response.json()
+
+    async def get_reflect(self, session_id: str, focus: str = "auto", last_n: int = 20) -> dict[str, Any]:
+        """Get diagnostic evidence for agent self-reflection."""
+        response = await self._request(
+            "GET", f"/chat/session/{session_id}/reflect",
+            params={"focus": focus, "last_n": last_n},
+        )
+        return response.json()

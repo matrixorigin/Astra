@@ -81,6 +81,11 @@ class WriteFileTool(EdgeTool):
 
     async def execute(self, path: str, content: str, **_: Any) -> str:
         resolved = _resolve_path(path, self._root)
+        if resolved.exists():
+            return (
+                f"Error: File already exists: {path}. "
+                "Use str_replace to edit existing files instead of overwriting."
+            )
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"

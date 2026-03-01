@@ -7,7 +7,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -679,6 +679,177 @@ def _peek_session_entry(session_id: str) -> dict[str, Any] | None:
     return _session_cache.get(session_id)
 
 
+def _verify_session_owner(user_id: str, session_id: str, db: Session | None = None) -> None:
+    """Verify user owns the session. Raises HTTPException on failure.
+
+    Accepts an optional *db* session to avoid opening a second connection
+    when the caller already holds one (e.g. _build_reflect_evidence).
+    """
+    def _check(conn: Session) -> None:
+        row = conn.execute(
+            text("SELECT user_id FROM agent_sessions WHERE session_id = :sid"),
+            {"sid": session_id},
+        ).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if row[0] != user_id:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+    if db is not None:
+        _check(db)
+    else:
+        with SessionLocal() as conn:
+            _check(conn)
+
+
+_ReflectFocus = Literal["auto", "skill_failure", "unexpected_result", "data_quality"]
+
+
+def _build_reflect_evidence(
+    session_id: str, user_id: str, focus: _ReflectFocus, last_n: int,
+) -> dict[str, Any]:
+    """Gather diagnostic evidence from DB for agent self-reflection.
+
+    Returns structured evidence the LLM cannot see in its context window:
+    event trail with timing/tokens, skill selection history, procedural
+    memories, implicit feedback signals, and deterministic diagnosis hints.
+    """
+    result: dict[str, Any] = {"session_id": session_id, "focus": focus}
+    hints: list[str] = []
+
+    with SessionLocal() as db:
+        # 1. Event trail — server-side events with timing and token usage
+        rows = db.execute(
+            text(f"""
+                SELECT event_type, content, metadata, created_at,
+                       llm_model_used, skill_name
+                FROM agent_events
+                WHERE session_id = :sid
+                ORDER BY created_at DESC LIMIT {int(last_n)}
+            """),
+            {"sid": session_id},
+        ).fetchall()
+
+        events = []
+        fail_counts: dict[str, int] = {}
+        for r in reversed(rows):
+            evt = {"type": r[0], "ts": str(r[3]) if r[3] else None}
+            if r[4]:
+                evt["model"] = r[4]
+            if r[5]:
+                evt["skill"] = r[5]
+            # Parse content for tool_result success/failure
+            if r[0] == "tool_result" and r[1]:
+                try:
+                    content = json.loads(r[1])
+                    evt["tool_name"] = content.get("name", "")
+                    result_str = str(content.get("result", ""))[:200]
+                    evt["result_preview"] = result_str
+                    if "Error" in result_str or "error" in result_str:
+                        evt["failed"] = True
+                        name = content.get("name", "unknown")
+                        fail_counts[name] = fail_counts.get(name, 0) + 1
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            elif r[0] == "tool_call" and r[1]:
+                try:
+                    content = json.loads(r[1])
+                    evt["tool_name"] = content.get("name", "")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            events.append(evt)
+        result["event_summary"] = events
+
+        # Auto-detect focus from events: scan for the most relevant signal.
+        if focus == "auto":
+            has_failure = any(e.get("failed") for e in events)
+            has_missing_provenance = any(
+                e.get("type") == "tool_result" and e.get("result_preview")
+                and "data_source" not in e.get("result_preview", "")
+                for e in events
+            )
+            if has_failure:
+                focus = "skill_failure"
+            elif has_missing_provenance:
+                focus = "data_quality"
+            else:
+                focus = "unexpected_result"
+            result["focus"] = focus
+
+        # Repeated failure hint
+        for name, count in fail_counts.items():
+            if count >= 2:
+                hints.append(f"Skill '{name}' failed {count} times in this session")
+
+        # 2. Skill selection history — candidate scores, reasoning, outcomes
+        sel_rows = db.execute(
+            text("""
+                SELECT skill_name, selected_skills, selection_reasoning,
+                       execution_success, execution_time_ms, created_at
+                FROM skill_selection_events
+                WHERE session_id = :sid
+                ORDER BY created_at DESC LIMIT 5
+            """),
+            {"sid": session_id},
+        ).fetchall()
+        result["skill_history"] = [
+            {
+                "skill": r[0], "selected": r[1], "reasoning": (r[2] or "")[:200],
+                "success": bool(r[3]) if r[3] is not None else None,
+                "time_ms": r[4], "ts": str(r[5]) if r[5] else None,
+            }
+            for r in sel_rows
+        ]
+
+        # 3. Past lessons — procedural memories relevant to this session
+        try:
+            from core.memory.store import MemoryStore
+            from core.memory.types import MemoryType
+            store = MemoryStore(SessionLocal)
+            memories = store.list_active(user_id, MemoryType.PROCEDURAL)
+            result["past_lessons"] = [m.content for m in memories[:5]]
+            # Match hint
+            for m in memories[:5]:
+                for name in fail_counts:
+                    if name in m.content:
+                        hints.append(f"Past lesson matches: {m.content[:150]}")
+                        break
+        except Exception:
+            result["past_lessons"] = []
+
+        # 4. Implicit feedback signals
+        try:
+            fb_rows = db.execute(
+                text("""
+                    SELECT user_comment, created_at
+                    FROM ctx_prompt_feedback
+                    WHERE llm_request_id IN (
+                        SELECT event_id FROM agent_events
+                        WHERE session_id = :sid AND event_type = 'user_query'
+                    )
+                    ORDER BY created_at DESC LIMIT 5
+                """),
+                {"sid": session_id},
+            ).fetchall()
+            result["feedback_signals"] = [
+                {"signal": r[0], "ts": str(r[1]) if r[1] else None}
+                for r in fb_rows
+            ]
+        except Exception:
+            result["feedback_signals"] = []
+
+        # 5. Data quality hints — check tool results for missing provenance
+        for evt in events:
+            if evt.get("type") == "tool_result" and evt.get("result_preview"):
+                preview = evt.get("result_preview", "")
+                if "data_source" not in preview and evt.get("tool_name"):
+                    hints.append(f"Tool '{evt['tool_name']}' result has no data_source provenance")
+                    break  # one hint is enough
+
+    result["diagnosis_hints"] = hints
+    return result
+
+
 def _get_or_create_session_entry(session_id: str) -> dict[str, Any]:
     """Get existing or create new cache entry (may evict LRU entries)."""
     entry = _session_cache.get(session_id)
@@ -1120,6 +1291,8 @@ def _persist_turn_events(
 
         if user_content:
             hooks.detect_implicit_feedback(user_content, messages, parent_event_id)
+
+        hooks.detect_reflection_learning(session_id, user_id, tool_calls, tool_results)
     except Exception as e:
         logger.warning("Phase 4 (TurnHooks) failed: %s", e)
 
@@ -1155,6 +1328,23 @@ def _get_shared_embed_fn():
                 except Exception:
                     _shared_embed_fn = None
     return _shared_embed_fn
+
+
+@router.get("/chat/session/{session_id}/reflect")
+async def reflect_session(
+    session_id: str,
+    current_user: Annotated[dict, Depends(get_current_user)],
+    focus: _ReflectFocus = Query(default="auto", description="Focus: auto, skill_failure, unexpected_result, data_quality"),
+    last_n: int = Query(default=20, ge=1, le=100),
+):
+    """Gather diagnostic evidence from server-side data for agent self-reflection."""
+    user_id = current_user["user_id"]
+    _verify_session_owner(user_id, session_id)
+
+    import asyncio
+    return await asyncio.to_thread(
+        _build_reflect_evidence, session_id, user_id, focus, last_n,
+    )
 
 
 @router.post("/chat/turn")

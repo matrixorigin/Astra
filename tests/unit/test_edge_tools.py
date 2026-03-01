@@ -231,10 +231,12 @@ class TestFileOps:
         assert (project / "new" / "deep" / "file.txt").read_text() == "hello"
 
     @pytest.mark.asyncio
-    async def test_write_file_overwrites(self, project: Path):
+    async def test_write_file_rejects_overwrite(self, project: Path):
         tool = WriteFileTool(str(project))
-        await tool.execute(path="src/main.py", content="replaced")
-        assert (project / "src" / "main.py").read_text() == "replaced"
+        result = await tool.execute(path="src/main.py", content="replaced")
+        assert "already exists" in result.lower()
+        # Original file unchanged
+        assert "hello world" in (project / "src" / "main.py").read_text()
 
     @pytest.mark.asyncio
     async def test_str_replace_success(self, project: Path):

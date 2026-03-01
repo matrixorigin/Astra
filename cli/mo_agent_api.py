@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import asyncio
 import json
 import logging
+import re
 import subprocess
 import click
 from cli.api_client import APIClient, AuthenticationError
@@ -525,6 +526,12 @@ def _build_skill_dev_context(name: str, skill_dir: Path) -> str:
         "",
         "You are helping develop a local skill. The user describes what the skill should do.",
         "",
+        "## CRITICAL: Data Integrity",
+        "",
+        "- NEVER fabricate data. If an API call fails, return success=False with the error.",
+        "- Every skill that fetches data MUST set data_source and data_timestamp on output.",
+        "- If the user asks for real-time data, the skill MUST call a real API — no mock data.",
+        "",
         "## CRITICAL: Use write_file for full rewrites",
         "",
         "When replacing the entire skill.py, use write_file (NOT str_replace).",
@@ -630,6 +637,7 @@ class MySkill(Skill[MyInput, MyOutput]):
 3. **ALWAYS Field(description=...)** — LLM needs this to fill parameters correctly
 4. **ALWAYS default values on Output fields** — prevents Pydantic validation errors
 5. **name must be snake_case** — matches the directory name (kebab-case → snake_case)
+6. **Set data_source and data_timestamp** — on every successful output that fetches external data
 
 ### Common Patterns
 
@@ -638,10 +646,12 @@ class MySkill(Skill[MyInput, MyOutput]):
 async def execute(self, input: MyInput) -> MyOutput:
     try:
         import httpx
+        from datetime import datetime, timezone
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(f"https://api.example.com/{input.query}")
             resp.raise_for_status()
-            return MyOutput(success=True, data=resp.json())
+            return MyOutput(success=True, data=resp.json(),
+                            data_source="example_api", data_timestamp=datetime.now(timezone.utc).isoformat())
     except httpx.HTTPError as e:
         return MyOutput(success=False, error=f"API error: {e}")
     except Exception as e:
@@ -951,6 +961,26 @@ def _validate_skill_source(skill_dir: Path) -> list[tuple[str, str]]:
                         issues.append(("error", "Skill.name is empty"))
                     if not instance.description or instance.description.startswith("TODO"):
                         issues.append(("warning", "Skill.description is missing or TODO"))
+                    # Check NETWORK skill imports a known HTTP/API library.
+                    # Uses import statements (not substring) to avoid false positives
+                    # like variable names containing "ak." or comments mentioning "requests".
+                    is_network = any(r.value == "network" for r in instance.requirements.runtime)
+                    if is_network:
+                        import_lines = [l.strip() for l in source.splitlines()
+                                        if l.strip().startswith(("import ", "from "))]
+                        _HTTP_MODULES = {"httpx", "requests", "aiohttp", "urllib", "akshare", "grpc", "websocket"}
+                        has_http_import = any(
+                            mod_name in line
+                            for line in import_lines
+                            for mod_name in _HTTP_MODULES
+                        )
+                        if not has_http_import:
+                            issues.append(("warning", "NETWORK skill but no HTTP/API library imported — verify data source"))
+                    # Check data_source is assigned in execute() body (not just mentioned in comments).
+                    # Looks for "data_source=" or "data_source =" assignment patterns.
+                    if is_network:
+                        if not re.search(r'data_source\s*=', source):
+                            issues.append(("warning", "Missing data_source assignment — set SkillOutput.data_source for provenance tracking"))
                     # Check Output class has business fields beyond base SkillOutput
                     from core.skills.base import SkillOutput as SkillOutputBase
                     output_cls = None
@@ -1041,10 +1071,12 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
         router.register(local.skill)
 
     from cli.tools.introspection import GetAgentInfoTool
+    from cli.tools.reflect import ReflectTool
     session_info = {"session_id": session_id, "agent_id": agent_id, "model": model, "turn": 0}
     perms = PermissionManager(auto_approve=auto_approve)
 
     router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client))
+    router.register(ReflectTool(api_client=api_client, session_info=session_info))
     return await edge_chat_loop(
         user_input, api_client, router, perms,
         session_id=session_id, project_root=project_root,

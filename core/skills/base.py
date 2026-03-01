@@ -102,6 +102,8 @@ class SkillOutput(BaseModel):
     result: Any = None
     error: str | None = None
     cost: float = 0.0
+    data_source: str = ""       # Origin of data, e.g. "alpha_vantage_api". Empty string means not set.
+    data_timestamp: str = ""    # ISO 8601 when data was fetched. Empty string means not set.
 
 
 # ---------------------------------------------------------------------------
