@@ -99,9 +99,65 @@ class TestHistoryCompression:
         """Test text summarization to first sentence."""
         text = "This is the first sentence. This is the second. And third."
         
+        summary = _summarize_text(text, max_chars=30)  # Force truncation
+        
+        # Should be truncated since text is longer than max_chars
+        assert len(summary) <= 33  # 30 + "..."
+        assert "..." in summary
+    
+    def test_summarize_text_handles_abbreviations(self):
+        """Test that abbreviations don't break sentence detection."""
+        text = "Dr. Smith said the value is 3.14. Then he left."
+        
         summary = _summarize_text(text)
         
-        assert summary == "This is the first sentence...."
+        # Should find real sentence boundary after "3.14."
+        assert "Dr. Smith" in summary
+        assert "3.14" in summary
+    
+    def test_summarize_text_truncates_long_sentence(self):
+        """Test long first sentence is truncated."""
+        text = "A" * 500 + ". Second sentence."
+        
+        summary = _summarize_text(text, max_chars=400)
+        
+        assert len(summary) <= 403  # 400 + "..."
+        assert summary.endswith("...")
+    
+    def test_summarize_text_empty_input(self):
+        """Test empty input returns empty string."""
+        assert _summarize_text("") == ""
+        assert _summarize_text(None) == ""
+    
+    def test_compress_turn_handles_invalid_input(self):
+        """Test compress_turn handles invalid input gracefully."""
+        from core.context.history_compression import _compress_turn
+        
+        # Invalid turn type
+        result = _compress_turn(None, set())
+        assert result == {}
+        
+        # Missing keys
+        result = _compress_turn({}, set())
+        assert "user_query" in result
+        assert result["user_query"] == ""
+    
+    def test_compress_turn_handles_invalid_tool_results(self):
+        """Test compress_turn handles invalid tool results."""
+        from core.context.history_compression import _compress_turn
+        
+        turn = {
+            "user_query": "test",
+            "tool_results": [
+                None,  # Invalid
+                "string",  # Invalid type
+                {},  # Valid but empty
+            ]
+        }
+        
+        # Should not crash
+        result = _compress_turn(turn, set())
+        assert isinstance(result, dict)
     
     def test_tier3_synopsis_created(self):
         """Tier3 synopsis created for long histories."""

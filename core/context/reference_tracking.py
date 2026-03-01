@@ -1,13 +1,11 @@
 """Reference tracking for history compression.
 
-P0 Critical: Async hybrid verification to avoid blocking SSE stream.
+Uses lightweight heuristics to identify which prior tool results are referenced.
 Design ref: context-window-management.md §2 Phase 2.5
 """
 
 from __future__ import annotations
 
-import asyncio
-import os
 import re
 from typing import TYPE_CHECKING
 
@@ -28,6 +26,10 @@ def analyze_semantic_references(
     2. Data references: Current response contains data from prior tool result
     3. Causal chain: Current tool call uses output from prior call
     
+    NOTE: This is a conservative heuristic approach. False negatives (missing a reference)
+    are acceptable - we'll just compress that content. False positives (marking unreferenced
+    content) waste tokens but don't lose information.
+    
     Args:
         current_turn_response: Current LLM response text
         current_turn_tool_calls: Tool calls made in current turn
@@ -45,32 +47,61 @@ def analyze_semantic_references(
         >>> "evt_1" in refs
         True
     """
+    if not current_turn_response:
+        current_turn_response = ""
+    
     referenced_events = set()
+    
+    # Validate history
+    if not history or not isinstance(history, list):
+        return referenced_events
     
     # Heuristic 1: Explicit file/tool mentions in LLM response
     for turn in history:
-        for tool_call in turn.get("tool_calls", []):
+        # Skip invalid turns
+        if not isinstance(turn, dict):
+            continue
+        
+        for tool_call in turn.get("tool_calls", []) or []:
+            if not isinstance(tool_call, dict):
+                continue
+            
             tool_name = tool_call.get("tool_name", "")
             args = tool_call.get("args", {})
             event_id = tool_call.get("event_id", "")
             
+            if not event_id:
+                continue
+            
             if tool_name == "read_file":
-                # Check if filename is mentioned
-                filename = args.get("path", "").split("/")[-1]
-                if filename and filename in current_turn_response:
-                    referenced_events.add(event_id)
+                # Check if filename is mentioned (full path or basename)
+                path = args.get("path", "") if isinstance(args, dict) else ""
+                if path:
+                    filename = path.split("/")[-1]
+                    # Check both full path and filename
+                    if path in current_turn_response or filename in current_turn_response:
+                        referenced_events.add(event_id)
             
             elif tool_name == "grep":
                 # Check if pattern is mentioned
-                pattern = args.get("pattern", "")
+                pattern = args.get("pattern", "") if isinstance(args, dict) else ""
                 if pattern and pattern in current_turn_response:
                     referenced_events.add(event_id)
     
     # Heuristic 2: Data overlap (substring matching for structured data)
     for turn in history:
+        if not isinstance(turn, dict):
+            continue
+        
         for tool_result in turn.get("tool_results", []):
+            if not isinstance(tool_result, dict):
+                continue
+            
             content = tool_result.get("content", "")
             event_id = tool_result.get("event_id", "")
+            
+            if not event_id or not content:
+                continue
             
             # Extract key identifiers (variable names, function names, etc.)
             key_data = _extract_key_identifiers(content)
@@ -78,17 +109,36 @@ def analyze_semantic_references(
                 referenced_events.add(event_id)
     
     # Heuristic 3: Causal chain (tool output → tool input)
-    if current_turn_tool_calls:
+    # If current tool call arguments contain data from prior tool results
+    if current_turn_tool_calls and isinstance(current_turn_tool_calls, list):
         for tool_call in current_turn_tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            
             args = tool_call.get("args", {})
-            # Check if any arg value came from prior tool result
+            if not isinstance(args, dict):
+                continue
+            
             for turn in history:
+                if not isinstance(turn, dict):
+                    continue
+                
                 for tool_result in turn.get("tool_results", []):
+                    if not isinstance(tool_result, dict):
+                        continue
+                    
                     content = tool_result.get("content", "")
                     event_id = tool_result.get("event_id", "")
-                    # Simple substring check
-                    if any(str(arg_val) in content for arg_val in args.values() if arg_val):
-                        referenced_events.add(event_id)
+                    
+                    if not event_id or not content:
+                        continue
+                    
+                    # Check if any arg value appears in prior tool result
+                    # This catches cases like: grep result → used in next grep pattern
+                    for arg_val in args.values():
+                        if arg_val and str(arg_val) in content:
+                            referenced_events.add(event_id)
+                            break
     
     return referenced_events
 
@@ -101,98 +151,30 @@ def _extract_key_identifiers(content: str) -> list[str]:
     - Variable names (e.g., DATABASE_URL, API_KEY)
     - Function names (e.g., def foo(), function bar())
     - Class names (e.g., class MyClass)
+    
+    Returns:
+        List of up to 20 identifiers found in content
     """
+    if not content:
+        return []
+    
     identifiers = []
     
     # Variable assignments (VAR = value, VAR: value)
+    # Matches: DATABASE_URL = "...", API_KEY: "..."
     var_pattern = r'\b([A-Z_][A-Z0-9_]{2,})\s*[=:]'
     identifiers.extend(re.findall(var_pattern, content))
     
     # Function definitions
+    # Matches: def foo(), function bar()
     func_pattern = r'def\s+(\w+)\s*\(|function\s+(\w+)\s*\('
     for match in re.finditer(func_pattern, content):
         identifiers.extend([g for g in match.groups() if g])
     
     # Class definitions
+    # Matches: class MyClass
     class_pattern = r'class\s+(\w+)'
     identifiers.extend(re.findall(class_pattern, content))
     
-    return identifiers[:20]  # Limit to top 20 identifiers
-
-
-async def verify_references_hybrid(
-    uncertain_events: list[dict[str, Any]],
-    current_turn_response: str,
-    feature_flag: bool = True
-) -> set[str]:
-    """
-    Async hybrid verification for borderline reference cases.
-    
-    P0 CRITICAL: Must run as background task to avoid blocking SSE stream.
-    
-    Uses ultra-cheap model (gpt-4o-mini) for lightweight verification:
-    - max_tokens=50 (only need "Yes/No + event_ids")
-    - Cost: <0.1% of total token usage
-    - False negative rate: <0.5% (vs. 2%+ for pure heuristics)
-    
-    Args:
-        uncertain_events: Events with borderline heuristic confidence
-        current_turn_response: Current LLM response text
-        feature_flag: Enable/disable hybrid verification
-        
-    Returns:
-        Set of event_ids that are referenced
-        
-    Example:
-        >>> task = asyncio.create_task(verify_references_hybrid(...))
-        >>> # SSE stream continues without blocking
-        >>> task.add_done_callback(lambda t: referenced_events.update(t.result()))
-    """
-    if not feature_flag or not uncertain_events:
-        return set()
-    
-    # Build minimal prompt
-    events_desc = "\n".join(
-        f"{i}. {e['tool_name']}({e.get('args', {})}) → {e['content'][:100]}..."
-        for i, e in enumerate(uncertain_events)
-    )
-    
-    prompt = f"""Current response references which prior tool results?
-Response: {current_turn_response[:500]}...
-
-Prior results:
-{events_desc}
-
-Reply ONLY: "Referenced: [list of numbers]" or "None"
-"""
-    
-    # P0: Async LLM call (non-blocking)
-    try:
-        # Placeholder for actual async LLM call
-        # In real implementation, use: await llm_client.chat.completions.create(...)
-        response = await _mock_llm_call_async(prompt)
-        
-        # Parse response
-        referenced_indices = _parse_referenced_indices(response)
-        return {uncertain_events[i]['event_id'] for i in referenced_indices if i < len(uncertain_events)}
-    except Exception as e:
-        # Fallback: if verification fails, assume not referenced (conservative)
-        return set()
-
-
-async def _mock_llm_call_async(prompt: str) -> str:
-    """Mock async LLM call for testing."""
-    await asyncio.sleep(0.01)  # Simulate network delay
-    return "Referenced: [0, 1]"
-
-
-def _parse_referenced_indices(response: str) -> list[int]:
-    """Parse LLM response to extract referenced indices."""
-    import re
-    # Look for numbers in the response
-    matches = re.findall(r'\d+', response)
-    return [int(m) for m in matches]
-
-
-# Feature flag
-HYBRID_REFERENCE_CHECK = os.getenv("HYBRID_REFERENCE_CHECK", "true").lower() == "true"
+    # Limit to top 20 to avoid performance issues
+    return identifiers[:20]

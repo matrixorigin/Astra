@@ -669,43 +669,80 @@ class PromptAssembler(DbConsumer):
         return "Recent conversation:\n" + "\n".join(lines) if lines else None
     
     def _build_history_compressed(self, rows, budget_chars: int) -> str | None:
-        """Reference-aware compressed history formatting."""
-        # Convert rows to history format
-        history = []
-        current_turn = {}
+        """
+        Reference-aware compressed history formatting.
         
-        for row in reversed(rows):
-            event_id, event_type, content, metadata = row
+        Converts DB rows to history format and applies compression.
+        Handles malformed data gracefully with fallback to simple format.
+        """
+        try:
+            # Convert rows to history format
+            history = []
+            current_turn = {}
             
-            if event_type == "user_query":
-                if current_turn:
-                    history.append(current_turn)
-                current_turn = {"user_query": content or ""}
-            elif event_type == "llm_response":
-                current_turn["llm_response"] = content or ""
-            elif event_type == "tool_result":
-                if "tool_results" not in current_turn:
-                    current_turn["tool_results"] = []
-                # Parse metadata for tool info
-                meta = json.loads(metadata) if metadata else {}
-                current_turn["tool_results"].append({
-                    "event_id": event_id,
-                    "tool_name": meta.get("tool_name", "unknown"),
-                    "content": content or "",
-                    "args": meta.get("args", {})
-                })
+            for row in reversed(rows):
+                # Validate row structure
+                if len(row) < 4:
+                    logger.warning(f"Invalid row structure: expected 4 columns, got {len(row)}")
+                    continue
+                
+                event_id, event_type, content, metadata = row
+                
+                if event_type == "user_query":
+                    # Start new turn
+                    if current_turn:
+                        history.append(current_turn)
+                    current_turn = {"user_query": content or ""}
+                
+                elif event_type == "llm_response":
+                    # Add response to current turn
+                    current_turn["llm_response"] = content or ""
+                
+                elif event_type == "tool_result":
+                    # Add tool result to current turn
+                    if "tool_results" not in current_turn:
+                        current_turn["tool_results"] = []
+                    
+                    # Parse metadata with error handling
+                    meta = {}
+                    if metadata:
+                        try:
+                            meta = json.loads(metadata)
+                            if not isinstance(meta, dict):
+                                logger.warning(f"Metadata is not a dict: {type(meta)}")
+                                meta = {}
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Failed to parse metadata JSON: {e}")
+                            meta = {}
+                    
+                    current_turn["tool_results"].append({
+                        "event_id": event_id,
+                        "tool_name": meta.get("tool_name", "unknown"),
+                        "content": content or "",
+                        "args": meta.get("args", {})
+                    })
+            
+            # Add last turn
+            if current_turn:
+                history.append(current_turn)
+            
+            # If no valid history, return None
+            if not history:
+                return None
+            
+            # Use compression integration
+            return integrate_compression_into_prompt(
+                history=history,
+                current_turn_response="",  # No current response in history building
+                current_turn_tool_calls=[],
+                elastic_budget=budget_chars // 4,  # Convert chars to tokens
+                enable_compression=True
+            )
         
-        if current_turn:
-            history.append(current_turn)
-        
-        # Use compression integration
-        return integrate_compression_into_prompt(
-            history=history,
-            current_turn_response="",  # No current response in history building
-            current_turn_tool_calls=[],
-            elastic_budget=budget_chars // 4,  # Convert chars to tokens
-            enable_compression=True
-        )
+        except Exception as e:
+            # On any error, fall back to simple format
+            logger.error(f"Compression failed, falling back to simple format: {e}")
+            return self._build_history_simple(rows, budget_chars)
 
     # ------------------------------------------------------------------
     # Compression

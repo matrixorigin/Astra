@@ -1,14 +1,11 @@
-"""Unit tests for async hybrid reference tracking.
+"""Unit tests for reference tracking.
 
-Tests P0 async verification that doesn't block SSE stream.
+Tests heuristic-based reference detection for history compression.
 Design ref: context-window-management.md §2 Phase 2.5
 """
 
-import asyncio
-import time
 import pytest
 from core.context.reference_tracking import (
-    verify_references_hybrid,
     analyze_semantic_references,
     _extract_key_identifiers,
 )
@@ -17,8 +14,8 @@ from core.context.reference_tracking import (
 class TestSemanticReferenceAnalysis:
     """Test semantic reference analysis with 3 heuristics."""
     
-    def test_heuristic_explicit_file_mention(self):
-        """Heuristic 1: Explicit file mentions in response."""
+    def test_heuristic_explicit_file_mention_basename(self):
+        """Heuristic 1: File basename mentioned in response."""
         history = [{
             "tool_calls": [{
                 "tool_name": "read_file",
@@ -32,6 +29,22 @@ class TestSemanticReferenceAnalysis:
         refs = analyze_semantic_references(current_response, [], history)
         
         assert "evt_1" in refs
+    
+    def test_heuristic_explicit_file_mention_full_path(self):
+        """Heuristic 1: Full file path mentioned in response."""
+        history = [{
+            "tool_calls": [{
+                "tool_name": "read_file",
+                "args": {"path": "/app/config.py"},
+                "event_id": "evt_1b"
+            }],
+            "tool_results": []
+        }]
+        current_response = "The file /app/config.py contains..."
+        
+        refs = analyze_semantic_references(current_response, [], history)
+        
+        assert "evt_1b" in refs
     
     def test_heuristic_grep_pattern_mention(self):
         """Heuristic 1: Grep pattern mentioned in response."""
@@ -82,7 +95,7 @@ class TestSemanticReferenceAnalysis:
         
         assert "evt_4" in refs
     
-    def test_no_references(self):
+    def test_no_references_when_no_match(self):
         """Test no references when content doesn't match."""
         history = [{
             "tool_calls": [{
@@ -97,6 +110,51 @@ class TestSemanticReferenceAnalysis:
         refs = analyze_semantic_references(current_response, [], history)
         
         assert "evt_5" not in refs
+    
+    def test_empty_response_returns_empty_set(self):
+        """Test empty response returns empty set."""
+        history = [{
+            "tool_calls": [{
+                "tool_name": "read_file",
+                "args": {"path": "config.py"},
+                "event_id": "evt_6"
+            }],
+            "tool_results": []
+        }]
+        
+        refs = analyze_semantic_references("", [], history)
+        
+        assert len(refs) == 0
+    
+    def test_missing_event_id_skipped(self):
+        """Test tool calls without event_id are skipped."""
+        history = [{
+            "tool_calls": [{
+                "tool_name": "read_file",
+                "args": {"path": "config.py"},
+                # No event_id
+            }],
+            "tool_results": []
+        }]
+        current_response = "In config.py..."
+        
+        refs = analyze_semantic_references(current_response, [], history)
+        
+        assert len(refs) == 0
+    
+    def test_malformed_history_handled_gracefully(self):
+        """Test malformed history doesn't crash."""
+        history = [
+            None,  # Invalid turn
+            {},  # Empty turn
+            {"tool_calls": None},  # Invalid tool_calls
+        ]
+        current_response = "Some response"
+        
+        # Should not crash
+        refs = analyze_semantic_references(current_response, [], history)
+        
+        assert isinstance(refs, set)
     
     def test_extract_key_identifiers_variables(self):
         """Test extraction of variable names."""
@@ -125,98 +183,3 @@ class TestSemanticReferenceAnalysis:
         assert "MyClass" in identifiers
 
 
-class TestAsyncHybridVerification:
-    """Test P0 async hybrid verification (non-blocking)."""
-    
-    @pytest.mark.asyncio
-    async def test_verify_returns_set(self):
-        """Test basic functionality returns set of event_ids."""
-        uncertain_events = [
-            {"event_id": "evt_1", "tool_name": "read_file", "content": "def foo(): pass", "args": {"path": "test.py"}},
-            {"event_id": "evt_2", "tool_name": "grep", "content": "result line", "args": {"pattern": "test"}},
-        ]
-        current_response = "The function foo is defined in test.py"
-        
-        result = await verify_references_hybrid(uncertain_events, current_response, feature_flag=True)
-        
-        assert isinstance(result, set)
-        # Mock returns [0, 1], so should have both event_ids
-        assert "evt_1" in result
-        assert "evt_2" in result
-    
-    @pytest.mark.asyncio
-    async def test_async_non_blocking(self):
-        """P0 Critical: Verify async doesn't block."""
-        uncertain_events = [
-            {"event_id": "evt_1", "tool_name": "read_file", "content": "test", "args": {}},
-        ]
-        
-        start = time.time()
-        
-        # Create task without awaiting
-        task = asyncio.create_task(
-            verify_references_hybrid(uncertain_events, "test response", feature_flag=True)
-        )
-        
-        # Should return immediately (not blocked)
-        elapsed = time.time() - start
-        assert elapsed < 0.01, f"Task creation blocked for {elapsed}s"
-        
-        # Task completes in background
-        result = await task
-        assert isinstance(result, set)
-    
-    @pytest.mark.asyncio
-    async def test_feature_flag_disabled(self):
-        """Test feature flag disables verification."""
-        uncertain_events = [{"event_id": "evt_1", "tool_name": "read_file", "content": "test", "args": {}}]
-        
-        result = await verify_references_hybrid(uncertain_events, "test", feature_flag=False)
-        
-        assert result == set()
-    
-    @pytest.mark.asyncio
-    async def test_empty_events(self):
-        """Test empty events list returns empty set."""
-        result = await verify_references_hybrid([], "test response", feature_flag=True)
-        
-        assert result == set()
-    
-    @pytest.mark.asyncio
-    async def test_callback_pattern(self):
-        """Test usage pattern with callback for result merging."""
-        uncertain_events = [
-            {"event_id": "evt_1", "tool_name": "read_file", "content": "test", "args": {}},
-        ]
-        referenced_events = set()
-        
-        # Create task with callback
-        task = asyncio.create_task(
-            verify_references_hybrid(uncertain_events, "test", feature_flag=True)
-        )
-        
-        # Add callback to merge results
-        def merge_results(future):
-            referenced_events.update(future.result())
-        
-        task.add_done_callback(merge_results)
-        
-        # Wait for completion
-        await task
-        
-        # Results should be merged
-        assert len(referenced_events) > 0
-    
-    @pytest.mark.asyncio
-    async def test_exception_handling(self):
-        """Test graceful handling of verification failures."""
-        # This would test actual LLM call failures
-        # For now, verify the function doesn't crash
-        uncertain_events = [
-            {"event_id": "evt_1", "tool_name": "read_file", "content": "test", "args": {}},
-        ]
-        
-        result = await verify_references_hybrid(uncertain_events, "test", feature_flag=True)
-        
-        # Should return set even if internal error occurs
-        assert isinstance(result, set)
