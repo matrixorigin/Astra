@@ -188,11 +188,18 @@ class TestPromptAssemblerCompression:
         assert "memory" not in result.sections, "memory should be dropped first"
         assert "history" not in result.sections, "history should be dropped before identity"
         assert "working_memory" not in result.sections, "working_memory should be dropped"
-        # Total should respect the budget (with tolerance for minimum-section overhead)
+        # Total should respect the budget (with tolerance for never-compressed sections)
+        # identity + constraints are never compressed, so actual total may exceed
+        # max_tokens when those sections alone are larger than the budget.
         total = sum(result.token_breakdown.values())
         budget_with_tolerance = 100 * (1 + _TOKEN_ESTIMATE_TOLERANCE)
-        assert total <= budget_with_tolerance, \
-            f"Expected ≤ {budget_with_tolerance:.0f} tokens, got {total}"
+        never_compressed = sum(
+            v for k, v in result.token_breakdown.items()
+            if k in ("identity", "constraints")
+        )
+        expected_max = max(budget_with_tolerance, never_compressed)
+        assert total <= expected_max, \
+            f"Expected ≤ {expected_max:.0f} tokens, got {total}"
 
 
 # ============================================================================
