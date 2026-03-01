@@ -1442,7 +1442,13 @@ def _persist_turn_events(
                         content=json.dumps(qa),
                         parent_event_id=parent_event_id,
                         causal_chain_id=causal_chain_id,
-                        metadata=qa,
+                        metadata={
+                            "tool_name": qa["tool_name"],
+                            "quality_score": qa["score"],
+                            "quality_grade": qa["grade"],
+                            "signals": qa["signals"],
+                            "stale": qa["stale"],
+                        },
                     )
     except Exception as e:
         logger.warning("Phase 2b (tool_quality) failed: %s", e, exc_info=True)

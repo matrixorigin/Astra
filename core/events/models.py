@@ -34,6 +34,9 @@ class EventType(str, Enum):
     # Memory governance events
     KNOWLEDGE_EXTRACTED = "knowledge_extracted"
 
+    # Tool quality assessment
+    TOOL_RESULT_QUALITY = "tool_result_quality"
+
     # Agent run lifecycle
     RUN_STARTED = "run_started"
     RUN_WAITING = "run_waiting"
