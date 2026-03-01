@@ -7,13 +7,11 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -263,10 +261,8 @@ def _resolve_skill_versions(names: set[str]) -> dict[str, str]:
 def _ensure_session(db: Session, user_id: str, session_id: str | None, agent_id: str | None) -> str:
     """Return existing session_id or create a new one."""
     if session_id:
-        row = db.execute(
-            text("SELECT session_id FROM agent_sessions WHERE session_id = :sid"),
-            {"sid": session_id},
-        ).first()
+        from api.models.agent import Session as SessionModel
+        row = db.query(SessionModel.session_id).filter(SessionModel.session_id == session_id).first()
         if not row:
             raise HTTPException(status_code=404, detail="Session not found")
         return session_id
@@ -687,10 +683,8 @@ def _verify_session_owner(user_id: str, session_id: str, db: Session | None = No
     when the caller already holds one (e.g. _build_reflect_evidence).
     """
     def _check(conn: Session) -> None:
-        row = conn.execute(
-            text("SELECT user_id FROM agent_sessions WHERE session_id = :sid"),
-            {"sid": session_id},
-        ).first()
+        from api.models.agent import Session as SessionModel
+        row = conn.query(SessionModel.user_id).filter(SessionModel.session_id == session_id).first()
         if not row:
             raise HTTPException(status_code=404, detail="Session not found")
         if row[0] != user_id:
@@ -720,16 +714,17 @@ def _build_reflect_evidence(
 
     with SessionLocal() as db:
         # 1. Event trail — server-side events with timing and token usage
-        rows = db.execute(
-            text(f"""
-                SELECT event_type, content, metadata, created_at,
-                       llm_model_used, skill_name
-                FROM agent_events
-                WHERE session_id = :sid
-                ORDER BY created_at DESC LIMIT {int(last_n)}
-            """),
-            {"sid": session_id},
-        ).fetchall()
+        from api.models.agent import Event as EventModel
+        rows = (
+            db.query(
+                EventModel.event_type, EventModel.content, EventModel.event_metadata,
+                EventModel.created_at, EventModel.llm_model_used, EventModel.skill_name,
+            )
+            .filter(EventModel.session_id == session_id)
+            .order_by(EventModel.created_at.desc())
+            .limit(int(last_n))
+            .all()
+        )
 
         events = []
         fail_counts: dict[str, int] = {}
@@ -783,16 +778,18 @@ def _build_reflect_evidence(
                 hints.append(f"Skill '{name}' failed {count} times in this session")
 
         # 2. Skill selection history — candidate scores, reasoning, outcomes
-        sel_rows = db.execute(
-            text("""
-                SELECT skill_name, selected_skills, selection_reasoning,
-                       execution_success, execution_time_ms, created_at
-                FROM skill_selection_events
-                WHERE session_id = :sid
-                ORDER BY created_at DESC LIMIT 5
-            """),
-            {"sid": session_id},
-        ).fetchall()
+        from api.models.skill import SkillSelectionEvent
+        sel_rows = (
+            db.query(
+                SkillSelectionEvent.skill_name, SkillSelectionEvent.selected_skills,
+                SkillSelectionEvent.selection_reasoning, SkillSelectionEvent.execution_success,
+                SkillSelectionEvent.execution_time_ms, SkillSelectionEvent.created_at,
+            )
+            .filter(SkillSelectionEvent.session_id == session_id)
+            .order_by(SkillSelectionEvent.created_at.desc())
+            .limit(5)
+            .all()
+        )
         result["skill_history"] = [
             {
                 "skill": r[0], "selected": r[1], "reasoning": (r[2] or "")[:200],
@@ -820,18 +817,24 @@ def _build_reflect_evidence(
 
         # 4. Implicit feedback signals
         try:
-            fb_rows = db.execute(
-                text("""
-                    SELECT user_comment, created_at
-                    FROM ctx_prompt_feedback
-                    WHERE llm_request_id IN (
-                        SELECT event_id FROM agent_events
-                        WHERE session_id = :sid AND event_type = 'user_query'
-                    )
-                    ORDER BY created_at DESC LIMIT 5
-                """),
-                {"sid": session_id},
-            ).fetchall()
+            from api.models.context import PromptFeedback
+            from api.models.agent import Event as EventModel
+            user_event_ids = [
+                r[0] for r in
+                db.query(EventModel.event_id)
+                .filter(EventModel.session_id == session_id, EventModel.event_type == "user_query")
+                .all()
+            ]
+            if user_event_ids:
+                fb_rows = (
+                    db.query(PromptFeedback.user_comment, PromptFeedback.created_at)
+                    .filter(PromptFeedback.llm_request_id.in_(user_event_ids))
+                    .order_by(PromptFeedback.created_at.desc())
+                    .limit(5)
+                    .all()
+                )
+            else:
+                fb_rows = []
             result["feedback_signals"] = [
                 {"signal": r[0], "ts": str(r[1]) if r[1] else None}
                 for r in fb_rows
@@ -1039,14 +1042,14 @@ def _recover_history_from_db(
     """
     # Fast path: try snapshot first
     try:
-        snap_row = db.execute(
-            text("""
-                SELECT content, created_at FROM agent_events
-                WHERE session_id = :sid AND event_type = 'session_history_snapshot'
-                ORDER BY created_at DESC LIMIT 1
-            """),
-            {"sid": session_id},
-        ).first()
+        from api.models.agent import Event as EventModel
+        snap_row = (
+            db.query(EventModel.content, EventModel.created_at)
+            .filter(EventModel.session_id == session_id,
+                    EventModel.event_type == "session_history_snapshot")
+            .order_by(EventModel.created_at.desc())
+            .first()
+        )
         if snap_row and snap_row[0]:
             history = json.loads(snap_row[0])
             if isinstance(history, list) and history:
@@ -1068,16 +1071,18 @@ def _recover_history_from_db(
                 # was at turn 3 but conversation continued to turn 5).
                 snap_ts = snap_row[1]
                 if snap_ts:
-                    post_rows = db.execute(
-                        text(f"""
-                            SELECT event_type, content, metadata FROM agent_events
-                            WHERE session_id = :sid
-                              AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result')
-                              AND created_at > :snap_ts
-                            ORDER BY created_at ASC LIMIT {_MAX_RECOVERY_EVENTS}
-                        """),
-                        {"sid": session_id, "snap_ts": snap_ts},
-                    ).fetchall()
+                    _event_types = ('user_query', 'llm_response', 'tool_call', 'tool_result')
+                    post_rows = (
+                        db.query(EventModel.event_type, EventModel.content, EventModel.event_metadata)
+                        .filter(
+                            EventModel.session_id == session_id,
+                            EventModel.event_type.in_(_event_types),
+                            EventModel.created_at > snap_ts,
+                        )
+                        .order_by(EventModel.created_at.asc())
+                        .limit(_MAX_RECOVERY_EVENTS)
+                        .all()
+                    )
                     if post_rows:
                         history = _append_recovered_events(history, post_rows)
 
@@ -1087,15 +1092,18 @@ def _recover_history_from_db(
 
     # Fallback: event-by-event reconstruction
     try:
-        rows = db.execute(
-            text(f"""
-                SELECT event_type, content, metadata FROM agent_events
-                WHERE session_id = :sid
-                  AND event_type IN ('user_query', 'llm_response', 'tool_call', 'tool_result')
-                ORDER BY created_at ASC LIMIT {_MAX_RECOVERY_EVENTS}
-            """),
-            {"sid": session_id},
-        ).fetchall()
+        from api.models.agent import Event as EventModel
+        _event_types = ('user_query', 'llm_response', 'tool_call', 'tool_result')
+        rows = (
+            db.query(EventModel.event_type, EventModel.content, EventModel.event_metadata)
+            .filter(
+                EventModel.session_id == session_id,
+                EventModel.event_type.in_(_event_types),
+            )
+            .order_by(EventModel.created_at.asc())
+            .limit(_MAX_RECOVERY_EVENTS)
+            .all()
+        )
         if not rows:
             return [], None
 
@@ -1474,19 +1482,18 @@ def _build_decision_trace(
     # 3. Tool usage in this session
     tool_usage: dict[str, int] = {}
     with SessionLocal() as db:
-        rows = db.execute(
-            text("""
-                SELECT content, created_at
-                FROM agent_events
-                WHERE session_id = :sid AND event_type = 'tool_call'
-                ORDER BY created_at DESC LIMIT 20
-            """),
-            {"sid": session_id},
-        ).fetchall()
+        from api.models.agent import Event as EventModel
+        rows = (
+            db.query(EventModel.content)
+            .filter(EventModel.session_id == session_id, EventModel.event_type == "tool_call")
+            .order_by(EventModel.created_at.desc())
+            .limit(20)
+            .all()
+        )
 
-        for r in rows:
+        for (content_str,) in rows:
             try:
-                content = json.loads(r[0]) if r[0] else {}
+                content = json.loads(content_str) if content_str else {}
                 name = content.get("name", "unknown")
                 tool_usage[name] = tool_usage.get(name, 0) + 1
             except (json.JSONDecodeError, TypeError):
@@ -1494,15 +1501,19 @@ def _build_decision_trace(
         result["tool_usage_counts"] = tool_usage
 
         # 4. Skill selection events
-        sel_rows = db.execute(
-            text("""
-                SELECT skill_name, selected_skills, selection_reasoning, created_at
-                FROM skill_selection_events
-                WHERE session_id = :sid
-                ORDER BY created_at DESC LIMIT 5
-            """),
-            {"sid": session_id},
-        ).fetchall()
+        from api.models.skill import SkillSelectionEvent
+        sel_rows = (
+            db.query(
+                SkillSelectionEvent.skill_name,
+                SkillSelectionEvent.selected_skills,
+                SkillSelectionEvent.selection_reasoning,
+                SkillSelectionEvent.created_at,
+            )
+            .filter(SkillSelectionEvent.session_id == session_id)
+            .order_by(SkillSelectionEvent.created_at.desc())
+            .limit(5)
+            .all()
+        )
         result["skill_selections"] = [
             {"skill": r[0], "selected": r[1],
              "reasoning": (r[2] or "")[:200], "ts": str(r[3]) if r[3] else None}
@@ -1723,15 +1734,17 @@ async def chat_turn(
                         cloud_result = await _execute_cloud_skill(cloud_registry, tc_name, tc_args)
                         # Record cloud skill execution as event for decision_trace visibility.
                         try:
+                            from api.models.agent import Event as EventModel
                             _db = SessionLocal()
-                            _db.execute(text(
-                                "INSERT INTO agent_events (event_id, session_id, user_id, agent_id, agent_version, "
-                                "causal_chain_id, event_type, content, created_at) "
-                                "VALUES (:eid, :sid, :uid, :aid, '0', :cid, 'tool_call', :content, :ts)"
-                            ), {"eid": str(__import__('uuid').uuid4()), "sid": session_id, "uid": user_id,
-                                "aid": request.agent_id or "edge", "cid": session_id,
-                                "content": json.dumps({"name": tc_name, "arguments": tc_args, "source": "cloud"}),
-                                "ts": datetime.now(timezone.utc).replace(tzinfo=None)})
+                            _db.add(EventModel(
+                                event_id=str(__import__('uuid').uuid4()),
+                                session_id=session_id,
+                                user_id=user_id,
+                                agent_id=request.agent_id or "edge",
+                                event_type="tool_call",
+                                content=json.dumps({"name": tc_name, "arguments": tc_args, "source": "cloud"}),
+                                causal_chain_id=session_id,
+                            ))
                             _db.commit()
                             _db.close()
                         except Exception:

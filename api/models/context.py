@@ -49,6 +49,14 @@ class DecisionAudit(Base):
     context_capture_id = Column(String(36))
 
 
+class PromptFeedback(Base):
+    __tablename__ = "ctx_prompt_feedback"
+    feedback_id = Column(String(36), primary_key=True)
+    llm_request_id = Column(String(36), nullable=False, index=True)
+    user_comment = Column(Text)
+    created_at = Column(DateTime, default=func.now())
+
+
 class EventEmbedding(Base):
     __tablename__ = "ctx_event_embeddings"
     event_id = Column(String(36), primary_key=True)

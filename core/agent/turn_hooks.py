@@ -113,16 +113,19 @@ class TurnHooks(DbConsumer):
         if not tool_calls:
             return
         try:
-            from sqlalchemy import text as sa_text
+            from api.models.skill import SkillSelectionEvent
             with self._db() as db:
-                db.execute(
-                    sa_text("""UPDATE skill_selection_events
-                               SET execution_time_ms = :t, execution_success = 1
-                               WHERE session_id = :sid AND execution_time_ms IS NULL
-                               ORDER BY created_at DESC LIMIT 1"""),
-                    {"t": elapsed_ms or 0, "sid": session_id},
+                row = (
+                    db.query(SkillSelectionEvent)
+                    .filter(SkillSelectionEvent.session_id == session_id,
+                            SkillSelectionEvent.execution_time_ms.is_(None))
+                    .order_by(SkillSelectionEvent.created_at.desc())
+                    .first()
                 )
-                db.commit()
+                if row:
+                    row.execution_time_ms = elapsed_ms or 0
+                    row.execution_success = 1
+                    db.commit()
         except Exception as e:
             logger.debug("Backfill selection metrics skipped: %s", e)
 

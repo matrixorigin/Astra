@@ -16,19 +16,29 @@ class TestRecoverHistory:
     def _make_row(self, event_type, content, metadata=None):
         return (event_type, content, json.dumps(metadata or {}))
 
+    def _mock_db(self, rows):
+        """Create a mock db where ORM query returns rows on the fallback path.
+
+        Snapshot query (.first()) returns None → triggers fallback.
+        Fallback query (.all()) returns the provided rows.
+        """
+        db = MagicMock()
+        chain = db.query.return_value.filter.return_value.order_by.return_value
+        chain.first.return_value = None  # no snapshot
+        chain.limit.return_value.all.return_value = rows
+        return db
+
     def test_text_only_conversation(self):
         """Pure text conversation recovers correctly."""
-        db = MagicMock()
         rows = [
             self._make_row("user_query", "Hello"),
             self._make_row("llm_response", "Hi there!"),
             self._make_row("user_query", "How are you?"),
             self._make_row("llm_response", "I'm good."),
         ]
+        db = self._mock_db(rows)
         with patch("api.routers.chat.SessionLocal"), \
-             patch.object(db, "execute") as mock_exec, \
              patch("core.context.prompt_assembler.PromptAssembler") as mock_pa:
-            mock_exec.return_value.fetchall.return_value = rows
             mock_pa.return_value.assemble.return_value = MagicMock(
                 system_message="system", snapshot_id=None, token_breakdown={},
                 sections={"identity": "system"},
@@ -45,7 +55,6 @@ class TestRecoverHistory:
 
     def test_tool_call_roundtrip(self):
         """user → tool_call → tool_result → llm_response recovers correctly."""
-        db = MagicMock()
         rows = [
             self._make_row("user_query", "Read file.txt"),
             self._make_row("tool_call",
@@ -56,10 +65,9 @@ class TestRecoverHistory:
                            {"tool_call_id": "tc1", "name": "read_file"}),
             self._make_row("llm_response", "The file says: file contents"),
         ]
+        db = self._mock_db(rows)
         with patch("api.routers.chat.SessionLocal"), \
-             patch.object(db, "execute") as mock_exec, \
              patch("core.context.prompt_assembler.PromptAssembler") as mock_pa:
-            mock_exec.return_value.fetchall.return_value = rows
             mock_pa.return_value.assemble.return_value = MagicMock(
                 system_message="sys", snapshot_id=None, token_breakdown={},
                 sections={"identity": "sys"},
@@ -77,10 +85,8 @@ class TestRecoverHistory:
         assert history[4] == {"role": "assistant", "content": "The file says: file contents"}
 
     def test_empty_session_returns_empty(self):
-        db = MagicMock()
-        with patch("api.routers.chat.SessionLocal"), \
-             patch.object(db, "execute") as mock_exec:
-            mock_exec.return_value.fetchall.return_value = []
+        db = self._mock_db([])
+        with patch("api.routers.chat.SessionLocal"):
             from api.routers.chat import _recover_history_from_db
             assert _recover_history_from_db(db, "u1", "s1") == ([], None)
 
