@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Constants for tier boundaries
-TIER1_RECENT_TURNS = 3  # Last N turns kept in full fidelity
+TIER1_RECENT_TURNS = 2  # Last N turns kept in full fidelity (reduced from 3 to 2 for better compression)
 TIER3_SYNOPSIS_THRESHOLD = 6  # Create synopsis if history > N turns
 
 
@@ -77,23 +77,64 @@ def compress_history_with_references(
 
 def _compress_turn(turn: dict[str, Any], referenced_events: set[str]) -> dict[str, Any]:
     """
-    Compress a single turn based on reference status.
+    Aggressively compress a single turn based on reference status.
     
-    Referenced tool results are kept in full. Unreferenced results are summarized.
+    Strategy for >50% compression:
+    - User queries: First 80 chars only (users rarely reference old queries)
+    - LLM responses: First 80 chars only (unless referenced)
+    - Tool results: REMOVE completely if unreferenced (just keep count)
+    - Tool calls: Keep (lightweight, needed for context)
+    
+    This achieves >50% reduction while preserving referenced content in full.
     """
     if not isinstance(turn, dict):
         logger.warning(f"Invalid turn type: {type(turn)}")
         return {}
     
+    # Aggressively compress user query (first 80 chars)
+    user_query = turn.get("user_query", "")
+    if len(user_query) > 80:
+        compressed_query = user_query[:80] + "..."
+    else:
+        compressed_query = user_query
+    
+    # Compress LLM response based on reference status
+    llm_response = turn.get("llm_response", "")
+    # Check if any event in this turn is referenced
+    # Need to handle invalid tool_results (None, non-list, contains None)
+    tool_results = turn.get("tool_results", [])
+    if not isinstance(tool_results, list):
+        tool_results = []
+    
+    turn_referenced = any(
+        isinstance(result, dict) and result.get("event_id", "") in referenced_events 
+        for result in tool_results
+    )
+    
+    if turn_referenced:
+        # Keep full response if turn is referenced
+        compressed_response = llm_response
+    else:
+        # Otherwise, first 80 chars only
+        if len(llm_response) > 80:
+            compressed_response = llm_response[:80] + "..."
+        else:
+            compressed_response = llm_response
+    
     compressed = {
-        "user_query": turn.get("user_query", ""),
+        "user_query": compressed_query,
         "tool_calls": turn.get("tool_calls", []),  # Keep tool calls (lightweight)
         "tool_results": [],
-        "llm_response": _summarize_text(turn.get("llm_response", ""))
+        "llm_response": compressed_response
     }
     
     # Compress tool results based on reference status
-    for result in turn.get("tool_results", []):
+    tool_results = turn.get("tool_results", [])
+    referenced_count = 0
+    unreferenced_count = 0
+    
+    for result in tool_results:
+        # Handle invalid tool results (None, non-dict)
         if not isinstance(result, dict):
             continue
         
@@ -102,19 +143,17 @@ def _compress_turn(turn: dict[str, Any], referenced_events: set[str]) -> dict[st
         if event_id in referenced_events:
             # Keep full content for referenced events
             compressed["tool_results"].append(result)
+            referenced_count += 1
         else:
-            # Summarize unreferenced events
-            try:
-                summary = _summarize_tool_result(result)
-                compressed["tool_results"].append({
-                    "event_id": event_id,
-                    "tool_name": result.get("tool_name", ""),
-                    "summary": summary
-                })
-            except Exception as e:
-                logger.warning(f"Failed to summarize tool result: {e}")
-                # On error, keep original (safe fallback)
-                compressed["tool_results"].append(result)
+            # For unreferenced events: DON'T include them at all
+            # This is where we get the biggest compression wins
+            unreferenced_count += 1
+    
+    # If there were unreferenced tool results, add a single summary line
+    if unreferenced_count > 0:
+        compressed["tool_results"].append({
+            "summary": f"({unreferenced_count} tool results omitted)"
+        })
     
     return compressed
 
@@ -152,17 +191,19 @@ def _summarize_tool_result(result: dict[str, Any]) -> str:
         return f"{tool_name} → {len(content)} chars"
 
 
-def _summarize_text(text: str, max_chars: int = 400) -> str:
+def _summarize_text(text: str, max_chars: int = 150) -> str:
     """
-    Summarize text to first complete sentence or max_chars.
+    Aggressively summarize text to first complete sentence or max_chars.
+    
+    For >50% compression, we need to be aggressive:
+    - Default max_chars reduced from 400 to 150
+    - Prioritize first sentence (usually contains key information)
+    - Truncate long sentences
     
     Uses improved sentence boundary detection to handle:
     - Abbreviations (Dr., Mr., etc.)
     - Decimals (3.14)
     - Code snippets
-    
-    NOTE: This is a simple heuristic. For production, consider using
-    a proper sentence tokenizer (e.g., nltk.sent_tokenize).
     """
     if not text:
         return ""
@@ -182,13 +223,12 @@ def _summarize_text(text: str, max_chars: int = 400) -> str:
         # Found sentence boundary
         first_sentence = text[:match.start() + 1]
         
-        # If first sentence is too long, truncate
+        # If first sentence is too long, truncate aggressively
         if len(first_sentence) > max_chars:
             return first_sentence[:max_chars] + "..."
         
-        # Add ellipsis if there's more content
-        has_more = match.end() < len(text)
-        return first_sentence + ("..." if has_more else "")
+        # Return first sentence (no ellipsis needed, it's complete)
+        return first_sentence
     else:
         # No sentence boundary found, truncate at max_chars
         return text[:max_chars] + "..."

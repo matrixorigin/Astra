@@ -73,40 +73,48 @@ def _format_history_simple(history: list[dict[str, Any]]) -> str:
 
 
 def _format_compressed_history(compressed: dict[str, Any]) -> str:
-    """Format compressed history for prompt."""
+    """Format compressed history for prompt.
+    
+    Minimalist formatting to avoid overhead from section headers.
+    The compression algorithm already reduced content; formatting should not add back overhead.
+    """
     parts = []
     
-    # Tier 3: Synopsis (if exists)
+    # Tier 3: Synopsis (if exists) - replaces first few turns
     if compressed.get("tier3"):
-        parts.append("=== Session Synopsis ===")
         parts.append(compressed["tier3"])
-        parts.append("")
+        parts.append("")  # Single blank line separator
     
     # Tier 2: Middle turns (compressed)
+    # These are already compressed by _compress_turn()
     if compressed.get("tier2"):
-        parts.append("=== Earlier Context ===")
         for turn in compressed["tier2"]:
-            if "user_query" in turn:
+            # User query (already compressed to first sentence)
+            if "user_query" in turn and turn["user_query"]:
                 parts.append(f"User: {turn['user_query']}")
             
-            # Tool results (full or summary)
+            # Tool results (already compressed: full if referenced, summary if not)
             for result in turn.get("tool_results", []):
                 if "summary" in result:
+                    # Unreferenced: just metadata
                     parts.append(f"  {result['summary']}")
                 elif "content" in result:
-                    parts.append(f"  {result['tool_name']}: {result['content'][:200]}...")
+                    # Referenced: full content
+                    parts.append(f"  {result['tool_name']}: {result['content']}")
             
-            if "llm_response" in turn:
+            # LLM response (already compressed to first sentence unless referenced)
+            if "llm_response" in turn and turn["llm_response"]:
                 parts.append(f"Assistant: {turn['llm_response']}")
-        parts.append("")
+        
+        if parts:  # Only add separator if we added content
+            parts.append("")
     
     # Tier 1: Recent turns (full fidelity)
     if compressed.get("tier1"):
-        parts.append("=== Recent Context ===")
         for turn in compressed["tier1"]:
-            if "user_query" in turn:
+            if "user_query" in turn and turn["user_query"]:
                 parts.append(f"User: {turn['user_query']}")
-            if "llm_response" in turn:
+            if "llm_response" in turn and turn["llm_response"]:
                 parts.append(f"Assistant: {turn['llm_response']}")
     
     return "\n".join(parts)

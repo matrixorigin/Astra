@@ -24,50 +24,59 @@ class TestHistoryCompression:
         assert len(result["tier2"]) == 0
         assert result["tier3"] is None
     
-    def test_tier1_recent_3_turns(self):
-        """Last 3 turns always in tier1 (full fidelity)."""
+    def test_tier1_recent_2_turns(self):
+        """Last 2 turns always in tier1 (full fidelity) - updated from 3 to 2 for better compression."""
         history = [{"user_query": f"q{i}"} for i in range(10)]
         
         result = compress_history_with_references(history, set(), 10000)
         
-        assert len(result["tier1"]) == 3
-        assert result["tier1"][0]["user_query"] == "q7"
+        # TIER1_RECENT_TURNS changed from 3 to 2 for >50% compression
+        assert len(result["tier1"]) == 2
+        assert result["tier1"][0]["user_query"] == "q8"
         assert result["tier1"][-1]["user_query"] == "q9"
     
     def test_tier2_preserves_referenced(self):
         """Tier2 keeps full content for referenced events."""
         history = [
-            {"user_query": "q1", "tool_results": [
+            {"user_query": "q1", "llm_response": "a1", "tool_results": [
                 {"event_id": "evt_1", "tool_name": "read_file", "content": "full content"}
             ]},
-            {"user_query": "q2"},
-            {"user_query": "q3"},
-            {"user_query": "q4"},
+            {"user_query": "q2", "llm_response": "a2"},
+            {"user_query": "q3", "llm_response": "a3"},
+            {"user_query": "q4", "llm_response": "a4"},
         ]
         referenced = {"evt_1"}
         
         result = compress_history_with_references(history, referenced, 10000)
         
         # evt_1 should be in tier2 with full content
-        assert len(result["tier2"]) == 1
+        # Tier2 has first 2 turns (q1, q2), tier1 has last 2 turns (q3, q4)
+        assert len(result["tier2"]) == 2
+        # First turn has referenced event, should keep full content
         assert result["tier2"][0]["tool_results"][0]["content"] == "full content"
+        # LLM response should also be kept full for referenced turn
+        assert result["tier2"][0]["llm_response"] == "a1"
     
-    def test_tier2_summarizes_unreferenced(self):
-        """Tier2 summarizes unreferenced tool results."""
+    def test_tier2_omits_unreferenced(self):
+        """Tier2 omits unreferenced tool results completely (aggressive compression)."""
         history = [
-            {"user_query": "q1", "tool_results": [
+            {"user_query": "q1", "llm_response": "a1", "tool_results": [
                 {"event_id": "evt_2", "tool_name": "read_file", "content": "line1\nline2\nline3", "args": {"path": "test.py"}}
             ]},
-            {"user_query": "q2"},
-            {"user_query": "q3"},
-            {"user_query": "q4"},
+            {"user_query": "q2", "llm_response": "a2"},
+            {"user_query": "q3", "llm_response": "a3"},
+            {"user_query": "q4", "llm_response": "a4"},
         ]
         
         result = compress_history_with_references(history, set(), 10000)
         
-        # evt_2 should be summarized
+        # evt_2 should be omitted, replaced with summary
+        assert len(result["tier2"]) == 2
         assert "summary" in result["tier2"][0]["tool_results"][0]
-        assert "3 lines" in result["tier2"][0]["tool_results"][0]["summary"]
+        assert "omitted" in result["tier2"][0]["tool_results"][0]["summary"]
+        # User query and LLM response should be truncated to 80 chars
+        assert len(result["tier2"][0]["user_query"]) <= 83  # 80 + "..."
+        assert len(result["tier2"][0]["llm_response"]) <= 83
     
     def test_summarize_tool_result_read_file(self):
         """Test read_file summarization."""
@@ -97,13 +106,27 @@ class TestHistoryCompression:
     
     def test_summarize_text_first_sentence(self):
         """Test text summarization to first sentence."""
-        text = "This is the first sentence. This is the second. And third."
+        # Test 1: Text longer than max_chars, should extract first sentence
+        text = "This is a long first sentence that contains important information about the system. This is the second sentence with more details. And a third sentence."
         
-        summary = _summarize_text(text, max_chars=30)  # Force truncation
+        # With max_chars=150, text is longer, should extract first sentence
+        summary = _summarize_text(text, max_chars=150)
         
-        # Should be truncated since text is longer than max_chars
-        assert len(summary) <= 33  # 30 + "..."
-        assert "..." in summary
+        # Should return first sentence only
+        assert summary == "This is a long first sentence that contains important information about the system."
+        assert "second sentence" not in summary
+        
+        # Test 2: First sentence itself is too long, should truncate
+        long_sentence = "This is an extremely long first sentence that exceeds the maximum character limit and should be truncated with ellipsis at the end to indicate there is more content that was cut off."
+        summary_truncated = _summarize_text(long_sentence, max_chars=80)
+        
+        assert len(summary_truncated) <= 83  # 80 + "..."
+        assert "..." in summary_truncated
+        
+        # Test 3: Short text, should return as-is
+        short_text = "Short text."
+        summary_short = _summarize_text(short_text, max_chars=150)
+        assert summary_short == short_text
     
     def test_summarize_text_handles_abbreviations(self):
         """Test that abbreviations don't break sentence detection."""

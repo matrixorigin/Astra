@@ -52,8 +52,11 @@ class TestPromptIntegration:
             history, current_response, [], elastic_budget=10000, enable_compression=True
         )
         
-        # Should have tiered structure
-        assert "Recent Context" in result or "Earlier Context" in result
+        # Should have compressed content (no section headers in new format)
+        # Verify referenced content is preserved
+        assert "read_file: DATABASE_URL=postgres" in result
+        # Verify recent turns are included
+        assert "q3" in result or "q4" in result
     
     def test_format_simple(self):
         """Test simple formatting."""
@@ -84,11 +87,12 @@ class TestPromptIntegration:
         
         result = _format_compressed_history(compressed)
         
-        assert "Session Synopsis" in result
-        assert "Earlier Context" in result
-        assert "Recent Context" in result
-        assert "Middle query" in result
-        assert "Recent query" in result
+        # New format doesn't use section headers (removed for compression efficiency)
+        # Verify content is present
+        assert "Session started with initial query" in result  # tier3
+        assert "Middle query" in result  # tier2
+        assert "Recent query" in result  # tier1
+        assert "read_file(test.py)" in result  # tool result summary
     
     def test_format_compressed_tier1_only(self):
         """Test formatting with only tier1 (short history)."""
@@ -100,6 +104,8 @@ class TestPromptIntegration:
         
         result = _format_compressed_history(compressed)
         
-        assert "Recent Context" in result
+        # New format doesn't use section headers
         assert "q1" in result
-        assert "Session Synopsis" not in result
+        assert "r1" in result
+        # Verify no synopsis (tier3 is None)
+        assert result.count("User:") == 1  # Only one turn

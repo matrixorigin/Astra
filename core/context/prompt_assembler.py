@@ -195,12 +195,26 @@ class PromptAssembler(DbConsumer):
         zone_budgets = None
         if _COMPRESSION_AVAILABLE:
             try:
-                # Get model context size from edge_context or use default
-                model_context_size = max_tokens  # Simplified: use max_tokens as proxy
+                # Get model context size from edge_context or estimate
+                # NOTE: max_tokens is the BUDGET (e.g., 4000), not the MODEL SIZE (e.g., 128K)
+                # We need the actual model context size to compute zone budgets correctly
+                if edge_context and hasattr(edge_context, 'model_context_size'):
+                    model_context_size = edge_context.model_context_size
+                    logger.debug(f"Using model context size from edge_context: {model_context_size}")
+                else:
+                    # Estimate: budget is typically 25% of model size
+                    # For GPT-4: 128K context, typical budget 32K
+                    # For GPT-3.5: 16K context, typical budget 4K
+                    model_context_size = max_tokens * 4
+                    logger.debug(f"Estimating model context size: {model_context_size} (4x budget of {max_tokens})")
+                
                 zone_budgets = compute_zone_budgets(model_context_size)
-                logger.debug(f"Zone budgets computed: {zone_budgets}")
+                logger.info(f"Zone budgets computed for {model_context_size} context: "
+                           f"fixed={zone_budgets.fixed}, managed={zone_budgets.managed}, elastic={zone_budgets.elastic}")
             except Exception as e:
-                logger.warning(f"Failed to compute zone budgets: {e}")
+                # Log error with full traceback for debugging
+                logger.error(f"Failed to compute zone budgets: {e}", exc_info=True)
+                zone_budgets = None
 
         # §1 Identity
         identity = self._build_identity(agent_id)
