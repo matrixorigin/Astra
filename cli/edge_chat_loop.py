@@ -136,9 +136,31 @@ def detect_edge_profile(project_root: str) -> dict[str, Any]:
     return profile
 
 
-async def _consume_turn(sse_stream, renderer: Renderer, *, timeout: float = MAX_TURN_WALL_CLOCK_S) -> TurnResult:
-    """Consume one /chat/turn SSE stream, render text, collect tool_calls."""
+async def _consume_turn(
+    sse_stream,
+    renderer: Renderer,
+    *,
+    timeout: float = MAX_TURN_WALL_CLOCK_S,
+    suppress_prefix: str = "",
+) -> TurnResult:
+    """Consume one /chat/turn SSE stream, render text, collect tool_calls.
+
+    suppress_prefix: if the LLM repeats the previous turn's text verbatim
+    at the start of this turn, skip rendering the duplicate prefix.
+    """
     result = TurnResult()
+    # Dedup state: accumulate early chunks until we can decide whether
+    # the LLM is repeating the previous turn's preamble.
+    _dedup_buf = "" if suppress_prefix else None  # None = dedup disabled
+    _dedup_prefix = suppress_prefix.strip()
+
+    def _flush_dedup():
+        """Flush any buffered dedup text to the renderer."""
+        nonlocal _dedup_buf
+        if _dedup_buf is not None and _dedup_buf:
+            renderer.text(_dedup_buf)
+        _dedup_buf = None
+
     deadline = asyncio.timeout(timeout)
     try:
         async with deadline:
@@ -147,14 +169,31 @@ async def _consume_turn(sse_stream, renderer: Renderer, *, timeout: float = MAX_
                 if etype == "text_delta":
                     chunk = event.get("content", "")
                     result.text += chunk
+                    # Dedup: buffer early chunks and check if they repeat
+                    # the previous turn's preamble text verbatim.
+                    if _dedup_buf is not None:
+                        _dedup_buf += chunk
+                        buf_s = _dedup_buf.strip()
+                        if not buf_s:
+                            continue  # only whitespace so far
+                        if _dedup_prefix.startswith(buf_s):
+                            if buf_s == _dedup_prefix:
+                                _dedup_buf = None  # full match — suppressed
+                            continue  # partial match — keep buffering
+                        # Not a prefix match — flush buffer and disable dedup
+                        renderer.text(_dedup_buf)
+                        _dedup_buf = None
+                        continue
                     renderer.text(chunk)
                 elif etype == "tool_call_start":
+                    _flush_dedup()
                     # LLM started generating a tool call — show which tool
                     # so user sees progress instead of just "Thinking…"
                     name = event.get("name", "")
                     if hasattr(renderer, "thinking"):
                         renderer.thinking(f"Generating {name}…")
                 elif etype == "tool_call":
+                    _flush_dedup()
                     # Hide thinking before collecting tool calls — the LLM
                     # has decided on an action, no longer "thinking".
                     if hasattr(renderer, "thinking_hide"):
@@ -175,6 +214,8 @@ async def _consume_turn(sse_stream, renderer: Renderer, *, timeout: float = MAX_
                     # so the user knows the LLM is still working.
                     if hasattr(renderer, "thinking"):
                         renderer.thinking()
+            # Stream ended — flush any remaining dedup buffer
+            _flush_dedup()
     except TimeoutError:
         if deadline.expired():
             # Our wall-clock deadline fired — report as client timeout.
@@ -218,6 +259,7 @@ async def edge_chat_loop(
         session_info["has_edge_profile"] = bool(edge_profile)
 
     final_text = ""
+    prev_turn_text = ""  # text from previous turn — used to suppress LLM repeats
     total_usage: dict[str, int] = {}
 
     try:
@@ -246,7 +288,7 @@ async def edge_chat_loop(
                         edge_tools=send_edge_tools,
                         edge_profile=edge_profile if turn == 0 else None,
                     )
-                    result = await _consume_turn(sse_stream, renderer)
+                    result = await _consume_turn(sse_stream, renderer, suppress_prefix=prev_turn_text)
                     if result.error and result.error.get("retryable") and attempt < _MAX_RETRIES:
                         delay = result.error.get("retry_after_ms", _BACKOFF[attempt] * 1000) / 1000
                         renderer.info(f"  ⟳ Retrying in {delay:.0f}s...")
@@ -287,6 +329,9 @@ async def edge_chat_loop(
             if not result.has_tool_calls:
                 break
 
+            # Remember this turn's text so the next turn can suppress if LLM repeats it.
+            prev_turn_text = result.text
+
             # Execute tool calls locally
             parsed = ToolRouter.parse_tool_calls(result.tool_calls)
             approved: list[ToolCall] = []
@@ -323,10 +368,9 @@ async def edge_chat_loop(
 
             # Execute approved tools concurrently
             if approved:
-                for tc in approved:
-                    renderer.tool_start(tc.name, tc.arguments)
                 results = await tool_router.execute(approved)
-                for r in results:
+                for tc, r in zip(approved, results):
+                    renderer.tool_start(tc.name, tc.arguments)
                     renderer.tool_done(r.name, r.result, r.error)
                     tool_results.append({"tool_call_id": r.tool_call_id, "name": r.name, "result": r.result})
 

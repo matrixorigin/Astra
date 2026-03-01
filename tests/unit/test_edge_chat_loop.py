@@ -135,6 +135,51 @@ class TestConsumeTurn:
         assert result.session_id == "ses_123"
         assert result.run_id == "run_456"
 
+    @pytest.mark.asyncio
+    async def test_suppress_duplicate_prefix(self, renderer):
+        """When LLM repeats previous turn's text, the duplicate is suppressed."""
+        async def stream():
+            yield {"type": "text_delta", "content": "Let me "}
+            yield {"type": "text_delta", "content": "read that."}
+            yield {"type": "text_delta", "content": " Here is the result."}
+            yield {"type": "turn_complete", "has_tool_calls": False}
+
+        result = await _consume_turn(
+            stream(), renderer, suppress_prefix="Let me read that.",
+        )
+        # Full text is still recorded (for history)
+        assert result.text == "Let me read that. Here is the result."
+        # But only the non-duplicate part was rendered
+        assert renderer.full_text == " Here is the result."
+
+    @pytest.mark.asyncio
+    async def test_suppress_no_match_flushes(self, renderer):
+        """When LLM says something different, buffer is flushed — no text lost."""
+        async def stream():
+            yield {"type": "text_delta", "content": "Something new."}
+            yield {"type": "turn_complete", "has_tool_calls": False}
+
+        result = await _consume_turn(
+            stream(), renderer, suppress_prefix="Let me read that.",
+        )
+        assert result.text == "Something new."
+        assert renderer.full_text == "Something new."
+
+    @pytest.mark.asyncio
+    async def test_suppress_flushed_on_tool_call(self, renderer):
+        """Dedup buffer is flushed when a tool_call arrives mid-buffer."""
+        async def stream():
+            yield {"type": "text_delta", "content": "Partial"}
+            yield {"type": "tool_call", "id": "tc_1", "name": "read_file",
+                   "arguments": {"path": "x"}}
+            yield {"type": "turn_complete", "has_tool_calls": True}
+
+        result = await _consume_turn(
+            stream(), renderer, suppress_prefix="Something else entirely.",
+        )
+        assert renderer.full_text == "Partial"
+        assert len(result.tool_calls) == 1
+
 
 # ============================================================================
 # Tests: edge_chat_loop
@@ -209,6 +254,36 @@ class TestEdgeChatLoop:
         assert result == "Done."
         tr = api.calls[1]["tool_results"]
         assert len(tr) == 2
+        # tool_start and tool_done are paired: each start is immediately followed by its done
+        assert renderer.tool_starts == ["read_file", "list_dir"]
+        assert renderer.tool_dones == [("read_file", False), ("list_dir", False)]
+
+    @pytest.mark.asyncio
+    async def test_cross_turn_dedup(self, project, router, perms, renderer):
+        """LLM repeating pre-tool text in the next turn is suppressed."""
+        api = MockAPIClient([
+            # Turn 1: text + tool call
+            [
+                {"type": "text_delta", "content": "Let me read that."},
+                {"type": "tool_call", "id": "tc_1", "name": "read_file",
+                 "arguments": {"path": "hello.txt"}},
+                {"type": "turn_complete", "has_tool_calls": True},
+            ],
+            # Turn 2: LLM repeats the same text, then gives answer
+            [
+                {"type": "text_delta", "content": "Let me read that."},
+                {"type": "text_delta", "content": " The file contains Hello, world!"},
+                {"type": "turn_complete", "has_tool_calls": False},
+            ],
+        ])
+        result = await edge_chat_loop(
+            "Read hello.txt", api, router, perms,
+            project_root=str(project), renderer=renderer,
+        )
+        # The duplicate "Let me read that." from turn 2 should be suppressed
+        rendered = renderer.full_text
+        assert rendered.count("Let me read that.") == 1
+        assert "Hello, world!" in rendered
 
     @pytest.mark.asyncio
     async def test_permission_deny_dangerous(self, project, renderer):
