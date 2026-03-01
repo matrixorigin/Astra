@@ -75,6 +75,7 @@ class ChatLoopResult:
     """Result of edge_chat_loop execution."""
     text: str
     explain_turns: list[dict[str, Any]] | None = None
+    usage: dict[str, int] | None = None
 
 
 def load_project_rules(project_root: str) -> str | None:
@@ -302,9 +303,13 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
     w(f"{dim}─────────────────────────────────────────────{reset}\n")
 
 
-def _make_result(text: str, explain_turns: list[dict[str, Any]]) -> ChatLoopResult:
-    """Construct ChatLoopResult, converting empty list to None."""
-    return ChatLoopResult(text=text, explain_turns=explain_turns if explain_turns else None)
+def _make_result(text: str, explain_turns: list[dict[str, Any]], usage: dict[str, int]) -> ChatLoopResult:
+    """Construct ChatLoopResult, converting empty collections to None."""
+    return ChatLoopResult(
+        text=text,
+        explain_turns=explain_turns if explain_turns else None,
+        usage=usage if usage else None,
+    )
 
 
 async def edge_chat_loop(
@@ -344,129 +349,123 @@ async def edge_chat_loop(
     total_usage: dict[str, int] = {}
     _explain_turns: list[dict[str, Any]] = []
 
-    try:
-        for turn in range(MAX_TURNS):
-            if session_info is not None:
-                session_info["turn"] = turn
+    for turn in range(MAX_TURNS):
+        if session_info is not None:
+            session_info["turn"] = turn
 
-            # Always send edge_tools so the server has them even after
-            # a restart (server-side session cache is in-memory only).
-            current_schemas = tool_router.get_schemas()
-            send_edge_tools = current_schemas
+        # Always send edge_tools so the server has them even after
+        # a restart (server-side session cache is in-memory only).
+        current_schemas = tool_router.get_schemas()
+        send_edge_tools = current_schemas
 
-            # Call cloud with retry for transient errors
-            _MAX_RETRIES = 2
-            _BACKOFF = [1.0, 3.0]
-            result = TurnResult()
-            for attempt in range(_MAX_RETRIES + 1):
-                try:
-                    sse_stream = api_client.chat_turn(
-                        messages=messages,
-                        session_id=session_id,
-                        tool_results=tool_results if tool_results else None,
-                        project_rules=project_rules if turn == 0 else None,
-                        agent_id=agent_id,
-                        model=model,
-                        edge_tools=send_edge_tools,
-                        edge_profile=edge_profile if turn == 0 else None,
-                        explain=explain,
-                    )
-                    result = await _consume_turn(sse_stream, renderer, suppress_prefix=prev_turn_text)
-                    if result.error and result.error.get("retryable") and attempt < _MAX_RETRIES:
-                        delay = result.error.get("retry_after_ms", _BACKOFF[attempt] * 1000) / 1000
-                        renderer.info(f"  ⟳ Retrying in {delay:.0f}s...")
-                        await asyncio.sleep(delay)
-                        continue
-                    break
-                # httpx.TransportError covers ReadError, ConnectError,
-                # TimeoutException, etc. — all transient network failures.
-                # Standard ConnectionError/OSError catch non-httpx sources.
-                except (ConnectionError, OSError, TimeoutError, httpx.TransportError) as e:
-                    if isinstance(e, (httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
-                        # Config or client bug — not transient, don't retry.
-                        renderer.error(f"{type(e).__name__}: {e}")
-                        break
-                    if attempt < _MAX_RETRIES:
-                        renderer.info(f"  ⟳ Network error, retrying in {_BACKOFF[attempt]:.0f}s...")
-                        await asyncio.sleep(_BACKOFF[attempt])
-                        continue
-                    renderer.error(f"Network error: {e}")
-                    break
-                except KeyboardInterrupt:
-                    renderer.error("Interrupted by user")
-                    return _make_result(final_text, _explain_turns)
-                except AuthenticationError:
-                    raise  # propagate to CLI for re-login prompt
-                except Exception as e:
+        # Call cloud with retry for transient errors
+        _MAX_RETRIES = 2
+        _BACKOFF = [1.0, 3.0]
+        result = TurnResult()
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                sse_stream = api_client.chat_turn(
+                    messages=messages,
+                    session_id=session_id,
+                    tool_results=tool_results if tool_results else None,
+                    project_rules=project_rules if turn == 0 else None,
+                    agent_id=agent_id,
+                    model=model,
+                    edge_tools=send_edge_tools,
+                    edge_profile=edge_profile if turn == 0 else None,
+                    explain=explain,
+                )
+                result = await _consume_turn(sse_stream, renderer, suppress_prefix=prev_turn_text)
+                if result.error and result.error.get("retryable") and attempt < _MAX_RETRIES:
+                    delay = result.error.get("retry_after_ms", _BACKOFF[attempt] * 1000) / 1000
+                    renderer.info(f"  ⟳ Retrying in {delay:.0f}s...")
+                    await asyncio.sleep(delay)
+                    continue
+                break
+            # httpx.TransportError covers ReadError, ConnectError,
+            # TimeoutException, etc. — all transient network failures.
+            # Standard ConnectionError/OSError catch non-httpx sources.
+            except (ConnectionError, OSError, TimeoutError, httpx.TransportError) as e:
+                if isinstance(e, (httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+                    # Config or client bug — not transient, don't retry.
                     renderer.error(f"{type(e).__name__}: {e}")
                     break
-
-            # Track session from first response
-            if result.session_id and not session_id:
-                session_id = result.session_id
-
-            final_text = result.text
-            for k, v in result.usage.items():
-                total_usage[k] = total_usage.get(k, 0) + (v if isinstance(v, int) else 0)
-            if result.explain:
-                _explain_turns.append({"turn": turn, **result.explain})
-
-            if not result.has_tool_calls:
+                if attempt < _MAX_RETRIES:
+                    renderer.info(f"  ⟳ Network error, retrying in {_BACKOFF[attempt]:.0f}s...")
+                    await asyncio.sleep(_BACKOFF[attempt])
+                    continue
+                renderer.error(f"Network error: {e}")
+                break
+            except KeyboardInterrupt:
+                renderer.error("Interrupted by user")
+                return _make_result(final_text, _explain_turns, total_usage)
+            except AuthenticationError:
+                raise  # propagate to CLI for re-login prompt
+            except Exception as e:
+                renderer.error(f"{type(e).__name__}: {e}")
                 break
 
-            # Remember this turn's text so the next turn can suppress if LLM repeats it.
-            prev_turn_text = result.text
+        # Track session from first response
+        if result.session_id and not session_id:
+            session_id = result.session_id
 
-            # Execute tool calls locally
-            parsed = ToolRouter.parse_tool_calls(result.tool_calls)
-            approved: list[ToolCall] = []
-            tool_results = []
+        final_text = result.text
+        for k, v in result.usage.items():
+            total_usage[k] = total_usage.get(k, 0) + (v if isinstance(v, int) else 0)
+        if result.explain:
+            _explain_turns.append({"turn": turn, **result.explain})
 
-            for tc in parsed:
-                tool = tool_router.get_tool(tc.name)
-                if tool is None:
-                    tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": f"Unknown tool: {tc.name}"})
-                    continue
+        if not result.has_tool_calls:
+            break
 
-                side_effect = resolve_side_effect(tool)
+        # Remember this turn's text so the next turn can suppress if LLM repeats it.
+        prev_turn_text = result.text
 
-                decision = permissions.check(tc.name, side_effect, tc.arguments)
+        # Execute tool calls locally
+        parsed = ToolRouter.parse_tool_calls(result.tool_calls)
+        approved: list[ToolCall] = []
+        tool_results = []
 
+        for tc in parsed:
+            tool = tool_router.get_tool(tc.name)
+            if tool is None:
+                tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": f"Unknown tool: {tc.name}"})
+                continue
+
+            side_effect = resolve_side_effect(tool)
+
+            decision = permissions.check(tc.name, side_effect, tc.arguments)
+
+            if decision == Decision.DENY:
+                renderer.tool_start(tc.name, tc.arguments)
+                renderer.tool_done(tc.name, "Blocked (dangerous)", True)
+                tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": "Permission denied: command blocked by safety policy"})
+                continue
+
+            if decision == Decision.ASK:
+                # End streaming markdown before showing interactive prompt,
+                # otherwise the permission panel renders on top of raw text.
+                if hasattr(renderer, "end_response"):
+                    renderer.end_response(rerender=False)
+                decision = permissions.prompt_user(tc.name, side_effect, tc.arguments)
                 if decision == Decision.DENY:
-                    renderer.tool_start(tc.name, tc.arguments)
-                    renderer.tool_done(tc.name, "Blocked (dangerous)", True)
-                    tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": "Permission denied: command blocked by safety policy"})
+                    renderer.tool_done(tc.name, "Denied by user", True)
+                    tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": "Permission denied by user"})
                     continue
 
-                if decision == Decision.ASK:
-                    # End streaming markdown before showing interactive prompt,
-                    # otherwise the permission panel renders on top of raw text.
-                    if hasattr(renderer, "end_response"):
-                        renderer.end_response(rerender=False)
-                    decision = permissions.prompt_user(tc.name, side_effect, tc.arguments)
-                    if decision == Decision.DENY:
-                        renderer.tool_done(tc.name, "Denied by user", True)
-                        tool_results.append({"tool_call_id": tc.id, "name": tc.name, "result": "Permission denied by user"})
-                        continue
+            approved.append(tc)
 
-                approved.append(tc)
+        # Execute approved tools concurrently
+        if approved:
+            results = await tool_router.execute(approved)
+            for tc, r in zip(approved, results):
+                renderer.tool_start(tc.name, tc.arguments)
+                renderer.tool_done(r.name, r.result, r.error)
+                tool_results.append({"tool_call_id": r.tool_call_id, "name": r.name, "result": r.result})
 
-            # Execute approved tools concurrently
-            if approved:
-                results = await tool_router.execute(approved)
-                for tc, r in zip(approved, results):
-                    renderer.tool_start(tc.name, tc.arguments)
-                    renderer.tool_done(r.name, r.result, r.error)
-                    tool_results.append({"tool_call_id": r.tool_call_id, "name": r.name, "result": r.result})
+        # Clear messages after first turn — cloud has the history
+        messages = []
+    else:
+        renderer.error(f"Reached maximum turns ({MAX_TURNS})")
 
-            # Clear messages after first turn — cloud has the history
-            messages = []
-        else:
-            renderer.error(f"Reached maximum turns ({MAX_TURNS})")
-    finally:
-        if hasattr(renderer, "stats"):
-            renderer.stats(total_usage)
-        if _explain_turns:
-            _print_explain(_explain_turns)
-
-    return _make_result(final_text, _explain_turns)
+    return _make_result(final_text, _explain_turns, total_usage)

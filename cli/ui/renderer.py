@@ -96,16 +96,16 @@ class RichRenderer:
         parts = []
         if self._t0:
             elapsed = time.monotonic() - self._t0
-            parts.append(f"{elapsed:.1f}s")
+            parts.append(f"⏱{elapsed:.1f}s")
         if "prompt_tokens" in usage:
-            parts.append(f"in:{usage['prompt_tokens']}")
+            # Format large numbers compactly: 9755 -> 9.8k
+            p = usage["prompt_tokens"]
+            parts.append(f"↓{p/1000:.1f}k" if p >= 1000 else f"↓{p}")
         if "completion_tokens" in usage:
-            parts.append(f"out:{usage['completion_tokens']}")
-        if "total_tokens" in usage:
-            parts.append(f"total:{usage['total_tokens']}")
+            c = usage["completion_tokens"]
+            parts.append(f"↑{c/1000:.1f}k" if c >= 1000 else f"↑{c}")
         if parts:
-            self._console.print()
-            self._console.print(f"  [dim]{' · '.join(parts)}[/dim]")
+            self._console.print(f"  [dim]{' '.join(parts)}[/dim]")
 
 
 class SimpleRenderer:

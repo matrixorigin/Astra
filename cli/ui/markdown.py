@@ -143,7 +143,8 @@ class StreamingMarkdown:
         self._buffer += chunk
         if self._live:
             f = self._console.file
-            f.write(chunk)
+            # Stream with dim style so it looks like "thinking" output
+            f.write(f"\033[2m{chunk}\033[0m")
             f.flush()
             self._raw_lines += self._count_lines(chunk)
 

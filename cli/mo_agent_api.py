@@ -1413,7 +1413,10 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                 result_text = loop_result.text
                 if hasattr(renderer, "end_response"):
                     renderer.end_response()
-                # Auto-print explain after rendered response
+                # Show stats after rendered response
+                if hasattr(renderer, "stats") and loop_result.usage:
+                    renderer.stats(loop_result.usage)
+                # Auto-print explain after stats
                 if should_explain and loop_result.explain_turns:
                     from cli.edge_chat_loop import _print_explain
                     _print_explain(loop_result.explain_turns)
