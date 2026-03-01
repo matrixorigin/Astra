@@ -193,7 +193,7 @@ class TestGitHubAPIMethods:
         mock_run.html_url = "url"
         mock_run.created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
         mock_repo = MagicMock()
-        mock_repo.get_wf_runs.return_value = [mock_run]
+        mock_repo.get_workflow_runs.return_value = [mock_run]
         mock_gh_client.get_repo.return_value = mock_repo
         result = await api.list_wf_runs("owner/repo", limit=5)
         assert len(result) == 1

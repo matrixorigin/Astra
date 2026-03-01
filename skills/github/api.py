@@ -251,7 +251,7 @@ class GitHubSkillAPI:
         await self._check_rate_limit()
         try:
             gh_repo = self._get_repo(repo)
-            runs = gh_repo.get_wf_runs()
+            runs = gh_repo.get_workflow_runs()
             result = []
             for i, run in enumerate(runs):
                 if i >= limit:

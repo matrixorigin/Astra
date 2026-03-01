@@ -134,7 +134,7 @@ async def test_summarize_pr_skill(db_session, llm, github, monkeypatch):
     # Mock LLM response
     from core.llm.models import LLMProvider, LLMResponse
 
-    async def mock_chat(*args, **kwargs):
+    def mock_chat(*args, **kwargs):
         return LLMResponse(
             content="This PR adds a new feature",
             model="gpt-4",
@@ -299,3 +299,36 @@ async def test_register_builtin_skills_then_execute(db_session):
     out2 = await ci_skill.execute(inp2)
     assert out2.success is True
     assert len(out2.workflows) == 1
+
+
+@pytest.mark.asyncio
+async def test_summarize_pr_works_with_sync_llm(db_session):
+    """summarize_pr must work with sync LLMClient.chat (not async).
+
+    Regression: execute() had 'await self.llm.chat(...)' but LLMClient.chat
+    is synchronous — only passed tests because mocks used AsyncMock.
+    """
+    from core.skills.builtin import SummarizePRSkill
+    from core.llm.models import LLMProvider, LLMResponse
+    from unittest.mock import MagicMock, AsyncMock
+
+    fake_gh = MagicMock()
+    fake_gh.get_pr = AsyncMock(return_value={
+        "number": 1, "title": "test", "body": "desc",
+        "files_changed": 2, "additions": 10, "deletions": 5,
+    })
+    fake_gh.get_pr_diff = AsyncMock(return_value="diff")
+
+    # Intentionally sync — mimics real LLMClient.chat
+    fake_llm = MagicMock()
+    fake_llm.chat = MagicMock(return_value=LLMResponse(
+        content="Summary", model="gpt-4", provider=LLMProvider.OPENAI,
+        tokens_prompt=10, tokens_completion=5, tokens_total=15,
+        latency_ms=100, cost_usd=0.001,
+    ))
+
+    skill = SummarizePRSkill(fake_llm, fake_gh)
+    inp = skill.validate_input({"repo": "owner/repo", "pr_number": 1})
+    out = await skill.execute(inp)
+    assert out.success is True
+    assert out.summary == "Summary"

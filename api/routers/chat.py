@@ -7,6 +7,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -1720,6 +1721,22 @@ async def chat_turn(
 
                         yield f"data: {json.dumps({'type': 'tool_call_start', 'name': tc_name})}\n\n"
                         cloud_result = await _execute_cloud_skill(cloud_registry, tc_name, tc_args)
+                        # Record cloud skill execution as event for decision_trace visibility.
+                        try:
+                            _db = SessionLocal()
+                            _db.execute(text(
+                                "INSERT INTO agent_events (event_id, session_id, user_id, agent_id, agent_version, "
+                                "causal_chain_id, event_type, content, created_at) "
+                                "VALUES (:eid, :sid, :uid, :aid, '0', :cid, 'tool_call', :content, :ts)"
+                            ), {"eid": str(__import__('uuid').uuid4()), "sid": session_id, "uid": user_id,
+                                "aid": request.agent_id or "edge", "cid": session_id,
+                                "content": json.dumps({"name": tc_name, "arguments": tc_args, "source": "cloud"}),
+                                "ts": datetime.now(timezone.utc).replace(tzinfo=None)})
+                            _db.commit()
+                            _db.close()
+                        except Exception:
+                            pass
+                        yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': cloud_result[:500]})}\n\n"
                         # Append tool result to messages for next LLM call.
                         _current_llm_messages = _current_llm_messages + [
                             {"role": "tool", "tool_call_id": tc_id, "content": cloud_result}

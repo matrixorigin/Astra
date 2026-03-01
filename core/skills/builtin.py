@@ -79,7 +79,7 @@ Files changed: {pr["files_changed"]}
             prompt += f"\nDiff (first 5000 chars):\n{diff[:5000]}"
 
         # 3. Call LLM
-        response = await self.llm.chat(
+        response = self.llm.chat(
             messages=[{"role": "user", "content": prompt}],
             user_id=input.user_id,
             session_id=input.session_id,

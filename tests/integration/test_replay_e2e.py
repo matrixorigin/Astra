@@ -79,7 +79,7 @@ async def test_e2e_skill_version_replay(
 
     Core promise: reproduce today's decision 10 years later.
     """
-    async def mock_chat(*args, **kwargs):
+    def mock_chat(*args, **kwargs):
         metadata = kwargs.get("metadata", {})
         version = metadata.get("skill_version", "unknown")
         return LLMResponse(
