@@ -1,8 +1,8 @@
 # Prompt Lifecycle Architecture
 
 > **Status**: Core Design — single source of truth for prompt generation, assembly, versioning, and introspection  
-> **Last Updated**: 2026-02-25 (revised per review feedback)  
-> **Related**: [agent-introspection.md](agent-introspection.md), [memory-architecture.md](memory-architecture.md), [edge-cloud-execution.md](edge-cloud-execution.md), [evaluation-and-evolution.md](evaluation-and-evolution.md)
+> **Last Updated**: 2026-03-01  
+> **Related**: [agent-introspection.md](agent-introspection.md), [memory-architecture.md](memory-architecture.md), [edge-cloud-execution.md](edge-cloud-execution.md), [evaluation-and-evolution.md](evaluation-and-evolution.md), [context-window-management.md](context-window-management.md) (runtime optimization and token budgets)
 
 ---
 
@@ -171,6 +171,15 @@ use the `get_agent_info` tool.
 ```
 
 The "What I've Learned" subsection is the breakthrough: it comes from **procedural memory** — the `SelfImprovingSelector`'s historical accuracy data and the `Observer`'s behavioral pattern extraction. The agent literally knows its own strengths and weaknesses, backed by data.
+
+> **Evolution note (2026-03-01)**: Session analysis revealed that general insights in §2 are insufficient — the LLM ignores them when making tool-call decisions. Skill-specific procedural memories are now also injected directly into tool descriptions at runtime (not stored in base schema). See [context-window-management.md](context-window-management.md) §1 "Procedural Memory at Point of Use" for the complete design.
+>
+> **Current behavior**:
+> - **General insights** (e.g., "I work better with structured data"): Remain in §2 Self-Model
+> - **Skill-specific patterns** (e.g., "Use analysis_type='overview' for stock queries"): Injected into tool description at runtime
+> - **Audit trail**: Both stored separately in audit snapshot, enabling exact replay
+>
+> §2 retains general behavioral insights; skill-specific patterns live in the runtime tool schema.
 
 **Cold start**: New agents or agents with insufficient history (<50 interactions) have no procedural memory insights yet. For these, the self-model falls back to **baseline insights by agent type**:
 

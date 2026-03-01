@@ -1,9 +1,10 @@
 # Memory Architecture
 
 > **Status**: Core Design — single source of truth for memory architecture  
-> **Last Updated**: 2026-02-27  
+> **Last Updated**: 2026-03-01  
 > **Scope**: Conceptual architecture, design decisions, and design-level specifications  
-> **Implementation**: See [memory-system-status.md](../implementation/memory-system-status.md) for engineering status, module mapping, and known issues
+> **Implementation**: See [memory-system-status.md](../implementation/memory-system-status.md) for engineering status, module mapping, and known issues  
+> **Related**: [context-window-management.md](context-window-management.md) (runtime context optimization with procedural memory injection at point of use, reference-aware history compression)
 
 ---
 
@@ -652,6 +653,13 @@ CREATE TABLE knowledge_entry_sources (
 
 Procedural memory is **how the agent has learned to behave**: versioned skill definitions, versioned system prompts, and patterns learned from skill selection failures.
 
+> **Injection evolution (2026-03-01)**: Procedural memories that reference specific tools are now injected into tool descriptions at runtime (not stored in base schema). This "knowledge at point of use" pattern improves LLM compliance with learned patterns. The injection is ephemeral - audit snapshots store base schema and procedural memories separately to preserve replay capability. See [context-window-management.md](context-window-management.md) §1 for the complete design.
+>
+> **Key distinction**: 
+> - **Base skill schema**: Immutable, versioned, stored in skill definitions
+> - **Procedural hints**: Runtime metadata, injected at prompt assembly time
+> - **Audit snapshot**: Stores both separately, enabling exact replay
+
 ### Working Memory: Structured Notes
 
 ```sql
@@ -949,7 +957,14 @@ Tool Output → Size Check → [>10KB] → Store as TOOL_RESULT memory
 | Info retention | ~30% | 100% (stored in Memory) |
 | Summary cost | $0 | $0 (rule-based) |
 
-See [context-overflow-optimization.md](context-overflow-optimization.md) for full design.
+See [context-window-management.md](context-window-management.md) for runtime context optimization (separate from memory storage).
+
+**Critical Distinction**:
+- **Memory system** (this doc): Long-term storage of knowledge, tool results, procedural patterns. Persists across sessions.
+- **Runtime context** (context-window-management.md): Compressed prompt sent to LLM. Optimized per-turn for token efficiency.
+- **Audit snapshot** (ctx_snapshots table): Complete uncompressed state for replay. Stored per decision.
+
+These serve different purposes and must not be conflated.
 
 ---
 
