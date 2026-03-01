@@ -1,7 +1,8 @@
 # Trust and Safety
 
 > **Status**: Core Design — single source of truth for audit, verification, and safety  
-> **Last Updated**: 2026-02-25
+> **Last Updated**: 2026-03-01  
+> **Related**: [tool-result-quality-firewall.md](tool-result-quality-firewall.md) (pre-LLM tool result quality assessment — complements the post-LLM Hallucination Firewall in §2)
 
 ---
 

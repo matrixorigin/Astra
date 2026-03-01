@@ -28,6 +28,7 @@ from core.db_consumer import DbConsumer, DbFactory
 # Context window management (feature-flagged)
 try:
     from core.context.prompt_integration import integrate_compression_into_prompt
+    from core.context.zone_budgets import compute_zone_budgets
     _COMPRESSION_AVAILABLE = True
 except ImportError:
     _COMPRESSION_AVAILABLE = False
@@ -180,8 +181,26 @@ class PromptAssembler(DbConsumer):
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         username: str | None = None,
     ) -> AssembledPrompt:
+        """
+        Assemble system prompt with zone-based budget tracking.
+        
+        Phase 1 Integration: Computes zone budgets based on model context size
+        and tracks which zones overflow. This enables data-driven optimization.
+        """
         sections: dict[str, str] = {}
         breakdown: dict[str, int] = {}
+        
+        # Phase 1: Compute zone budgets based on model context size
+        # This provides the foundation for measuring compression effectiveness
+        zone_budgets = None
+        if _COMPRESSION_AVAILABLE:
+            try:
+                # Get model context size from edge_context or use default
+                model_context_size = max_tokens  # Simplified: use max_tokens as proxy
+                zone_budgets = compute_zone_budgets(model_context_size)
+                logger.debug(f"Zone budgets computed: {zone_budgets}")
+            except Exception as e:
+                logger.warning(f"Failed to compute zone budgets: {e}")
 
         # §1 Identity
         identity = self._build_identity(agent_id)
@@ -250,6 +269,11 @@ class PromptAssembler(DbConsumer):
 
         # Compress if over budget
         total = sum(breakdown.values())
+        
+        # Phase 1: Check zone budget overflows and log
+        if zone_budgets and _COMPRESSION_AVAILABLE:
+            self._check_zone_overflows(breakdown, zone_budgets, session_id)
+        
         if total > max_tokens:
             sections, breakdown = self._compress(sections, breakdown, max_tokens)
 
@@ -747,6 +771,59 @@ class PromptAssembler(DbConsumer):
     # ------------------------------------------------------------------
     # Compression
     # ------------------------------------------------------------------
+    
+    def _check_zone_overflows(
+        self,
+        breakdown: dict[str, int],
+        zone_budgets,
+        session_id: str
+    ) -> None:
+        """
+        Phase 1: Check which zones exceed their budgets and log for observability.
+        
+        This enables data-driven optimization by identifying bottlenecks.
+        Maps prompt sections to zone budgets:
+        - Fixed zone: identity, self_model, project_context, constraints
+        - Managed zone: memory, working_memory  
+        - Elastic zone: history
+        """
+        # Map sections to zones
+        fixed_sections = ["identity", "self_model", "project_context", "constraints"]
+        managed_sections = ["memory", "working_memory"]
+        elastic_sections = ["history"]
+        
+        # Calculate actual usage per zone
+        fixed_usage = sum(breakdown.get(s, 0) for s in fixed_sections)
+        managed_usage = sum(breakdown.get(s, 0) for s in managed_sections)
+        elastic_usage = sum(breakdown.get(s, 0) for s in elastic_sections)
+        
+        # Check overflows and log
+        overflows = []
+        
+        if fixed_usage > zone_budgets.fixed:
+            overflow_pct = ((fixed_usage - zone_budgets.fixed) / zone_budgets.fixed) * 100
+            overflows.append(f"fixed: {fixed_usage}/{zone_budgets.fixed} (+{overflow_pct:.1f}%)")
+        
+        if managed_usage > zone_budgets.managed:
+            overflow_pct = ((managed_usage - zone_budgets.managed) / zone_budgets.managed) * 100
+            overflows.append(f"managed: {managed_usage}/{zone_budgets.managed} (+{overflow_pct:.1f}%)")
+        
+        if elastic_usage > zone_budgets.elastic:
+            overflow_pct = ((elastic_usage - zone_budgets.elastic) / zone_budgets.elastic) * 100
+            overflows.append(f"elastic: {elastic_usage}/{zone_budgets.elastic} (+{overflow_pct:.1f}%)")
+        
+        if overflows:
+            logger.warning(
+                f"Zone budget overflows in session {session_id}: {', '.join(overflows)}. "
+                f"Total: {fixed_usage + managed_usage + elastic_usage}/{zone_budgets.model_context_size}"
+            )
+        else:
+            logger.debug(
+                f"All zones within budget for session {session_id}. "
+                f"Fixed: {fixed_usage}/{zone_budgets.fixed}, "
+                f"Managed: {managed_usage}/{zone_budgets.managed}, "
+                f"Elastic: {elastic_usage}/{zone_budgets.elastic}"
+            )
 
     def _compress(
         self,

@@ -36,6 +36,7 @@ Welcome to mo-agent documentation! This guide will help you find the information
 - [Architecture](design/ARCHITECTURE.md) - System overview and data flow
 - [Memory Architecture](design/memory-architecture.md) - Cognitive memory and context engineering
 - [Context Window Management](design/context-window-management.md) - Token budgets, history compression, procedural memory injection
+- [Tool Result Quality Firewall](design/tool-result-quality-firewall.md) - Pre-LLM tool result quality assessment and annotation
 - [Trust and Safety](design/trust-and-safety.md) - Audit, guardrails, and robustness
 - [Skills and Tools](design/skills-and-tools.md) - Skill architecture and marketplace
 - [Agents and Orchestration](design/agents-and-orchestration.md) - ChatLoop, planning, and teams

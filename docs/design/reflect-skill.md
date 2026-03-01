@@ -107,3 +107,77 @@ class ReflectTool(EdgeTool):
 | `cli/edge_chat_loop.py` | REMOVE `session_state` parameter + history population |
 | `cli/mo_agent_api.py` | REMOVE `session_state`, simplify ReflectTool construction |
 | `tests/unit/test_reflect.py` | REWRITE — test endpoint + edge tool + diagnosis logic |
+
+---
+
+## Known Limitations
+
+Reflect is strong at structural analysis (what happened, when, which tools) but weak at semantic analysis (was the result good, was the cost reasonable). This is by design — reflect is a **data retrieval** tool, not a **quality evaluation** tool. The LLM interprets the data; reflect provides it.
+
+| Dimension | Capability | Gap | Evolution Path |
+|-----------|-----------|-----|----------------|
+| Event timeline | ⭐⭐⭐⭐⭐ Precise timestamps, causal chains | — | — |
+| Tool call counts | ⭐⭐⭐⭐⭐ Complete per-session and per-skill | — | — |
+| Success/failure | ⭐⭐⭐⭐ `success` status from skill_selection_events | No error categorization (transient vs permanent) | Add `error_category` to skill_selection_events |
+| Performance | ⭐⭐ `execution_time_ms` on some tools | Missing on edge tools; no latency breakdown (network vs compute) | Edge tools report `execution_time_ms` in tool_result metadata |
+| Token usage | ⭐ Not surfaced | `token_usage` exists in `agent_events` but reflect doesn't include it | **Phase 1**: Add `token_summary` to reflect response (sum prompt/completion tokens per LLM call in session) |
+| Content quality | ⭐ Cannot assess | Reflect returns event data, not quality judgments | **Addressed by**: [tool-result-quality-firewall.md](tool-result-quality-firewall.md) — quality signals are now attached to tool results before they reach the LLM. Reflect can surface these signals via `quality_grade` field in event_summary. |
+| Cost analysis | ⭐ Cannot compute | No cost data in events | **Phase 2**: Add `estimated_cost` to LLM response events (model × tokens × price_per_token from model registry). Reflect surfaces cumulative session cost. |
+
+### Phase 1: Token and Quality Visibility (Low Effort)
+
+Extend `_build_reflect_evidence()` to include two new fields:
+
+```python
+# In reflect endpoint response, add:
+{
+    # ... existing fields ...
+
+    # NEW: Token summary from agent_events
+    "token_summary": {
+        "total_prompt_tokens": 25010,
+        "total_completion_tokens": 812,
+        "llm_calls": 4,
+        "avg_prompt_per_call": 6252,
+    },
+
+    # NEW: Quality grades from tool_result_quality events (if firewall enabled)
+    # Allows reflect to answer "was the data any good?"
+    "tool_quality_summary": [
+        {"tool": "stock_assistant", "grade": "degraded", "score": 0.35,
+         "signals": ["technical_indicators empty", "risk_score is default"]},
+    ],
+}
+```
+
+Data sources:
+- `token_summary`: `SELECT SUM(token_usage->>'$.prompt_tokens'), ... FROM agent_events WHERE session_id = :sid AND event_type = 'llm_response'`
+- `tool_quality_summary`: `SELECT metadata FROM agent_events WHERE session_id = :sid AND event_type = 'tool_result_quality'`
+
+Both queries use existing indexed columns. No schema changes needed.
+
+### Phase 2: Cost Visibility (Requires Model Registry)
+
+Depends on model pricing data in the model registry (not yet implemented). Once available:
+
+```python
+"cost_summary": {
+    "total_estimated_cost_usd": 0.038,
+    "breakdown": [
+        {"model": "deepseek-chat", "calls": 4, "tokens": 25822, "cost_usd": 0.038},
+    ],
+}
+```
+
+### Relationship to Tool Result Quality Firewall
+
+The quality firewall (tool-result-quality-firewall.md) and reflect are complementary:
+
+| Concern | Quality Firewall | Reflect |
+|---------|-----------------|---------|
+| When | Pre-LLM (before the LLM sees the result) | Post-hoc (after the turn, on demand) |
+| Purpose | Annotate data so LLM responds honestly | Diagnose what happened and why |
+| Content quality | Assesses tool result completeness | Surfaces quality grades from firewall events |
+| Audience | The LLM (via annotation in context) | The LLM or user (via reflect tool call) |
+
+With the quality firewall in place, reflect gains the ability to answer "was the data any good?" by reading `tool_result_quality` events — closing its biggest gap without adding quality assessment logic to reflect itself.
