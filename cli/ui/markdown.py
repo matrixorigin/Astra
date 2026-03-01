@@ -1,5 +1,7 @@
 """Streaming markdown — streams raw text, renders rich Markdown on finish."""
 
+import time
+
 from rich.cells import cell_len
 from rich.console import Console, ConsoleOptions, RenderResult
 from rich.markdown import CodeBlock, Markdown
@@ -81,25 +83,52 @@ class StreamingMarkdown:
                         self._current_line_width = self._current_line_width - width
         return lines
 
-    def show_thinking(self) -> None:
-        """Display a transient thinking indicator below the current text."""
-        if not self._live or not self._console.is_terminal or self._thinking_shown:
+    def show_thinking(self, label: str = "Thinking…") -> None:
+        """Display a transient thinking indicator with elapsed time, auto-refreshing."""
+        if not self._live or not self._console.is_terminal:
             return
+        self._thinking_label = label
+        if not hasattr(self, "_thinking_t0") or self._thinking_t0 is None:
+            self._thinking_t0 = time.monotonic()
+        self._render_thinking()
+        # Start auto-refresh thread (1s interval) if not already running
+        if not getattr(self, "_thinking_timer", None):
+            import threading
+            stop = threading.Event()
+            self._thinking_stop = stop
+            def _refresh():
+                while not stop.wait(1.0):
+                    if self._thinking_shown:
+                        self._render_thinking()
+                    else:
+                        break
+            self._thinking_timer = threading.Thread(target=_refresh, daemon=True)
+            self._thinking_timer.start()
+
+    def _render_thinking(self) -> None:
+        elapsed = time.monotonic() - (self._thinking_t0 or time.monotonic())
+        label = getattr(self, "_thinking_label", "Thinking…")
         f = self._console.file
-        # Save cursor position so _hide_thinking can restore exactly,
-        # even if the newline triggers a terminal scroll.
-        f.write("\033[s\n\033[2m  ⏳ Thinking…\033[0m")
+        if self._thinking_shown:
+            f.write(f"\r\033[2K\033[2m  ⏳ {label} {elapsed:.1f}s\033[0m")
+        else:
+            f.write(f"\033[s\n\033[2m  ⏳ {label} {elapsed:.1f}s\033[0m")
+            self._thinking_shown = True
         f.flush()
-        self._thinking_shown = True
 
     def _hide_thinking(self) -> None:
         if not self._thinking_shown:
             return
+        # Stop refresh thread
+        if hasattr(self, "_thinking_stop") and self._thinking_stop:
+            self._thinking_stop.set()
+        self._thinking_timer = None
+        self._thinking_stop = None
         f = self._console.file
-        # Erase the thinking line, then restore saved cursor position.
         f.write("\r\033[2K\033[u")
         f.flush()
         self._thinking_shown = False
+        self._thinking_t0 = None
 
     def feed(self, chunk: str) -> None:
         self._hide_thinking()

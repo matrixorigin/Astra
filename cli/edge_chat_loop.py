@@ -148,6 +148,12 @@ async def _consume_turn(sse_stream, renderer: Renderer, *, timeout: float = MAX_
                     chunk = event.get("content", "")
                     result.text += chunk
                     renderer.text(chunk)
+                elif etype == "tool_call_start":
+                    # LLM started generating a tool call — show which tool
+                    # so user sees progress instead of just "Thinking…"
+                    name = event.get("name", "")
+                    if hasattr(renderer, "thinking"):
+                        renderer.thinking(f"Generating {name}…")
                 elif etype == "tool_call":
                     # Hide thinking before collecting tool calls — the LLM
                     # has decided on an action, no longer "thinking".

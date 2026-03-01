@@ -25,41 +25,17 @@ class RichRenderer:
         self._t0: float = 0
 
     def begin_response(self) -> None:
-        """Start thinking spinner with elapsed time. Markdown Live starts on first text chunk."""
+        """Start thinking indicator. Markdown Live starts on first text chunk."""
         self._t0 = time.monotonic()
         self._md = StreamingMarkdown(console=self._console)
-        try:
-            from rich.live import Live
-            self._thinking_live = Live(
-                "[dim]Thinking… 0.0s[/dim]",
-                console=self._console, transient=True, refresh_per_second=4,
-            )
-            self._thinking_live.start()
-            # Update elapsed time in background
-            import threading
-            self._thinking_stop = threading.Event()
-            def _update():
-                while not self._thinking_stop.wait(0.25):
-                    elapsed = time.monotonic() - self._t0
-                    try:
-                        self._thinking_live.update(f"[dim]Thinking… {elapsed:.1f}s[/dim]")
-                    except Exception:
-                        break
-            self._thinking_thread = threading.Thread(target=_update, daemon=True)
-            self._thinking_thread.start()
-            self._spinner = self._thinking_live  # for _stop_spinner compat
-        except Exception:
-            self._spinner = None
+        self._md.start()
+        self._md.show_thinking()
+        self._spinner = True  # flag for _stop_spinner
 
     def _stop_spinner(self) -> None:
-        if self._spinner is not None:
-            if hasattr(self, "_thinking_stop"):
-                self._thinking_stop.set()
-            try:
-                self._spinner.stop()
-            except Exception:
-                pass
-            self._spinner = None
+        if self._spinner and self._md is not None:
+            self._md._hide_thinking()
+        self._spinner = None
 
     def end_response(self) -> str:
         """Stop streaming and return accumulated text."""
@@ -78,10 +54,10 @@ class RichRenderer:
             self._md.start()
         self._md.feed(chunk)
 
-    def thinking(self) -> None:
+    def thinking(self, label: str = "Thinking…") -> None:
         """Show a thinking indicator during long pauses in LLM output."""
         if self._md is not None:
-            self._md.show_thinking()
+            self._md.show_thinking(label)
 
     def thinking_hide(self) -> None:
         """Explicitly hide the thinking indicator."""

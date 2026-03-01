@@ -39,6 +39,73 @@ SERVER_TURN_TIMEOUT_S = 240
 _HEARTBEAT_SENTINEL = object()
 
 
+import re as _re
+
+
+def _try_repair_tool_args(tc_name: str, raw: str) -> dict | None:
+    """Best-effort repair of malformed tool-call JSON from the LLM.
+
+    Returns parsed dict on success, None if unrecoverable.
+    Common failures:
+      1. Trailing comma before closing brace  ``{"a": 1,}``
+      2. Unescaped control chars inside string values (literal newlines/tabs)
+      3. Truncated JSON missing closing braces/quotes
+      4. Single-quoted strings
+    """
+    s = raw.strip()
+    if not s:
+        return None
+
+    # 1. Single quotes → double quotes (only outermost; naive but covers common case)
+    if s.startswith("{'") or ", '" in s:
+        s = s.replace("'", '"')
+
+    # 2. Trailing commas:  ,} or ,]
+    s = _re.sub(r",\s*([}\]])", r"\1", s)
+
+    # 3. Unescaped literal newlines/tabs inside strings — escape them
+    #    Walk char-by-char to only fix inside quoted regions.
+    fixed: list[str] = []
+    in_str = False
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == '"' and (i == 0 or s[i - 1] != '\\'):
+            in_str = not in_str
+            fixed.append(ch)
+        elif in_str and ch == '\n':
+            fixed.append('\\n')
+        elif in_str and ch == '\t':
+            fixed.append('\\t')
+        elif in_str and ch == '\r':
+            fixed.append('\\r')
+        else:
+            fixed.append(ch)
+        i += 1
+    s = "".join(fixed)
+
+    # 4. Try parsing now
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    # 5. Truncated — try closing open braces/brackets/quotes
+    #    Count unmatched openers and append closers.
+    depth_brace = s.count('{') - s.count('}')
+    depth_bracket = s.count('[') - s.count(']')
+    if in_str:
+        s += '"'
+    s += ']' * max(depth_bracket, 0)
+    s += '}' * max(depth_brace, 0)
+    try:
+        result = json.loads(s)
+        logger.info("Repaired truncated tool_call JSON for %s", tc_name)
+        return result
+    except json.JSONDecodeError:
+        return None
+
+
 def _sse_ping() -> str:
     return f"data: {json.dumps({'type': 'ping', 'ts': int(time.time() * 1000)})}\n\n"
 
@@ -1191,6 +1258,8 @@ async def chat_turn(
                             yield f"data: {json.dumps({'type': 'text_delta', 'content': chunk['content']})}\n\n"
                         elif chunk["type"] == "tool_call":
                             tool_calls.append(chunk["data"])
+                        elif chunk["type"] == "tool_call_start":
+                            yield f"data: {json.dumps({'type': 'tool_call_start', 'name': chunk['name']})}\n\n"
                         elif chunk["type"] == "usage":
                             usage = {"prompt": chunk.get("prompt", 0), "completion": chunk.get("completion", 0), "total": chunk.get("prompt", 0) + chunk.get("completion", 0)}
                             yield f"data: {json.dumps({'type': 'usage', 'prompt_tokens': chunk.get('prompt', 0), 'completion_tokens': chunk.get('completion', 0), 'cache_read_tokens': chunk.get('cache_read', 0)})}\n\n"
@@ -1217,9 +1286,12 @@ async def chat_turn(
                         try:
                             parsed_args = json.loads(args) if isinstance(args, str) else args
                         except json.JSONDecodeError:
-                            logger.warning("Malformed tool_call arguments for %s: %s",
-                                           tc_name, args[:200])
-                            parsed_args = {"_parse_error": f"Malformed arguments JSON: {args[:200]}"}
+                            # Try to repair common LLM JSON errors before giving up
+                            parsed_args = _try_repair_tool_args(tc_name, args)
+                            if parsed_args is None:
+                                logger.warning("Malformed tool_call arguments for %s: %s",
+                                               tc_name, args[:200])
+                                parsed_args = {"_parse_error": f"Malformed arguments JSON: {args[:200]}"}
                     yield f"data: {json.dumps({'type': 'tool_call', 'id': tc.get('id', ''), 'name': tc_name, 'arguments': parsed_args})}\n\n"
 
                 # Update session cache: append assistant message, increment turn_count

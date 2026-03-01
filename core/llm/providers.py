@@ -129,7 +129,11 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
                 elif tc.id:
                     buf[idx]["id"] = tc.id
                 if tc.function and tc.function.name:
+                    prev = buf[idx]["function"]["name"]
                     buf[idx]["function"]["name"] = tc.function.name
+                    if not prev:
+                        # First time we see the tool name — notify caller
+                        yield {"type": "tool_call_start", "name": tc.function.name}
                 if tc.function and tc.function.arguments:
                     buf[idx]["function"]["arguments"] += tc.function.arguments
     for tc in buf.values():
@@ -173,8 +177,13 @@ class OpenAIProvider(BaseProvider):
 
     def __init__(self, api_key: str, base_url: str | None = None):
         import openai
+        import httpx
 
-        kwargs: dict[str, Any] = {"api_key": api_key}
+        kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            # Connect fast, allow generous read for streaming (120s idle per chunk).
+            "timeout": httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+        }
         if base_url:
             kwargs["base_url"] = base_url
         self._client = openai.OpenAI(**kwargs)
@@ -268,8 +277,12 @@ class GroqProvider(BaseProvider):
 
     def __init__(self, api_key: str):
         from groq import Groq
+        import httpx
 
-        self._client = Groq(api_key=api_key)
+        self._client = Groq(
+            api_key=api_key,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+        )
 
     def complete(self, messages, model, temperature, max_tokens) -> LLMResponse:
         resp = self._with_retry(
@@ -348,8 +361,12 @@ class AnthropicProvider(BaseProvider):
 
     def __init__(self, api_key: str):
         import anthropic
+        import httpx
 
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self._client = anthropic.Anthropic(
+            api_key=api_key,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+        )
         self.cache_enabled = True  # Set by LLMClient._dispatch from ModelConfig.enable_cache
 
     def _split_system(self, messages: list[dict]) -> tuple[list[dict] | str, list[dict]]:
