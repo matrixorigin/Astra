@@ -254,11 +254,59 @@ class LLMClient(DbConsumer):
         name = p.value if isinstance(p, LLMProvider) else str(p)
         provider = self._providers.get(name)
         if not provider:
-            raise ValueError(
-                f"Provider '{name}' is not available. "
-                f"Check: pip install openai  and  mo-admin model check <model>"
-            )
+            # Try lazy initialization from database
+            provider = self._lazy_init_provider(name)
+            if provider:
+                return provider
+            
+            # Check if model is registered in database
+            with self._db() as db:
+                from api.models import LLMModel
+                registered = db.query(LLMModel).filter(
+                    LLMModel.provider == name, LLMModel.is_active == 1
+                ).first()
+            
+            if registered:
+                raise ValueError(
+                    f"Provider '{name}' is registered but failed to initialize. "
+                    f"Check logs or try: make dev-api-restart"
+                )
+            else:
+                raise ValueError(
+                    f"Provider '{name}' is not available. "
+                    f"Check: pip install openai  and  mo-admin model check <model>"
+                )
         return provider
+    
+    def _lazy_init_provider(self, provider_name: str) -> BaseProvider | None:
+        """Attempt to initialize a provider on-demand from database."""
+        try:
+            with self._db() as db:
+                from api.models import LLMModel
+                row = db.query(LLMModel).filter(
+                    LLMModel.provider == provider_name, LLMModel.is_active == 1
+                ).first()
+                
+                if not row:
+                    return None
+                
+                api_key = decrypt_token(row.api_key_encrypted)
+                base_url = row.base_url
+                
+                if provider_name == "groq" and not base_url:
+                    provider = GroqProvider(api_key)
+                elif provider_name == "anthropic" and not base_url:
+                    provider = AnthropicProvider(api_key)
+                else:
+                    kwargs = {"base_url": base_url} if base_url else {}
+                    provider = OpenAIProvider(api_key, **kwargs)
+                
+                self._providers[provider_name] = provider
+                logger.info(f"Lazy-initialized {provider_name} provider")
+                return provider
+        except Exception as e:
+            logger.warning(f"Failed to lazy-init {provider_name}: {e}")
+            return None
 
     def _resolve_model(self, model: str | None) -> str:
         from core.llm.model_resolver import resolve_model
