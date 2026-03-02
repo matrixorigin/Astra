@@ -1,15 +1,12 @@
 """Tests for progressive disclosure: SkillIndex, token budget, semantic retrieval."""
 
-import json
-import math
 from unittest.mock import Mock, patch
 
 import pytest
 
-from core.skills.modern_selector import ModernSkillSelector, _estimate_tokens, _DEFAULT_CONTEXT_BUDGET
+from core.skills.modern_selector import ModernSkillSelector, _estimate_tokens
 from core.skills.selector import SkillMetadata
-from core.skills.skill_index import SkillIndex, _cosine, _skill_text
-
+from core.skills.skill_index import SkillIndex, _skill_text
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -25,14 +22,37 @@ def _make_skill(name, description="desc", triggers=None, cost="low"):
 
 
 def _deterministic_embed(text: str) -> list[float]:
-    """Hash-based embedding that produces different vectors for different text."""
+    """Hash-based embedding that produces different vectors for different text.
+
+    Produces 384-dim vectors to match the VECF32(384) column in skills_registry.
+    """
     import hashlib
     h = hashlib.sha256(text.encode()).digest()
     vec = [(b / 255.0) * 2 - 1 for b in h]
-    # Pad to 32 dims for test speed
-    while len(vec) < 32:
-        vec.extend(vec[:32 - len(vec)])
-    return vec[:32]
+    while len(vec) < 384:
+        vec.extend(vec[:384 - len(vec)])
+    return vec[:384]
+
+
+def _ensure_db_skill(db, name, desc="desc"):
+    """Ensure a skills_registry row exists so SkillIndex can UPDATE its embedding."""
+    from api.models.skill import SkillRegistry as SkillModel
+    row = db.query(SkillModel).filter_by(skill_name=name, is_active=1).first()
+    if not row:
+        db.add(SkillModel(
+            skill_id=f"{name}@1.0.0", skill_name=name, version="1.0.0",
+            description=desc, is_active=1,
+        ))
+    db.commit()
+
+
+def _clear_embeddings(db):
+    """Clear all embeddings in skills_registry."""
+    from sqlalchemy import text as sa_text
+    db.execute(sa_text(
+        "UPDATE skills_registry SET embedding = NULL WHERE embedding IS NOT NULL"
+    ))
+    db.commit()
 
 
 # ===========================================================================
@@ -40,95 +60,128 @@ def _deterministic_embed(text: str) -> list[float]:
 # ===========================================================================
 
 class TestSkillIndex:
+    """Tests for DB-backed SkillIndex.
 
-    def test_build_indexes_all_skills(self):
-        skills = [_make_skill("a"), _make_skill("b"), _make_skill("c")]
-        idx = SkillIndex(embed_fn=_deterministic_embed)
+    These tests use the real test database.  The ``db`` fixture provides
+    a session; ``db_factory`` wraps it for SkillIndex's constructor.
+    Skills must exist in ``skills_registry`` for UPDATE to write embeddings.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _seed_skills(self, db):
+        """Seed skills_registry rows so SkillIndex.build() can UPDATE them."""
+        from sqlalchemy import text
+
+        from api.models.skill import SkillRegistry
+        # Clear ALL embeddings — query() returns top-k by distance across the
+        # entire table, so non-test embeddings would pollute results.
+        # These DB-dependent tests must run serially (not xdist-safe).
+        db.execute(text("UPDATE skills_registry SET embedding = NULL WHERE embedding IS NOT NULL"))
+        db.query(SkillRegistry).filter(
+            SkillRegistry.skill_name.like("test_si_%"),
+        ).delete(synchronize_session=False)
+        db.commit()
+        self._db = db
+        yield
+        db.query(SkillRegistry).filter(
+            SkillRegistry.skill_name.like("test_si_%"),
+        ).delete(synchronize_session=False)
+        db.commit()
+
+    def _insert_skill(self, name, desc="desc"):
+        from api.models.skill import SkillRegistry
+        row = SkillRegistry(
+            skill_id=f"{name}@1.0.0",
+            skill_name=name,
+            version="1.0.0",
+            description=desc,
+            is_active=1,
+        )
+        self._db.add(row)
+        self._db.commit()
+
+    def test_build_indexes_all_skills(self, db, db_factory):
+        for n in ["test_si_a", "test_si_b", "test_si_c"]:
+            self._insert_skill(n)
+        skills = [_make_skill(n) for n in ["test_si_a", "test_si_b", "test_si_c"]]
+        idx = SkillIndex(embed_fn=_deterministic_embed, db_factory=db_factory)
         count = idx.build(skills)
         assert count == 3
 
-    def test_query_returns_ranked_names(self):
-        """Query should return skill names ordered by cosine similarity."""
+    def test_query_returns_all_matching_names(self, db, db_factory):
+        """Query should return all embedded skill names within distance threshold."""
+        for n in ["test_si_code_review", "test_si_deploy_k8s", "test_si_search_code"]:
+            self._insert_skill(n, desc=f"{n} description")
         skills = [
-            _make_skill("code_review", description="review pull request code quality"),
-            _make_skill("deploy_k8s", description="deploy kubernetes cluster"),
-            _make_skill("search_code", description="search codebase for patterns"),
+            _make_skill("test_si_code_review", description="review pull request code quality"),
+            _make_skill("test_si_deploy_k8s", description="deploy kubernetes cluster"),
+            _make_skill("test_si_search_code", description="search codebase for patterns"),
         ]
-        idx = SkillIndex(embed_fn=_deterministic_embed)
+        idx = SkillIndex(embed_fn=_deterministic_embed, db_factory=db_factory)
         idx.build(skills)
 
-        results = idx.query("review my pull request", top_k=3, min_score=-1)
+        results = idx.query("review my pull request", top_k=3, max_distance=999)
         assert isinstance(results, list)
         assert len(results) == 3
-        # All skill names present
-        assert set(results) == {"code_review", "deploy_k8s", "search_code"}
+        assert set(results) == {"test_si_code_review", "test_si_deploy_k8s", "test_si_search_code"}
 
-    def test_query_respects_top_k(self):
-        skills = [_make_skill(f"skill_{i}") for i in range(10)]
-        idx = SkillIndex(embed_fn=_deterministic_embed)
+    def test_query_respects_top_k(self, db, db_factory):
+        for i in range(10):
+            self._insert_skill(f"test_si_skill_{i}")
+        skills = [_make_skill(f"test_si_skill_{i}") for i in range(10)]
+        idx = SkillIndex(embed_fn=_deterministic_embed, db_factory=db_factory)
         idx.build(skills)
 
-        results = idx.query("anything", top_k=3, min_score=-1)
+        results = idx.query("anything", top_k=3, max_distance=999)
         assert len(results) == 3
 
-    def test_query_empty_index_returns_empty(self):
-        idx = SkillIndex(embed_fn=_deterministic_embed)
+    def test_query_empty_index_returns_empty(self, db, db_factory):
+        idx = SkillIndex(embed_fn=_deterministic_embed, db_factory=db_factory)
         assert idx.query("hello") == []
 
-    def test_no_embed_fn_returns_empty(self):
+    def test_no_embed_fn_returns_empty(self, db, db_factory):
         """Without embed_fn, index is inert."""
-        idx = SkillIndex(embed_fn=None)
-        assert idx.build([_make_skill("a")]) == 0
+        idx = SkillIndex(embed_fn=None, db_factory=db_factory)
+        assert idx.build([_make_skill("test_si_a")]) == 0
         assert idx.query("hello") == []
 
-    def test_build_survives_embed_failure(self):
+    def test_no_db_factory_returns_empty(self):
+        """Without db_factory, index is inert."""
+        idx = SkillIndex(embed_fn=_deterministic_embed, db_factory=None)
+        assert idx.build([_make_skill("test_si_a")]) == 0
+        assert idx.query("hello") == []
+
+    def test_build_survives_embed_failure(self, db, db_factory):
         """If embedding one skill fails, others still get indexed."""
+        for n in ["test_si_a", "test_si_b", "test_si_c"]:
+            self._insert_skill(n)
         call_count = 0
-        def flaky_embed(text):
+        def flaky_embed(text_input):
             nonlocal call_count
             call_count += 1
             if call_count == 2:
                 raise RuntimeError("boom")
-            return _deterministic_embed(text)
+            return _deterministic_embed(text_input)
 
-        skills = [_make_skill("a"), _make_skill("b"), _make_skill("c")]
-        idx = SkillIndex(embed_fn=flaky_embed)
+        skills = [_make_skill("test_si_a"), _make_skill("test_si_b"), _make_skill("test_si_c")]
+        idx = SkillIndex(embed_fn=flaky_embed, db_factory=db_factory)
         count = idx.build(skills)
         assert count == 2  # one failed
 
-    def test_query_survives_embed_failure(self):
+    def test_query_survives_embed_failure(self, db, db_factory):
         """If query embedding fails, return empty list."""
-        idx = SkillIndex(embed_fn=lambda t: (_ for _ in ()).throw(RuntimeError("boom")))
-        idx._entries = [Mock(name="x", vector=[1.0])]  # non-empty index
+        idx = SkillIndex(
+            embed_fn=lambda t: (_ for _ in ()).throw(RuntimeError("boom")),
+            db_factory=db_factory,
+        )
         assert idx.query("hello") == []
-
-    def test_rebuild_replaces_old_entries(self):
-        idx = SkillIndex(embed_fn=_deterministic_embed)
-        idx.build([_make_skill("old_skill")])
-        assert len(idx._entries) == 1
-
-        idx.build([_make_skill("new_a"), _make_skill("new_b")])
-        assert len(idx._entries) == 2
-        assert all(e.name.startswith("new_") for e in idx._entries)
-
-    def test_cosine_identical_vectors(self):
-        v = [1.0, 2.0, 3.0]
-        assert abs(_cosine(v, v) - 1.0) < 1e-9
-
-    def test_cosine_orthogonal_vectors(self):
-        a = [1.0, 0.0]
-        b = [0.0, 1.0]
-        assert abs(_cosine(a, b)) < 1e-9
-
-    def test_cosine_zero_vector(self):
-        assert _cosine([0, 0], [1, 2]) == 0.0
 
     def test_skill_text_includes_all_fields(self):
         skill = _make_skill("review", description="check code", triggers=["pr", "review"])
-        text = _skill_text(skill)
-        assert "review" in text
-        assert "check code" in text
-        assert "pr" in text
+        t = _skill_text(skill)
+        assert "review" in t
+        assert "check code" in t
+        assert "pr" in t
 
 
 # ===========================================================================
@@ -159,15 +212,26 @@ class TestEstimateTokens:
 class TestProgressiveDisclosure:
 
     @pytest.fixture
-    def selector_with_skills(self, db):
+    def selector_with_skills(self, db, db_factory):
         """Selector with pre-loaded skills and deterministic embeddings."""
-        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=_deterministic_embed)
-        for name in ["code_review", "deploy_k8s", "search_code", "ci_status", "list_prs"]:
+        names = ["code_review", "deploy_k8s", "search_code", "ci_status", "list_prs"]
+        for name in names:
+            _ensure_db_skill(db, name, f"{name} description")
+
+        sel = ModernSkillSelector(db_factory, llm_client=None, embed_fn=_deterministic_embed)
+        # Clear embeddings set by constructor, then add our test skills and rebuild
+        _clear_embeddings(db)
+        for name in names:
             skill = _make_skill(name, description=f"{name} description", triggers=[name.split("_")[0]])
             sel.rule_selector.skills[name] = skill
-        # Rebuild index with new skills
-        sel._index.build(list(sel.rule_selector.skills.values()))
-        return sel
+        sel._index.build(list(sel.rule_selector.skills.values()), force=True)
+        yield sel
+
+        # Cleanup
+        from api.models.skill import SkillRegistry as SkillModel
+        for name in names:
+            db.query(SkillModel).filter_by(skill_name=name).delete()
+        db.commit()
 
     def test_semantic_retrieval_preferred_over_keyword(self, selector_with_skills):
         """When embed_fn is available, semantic index is used first."""
@@ -184,9 +248,9 @@ class TestProgressiveDisclosure:
         assert len(called) > 0, "Semantic index should have been queried"
         assert len(tools) > 0
 
-    def test_keyword_fallback_when_no_embed(self, db):
+    def test_keyword_fallback_when_no_embed(self, db, db_factory):
         """Without embed_fn, falls back to keyword matching."""
-        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=None)
+        sel = ModernSkillSelector(db_factory, llm_client=None, embed_fn=None)
         skill = _make_skill("code_review", triggers=["review", "code"])
         sel.rule_selector.skills["code_review"] = skill
 
@@ -220,16 +284,19 @@ class TestProgressiveDisclosure:
         tools, _ = sel.get_tools_schema("code", max_candidates=5, context_budget=100000)
         assert len(tools) > 0
 
-    def test_real_token_measurement_varies_by_schema(self, db):
+    def test_real_token_measurement_varies_by_schema(self, db, db_factory):
         """Different skills produce different token costs."""
-        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=_deterministic_embed)
+        _ensure_db_skill(db, "tiny", "x")
+        _ensure_db_skill(db, "huge", "A very long description " * 50)
+        sel = ModernSkillSelector(db_factory, llm_client=None, embed_fn=_deterministic_embed)
 
         small = _make_skill("tiny", description="x")
         big = _make_skill("huge", description="A very long description " * 50,
                           triggers=["a", "b", "c", "d", "e"])
         sel.rule_selector.skills["tiny"] = small
         sel.rule_selector.skills["huge"] = big
-        sel._index.build(list(sel.rule_selector.skills.values()))
+        _clear_embeddings(db)
+        sel._index.build(list(sel.rule_selector.skills.values()), force=True)
 
         schema_small = sel._skill_to_tool_schema(small)
         schema_big = sel._skill_to_tool_schema(big)
@@ -241,8 +308,8 @@ class TestProgressiveDisclosure:
         tools, _ = sel.get_tools_schema("code", max_candidates=2, context_budget=100000)
         assert len(tools) <= 2
 
-    def test_empty_skill_registry_returns_empty(self, db):
-        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=_deterministic_embed)
+    def test_empty_skill_registry_returns_empty(self, db, db_factory):
+        sel = ModernSkillSelector(db_factory, llm_client=None, embed_fn=_deterministic_embed)
         # Clear all skills to simulate empty registry
         sel.rule_selector.skills.clear()
         sel._index.build([])
@@ -261,13 +328,16 @@ class TestProgressiveDisclosure:
 class TestFallbackSelection:
 
     @pytest.fixture
-    def selector_with_llm(self, db):
+    def selector_with_llm(self, db, db_factory):
         mock_llm = Mock()
-        sel = ModernSkillSelector(lambda: db, llm_client=mock_llm, embed_fn=_deterministic_embed)
+        _ensure_db_skill(db, "code_review", "review code")
+        sel = ModernSkillSelector(db_factory, llm_client=mock_llm, embed_fn=_deterministic_embed)
+        # Clear embeddings set by constructor, then add our test skill and rebuild
+        _clear_embeddings(db)
         skill = _make_skill("code_review", description="review code", triggers=["review"])
-        sel.rule_selector.skills = {"code_review": skill}  # isolate from DB
-        sel._index.build([skill])
-        sel._index.MIN_SCORE = -1
+        sel.rule_selector.skills = {"code_review": skill}
+        sel._index.build([skill], force=True)
+        sel._index.MAX_L2_DISTANCE = 999
         return sel, mock_llm
 
     def test_fallback_returns_top_ranked_candidate(self, selector_with_llm):
@@ -282,23 +352,30 @@ class TestFallbackSelection:
         assert result[0]["function"]["arguments"] is None
         assert result[0]["fallback"] is True
 
-    def test_fallback_preserves_ranking_order(self, db):
-        """Fallback should use the semantic/keyword ranked order, not arbitrary."""
+    def test_fallback_preserves_ranking_order(self, db, db_factory):
+        """Fallback should return the same top-ranked skill as semantic retrieval."""
         mock_llm = Mock()
         mock_llm.chat_with_tools.side_effect = RuntimeError("boom")
 
-        sel = ModernSkillSelector(lambda: db, llm_client=mock_llm, embed_fn=_deterministic_embed)
-        # Add multiple skills
+        for name in ["deploy_k8s", "code_review", "search_code"]:
+            _ensure_db_skill(db, name, f"{name} desc")
+        sel = ModernSkillSelector(db_factory, llm_client=mock_llm, embed_fn=_deterministic_embed)
         for name in ["deploy_k8s", "code_review", "search_code"]:
             skill = _make_skill(name, description=f"{name} desc", triggers=[name.split("_")[0]])
             sel.rule_selector.skills[name] = skill
-        sel._index.build(list(sel.rule_selector.skills.values()))
+        _clear_embeddings(db)
+        sel._index.build(list(sel.rule_selector.skills.values()), force=True)
+        sel._index.MAX_L2_DISTANCE = 999
+
+        # Get the expected top-ranked skill from semantic retrieval
+        expected_top = sel._index.query("review code quality", top_k=1, max_distance=999)
+        assert len(expected_top) == 1, "Semantic index should return at least 1 result"
 
         result = sel.select_and_execute("review code quality")
 
         assert len(result) == 1
-        # Should be the top-ranked skill from semantic retrieval, not arbitrary
-        assert result[0]["function"]["name"] in sel.rule_selector.skills
+        assert result[0]["function"]["name"] == expected_top[0], \
+            f"Fallback should return top-ranked '{expected_top[0]}', got '{result[0]['function']['name']}'"
 
     def test_fallback_logs_warning(self, selector_with_llm, caplog):
         """Fallback should log a warning with skill name and candidate count."""
@@ -312,12 +389,12 @@ class TestFallbackSelection:
         assert any("Fallback selection" in r.message for r in caplog.records)
         assert any("code_review" in r.message for r in caplog.records)
 
-    def test_fallback_with_no_candidates_returns_empty(self, db):
+    def test_fallback_with_no_candidates_returns_empty(self, db, db_factory):
         """If no candidates found, fallback should return empty list."""
         mock_llm = Mock()
         mock_llm.chat_with_tools.side_effect = RuntimeError("boom")
 
-        sel = ModernSkillSelector(lambda: db, llm_client=mock_llm, embed_fn=_deterministic_embed)
+        sel = ModernSkillSelector(db_factory, llm_client=mock_llm, embed_fn=_deterministic_embed)
         sel.rule_selector.skills.clear()
         sel._index.build([])
 
@@ -379,9 +456,9 @@ class TestInlineRefs:
 
 class TestRegistryCache:
 
-    def test_registry_cached_in_init(self, db):
+    def test_registry_cached_in_init(self, db, db_factory):
         """SkillRegistry should be instantiated once in __init__, not per schema call."""
-        sel = ModernSkillSelector(lambda: db, llm_client=None)
+        sel = ModernSkillSelector(db_factory, llm_client=None)
         assert hasattr(sel, "_registry")
 
         # Call _skill_to_tool_schema multiple times — should reuse same registry
@@ -397,23 +474,23 @@ class TestRegistryCache:
 
 class TestPipelineEmbedIntegration:
 
-    def test_pipeline_passes_embed_fn_to_selector(self, db):
+    def test_pipeline_passes_embed_fn_to_selector(self, db, db_factory):
         """SkillPipeline should auto-resolve embed_fn and pass to ModernSkillSelector."""
         from core.skills.pipeline import SkillPipeline
 
         custom_embed = Mock(return_value=[0.1] * 32)
-        pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False,
+        pipeline = SkillPipeline(db_factory, llm_client=None, audit=False, learning=False,
                                  embed_fn=custom_embed)
         # The internal selector should have a SkillIndex with our embed_fn
         assert pipeline._modern._index._embed is custom_embed
 
-    def test_pipeline_works_without_embed_fn(self, db):
+    def test_pipeline_works_without_embed_fn(self, db, db_factory):
         """Pipeline should work even if no embed_fn is available."""
         from core.skills.pipeline import SkillPipeline
 
         # Patch get_embedding_client so it raises — pipeline should fall back to None
         with patch("core.context.embeddings.get_embedding_client", side_effect=Exception("no embeddings")):
-            pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False,
+            pipeline = SkillPipeline(db_factory, llm_client=None, audit=False, learning=False,
                                      embed_fn=None)
         # Should have fallen back to None
         assert pipeline._modern._index._embed is None
@@ -432,15 +509,16 @@ class TestEmbeddingQuality:
     True semantic quality requires integration tests with a real embedding model.
     """
 
-    def test_semantic_similarity_ranks_relevant_skills_higher(self, db):
-        """Verify 'review PR' query ranks code_review higher than deploy_k8s."""
+    def test_retrieval_pipeline_ranks_by_embedding_distance(self, db, db_factory):
+        """Verify the full retrieval pipeline: embed → store → query → rank → return."""
         from core.context.embeddings import EmbeddingService
-        
-        # Use mock embedding service (simple bag-of-words)
-        embed_service = EmbeddingService(lambda: db, provider="mock")
-        embed_fn = lambda text: embed_service.embed_text(text)
-        
-        # Create skills with distinct semantic content
+
+        embed_service = EmbeddingService(db_factory, provider="mock")
+        def embed_fn(t): return embed_service.embed_text(t)
+
+        _ensure_db_skill(db, "code_review", "Review code changes in pull requests for quality and security")
+        _ensure_db_skill(db, "deploy_k8s", "Deploy application to Kubernetes cluster")
+
         code_review = _make_skill(
             "code_review",
             description="Review code changes in pull requests for quality and security",
@@ -451,69 +529,73 @@ class TestEmbeddingQuality:
             description="Deploy application to Kubernetes cluster",
             triggers=["deploy", "kubernetes", "k8s", "cluster"]
         )
-        
-        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=embed_fn)
+
+        sel = ModernSkillSelector(db_factory, llm_client=None, embed_fn=embed_fn)
         sel.rule_selector.skills = {
             "code_review": code_review,
             "deploy_k8s": deploy_k8s,
         }
-        sel._index.build([code_review, deploy_k8s])
-        sel._index.MIN_SCORE = -1  # mock embeddings: test pipeline, not quality
-        
+        _clear_embeddings(db)
+        sel._index.build([code_review, deploy_k8s], force=True)
+        sel._index.MAX_L2_DISTANCE = 999
+
         # Query: "review PR" should rank code_review higher than deploy_k8s
         tools, method = sel.get_tools_schema("review PR code", max_candidates=3)
-        
+
         assert method == "semantic"
         assert len(tools) >= 1
-        
+
         # Extract skill names in order
         skill_names = [t["function"]["name"] for t in tools]
-        
-        # code_review should appear before deploy_k8s (more relevant)
-        if "code_review" in skill_names and "deploy_k8s" in skill_names:
-            code_idx = skill_names.index("code_review")
-            deploy_idx = skill_names.index("deploy_k8s")
-            assert code_idx < deploy_idx, \
-                f"code_review should rank higher than deploy_k8s for 'review PR code', got {skill_names}"
 
-    def test_keyword_fallback_still_works(self, db):
+        # Both skills must appear (MAX_L2_DISTANCE=999 disables threshold)
+        assert "code_review" in skill_names, f"code_review missing from {skill_names}"
+        assert "deploy_k8s" in skill_names, f"deploy_k8s missing from {skill_names}"
+        # code_review should appear before deploy_k8s (more relevant to "review PR")
+        assert skill_names.index("code_review") < skill_names.index("deploy_k8s"), \
+            f"code_review should rank higher than deploy_k8s for 'review PR code', got {skill_names}"
+
+    def test_keyword_fallback_still_works(self, db, db_factory):
         """Verify keyword fallback when no embedding available."""
         code_review = _make_skill(
             "code_review",
             description="Review code",
             triggers=["review", "code"]
         )
-        
-        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=None)
+
+        sel = ModernSkillSelector(db_factory, llm_client=None, embed_fn=None)
         sel.rule_selector.skills = {"code_review": code_review}
-        
+
         tools, method = sel.get_tools_schema("review code", max_candidates=3)
-        
+
         assert method == "keyword"
         assert len(tools) == 1
         assert tools[0]["function"]["name"] == "code_review"
 
-    def test_semantic_retrieval_handles_synonyms(self, db):
+    def test_semantic_retrieval_handles_synonyms(self, db, db_factory):
         """Verify semantic retrieval finds skills even with different wording."""
         from core.context.embeddings import EmbeddingService
-        
-        embed_service = EmbeddingService(lambda: db, provider="mock")
-        embed_fn = lambda text: embed_service.embed_text(text)
-        
+
+        embed_service = EmbeddingService(db_factory, provider="mock")
+        def embed_fn(t): return embed_service.embed_text(t)
+
+        _ensure_db_skill(db, "code_review", "Review code changes in pull requests")
+
         code_review = _make_skill(
             "code_review",
             description="Review code changes in pull requests",
             triggers=["review", "pr"]
         )
-        
-        sel = ModernSkillSelector(lambda: db, llm_client=None, embed_fn=embed_fn)
+
+        sel = ModernSkillSelector(db_factory, llm_client=None, embed_fn=embed_fn)
         sel.rule_selector.skills = {"code_review": code_review}
-        sel._index.build([code_review])
-        sel._index.MIN_SCORE = -1  # mock embeddings: test pipeline, not quality
-        
+        _clear_embeddings(db)
+        sel._index.build([code_review], force=True)
+        sel._index.MAX_L2_DISTANCE = 999  # mock embeddings: test pipeline, not quality
+
         # Query with synonyms: "inspect merge request"
         tools, method = sel.get_tools_schema("inspect merge request", max_candidates=3)
-        
+
         assert method == "semantic"
         # Should find code_review despite different wording
         # (mock embedding uses bag-of-words, so "request" matches "requests")

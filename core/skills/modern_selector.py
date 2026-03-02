@@ -38,7 +38,7 @@ class ModernSkillSelector:
 
         # Semantic index — primary retrieval path when available
         from core.skills.skill_index import SkillIndex
-        self._index = SkillIndex(embed_fn=embed_fn)
+        self._index = SkillIndex(embed_fn=embed_fn, db_factory=db_factory)
         if embed_fn:
             self._index.build(list(self.rule_selector.skills.values()))
 

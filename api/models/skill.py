@@ -43,6 +43,7 @@ class SkillRegistry(Base):
     created_by = Column(String(36))
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    embedding = Column(VectorType(EMBEDDING_DIM, VectorPrecision.F32))
 
 
 class SkillInstallation(Base):
