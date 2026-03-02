@@ -203,3 +203,214 @@ class TestBackwardCompat:
             assert inst.status == "installed"
         finally:
             _cleanup(db_session, consumer, base)
+
+
+class TestUninstallReverseDep:
+    """uninstall() rejects when other installed skills depend on the target."""
+
+    def test_blocked_when_dependent_exists(self, mgr, db_session):
+        base = _uid("base")
+        app = _uid("app")
+        _add_skill(db_session, base, "1.0.0")
+        _add_skill(db_session, app, depends_on=[
+            {"name": base, "version": ">=1.0", "type": "skill"},
+        ])
+        db_session.commit()
+        try:
+            mgr.install("user-1", base)
+            mgr.install("user-1", app)
+            with pytest.raises(DependencyConflictError):
+                mgr.uninstall("user-1", base)
+            # Still installed
+            assert mgr.get_installation("user-1", base) is not None
+        finally:
+            _cleanup(db_session, app, base)
+
+    def test_force_bypasses(self, mgr, db_session):
+        base = _uid("base")
+        app = _uid("app")
+        _add_skill(db_session, base, "1.0.0")
+        _add_skill(db_session, app, depends_on=[
+            {"name": base, "version": ">=1.0", "type": "skill"},
+        ])
+        db_session.commit()
+        try:
+            mgr.install("user-1", base)
+            mgr.install("user-1", app)
+            mgr.uninstall("user-1", base, force=True)
+            assert mgr.get_installation("user-1", base) is None
+        finally:
+            _cleanup(db_session, app, base)
+
+    def test_old_format_detected(self, mgr, db_session):
+        """Old-format depends_on: ["base"] is detected as reverse dep."""
+        base = _uid("base")
+        app = _uid("app")
+        _add_skill(db_session, base, "1.0.0")
+        _add_skill(db_session, app, depends_on=[base])
+        db_session.commit()
+        try:
+            mgr.install("user-1", base)
+            mgr.install("user-1", app)
+            with pytest.raises(DependencyConflictError):
+                mgr.uninstall("user-1", base)
+        finally:
+            _cleanup(db_session, app, base)
+
+
+class TestUpgradeDepValidation:
+    """upgrade() validates both reverse and forward dependencies."""
+
+    def test_blocked_when_new_version_breaks_dependent(self, mgr, db_session):
+        """app requires base ~=1.0 → upgrading base to 2.0.0 is rejected."""
+        base = _uid("base")
+        app = _uid("app")
+        _add_skill(db_session, base, "1.0.0")
+        _add_skill(db_session, app, depends_on=[
+            {"name": base, "version": "~=1.0", "type": "skill"},
+        ])
+        db_session.commit()
+        try:
+            mgr.install("user-1", base)
+            mgr.install("user-1", app)
+            # Bump registry to 2.0.0
+            db_session.query(SkillRegistry).filter_by(skill_name=base).update({"version": "2.0.0"})
+            db_session.commit()
+            with pytest.raises(DependencyConflictError):
+                mgr.upgrade("user-1", base)
+            assert mgr.get_installation("user-1", base).skill_version == "1.0.0"
+        finally:
+            _cleanup(db_session, app, base)
+
+    def test_compatible_upgrade_succeeds(self, mgr, db_session):
+        """app requires base ~=1.0 → upgrading base to 1.5.0 is OK."""
+        base = _uid("base")
+        app = _uid("app")
+        _add_skill(db_session, base, "1.0.0")
+        _add_skill(db_session, app, depends_on=[
+            {"name": base, "version": "~=1.0", "type": "skill"},
+        ])
+        db_session.commit()
+        try:
+            mgr.install("user-1", base)
+            mgr.install("user-1", app)
+            db_session.query(SkillRegistry).filter_by(skill_name=base).update({"version": "1.5.0"})
+            db_session.commit()
+            inst = mgr.upgrade("user-1", base)
+            assert inst.skill_version == "1.5.0"
+            assert inst.previous_version == "1.0.0"
+        finally:
+            _cleanup(db_session, app, base)
+
+    def test_blocked_when_new_version_needs_missing_dep(self, mgr, db_session):
+        """New version adds a dependency that doesn't exist."""
+        evolving = _uid("evolving")
+        _add_skill(db_session, evolving, "1.0.0")
+        db_session.commit()
+        try:
+            mgr.install("user-1", evolving)
+            db_session.query(SkillRegistry).filter_by(skill_name=evolving).update({
+                "version": "2.0.0",
+                "manifest": {"depends_on": [{"name": "ghost", "version": ">=1.0", "type": "skill"}]},
+            })
+            db_session.commit()
+            with pytest.raises(SkillNotFoundError, match="Missing dependencies"):
+                mgr.upgrade("user-1", evolving)
+        finally:
+            _cleanup(db_session, evolving)
+
+
+class TestRollbackDepValidation:
+    """rollback() validates reverse dependencies against previous_version."""
+
+    def test_blocked_when_old_version_breaks_dependent(self, mgr, db_session):
+        """consumer requires core >=2.0 → rollback core to 1.0.0 is rejected."""
+        core = _uid("core")
+        consumer = _uid("consumer")
+        _add_skill(db_session, core, "2.0.0")
+        _add_skill(db_session, consumer, depends_on=[
+            {"name": core, "version": ">=2.0", "type": "skill"},
+        ])
+        db_session.commit()
+        try:
+            mgr.install("user-1", core)
+            mgr.install("user-1", consumer)
+            # Simulate previous_version
+            from api.models import SkillInstallation
+            db_session.query(SkillInstallation).filter_by(
+                user_id="user-1", skill_name=core, status="installed",
+            ).update({"previous_version": "1.0.0"})
+            db_session.commit()
+            with pytest.raises(DependencyConflictError):
+                mgr.rollback("user-1", core)
+            assert mgr.get_installation("user-1", core).skill_version == "2.0.0"
+        finally:
+            _cleanup(db_session, consumer, core)
+
+    def test_compatible_rollback_succeeds(self, mgr, db_session):
+        """consumer requires core >=1.0 → rollback core from 2.0.0 to 1.5.0 is OK."""
+        core = _uid("core")
+        consumer = _uid("consumer")
+        _add_skill(db_session, core, "2.0.0")
+        _add_skill(db_session, consumer, depends_on=[
+            {"name": core, "version": ">=1.0", "type": "skill"},
+        ])
+        db_session.commit()
+        try:
+            mgr.install("user-1", core)
+            mgr.install("user-1", consumer)
+            from api.models import SkillInstallation
+            db_session.query(SkillInstallation).filter_by(
+                user_id="user-1", skill_name=core, status="installed",
+            ).update({"previous_version": "1.5.0"})
+            db_session.commit()
+            inst = mgr.rollback("user-1", core)
+            assert inst.skill_version == "1.5.0"
+            assert inst.previous_version == "2.0.0"
+        finally:
+            _cleanup(db_session, consumer, core)
+
+
+class TestRequireExecutableVersionCheck:
+    """require_executable() checks dependency version compatibility at runtime."""
+
+    def test_catches_version_mismatch(self, mgr, db_session):
+        dep = _uid("dep")
+        caller = _uid("caller")
+        _add_skill(db_session, dep, "0.5.0")
+        _add_skill(db_session, caller, depends_on=[
+            {"name": dep, "version": ">=1.0", "type": "skill"},
+        ])
+        db_session.commit()
+        try:
+            from api.models import SkillInstallation
+            for name, ver in [(dep, "0.5.0"), (caller, "1.0.0")]:
+                db_session.add(SkillInstallation(
+                    installation_id=str(uuid.uuid4()), user_id="user-1", skill_name=name,
+                    skill_version=ver, status="installed", installed_at=_now(),
+                ))
+            db_session.commit()
+            with pytest.raises(SkillNotInstalledError, match="does not satisfy"):
+                mgr.require_executable("user-1", caller)
+        finally:
+            _cleanup(db_session, caller, dep)
+
+    def test_passes_when_version_matches(self, mgr, db_session):
+        dep = _uid("dep")
+        caller = _uid("caller")
+        _add_skill(db_session, dep, "1.2.0")
+        _add_skill(db_session, caller, depends_on=[
+            {"name": dep, "version": ">=1.0,<2.0", "type": "skill"},
+        ])
+        db_session.commit()
+        try:
+            from api.models import SkillInstallation
+            for name, ver in [(dep, "1.2.0"), (caller, "1.0.0")]:
+                db_session.add(SkillInstallation(
+                    installation_id=str(uuid.uuid4()), user_id="user-1", skill_name=name,
+                    skill_version=ver, status="installed", installed_at=_now(),
+                ))
+            db_session.commit()
+            mgr.require_executable("user-1", caller)  # should not raise
+        finally:
+            _cleanup(db_session, caller, dep)

@@ -7,6 +7,7 @@ from api.database import SessionLocal
 from api.dependencies import get_current_user
 from config.settings import get_settings
 from core.skills.credential_manager import CredentialManager
+from core.skills.resolver import CircularDependencyError, DependencyConflictError
 from core.skills.skill_manager import (
     PermissionDeniedError,
     SkillManager,
@@ -70,6 +71,8 @@ async def install_skill(
         )
     except SkillNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except (SkillNotInstalledError, DependencyConflictError, CircularDependencyError) as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except PermissionDeniedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
 
@@ -84,6 +87,8 @@ async def uninstall_skill(
         _mgr().uninstall(current_user["user_id"], req.skill_name)
     except SkillNotInstalledError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except DependencyConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
 
 @router.post("/upgrade", response_model=InstallationResponse)
@@ -104,6 +109,8 @@ async def upgrade_skill(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except SkillNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except (DependencyConflictError, CircularDependencyError) as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
 
 @router.post("/rollback", response_model=InstallationResponse)
@@ -122,6 +129,8 @@ async def rollback_skill(
         )
     except SkillNotInstalledError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except DependencyConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
 
 
 @router.get("/installed", response_model=InstalledListResponse)

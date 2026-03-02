@@ -141,6 +141,8 @@ class SkillManager(DbConsumer):
 
             # Check direct dependencies (existence + version compatibility)
             if defn.manifest:
+                from core.skills.version import VersionConstraint
+
                 raw_deps = defn.manifest.get("depends_on", [])
                 deps = parse_depends_on(raw_deps) if raw_deps else []
                 for dep in deps:
@@ -151,7 +153,6 @@ class SkillManager(DbConsumer):
                                 f"Dependency '{dep.name}' required by '{skill_name}' is not installed"
                             )
                         if dep.version_constraint != "*" and dep_inst.skill_version:
-                            from core.skills.version import VersionConstraint
                             try:
                                 if not VersionConstraint(dep.version_constraint).matches(dep_inst.skill_version):
                                     raise SkillNotInstalledError(
@@ -299,6 +300,10 @@ class SkillManager(DbConsumer):
         """Find installed skills that depend on *skill_name*.
 
         Returns list of (dependent_name, version_constraint).
+
+        Performance: O(N) queries where N = number of installed skills.
+        Acceptable for low-frequency mutation operations (uninstall/upgrade/rollback).
+        If this becomes a bottleneck, batch-load all SkillRegistry rows in one query.
         """
         installed = (
             db.query(SkillInstallation)
@@ -340,7 +345,6 @@ class SkillManager(DbConsumer):
             except ValueError:
                 broken.append((dep_name, constraint_str))
         if broken:
-            from core.skills.resolver import Conflict
             conflicts = [Conflict(
                 dependency=skill_name,
                 required_by=broken,
@@ -438,7 +442,7 @@ class SkillManager(DbConsumer):
         """Rollback a skill to its previous version.
 
         Validates that the old version satisfies all dependents' constraints
-        and that the old version's own dependencies are met.
+        and that the old version's own dependencies are still met.
 
         Raises SkillNotInstalledError if not installed or no previous version.
         """
@@ -454,6 +458,22 @@ class SkillManager(DbConsumer):
             self._check_version_satisfies_dependents(
                 db, user_id, skill_name, prev,
             )
+
+            # Forward: old version's own deps must still be resolvable + installed.
+            # NOTE: uses current registry manifest, not the historical manifest for
+            # previous_version (registry only stores one active version). This is a
+            # known limitation — see skills-and-tools.md §12.
+            defn = self._get_definition(db, skill_name)
+            if defn and defn.manifest:
+                raw_deps = defn.manifest.get("depends_on", [])
+                if raw_deps:
+                    deps = parse_depends_on(raw_deps)
+                    for dep in deps:
+                        if dep.type == DependencyType.SKILL:
+                            if self._get_installation(db, user_id, dep.name) is None:
+                                raise SkillNotInstalledError(
+                                    f"Dependency '{dep.name}' must be installed before rolling back '{skill_name}'"
+                                )
 
             inst.skill_version, inst.previous_version = prev, inst.skill_version
             inst.updated_at = _now()
