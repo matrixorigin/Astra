@@ -180,6 +180,554 @@ class TestSessionAnalyzer:
 
 
 # ============================================================================
+# 1b. Execution tree, summary, cost, and ASCII rendering (unit tests)
+# ============================================================================
+
+class TestCalculateCost:
+    """Unit tests for _calculate_cost."""
+
+    def test_known_model(self):
+        from core.agent.session_analyzer import _calculate_cost
+        cost = _calculate_cost("gpt-4o", 1_000_000, 1_000_000)
+        assert cost == pytest.approx(2.50 + 10.00)
+
+    def test_prefix_match(self):
+        from core.agent.session_analyzer import _calculate_cost
+        cost = _calculate_cost("gpt-4o-2024-08-06", 1_000_000, 0)
+        assert cost == pytest.approx(2.50)
+
+    def test_unknown_model_returns_zero(self):
+        from core.agent.session_analyzer import _calculate_cost
+        cost = _calculate_cost("unknown-model-xyz", 1000, 1000)
+        assert cost == 0.0
+
+    def test_zero_tokens(self):
+        from core.agent.session_analyzer import _calculate_cost
+        assert _calculate_cost("gpt-4o", 0, 0) == 0.0
+
+
+class TestExecutionNodeAscii:
+    """Unit tests for ExecutionNode.to_ascii rendering."""
+
+    def test_single_node(self):
+        from core.agent.session_analyzer import ExecutionNode
+        node = ExecutionNode(
+            node_id="1", node_type="user_query", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=5.0, detail="hello",
+        )
+        lines = node.to_ascii()
+        assert len(lines) == 1
+        assert "user_query" in lines[0]
+        assert "hello" in lines[0]
+        assert "5.00s" in lines[0]
+
+    def test_parent_duration_pct_shown(self):
+        from core.agent.session_analyzer import ExecutionNode
+        node = ExecutionNode(
+            node_id="1", node_type="llm_response", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=3.0,
+            parent_duration_pct=75.0,
+        )
+        lines = node.to_ascii()
+        assert "75%" in lines[0]
+
+    def test_parent_duration_pct_zero_shown(self):
+        """parent_duration_pct=0.0 should still render (not be skipped by truthiness)."""
+        from core.agent.session_analyzer import ExecutionNode
+        node = ExecutionNode(
+            node_id="1", node_type="llm_response", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            parent_duration_pct=0.0,
+        )
+        lines = node.to_ascii()
+        assert "0%" in lines[0]
+
+    def test_tokens_displayed(self):
+        from core.agent.session_analyzer import ExecutionNode
+        node = ExecutionNode(
+            node_id="1", node_type="llm_response", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            tokens_in=100, tokens_out=50,
+        )
+        lines = node.to_ascii()
+        assert "100→50 tokens" in lines[0]
+
+    def test_cost_displayed(self):
+        from core.agent.session_analyzer import ExecutionNode
+        node = ExecutionNode(
+            node_id="1", node_type="llm_response", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            cost_usd=0.0123,
+        )
+        lines = node.to_ascii()
+        assert "$0.0123" in lines[0]
+
+    def test_issues_displayed(self):
+        from core.agent.session_analyzer import ExecutionNode
+        node = ExecutionNode(
+            node_id="1", node_type="tool_result", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=15.0,
+            issues=["SLOW", "BOTTLENECK"],
+        )
+        lines = node.to_ascii()
+        assert "SLOW" in lines[0]
+        assert "BOTTLENECK" in lines[0]
+
+    def test_children_rendered(self):
+        from core.agent.session_analyzer import ExecutionNode
+        child = ExecutionNode(
+            node_id="c1", node_type="tool_call", event_id="c1",
+            ts=datetime(2026, 1, 1), duration_s=0,
+            detail="bash",
+        )
+        parent = ExecutionNode(
+            node_id="p1", node_type="llm_response", event_id="p1",
+            ts=datetime(2026, 1, 1), duration_s=2.0,
+            children=[child],
+        )
+        lines = parent.to_ascii()
+        assert len(lines) == 2
+        assert "└─" in lines[1]
+        assert "bash" in lines[1]
+
+    def test_tool_result_metadata_rendered(self):
+        from core.agent.session_analyzer import ExecutionNode
+        node = ExecutionNode(
+            node_id="1", node_type="tool_result", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            metadata={"api_latency_ms": 500, "result_size_bytes": 2048, "result_size_tokens": 300},
+        )
+        lines = node.to_ascii()
+        assert any("api_latency: 500ms" in l for l in lines)
+        assert any("result_size: 2.0KB" in l for l in lines)
+        assert any("tokens_added: 300" in l for l in lines)
+
+
+class TestBuildExecutionTree:
+    """Unit tests for _build_execution_tree and _build_basic_tree."""
+
+    def _make_row(self, event_id, event_type, content, skill_name, ts, agent_id="agent", metadata=None):
+        """Create a fake DB row tuple matching the SELECT column order."""
+        return (event_id, event_type, content, skill_name, ts, agent_id, metadata or {})
+
+    def _make_analyzer(self):
+        from core.agent.session_analyzer import SessionAnalyzer
+        # SessionAnalyzer needs a db_factory but tree building doesn't use DB
+        return SessionAnalyzer(db_factory=lambda: None)
+
+    def test_empty_rows(self):
+        analyzer = self._make_analyzer()
+        tree = analyzer._build_execution_tree([])
+        assert tree.node_type == "empty"
+
+    def test_single_user_query(self):
+        analyzer = self._make_analyzer()
+        rows = [self._make_row("e1", "user_query", "hello", None, datetime(2026, 1, 1, 0, 0, 0))]
+        tree = analyzer._build_execution_tree(rows)
+        assert tree.node_type == "session"
+        assert len(tree.children) == 1
+        assert tree.children[0].node_type == "user_query"
+
+    def test_simple_turn(self):
+        """user_query → llm_response should produce correct parent-child."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "hello", None, t0),
+            self._make_row("e2", "llm_response", "world", None, t0 + timedelta(seconds=2)),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        uq = tree.children[0]
+        assert uq.node_type == "user_query"
+        assert len(uq.children) == 1
+        llm = uq.children[0]
+        assert llm.node_type == "llm_response"
+        assert llm.duration_s == pytest.approx(2.0)
+
+    def test_multi_turn_tool_use(self):
+        """user_query → llm → tool_call → tool_result → llm (turn 2)."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "do stuff", None, t0),
+            self._make_row("e2", "llm_response", "calling tool", None, t0 + timedelta(seconds=1)),
+            self._make_row("e3", "tool_call", json.dumps({"name": "bash"}), "bash", t0 + timedelta(seconds=2)),
+            self._make_row("e4", "tool_result", json.dumps({"name": "bash", "result": "ok"}), "bash", t0 + timedelta(seconds=5)),
+            self._make_row("e5", "llm_response", "done", None, t0 + timedelta(seconds=7)),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        uq = tree.children[0]
+        assert uq.node_type == "user_query"
+        # Should have 2 llm_response children (turn 1 and turn 2)
+        llm_children = [c for c in uq.children if c.node_type == "llm_response"]
+        assert len(llm_children) == 2, f"Expected 2 llm_responses, got {len(llm_children)}"
+
+        # First llm_response should have tool_call child
+        llm1 = llm_children[0]
+        tool_calls = [c for c in llm1.children if c.node_type == "tool_call"]
+        assert len(tool_calls) == 1
+        assert tool_calls[0].detail == "bash"
+
+        # tool_call should have tool_result child
+        assert len(tool_calls[0].children) == 1
+        assert tool_calls[0].children[0].node_type == "tool_result"
+        assert tool_calls[0].children[0].duration_s == pytest.approx(3.0)
+
+    def test_multiple_tool_calls_in_one_turn(self):
+        """llm_response with 2 tool_calls, each matched to its result."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "q", None, t0),
+            self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
+            self._make_row("e3", "tool_call", json.dumps({"name": "foo"}), "foo", t0 + timedelta(seconds=2)),
+            self._make_row("e4", "tool_call", json.dumps({"name": "bar"}), "bar", t0 + timedelta(seconds=3)),
+            self._make_row("e5", "tool_result", json.dumps({"name": "foo", "result": "ok"}), "foo", t0 + timedelta(seconds=5)),
+            self._make_row("e6", "tool_result", json.dumps({"name": "bar", "result": "ok"}), "bar", t0 + timedelta(seconds=6)),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        llm = tree.children[0].children[0]
+        assert len(llm.children) == 2
+        assert llm.children[0].detail == "foo"
+        assert llm.children[1].detail == "bar"
+        # Each tool_call should have exactly one tool_result child
+        assert len(llm.children[0].children) == 1
+        assert len(llm.children[1].children) == 1
+        assert llm.children[0].children[0].detail == "foo"
+        assert llm.children[1].children[0].detail == "bar"
+
+    def test_tool_call_duration_is_zero(self):
+        """tool_call node itself should have duration=0 (not fake 0.05s)."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "q", None, t0),
+            self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
+            self._make_row("e3", "tool_call", json.dumps({"name": "x"}), "x", t0 + timedelta(seconds=2)),
+            self._make_row("e4", "tool_result", json.dumps({"name": "x", "result": "ok"}), "x", t0 + timedelta(seconds=4)),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        llm = tree.children[0].children[0]
+        tc = llm.children[0]
+        assert tc.node_type == "tool_call"
+        assert tc.duration_s == 0
+
+    def test_malformed_content_no_crash(self):
+        """Malformed JSON in tool_call/tool_result should not crash."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "q", None, t0),
+            self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
+            self._make_row("e3", "tool_call", "not json", "fallback_skill", t0 + timedelta(seconds=2)),
+            self._make_row("e4", "tool_result", "also not json", "fallback_skill", t0 + timedelta(seconds=3)),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        # Should not raise; tool_call should use skill_name as fallback
+        llm = tree.children[0].children[0]
+        assert llm.children[0].detail == "fallback_skill"
+
+    def test_orphan_tool_result_attached(self):
+        """tool_result with no matching tool_call should still appear in tree."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "q", None, t0),
+            self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
+            self._make_row("e3", "tool_result", json.dumps({"name": "orphan", "result": "ok"}), "orphan", t0 + timedelta(seconds=2)),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        llm = tree.children[0].children[0]
+        # Orphan should be attached directly to llm_response
+        assert any(c.node_type == "tool_result" and c.detail == "orphan" for c in llm.children)
+
+    def test_other_event_types_attached(self):
+        """Non-standard event types (e.g. system_message) should appear as leaves."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "q", None, t0),
+            self._make_row("e2", "system_message", "sys msg", None, t0 + timedelta(seconds=1)),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        uq = tree.children[0]
+        assert any(c.node_type == "system_message" for c in uq.children)
+
+    def test_user_query_duration_spans_descendants(self):
+        """user_query duration should span from its ts to its last descendant."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "q", None, t0),
+            self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=5)),
+            self._make_row("e3", "tool_call", json.dumps({"name": "x"}), "x", t0 + timedelta(seconds=6)),
+            self._make_row("e4", "tool_result", json.dumps({"name": "x", "result": "ok"}), "x", t0 + timedelta(seconds=20)),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        uq = tree.children[0]
+        assert uq.duration_s == pytest.approx(20.0)
+
+
+class TestCalculateMetrics:
+    """Unit tests for _calculate_metrics issue detection."""
+
+    def _make_analyzer(self):
+        from core.agent.session_analyzer import SessionAnalyzer
+        return SessionAnalyzer(db_factory=lambda: None)
+
+    def test_slow_detection(self):
+        from core.agent.session_analyzer import ExecutionNode, SLOW_NODE_THRESHOLD_S
+        analyzer = self._make_analyzer()
+        node = ExecutionNode(
+            node_id="1", node_type="tool_result", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=SLOW_NODE_THRESHOLD_S,
+        )
+        analyzer._calculate_metrics(node, None)
+        assert "SLOW" in node.issues
+
+    def test_not_slow_below_threshold(self):
+        from core.agent.session_analyzer import ExecutionNode, SLOW_NODE_THRESHOLD_S
+        analyzer = self._make_analyzer()
+        node = ExecutionNode(
+            node_id="1", node_type="tool_result", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=SLOW_NODE_THRESHOLD_S - 1,
+        )
+        analyzer._calculate_metrics(node, None)
+        assert "SLOW" not in node.issues
+
+    def test_bottleneck_detection(self):
+        from core.agent.session_analyzer import ExecutionNode
+        analyzer = self._make_analyzer()
+        parent = ExecutionNode(
+            node_id="p", node_type="user_query", event_id="p",
+            ts=datetime(2026, 1, 1), duration_s=10.0,
+        )
+        child = ExecutionNode(
+            node_id="c", node_type="llm_response", event_id="c",
+            ts=datetime(2026, 1, 1), duration_s=8.0,
+        )
+        analyzer._calculate_metrics(child, parent)
+        assert "BOTTLENECK" in child.issues
+        assert child.parent_duration_pct == pytest.approx(80.0)
+
+    def test_high_token_detection(self):
+        from core.agent.session_analyzer import ExecutionNode, HIGH_TOKEN_THRESHOLD
+        analyzer = self._make_analyzer()
+        node = ExecutionNode(
+            node_id="1", node_type="llm_response", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            tokens_in=HIGH_TOKEN_THRESHOLD + 1,
+        )
+        analyzer._calculate_metrics(node, None)
+        assert "HIGH_TOKEN" in node.issues
+
+    def test_expensive_detection(self):
+        from core.agent.session_analyzer import ExecutionNode, EXPENSIVE_THRESHOLD_USD
+        analyzer = self._make_analyzer()
+        node = ExecutionNode(
+            node_id="1", node_type="llm_response", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            cost_usd=EXPENSIVE_THRESHOLD_USD + 0.001,
+        )
+        analyzer._calculate_metrics(node, None)
+        assert "EXPENSIVE" in node.issues
+
+    def test_large_context_detection(self):
+        from core.agent.session_analyzer import ExecutionNode, LARGE_CONTEXT_THRESHOLD
+        analyzer = self._make_analyzer()
+        node = ExecutionNode(
+            node_id="1", node_type="tool_result", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            metadata={"result_size_tokens": LARGE_CONTEXT_THRESHOLD + 1},
+        )
+        analyzer._calculate_metrics(node, None)
+        assert "LARGE_CONTEXT" in node.issues
+
+    def test_no_issues_on_clean_node(self):
+        from core.agent.session_analyzer import ExecutionNode
+        analyzer = self._make_analyzer()
+        node = ExecutionNode(
+            node_id="1", node_type="llm_response", event_id="1",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            tokens_in=100, cost_usd=0.001,
+        )
+        analyzer._calculate_metrics(node, None)
+        assert node.issues == []
+
+
+class TestBuildSummary:
+    """Unit tests for _build_summary."""
+
+    def _make_analyzer(self):
+        from core.agent.session_analyzer import SessionAnalyzer
+        return SessionAnalyzer(db_factory=lambda: None)
+
+    def test_leaf_only_time_accounting(self):
+        """Only leaf nodes should contribute to time_by_category (no double-counting)."""
+        from core.agent.session_analyzer import ExecutionNode
+        analyzer = self._make_analyzer()
+
+        # Parent with 10s, child with 8s — only child (leaf) should count
+        child = ExecutionNode(
+            node_id="c", node_type="tool_result", event_id="c",
+            ts=datetime(2026, 1, 1), duration_s=8.0,
+        )
+        parent = ExecutionNode(
+            node_id="p", node_type="llm_response", event_id="p",
+            ts=datetime(2026, 1, 1), duration_s=10.0,
+            children=[child],
+        )
+        root = ExecutionNode(
+            node_id="r", node_type="session", event_id=None,
+            ts=datetime(2026, 1, 1), duration_s=10.0,
+            children=[parent],
+        )
+
+        summary = analyzer._build_summary(root)
+        # tool_execution should be 8s, llm_inference should NOT be 10s (it has children)
+        assert summary.time_by_category.get("tool_execution", 0) == pytest.approx(8.0)
+        assert "llm_inference" not in summary.time_by_category  # parent is not a leaf
+
+    def test_token_aggregation(self):
+        from core.agent.session_analyzer import ExecutionNode
+        analyzer = self._make_analyzer()
+
+        llm1 = ExecutionNode(
+            node_id="l1", node_type="llm_response", event_id="l1",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            tokens_in=1000, tokens_out=200,
+        )
+        llm2 = ExecutionNode(
+            node_id="l2", node_type="llm_response", event_id="l2",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            tokens_in=500, tokens_out=100,
+        )
+        root = ExecutionNode(
+            node_id="r", node_type="session", event_id=None,
+            ts=datetime(2026, 1, 1), duration_s=5.0,
+            children=[llm1, llm2],
+        )
+
+        summary = analyzer._build_summary(root)
+        assert summary.total_tokens == 1800
+        assert summary.tokens_by_source["prompt"] == 1500
+        assert summary.tokens_by_source["completion"] == 300
+
+    def test_cost_by_turn(self):
+        """Each llm_response gets a distinct turn number (depth-first order)."""
+        from core.agent.session_analyzer import ExecutionNode
+        analyzer = self._make_analyzer()
+
+        llm1 = ExecutionNode(
+            node_id="l1", node_type="llm_response", event_id="l1",
+            ts=datetime(2026, 1, 1), duration_s=2.0,
+            cost_usd=0.005,
+        )
+        llm2 = ExecutionNode(
+            node_id="l2", node_type="llm_response", event_id="l2",
+            ts=datetime(2026, 1, 1), duration_s=1.0,
+            cost_usd=0.010,
+        )
+        uq = ExecutionNode(
+            node_id="uq", node_type="user_query", event_id="uq",
+            ts=datetime(2026, 1, 1), duration_s=5.0,
+            children=[llm1, llm2],
+        )
+        root = ExecutionNode(
+            node_id="r", node_type="session", event_id=None,
+            ts=datetime(2026, 1, 1), duration_s=5.0,
+            children=[uq],
+        )
+
+        summary = analyzer._build_summary(root)
+        assert summary.total_cost_usd == pytest.approx(0.015)
+        assert summary.cost_by_turn[1] == pytest.approx(0.005)
+        assert summary.cost_by_turn[2] == pytest.approx(0.010)
+
+    def test_root_causes_from_slow_nodes(self):
+        from core.agent.session_analyzer import ExecutionNode, SLOW_NODE_THRESHOLD_S
+        analyzer = self._make_analyzer()
+
+        slow = ExecutionNode(
+            node_id="s", node_type="tool_result", event_id="s",
+            ts=datetime(2026, 1, 1), duration_s=SLOW_NODE_THRESHOLD_S + 5,
+            detail="slow_tool",
+            issues=["SLOW"],
+        )
+        root = ExecutionNode(
+            node_id="r", node_type="session", event_id=None,
+            ts=datetime(2026, 1, 1), duration_s=20.0,
+            children=[slow],
+        )
+
+        summary = analyzer._build_summary(root)
+        assert any("slow_tool" in c for c in summary.root_causes)
+
+    def test_empty_tree_summary(self):
+        from core.agent.session_analyzer import ExecutionNode
+        analyzer = self._make_analyzer()
+
+        root = ExecutionNode(
+            node_id="r", node_type="session", event_id=None,
+            ts=datetime(2026, 1, 1), duration_s=0,
+        )
+        summary = analyzer._build_summary(root)
+        assert summary.total_tokens == 0
+        assert summary.total_cost_usd == 0.0
+        assert summary.total_duration_s == 0
+        assert summary.root_causes == []
+
+
+class TestRenderSummary:
+    """Unit tests for SessionReport._render_summary."""
+
+    def test_renders_time_breakdown(self):
+        from core.agent.session_analyzer import SessionReport, ExecutionSummary
+        summary = ExecutionSummary(
+            total_duration_s=10.0,
+            time_by_category={"llm_inference": 7.0, "tool_execution": 3.0},
+            bottleneck_category="llm_inference",
+            total_tokens=0,
+            tokens_by_source={},
+            largest_token_source=None,
+            total_cost_usd=0,
+            cost_by_turn={},
+            root_causes=[],
+        )
+        report = SessionReport(
+            session_id="test", timeline=[], total_duration_s=10.0,
+            issues=[], recommendations=[], stats={},
+        )
+        lines = report._render_summary(summary)
+        text = "\n".join(lines)
+        assert "10.0s" in text
+        assert "BOTTLENECK" in text
+        assert "llm_inference" in text
+
+    def test_renders_token_breakdown(self):
+        from core.agent.session_analyzer import SessionReport, ExecutionSummary
+        summary = ExecutionSummary(
+            total_duration_s=5.0,
+            time_by_category={},
+            bottleneck_category=None,
+            total_tokens=1500,
+            tokens_by_source={"prompt": 1200, "completion": 300},
+            largest_token_source="prompt",
+            total_cost_usd=0,
+            cost_by_turn={},
+            root_causes=[],
+        )
+        report = SessionReport(
+            session_id="test", timeline=[], total_duration_s=5.0,
+            issues=[], recommendations=[], stats={},
+        )
+        lines = report._render_summary(summary)
+        text = "\n".join(lines)
+        assert "1,500" in text
+        assert "LARGEST CONTRIBUTOR" in text
+
+
+# ============================================================================
 # 2. _try_repair_tool_args bare-word fix
 # ============================================================================
 
