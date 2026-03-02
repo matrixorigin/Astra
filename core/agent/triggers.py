@@ -80,8 +80,15 @@ def get_trigger(db: Session, trigger_id: str) -> dict | None:
     return {c.name: getattr(row, c.name) for c in row.__table__.columns}
 
 
-def list_triggers(db: Session, user_id: str) -> list[dict]:
-    rows = db.query(Trigger).filter(Trigger.user_id == user_id).order_by(Trigger.created_at.desc()).all()
+def list_triggers(db: Session, user_id: str, limit: int = 100) -> list[dict]:
+    """List triggers for a user.
+    
+    Args:
+        db: Database session
+        user_id: User ID filter
+        limit: Max results (default 100). Typical users have <10 triggers, but cap prevents abuse.
+    """
+    rows = db.query(Trigger).filter(Trigger.user_id == user_id).order_by(Trigger.created_at.desc()).limit(limit).all()
     return [{c.name: getattr(r, c.name) for c in r.__table__.columns} for r in rows]
 
 

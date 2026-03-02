@@ -150,7 +150,7 @@ class TestListAndDelete:
         col.name = "trigger_id"
         row.__table__.columns = [col]
         row.trigger_id = "t1"
-        mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [row]
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [row]
         result = list_triggers(mock_db, "u1")
         assert len(result) == 1
         assert result[0]["trigger_id"] == "t1"

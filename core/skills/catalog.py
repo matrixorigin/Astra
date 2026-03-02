@@ -703,8 +703,13 @@ class SkillCatalog(DbConsumer):
         self._metadata_cache[cache_key] = result
         return result
 
-    def list_by_source(self, source: str) -> list[dict[str, Any]]:
-        """List skills filtered by source."""
+    def list_by_source(self, source: str, limit: int = 100) -> list[dict[str, Any]]:
+        """List skills filtered by source.
+        
+        Args:
+            source: Skill source filter
+            limit: Max results (default 100, prevents unbounded queries)
+        """
         with self._db() as db:
             # Projection: skip embedding column (not returned by _row_to_dict anyway)
             rows = db.query(
@@ -726,7 +731,7 @@ class SkillCatalog(DbConsumer):
                 SkillModel.created_at,
             ).filter(
                 SkillModel.source == source, SkillModel.is_active == 1,
-            ).order_by(SkillModel.created_at.desc()).all()
+            ).order_by(SkillModel.created_at.desc()).limit(limit).all()
             # Convert Row tuples to dict manually (can't use _row_to_dict with tuples)
             return [
                 {
@@ -750,8 +755,13 @@ class SkillCatalog(DbConsumer):
                 for r in rows
             ]
 
-    def list_by_owner(self, user_id: str) -> list[dict[str, Any]]:
-        """List skills created by a specific user."""
+    def list_by_owner(self, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """List skills created by a specific user.
+        
+        Args:
+            user_id: User ID filter
+            limit: Max results (default 100, prevents unbounded queries)
+        """
         with self._db() as db:
             # Projection: skip embedding column
             rows = db.query(
@@ -773,7 +783,7 @@ class SkillCatalog(DbConsumer):
                 SkillModel.created_at,
             ).filter(
                 SkillModel.created_by == user_id,
-            ).order_by(SkillModel.created_at.desc()).all()
+            ).order_by(SkillModel.created_at.desc()).limit(limit).all()
             return [
                 {
                     "skill_id": r.skill_id,
