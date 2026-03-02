@@ -69,20 +69,26 @@ class EmbeddingService(DbConsumer):
         if len(embedding) != dim:
             raise ValueError(f"Embedding must be {dim} dimensions, got {len(embedding)}")
         vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
+        from sqlalchemy.dialects.mysql import insert
+
         from api.models.context import EventEmbedding
+        _meta = EventEmbedding.__table__.c.metadata
         with self._db() as db:
-            existing = db.query(EventEmbedding).filter_by(event_id=event_id).first()
-            if existing:
-                existing.embedding = vec_str
-                existing.embedding_metadata = metadata or {}
-            else:
-                db.add(EventEmbedding(
+            stmt = (
+                insert(EventEmbedding.__table__)
+                .values(
                     event_id=event_id,
                     embedding=vec_str,
                     model_name=self._client.model_name,
                     model_version="1.0",
-                    embedding_metadata=metadata or {},
-                ))
+                    **{_meta.name: metadata or {}},
+                )
+                .on_duplicate_key_update(
+                    embedding=vec_str,
+                    **{_meta.name: metadata or {}},
+                )
+            )
+            db.execute(stmt)
             db.commit()
 
     def search_similar(

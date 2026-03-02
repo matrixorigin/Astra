@@ -202,18 +202,19 @@ class HybridRetriever(DbConsumer):
                     for r in ft_rows:
                         if r.entry_id in entries_by_id:
                             entries_by_id[r.entry_id]["relevance_score"] += weights["keyword"]
-                        else:
-                            # Fulltext-only hit — fetch full row
-                            full = db.query(K).filter_by(entry_id=r.entry_id).first()
-                            if full:
-                                entries_by_id[r.entry_id] = {
-                                    "entry_id": full.entry_id, "category": full.category,
-                                    "key_name": full.key_name, "value": full.value,
-                                    "confidence": float(full.confidence), "trust_tier": full.trust_tier,
-                                    "created_at": full.created_at.isoformat() if full.created_at else None,
-                                    "last_validated_at": full.last_validated_at.isoformat() if full.last_validated_at else None,
-                                    "relevance_score": weights["keyword"] + weights["confidence"] * float(full.confidence),
-                                }
+                    # Batch-fetch fulltext-only hits
+                    new_ids = [r.entry_id for r in ft_rows if r.entry_id not in entries_by_id]
+                    if new_ids:
+                        full_rows = db.query(K).filter(K.entry_id.in_(new_ids)).all()
+                        for full in full_rows:
+                            entries_by_id[full.entry_id] = {
+                                "entry_id": full.entry_id, "category": full.category,
+                                "key_name": full.key_name, "value": full.value,
+                                "confidence": float(full.confidence), "trust_tier": full.trust_tier,
+                                "created_at": full.created_at.isoformat() if full.created_at else None,
+                                "last_validated_at": full.last_validated_at.isoformat() if full.last_validated_at else None,
+                                "relevance_score": weights["keyword"] + weights["confidence"] * float(full.confidence),
+                            }
                 except Exception as e:
                     logger.warning("Knowledge fulltext search failed (non-fatal): %s", e)
 
