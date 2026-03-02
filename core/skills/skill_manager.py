@@ -24,6 +24,7 @@ from core.skills.credential_manager import CredentialManager
 from core.skills.dependencies import DependencyType, parse_depends_on
 from core.skills.resolver import (
     CircularDependencyError,
+    Conflict,
     DependencyConflictError,
     DependencyResolver,
 )
@@ -138,16 +139,27 @@ class SkillManager(DbConsumer):
                     f"Permission to execute '{skill_name}' has been revoked"
                 )
 
-            # Check direct dependencies
+            # Check direct dependencies (existence + version compatibility)
             if defn.manifest:
                 raw_deps = defn.manifest.get("depends_on", [])
                 deps = parse_depends_on(raw_deps) if raw_deps else []
                 for dep in deps:
                     if dep.type == DependencyType.SKILL:
-                        if self._get_installation(db, user_id, dep.name) is None:
+                        dep_inst = self._get_installation(db, user_id, dep.name)
+                        if dep_inst is None:
                             raise SkillNotInstalledError(
                                 f"Dependency '{dep.name}' required by '{skill_name}' is not installed"
                             )
+                        if dep.version_constraint != "*" and dep_inst.skill_version:
+                            from core.skills.version import VersionConstraint
+                            try:
+                                if not VersionConstraint(dep.version_constraint).matches(dep_inst.skill_version):
+                                    raise SkillNotInstalledError(
+                                        f"Dependency '{dep.name}' version {dep_inst.skill_version} "
+                                        f"does not satisfy '{dep.version_constraint}' required by '{skill_name}'"
+                                    )
+                            except ValueError:
+                                pass  # malformed constraint — skip check
 
     # ── permission check ──────────────────────────────────────────────────────
 
@@ -279,14 +291,83 @@ class SkillManager(DbConsumer):
                 tools[r.skill_name] = r.version or "1.0.0"
         return skills, tools
 
+    # ── dependency validation helpers ────────────────────────────────────────
+
+    def _find_reverse_dependents(
+        self, db: Session, user_id: str, skill_name: str,
+    ) -> list[tuple[str, str]]:
+        """Find installed skills that depend on *skill_name*.
+
+        Returns list of (dependent_name, version_constraint).
+        """
+        installed = (
+            db.query(SkillInstallation)
+            .filter_by(user_id=user_id, status="installed")
+            .all()
+        )
+        result: list[tuple[str, str]] = []
+        for inst in installed:
+            if inst.skill_name == skill_name:
+                continue
+            defn = self._get_definition(db, inst.skill_name)
+            if defn is None or not defn.manifest:
+                continue
+            raw_deps = defn.manifest.get("depends_on", [])
+            if not raw_deps:
+                continue
+            for dep in parse_depends_on(raw_deps):
+                if dep.name == skill_name and dep.type == DependencyType.SKILL:
+                    result.append((inst.skill_name, dep.version_constraint))
+        return result
+
+    def _check_version_satisfies_dependents(
+        self, db: Session, user_id: str, skill_name: str, target_version: str,
+    ) -> None:
+        """Raise DependencyConflictError if *target_version* breaks any dependent."""
+        from core.skills.version import VersionConstraint, parse_version
+
+        dependents = self._find_reverse_dependents(db, user_id, skill_name)
+        if not dependents:
+            return
+        v = parse_version(target_version)
+        broken: list[tuple[str, str]] = []
+        for dep_name, constraint_str in dependents:
+            if constraint_str == "*":
+                continue
+            try:
+                if not VersionConstraint(constraint_str).matches(v):
+                    broken.append((dep_name, constraint_str))
+            except ValueError:
+                broken.append((dep_name, constraint_str))
+        if broken:
+            from core.skills.resolver import Conflict
+            conflicts = [Conflict(
+                dependency=skill_name,
+                required_by=broken,
+                available_version=target_version,
+            )]
+            raise DependencyConflictError(conflicts)
+
     # ── uninstall ─────────────────────────────────────────────────────────────
 
-    def uninstall(self, user_id: str, skill_name: str) -> None:
-        """Uninstall a skill: mark uninstalled + delete credentials."""
+    def uninstall(self, user_id: str, skill_name: str, *, force: bool = False) -> None:
+        """Uninstall a skill: mark uninstalled + delete credentials.
+
+        Raises DependencyConflictError if other installed skills depend on this one,
+        unless *force=True*.
+        """
         with self._db() as db:
             inst = self._get_installation(db, user_id, skill_name)
             if inst is None:
                 raise SkillNotInstalledError(f"'{skill_name}' is not installed")
+            if not force:
+                dependents = self._find_reverse_dependents(db, user_id, skill_name)
+                if dependents:
+                    raise DependencyConflictError([Conflict(
+                        dependency=skill_name,
+                        required_by=dependents,
+                        available_version=inst.skill_version or "0.0.0",
+                    )])
             db.query(UserCredential).filter_by(
                 user_id=user_id, skill_name=skill_name
             ).delete()
@@ -297,7 +378,11 @@ class SkillManager(DbConsumer):
     # ── upgrade ───────────────────────────────────────────────────────────────
 
     def upgrade(self, user_id: str, skill_name: str) -> SkillInstallation:
-        """Upgrade a skill to the latest version (version bump only)."""
+        """Upgrade a skill to the latest version.
+
+        Validates that the new version satisfies all dependents' constraints
+        and that the new version's own dependencies are met.
+        """
         with self._db() as db:
             inst = self._get_installation(db, user_id, skill_name)
             if inst is None:
@@ -305,17 +390,55 @@ class SkillManager(DbConsumer):
             defn = self._get_definition(db, skill_name)
             if defn is None:
                 raise SkillNotFoundError(f"Skill '{skill_name}' not found")
-            if inst.skill_version != defn.version:
-                inst.previous_version = inst.skill_version
-                inst.skill_version = defn.version
-                inst.updated_at = _now()
-                db.commit()
-                db.refresh(inst)
+            if inst.skill_version == defn.version:
+                db.expunge(inst)
+                return inst
+
+            # Reverse: new version must satisfy dependents' constraints
+            self._check_version_satisfies_dependents(
+                db, user_id, skill_name, defn.version,
+            )
+
+            # Forward: new version's own deps must be resolvable + installed
+            manifest = defn.manifest or {}
+            raw_deps = manifest.get("depends_on", [])
+            if raw_deps:
+                deps = parse_depends_on(raw_deps)
+                available_skills, available_tools = self._collect_available(db)
+                resolver = DependencyResolver(
+                    available_skills=available_skills,
+                    available_tools=available_tools,
+                )
+                result = resolver.resolve(skill_name, deps)
+                if not result.success:
+                    if result.cycle:
+                        raise CircularDependencyError(result.cycle)
+                    if result.conflicts:
+                        raise DependencyConflictError(result.conflicts)
+                    if result.missing:
+                        raise SkillNotFoundError(
+                            f"Missing dependencies for '{skill_name}': {', '.join(result.missing)}"
+                        )
+                for dep in deps:
+                    if dep.type == DependencyType.SKILL:
+                        if self._get_installation(db, user_id, dep.name) is None:
+                            raise SkillNotInstalledError(
+                                f"Dependency '{dep.name}' must be installed before upgrading '{skill_name}'"
+                            )
+
+            inst.previous_version = inst.skill_version
+            inst.skill_version = defn.version
+            inst.updated_at = _now()
+            db.commit()
+            db.refresh(inst)
             db.expunge(inst)
             return inst
 
     def rollback(self, user_id: str, skill_name: str) -> SkillInstallation:
         """Rollback a skill to its previous version.
+
+        Validates that the old version satisfies all dependents' constraints
+        and that the old version's own dependencies are met.
 
         Raises SkillNotInstalledError if not installed or no previous version.
         """
@@ -326,6 +449,12 @@ class SkillManager(DbConsumer):
             prev = getattr(inst, "previous_version", None)
             if not prev:
                 raise SkillNotInstalledError(f"'{skill_name}' has no previous version to rollback to")
+
+            # Reverse: previous version must satisfy dependents' constraints
+            self._check_version_satisfies_dependents(
+                db, user_id, skill_name, prev,
+            )
+
             inst.skill_version, inst.previous_version = prev, inst.skill_version
             inst.updated_at = _now()
             db.commit()

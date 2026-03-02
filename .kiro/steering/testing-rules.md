@@ -202,6 +202,156 @@ def test_event_persistence_mocked():
     # ... too much mocking
 ```
 
+### ⚠️ CRITICAL: Database Field-Level Verification
+
+**When a flow touches the database, verify EVERY field — not just "record exists".**
+
+```python
+# ❌ BAD: Only checks existence — misses wrong data
+def test_create_event(db):
+    event = logger.create_user_query(user_id="alice", content="hello")
+    saved = db.query(Event).filter_by(event_id=event.event_id).first()
+    assert saved is not None  # This proves NOTHING about correctness!
+
+# ❌ BAD: Spot-checks one field — other fields could be garbage
+def test_create_event(db):
+    event = logger.create_user_query(user_id="alice", content="hello")
+    saved = db.query(Event).filter_by(event_id=event.event_id).first()
+    assert saved.user_id == "alice"  # What about content? event_type? timestamps?
+
+# ✅ GOOD: Verify EVERY field in the database record
+def test_create_event(db):
+    before = datetime.now(timezone.utc)
+    event = logger.create_user_query(
+        user_id="alice",
+        session_id="sess-001",
+        content="hello",
+        causal_chain_id="chain-001"
+    )
+    after = datetime.now(timezone.utc)
+
+    # Re-query from DB (not from return value!)
+    saved = db.query(Event).filter_by(event_id=event.event_id).first()
+    assert saved is not None
+
+    # Verify EVERY field
+    assert saved.event_type == "user_query"
+    assert saved.user_id == "alice"
+    assert saved.session_id == "sess-001"
+    assert saved.content == "hello"
+    assert saved.causal_chain_id == "chain-001"
+    assert saved.parent_event_id is None  # Root event
+    assert saved.agent_id is None  # User event, no agent
+    assert before <= saved.created_at <= after
+    assert saved.metadata is not None
+```
+
+### Multi-Step Flow: Verify Ground Truth End State
+
+**For complex flows or API endpoints, verify the final database state as ground truth.**
+
+```python
+# ✅ GOOD: End-to-end flow with ground truth verification
+def test_install_skill_full_flow(db_factory):
+    """Install skill → verify ALL side effects in DB."""
+    db = db_factory()
+    mgr = SkillManager(db_factory, cred_mgr)
+
+    # Act
+    skill = mgr.install_skill(
+        skill_id="python-linter",
+        user_id="alice",
+        version="1.0.0"
+    )
+
+    # Ground truth 1: SkillInstallation record
+    installation = db.query(SkillInstallation).filter_by(
+        skill_id="python-linter", user_id="alice"
+    ).first()
+    assert installation is not None
+    assert installation.version == "1.0.0"
+    assert installation.status == "installed"
+    assert installation.installed_by == "alice"
+    assert installation.installed_at is not None
+    assert installation.uninstalled_at is None
+
+    # Ground truth 2: SkillPermission records created
+    perms = db.query(SkillPermission).filter_by(
+        skill_id="python-linter", user_id="alice"
+    ).all()
+    assert len(perms) > 0
+    assert any(p.permission == "execute" for p in perms)
+
+    # Ground truth 3: Event logged
+    events = db.query(Event).filter_by(
+        event_type="skill_installed", user_id="alice"
+    ).all()
+    assert len(events) == 1
+    assert events[0].content contains "python-linter"
+    assert events[0].causal_chain_id is not None
+
+    # Ground truth 4: No unexpected side effects
+    # (e.g., no other users affected)
+    other_installations = db.query(SkillInstallation).filter(
+        SkillInstallation.user_id != "alice"
+    ).count()
+    assert other_installations == 0
+
+
+# ✅ GOOD: API endpoint ground truth verification
+def test_chat_endpoint_persists_correctly(client, db, auth_headers):
+    """POST /chat → verify session, events, audit all persisted correctly."""
+    response = client.post(
+        "/chat",
+        json={"message": "What is event sourcing?"},
+        headers=auth_headers
+    )
+    assert response.status_code == 200
+    data = response.json()
+    run_id = data["run_id"]
+    session_id = data["session_id"]
+
+    # Ground truth 1: Session created/updated
+    session = db.query(Session).filter_by(session_id=session_id).first()
+    assert session is not None
+    assert session.status == "active"
+    assert session.event_count >= 2  # user_query + llm_response
+
+    # Ground truth 2: User query event
+    user_event = db.query(Event).filter_by(
+        session_id=session_id, event_type="user_query"
+    ).first()
+    assert user_event is not None
+    assert user_event.content == "What is event sourcing?"
+    assert user_event.causal_chain_id is not None
+
+    # Ground truth 3: LLM response event
+    llm_event = db.query(Event).filter_by(
+        session_id=session_id, event_type="llm_response"
+    ).first()
+    assert llm_event is not None
+    assert llm_event.parent_event_id == user_event.event_id
+    assert llm_event.causal_chain_id == user_event.causal_chain_id
+    assert llm_event.agent_id is not None
+    assert len(llm_event.content) > 0
+
+    # Ground truth 4: Audit log
+    audit = db.query(AuditLog).filter_by(run_id=run_id).first()
+    assert audit is not None
+    assert audit.action == "chat"
+    assert audit.user_id == current_user.id
+```
+
+### Rules for Database Verification
+
+1. **Always re-query from DB** — don't trust the return value, verify what's actually persisted
+2. **Check every field** — not just the "important" ones; wrong defaults are bugs too
+3. **Check timestamps** — verify `created_at`, `updated_at` are within expected range
+4. **Check nulls explicitly** — `assert field is None` for fields that should be empty
+5. **Check no side effects** — verify other records weren't accidentally modified
+6. **For multi-table flows** — verify ALL affected tables, not just the primary one
+7. **For updates** — verify both changed AND unchanged fields (no accidental overwrites)
+
 ### Fixture Scope
 ```python
 @pytest.fixture(scope="session")  # Once per test session
@@ -552,6 +702,60 @@ make dev-test-keep
 ```
 
 ### Common Debug Patterns
+
+#### ⚠️ MatrixOne Database Issues — Don't Jump to Conclusions
+
+**MatrixOne is not MySQL/PostgreSQL. When you hit unexpected database behavior:**
+
+1. **Don't assume "it can't be done"** — MatrixOne has unique capabilities (time-travel, branching) but also different behavior from traditional databases
+2. **Don't silently work around it** — If a SQL feature behaves differently, it might be a compatibility gap, not a limitation
+3. **Don't downgrade the test** — Don't weaken assertions or skip tests because "the database doesn't support it"
+
+**When you encounter a database issue:**
+
+```
+Database behaves unexpectedly
+    │
+    ├─ Is it a known MatrixOne difference?
+    │   └─ Check MatrixOne docs first
+    │
+    ├─ Is it a SQL syntax difference?
+    │   └─ Try MatrixOne-compatible syntax
+    │
+    ├─ Is it a potential bug?
+    │   └─ ⚠️ ASK the user before concluding
+    │
+    └─ Not sure?
+        └─ ⚠️ ASK the user — don't guess
+```
+
+**Examples:**
+
+```python
+# ❌ BAD: Silently giving up
+def test_time_travel():
+    # "MatrixOne doesn't support this" — WRONG, it does!
+    pytest.skip("Database limitation")
+
+# ❌ BAD: Working around without understanding
+def test_branch_merge():
+    # Got an error, so just catch and ignore
+    try:
+        branch.merge(...)
+    except Exception:
+        pass  # "Database issue"
+
+# ✅ GOOD: Investigate, then ask if stuck
+def test_time_travel():
+    # If this fails with unexpected error,
+    # check MatrixOne docs or ask the user
+    result = db.execute(
+        "SELECT * FROM events {MO_TS = '2026-01-01 00:00:00'}"
+    )
+    assert result.rowcount > 0
+```
+
+**Bottom line: When in doubt about MatrixOne behavior, ASK — don't assume.**
 
 ```bash
 # Run only failed tests from last run (fast iteration)

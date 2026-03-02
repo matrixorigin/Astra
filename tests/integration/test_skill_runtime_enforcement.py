@@ -192,8 +192,9 @@ class TestRuntimeDependencyCheck:
         # Install main skill (dependency check passes)
         skill_mgr.install(user_id, main_skill)
 
-        # Uninstall dependency
-        skill_mgr.uninstall(user_id, dep_skill)
+        # Uninstall dependency (force=True to bypass reverse dependency check,
+        # since we're testing runtime enforcement, not uninstall validation)
+        skill_mgr.uninstall(user_id, dep_skill, force=True)
 
         # Execute main skill fails: dependency missing
         with pytest.raises(SkillNotInstalledError, match="Dependency.*not installed"):
@@ -225,8 +226,9 @@ class TestRuntimeDependencyCheck:
         skill_mgr.install(user_id, skill_b)
         skill_mgr.install(user_id, skill_a)
 
-        # Uninstall C
-        skill_mgr.uninstall(user_id, skill_c)
+        # Uninstall C (force=True to bypass reverse dependency check,
+        # since we're testing runtime enforcement, not uninstall validation)
+        skill_mgr.uninstall(user_id, skill_c, force=True)
 
         # Execute A succeeds (A only depends on B, which is still installed)
         skill_mgr.require_executable(user_id, skill_a)
@@ -407,7 +409,7 @@ class TestConcurrentRaceConditions:
             # Each SkillManager._db() call creates and closes its own session
             mgr = SkillManager(SessionLocal, CredentialManager(secret_key="test"))
             try:
-                mgr.uninstall(user_id, dep_skill)
+                mgr.uninstall(user_id, dep_skill, force=True)
             finally:
                 uninstall_done.set()
 

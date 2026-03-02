@@ -184,6 +184,13 @@ def get_users_with_skills() -> list[dict]:
     return [{"user": user, "skills": user.skills} for user in users]
 ```
 
+### MatrixOne-Specific: Don't Assume, Ask
+
+**MatrixOne ≠ MySQL ≠ PostgreSQL. When something behaves unexpectedly:**
+- Don't conclude "it's impossible" — check MatrixOne docs first
+- Don't silently work around with weaker code — it might be a bug worth reporting
+- Don't downgrade the design — if stuck, **ask the user** before compromising
+
 ---
 
 ## Event Sourcing - Mandatory Pattern
