@@ -235,19 +235,28 @@ class PollutionDetector(DbConsumer):
                 depth += 1
                 next_frontier: set[str] = set()
 
-                # Find snapshots that reference any frontier entry in selected_events
-                snapshots = db.query(ContextSnapshot).all()
+                # Find snapshots that reference any frontier entry in selected_events.
+                # Paginate to guarantee correctness — this is offline analysis.
+                batch_size = 1000
                 hit_snapshot_ids: set[str] = set()
-                for snap in snapshots:
-                    events = snap.selected_events or []
-                    if isinstance(events, str):
-                        try:
-                            events = json.loads(events)
-                        except (json.JSONDecodeError, TypeError):
-                            continue
-                    event_ids = {e.get("event_id") or e for e in events if isinstance(e, (dict, str))}
-                    if frontier & event_ids:
-                        hit_snapshot_ids.add(snap.context_capture_id)
+                offset = 0
+                while True:
+                    batch = db.query(ContextSnapshot).offset(offset).limit(batch_size).all()
+                    if not batch:
+                        break
+                    for snap in batch:
+                        events = snap.selected_events or []
+                        if isinstance(events, str):
+                            try:
+                                events = json.loads(events)
+                            except (json.JSONDecodeError, TypeError):
+                                continue
+                        event_ids = {e.get("event_id") or e for e in events if isinstance(e, (dict, str))}
+                        if frontier & event_ids:
+                            hit_snapshot_ids.add(snap.context_capture_id)
+                    if len(batch) < batch_size:
+                        break
+                    offset += batch_size
 
                 if not hit_snapshot_ids:
                     break

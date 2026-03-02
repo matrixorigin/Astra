@@ -52,25 +52,46 @@ class TestTaskBoard:
 
     def test_claim_task_success(self):
         db = _mock_db()
-        db.execute.side_effect = [
-            Mock(scalar=Mock(return_value=0)),  # No existing claims
-            None,  # Insert claim event
-        ]
-        event_logger = Mock()
-        event_logger.create_event.return_value = Mock(event_id="evt-claim")
+        db.execute.return_value = Mock(rowcount=1)  # 1 row inserted
 
-        tb = TaskBoard(lambda: db, event_logger=event_logger)
+        tb = TaskBoard(lambda: db, event_logger=Mock())
         result = tb.claim_task("task-1", "agent-1", "sess-1")
 
         assert result is True
-        event_logger.create_event.assert_called_once()
-        call_kwargs = event_logger.create_event.call_args[1]
-        assert call_kwargs["event_type"] == "team_task_claimed"
-        assert call_kwargs["parent_event_id"] == "task-1"
+        db.commit.assert_called_once()
+        # Verify atomic INSERT...SELECT WHERE NOT EXISTS was used
+        sql_arg = str(db.execute.call_args[0][0])
+        assert "WHERE NOT EXISTS" in sql_arg
+        params = db.execute.call_args[1] if db.execute.call_args[1] else db.execute.call_args[0][1]
+        assert params["parent"] == "task-1"
+        assert params["sid"] == "sess-1"
 
     def test_claim_task_already_claimed(self):
         db = _mock_db()
-        db.execute.return_value = Mock(scalar=Mock(return_value=1))  # Already claimed
+        db.execute.return_value = Mock(rowcount=0)  # 0 rows = already claimed
+
+        tb = TaskBoard(lambda: db, event_logger=Mock())
+        result = tb.claim_task("task-1", "agent-1", "sess-1")
+
+        assert result is False
+
+    def test_claim_task_without_event_logger(self):
+        """Without event_logger, same atomic INSERT...SELECT is used."""
+        db = _mock_db()
+        db.execute.return_value = Mock(rowcount=1)
+
+        tb = TaskBoard(lambda: db, event_logger=None)
+        result = tb.claim_task("task-1", "agent-1", "sess-1")
+
+        assert result is True
+        db.commit.assert_called_once()
+        sql_arg = str(db.execute.call_args[0][0])
+        assert "WHERE NOT EXISTS" in sql_arg
+
+    def test_claim_task_without_event_logger_already_claimed(self):
+        """INSERT...SELECT inserts 0 rows when already claimed."""
+        db = _mock_db()
+        db.execute.return_value = Mock(rowcount=0)
 
         tb = TaskBoard(lambda: db, event_logger=None)
         result = tb.claim_task("task-1", "agent-1", "sess-1")

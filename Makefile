@@ -414,6 +414,19 @@ dev-reset: dev-clean
 	@$(MAKE) dev-init
 	@echo "✅ Development environment reset"
 
+# Aliases: README uses dev-start/dev-stop, Makefile defines dev-up/dev-down
+.PHONY: dev-start dev-stop dev-start-docker
+dev-start: dev-up
+dev-stop: dev-down
+dev-start-docker: dev-up-docker
+
+# Test aliases: README uses dev-test-*, Makefile defines test-*
+.PHONY: dev-test dev-test-keep dev-test-unit dev-test-integration
+dev-test: test
+dev-test-keep: test
+dev-test-unit: test-unit
+dev-test-integration: test-integration
+
 # ============================================================================
 # Development - Testing
 # ============================================================================

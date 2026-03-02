@@ -132,62 +132,54 @@ class TaskBoard(DbConsumer):
         agent_id: str,
         session_id: str,
     ) -> bool:
-        """Claim a task (optimistic lock via event creation).
+        """Claim a task atomically.
 
-        Args:
-            task_id: Task event ID
-            agent_id: Agent claiming the task
-            session_id: Session ID
+        Both paths (with and without event_logger) use
+        INSERT ... SELECT ... WHERE NOT EXISTS so the duplicate check and
+        the insert execute as a single SQL statement — no TOCTOU window.
 
-        Returns:
-            True if claimed successfully, False if already claimed
+        When event_logger is present we still do the atomic SQL ourselves
+        (event_logger.create_event cannot do conditional insert) and then
+        notify the logger so the event enters the async pipeline.
         """
-        # Check if already claimed
-        with self._db() as db:
-            existing = db.execute(
-                text(
-                    "SELECT COUNT(*) FROM agent_events "
-                    "WHERE parent_event_id = :task_id AND event_type = 'team_task_claimed'"
-                ),
-                {"task_id": task_id},
-            ).scalar()
+        from core.utils.id_generator import generate_id
 
-            if existing > 0:
+        eid = generate_id()
+        content = f"Claimed by {agent_id}"
+        meta_dict = {"claimed_by": agent_id}
+
+        with self._db() as db:
+            result = db.execute(
+                text(
+                    "INSERT INTO agent_events "
+                    "(event_id, session_id, user_id, agent_id, agent_version, "
+                    "event_type, content, metadata, causal_chain_id, parent_event_id, created_at) "
+                    "SELECT :id, :sid, 'system', 'system', '1.0.0', "
+                    "'team_task_claimed', :content, :meta, :id, :parent, NOW() "
+                    "FROM dual WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM agent_events "
+                    "  WHERE parent_event_id = :parent AND event_type = 'team_task_claimed'"
+                    ")"
+                ),
+                {
+                    "id": eid,
+                    "sid": session_id,
+                    "content": content,
+                    "meta": json.dumps(meta_dict),
+                    "parent": task_id,
+                },
+            )
+            db.commit()
+
+            if result.rowcount == 0:
                 logger.warning(f"Task {task_id} already claimed")
                 return False
 
-            # Create claim event (atomic insert)
-            if self.event_logger:
-                self.event_logger.create_event(
-                    user_id="system",
-                    session_id=session_id,
-                    event_type="team_task_claimed",
-                    content=f"Claimed by {agent_id}",
-                    metadata={"claimed_by": agent_id},
-                    parent_event_id=task_id,
-                )
-            else:
-                from core.utils.id_generator import generate_id
-
-                eid = generate_id()
-                # causal_chain_id = eid: claim is an independent action, linked to task via parent_event_id
-                db.execute(
-                    text(
-                        "INSERT INTO agent_events "
-                        "(event_id, session_id, user_id, agent_id, agent_version, "
-                        "event_type, content, metadata, causal_chain_id, parent_event_id, created_at) "
-                        "VALUES (:id, :sid, 'system', 'system', '1.0.0', "
-                        "'team_task_claimed', :content, :meta, :id, :parent, NOW())"
-                    ),
-                    {
-                        "id": eid,
-                        "sid": session_id,
-                        "content": f"Claimed by {agent_id}",
-                        "meta": json.dumps({"claimed_by": agent_id}),
-                        "parent": task_id,
-                    },
-                )
-                db.commit()
+            # Notify event_logger so the event enters the async pipeline
+            # (embedding generation, memory extraction, etc.).
+            # The row already exists — the logger only needs to process it.
+            if self.event_logger and hasattr(self.event_logger, "notify_event"):
+                self.event_logger.notify_event(eid)
 
             logger.info(f"Task {task_id} claimed by {agent_id}")
             return True

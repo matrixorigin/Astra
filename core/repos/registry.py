@@ -1,13 +1,17 @@
 """Repository registry service."""
 
-import json
+import logging
 from datetime import datetime, timezone
 
 from uuid_utils import uuid7
 
+from sqlalchemy import text
+
 from api.database import get_db_session
 from core.repos.models import AccessScope, OwnerType, Repo, RepoType
 from core.db_consumer import DbConsumer, DbFactory
+
+logger = logging.getLogger(__name__)
 
 
 class RepoRegistry(DbConsumer):
@@ -85,7 +89,11 @@ class RepoRegistry(DbConsumer):
             return self._to_model(result)
 
     def list_by_owner(self, owner_id: str, repo_type: RepoType | None = None) -> list[Repo]:
-        """List repositories by owner."""
+        """List repositories by owner.
+
+        Returns at most 200 repos. Logs a warning if truncated.
+        """
+        max_results = 200
         with self._db() as db:
             from api.models import Repo as RepoModel
             query = db.query(RepoModel).filter(
@@ -96,33 +104,26 @@ class RepoRegistry(DbConsumer):
             if repo_type:
                 query = query.filter(RepoModel.repo_type == repo_type.value)
         
-            results = query.order_by(RepoModel.created_at.desc()).all()
+            results = query.order_by(RepoModel.created_at.desc()).limit(max_results).all()
+            if len(results) >= max_results:
+                logger.warning("list_by_owner(%s) hit limit of %d; results truncated", owner_id, max_results)
             return [self._to_model(r) for r in results]
 
     def list_by_group(self, repo_group: str) -> list[Repo]:
-        """List repositories by group."""
-        # Note: We store repo_group in metadata now, so we can't efficiently query it 
-        # unless we extract it to a column or use JSON search.
-        # For now, we'll scan (inefficient) or deprecate this method.
-        # Given the user request "fix tests", and likely tests use this, 
-        # we will support it via JSON search if possible or just filter in memory for now.
+        """List repositories by group.
+
+        Uses JSON_EXTRACT to filter at the DB level so the limit does not
+        silently discard matching rows that happen to sit beyond the cap.
+        """
         with self._db() as db:
             from api.models import Repo as RepoModel
-            # Basic implementation: list all active repos and filter
-            # Better: use JSON_EXTRACT or similar if DB supports it.
-            # Safe fallback: filter in python
         
             results = db.query(RepoModel).filter(
-                RepoModel.status == "active"
-            ).all()
+                RepoModel.status == "active",
+                text("JSON_UNQUOTE(JSON_EXTRACT(repo_metadata, '$.repo_group')) = :rg"),
+            ).params(rg=repo_group).limit(500).all()
         
-            filtered = []
-            for r in results:
-                meta = r.repo_metadata or {}
-                if meta.get("repo_group") == repo_group:
-                    filtered.append(r)
-                
-            return [self._to_model(r) for r in filtered]
+            return [self._to_model(r) for r in results]
 
     def update_token(self, repo_id: str, token_id: str) -> None:
         """Update repository token."""

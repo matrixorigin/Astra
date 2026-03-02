@@ -118,13 +118,27 @@ class GovernanceScheduler(DbConsumer):
     def run_daily_all(self) -> GovernanceCycleResult:
         """Daily governance for ALL users. Used by scheduler."""
         combined = GovernanceCycleResult()
+        batch_size = 2000
+        offset = 0
         with self._db() as db:
-            rows = db.execute(text("SELECT DISTINCT user_id FROM mem_memories WHERE is_active = 1")).fetchall()
-        for (uid,) in rows:
-            r = self.run_daily(uid)
-            combined.cleaned_stale += r.cleaned_stale
-            combined.quarantined += r.quarantined
-            combined.errors.extend(r.errors)
+            while True:
+                rows = db.execute(
+                    text(
+                        "SELECT DISTINCT user_id FROM mem_memories "
+                        "WHERE is_active = 1 LIMIT :limit OFFSET :offset"
+                    ),
+                    {"limit": batch_size, "offset": offset},
+                ).fetchall()
+                if not rows:
+                    break
+                for (uid,) in rows:
+                    r = self.run_daily(uid)
+                    combined.cleaned_stale += r.cleaned_stale
+                    combined.quarantined += r.quarantined
+                    combined.errors.extend(r.errors)
+                if len(rows) < batch_size:
+                    break
+                offset += batch_size
         return combined
 
     def run_daily(self, user_id: str) -> GovernanceCycleResult:

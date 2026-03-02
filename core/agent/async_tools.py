@@ -547,7 +547,13 @@ def restore_waiting_workflows() -> int:
 
         db = next(get_db_session())
         try:
-            rows = db.query(WFRunModel).filter(WFRunModel.status == "waiting").all()
+            restore_batch = 200
+            rows = db.query(WFRunModel).filter(WFRunModel.status == "waiting").limit(restore_batch).all()
+            if len(rows) >= restore_batch:
+                logger.warning(
+                    "restore_waiting_workflows hit limit of %d; some workflows may not be restored",
+                    restore_batch,
+                )
             count = 0
             for row in rows:
                 wf_def = db.query(WorkflowDefinition).filter(

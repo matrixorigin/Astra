@@ -166,7 +166,8 @@ class TestPollutionDetector:
                 # Column attribute — get parent table name
                 name = model.class_.__tablename__
             if name == "ctx_snapshots":
-                m.all.return_value = [snap]
+                # Pagination: first batch returns [snap], second returns []
+                m.offset.return_value.limit.return_value.all.side_effect = [[snap], []]
             elif name == "ctx_decision_audits":
                 m.filter.return_value.all.return_value = [decision]
             elif name == "sk_knowledge_entry_sources":
@@ -188,7 +189,8 @@ class TestPollutionDetector:
         snap.context_capture_id = "snap_x"
         snap.selected_events = [{"event_id": "unrelated"}]
 
-        mock_db.query.return_value.all.return_value = [snap]
+        # Pagination: first batch returns [snap], second returns []
+        mock_db.query.return_value.offset.return_value.limit.return_value.all.side_effect = [[snap], []]
 
         result = detector.analyze_cascade_impact("ke_orphan")
 

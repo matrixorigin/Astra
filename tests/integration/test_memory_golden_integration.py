@@ -451,6 +451,9 @@ class TestSandboxRealDB:
         assert result is True
 
 
+# Serialize DDL-heavy provenance tests — CREATE/DROP SNAPSHOT can conflict
+# with other parallel tests that touch the same MatrixOne catalog.
+@pytest.mark.xdist_group("ddl_provenance")
 class TestProvenanceRealDB:
     """MemoryProvenance with real MatrixOne database."""
 
