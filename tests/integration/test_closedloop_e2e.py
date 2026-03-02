@@ -838,7 +838,7 @@ class TestChatAPIGateTriggerE2E:
         client = TestClient(app)
 
         # Register + login
-        username = f"gate_e2e_{generate_id()[:8]}"
+        username = f"gate_e2e_{generate_id()}"
         client.post("/auth/register", json={
             "username": username,
             "email": f"{username}@test.com",

@@ -15,7 +15,7 @@ def setup_tables(db_session):
     """Ensure eval_gate_results table exists and clean test data."""
     from core.utils.id_generator import generate_id
     from api.database import init_db
-    uid = f"gate_test_{generate_id()[:8]}"
+    uid = generate_id()
 
     # Ensure table exists (init_db is idempotent)
     init_db()

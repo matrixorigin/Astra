@@ -24,11 +24,11 @@ from core.memory.config import MemoryGovernanceConfig
 
 
 def _uid():
-    return f"closedloop_{uuid7().hex[:12]}"
+    return f"closedloop_{uuid7().hex}"
 
 
 def _sid():
-    return f"sess_{uuid7().hex[:12]}"
+    return f"sess_{uuid7().hex}"
 
 
 def _embed(text: str) -> list[float]:

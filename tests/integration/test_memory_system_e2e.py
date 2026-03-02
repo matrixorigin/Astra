@@ -21,7 +21,7 @@ from core.memory.types import Memory, MemoryType
 
 
 def uid() -> str:
-    return f"e2e_{uuid.uuid4().hex[:8]}"
+    return f"e2e_{uuid.uuid4().hex}"
 
 
 class TestL0ProfileInPrompt:

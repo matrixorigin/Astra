@@ -29,7 +29,7 @@ from core.skills.credential_manager import CredentialManager
 
 def _uid(prefix: str = "") -> str:
     """Generate unique ID."""
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 # Track all test data for cleanup
@@ -80,7 +80,7 @@ def _create_user(db: Session, user_id: str) -> User:
     _cleanup_users.append(user_id)
     user = User(
         user_id=user_id,
-        username=_uid("user"),
+        username=_uid("u"),
         email=f"{user_id}@test.local",
         password_hash="test",
     )
@@ -109,7 +109,7 @@ def _create_skill(db: Session, skill_name: str, manifest: dict | None = None) ->
 def _grant_permission(db: Session, skill_name: str, user_id: str) -> None:
     """Grant user permission to install skill."""
     perm = SkillPermission(
-        permission_id=_uid("perm"),
+        permission_id=_uid("p"),
         skill_name=skill_name,
         grantee_type="user",
         grantee_id=user_id,
@@ -132,7 +132,7 @@ class TestRuntimePermissionCheck:
 
     def test_permission_revoked_after_install_blocks_execute(self, db, skill_mgr):
         """Install with permission, revoke permission, execute fails."""
-        user_id = _uid("user")
+        user_id = _uid("u")
         skill_name = _uid("skill")
 
         _create_user(db, user_id)
@@ -152,7 +152,7 @@ class TestRuntimePermissionCheck:
 
     def test_permission_check_at_install_vs_runtime(self, db, skill_mgr):
         """Install checks permission, runtime checks again (may have changed)."""
-        user_id = _uid("user")
+        user_id = _uid("u")
         skill_name = _uid("skill")
 
         _create_user(db, user_id)
@@ -176,7 +176,7 @@ class TestRuntimeDependencyCheck:
 
     def test_dependency_missing_at_runtime_blocks_execute(self, db, skill_mgr):
         """Install with dependency, uninstall dependency, execute fails."""
-        user_id = _uid("user")
+        user_id = _uid("u")
         dep_skill = _uid("dep")
         main_skill = _uid("main")
 
@@ -207,7 +207,7 @@ class TestRuntimeDependencyCheck:
         but A's execution will succeed (A only depends on B).
         This is correct: each skill is responsible for its own dependencies.
         """
-        user_id = _uid("user")
+        user_id = _uid("u")
         skill_c = _uid("c")
         skill_b = _uid("b")
         skill_a = _uid("a")
@@ -244,7 +244,7 @@ class TestConcurrentRaceConditions:
         import threading
         from api.database import SessionLocal
 
-        user_id = _uid("user")
+        user_id = _uid("u")
         skill_name = _uid("skill")
 
         _create_user(db, user_id)
@@ -283,7 +283,7 @@ class TestConcurrentRaceConditions:
         import threading
         from api.database import SessionLocal
 
-        user_id = _uid("user")
+        user_id = _uid("u")
         skill_name = _uid("skill")
 
         _create_user(db, user_id)
@@ -355,7 +355,7 @@ class TestConcurrentRaceConditions:
         import threading
         from api.database import SessionLocal
 
-        user_id = _uid("user")
+        user_id = _uid("u")
         dep_skill = _uid("dep")
         main_skill = _uid("main")
 
@@ -428,7 +428,7 @@ class TestSkillDeactivation:
 
     def test_skill_deactivated_blocks_execute(self, db, skill_mgr):
         """Install skill, deactivate it, execute fails."""
-        user_id = _uid("user")
+        user_id = _uid("u")
         skill_name = _uid("skill")
 
         _create_user(db, user_id)
@@ -449,7 +449,7 @@ class TestSkillDeactivation:
 
     def test_public_skill_no_permission_needed(self, db, skill_mgr):
         """Public skill: no permission check needed."""
-        user_id = _uid("user")
+        user_id = _uid("u")
         skill_name = _uid("skill")
 
         _create_user(db, user_id)
@@ -469,7 +469,7 @@ class TestExecutorIntegration:
 
     def test_enforce_called_on_execute(self, db, skill_mgr):
         """require_executable blocks after permission revoke."""
-        user_id = _uid("user")
+        user_id = _uid("u")
         skill_name = _uid("skill")
 
         _create_user(db, user_id)

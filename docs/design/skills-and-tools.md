@@ -133,6 +133,12 @@ requires:
   - http
 
 depends_on: []
+# New format with version constraints (also supported):
+# depends_on:
+#   - name: knowledge
+#     version: ">=1.0,<2.0"
+#     type: skill
+# See docs/guides/skill-dependencies.md for full reference.
 ```
 
 #### Schema (Platform-Defined)
@@ -240,7 +246,9 @@ Replay   → Load exact version from event metadata
          → Compare results for drift detection
 
 Upgrade  → New version triggers regression gate (see trust-and-safety.md)
-         → Gate passes → activate new version
+         → Gate passes → validate dependency constraints (see §5 Lifecycle)
+         → Constraint check passes → activate new version
+         → Constraint check fails → reject, report which dependents would break
          → Gate fails → reject, keep old version
 ```
 
@@ -761,31 +769,70 @@ class SkillPermission(Base):
 
 ### Install / Uninstall Lifecycle
 
+Every mutation to a user's installed skill set must preserve the **dependency invariant**: all version constraints declared by all installed skills are satisfied. `install()` establishes this invariant; `upgrade()`, `rollback()`, and `uninstall()` must not break it.
+
 **Install Flow**:
 ```
 User: "install github skill"
   ├─ 1. Check permission → query skill_permissions
-  ├─ 2. Check dependencies → query skill_installations
-  ├─ 3. Prompt for credentials (if required) → encrypt and store in user_credentials
-  └─ 4. Record installation → INSERT INTO skill_installations
+  ├─ 2. Resolve dependency tree (DependencyResolver):
+  │     ├─ Cycle detection (DFS)
+  │     ├─ Missing dependency check (transitive)
+  │     ├─ Version constraint validation (all constraints in tree)
+  │     └─ Topological sort (install order)
+  ├─ 3. Verify all skill-type deps are installed for this user
+  ├─ 4. Prompt for credentials (if required) → encrypt and store in user_credentials
+  └─ 5. Record installation → INSERT INTO skill_installations
 ```
 No DDL execution. Tables already exist in platform DB (created by `init_db()`).
+
+**Upgrade Flow**:
+```
+User: "upgrade knowledge"  (knowledge currently 1.5.0, registry has 2.0.0)
+  ├─ 1. Verify skill is installed and new version exists in registry
+  ├─ 2. Reverse dependency check: find all installed skills that depend on this skill
+  │     For each dependent, verify new version satisfies their version constraint
+  │     If any constraint would break → reject with DependencyConflictError
+  │     Example: skill_a requires knowledge ~=1.2 → upgrading to 2.0.0 rejected
+  ├─ 3. Forward dependency check: if the new version has different depends_on,
+  │     resolve the new dependency tree (same as install: cycles, missing, versions)
+  ├─ 4. Update skill_installations.skill_version, record previous_version
+  └─ 5. On failure: previous_version enables rollback
+```
+
+**Rollback Flow**:
+```
+User: "rollback knowledge"  (knowledge currently 2.0.0, previous was 1.5.0)
+  ├─ 1. Verify skill is installed and has previous_version
+  ├─ 2. Same validation as upgrade but targeting previous_version:
+  │     ├─ Reverse dependency check (dependents still satisfied?)
+  │     └─ Forward dependency check (old version's deps still available?)
+  └─ 3. Swap skill_version ↔ previous_version
+```
 
 **Uninstall Flow**:
 ```
 User: "uninstall github skill"
-  ├─ 1. Check: any other skills depend on this?
+  ├─ 1. Reverse dependency check: find all installed skills that depend on this skill
+  │     If any exist → reject with error listing dependents
+  │     "Cannot uninstall 'github': required by 'code_review', 'pr_tracker'.
+  │      Uninstall dependents first, or use --force to skip this check."
   ├─ 2. Mark as uninstalled in skill_installations
   └─ 3. Delete credentials from user_credentials
 ```
 No DROP TABLE. Skill data remains in platform DB.
 
-**Upgrade Flow**:
+**Runtime Enforcement** (`require_executable`):
 ```
-Platform upgrades github skill v1.0.0 → v1.1.0
-  ├─ Schema change? → Platform-level migration (same as any api/models.py change)
-  └─ No schema change? → Update skill_installations.skill_version
+Agent calls skill during session
+  ├─ 1. Verify skill is installed and active
+  ├─ 2. Verify all skill-type dependencies are installed
+  ├─ 3. Verify installed dependency versions satisfy constraints
+  │     (last line of defense if invariant was violated by a bug or --force)
+  └─ 4. Verify user has permission
 ```
+
+**Design rationale**: Version validation at every mutation point (install/upgrade/rollback/uninstall) is the primary safety mechanism. Runtime version checking in `require_executable` is a defense-in-depth backstop — it should never trigger if the mutation gates work correctly, but it catches edge cases like `--force` uninstalls or direct DB edits.
 
 ### init_db() — Skill Table Discovery
 
@@ -1157,13 +1204,24 @@ Phase 3. Current skills are all platform-built (trusted). Sandbox mode becomes c
 
 ## 12. Dependency Management Enhancement
 
-Current dependency management (see [Section 1](#1-skill-architecture) manifest format and [Section 3](#3-skill-selection-pipeline) resolution) only supports name-based matching (`depends_on: ["git"]`) with no version constraints, no Skill→Tool tracking, and no conflict detection at install time.
+Dependency versioning is partially implemented. The install-time validation is complete; upgrade/rollback/uninstall validation is designed (see §5 Lifecycle) but not yet implemented.
 
-A comprehensive enhancement plan covering semantic versioning, tool dependencies, conflict resolution, and upgrade impact analysis is documented in:
+**Implemented** (install path):
+- Semantic versioning with pip-style constraints (`>=1.0,<2.0`, `~=1.2.3`, etc.)
+- Typed dependencies: `Dependency(name, version_constraint, type=skill|tool)`
+- Full dependency tree validation: cycles, missing, version conflicts, transitive deps
+- Topological sort for install ordering
+- Backward compatible with old `depends_on: ["name"]` format
+- CLI `upgrade-check` command for impact analysis
 
-**[Skill and Tool Dependency & Versioning Enhancement Plan](../../plans/skill-tool-dependency-versioning.md)**
+**Not yet implemented** (mutation paths):
+- `upgrade()` — does not validate that new version satisfies dependents' constraints
+- `rollback()` — does not validate that old version satisfies dependents' constraints
+- `uninstall()` — does not check for reverse dependencies
+- `require_executable()` — checks dependency existence but not version compatibility
 
-The enhanced format will be backward compatible with the current list-based `depends_on` syntax.
+See [Skill Dependencies Guide](../guides/skill-dependencies.md) for usage documentation.
+See [Enhancement Plan](../../plans/skill-tool-dependency-versioning.md) for full task breakdown.
 
 ---
 

@@ -151,7 +151,7 @@ def test_llm_extraction(db_session):
     }
     extractor = KnowledgeExtractor(db_session, llm_client=llm)
 
-    user_id = str(uuid7())[:36]
+    user_id = str(uuid7())
     chain_id = str(uuid7())
     event = Event(
         event_id=str(uuid7()),
@@ -175,7 +175,7 @@ def test_llm_extraction(db_session):
 def test_contradiction_detection(db_session):
     """Contradictory value supersedes old entry and decays its confidence."""
     extractor = KnowledgeExtractor(db_session)
-    user_id = str(uuid7())[:36]
+    user_id = str(uuid7())
 
     # Create existing entry
     old = KnowledgeEntry(
@@ -242,7 +242,7 @@ def test_synonym_match_reinforces_not_contradicts(db_session):
     from skills.knowledge.api import KnowledgeExtractor
     from uuid_utils import uuid7
 
-    user_id = str(uuid7())[:36]
+    user_id = str(uuid7())
     extractor = KnowledgeExtractor(db_session)
 
     # Pre-existing entry with value "javascript"
@@ -285,7 +285,7 @@ def test_reinforcement_appends_source_ids(db_session):
     from skills.knowledge.api import KnowledgeExtractor
     from uuid_utils import uuid7
 
-    user_id = str(uuid7())[:36]
+    user_id = str(uuid7())
     entry_id = str(uuid7())
     extractor = KnowledgeExtractor(db_session)
 

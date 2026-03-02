@@ -40,9 +40,12 @@ _SIDE_EFFECT_MAP: dict[SideEffect, SideEffectCategory] = {
 }
 
 # Reverse mapping: SideEffectCategory → SideEffect
+# DESTRUCTIVE maps to EXECUTE — destructive operations require at least execute-level
+# permission gates, falling back to READ would silently bypass safety checks.
 _CATEGORY_TO_SIDE_EFFECT: dict[SideEffectCategory, SideEffect] = {
     v: k for k, v in _SIDE_EFFECT_MAP.items()
 }
+_CATEGORY_TO_SIDE_EFFECT[SideEffectCategory.DESTRUCTIVE] = SideEffect.EXECUTE
 
 
 def resolve_side_effect(tool: Any) -> SideEffect:
@@ -73,6 +76,7 @@ class EdgeTool(Skill[SkillInput, SkillOutput]):
     description: str
     parameters: dict[str, Any]
     side_effect: SideEffect
+    version: str = "1.0.0"
 
     # Default: edge tools need local filesystem
     requirements: SkillRequirement = SkillRequirement(

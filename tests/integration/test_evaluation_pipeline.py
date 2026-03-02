@@ -210,7 +210,7 @@ class TestEvaluationAPI:
 
     @pytest.fixture
     def auth_headers(self, client):
-        username = f"eval_{generate_id()[:8]}"
+        username = f"eval_{generate_id()}"
         client.post("/auth/register", json={
             "username": username,
             "email": f"{username}@test.com",
@@ -278,7 +278,7 @@ class TestEvaluationActionAPI:
 
     @pytest.fixture
     def auth_token(self, client):
-        username = f"eval_action_{generate_id()[:8]}"
+        username = f"eval_action_{generate_id()}"
         client.post("/auth/register", json={
             "username": username,
             "email": f"{username}@test.com",

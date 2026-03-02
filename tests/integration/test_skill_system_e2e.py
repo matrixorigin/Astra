@@ -6,6 +6,7 @@ All tests use real MatrixOne database. Every assertion checks actual DB field va
 import json
 import pytest
 from datetime import datetime, timezone
+from uuid import uuid4
 from uuid_utils import uuid7
 
 from api.database import SessionLocal
@@ -252,17 +253,19 @@ class TestTask3ProceduralMemoryBridge:
 
     def test_list_as_memories_active_filter(self, clean_e2e_db):
         db = clean_e2e_db
-        prefix = f"e2e_lam_{uuid7().hex[:6]}"
+        lid_a = str(uuid4())
+        lid_i = str(uuid4())
+        qpat = f"e2e_lam_{uuid7().hex}"
 
         db.add(SkillSelectionLearning(
-            learning_id=f"{prefix}_a",
-            query_pattern=f"{prefix}_active",
+            learning_id=lid_a,
+            query_pattern=f"{qpat}_active",
             wrong_skills=["x"], correct_skills=["y"],
             confidence=80.0, signal_type="wrong_skill", is_active=1,
         ))
         db.add(SkillSelectionLearning(
-            learning_id=f"{prefix}_i",
-            query_pattern=f"{prefix}_inactive",
+            learning_id=lid_i,
+            query_pattern=f"{qpat}_inactive",
             wrong_skills=["x"], correct_skills=["y"],
             confidence=50.0, signal_type="wrong_skill", is_active=0,
         ))
@@ -270,16 +273,16 @@ class TestTask3ProceduralMemoryBridge:
 
         active = list_as_memories(db, active_only=True)
         active_ids = {m.memory_id for m in active}
-        assert f"{prefix}_a" in active_ids
-        assert f"{prefix}_i" not in active_ids
+        assert lid_a in active_ids
+        assert lid_i not in active_ids
 
         all_mems = list_as_memories(db, active_only=False)
         all_ids = {m.memory_id for m in all_mems}
-        assert f"{prefix}_a" in all_ids
-        assert f"{prefix}_i" in all_ids
+        assert lid_a in all_ids
+        assert lid_i in all_ids
 
         # Verify all meaningful fields on the active one
-        mem = next(m for m in active if m.memory_id == f"{prefix}_a")
+        mem = next(m for m in active if m.memory_id == lid_a)
         assert mem.memory_type == MemoryType.PROCEDURAL
         assert mem.user_id == "__system__"
         assert mem.initial_confidence == 0.8
@@ -287,10 +290,10 @@ class TestTask3ProceduralMemoryBridge:
         assert mem.is_active is True
         assert mem.session_id is None
         assert "wrong_skill" in mem.content
-        assert f"{prefix}_active" in mem.content
+        assert f"{qpat}_active" in mem.content
 
         # Verify inactive one preserves fields but is_active=False
-        inactive_mem = next(m for m in all_mems if m.memory_id == f"{prefix}_i")
+        inactive_mem = next(m for m in all_mems if m.memory_id == lid_i)
         assert inactive_mem.is_active is False
         assert inactive_mem.initial_confidence == 0.5
         assert inactive_mem.memory_type == MemoryType.PROCEDURAL

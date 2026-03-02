@@ -48,7 +48,7 @@ def _drain_worker(worker, db) -> int:
 
 @pytest.fixture
 def session_id():
-    return str(uuid7())[:36]
+    return str(uuid7())
 
 
 @pytest.fixture

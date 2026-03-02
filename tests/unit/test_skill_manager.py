@@ -46,7 +46,7 @@ def _now():
 
 
 def _unique_name(prefix="skill"):
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 def _seed_skill(db, name=None, version="1.0.0", is_public=True):
@@ -120,8 +120,8 @@ class TestCheckPermission:
         defn = _seed_skill(db_session, is_public=False)
         uid = _uid()
         role_id = _uid()
-        db_session.add(User(user_id=uid, username=f"u_{uid[:8]}", email=f"{uid[:8]}@test.com", password_hash="x"))
-        db_session.add(Role(role_id=role_id, role_name=f"r_{role_id[:8]}"))
+        db_session.add(User(user_id=uid, username=f"u_{uid}", email=f"{uid}@test.com", password_hash="x"))
+        db_session.add(Role(role_id=role_id, role_name=f"r_{role_id}"))
         db_session.flush()
         _seed_permission(db_session, defn.skill_name, "role", role_id)
         db_session.add(UserRole(user_id=uid, role_id=role_id))

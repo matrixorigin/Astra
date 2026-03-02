@@ -53,7 +53,7 @@ def test_retrieval_storage_and_replay():
         causal_chain_id=chain_id,
     )
     
-    print(f"✓ Created 3 events in session {session_id[:8]}")
+    print(f"✓ Created 3 events in session {session_id}")
     
     # Build context (will retrieve and store results)
     ctx_mgr = ContextManager(lambda: db, embedding_provider="mock")
@@ -107,7 +107,7 @@ def test_retrieval_storage_and_replay():
         event_id=e3.event_id,
     )
     
-    print(f"✓ Saved snapshot: {context_capture_id[:8]}")
+    print(f"✓ Saved snapshot: {context_capture_id}")
     
     # Load snapshot
     ctx_mgr.flush_writes()

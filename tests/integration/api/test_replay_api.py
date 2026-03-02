@@ -93,7 +93,7 @@ class TestReplaySession:
         # Create another user with unique name
         from core.auth.password import hash_password
         
-        uid = str(uuid4())[:8]
+        uid = uuid4().hex
         other_username = f"otherreplay_{uid}"
         
         repo = UserRepository(lambda: db_session)

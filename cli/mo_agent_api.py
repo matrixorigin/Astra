@@ -1620,6 +1620,40 @@ def skill_scaffold(yaml_file, output_dir):
         click.echo(f"❌ Error: {e}")
 
 
+@skill.command("upgrade-check")
+@click.argument("skill_name")
+@click.argument("new_version")
+@click.pass_context
+def skill_upgrade_check(ctx, skill_name, new_version):
+    """Check what breaks when upgrading a skill to a new version."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    try:
+        skills = client.list_skills(active_only=True)
+        if not skills:
+            click.echo("No skills found")
+            return
+
+        from core.skills.resolver import DependencyResolver
+        available = {
+            s["skill_name"]: {
+                "version": s.get("version", "0.0.0"),
+                "depends_on": (s.get("manifest") or {}).get("depends_on", []),
+            }
+            for s in skills
+        }
+        resolver = DependencyResolver(available_skills=available)
+        broken = resolver.analyze_upgrade_impact(skill_name, new_version)
+        if not broken:
+            click.echo(f"✅ Upgrading {skill_name} to {new_version} breaks nothing")
+        else:
+            click.echo(f"⚠️  Upgrading {skill_name} to {new_version} would break:")
+            for dep_name, constraint in broken:
+                click.echo(f"  • {dep_name} (requires {constraint})")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
 @cli.command()
 @click.argument("session_id")
 @click.pass_context

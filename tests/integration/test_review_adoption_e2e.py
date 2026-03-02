@@ -3,6 +3,7 @@
 import os
 import pytest
 from datetime import datetime
+from uuid import uuid4
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -34,10 +35,10 @@ class TestDataVersioningAPI:
         from core.events.event_reader import EventReader
         reader = EventReader(lambda: db_session)
 
-        parent_id = f"ev_parent_{os.urandom(4).hex()}"
-        child_id = f"ev_child_{os.urandom(4).hex()}"
-        chain_id = f"chain_{os.urandom(4).hex()}"
-        sid = f"sess_{os.urandom(4).hex()}"
+        parent_id = str(uuid4())
+        child_id = str(uuid4())
+        chain_id = str(uuid4())
+        sid = str(uuid4())
 
         for eid, pid in [(parent_id, None), (child_id, parent_id)]:
             db_session.execute(text("""
@@ -70,11 +71,11 @@ class TestDataVersioningAPI:
         from core.events.event_reader import EventReader
         reader = EventReader(lambda: db_session)
 
-        chain_id = f"chain_{os.urandom(4).hex()}"
-        sid = f"sess_{os.urandom(4).hex()}"
+        chain_id = str(uuid4())
+        sid = str(uuid4())
         ids = []
         for i in range(3):
-            eid = f"ev_cc_{os.urandom(4).hex()}"
+            eid = str(uuid4())
             ids.append(eid)
             db_session.execute(text("""
                 INSERT INTO agent_events
@@ -110,7 +111,7 @@ class TestSkillLifecycle:
     def _create_skill(self, db, name, status="active"):
         self._created_names.append(name)
         skill = SkillRegistryModel(
-            skill_id=f"sk_{os.urandom(4).hex()}",
+            skill_id=str(uuid4()),
             skill_name=name,
             version="1.0.0",
             is_active=1 if status == "active" else 0,
@@ -126,7 +127,7 @@ class TestSkillLifecycle:
     def test_publish_transitions_draft_to_active(self, db_session):
         """publish() moves draft skill to active."""
         from core.skills.registry import SkillRegistry
-        name = f"sk_pub_{os.urandom(4).hex()}"
+        name = f"sk_pub_{uuid4().hex}"
         self._create_skill(db_session, name, status="draft")
 
         registry = SkillRegistry(lambda: db_session)
@@ -139,7 +140,7 @@ class TestSkillLifecycle:
     def test_deprecate_transitions_active_to_deprecated(self, db_session):
         """deprecate() moves active skill to deprecated."""
         from core.skills.registry import SkillRegistry
-        name = f"sk_dep_{os.urandom(4).hex()}"
+        name = f"sk_dep_{uuid4().hex}"
         self._create_skill(db_session, name, status="active")
 
         registry = SkillRegistry(lambda: db_session)
@@ -155,7 +156,7 @@ class TestSkillLifecycle:
         from core.skills.credential_manager import CredentialManager
         from config.settings import get_settings
 
-        name = f"sk_draft_{os.urandom(4).hex()}"
+        name = f"sk_draft_{uuid4().hex}"
         self._create_skill(db_session, name, status="draft")
 
         mgr = SkillManager(db_factory, CredentialManager(get_settings().secret_key))
@@ -168,7 +169,7 @@ class TestSkillLifecycle:
         from core.skills.credential_manager import CredentialManager
         from config.settings import get_settings
 
-        name = f"sk_depr_{os.urandom(4).hex()}"
+        name = f"sk_depr_{uuid4().hex}"
         self._create_skill(db_session, name, status="deprecated")
 
         mgr = SkillManager(db_factory, CredentialManager(get_settings().secret_key))
@@ -231,7 +232,7 @@ class TestSLODashboard:
         from core.evaluation.slo_monitor import SLOMonitor, SLOSeverity, SLOStatus, SLOTarget
         from api.database import SessionLocal
         monitor = SLOMonitor(SessionLocal)
-        agent_id = f"slo_warn_{os.urandom(4).hex()}"
+        agent_id = str(uuid4())
 
         status = SLOStatus(
             slo=SLOTarget("quality", "avg_quality", 4.0, ">="),
@@ -264,7 +265,7 @@ class TestSLODashboard:
 
         gate_trigger = MagicMock()
         monitor = SLOMonitor(lambda: db_session, gate_trigger=gate_trigger)
-        agent_id = f"slo_crit_{os.urandom(4).hex()}"
+        agent_id = str(uuid4())
 
         status = SLOStatus(
             slo=SLOTarget("quality", "avg_quality", 4.0, ">="),
@@ -292,7 +293,7 @@ class TestSLODashboard:
         from core.evaluation.slo_monitor import SLOMonitor, SLOSeverity, SLOStatus, SLOTarget
         from api.database import SessionLocal
         monitor = SLOMonitor(SessionLocal)
-        agent_id = f"slo_breach_{os.urandom(4).hex()}"
+        agent_id = str(uuid4())
 
         status = SLOStatus(
             slo=SLOTarget("quality", "avg_quality", 4.0, ">="),
@@ -347,7 +348,7 @@ class TestSLODashboard:
         from core.agent.chat_loop import ChatLoop
         from core.llm.router import ModelRouter
 
-        agent_id = f"esc_{os.urandom(4).hex()}"
+        agent_id = str(uuid4())
 
         # Write escalation event directly
         db_session.execute(text("""
@@ -356,7 +357,7 @@ class TestSLODashboard:
                  event_type, content, causal_chain_id, created_at)
             VALUES (:eid, 'system_slo', 'system', :aid, '1.0.0',
                     'slo_model_escalation', '{}', :eid, NOW())
-        """), {"eid": os.urandom(8).hex(), "aid": agent_id})
+        """), {"eid": uuid4().hex, "aid": agent_id})
         db_session.commit()
 
         mock_llm = MagicMock()
@@ -387,14 +388,14 @@ class TestSLODashboard:
         """HITLPolicy appends tightening policy when slo_hitl_tightened event exists."""
         from core.verification.hitl_policy import HITLPolicyEngine, SupervisionAction
 
-        agent_id = f"hitl_{os.urandom(4).hex()}"
+        agent_id = str(uuid4())
         db_session.execute(text("""
             INSERT INTO agent_events
                 (event_id, session_id, user_id, agent_id, agent_version,
                  event_type, content, causal_chain_id, created_at)
             VALUES (:eid, 'system_slo', 'system', :aid, '1.0.0',
                     'slo_hitl_tightened', '{}', :eid, NOW())
-        """), {"eid": os.urandom(8).hex(), "aid": agent_id})
+        """), {"eid": uuid4().hex, "aid": agent_id})
         db_session.commit()
 
         engine = HITLPolicyEngine(lambda: db_session)
@@ -431,8 +432,8 @@ class TestPromptEvolutionGate:
         from core.evaluation.prompt_evolution import PromptEvolver
 
         evolver = PromptEvolver(lambda: db_session)
-        template_id = f"tmpl_{os.urandom(4).hex()}"
-        variant_id = f"var_{os.urandom(4).hex()}"
+        template_id = f"tmpl_{uuid4().hex}"
+        variant_id = f"var_{uuid4().hex}"
 
         # Seed template and variant
         db_session.execute(text("""
@@ -463,8 +464,8 @@ class TestPromptEvolutionGate:
         gate.validate_change.return_value = {"verdict": "approved", "metrics": {}}
         evolver = PromptEvolver(lambda: db_session, regression_gate=gate)
 
-        template_id = f"tmpl_{os.urandom(4).hex()}"
-        variant_id = f"var_{os.urandom(4).hex()}"
+        template_id = f"tmpl_{uuid4().hex}"
+        variant_id = f"var_{uuid4().hex}"
         db_session.execute(text("""
             INSERT INTO ctx_prompt_templates (template_id, version, content, is_active, created_at, updated_at)
             VALUES (:tid, 1, 'old', 1, NOW(), NOW())
@@ -494,8 +495,8 @@ class TestPromptEvolutionGate:
         gate.validate_change.return_value = {"verdict": "rejected", "reason": "score_regression"}
         evolver = PromptEvolver(lambda: db_session, regression_gate=gate)
 
-        template_id = f"tmpl_{os.urandom(4).hex()}"
-        variant_id = f"var_{os.urandom(4).hex()}"
+        template_id = f"tmpl_{uuid4().hex}"
+        variant_id = f"var_{uuid4().hex}"
         db_session.execute(text("""
             INSERT INTO ctx_prompt_templates (template_id, version, content, is_active, created_at, updated_at)
             VALUES (:tid, 1, 'original', 1, NOW(), NOW())

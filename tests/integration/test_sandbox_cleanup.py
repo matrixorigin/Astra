@@ -21,7 +21,7 @@ def cleaner(db_session):
 
 
 def _name():
-    return f"sandbox_{str(uuid7()).replace('-', '_')[:16]}".lower()
+    return f"sandbox_{uuid7().hex}".lower()
 
 
 def test_cleanup_expired(sandbox, cleaner, db_session):
@@ -59,7 +59,7 @@ def test_cleanup_skips_recent(sandbox, cleaner):
 
 def test_cleanup_orphan_database(sandbox, cleaner, db_session):
     """Database with sandbox_ prefix but no metadata gets force-deleted."""
-    orphan = f"sandbox_orphan_{str(uuid7())[:8]}".lower()
+    orphan = f"sandbox_orphan_{uuid7().hex}".lower()
     db_session.execute(text(f"CREATE DATABASE {orphan}"))
     db_session.commit()
 

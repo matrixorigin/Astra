@@ -33,7 +33,7 @@ def auth_headers(client):
     import uuid
     from core.auth.seed_roles import seed_roles
     
-    username = f"agent_model_test_{uuid.uuid4().hex[:8]}"
+    username = f"agent_model_test_{uuid.uuid4().hex}"
     
     db = next(get_db_session())
     seed_roles(db)
@@ -99,7 +99,7 @@ def create_agent_with_model(client, auth_headers):
     
     def _create(agent_name: str, model: str, model_constraints: dict | None = None):
         import uuid
-        agent_id = f"test-{agent_name}-{uuid.uuid4().hex[:8]}"
+        agent_id = f"test-{agent_name}-{uuid.uuid4().hex}"
         
         config = {
             "system_prompt": f"You are {agent_name}.",

@@ -30,7 +30,7 @@ def client():
 
 @pytest.fixture
 def auth_headers(client):
-    username = f"rv_{generate_id()[:8]}"
+    username = f"rv_{generate_id()}"
     client.post("/auth/register", json={
         "username": username,
         "email": f"{username}@test.com",

@@ -148,7 +148,7 @@ def client():
 
 @pytest.fixture
 def auth_headers(client):
-    u = f"bb_{generate_id()[:10]}"
+    u = f"bb_{generate_id()}"
     client.post("/auth/register", json={"username": u, "email": f"{u}@t.com", "password": "testpass1234"})
     r = client.post("/auth/login", json={"username": u, "password": "testpass1234"})
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
@@ -392,7 +392,7 @@ class TestTriggerToRun:
 
         trig = create_trigger(
             db, user_id="test-user", agent_id="dev-agent",
-            trigger_type="schedule", name=f"drift-{generate_id()[:8]}",
+            trigger_type="schedule", name=f"drift-{generate_id()}",
             user_input="Check drift", cron_expr="* * * * *",
             session_id=session_id,
         )

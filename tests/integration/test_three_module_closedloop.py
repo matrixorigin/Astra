@@ -9,6 +9,7 @@ import os
 import json
 import pytest
 from datetime import datetime, timedelta
+from uuid import uuid4
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -39,7 +40,7 @@ class TestSelectorFeedbackClosedloop:
         from core.agent.executor import AgentExecutor
         from core.skills.registry import SkillRegistry
 
-        event_id = f"sel_{os.urandom(4).hex()}"
+        event_id = f"sel_{uuid4().hex}"
         db_session.execute(text("""
             INSERT INTO skill_selection_events (event_id, session_id, user_query, selected_skills, selection_method, created_at)
             VALUES (:eid, 'sess1', 'test query', '["test_skill"]', 'keyword', NOW())
@@ -62,7 +63,7 @@ class TestSelectorFeedbackClosedloop:
         from core.agent.executor import AgentExecutor
         from core.skills.registry import SkillRegistry
 
-        event_id = f"sel_{os.urandom(4).hex()}"
+        event_id = f"sel_{uuid4().hex}"
         db_session.execute(text("""
             INSERT INTO skill_selection_events (event_id, session_id, user_query, selected_skills, selection_method, created_at)
             VALUES (:eid, 'sess1', 'test', '["s"]', 'keyword', NOW())
@@ -119,7 +120,7 @@ class TestGovernanceStructuredOutputs:
         from uuid_utils import uuid7
 
         engine = MemoryGovernanceEngine(lambda: db_session)
-        cat = f"cat_{os.urandom(4).hex()}"
+        cat = f"cat_{uuid4().hex}"
 
         for val in ["value_A", "value_B"]:
             db_session.add(KnowledgeEntry(
@@ -167,8 +168,8 @@ class TestSkillRollback:
         from core.skills.skill_manager import SkillManager
         from core.skills.credential_manager import CredentialManager
 
-        uid = f"u_{os.urandom(4).hex()}"
-        skill = f"trb_{os.urandom(4).hex()}"
+        uid = f"u_{uuid4().hex}"
+        skill = f"trb_{uuid4().hex}"
         self._create_skill_def(db_session, skill, "1.0")
 
         mgr = SkillManager(db_factory, CredentialManager("test-secret-key-1234567890123456"))
@@ -189,8 +190,8 @@ class TestSkillRollback:
         from core.skills.skill_manager import SkillManager
         from core.skills.credential_manager import CredentialManager
 
-        uid = f"u_{os.urandom(4).hex()}"
-        skill = f"rb_{os.urandom(4).hex()}"
+        uid = f"u_{uuid4().hex}"
+        skill = f"rb_{uuid4().hex}"
         self._create_skill_def(db_session, skill, "1.0")
 
         mgr = SkillManager(db_factory, CredentialManager("test-secret-key-1234567890123456"))
@@ -211,8 +212,8 @@ class TestSkillRollback:
         from core.skills.skill_manager import SkillManager, SkillNotInstalledError
         from core.skills.credential_manager import CredentialManager
 
-        uid = f"u_{os.urandom(4).hex()}"
-        skill = f"norb_{os.urandom(4).hex()}"
+        uid = f"u_{uuid4().hex}"
+        skill = f"norb_{uuid4().hex}"
         self._create_skill_def(db_session, skill, "1.0")
 
         mgr = SkillManager(db_factory, CredentialManager("test-secret-key-1234567890123456"))

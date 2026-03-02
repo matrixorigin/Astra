@@ -12,6 +12,7 @@ These tests hit real DB (MatrixOne) via the test fixtures from conftest.py.
 
 import json
 import pytest
+from uuid import uuid4
 from unittest.mock import patch
 
 from sqlalchemy import text as sql_text
@@ -533,26 +534,31 @@ class TestSelfModelSkills:
     """Test that Self-Model correctly shows installed vs cloud skills."""
 
     def _seed_skills(self, db, user_id: str):
-        """Insert test skills into registry + install some for user."""
+        """Insert test skills into registry + install some for user.
+
+        Skill names are prefixed with ``a_`` so they sort before any
+        concurrently-inserted skills (``cache_*``, ``sk_*``, …) and
+        always land within the 10-slot cloud-skills cap.
+        """
         for suffix, desc in [("ci", "Check CI status"), ("pr", "List open PRs"), ("sum", "Summarize PR changes")]:
-            name = f"{user_id}_{suffix}"
+            name = f"a_{user_id}_{suffix}"
             db.execute(sql_text(
                 "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active, category) "
                 "VALUES (:id, :n, '1.0.0', :d, 1, 'devops')"
             ), {"id": f"{name}@1.0.0", "n": name, "d": desc})
         # Install only first two for the user
         for i, suffix in enumerate(["ci", "pr"], 1):
-            name = f"{user_id}_{suffix}"
+            name = f"a_{user_id}_{suffix}"
             db.execute(sql_text(
                 "INSERT INTO skill_installations (installation_id, user_id, skill_name, skill_version, status, installed_at) "
                 "VALUES (:iid, :uid, :n, '1.0.0', 'installed', NOW())"
-            ), {"iid": f"inst_{user_id}_{i}", "uid": user_id, "n": name})
+            ), {"iid": str(uuid4()), "uid": user_id, "n": name})
         db.commit()
 
     def _cleanup_skills(self, db, user_id: str):
         """Remove test data to avoid leaking into other tests."""
         db.execute(sql_text("DELETE FROM skill_installations WHERE user_id = :uid"), {"uid": user_id})
-        db.execute(sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"), {"pat": f"{user_id}%"})
+        db.execute(sql_text("DELETE FROM skills_registry WHERE skill_name LIKE :pat"), {"pat": f"a_{user_id}%"})
         db.commit()
 
     def test_installed_skills_shown_with_description(self, db_session):
@@ -568,8 +574,8 @@ class TestSelfModelSkills:
             )
             sm = result.sections["self_model"]
             assert "My installed skills" in sm
-            assert f"{uid}_ci (v1.0.0): Check CI status" in sm
-            assert f"{uid}_pr (v1.0.0): List open PRs" in sm
+            assert f"a_{uid}_ci (v1.0.0): Check CI status" in sm
+            assert f"a_{uid}_pr (v1.0.0): List open PRs" in sm
         finally:
             self._cleanup_skills(db_session, uid)
 
@@ -586,10 +592,10 @@ class TestSelfModelSkills:
             )
             sm = result.sections["self_model"]
             # _sum is NOT installed → should appear in cloud skills
-            assert f"{uid}_sum" in sm
+            assert f"a_{uid}_sum" in sm
             # _ci IS installed → should NOT appear in cloud skills section
             cloud_section = sm.split("Available cloud skills:")[-1] if "Available cloud skills:" in sm else ""
-            assert f"{uid}_ci" not in cloud_section
+            assert f"a_{uid}_ci" not in cloud_section
         finally:
             self._cleanup_skills(db_session, uid)
 
@@ -597,7 +603,7 @@ class TestSelfModelSkills:
         """Multiple versions of same skill don't produce duplicate lines."""
         from core.context.prompt_assembler import PromptAssembler
         uid = unique_test_id()
-        skill_name = f"{uid}_multi"
+        skill_name = f"a_{uid}_multi"
         db_session.execute(sql_text(
             "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active) "
             "VALUES (:id1, :n, '1.0.0', 'Version one', 1)"

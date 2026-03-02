@@ -34,7 +34,7 @@ def auth_headers_e2e(client):
     from core.auth.seed_roles import seed_roles
     from sqlalchemy import text
 
-    username = f"e2e_user_{uuid.uuid4().hex[:8]}"
+    username = f"e2e_user_{uuid.uuid4().hex}"
     
     # Ensure roles exist (parallel workers may not have seeded yet)
     db = next(get_db_session())

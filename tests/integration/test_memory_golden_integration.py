@@ -32,7 +32,7 @@ def _load_fixture(name: str) -> dict:
 
 
 def _uid():
-    return f"mem_test_{uuid7().hex[:12]}"
+    return f"mem_test_{uuid7().hex}"
 
 
 @pytest.fixture

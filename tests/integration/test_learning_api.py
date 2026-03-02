@@ -20,7 +20,7 @@ def client():
 def auth_headers(client):
     """Register + login, return auth headers."""
     from core.utils.id_generator import generate_id
-    username = f"learn_{generate_id()[:8]}"
+    username = f"learn_{generate_id()}"
     client.post("/auth/register", json={
         "username": username,
         "email": f"{username}@test.com",

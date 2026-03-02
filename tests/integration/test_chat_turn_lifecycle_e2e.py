@@ -35,8 +35,8 @@ def _unique_auth(client, db, prefix="lc"):
 
     Returns (headers, user_id) so tests can make precise assertions on user_id.
     """
-    uid = uuid4().hex[:8]
-    user_id = f"{prefix}_uid_{uid}"
+    uid = uuid4().hex
+    user_id = str(uuid4())  # must fit VARCHAR(36)
     headers = get_auth_headers(
         client, db,
         username=f"{prefix}_{uid}",

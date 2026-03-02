@@ -18,7 +18,7 @@ from core.memory.types import Memory, MemoryType
 
 
 def _uid():
-    return f"explain_test_{uuid4().hex[:8]}"
+    return f"explain_test_{uuid4().hex}"
 
 
 def _embed(text: str) -> list[float]:
@@ -57,7 +57,7 @@ class TestExplainE2E:
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
         user_id = _uid()
-        session_id = f"sess_{uuid4().hex[:8]}"
+        session_id = f"sess_{uuid4().hex}"
 
         # Create test memory with embedding
         mem = Memory(
@@ -219,7 +219,7 @@ class TestExplainE2E:
         store = MemoryStore(db_factory)
         loader = TieredMemoryLoader(db_factory)
         user_id = _uid()
-        session_id = f"sess_{uuid4().hex[:8]}"
+        session_id = f"sess_{uuid4().hex}"
 
         # Create profile memory (L0)
         profile_mem = Memory(
@@ -280,7 +280,7 @@ class TestExplainE2E:
         store = MemoryStore(db_factory)
         retriever = MemoryRetriever(db_factory)
         user_id = _uid()
-        session_id = f"sess_{uuid4().hex[:8]}"
+        session_id = f"sess_{uuid4().hex}"
 
         # Create memory with embedding
         mem = Memory(

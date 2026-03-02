@@ -25,7 +25,7 @@ from core.memory.types import Memory, MemoryType
 
 
 def _uid():
-    return f"path_verify_{uuid4().hex[:8]}"
+    return f"path_verify_{uuid4().hex}"
 
 
 def _embed(text: str) -> list[float]:

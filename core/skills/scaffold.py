@@ -70,7 +70,7 @@ class SkillSpec:
     credentials: list[dict[str, Any]]
     tables: dict[str, TableSpec]
     actions: dict[str, ActionSpec]
-    depends_on: list[str]
+    depends_on: list[str | dict[str, str]]
     author: str = ""
     requires: list[str] = field(default_factory=list)
 

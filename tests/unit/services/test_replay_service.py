@@ -28,7 +28,7 @@ def test_user(db_session):
     repo = UserRepository(lambda: db_session)
     
     # Use unique username per test run
-    uid = str(uuid4())[:8]
+    uid = uuid4().hex
     username = f"replaytest_{uid}"
     
     # 创建

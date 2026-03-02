@@ -47,7 +47,7 @@ def db_session():
 
 def test_register_skill_success(client, auth_headers):
     """Test successful skill registration."""
-    skill_id = f"test_skill_{str(uuid4())[:8]}"
+    skill_id = f"test_skill_{uuid4().hex}"
     
     response = client.post(
         "/skills",
@@ -74,7 +74,7 @@ def test_register_skill_success(client, auth_headers):
 
 def test_get_skill_success(client, auth_headers):
     """Test successful skill retrieval."""
-    skill_id = f"test_skill_{str(uuid4())[:8]}"
+    skill_id = f"test_skill_{uuid4().hex}"
     
     # Register first
     client.post(

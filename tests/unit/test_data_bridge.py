@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import Column, Integer, MetaData, String, Table
 
 from core.skills.data_bridge import SkillDataBridge, _apply_filters
+from core.skills.dependencies import Dependency
 from core.skills.loader import SkillManifest
 
 
@@ -14,7 +15,7 @@ from core.skills.loader import SkillManifest
 @pytest.fixture
 def manifests() -> dict[str, SkillManifest]:
     return {
-        "knowledge": SkillManifest(name="knowledge", version="1.0", depends_on=["github"]),
+        "knowledge": SkillManifest(name="knowledge", version="1.0", depends_on=[Dependency(name="github")]),
         "github": SkillManifest(name="github", version="1.0", depends_on=[]),
     }
 

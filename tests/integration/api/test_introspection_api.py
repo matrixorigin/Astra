@@ -1,6 +1,7 @@
 """Integration tests for introspection API endpoints."""
 
 import pytest
+from uuid import uuid4
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -28,8 +29,12 @@ class TestIntrospectionSkills:
     """Test GET /introspection/skills endpoint."""
 
     def _seed(self, db, user_id: str):
-        """Seed skills + installations for a user. Returns cleanup function."""
-        prefix = user_id[:16]
+        """Seed skills + installations for a user. Returns cleanup function.
+
+        Skill names prefixed with ``a_`` so they sort before concurrent
+        test data and always land within the cloud-skills cap.
+        """
+        prefix = f"a_{user_id}"
         for suffix, desc, cat in [
             ("ci", "Check CI status", "devops"),
             ("pr", "List open PRs", "devops"),
@@ -46,7 +51,7 @@ class TestIntrospectionSkills:
                 "INSERT INTO skill_installations "
                 "(installation_id, user_id, skill_name, skill_version, status, installed_at) "
                 "VALUES (:iid, :uid, :n, '1.0.0', 'installed', NOW())"
-            ), {"iid": f"inst_{prefix}_{i}", "uid": user_id, "n": name})
+            ), {"iid": str(uuid4()), "uid": user_id, "n": name})
         db.commit()
 
         def cleanup():
@@ -65,7 +70,7 @@ class TestIntrospectionSkills:
             assert "installed" in data
             assert "cloud" in data
 
-            prefix = test_user.user_id[:16]
+            prefix = f"a_{test_user.user_id}"
             installed_names = {s["name"] for s in data["installed"]}
             assert f"{prefix}_ci" in installed_names
             assert f"{prefix}_pr" in installed_names
@@ -83,7 +88,7 @@ class TestIntrospectionSkills:
         try:
             resp = client.get("/introspection/skills", headers=auth_headers)
             data = resp.json()
-            prefix = test_user.user_id[:16]
+            prefix = f"a_{test_user.user_id}"
             cloud_names = {s["name"] for s in data["cloud"]}
             assert f"{prefix}_ci" not in cloud_names
             assert f"{prefix}_pr" not in cloud_names
@@ -96,7 +101,7 @@ class TestIntrospectionSkills:
         try:
             resp = client.get("/introspection/skills", headers=auth_headers)
             data = resp.json()
-            prefix = test_user.user_id[:16]
+            prefix = f"a_{test_user.user_id}"
             ci = next(s for s in data["installed"] if s["name"] == f"{prefix}_ci")
             assert ci["description"] == "Check CI status"
             assert ci["version"] == "1.0.0"
@@ -106,7 +111,7 @@ class TestIntrospectionSkills:
 
     def test_multi_version_dedup(self, client, auth_headers, db, test_user):
         """Multiple versions of same skill appear only once in cloud list."""
-        prefix = test_user.user_id[:16]
+        prefix = f"a_{test_user.user_id}"
         name = f"{prefix}_multi"
         db.execute(text(
             "INSERT INTO skills_registry (skill_id, skill_name, version, description, is_active) "

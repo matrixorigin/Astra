@@ -16,11 +16,11 @@ from core.memory.types import Memory, MemoryType, TrustTier
 
 
 def _uid():
-    return f"gov_e2e_{uuid7().hex[:12]}"
+    return f"gov_e2e_{uuid7().hex}"
 
 
 def _sid():
-    return f"sess_{uuid7().hex[:12]}"
+    return f"sess_{uuid7().hex}"
 
 
 @pytest.fixture

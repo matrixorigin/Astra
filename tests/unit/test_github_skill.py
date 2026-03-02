@@ -22,19 +22,19 @@ class TestRepoManagement:
         return GitHubSkillAPI(token=None, db=db_session)
 
     def test_add_repo(self, api):
-        result = api.add_repo("octocat", f"repo_{uuid.uuid4().hex[:8]}")
+        result = api.add_repo("octocat", f"repo_{uuid.uuid4().hex}")
         assert result["created"] is True
         assert result["repo_id"]
 
     def test_add_repo_idempotent(self, api):
-        name = f"repo_{uuid.uuid4().hex[:8]}"
+        name = f"repo_{uuid.uuid4().hex}"
         r1 = api.add_repo("octocat", name)
         r2 = api.add_repo("octocat", name)
         assert r1["repo_id"] == r2["repo_id"]
         assert r2["created"] is False
 
     def test_list_repos(self, api):
-        name = f"repo_{uuid.uuid4().hex[:8]}"
+        name = f"repo_{uuid.uuid4().hex}"
         api.add_repo("testowner", name)
         repos = api.list_repos()
         names = [r["full_name"] for r in repos]
@@ -59,14 +59,14 @@ class TestPRCache:
         return GitHubSkillAPI(token=None, db=db_session)
 
     def test_cache_pr_insert(self, api, db_session):
-        repo = f"owner/cache_test_{uuid.uuid4().hex[:8]}"
+        repo = f"owner/cache_test_{uuid.uuid4().hex}"
         api._cache_pr(repo, {"number": 42, "title": "Test PR", "state": "open", "user": "alice"})
         row = db_session.query(SkGithubPRCache).filter_by(repo_full_name=repo, pr_number=42).one()
         assert row.title == "Test PR"
         assert row.state == "open"
 
     def test_cache_pr_update(self, api, db_session):
-        repo = f"owner/cache_upd_{uuid.uuid4().hex[:8]}"
+        repo = f"owner/cache_upd_{uuid.uuid4().hex}"
         api._cache_pr(repo, {"number": 1, "title": "v1", "state": "open", "user": "a"})
         api._cache_pr(repo, {"number": 1, "title": "v2", "state": "closed", "user": "a"})
         row = db_session.query(SkGithubPRCache).filter_by(repo_full_name=repo, pr_number=1).one()

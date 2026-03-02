@@ -5,8 +5,14 @@ from uuid import uuid4
 
 
 def unique_test_id() -> str:
-    """Generate unique ID for test isolation (xdist-safe)."""
-    return f"test_{uuid4().hex[:16]}"
+    """Generate unique ID for test isolation (xdist-safe).
+
+    Uses the full 32-char hex of uuid4 — never truncate UUIDs,
+    truncation dramatically increases collision probability under
+    parallel execution.  Prefix kept to 3 chars so total (36) fits
+    VARCHAR(36) columns.
+    """
+    return f"tt_{uuid4().hex}"
 
 
 class NullRenderer:

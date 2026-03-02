@@ -53,7 +53,7 @@ def _make_due_trigger(db, session_id, name_suffix=""):
     trig = create_trigger(
         db, user_id="test-user", agent_id="dev-agent",
         trigger_type="schedule",
-        name=f"iso-{generate_id()[:8]}{name_suffix}",
+        name=f"iso-{generate_id()}{name_suffix}",
         user_input="test input",
         cron_expr="* * * * *",
         session_id=session_id,
@@ -271,7 +271,7 @@ class TestGetDueTriggersRealDB:
         trig_future = create_trigger(
             db, user_id="test-user", agent_id="dev-agent",
             trigger_type="schedule",
-            name=f"iso-{generate_id()[:8]}-future",
+            name=f"iso-{generate_id()}-future",
             user_input="test input",
             cron_expr="* * * * *",
             session_id=session_id,

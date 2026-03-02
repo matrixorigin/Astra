@@ -43,7 +43,7 @@ def sandbox(db):
 
 def test_snapshot_creation_and_listing(git):
     """Test creating and listing snapshots."""
-    snapshot_name = f"test_snapshot_{str(uuid7()).replace('-', '_')[:8]}".lower()
+    snapshot_name = f"test_snapshot_{uuid7().hex}".lower()
 
     # Create snapshot
     snapshot = git.create_snapshot(snapshot_name)
@@ -69,7 +69,7 @@ def test_time_machine_checkpoint(time_machine, db):
     
     user_id = str(uuid4())
     session_id = str(uuid4())
-    checkpoint_name = f"test_checkpoint_{str(uuid7()).replace('-', '_')[:8]}".lower()
+    checkpoint_name = f"test_checkpoint_{uuid7().hex}".lower()
 
     # Create initial event directly
     db.execute(
@@ -128,7 +128,7 @@ def test_time_machine_checkpoint(time_machine, db):
 
 def test_sandbox_creation(sandbox):
     """Test sandbox creation and deletion."""
-    sandbox_name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
+    sandbox_name = f"sandbox_{uuid7().hex}".lower()
 
     # Create sandbox
     sandbox.create(sandbox_name)
@@ -145,7 +145,7 @@ def test_sandbox_experiment(sandbox, db):
     """Test running an experiment in a sandbox with table branching."""
     from sqlalchemy import text
     
-    sandbox_name = f"sandbox_{str(uuid7()).replace('-', '_')}".lower()
+    sandbox_name = f"sandbox_{uuid7().hex}".lower()
 
     # Create sandbox with agent_events table branched
     sandbox.create(sandbox_name, tables=["agent_events"])
@@ -201,7 +201,7 @@ def test_git_for_data_restore(git, db):
     """Test snapshot restore functionality using table-level restore."""
     from sqlalchemy import text
     
-    snapshot_name = f"test_restore_{str(uuid7()).replace('-', '_')[:8]}".lower()
+    snapshot_name = f"test_restore_{uuid7().hex}".lower()
     test_event_id = str(uuid4())
 
     # Create test event directly

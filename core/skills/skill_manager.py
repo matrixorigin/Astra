@@ -21,6 +21,12 @@ from api.models import (
 )
 from core.db_consumer import DbConsumer
 from core.skills.credential_manager import CredentialManager
+from core.skills.dependencies import DependencyType, parse_depends_on
+from core.skills.resolver import (
+    CircularDependencyError,
+    DependencyConflictError,
+    DependencyResolver,
+)
 
 
 class SkillNotFoundError(Exception):
@@ -134,11 +140,14 @@ class SkillManager(DbConsumer):
 
             # Check direct dependencies
             if defn.manifest:
-                for dep in defn.manifest.get("depends_on", []):
-                    if self._get_installation(db, user_id, dep) is None:
-                        raise SkillNotInstalledError(
-                            f"Dependency '{dep}' required by '{skill_name}' is not installed"
-                        )
+                raw_deps = defn.manifest.get("depends_on", [])
+                deps = parse_depends_on(raw_deps) if raw_deps else []
+                for dep in deps:
+                    if dep.type == DependencyType.SKILL:
+                        if self._get_installation(db, user_id, dep.name) is None:
+                            raise SkillNotInstalledError(
+                                f"Dependency '{dep.name}' required by '{skill_name}' is not installed"
+                            )
 
     # ── permission check ──────────────────────────────────────────────────────
 
@@ -171,7 +180,10 @@ class SkillManager(DbConsumer):
     # ── install ───────────────────────────────────────────────────────────────
 
     def install(self, user_id: str, skill_name: str) -> SkillInstallation:
-        """Install a skill for a user (record only, no DDL)."""
+        """Install a skill for a user (record only, no DDL).
+
+        Validates dependency versions and detects cycles/conflicts before install.
+        """
         with self._db() as db:
             defn = self._get_definition(db, skill_name)
             if defn is None:
@@ -179,13 +191,34 @@ class SkillManager(DbConsumer):
             if not self._check_permission(db, user_id, skill_name):
                 raise PermissionDeniedError(f"No permission to install '{skill_name}'")
 
-            # Check dependencies
+            # Resolve dependencies with version constraints
             manifest = defn.manifest or {}
-            for dep in manifest.get("depends_on", []):
-                if self._get_installation(db, user_id, dep) is None:
-                    raise SkillNotInstalledError(
-                        f"Dependency '{dep}' must be installed before '{skill_name}'"
-                    )
+            raw_deps = manifest.get("depends_on", [])
+            if raw_deps:
+                deps = parse_depends_on(raw_deps)
+                available_skills, available_tools = self._collect_available(db)
+                resolver = DependencyResolver(
+                    available_skills=available_skills,
+                    available_tools=available_tools,
+                )
+                resolve_result = resolver.resolve(skill_name, deps)
+                if not resolve_result.success:
+                    if resolve_result.cycle:
+                        raise CircularDependencyError(resolve_result.cycle)
+                    if resolve_result.conflicts:
+                        raise DependencyConflictError(resolve_result.conflicts)
+                    if resolve_result.missing:
+                        raise SkillNotFoundError(
+                            f"Missing dependencies for '{skill_name}': {', '.join(resolve_result.missing)}"
+                        )
+
+                # Ensure all deps are installed for this user
+                for dep in deps:
+                    if dep.type == DependencyType.SKILL:
+                        if self._get_installation(db, user_id, dep.name) is None:
+                            raise SkillNotInstalledError(
+                                f"Dependency '{dep.name}' must be installed before '{skill_name}'"
+                            )
 
             existing = self._get_installation(db, user_id, skill_name)
             if existing is not None:
@@ -216,7 +249,6 @@ class SkillManager(DbConsumer):
             except OperationalError as e:
                 db.rollback()
                 if getattr(e.orig, "args", (None,))[0] == 20619:
-                    # MatrixOne w-w conflict — concurrent insert won
                     result = self._get_installation(db, user_id, skill_name)
                     if result is None:
                         raise SkillNotFoundError(
@@ -227,6 +259,25 @@ class SkillManager(DbConsumer):
                 raise
             db.expunge(installation)
             return installation
+
+    def _collect_available(self, db: Session) -> tuple[dict[str, dict], dict[str, str]]:
+        """Collect all active skills and tools in a single query.
+
+        Returns (skills_dict, tools_dict) where:
+        - skills_dict: {name: {version, depends_on}} for all active skills
+        - tools_dict: {name: version} for skills with source='edge_tool'
+        """
+        rows = db.query(SkillRegistry).filter_by(is_active=1).all()
+        skills: dict[str, dict] = {}
+        tools: dict[str, str] = {}
+        for r in rows:
+            skills[r.skill_name] = {
+                "version": r.version or "0.0.0",
+                "depends_on": (r.manifest or {}).get("depends_on", []),
+            }
+            if r.source == "edge_tool":
+                tools[r.skill_name] = r.version or "1.0.0"
+        return skills, tools
 
     # ── uninstall ─────────────────────────────────────────────────────────────
 

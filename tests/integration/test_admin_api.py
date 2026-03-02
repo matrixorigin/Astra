@@ -38,7 +38,7 @@ def client(db_session):
 @pytest.fixture
 def admin_user(client, db_session):
     """Create admin user and return auth token."""
-    unique_id = str(uuid.uuid4())[:8]
+    unique_id = uuid.uuid4().hex
     username = f"admin_{unique_id}"
     email = f"admin_{unique_id}@test.com"
 
@@ -90,7 +90,7 @@ def admin_user(client, db_session):
 @pytest.fixture
 def regular_user(client):
     """Create regular user and return auth token."""
-    unique_id = str(uuid.uuid4())[:8]
+    unique_id = uuid.uuid4().hex
     username = f"regular_{unique_id}"
     email = f"regular_{unique_id}@test.com"
 
@@ -303,7 +303,7 @@ def test_grant_role_user_not_found(client, admin_user):
 def test_grant_role_invalid_role(client, admin_user, db_session):
     """Test granting invalid role."""
     # Create a test user
-    unique_id = str(uuid.uuid4())[:8]
+    unique_id = uuid.uuid4().hex
     username = f"testuser_{unique_id}"
     response = client.post(
         "/auth/register",
@@ -328,7 +328,7 @@ def test_grant_role_invalid_role(client, admin_user, db_session):
 def test_grant_and_revoke_role_success(client, admin_user, db_session):
     """Test successful role grant and revoke."""
     # Create a test user
-    unique_id = str(uuid.uuid4())[:8]
+    unique_id = uuid.uuid4().hex
     username = f"testuser_{unique_id}"
     response = client.post(
         "/auth/register",
@@ -413,7 +413,7 @@ def test_first_user_becomes_admin(client, db_session):
     db_session.commit()
 
     # Register first user
-    unique_id = str(uuid.uuid4())[:8]
+    unique_id = uuid.uuid4().hex
     username = f"firstuser_{unique_id}"
     response = client.post(
         "/auth/register",

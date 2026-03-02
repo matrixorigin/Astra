@@ -57,7 +57,7 @@ def _uid():
 
 
 def _name(prefix="sk"):
-    return f"{prefix}_{uuid.uuid4().hex[:8]}"
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 @pytest.fixture

@@ -141,7 +141,7 @@ class TestSkillRegistration:
     def test_register_skill_with_metadata(self, registry, mock_db):
         """Test skill registration with full metadata."""
         import uuid
-        skill_name = f"test_skill_{uuid.uuid4().hex[:8]}"
+        skill_name = f"test_skill_{uuid.uuid4().hex}"
         skill = MockSkill(skill_name, "1.0.0")
 
         registry.register(
