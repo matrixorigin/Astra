@@ -411,6 +411,74 @@ async def chat(
     return ChatResponse(session_id=session_id, run_id=run.run_id, status=run.status.value)
 
 
+def _transform_event_for_client(event: dict) -> dict:
+    """Transform internal event format to client-expected format.
+
+    Internal (from RunEngine): {"event_type": "text_delta", "data": {"chunk": "..."}, ...}
+    Client (SSE):              {"type": "text_delta", "content": "...", ...}
+
+    Fields are explicitly picked per event type to avoid leaking internal
+    structure.  Unknown event types are passed through with just the type
+    field (no data spread) and logged at debug level.
+    """
+    event_type = event.get("event_type", "")
+    data = event.get("data", {})
+
+    # ── Text ──
+    if event_type == "text_delta":
+        return {"type": "text_delta", "content": data.get("chunk", "")}
+    if event_type == "text_done":
+        return {"type": "text_done", "full_text": data.get("full_text", "")}
+
+    # ── Reasoning / CoT ──
+    if event_type == "reasoning_message_content":
+        return {"type": "reasoning_message_content", "content": data.get("content", "")}
+    if event_type == "thinking_delta":
+        return {"type": "thinking_delta", "content": data.get("chunk", "")}
+    if event_type == "thinking_done":
+        return {"type": "thinking_done"}
+
+    # ── Tool use ──
+    if event_type == "tool_call_start":
+        return {"type": "tool_call_start", "tool": data.get("tool", ""), "call_id": data.get("call_id", "")}
+    if event_type == "tool_result":
+        return {"type": "tool_result", "call_id": data.get("call_id", ""), "result": data.get("result", "")}
+
+    # ── Lifecycle ──
+    if event_type == "run_started":
+        return {"type": "run_started"}
+    if event_type == "run_finished":
+        return {"type": "run_finished"}
+    if event_type == "run_error":
+        return {"type": "error", "message": data.get("error", "Unknown error"), "code": "RUN_ERROR"}
+
+    # ── Planning ──
+    if event_type == "plan_created":
+        return {"type": "plan_created", "plan": data.get("plan", {})}
+    if event_type == "plan_step_start":
+        return {"type": "plan_step_start", "step": data.get("step", "")}
+    if event_type == "plan_step_done":
+        return {"type": "plan_step_done", "step": data.get("step", ""), "result": data.get("result", "")}
+    if event_type == "plan_revised":
+        return {"type": "plan_revised", "plan": data.get("plan", {})}
+
+    # ── Multi-agent ──
+    if event_type == "agent_delegated":
+        return {"type": "agent_delegated", "agent_id": data.get("agent_id", ""), "task": data.get("task", "")}
+    if event_type == "agent_progress":
+        return {"type": "agent_progress", "agent_id": data.get("agent_id", ""), "progress": data.get("progress", "")}
+    if event_type == "agent_completed":
+        return {"type": "agent_completed", "agent_id": data.get("agent_id", ""), "result": data.get("result", "")}
+
+    # ── Keepalive ──
+    if event_type == "keepalive":
+        return {"type": "ping"}
+
+    # Unknown event — pass through type only, don't spread internal data
+    logger.debug("Unknown internal event_type for client: %s", event_type)
+    return {"type": event_type}
+
+
 @router.post("/chat/stream")
 async def chat_stream(
     request: ChatRequest,
@@ -449,10 +517,12 @@ async def chat_stream(
             from core.agent.run_engine import _run_tasks
             _run_tasks[run.run_id] = task
 
-            yield f"data: {json.dumps({'event_type': 'session_info', 'data': {'session_id': session_id, 'run_id': run.run_id}})}\n\n"
+            yield f"data: {json.dumps({'type': 'session_info', 'session_id': session_id, 'run_id': run.run_id})}\n\n"
 
             async for event in engine.stream_agent_run_events(run.run_id):
-                yield f"data: {json.dumps(event)}\n\n"
+                # Transform internal event format to client-expected format
+                client_event = _transform_event_for_client(event)
+                yield f"data: {json.dumps(client_event)}\n\n"
         except Exception as e:
             logger.error(f"Stream error: {e}", exc_info=True)
             code = status_to_error_code(e.status_code) if isinstance(e, HTTPException) else "INTERNAL_ERROR"

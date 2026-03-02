@@ -25,6 +25,7 @@ build/
 .coverage
 htmlcov/
 *.manifest
+.mymodels*
 
 # Poetry
 # poetry.lock is tracked — required for reproducible CI builds and Docker images.

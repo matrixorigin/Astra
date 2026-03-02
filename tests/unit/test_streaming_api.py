@@ -45,9 +45,9 @@ class TestChatStream:
             if s.startswith("data: "):
                 collected.append(json.loads(s[6:].strip()))
 
-        assert collected[0]["event_type"] == "session_info"
-        assert collected[1]["event_type"] == "text_delta"
-        assert collected[2]["event_type"] == "run_finished"
+        assert collected[0]["type"] == "session_info"
+        assert collected[1]["type"] == "text_delta"
+        assert collected[2]["type"] == "run_finished"
 
     @pytest.mark.asyncio
     async def test_stream_chat_session_not_found(self, mock_auth):
@@ -135,7 +135,7 @@ class TestChatStream:
             if s.startswith("data: "):
                 collected.append(json.loads(s[6:].strip()))
 
-        types = [e["event_type"] for e in collected]
+        types = [e["type"] for e in collected]
         assert "tool_call_start" in types
         assert "tool_result" in types
 
@@ -169,7 +169,7 @@ class TestChatStream:
             if s.startswith("data: "):
                 collected.append(json.loads(s[6:].strip()))
 
-        types = [e["event_type"] for e in collected]
+        types = [e["type"] for e in collected]
         assert "plan_created" in types
         assert "plan_step_start" in types
 
@@ -203,10 +203,10 @@ class TestChatStream:
             if s.startswith("data: "):
                 collected.append(json.loads(s[6:].strip()))
 
-        types = [e["event_type"] for e in collected]
+        types = [e["type"] for e in collected]
         assert "reasoning_message_content" in types
-        reasoning_evt = [e for e in collected if e["event_type"] == "reasoning_message_content"][0]
-        assert reasoning_evt["data"]["content"] == "Let me think..."
+        reasoning_evt = [e for e in collected if e["type"] == "reasoning_message_content"][0]
+        assert reasoning_evt["content"] == "Let me think..."
 
 
 class TestChat:

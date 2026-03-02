@@ -201,18 +201,29 @@ class LLMClient(DbConsumer):
                     continue
                 self._model_keys[model_name] = api_key
 
+                # Create provider instance per model (not per provider name).
+                # This allows multiple models from same provider with different base_urls.
+                # Skip if a built-in provider is already registered under the plain
+                # provider name (e.g. "mock" → MockEchoProvider) — the built-in
+                # takes precedence over DB-created OpenAIProvider instances.
+                provider_key = f"{provider_name}:{model_name}"
+                if provider_key in self._providers:
+                    continue
                 if provider_name in self._providers:
-                    continue  # provider already initialized with first model's key
+                    # Built-in provider exists — reuse it for this model
+                    self._providers[provider_key] = self._providers[provider_name]
+                    logger.debug(f"Reusing built-in {provider_name} provider for {model_name}")
+                    continue
                 try:
                     base_url = row.base_url
                     if provider_name == "groq" and not base_url:
-                        self._providers[provider_name] = GroqProvider(api_key)
+                        self._providers[provider_key] = GroqProvider(api_key)
                     elif provider_name == "anthropic" and not base_url:
-                        self._providers[provider_name] = AnthropicProvider(api_key)
+                        self._providers[provider_key] = AnthropicProvider(api_key)
                     else:
                         kwargs = {"base_url": base_url} if base_url else {}
-                        self._providers[provider_name] = OpenAIProvider(api_key, **kwargs)
-                    logger.debug(f"Initialized {provider_name} provider")
+                        self._providers[provider_key] = OpenAIProvider(api_key, **kwargs)
+                    logger.debug(f"Initialized {provider_name} provider for {model_name}")
                 except Exception as e:
                     hint = ""
                     if "No module named" in str(e):
@@ -250,48 +261,71 @@ class LLMClient(DbConsumer):
         for m in self.router.list_models():
             self.rate_limiter.configure(m.model_name, m.rpm_limit, m.tpm_limit)
 
-    def _get_provider(self, p) -> BaseProvider:
+    def _get_provider(self, p, model_name: str | None = None) -> BaseProvider:
         name = p.value if isinstance(p, LLMProvider) else str(p)
-        provider = self._providers.get(name)
-        if not provider:
-            # Try lazy initialization from database
-            provider = self._lazy_init_provider(name)
+        
+        # Try model-specific provider first (format: "provider:model").
+        # _refresh_providers always stores as "provider:model", so this is
+        # the primary lookup path for DB-registered models.
+        if model_name:
+            provider_key = f"{name}:{model_name}"
+            provider = self._providers.get(provider_key)
             if provider:
                 return provider
-            
-            # Check if model is registered in database
-            with self._db() as db:
-                from api.models import LLMModel
-                registered = db.query(LLMModel).filter(
-                    LLMModel.provider == name, LLMModel.is_active == 1
-                ).first()
-            
-            if registered:
-                raise ValueError(
-                    f"Provider '{name}' is registered but failed to initialize. "
-                    f"Check logs or try: make dev-api-restart"
-                )
-            else:
-                raise ValueError(
-                    f"Provider '{name}' is not available. "
-                    f"Check: pip install openai  and  mo-admin model check <model>"
-                )
-        return provider
+        
+        # Fall back to plain provider name — used by built-in providers
+        # (e.g. "mock") that are registered without a model-specific key.
+        provider = self._providers.get(name)
+        if provider:
+            return provider
+        
+        # Not cached — try lazy init from DB.
+        provider = self._lazy_init_provider(name, model_name)
+        if provider:
+            return provider
+        
+        # Check if model is registered in database
+        with self._db() as db:
+            from api.models import LLMModel
+            registered = db.query(LLMModel).filter(
+                LLMModel.provider == name, LLMModel.is_active == 1
+            ).first()
+        
+        if registered:
+            raise ValueError(
+                f"Provider '{name}' is registered but failed to initialize. "
+                f"Check logs or try: make dev-api-restart"
+            )
+        else:
+            raise ValueError(
+                f"Provider '{name}' is not available. "
+                f"Check: pip install openai  and  mo-admin model check <model>"
+            )
     
-    def _lazy_init_provider(self, provider_name: str) -> BaseProvider | None:
-        """Attempt to initialize a provider on-demand from database."""
+    def _lazy_init_provider(self, provider_name: str, model_name: str | None = None) -> BaseProvider | None:
+        """Attempt to initialize a provider on-demand from database.
+
+        Always stores with "provider:model" key when model_name is known,
+        matching the key format used by _refresh_providers.
+        """
         try:
             with self._db() as db:
                 from api.models import LLMModel
-                row = db.query(LLMModel).filter(
-                    LLMModel.provider == provider_name, LLMModel.is_active == 1
-                ).first()
+                if model_name:
+                    row = db.query(LLMModel).filter(
+                        LLMModel.model_name == model_name, LLMModel.is_active == 1
+                    ).first()
+                else:
+                    row = db.query(LLMModel).filter(
+                        LLMModel.provider == provider_name, LLMModel.is_active == 1
+                    ).first()
                 
                 if not row:
                     return None
                 
                 api_key = decrypt_token(row.api_key_encrypted)
                 base_url = row.base_url
+                resolved_model = model_name or row.model_name
                 
                 if provider_name == "groq" and not base_url:
                     provider = GroqProvider(api_key)
@@ -301,8 +335,10 @@ class LLMClient(DbConsumer):
                     kwargs = {"base_url": base_url} if base_url else {}
                     provider = OpenAIProvider(api_key, **kwargs)
                 
-                self._providers[provider_name] = provider
-                logger.info(f"Lazy-initialized {provider_name} provider")
+                # Always use "provider:model" key for consistency with _refresh_providers
+                provider_key = f"{provider_name}:{resolved_model}"
+                self._providers[provider_key] = provider
+                logger.info(f"Lazy-initialized {provider_name} provider for {resolved_model}")
                 return provider
         except Exception as e:
             logger.warning(f"Failed to lazy-init {provider_name}: {e}")
@@ -405,7 +441,7 @@ class LLMClient(DbConsumer):
 
             try:
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
-                provider = self._get_provider(model_cfg.provider)
+                provider = self._get_provider(model_cfg.provider, model_cfg.model_name)
                 # Pass cache config to Anthropic provider
                 if hasattr(provider, 'cache_enabled'):
                     provider.cache_enabled = model_cfg.enable_cache
@@ -537,7 +573,7 @@ class LLMClient(DbConsumer):
                 continue
             try:
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
-                provider = self._get_provider(model_cfg.provider)
+                provider = self._get_provider(model_cfg.provider, model_cfg.model_name)
                 usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}
 
                 sync_iter = provider.complete_stream(
@@ -622,7 +658,7 @@ class LLMClient(DbConsumer):
                 continue
             try:
                 self.rate_limiter.wait_and_acquire(model_cfg.model_name, estimated_tokens=500)
-                provider = self._get_provider(model_cfg.provider)
+                provider = self._get_provider(model_cfg.provider, model_cfg.model_name)
                 if hasattr(provider, 'cache_enabled'):
                     provider.cache_enabled = model_cfg.enable_cache
                 usage = {"prompt": 0, "completion": 0, "cache_read": 0, "cache_creation": 0}

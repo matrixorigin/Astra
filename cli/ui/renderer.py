@@ -67,7 +67,9 @@ class RichRenderer:
     def tool_start(self, name: str, args: dict[str, Any]) -> None:
         self._stop_spinner()
         if self._md is not None:
-            self.end_response(rerender=False)
+            # Finish markdown without extra newline - tool output follows immediately
+            self._md.finish(rerender=False)
+            self._md = None
         detail = args.get("command", args.get("path", ""))
         self._console.print(
             f"  {THEME.tool} [yellow]{name}[/yellow]: {detail}… ",

@@ -1,0 +1,63 @@
+# Example model configuration file for mo-admin model load
+#
+# Usage: mo-admin model load models.yaml
+#
+# Supports both single model and array of models.
+# Required fields: name, provider, api_key
+# All other fields are optional.
+
+# Private DeepSeek deployment (OpenAI-compatible)
+- name: my-deepseek-v3
+  provider: deepseek
+  api_key: your-api-key-here
+  base_url: https://api.example.com/v1
+  description: "Private DeepSeek V3 deployment"
+  pricing_prompt: 0.001
+  pricing_completion: 0.002
+  tags: [code, chat, reasoning]
+  context_window: 65536
+  max_completion_tokens: 8192
+
+# OpenAI GPT-4o
+- name: gpt-4o
+  provider: openai
+  api_key: sk-your-openai-key-here
+  description: "OpenAI GPT-4o - multimodal flagship model"
+  pricing_prompt: 0.0025
+  pricing_completion: 0.01
+  tags: [code, reasoning, vision]
+  context_window: 128000
+  max_completion_tokens: 16384
+
+# OpenAI GPT-4o-mini (cost-optimized)
+- name: gpt-4o-mini
+  provider: openai
+  api_key: sk-your-openai-key-here
+  description: "OpenAI GPT-4o-mini - fast and cheap"
+  pricing_prompt: 0.00015
+  pricing_completion: 0.0006
+  tags: [fast, cheap, chat]
+  context_window: 128000
+  max_completion_tokens: 16384
+
+# Anthropic Claude
+- name: claude-3-5-sonnet-20241022
+  provider: anthropic
+  api_key: sk-ant-your-anthropic-key-here
+  description: "Anthropic Claude 3.5 Sonnet - best for coding"
+  pricing_prompt: 0.003
+  pricing_completion: 0.015
+  tags: [code, reasoning, long-context]
+  context_window: 200000
+  max_completion_tokens: 8192
+
+# Custom OpenAI-compatible endpoint
+- name: my-custom-model
+  provider: custom
+  api_key: your-custom-api-key
+  base_url: https://your-custom-endpoint.com/v1
+  description: "Custom OpenAI-compatible model"
+  pricing_prompt: 0.0
+  pricing_completion: 0.0
+  tags: [custom, self-hosted]
+  context_window: 32000

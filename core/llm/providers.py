@@ -92,10 +92,49 @@ def _extract_openai_cached_tokens(usage) -> int:
 
 
 def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
-    """Shared tool call accumulation for OpenAI-compatible streaming."""
+    """Shared tool call accumulation for OpenAI-compatible streaming.
+
+    Some providers (e.g. private DeepSeek endpoints) include usage data in
+    every chunk alongside content.  The original code had ``continue`` after
+    yielding usage, which would silently drop content from those chunks.
+    We now process choices first, then usage, so nothing is lost.
+
+    Callers that need a single usage summary (e.g. LLMClient) overwrite on
+    each yield, so the last (cumulative) usage event wins — duplicates are
+    harmless.
+    """
     buf: dict[int, dict] = {}
     truncated = False
     for chunk in response_iter:
+        # Process content/tool_calls first, then usage.
+        if chunk.choices:
+            choice = chunk.choices[0]
+            if choice.finish_reason == "length":
+                truncated = True
+            delta = choice.delta
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                yield {"type": "reasoning", "content": reasoning}
+            if delta.content:
+                yield {"type": "text", "content": delta.content}
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in buf:
+                        buf[idx] = {
+                            "id": tc.id or f"idx_{idx}",
+                            "type": tc.type or "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    elif tc.id:
+                        buf[idx]["id"] = tc.id
+                    if tc.function and tc.function.name:
+                        prev = buf[idx]["function"]["name"]
+                        buf[idx]["function"]["name"] = tc.function.name
+                        if not prev:
+                            yield {"type": "tool_call_start", "name": tc.function.name}
+                    if tc.function and tc.function.arguments:
+                        buf[idx]["function"]["arguments"] += tc.function.arguments
         if chunk.usage:
             yield {
                 "type": "usage",
@@ -103,39 +142,6 @@ def _accumulate_tool_calls(response_iter) -> Iterator[dict]:
                 "completion": chunk.usage.completion_tokens,
                 "cache_read": _extract_openai_cached_tokens(chunk.usage),
             }
-            continue
-        if not chunk.choices:
-            continue
-        choice = chunk.choices[0]
-        # Detect output truncation (max_tokens reached).
-        if choice.finish_reason == "length":
-            truncated = True
-        delta = choice.delta
-        # OpenAI o-series reasoning tokens
-        reasoning = getattr(delta, "reasoning_content", None)
-        if reasoning:
-            yield {"type": "reasoning", "content": reasoning}
-        if delta.content:
-            yield {"type": "text", "content": delta.content}
-        if delta.tool_calls:
-            for tc in delta.tool_calls:
-                idx = tc.index
-                if idx not in buf:
-                    buf[idx] = {
-                        "id": tc.id or f"idx_{idx}",
-                        "type": tc.type or "function",
-                        "function": {"name": "", "arguments": ""},
-                    }
-                elif tc.id:
-                    buf[idx]["id"] = tc.id
-                if tc.function and tc.function.name:
-                    prev = buf[idx]["function"]["name"]
-                    buf[idx]["function"]["name"] = tc.function.name
-                    if not prev:
-                        # First time we see the tool name — notify caller
-                        yield {"type": "tool_call_start", "name": tc.function.name}
-                if tc.function and tc.function.arguments:
-                    buf[idx]["function"]["arguments"] += tc.function.arguments
     for tc in buf.values():
         if tc["function"]["name"]:
             if truncated:

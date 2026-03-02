@@ -170,7 +170,8 @@ class StreamingMarkdown:
                     # Render final markdown
                     self._console.print(Markdown(self._buffer))
                 else:
-                    # Just ensure we're on a new line
+                    # Don't erase/rerender — just ensure cursor is on a new line
+                    # so subsequent output (e.g. tool markers) starts cleanly.
                     if self._current_line_width > 0:
                         f.write("\n")
                         f.flush()

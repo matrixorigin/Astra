@@ -71,7 +71,7 @@ def register(ctx, username, password, email):
     try:
         ctx.obj["client"].admin_register(
             username=username, password=password,
-            email=email or f"{username}@admin.local",
+            email=email or f"{username}@example.com",
         )
         click.echo(f"✅ Admin registered: {username}")
     except Exception as e:
@@ -300,6 +300,73 @@ def model_remove(ctx, model_name, yes):
     except Exception as e:
         click.echo(f"❌ Failed: {e}")
         sys.exit(1)
+
+
+@model.command("load")
+@click.argument("file", type=click.Path(exists=True))
+@click.pass_context
+def model_load(ctx, file):
+    """Load models from a JSON or YAML file.
+
+    File should contain a list of model objects (or a single object).
+    Each object needs at minimum: name, provider, api_key.
+
+    \b
+    Example (YAML):
+      - name: deepseek-v3
+        provider: deepseek
+        api_key: sk-xxx
+        base_url: https://api.example.com/v1
+        description: "Private DeepSeek"
+        pricing_prompt: 0.001
+        pricing_completion: 0.002
+        tags: [code, chat]
+        context_window: 65536
+    """
+    client = ctx.obj["client"]
+    require_auth(client)
+
+    path = Path(file)
+    text = path.read_text(encoding="utf-8")
+    if path.suffix in (".yaml", ".yml"):
+        try:
+            import yaml
+        except ImportError:
+            click.echo("❌ PyYAML required: pip install pyyaml")
+            sys.exit(1)
+        data = yaml.safe_load(text)
+    else:
+        data = json.loads(text)
+
+    models = data if isinstance(data, list) else [data]
+    ok, fail = 0, 0
+    for m in models:
+        name = m.get("name")
+        provider = m.get("provider")
+        api_key = m.get("api_key")
+        if not (name and provider and api_key):
+            click.echo(f"⚠️  Skipped: missing name/provider/api_key in {m}")
+            fail += 1
+            continue
+        tags = m.get("tags")
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+        try:
+            result = client.admin_create_model(
+                model_name=name, provider=provider, api_key=api_key,
+                base_url=m.get("base_url"), description=m.get("description"),
+                pricing_prompt=m.get("pricing_prompt"), pricing_completion=m.get("pricing_completion"),
+                tags=tags, context_window=m.get("context_window"),
+                max_completion_tokens=m.get("max_completion_tokens"),
+            )
+            conn = result.get("connectivity", "unknown")
+            status = "✅" if result.get("is_active") else "⚠️ "
+            click.echo(f"{status} {name} ({provider}) — {conn}")
+            ok += 1
+        except Exception as e:
+            click.echo(f"❌ {name}: {e}")
+            fail += 1
+    click.echo(f"\nDone: {ok} loaded, {fail} failed")
 
 
 # ============================================================================
