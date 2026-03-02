@@ -24,7 +24,7 @@ class SkillRegistry(Base):
     skill_definition = Column(JSON)
     code_hash = Column(String(64))
     git_commit_hash = Column(String(64))
-    is_active = Column(SmallInteger, default=1)
+    is_active = Column(SmallInteger, default=1, server_default="1")
     status = Column(String(20), default="active")
     category = Column(String(50))
     subcategory = Column(String(50))
@@ -36,7 +36,7 @@ class SkillRegistry(Base):
     quality_schema = Column(JSON)  # Tool Result Quality Firewall — Tier 1 schema
     source = Column(String(20), default="builtin")
     manifest = Column(JSON)
-    is_public = Column(SmallInteger, default=0)
+    is_public = Column(SmallInteger, default=0, server_default="0")
     created_by = Column(String(36))
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
@@ -137,7 +137,7 @@ class SkillSelectionLearning(Base):
     signal_type = Column(String(50), default="wrong_skill", index=True)
     target_metrics = Column(JSON)
     context_features = Column(JSON)
-    is_active = Column(SmallInteger, default=1, index=True)
+    is_active = Column(SmallInteger, default=1, server_default="1", index=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

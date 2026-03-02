@@ -79,9 +79,9 @@ class UserFeedback(Base):
         Index("ix_feedback_agent_created", "agent_id", "created_at"),
     )
     feedback_id = Column(String(64), primary_key=True)
-    user_id = Column(String(255), nullable=False, index=True)
-    agent_id = Column(String(255), index=True)
-    session_id = Column(String(64))
+    user_id = Column(String(36), nullable=False, index=True)
+    agent_id = Column(String(64), index=True)
+    session_id = Column(String(36))
     event_id = Column(String(64))
     rating = Column(Integer)
     feedback_type = Column(String(32))

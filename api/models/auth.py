@@ -42,7 +42,7 @@ class RefreshToken(Base):
     token_hash = Column(String(255), nullable=False)
     token_prefix = Column(String(16), nullable=True, index=True)
     expires_at = Column(DateTime, nullable=False)
-    is_revoked = Column(SmallInteger, default=0, nullable=False)
+    is_revoked = Column(SmallInteger, default=0, server_default="0", nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
 
 
@@ -65,7 +65,7 @@ class Token(Base):
     provider = Column(String(50), nullable=False)
     encrypted_value = Column(String(255), nullable=True)
     secret_ref = Column(String(255))
-    is_active = Column(SmallInteger, default=1)
+    is_active = Column(SmallInteger, default=1, server_default="1")
     scope_user_id = Column(String(36), index=True)
     scope_repo = Column(String(255), index=True)
     created_at = Column(DateTime, default=func.now())

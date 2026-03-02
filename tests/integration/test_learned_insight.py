@@ -58,14 +58,21 @@ class TestLearnedInsightRealDB:
 
         assert result == "I focus deeply on my domain but may need to delegate cross-domain questions."
 
+    def test_just_below_threshold_returns_baseline(self, assembler, db_session):
+        """Exactly 49 interactions → still baseline (boundary)."""
+        _insert_events(db_session, "agent-49", count=49, success_count=40)
+
+        result = assembler._get_learned_insight("agent-49", "default")
+
+        assert result == "I'm still learning about my strengths and weaknesses. I'll improve as we work together."
+
     def test_at_threshold_returns_data_driven(self, assembler, db_session):
         """Exactly 50 interactions → data-driven insight."""
         _insert_events(db_session, "agent-beta", count=50, success_count=40)
 
         result = assembler._get_learned_insight("agent-beta", "specialist")
 
-        assert "80%" in result
-        assert "50 interactions" in result
+        assert result == "Based on recent history: 80% skill selection accuracy over 50 interactions."
 
     def test_above_threshold_accuracy(self, assembler, db_session):
         """100 interactions, 90 success → 90% accuracy."""
@@ -73,11 +80,13 @@ class TestLearnedInsightRealDB:
 
         result = assembler._get_learned_insight("agent-gamma", "default")
 
-        assert "90%" in result
-        assert "100 interactions" in result
+        assert result == "Based on recent history: 90% skill selection accuracy over 100 interactions."
 
-    def test_no_agent_id_returns_baseline(self, assembler):
-        """agent_id=None → baseline."""
+    def test_no_agent_id_returns_baseline(self, assembler, db_session):
+        """agent_id=None → baseline, even if DB has data for other agents."""
+        # Insert data that would trigger data-driven path if agent_id were used
+        _insert_events(db_session, "agent-decoy", count=100, success_count=90)
+
         result = assembler._get_learned_insight(None, "orchestrator")
 
         assert result == "I break down tasks and delegate to specialists rather than solving directly."
@@ -96,8 +105,7 @@ class TestLearnedInsightRealDB:
         result_a = assembler._get_learned_insight("agent-A", "specialist")
         result_b = assembler._get_learned_insight("agent-B", "specialist")
 
-        assert "83%" in result_a  # 50/60
-        assert "60 interactions" in result_a
+        assert result_a == "Based on recent history: 83% skill selection accuracy over 60 interactions."
         # Agent B below threshold → baseline
         assert result_b == "I focus deeply on my domain but may need to delegate cross-domain questions."
 
@@ -107,8 +115,7 @@ class TestLearnedInsightRealDB:
 
         result = assembler._get_learned_insight("agent-fail", "default")
 
-        assert "0%" in result
-        assert "50 interactions" in result
+        assert result == "Based on recent history: 0% skill selection accuracy over 50 interactions."
 
     def test_old_data_excluded_by_30day_window(self, assembler, db_session):
         """Events older than 30 days are excluded from insight calculation."""
@@ -153,7 +160,7 @@ class TestSkillSelectionEventFields:
     def test_all_fields_persisted(self, db_session):
         """Insert a SkillSelectionEvent and verify every column."""
         eid = str(uuid7())
-        before = datetime.now(timezone.utc).replace(tzinfo=None)
+        before = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
 
         db_session.add(SkillSelectionEvent(
             event_id=eid,

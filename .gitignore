@@ -40,7 +40,6 @@ yarn-error.log*
 # IDE / OS
 .idea/
 .vscode/
-.kiro
 *.swp
 *.swo
 *~

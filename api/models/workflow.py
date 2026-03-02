@@ -17,7 +17,7 @@ class WorkflowDefinition(Base):
     description = Column(Text)
     definition = Column(JSON, nullable=False)
     created_by = Column(String(255))
-    is_active = Column(SmallInteger, default=1)
+    is_active = Column(SmallInteger, default=1, server_default="1")
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -43,15 +43,15 @@ class WorkflowRun(Base):
 class Trigger(Base):
     __tablename__ = "wf_triggers"
     trigger_id = Column(String(255), primary_key=True)
-    user_id = Column(String(255), nullable=False, index=True)
-    agent_id = Column(String(255), nullable=False)
+    user_id = Column(String(36), nullable=False, index=True)
+    agent_id = Column(String(64), nullable=False)
     trigger_type = Column(String(32), nullable=False)
     name = Column(String(255), nullable=False)
     user_input = Column(Text, nullable=False)
     context = Column(JSON)
     cron_expr = Column(String(128))
     secret = Column(String(255))
-    session_id = Column(String(255))
+    session_id = Column(String(36))
     next_fire_at = Column(DateTime)
-    is_active = Column(SmallInteger, default=1)
+    is_active = Column(SmallInteger, default=1, server_default="1")
     created_at = Column(DateTime, default=func.now())

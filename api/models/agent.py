@@ -101,8 +101,8 @@ class AgentScratchpad(Base):
     )
 
     note_id = Column(String(64), primary_key=True)
-    session_id = Column(String(64), nullable=False)
-    user_id = Column(String(64), nullable=False)
+    session_id = Column(String(36), nullable=False)
+    user_id = Column(String(36), nullable=False)
     agent_id = Column(String(64))
     note_type = Column(String(50), nullable=False)
     content = Column(Text, nullable=False)
@@ -125,5 +125,5 @@ class RunEvent(Base):
     event_type = Column(String(64), nullable=False)
     data = Column(JSON, nullable=False)
     event_id = Column(String(255))
-    agent_id = Column(String(255))
+    agent_id = Column(String(64))
     created_at = Column(DateTime, default=func.now())

@@ -75,7 +75,7 @@ class PromptTemplate(Base):
     content = Column(Text, nullable=False)
     input_variables = Column(JSON)
     description = Column(String(255))
-    is_active = Column(SmallInteger, default=1)
+    is_active = Column(SmallInteger, default=1, server_default="1")
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

@@ -16,7 +16,7 @@ class HallucinationCheck(Base):
     claims_verified = Column(Integer, nullable=False, default=0)
     claims_contradicted = Column(Integer, nullable=False, default=0)
     confidence_score = Column(Float, nullable=False, default=0.0)
-    safe_to_deliver = Column(SmallInteger, nullable=False, default=1)
+    safe_to_deliver = Column(SmallInteger, nullable=False, default=1, server_default="1")
     evidence_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=func.now())
 
