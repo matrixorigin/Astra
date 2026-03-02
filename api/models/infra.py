@@ -27,6 +27,7 @@ class LLMModel(Base):
     supported_parameters = Column(JSON, default=list)
     pricing = Column(JSON, default=dict)
     architecture = Column(String(50), nullable=True)
+    description = Column(Text, nullable=True)
     tags = Column(JSON, default=list)
     created_by = Column(String(36), nullable=True)
     created_at = Column(DateTime, default=func.now())

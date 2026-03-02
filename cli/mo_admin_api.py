@@ -123,15 +123,27 @@ def model():
 @click.argument("provider")
 @click.option("--api-key", prompt="API key", hide_input=True, help="LLM provider API key")
 @click.option("--base-url", default=None, help="Custom base URL (OpenAI-compatible)")
+@click.option("--description", default=None, help="Model description")
+@click.option("--pricing-prompt", type=float, default=None, help="Price per 1k prompt tokens (USD)")
+@click.option("--pricing-completion", type=float, default=None, help="Price per 1k completion tokens (USD)")
+@click.option("--tags", default=None, help="Comma-separated tags (e.g. code,fast,cheap)")
+@click.option("--context-window", type=int, default=None, help="Context window size")
+@click.option("--max-completion-tokens", type=int, default=None, help="Max completion tokens")
 @click.pass_context
-def model_add(ctx, model_name, provider, api_key, base_url):
+def model_add(ctx, model_name, provider, api_key, base_url, description,
+              pricing_prompt, pricing_completion, tags, context_window, max_completion_tokens):
     """Register a model with API key. Validates connectivity."""
     client = ctx.obj["client"]
     require_auth(client)
     try:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
         result = client.admin_create_model(
             model_name=model_name, provider=provider,
             api_key=api_key, base_url=base_url,
+            description=description,
+            pricing_prompt=pricing_prompt, pricing_completion=pricing_completion,
+            tags=tag_list, context_window=context_window,
+            max_completion_tokens=max_completion_tokens,
         )
         conn = result.get("connectivity", "unknown")
         if result.get("is_active"):
@@ -158,10 +170,24 @@ def model_list(ctx):
             click.echo("\nRegister one with:")
             click.echo("  mo-admin model add <name> <provider> --api-key <key>")
             return
-        click.echo("Models:")
+        from rich.console import Console
+        from rich.table import Table
+        from rich.text import Text as RichText
+        console = Console()
+        t = Table(show_header=True, box=None)
+        t.add_column("", width=2)
+        t.add_column("Model")
+        t.add_column("Provider", style="dim")
+        t.add_column("Description", style="dim", max_width=40, no_wrap=True)
+        t.add_column("Tags", style="dim")
         for m in models:
             status = "✓" if m.get("is_active") else "✗"
-            click.echo(f"  {status} {m['name']} ({m['provider']})")
+            desc = m.get("description") or ""
+            if len(desc) > 40:
+                desc = desc[:37] + "..."
+            tags = ", ".join(m.get("tags") or [])
+            t.add_row(status, m["name"], m["provider"], desc, tags)
+        console.print(t)
     except Exception as e:
         click.echo(f"❌ Error: {e}")
 
@@ -174,15 +200,25 @@ def model_show(ctx, model_name):
     client = ctx.obj["client"]
     require_auth(client)
     try:
-        # TODO: use admin_get_model(name) when API adds a single-model endpoint
-        models = client.admin_list_models()
-        m = next((m for m in models if m["name"] == model_name), None)
-        if not m:
-            click.echo(f"❌ Model '{model_name}' not found")
-            sys.exit(1)
-        for k, v in m.items():
-            if k not in ("api_key",):
-                click.echo(f"  {k}: {v}")
+        m = client.admin_get_model(model_name)
+        status = "✓ active" if m.get("is_active") else "✗ inactive"
+        click.echo(f"  name:          {m['name']}")
+        click.echo(f"  provider:      {m['provider']}")
+        click.echo(f"  status:        {status}")
+        if m.get("description"):
+            click.echo(f"  description:   {m['description']}")
+        if m.get("base_url"):
+            click.echo(f"  base_url:      {m['base_url']}")
+        pricing = m.get("pricing", {})
+        if pricing.get("prompt") or pricing.get("completion"):
+            click.echo(f"  pricing:       ${pricing.get('prompt', 0)}/1k prompt, ${pricing.get('completion', 0)}/1k completion")
+        click.echo(f"  context:       {m.get('context_window', 128000)}")
+        if m.get("max_completion_tokens"):
+            click.echo(f"  max_tokens:    {m['max_completion_tokens']}")
+        if m.get("tags"):
+            click.echo(f"  tags:          {', '.join(m['tags'])}")
+        if m.get("architecture"):
+            click.echo(f"  architecture:  {m['architecture']}")
     except Exception as e:
         click.echo(f"❌ Error: {e}")
 
@@ -191,19 +227,36 @@ def model_show(ctx, model_name):
 @click.argument("model_name")
 @click.option("--api-key", default=None, hide_input=True, help="New API key")
 @click.option("--base-url", default=None, help="New base URL")
+@click.option("--description", default=None, help="Model description")
+@click.option("--pricing-prompt", type=float, default=None, help="Price per 1k prompt tokens (USD)")
+@click.option("--pricing-completion", type=float, default=None, help="Price per 1k completion tokens (USD)")
+@click.option("--tags", default=None, help="Comma-separated tags (e.g. code,fast,cheap)")
+@click.option("--context-window", type=int, default=None, help="Context window size")
+@click.option("--max-completion-tokens", type=int, default=None, help="Max completion tokens")
 @click.option("--activate/--deactivate", default=None, help="Set model active/inactive")
 @click.pass_context
-def model_update(ctx, model_name, api_key, base_url, activate):
+def model_update(ctx, model_name, api_key, base_url, description,
+                 pricing_prompt, pricing_completion, tags, context_window,
+                 max_completion_tokens, activate):
     """Update model config or API key."""
     client = ctx.obj["client"]
     require_auth(client)
-    if api_key is None and base_url is None and activate is None:
-        click.echo("Nothing to update. Use --api-key, --base-url, --activate, or --deactivate")
+    if all(v is None for v in [api_key, base_url, description, pricing_prompt,
+                                pricing_completion, tags, context_window,
+                                max_completion_tokens, activate]):
+        click.echo("Nothing to update. Use --api-key, --base-url, --description, --pricing-prompt, "
+                    "--pricing-completion, --tags, --context-window, --max-completion-tokens, "
+                    "--activate, or --deactivate")
         return
     try:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
         result = client.admin_update_model(
             model_name=model_name, api_key=api_key,
-            base_url=base_url, is_active=activate,
+            base_url=base_url, description=description,
+            pricing_prompt=pricing_prompt, pricing_completion=pricing_completion,
+            tags=tag_list, context_window=context_window,
+            max_completion_tokens=max_completion_tokens,
+            is_active=activate,
         )
         conn = result.get("connectivity")
         if conn and conn != "ok":

@@ -33,6 +33,7 @@ class ModelConfig(BaseModel):
 
     model_name: str
     provider: LLMProvider | str
+    description: str | None = None
 
     # ── Capabilities ──
     context_window: int = 128000
@@ -182,7 +183,7 @@ class ModelRegistry:
                 text(
                     "SELECT model_name, provider, context_window, max_completion_tokens, "
                     "input_modalities, output_modalities, supported_parameters, "
-                    "pricing, architecture, tags, is_active, base_url "
+                    "pricing, architecture, tags, is_active, base_url, description "
                     "FROM infra_llm_models WHERE is_active = 1"
                 )
             ).fetchall()
@@ -190,6 +191,7 @@ class ModelRegistry:
                 mc = ModelConfig(
                     model_name=row.model_name,
                     provider=row.provider,
+                    description=row.description,
                     context_window=row.context_window or 128000,
                     max_completion_tokens=row.max_completion_tokens,
                     input_modalities=json.loads(row.input_modalities) if isinstance(row.input_modalities, str) else (row.input_modalities or ["text"]),

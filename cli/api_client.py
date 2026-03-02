@@ -782,6 +782,12 @@ class APIClient:
         provider: str,
         api_key: str,
         base_url: str | None = None,
+        description: str | None = None,
+        pricing_prompt: float | None = None,
+        pricing_completion: float | None = None,
+        tags: list[str] | None = None,
+        context_window: int | None = None,
+        max_completion_tokens: int | None = None,
     ) -> dict[str, Any]:
         """Register a model with API key."""
         payload: dict[str, Any] = {
@@ -791,6 +797,20 @@ class APIClient:
         }
         if base_url:
             payload["base_url"] = base_url
+        if description:
+            payload["description"] = description
+        if tags:
+            payload["tags"] = tags
+        if context_window is not None:
+            payload["context_window"] = context_window
+        if max_completion_tokens is not None:
+            payload["max_completion_tokens"] = max_completion_tokens
+        if pricing_prompt is not None or pricing_completion is not None:
+            payload["pricing"] = {}
+            if pricing_prompt is not None:
+                payload["pricing"]["prompt"] = pricing_prompt
+            if pricing_completion is not None:
+                payload["pricing"]["completion"] = pricing_completion
         response = await self._request("POST", "/models", json=payload)
         return response.json()
 
@@ -799,11 +819,22 @@ class APIClient:
         response = await self._request("GET", "/models")
         return response.json()
 
+    async def admin_get_model(self, model_name: str) -> dict[str, Any]:
+        """Get a single model by name."""
+        response = await self._request("GET", f"/models/{model_name}")
+        return response.json()
+
     async def admin_update_model(
         self,
         model_name: str,
         api_key: str | None = None,
         base_url: str | None = None,
+        description: str | None = None,
+        pricing_prompt: float | None = None,
+        pricing_completion: float | None = None,
+        tags: list[str] | None = None,
+        context_window: int | None = None,
+        max_completion_tokens: int | None = None,
         is_active: bool | None = None,
     ) -> dict[str, Any]:
         """Update model config or API key."""
@@ -812,8 +843,22 @@ class APIClient:
             payload["api_key"] = api_key
         if base_url is not None:
             payload["base_url"] = base_url
+        if description is not None:
+            payload["description"] = description
+        if tags is not None:
+            payload["tags"] = tags
+        if context_window is not None:
+            payload["context_window"] = context_window
+        if max_completion_tokens is not None:
+            payload["max_completion_tokens"] = max_completion_tokens
         if is_active is not None:
             payload["is_active"] = is_active
+        if pricing_prompt is not None or pricing_completion is not None:
+            payload["pricing"] = {}
+            if pricing_prompt is not None:
+                payload["pricing"]["prompt"] = pricing_prompt
+            if pricing_completion is not None:
+                payload["pricing"]["completion"] = pricing_completion
         response = await self._request("PUT", f"/models/{model_name}", json=payload)
         return response.json()
 

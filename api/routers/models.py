@@ -34,6 +34,7 @@ class ModelCreateRequest(BaseModel):
     provider: str
     api_key: str  # required — the whole point
     base_url: str | None = None  # override provider default
+    description: str | None = None
     context_window: int = 128000
     max_completion_tokens: int | None = None
     input_modalities: list[str] = ["text"]
@@ -47,6 +48,7 @@ class ModelCreateRequest(BaseModel):
 class ModelUpdateRequest(BaseModel):
     api_key: str | None = None
     base_url: str | None = None
+    description: str | None = None
     context_window: int | None = None
     max_completion_tokens: int | None = None
     input_modalities: list[str] | None = None
@@ -63,6 +65,7 @@ class ModelResponse(BaseModel):
     name: str
     provider: str
     base_url: str | None = None
+    description: str | None = None
     is_active: bool = True
     context_window: int = 128000
     max_completion_tokens: int | None = None
@@ -138,7 +141,7 @@ def _validate_connectivity(provider: str, model_name: str, api_key: str, base_ur
 def _to_response(m: LLMModel, connectivity: str | None = None) -> ModelResponse:
     return ModelResponse(
         model_id=m.model_id, name=m.model_name, provider=m.provider,
-        base_url=m.base_url, is_active=bool(m.is_active),
+        base_url=m.base_url, description=m.description, is_active=bool(m.is_active),
         context_window=m.context_window or 128000,
         max_completion_tokens=m.max_completion_tokens,
         input_modalities=m.input_modalities or ["text"],
@@ -174,6 +177,7 @@ def create_model(
         model = LLMModel(
             model_id=str(uuid4()), model_name=request.name, provider=request.provider,
             api_key_encrypted=encrypt_token(request.api_key), base_url=base_url,
+            description=request.description,
             is_active=1 if conn_err is None else 0,
             context_window=request.context_window, max_completion_tokens=request.max_completion_tokens,
             input_modalities=request.input_modalities, output_modalities=request.output_modalities,
@@ -251,6 +255,8 @@ def update_model(
 
         if request.base_url is not None:
             model.base_url = request.base_url
+        if request.description is not None:
+            model.description = request.description
         if request.context_window is not None:
             model.context_window = request.context_window
         if request.max_completion_tokens is not None:

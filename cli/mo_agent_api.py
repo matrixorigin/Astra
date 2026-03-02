@@ -157,9 +157,11 @@ def cmd_model(console, client=None, selected_model=None, cmd_arg=None, state=Non
                 t.add_column("", width=2)
                 t.add_column("Model")
                 t.add_column("Provider", style="dim")
+                t.add_column("Description", style="dim")
                 for m in active:
                     marker = "→" if state.get("selected_model") == m["name"] else ""
-                    t.add_row(marker, m["name"], m["provider"])
+                    desc = m.get("description") or ""
+                    t.add_row(marker, m["name"], m["provider"], desc)
                 console.print(t)
     except AuthenticationError:
         console.print("[red]✗[/red] Session expired — please login again: mo-agent login")
