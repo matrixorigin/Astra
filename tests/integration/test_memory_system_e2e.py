@@ -5,15 +5,12 @@ Tests verify the memory system components work correctly together.
 """
 
 import uuid
-from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock, patch
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
 
-import pytest
 
-from core.memory.store import MemoryStore
-from core.memory.retriever import MemoryRetriever, TASK_WEIGHTS
+from core.memory.retriever import TASK_WEIGHTS
 from core.memory.typed_observer import TypedObserver
-from core.memory.profile import ProfileManager
 from core.memory.tiered_loader import TieredMemoryLoader
 from core.memory.health import MemoryHealth
 from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
@@ -72,7 +69,7 @@ class TestContradictionDetection:
         mock_row.content = "User prefers tabs"
         mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 0.1  # Very close → contradiction
-        mock_db.execute.return_value.fetchone.return_value = mock_row
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.first.return_value = mock_row
 
         store = MagicMock()
         observer = TypedObserver(
@@ -99,7 +96,7 @@ class TestContradictionDetection:
         mock_row.content = "User likes Go"
         mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 5.0  # Very far → not a contradiction
-        mock_db.execute.return_value.fetchone.return_value = mock_row
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.first.return_value = mock_row
 
         store = MagicMock()
         observer = TypedObserver(

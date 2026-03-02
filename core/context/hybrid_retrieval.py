@@ -1,27 +1,31 @@
 """Hybrid retrieval using MatrixOne native vector + fulltext search.
 
-Implements single-SQL hybrid search combining:
+Implements two-path hybrid search combining:
 - Semantic similarity (vector L2 distance)
 - Keyword matching (fulltext search)
 - Temporal decay (recency scoring)
 - Causal proximity (same chain bonus)
+
+Each path runs as a separate ORM query; results are merged and reranked in Python.
 """
 
-import json
 from typing import Any
+
 from sqlalchemy import text
-from core.logging_config import get_logger
+from sqlalchemy.sql import func
+
 from core.db_consumer import DbConsumer, DbFactory
+from core.logging_config import get_logger
 
 logger = get_logger(__name__)
 
 
 class HybridRetriever(DbConsumer):
     """MatrixOne-native hybrid retrieval for episodic and semantic memory."""
-    
+
     def __init__(self, db_factory: DbFactory):
         super().__init__(db_factory)
-    
+
     def retrieve_events(
         self,
         query_text: str,
@@ -32,155 +36,105 @@ class HybridRetriever(DbConsumer):
         weights: dict[str, float] | None = None,
     ) -> list[dict[str, Any]]:
         """Retrieve relevant events using hybrid search (vector + fulltext).
-        
+
         Two-path approach:
         1. Vector search: semantic similarity with temporal/causal scoring
         2. Fulltext search: keyword matching
         Then rerank in Python combining both scores.
-        
-        Args:
-            query_text: User query text for keyword matching
-            query_embedding: Query embedding vector for semantic search
-            session_id: Current session ID
-            current_chain_id: Current causal chain ID for proximity bonus
-            limit: Max results to return
-            weights: Scoring weights (semantic, keyword, temporal, causal)
-            
-        Returns:
-            List of events with relevance scores
         """
+        if weights is None:
+            weights = {"semantic": 0.35, "keyword": 0.25, "temporal": 0.20, "causal": 0.20}
+
+        from matrixone.sqlalchemy_ext import l2_distance
+
+        from api.models.agent import Event
+        from api.models.context import EventEmbedding
+
+        events_by_id: dict[str, dict[str, Any]] = {}
+
         with self._db() as db:
-            if weights is None:
-                weights = {
-                    "semantic": 0.35,
-                    "keyword": 0.25,
-                    "temporal": 0.20,
-                    "causal": 0.20,
-                }
-        
-            embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
-            events_by_id = {}
-        
             # 1. Vector search (semantic + temporal + causal)
             try:
-                vector_sql = text("""
-                    SELECT 
-                        e.event_id,
-                        e.session_id,
-                        e.event_type,
-                        e.content,
-                        e.created_at,
-                        e.causal_chain_id,
-                        e.parent_event_id,
-                        e.metadata,
-                        (
-                            :w_semantic * IFNULL(1.0 / (1.0 + l2_distance(ee.embedding, :query_vec)), 0) +
-                            :w_temporal * EXP(-TIMESTAMPDIFF(HOUR, e.created_at, NOW()) / 24.0) +
-                            :w_causal * CASE 
-                                WHEN e.causal_chain_id = :chain_id THEN 1.0 
-                                ELSE 0.0 
-                            END
-                        ) AS vector_score
-                    FROM agent_events e
-                    JOIN ctx_event_embeddings ee ON e.event_id = ee.event_id
-                    WHERE e.session_id = :session_id
-                    ORDER BY vector_score DESC
-                    LIMIT :limit
-                """)
-            
-                result = db.execute(
-                    vector_sql,
-                    {
-                        "query_vec": embedding_str,
-                        "session_id": session_id,
-                        "chain_id": current_chain_id or "",
-                        "limit": limit,
-                        "w_semantic": weights["semantic"],
-                        "w_temporal": weights["temporal"],
-                        "w_causal": weights["causal"],
-                    }
+                dist = l2_distance(EventEmbedding.embedding, query_embedding)
+                sem_score = (weights["semantic"] * (1.0 / (1.0 + dist))).label("sem")
+                temp_score = (weights["temporal"] * func.exp(
+                    -func.timestampdiff(text("HOUR"), Event.created_at, func.now()) / 24.0
+                )).label("temp")
+
+                rows = (
+                    db.query(
+                        Event.event_id, Event.session_id, Event.event_type,
+                        Event.content, Event.created_at, Event.causal_chain_id,
+                        Event.parent_event_id, Event.event_metadata,
+                        sem_score, temp_score,
+                    )
+                    .join(EventEmbedding, Event.event_id == EventEmbedding.event_id)
+                    .filter(Event.session_id == session_id)
+                    .order_by(sem_score.desc())
+                    .limit(limit)
+                    .all()
                 )
-            
-                for row in result:
-                    events_by_id[row.event_id] = {
-                        "event_id": row.event_id,
-                        "session_id": row.session_id,
-                        "event_type": row.event_type,
-                        "content": row.content,
-                        "created_at": row.created_at.isoformat() if row.created_at else None,
-                        "causal_chain_id": row.causal_chain_id,
-                        "parent_event_id": row.parent_event_id,
-                        "metadata": row.metadata,
-                        "vector_score": float(row.vector_score),
+                for r in rows:
+                    causal_bonus = weights["causal"] if (current_chain_id and r.causal_chain_id == current_chain_id) else 0.0
+                    events_by_id[r.event_id] = {
+                        "event_id": r.event_id,
+                        "session_id": r.session_id,
+                        "event_type": r.event_type,
+                        "content": r.content,
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                        "causal_chain_id": r.causal_chain_id,
+                        "parent_event_id": r.parent_event_id,
+                        "metadata": r.event_metadata,
+                        "vector_score": float(r.sem) + float(r.temp) + causal_bonus,
                         "keyword_score": 0.0,
                     }
             except Exception as e:
-                logger.warning(f"Vector search failed: {e}")
-        
-            # 2. Fulltext search (keyword matching with session_id filter in WHERE)
+                logger.warning("Vector search failed: %s", e)
+
+            # 2. Fulltext search
             try:
-                fulltext_sql = text("""
-                    SELECT 
-                        event_id,
-                        session_id,
-                        event_type,
-                        content,
-                        created_at,
-                        causal_chain_id,
-                        parent_event_id,
-                        metadata
-                    FROM agent_events
-                    WHERE MATCH(content, session_id) AGAINST(:query_text IN BOOLEAN MODE)
-                        AND session_id = :session_id
-                    LIMIT :limit
-                """)
-            
-                result = db.execute(
-                    fulltext_sql,
-                    {
-                        "query_text": query_text,
-                        "session_id": session_id,
-                        "limit": limit,
-                    }
+                from matrixone.sqlalchemy_ext import boolean_match
+                ft = boolean_match("content", "session_id").must(query_text)
+                rows = (
+                    db.query(
+                        Event.event_id, Event.session_id, Event.event_type,
+                        Event.content, Event.created_at, Event.causal_chain_id,
+                        Event.parent_event_id, Event.event_metadata,
+                    )
+                    .filter(ft, Event.session_id == session_id)
+                    .limit(limit)
+                    .all()
                 )
-            
-                for row in result:
-                    if row.event_id in events_by_id:
-                        # Already in vector results, add keyword score
-                        events_by_id[row.event_id]["keyword_score"] = weights["keyword"]
+                for r in rows:
+                    if r.event_id in events_by_id:
+                        events_by_id[r.event_id]["keyword_score"] = weights["keyword"]
                     else:
-                        # New from fulltext
-                        events_by_id[row.event_id] = {
-                            "event_id": row.event_id,
-                            "session_id": row.session_id,
-                            "event_type": row.event_type,
-                            "content": row.content,
-                            "created_at": row.created_at.isoformat() if row.created_at else None,
-                            "causal_chain_id": row.causal_chain_id,
-                            "parent_event_id": row.parent_event_id,
-                            "metadata": row.metadata,
+                        events_by_id[r.event_id] = {
+                            "event_id": r.event_id,
+                            "session_id": r.session_id,
+                            "event_type": r.event_type,
+                            "content": r.content,
+                            "created_at": r.created_at.isoformat() if r.created_at else None,
+                            "causal_chain_id": r.causal_chain_id,
+                            "parent_event_id": r.parent_event_id,
+                            "metadata": r.event_metadata,
                             "vector_score": 0.0,
                             "keyword_score": weights["keyword"],
                         }
             except Exception as e:
-                logger.warning(f"Fulltext search failed: {e}")
-        
-            # 3. Rerank in Python
-            events = list(events_by_id.values())
-            for event in events:
-                event["relevance_score"] = event["vector_score"] + event["keyword_score"]
-        
-            events.sort(key=lambda x: x["relevance_score"], reverse=True)
-            events = events[:limit]
-        
-            # Remove internal scores from output
-            for event in events:
-                del event["vector_score"]
-                del event["keyword_score"]
-        
-            logger.info(f"Hybrid retrieval: {len(events)} events, top score: {events[0]['relevance_score']:.3f}" if events else "No events found")
-            return events
-    
+                logger.warning("Fulltext search failed: %s", e)
+
+        # 3. Rerank
+        events = list(events_by_id.values())
+        for ev in events:
+            ev["relevance_score"] = ev.pop("vector_score") + ev.pop("keyword_score")
+        events.sort(key=lambda x: x["relevance_score"], reverse=True)
+        events = events[:limit]
+
+        if events:
+            logger.info("Hybrid retrieval: %d events, top score: %.3f", len(events), events[0]["relevance_score"])
+        return events
+
     def retrieve_knowledge(
         self,
         query_text: str,
@@ -190,136 +144,113 @@ class HybridRetriever(DbConsumer):
         confidence_threshold: float = 0.3,
         weights: dict[str, float] | None = None,
     ) -> list[dict[str, Any]]:
-        """Retrieve relevant knowledge entries using hybrid search.
-        
-        Args:
-            query_text: User query text for keyword matching
-            query_embedding: Query embedding vector for semantic search
-            user_id: User ID
-            limit: Max results to return
-            confidence_threshold: Min confidence to include (default 0.3)
-            weights: Scoring weights (semantic, keyword, confidence)
-            
-        Returns:
-            List of knowledge entries with relevance scores
-        """
-        with self._db() as db:
-            if weights is None:
-                weights = {
-                    "semantic": 0.5,
-                    "keyword": 0.3,
-                    "confidence": 0.2,
-                }
-        
-            # Validate weights dict
-            required_keys = {"semantic", "keyword", "confidence"}
-            if not required_keys.issubset(weights.keys()):
-                logger.error(f"Invalid weights dict, missing keys: {required_keys - weights.keys()}")
-                return []
-        
-            # Convert embedding to string format for SQL
-            # Note: This is safe as query_embedding is a list of floats from our own embedding service
-            embedding_str = "[" + ",".join(str(float(x)) for x in query_embedding) + "]"
-        
-            # Build hybrid search query for semantic memory
-            sql = text("""
-                SELECT 
-                    entry_id,
-                    category,
-                    key_name,
-                    value,
-                    confidence,
-                    trust_tier,
-                    created_at,
-                    last_validated_at,
-                    (
-                        :w_semantic * IFNULL(1.0 / (1.0 + l2_distance(embedding, :query_vec)), 0) +
-                        :w_keyword * COALESCE(
-                            MATCH(value) AGAINST(:query_text IN BOOLEAN MODE), 
-                            0
-                        ) +
-                        :w_confidence * confidence
-                    ) AS relevance_score
-                FROM sk_knowledge_entries
-                WHERE user_id = :user_id
-                    AND confidence > :threshold
-                    AND embedding IS NOT NULL
-                ORDER BY relevance_score DESC
-                LIMIT :limit
-            """)
-        
-            entries = []
-            try:
-                result = db.execute(
-                    sql,
-                    {
-                        "query_vec": embedding_str,
-                        "query_text": query_text,
-                        "user_id": user_id,
-                        "threshold": confidence_threshold,
-                        "limit": limit,
-                        "w_semantic": weights["semantic"],
-                        "w_keyword": weights["keyword"],
-                        "w_confidence": weights["confidence"],
-                    }
-                )
-            
-                for row in result:
-                    entries.append({
-                        "entry_id": row.entry_id,
-                        "category": row.category,
-                        "key_name": row.key_name,
-                        "value": row.value,
-                        "confidence": float(row.confidence),
-                        "trust_tier": row.trust_tier,
-                        "created_at": row.created_at.isoformat() if row.created_at else None,
-                        "last_validated_at": row.last_validated_at.isoformat() if row.last_validated_at else None,
-                        "relevance_score": float(row.relevance_score),
-                    })
-            
-                logger.info(f"Knowledge retrieval: {len(entries)} entries, top score: {entries[0]['relevance_score']:.3f}" if entries else "No entries found")
-            except Exception as e:
-                logger.error(f"Knowledge retrieval failed: {e}")
+        """Retrieve relevant knowledge entries using hybrid search."""
+        if weights is None:
+            weights = {"semantic": 0.5, "keyword": 0.3, "confidence": 0.2}
+        required_keys = {"semantic", "keyword", "confidence"}
+        if not required_keys.issubset(weights.keys()):
+            logger.error("Invalid weights dict, missing keys: %s", required_keys - weights.keys())
+            return []
 
-            # Access tracking — outside try/except so retrieval errors don't lose results
+        from matrixone.sqlalchemy_ext import l2_distance
+
+        from skills.knowledge.models import SkKnowledgeEntry as K
+
+        entries: list[dict[str, Any]] = []
+
+        with self._db() as db:
+            # Vector + confidence scoring
+            try:
+                sem = (weights["semantic"] * (1.0 / (1.0 + l2_distance(K.embedding, query_embedding)))).label("sem")
+                conf = (weights["confidence"] * K.confidence).label("conf")
+                rows = (
+                    db.query(
+                        K.entry_id, K.category, K.key_name, K.value,
+                        K.confidence, K.trust_tier, K.created_at, K.last_validated_at,
+                        sem, conf,
+                    )
+                    .filter(
+                        K.user_id == user_id,
+                        K.confidence > confidence_threshold,
+                        K.embedding.isnot(None),
+                    )
+                    .order_by(sem.desc())
+                    .limit(limit)
+                    .all()
+                )
+                entries_by_id: dict[str, dict[str, Any]] = {}
+                for r in rows:
+                    entries_by_id[r.entry_id] = {
+                        "entry_id": r.entry_id, "category": r.category,
+                        "key_name": r.key_name, "value": r.value,
+                        "confidence": float(r.confidence), "trust_tier": r.trust_tier,
+                        "created_at": r.created_at.isoformat() if r.created_at else None,
+                        "last_validated_at": r.last_validated_at.isoformat() if r.last_validated_at else None,
+                        "relevance_score": float(r.sem) + float(r.conf),
+                    }
+
+                # Fulltext boost — add keyword weight to matching entries
+                try:
+                    from matrixone.sqlalchemy_ext import boolean_match
+                    ft = boolean_match("value").must(query_text)
+                    ft_rows = (
+                        db.query(K.entry_id)
+                        .filter(ft, K.user_id == user_id, K.confidence > confidence_threshold)
+                        .limit(limit)
+                        .all()
+                    )
+                    for r in ft_rows:
+                        if r.entry_id in entries_by_id:
+                            entries_by_id[r.entry_id]["relevance_score"] += weights["keyword"]
+                        else:
+                            # Fulltext-only hit — fetch full row
+                            full = db.query(K).filter_by(entry_id=r.entry_id).first()
+                            if full:
+                                entries_by_id[r.entry_id] = {
+                                    "entry_id": full.entry_id, "category": full.category,
+                                    "key_name": full.key_name, "value": full.value,
+                                    "confidence": float(full.confidence), "trust_tier": full.trust_tier,
+                                    "created_at": full.created_at.isoformat() if full.created_at else None,
+                                    "last_validated_at": full.last_validated_at.isoformat() if full.last_validated_at else None,
+                                    "relevance_score": weights["keyword"] + weights["confidence"] * float(full.confidence),
+                                }
+                except Exception as e:
+                    logger.warning("Knowledge fulltext search failed (non-fatal): %s", e)
+
+                entries = sorted(entries_by_id.values(), key=lambda x: x["relevance_score"], reverse=True)[:limit]
+                if entries:
+                    logger.info("Knowledge retrieval: %d entries, top score: %.3f", len(entries), entries[0]["relevance_score"])
+            except Exception as e:
+                logger.error("Knowledge retrieval failed: %s", e)
+
+            # Access tracking
             if entries:
                 from skills.knowledge.api import update_access_tracking
                 update_access_tracking(db, [e["entry_id"] for e in entries])
 
-            # 1-hop graph expansion: find related entries not already in results
+            # 1-hop graph expansion
             if entries:
                 try:
                     from skills.knowledge.api import expand_with_graph
-                    seed_ids = [e["entry_id"] for e in entries[:5]]  # top-5 seeds
+                    seed_ids = [e["entry_id"] for e in entries[:5]]
                     expanded_ids = expand_with_graph(db, seed_ids, limit_per_entry=2)
                     if expanded_ids:
                         existing_ids = {e["entry_id"] for e in entries}
                         new_ids = [eid for eid in expanded_ids if eid not in existing_ids]
                         if new_ids:
-                            ph = ", ".join(f":g{i}" for i in range(len(new_ids)))
-                            params = {f"g{i}": eid for i, eid in enumerate(new_ids)}
-                            params["uid"] = user_id
-                            params["thr"] = confidence_threshold
-                            graph_rows = db.execute(
-                                text(f"""
-                                    SELECT entry_id, category, key_name, value, confidence, trust_tier,
-                                           created_at, last_validated_at
-                                    FROM sk_knowledge_entries
-                                    WHERE entry_id IN ({ph}) AND user_id = :uid AND confidence > :thr
-                                """),
-                                params,
-                            ).fetchall()
-                            for row in graph_rows:
+                            graph_rows = (
+                                db.query(K)
+                                .filter(K.entry_id.in_(new_ids), K.user_id == user_id, K.confidence > confidence_threshold)
+                                .all()
+                            )
+                            for r in graph_rows:
                                 entries.append({
-                                    "entry_id": row.entry_id,
-                                    "category": row.category,
-                                    "key_name": row.key_name,
-                                    "value": row.value,
-                                    "confidence": float(row.confidence),
-                                    "trust_tier": row.trust_tier,
-                                    "created_at": row.created_at.isoformat() if row.created_at else None,
-                                    "last_validated_at": row.last_validated_at.isoformat() if row.last_validated_at else None,
-                                    "relevance_score": 0.0,  # graph-expanded, no direct score
+                                    "entry_id": r.entry_id, "category": r.category,
+                                    "key_name": r.key_name, "value": r.value,
+                                    "confidence": float(r.confidence), "trust_tier": r.trust_tier,
+                                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                                    "last_validated_at": r.last_validated_at.isoformat() if r.last_validated_at else None,
+                                    "relevance_score": 0.0,
                                     "source": "graph_expansion",
                                 })
                             if graph_rows:
@@ -327,4 +258,4 @@ class HybridRetriever(DbConsumer):
                 except Exception as e:
                     logger.warning("Knowledge graph expansion failed (non-fatal): %s", e)
 
-            return entries
+        return entries

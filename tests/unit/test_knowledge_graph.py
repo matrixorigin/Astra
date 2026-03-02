@@ -118,28 +118,42 @@ class TestHybridRetrievalGraphExpansion:
         _mock_db = MagicMock()
         hr._db_factory = lambda: _mock_db
 
-        # Simulate: main query returns 1 entry, graph expansion raises
+        # Simulate: vector query returns 1 entry via ORM chain
         main_row = _make_row(
             entry_id="e1", category="fact", key_name="k", value="v",
             confidence=0.9, trust_tier="T1", created_at=None, last_validated_at=None,
-            relevance_score=0.8,
         )
+        main_row.sem = 0.8
+        main_row.conf = 0.18
+
+        vec_chain = MagicMock()
+        vec_chain.filter.return_value = vec_chain
+        vec_chain.order_by.return_value = vec_chain
+        vec_chain.limit.return_value = vec_chain
+        vec_chain.all.return_value = [main_row]
+        vec_chain.first.return_value = None
+
         call_count = [0]
-        def side_effect(*args, **kwargs):
+        def query_side_effect(*args, **kwargs):
+            nonlocal call_count
             call_count[0] += 1
             if call_count[0] == 1:
-                # Main query
-                result = MagicMock()
-                result.__iter__ = MagicMock(return_value=iter([main_row]))
-                return result
-            # Graph expansion or access tracking
+                return vec_chain  # vector query
+            if call_count[0] == 2:
+                # fulltext query — return empty
+                empty = MagicMock()
+                empty.filter.return_value = empty
+                empty.limit.return_value = empty
+                empty.all.return_value = []
+                return empty
+            # graph expansion query — raise
             raise RuntimeError("graph boom")
 
-        _mock_db.execute = MagicMock(side_effect=side_effect)
+        _mock_db.query = MagicMock(side_effect=query_side_effect)
 
         with patch("skills.knowledge.api.update_access_tracking"):
             entries = hr.retrieve_knowledge(
-                query_text="test", query_embedding=[0.1] * 1536,
+                query_text="test", query_embedding=[0.1] * 384,
                 user_id="u1", limit=5,
             )
         assert len(entries) >= 1

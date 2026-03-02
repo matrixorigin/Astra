@@ -5,8 +5,6 @@ import math
 import re
 from typing import Any
 
-from sqlalchemy import text
-
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -99,24 +97,25 @@ def semantic_similarity_map(
         return None
     if not hasattr(session, "bind") or session.bind is None:
         return None
-    vec_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
     try:
-        rows = session.execute(
-            text("""
-                SELECT learning_id, similarity FROM (
-                    SELECT learning_id,
-                           1.0 / (1.0 + L2_DISTANCE(query_embedding, :vec)) AS similarity
-                    FROM skill_selection_learnings
-                    WHERE query_embedding IS NOT NULL
-                ) ranked
-                WHERE similarity >= :threshold
-                ORDER BY similarity DESC
-                LIMIT :limit
-            """),
-            {"vec": vec_str, "limit": limit, "threshold": threshold},
-        ).fetchall()
+        from matrixone.sqlalchemy_ext import l2_distance
+
+        from api.models.skill import SkillSelectionLearning
+
+        dist = l2_distance(SkillSelectionLearning.query_embedding, query_embedding)
+        sim_expr = (1.0 / (1.0 + dist)).label("similarity")
+        rows = (
+            session.query(SkillSelectionLearning.learning_id, sim_expr)
+            .filter(
+                SkillSelectionLearning.query_embedding.isnot(None),
+                (1.0 / (1.0 + dist)) >= threshold,
+            )
+            .order_by(sim_expr.desc())
+            .limit(limit)
+            .all()
+        )
     except Exception as exc:
-        logger.warning(f"Semantic similarity SQL failed: {exc}")
+        logger.warning("Semantic similarity SQL failed: %s", exc)
         return None
     result = {
         str(row.learning_id): float(row.similarity)

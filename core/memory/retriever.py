@@ -21,11 +21,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 from sqlalchemy import text
+from sqlalchemy.sql import func
 
 from core.db_consumer import DbConsumer, DbFactory
 from core.memory.explain import RetrievalStats
 from core.memory.metrics import MemoryMetrics, Timer
-from core.memory.types import Memory, MemoryType, RetrievalWeights, TrustTier, TRUST_TIER_HALF_LIVES
+from core.memory.types import TRUST_TIER_HALF_LIVES, Memory, MemoryType, RetrievalWeights, TrustTier
 
 logger = logging.getLogger(__name__)
 
@@ -37,50 +38,16 @@ TASK_WEIGHTS: dict[str, RetrievalWeights] = {
     "default": RetrievalWeights(vector=0.3, keyword=0.2, temporal=0.2, confidence=0.3),
 }
 
-# Phase 1: keyword filter + temporal/confidence scoring in SQL
-# effective_confidence = initial_confidence * EXP(-age / half_life) — computed at query time, never stored
-_KEYWORD_SQL = """\
-SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id, m.trust_tier,
-    (
-        :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
-        :w_conf * (m.initial_confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
-    ) AS relevance
-FROM mem_memories m
-WHERE m.user_id = :uid AND m.is_active = 1
-    AND m.memory_type IN :types
-    AND MATCH(m.content) AGAINST(:query_text IN BOOLEAN MODE)
-    {session_filter}
-ORDER BY relevance DESC
-LIMIT :lim
-"""
 
-# Phase 1 fallback: no keyword match, temporal/confidence only
-_FALLBACK_SQL = """\
-SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id, m.trust_tier,
-    (
-        :w_time * EXP(-TIMESTAMPDIFF(HOUR, m.observed_at, NOW()) / :decay_hours) +
-        :w_conf * (m.initial_confidence * EXP(-TIMESTAMPDIFF(DAY, m.observed_at, NOW()) / :half_life))
-    ) AS relevance
-FROM mem_memories m
-WHERE m.user_id = :uid AND m.is_active = 1
-    AND m.memory_type IN :types
-    {session_filter}
-ORDER BY relevance DESC
-LIMIT :lim
-"""
-
-# Phase 2: vector candidates via L2_DISTANCE (over-fetch for merge)
-_VECTOR_SQL = """\
-SELECT m.memory_id, m.content, m.memory_type, m.initial_confidence, m.observed_at, m.session_id, m.trust_tier,
-    L2_DISTANCE(m.embedding, :query_vec) AS l2_dist
-FROM mem_memories m
-WHERE m.user_id = :uid AND m.is_active = 1
-    AND m.memory_type IN :types
-    AND m.embedding IS NOT NULL
-    {session_filter}
-ORDER BY l2_dist ASC
-LIMIT :lim
-"""
+def _relevance_expr(w_time: float, w_conf: float, decay_hours: float, half_life: float):
+    """Build ORM expression for temporal + confidence scoring."""
+    from api.models.memory import MemoryRecord as M
+    age_hours = func.timestampdiff(text("HOUR"), M.observed_at, func.now())
+    age_days = func.timestampdiff(text("DAY"), M.observed_at, func.now())
+    return (
+        w_time * func.exp(-age_hours / decay_hours) +
+        w_conf * (M.initial_confidence * func.exp(-age_days / half_life))
+    ).label("relevance")
 
 
 def _safe_exp(x: float) -> float:
@@ -149,21 +116,18 @@ class MemoryRetriever(DbConsumer):
         memory_types = memory_types or [MemoryType.SEMANTIC, MemoryType.PROCEDURAL, MemoryType.PROFILE]
         type_values = tuple(t.value for t in memory_types)
 
-        session_filter = (
-            "AND (m.session_id = :session_id OR m.session_id IS NULL)"
-            if include_cross_session else "AND m.session_id = :session_id"
-        )
         base_params = {
             "uid": user_id, "types": type_values,
             "decay_hours": self.decay_hours, "half_life": self.half_life_days,
             "session_id": session_id,
+            "include_cross": include_cross_session,
         }
 
         with Timer("retriever_retrieve", self._metrics):
             # Phase 1
             p1_start = time.time() if explain else 0
             phase1, p1_stats = self._phase1(
-                query_text, session_filter, base_params, weights,
+                query_text, base_params, weights,
                 limit * 2 if query_embedding else limit,
             )
             if stats:
@@ -182,7 +146,7 @@ class MemoryRetriever(DbConsumer):
 
             # Phase 2
             p2_start = time.time() if explain else 0
-            phase2, p2_stats = self._phase2(query_embedding, session_filter, base_params, limit * 2)
+            phase2, p2_stats = self._phase2(query_embedding, base_params, limit * 2)
             if stats:
                 stats.vector_attempted = p2_stats.vector_attempted
                 stats.vector_hit = p2_stats.vector_hit
@@ -202,21 +166,42 @@ class MemoryRetriever(DbConsumer):
             return memories, stats
 
     def _phase1(
-        self, query_text: str, session_filter: str, base_params: dict,
+        self, query_text: str, base_params: dict,
         weights: RetrievalWeights, limit: int,
     ) -> tuple[list[_Candidate], _PhaseStats]:
         total = weights.temporal + weights.confidence
         w_time = weights.temporal / total if total > 0 else 0.5
         w_conf = weights.confidence / total if total > 0 else 0.5
-        params = {**base_params, "w_time": w_time, "w_conf": w_conf, "lim": limit}
         stats = _PhaseStats()
 
+        from api.models.memory import MemoryRecord as M
+
+        rel = _relevance_expr(w_time, w_conf, self.decay_hours, self.half_life_days)
+        type_values = base_params["types"]
+        uid = base_params["uid"]
+        session_id = base_params["session_id"]
+        include_cross = base_params["include_cross"]
+
         with self._db() as db:
+            def _base_query():
+                q = (
+                    db.query(M.memory_id, M.content, M.memory_type, M.initial_confidence,
+                             M.observed_at, M.session_id, M.trust_tier, rel)
+                    .filter(M.user_id == uid, M.is_active == 1, M.memory_type.in_(type_values))
+                )
+                if include_cross:
+                    from sqlalchemy import or_
+                    q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
+                else:
+                    q = q.filter(M.session_id == session_id)
+                return q
+
             if query_text and query_text.strip():
                 stats.keyword_attempted = True
-                params["query_text"] = query_text
                 try:
-                    rows = db.execute(text(_KEYWORD_SQL.format(session_filter=session_filter)), params).fetchall()
+                    from matrixone.sqlalchemy_ext import boolean_match
+                    ft = boolean_match("content").must(query_text)
+                    rows = _base_query().filter(ft).order_by(rel.desc()).limit(limit).all()
                     if rows:
                         self._metrics.increment("retrieval_keyword_hits")
                         stats.keyword_hit = True
@@ -228,21 +213,40 @@ class MemoryRetriever(DbConsumer):
                     self._metrics.increment("retrieval_keyword_errors")
                     stats.keyword_error = str(e)
 
-            rows = db.execute(text(_FALLBACK_SQL.format(session_filter=session_filter)), params).fetchall()
+            rows = _base_query().order_by(rel.desc()).limit(limit).all()
             self._metrics.increment("retrieval_fallback_hits")
             return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
                                r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3") for r in rows], stats
 
     def _phase2(
-        self, query_embedding: list[float], session_filter: str, base_params: dict, limit: int,
+        self, query_embedding: list[float], base_params: dict, limit: int,
     ) -> tuple[list[_Candidate], _PhaseStats]:
-        vec_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
-        params = {**base_params, "query_vec": vec_str, "lim": limit}
         stats = _PhaseStats(vector_attempted=True)
+
+        from matrixone.sqlalchemy_ext import l2_distance
+
+        from api.models.memory import MemoryRecord as M
+
+        dist_expr = l2_distance(M.embedding, query_embedding).label("l2_dist")
+        uid = base_params["uid"]
+        type_values = base_params["types"]
+        session_id = base_params["session_id"]
+        include_cross = base_params["include_cross"]
 
         with self._db() as db:
             try:
-                rows = db.execute(text(_VECTOR_SQL.format(session_filter=session_filter)), params).fetchall()
+                q = (
+                    db.query(M.memory_id, M.content, M.memory_type, M.initial_confidence,
+                             M.observed_at, M.session_id, M.trust_tier, dist_expr)
+                    .filter(M.user_id == uid, M.is_active == 1,
+                            M.memory_type.in_(type_values), M.embedding.isnot(None))
+                )
+                if include_cross:
+                    from sqlalchemy import or_
+                    q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
+                else:
+                    q = q.filter(M.session_id == session_id)
+                rows = q.order_by("l2_dist").limit(limit).all()
                 self._metrics.increment("retrieval_vector_hits")
                 stats.vector_hit = bool(rows)
                 return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,

@@ -16,8 +16,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import text
-
 from core.db_consumer import DbFactory
 from core.memory.explain import ContradictionStats, ObserverStats
 from core.memory.metrics import MemoryMetrics
@@ -31,19 +29,6 @@ logger = logging.getLogger(__name__)
 _VALID_TYPES = {t.value for t in MemoryType if t != MemoryType.WORKING}
 
 _DEFAULT_L2_THRESHOLD = 0.55
-
-_CONTRADICTION_SQL = """\
-SELECT m.memory_id, m.content, m.initial_confidence,
-    L2_DISTANCE(m.embedding, :query_vec) AS l2_dist
-FROM mem_memories m
-WHERE m.user_id = :uid
-    AND m.is_active = 1
-    AND m.memory_type = :mtype
-    AND m.embedding IS NOT NULL
-    AND m.memory_id != :exclude_id
-ORDER BY l2_dist ASC
-LIMIT 1
-"""
 
 
 def _parse_json_array(text_str: str) -> list[dict[str, Any]]:
@@ -272,19 +257,28 @@ class TypedObserver:
                 stats.checked = False
             return None, stats
 
-        vec_str = "[" + ",".join(str(v) for v in new.embedding) + "]"
+        from matrixone.sqlalchemy_ext import l2_distance
+
+        from api.models.memory import MemoryRecord
+
+        dist_expr = l2_distance(MemoryRecord.embedding, new.embedding).label("l2_dist")
+
         db = self._db_factory()
         start = time.time() if explain else 0
         try:
-            row = db.execute(
-                text(_CONTRADICTION_SQL),
-                {
-                    "query_vec": vec_str,
-                    "uid": new.user_id,
-                    "mtype": new.memory_type.value,
-                    "exclude_id": new.memory_id,
-                },
-            ).fetchone()
+            row = (
+                db.query(MemoryRecord.memory_id, MemoryRecord.content, MemoryRecord.initial_confidence, dist_expr)
+                .filter(
+                    MemoryRecord.user_id == new.user_id,
+                    MemoryRecord.is_active == 1,
+                    MemoryRecord.memory_type == new.memory_type.value,
+                    MemoryRecord.embedding.isnot(None),
+                    MemoryRecord.memory_id != new.memory_id,
+                )
+                .order_by("l2_dist")
+                .limit(1)
+                .first()
+            )
         except Exception as e:
             if stats:
                 stats.error = str(e)

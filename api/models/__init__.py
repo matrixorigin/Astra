@@ -70,3 +70,11 @@ from api.models.infra import (  # noqa: F401
 from skills.knowledge.models import SkKnowledgeEntry as KnowledgeEntry  # noqa: F401
 from skills.knowledge.models import SkKnowledgeEntrySource as KnowledgeEntrySource  # noqa: F401
 from skills.knowledge.models import SkKnowledgeRelation as KnowledgeRelation  # noqa: F401
+
+# MatrixOne SDK's VectorType lacks cache_ok, causing SQLAlchemy to raise a
+# warning-as-error when ORM queries touch any embedding column.  Patch once
+# at import time so every consumer benefits.
+from matrixone import VectorType as _VectorType  # noqa: E402
+
+if not getattr(_VectorType, "cache_ok", False):
+    _VectorType.cache_ok = True

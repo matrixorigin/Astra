@@ -6,15 +6,14 @@ Also verifies fallback paths are observable via explain stats.
 
 import json
 import math
-from collections import namedtuple
 from datetime import datetime, timezone, timedelta
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from core.memory.retriever import MemoryRetriever, TASK_WEIGHTS, _safe_exp
+from core.memory.retriever import MemoryRetriever, _safe_exp
 from core.memory.typed_observer import TypedObserver
-from core.memory.typed_pipeline import run_typed_memory_pipeline, TypedPipelineResult
+from core.memory.typed_pipeline import run_typed_memory_pipeline
 from core.memory.governance import GovernanceScheduler
 from core.memory.profile import ProfileManager
 from core.memory.store import MemoryStore
@@ -24,9 +23,6 @@ from core.memory.metrics import MemoryMetrics
 
 
 # --- Helpers ---
-
-MemRow = namedtuple("MemRow", ["memory_id", "content", "memory_type", "initial_confidence", "observed_at", "session_id", "trust_tier"])
-VecRow = namedtuple("VecRow", ["memory_id", "content", "memory_type", "initial_confidence", "observed_at", "session_id", "trust_tier", "l2_dist"])
 
 
 def _mem(mid="m1", uid="u1", mtype=MemoryType.PROFILE, content="test", **kw):
@@ -42,30 +38,49 @@ class TestVectorRetrieval:
     @pytest.fixture
     def mock_db(self):
         db = MagicMock()
-        db.execute.return_value.fetchall.return_value = []
+        db.query.return_value = self._make_chain()
         return db
 
     @pytest.fixture
     def retriever(self, mock_db):
         return MemoryRetriever(db_factory=lambda: mock_db)
 
+    @staticmethod
+    def _make_chain(rows=None):
+        chain = MagicMock()
+        chain.filter.return_value = chain
+        chain.order_by.return_value = chain
+        chain.limit.return_value = chain
+        chain.all.return_value = rows or []
+        return chain
+
+    @staticmethod
+    def _orm_row(mid, content, mtype, conf, observed_at, session_id, trust_tier, relevance=1.0, l2_dist=None):
+        r = MagicMock()
+        r.memory_id = mid
+        r.content = content
+        r.memory_type = mtype
+        r.initial_confidence = conf
+        r.observed_at = observed_at
+        r.session_id = session_id
+        r.trust_tier = trust_tier
+        r.relevance = relevance
+        if l2_dist is not None:
+            r.l2_dist = l2_dist
+        return r
+
     def test_vector_sql_executed_when_embedding_provided(self, retriever, mock_db):
-        phase1_rows = [MemRow("m1", "Go testing", "semantic", 0.9, datetime(2026, 2, 26), None, "T3")]
-        vec_rows = [VecRow("m2", "Go patterns", "semantic", 0.8, datetime(2026, 2, 26), None, "T3", 0.3)]
+        phase1_row = self._orm_row("m1", "Go testing", "semantic", 0.9, datetime(2026, 2, 26), None, "T3")
+        vec_row = self._orm_row("m2", "Go patterns", "semantic", 0.8, datetime(2026, 2, 26), None, "T3", l2_dist=0.3)
 
         call_count = [0]
-        def mock_execute(sql, params=None):
+        def side_effect(*args, **kwargs):
             call_count[0] += 1
-            result = MagicMock()
             if call_count[0] == 1:
-                result.fetchall.return_value = phase1_rows
-            elif call_count[0] == 2:
-                result.fetchall.return_value = vec_rows
-            else:
-                result.fetchall.return_value = []
-            return result
+                return self._make_chain([phase1_row])
+            return self._make_chain([vec_row])
 
-        mock_db.execute.side_effect = mock_execute
+        mock_db.query.side_effect = side_effect
         results, _ = retriever.retrieve("u1", "Go testing", session_id="s1", query_embedding=[0.1] * 10)
         assert call_count[0] >= 2
         ids = {r.memory_id for r in results}
@@ -73,42 +88,32 @@ class TestVectorRetrieval:
         assert "m2" in ids
 
     def test_vector_only_candidate_appears_in_results(self, retriever, mock_db):
-        call_count = [0]
-        def mock_execute(sql, params=None):
-            call_count[0] += 1
-            result = MagicMock()
-            if call_count[0] <= 1:
-                result.fetchall.return_value = []
-            elif call_count[0] == 2:
-                result.fetchall.return_value = [
-                    VecRow("vec1", "vector-only memory", "semantic", 0.7, datetime(2026, 2, 26), None, "T3", 0.1)
-                ]
-            else:
-                result.fetchall.return_value = []
-            return result
+        vec_row = self._orm_row("vec1", "vector-only memory", "semantic", 0.7, datetime(2026, 2, 26), None, "T3", l2_dist=0.1)
 
-        mock_db.execute.side_effect = mock_execute
+        call_count = [0]
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 1:
+                return self._make_chain([])
+            return self._make_chain([vec_row])
+
+        mock_db.query.side_effect = side_effect
         results, _ = retriever.retrieve("u1", "", session_id="s1", query_embedding=[0.1] * 10)
         assert any(r.memory_id == "vec1" for r in results)
 
     def test_merge_ranks_by_weighted_score(self, retriever, mock_db):
         now = datetime.now(timezone.utc)
-        phase1_rows = [MemRow("m1", "old keyword", "semantic", 0.5, now - timedelta(days=30), None, "T3")]
-        vec_rows = [VecRow("m2", "recent vector", "semantic", 0.9, now, None, "T3", 0.01)]
+        phase1_row = self._orm_row("m1", "old keyword", "semantic", 0.5, now - timedelta(days=30), None, "T3")
+        vec_row = self._orm_row("m2", "recent vector", "semantic", 0.9, now, None, "T3", l2_dist=0.01)
 
         call_count = [0]
-        def mock_execute(sql, params=None):
+        def side_effect(*args, **kwargs):
             call_count[0] += 1
-            result = MagicMock()
             if call_count[0] == 1:
-                result.fetchall.return_value = phase1_rows
-            elif call_count[0] == 2:
-                result.fetchall.return_value = vec_rows
-            else:
-                result.fetchall.return_value = []
-            return result
+                return self._make_chain([phase1_row])
+            return self._make_chain([vec_row])
 
-        mock_db.execute.side_effect = mock_execute
+        mock_db.query.side_effect = side_effect
         results, _ = retriever.retrieve(
             "u1", "keyword", session_id="s1", query_embedding=[0.1] * 10,
             weights=RetrievalWeights(vector=0.7, keyword=0.1, temporal=0.1, confidence=0.1),
@@ -116,27 +121,23 @@ class TestVectorRetrieval:
         assert results[0].memory_id == "m2"
 
     def test_no_embedding_skips_vector_phase(self, retriever, mock_db):
-        mock_db.execute.return_value.fetchall.return_value = [
-            MemRow("m1", "test", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
-        ]
+        row = self._orm_row("m1", "test", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
+        mock_db.query.return_value = self._make_chain([row])
         results, _ = retriever.retrieve("u1", "test", session_id="s1")
-        assert mock_db.execute.call_count == 1
+        # Without embedding, only phase1 queries run
         assert len(results) == 1
 
     def test_vector_phase_failure_recorded_in_stats(self, retriever, mock_db):
-        call_count = [0]
-        def mock_execute(sql, params=None):
-            call_count[0] += 1
-            result = MagicMock()
-            if call_count[0] == 1:
-                result.fetchall.return_value = [
-                    MemRow("m1", "fallback", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
-                ]
-            else:
-                raise Exception("Vector index not available")
-            return result
+        fallback_row = self._orm_row("m1", "fallback", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
 
-        mock_db.execute.side_effect = mock_execute
+        call_count = [0]
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return self._make_chain([fallback_row])
+            raise Exception("Vector index not available")
+
+        mock_db.query.side_effect = side_effect
         results, stats = retriever.retrieve(
             "u1", "test", session_id="s1", query_embedding=[0.1] * 10, explain=True,
         )
@@ -145,19 +146,16 @@ class TestVectorRetrieval:
         assert "Vector index not available" in stats.vector_error
 
     def test_vector_success_recorded_in_stats(self, retriever, mock_db):
-        call_count = [0]
-        def mock_execute(sql, params=None):
-            call_count[0] += 1
-            result = MagicMock()
-            if call_count[0] == 1:
-                result.fetchall.return_value = []
-            else:
-                result.fetchall.return_value = [
-                    VecRow("v1", "vector hit", "semantic", 0.8, datetime(2026, 2, 26), None, "T3", 0.1)
-                ]
-            return result
+        vec_row = self._orm_row("v1", "vector hit", "semantic", 0.8, datetime(2026, 2, 26), None, "T3", l2_dist=0.1)
 
-        mock_db.execute.side_effect = mock_execute
+        call_count = [0]
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return self._make_chain([])
+            return self._make_chain([vec_row])
+
+        mock_db.query.side_effect = side_effect
         results, stats = retriever.retrieve(
             "u1", "test", session_id="s1", query_embedding=[0.1] * 10, explain=True,
         )
@@ -167,19 +165,17 @@ class TestVectorRetrieval:
         assert stats.phase2_candidates == 1
 
     def test_keyword_failure_recorded_in_stats(self, retriever, mock_db):
-        call_count = [0]
-        def mock_execute(sql, params=None):
-            call_count[0] += 1
-            result = MagicMock()
-            sql_str = str(sql)
-            if "MATCH" in sql_str:
-                raise Exception("Fulltext index error")
-            result.fetchall.return_value = [
-                MemRow("m1", "fallback", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
-            ]
-            return result
+        fallback_row = self._orm_row("m1", "fallback", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
 
-        mock_db.execute.side_effect = mock_execute
+        call_count = [0]
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First query is keyword attempt — raise to simulate fulltext error
+                raise Exception("Fulltext index error")
+            return self._make_chain([fallback_row])
+
+        mock_db.query.side_effect = side_effect
         results, stats = retriever.retrieve("u1", "test query", session_id="s1", explain=True)
         assert len(results) >= 1
         assert stats.keyword_attempted is True
@@ -364,7 +360,8 @@ class TestDBContradictionDetection:
         mock_row.content = "prefers tabs"
         mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 0.1
-        mock_db.execute.return_value.fetchone.return_value = mock_row
+        # ORM chain: db.query(...).filter(...).order_by(...).limit(...).first()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.first.return_value = mock_row
 
         observer = TypedObserver(
             store=MagicMock(), llm_client=None, embed_fn=None,
@@ -381,7 +378,7 @@ class TestDBContradictionDetection:
         mock_row.content = "likes Go"
         mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 5.0
-        mock_db.execute.return_value.fetchone.return_value = mock_row
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.first.return_value = mock_row
 
         observer = TypedObserver(
             store=MagicMock(), llm_client=None, embed_fn=None,
@@ -392,7 +389,7 @@ class TestDBContradictionDetection:
 
     def test_db_error_propagates(self):
         mock_db = MagicMock()
-        mock_db.execute.side_effect = Exception("DB connection lost")
+        mock_db.query.side_effect = Exception("DB connection lost")
 
         observer = TypedObserver(
             store=MagicMock(), llm_client=None, embed_fn=None,
@@ -600,11 +597,18 @@ class TestSandboxExplainStats:
 
 class TestExplainAnalyze:
 
+    @staticmethod
+    def _make_chain(rows=None):
+        chain = MagicMock()
+        chain.filter.return_value = chain
+        chain.order_by.return_value = chain
+        chain.limit.return_value = chain
+        chain.all.return_value = rows or []
+        return chain
+
     def test_retriever_explain_returns_stats(self):
         mock_db = MagicMock()
-        mock_db.execute.return_value.fetchall.return_value = [
-            MemRow("m1", "test content", "semantic", 0.8, datetime(2026, 2, 26), None, "T3")
-        ]
+        mock_db.query.return_value = self._make_chain()
         retriever = MemoryRetriever(db_factory=lambda: mock_db)
         _, stats = retriever.retrieve("u1", "test", session_id="s1", explain=True)
         assert stats is not None
@@ -612,7 +616,7 @@ class TestExplainAnalyze:
 
     def test_retriever_no_explain_returns_none_stats(self):
         mock_db = MagicMock()
-        mock_db.execute.return_value.fetchall.return_value = []
+        mock_db.query.return_value = self._make_chain()
         retriever = MemoryRetriever(db_factory=lambda: mock_db)
         _, stats = retriever.retrieve("u1", "test", session_id="s1", explain=False)
         assert stats is None

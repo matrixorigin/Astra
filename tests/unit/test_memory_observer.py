@@ -1,13 +1,12 @@
 """Unit tests for TypedObserver."""
 
 import json
-from datetime import datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from core.memory.typed_observer import TypedObserver, _parse_json_array
-from core.memory.types import Memory, MemoryType
+from core.memory.types import MemoryType
 
 
 @pytest.fixture
@@ -139,7 +138,8 @@ class TestContradictionDetection:
         mock_row.content = "prefers tabs"
         mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 0.1
-        mock_db.execute.return_value.fetchone.return_value = mock_row
+        # ORM chain: db.query(...).filter(...).order_by(...).limit(...).first()
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.first.return_value = mock_row
 
         observer = TypedObserver(
             store=mock_store, llm_client=mock_llm,
@@ -165,7 +165,7 @@ class TestContradictionDetection:
         mock_row.content = "likes Go"
         mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 5.0
-        mock_db.execute.return_value.fetchone.return_value = mock_row
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.first.return_value = mock_row
 
         observer = TypedObserver(
             store=mock_store, llm_client=mock_llm,
@@ -208,7 +208,7 @@ class TestObserveExplicit:
         mock_row.content = "old fact"
         mock_row.initial_confidence = 0.8
         mock_row.l2_dist = 0.1
-        mock_db.execute.return_value.fetchone.return_value = mock_row
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.first.return_value = mock_row
 
         observer = TypedObserver(
             store=mock_store, llm_client=None,

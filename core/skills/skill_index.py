@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from sqlalchemy import text
-
 from core.db_consumer import DbConsumer
 from core.logging_config import get_logger
 
@@ -108,36 +106,36 @@ class SkillIndex(DbConsumer):
         """Clear embedding for a skill by name."""
         if not self._db_factory:
             return False
+        from api.models.skill import SkillRegistry
         with self._db() as db:
-            r = db.execute(
-                text(
-                    "UPDATE skills_registry SET embedding = NULL"
-                    " WHERE skill_name = :name AND is_active = 1"
-                ),
-                {"name": name},
+            updated = (
+                db.query(SkillRegistry)
+                .filter(SkillRegistry.skill_name == name, SkillRegistry.is_active == 1)
+                .update({SkillRegistry.embedding: None})
             )
             db.commit()
-            return r.rowcount > 0  # type: ignore[union-attr]
+            return updated > 0
 
     def _upsert_embedding(self, db, skill: Embeddable, *, force: bool = False) -> bool:
         """Embed one skill and UPDATE its row.  Returns True if a row was written."""
+        from api.models.skill import SkillRegistry
         try:
             vec = self._embed(_skill_text(skill))
-            if self._expected_dim and len(vec) != self._expected_dim:
+            if len(vec) != self._expected_dim:
                 logger.warning(
                     "Dimension mismatch for %s: got %d, expected %d",
                     skill.name, len(vec), self._expected_dim,
                 )
                 return False
             vec_literal = "[" + ",".join(str(v) for v in vec) + "]"
-            sql = (
-                "UPDATE skills_registry SET embedding = :vec"
-                " WHERE skill_name = :name AND is_active = 1"
+            query = db.query(SkillRegistry).filter(
+                SkillRegistry.skill_name == skill.name,
+                SkillRegistry.is_active == 1,
             )
             if not force:
-                sql += " AND embedding IS NULL"
-            result = db.execute(text(sql), {"vec": vec_literal, "name": skill.name})
-            return result.rowcount > 0  # type: ignore[union-attr]
+                query = query.filter(SkillRegistry.embedding.is_(None))
+            updated = query.update({SkillRegistry.embedding: vec_literal})
+            return updated > 0
         except Exception as e:
             logger.warning("Failed to embed skill %s: %s", skill.name, e)
             return False
@@ -170,19 +168,24 @@ class SkillIndex(DbConsumer):
             return []
 
         threshold = max_distance if max_distance is not None else self.MAX_L2_DISTANCE
-        vec_literal = "[" + ",".join(str(v) for v in q_vec) + "]"
+
+        from matrixone.sqlalchemy_ext import l2_distance
+
+        from api.models.skill import SkillRegistry
+        dist_expr = l2_distance(SkillRegistry.embedding, q_vec).label("dist")
 
         with self._db() as db:
             try:
-                rows = db.execute(
-                    text(
-                        "SELECT skill_name, l2_distance(embedding, :vec) AS dist"
-                        " FROM skills_registry"
-                        " WHERE is_active = 1 AND embedding IS NOT NULL"
-                        " ORDER BY dist ASC LIMIT :k"
-                    ),
-                    {"vec": vec_literal, "k": top_k},
-                ).fetchall()
+                rows = (
+                    db.query(SkillRegistry.skill_name, dist_expr)
+                    .filter(
+                        SkillRegistry.is_active == 1,
+                        SkillRegistry.embedding.isnot(None),
+                    )
+                    .order_by("dist")
+                    .limit(top_k)
+                    .all()
+                )
             except Exception as e:
                 # Dimension mismatch from stale embeddings — clear them and
                 # return empty so the caller falls back to keyword matching.
@@ -190,22 +193,20 @@ class SkillIndex(DbConsumer):
                 db.rollback()
                 self._clear_stale_embeddings(db)
                 return []
-            return [r[0] for r in rows if r[1] <= threshold]
+            return [name for name, dist in rows if dist <= threshold]
 
     def _clear_stale_embeddings(self, db) -> int:
-        """NULL out embeddings that don't match the expected dimension.
+        """NULL out all embeddings so next build() re-embeds with correct dimension.
 
-        MatrixOne doesn't expose a vector_dims() function, so we attempt a
-        dummy l2_distance against a correctly-sized zero vector.  Rows that
-        cause a dimension error are the stale ones — but since we can't
-        identify them row-by-row efficiently, we clear ALL embeddings and
-        let the next build() re-embed with the correct dimension.
+        Called when l2_distance fails due to dimension mismatch from stale data.
         """
-        r = db.execute(
-            text("UPDATE skills_registry SET embedding = NULL WHERE embedding IS NOT NULL"),
+        from api.models.skill import SkillRegistry
+        cleared = (
+            db.query(SkillRegistry)
+            .filter(SkillRegistry.embedding.isnot(None))
+            .update({SkillRegistry.embedding: None})
         )
         db.commit()
-        cleared = r.rowcount  # type: ignore[union-attr]
         if cleared:
             logger.warning("Cleared %d stale embeddings (dimension mismatch)", cleared)
         return cleared

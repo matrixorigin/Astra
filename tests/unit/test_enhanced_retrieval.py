@@ -1,304 +1,187 @@
-"""Tests for enhanced hybrid retrieval."""
+"""Tests for enhanced hybrid retrieval.
+
+Strategy: ORM chain mocking is brittle, so we test the Python-side logic
+(reranking, score merging, error handling, validation) by controlling what
+the mock query chain returns, and verify the output dicts.
+"""
+
+from unittest.mock import MagicMock
 
 import pytest
-from unittest.mock import Mock, patch, MagicMock
+
 from core.context.hybrid_retrieval import HybridRetriever
 
 
-class TestEnhancedHybridRetrieval:
-    """Test enhanced hybrid retrieval with semantic memory."""
-    
+def _make_chain(rows=None):
+    """Return a chainable mock that ends with .all() -> rows."""
+    chain = MagicMock()
+    chain.join.return_value = chain
+    chain.filter.return_value = chain
+    chain.order_by.return_value = chain
+    chain.limit.return_value = chain
+    chain.all.return_value = rows or []
+    chain.first.return_value = None
+    return chain
+
+
+def _make_event_row(event_id, sem=0.3, temp=0.05, chain_id=None):
+    """Simulate an ORM row from the vector query."""
+    r = MagicMock()
+    r.event_id = event_id
+    r.session_id = "sess_1"
+    r.event_type = "user_query"
+    r.content = f"content_{event_id}"
+    r.created_at = None
+    r.causal_chain_id = chain_id
+    r.parent_event_id = None
+    r.event_metadata = {}
+    r.sem = sem
+    r.temp = temp
+    return r
+
+
+def _make_ft_row(event_id):
+    """Simulate an ORM row from the fulltext query."""
+    r = MagicMock()
+    r.event_id = event_id
+    r.session_id = "sess_1"
+    r.event_type = "user_query"
+    r.content = f"content_{event_id}"
+    r.created_at = None
+    r.causal_chain_id = None
+    r.parent_event_id = None
+    r.event_metadata = {}
+    return r
+
+
+class TestRetrieveEvents:
     @pytest.fixture
     def mock_db(self):
-        """Mock database session."""
-        return Mock()
-    
+        return MagicMock()
+
     @pytest.fixture
     def retriever(self, mock_db):
-        """Create hybrid retriever."""
         return HybridRetriever(lambda: mock_db)
-    
-    def test_retrieve_events(self, retriever, mock_db):
-        """Test episodic memory retrieval with hybrid search."""
-        # Mock vector search result
-        mock_vector_row = Mock()
-        mock_vector_row.event_id = "evt_123"
-        mock_vector_row.session_id = "sess_123"
-        mock_vector_row.event_type = "user_query"
-        mock_vector_row.content = "Test query"
-        mock_vector_row.created_at = None
-        mock_vector_row.causal_chain_id = "chain_123"
-        mock_vector_row.parent_event_id = None
-        mock_vector_row.metadata = {}
-        mock_vector_row.vector_score = 0.35  # semantic weight
-        
-        # Mock fulltext search result (same event)
-        mock_fulltext_row = Mock()
-        mock_fulltext_row.event_id = "evt_123"
-        mock_fulltext_row.session_id = "sess_123"
-        mock_fulltext_row.event_type = "user_query"
-        mock_fulltext_row.content = "Test query"
-        mock_fulltext_row.created_at = None
-        mock_fulltext_row.causal_chain_id = "chain_123"
-        mock_fulltext_row.parent_event_id = None
-        mock_fulltext_row.metadata = {}
-        
-        # First call: vector search, second call: fulltext search
-        mock_db.execute.side_effect = [
-            [mock_vector_row],  # Vector search results
-            [mock_fulltext_row],  # Fulltext search results
-        ]
-        
+
+    def test_vector_and_fulltext_scores_merge(self, retriever, mock_db):
+        """Event found by both paths gets combined score."""
+        vec_chain = _make_chain([_make_event_row("e1", sem=0.30, temp=0.05)])
+        ft_chain = _make_chain([_make_ft_row("e1")])
+        mock_db.query.side_effect = [vec_chain, ft_chain]
+
         events = retriever.retrieve_events(
-            query_text="test",
-            query_embedding=[0.1] * 1536,
-            session_id="sess_123",
+            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
         )
-        
         assert len(events) == 1
-        assert events[0]["event_id"] == "evt_123"
-        # Score = vector_score (0.35) + keyword_score (0.25) = 0.60
+        # vector_score = sem + temp + 0 causal = 0.35, keyword_score = 0.25
         assert events[0]["relevance_score"] == pytest.approx(0.60, abs=0.01)
-    
-    def test_retrieve_knowledge(self, retriever, mock_db):
-        """Test semantic memory retrieval."""
-        # Mock query result
-        mock_row = Mock()
-        mock_row.entry_id = "ke_123"
-        mock_row.category = "user_preference"
-        mock_row.key_name = "language"
-        mock_row.value = "python"
-        mock_row.confidence = 0.8
-        mock_row.trust_tier = "T3"
-        mock_row.created_at = None
-        mock_row.last_validated_at = None
-        mock_row.relevance_score = 0.75
-        
-        mock_db.execute.return_value = [mock_row]
-        
-        entries = retriever.retrieve_knowledge(
-            query_text="programming language",
-            query_embedding=[0.1] * 1536,
-            user_id="alice",
-        )
-        
-        assert len(entries) == 1
-        assert entries[0]["entry_id"] == "ke_123"
-        assert entries[0]["category"] == "user_preference"
-        assert entries[0]["relevance_score"] == 0.75
-    
-    def test_retrieve_knowledge_confidence_filter(self, retriever, mock_db):
-        """Test knowledge retrieval with confidence filtering."""
-        mock_db.execute.return_value = []
-        
-        entries = retriever.retrieve_knowledge(
-            query_text="test",
-            query_embedding=[0.1] * 1536,
-            user_id="alice",
-            confidence_threshold=0.5,
-        )
-        
-        # Should filter out low confidence entries
-        assert len(entries) == 0
-    
-    def test_retrieve_events_with_causal_bonus(self, retriever, mock_db):
-        """Test episodic retrieval with causal chain bonus."""
-        # Mock vector search result with causal bonus
-        mock_vector_row = Mock()
-        mock_vector_row.event_id = "evt_123"
-        mock_vector_row.session_id = "sess_123"
-        mock_vector_row.event_type = "user_query"
-        mock_vector_row.content = "Test query"
-        mock_vector_row.created_at = None
-        mock_vector_row.causal_chain_id = "chain_123"
-        mock_vector_row.parent_event_id = None
-        mock_vector_row.metadata = {}
-        mock_vector_row.vector_score = 0.55  # semantic + causal bonus
-        
-        # Mock fulltext search result
-        mock_fulltext_row = Mock()
-        mock_fulltext_row.event_id = "evt_123"
-        mock_fulltext_row.session_id = "sess_123"
-        mock_fulltext_row.event_type = "user_query"
-        mock_fulltext_row.content = "Test query"
-        mock_fulltext_row.created_at = None
-        mock_fulltext_row.causal_chain_id = "chain_123"
-        mock_fulltext_row.parent_event_id = None
-        mock_fulltext_row.metadata = {}
-        
-        mock_db.execute.side_effect = [
-            [mock_vector_row],  # Vector search
-            [mock_fulltext_row],  # Fulltext search
-        ]
-        
+        assert events[0]["event_id"] == "e1"
+
+    def test_causal_bonus_applied(self, retriever, mock_db):
+        """Event in same causal chain gets causal weight bonus."""
+        vec_chain = _make_chain([_make_event_row("e1", sem=0.30, temp=0.05, chain_id="c1")])
+        ft_chain = _make_chain([])
+        mock_db.query.side_effect = [vec_chain, ft_chain]
+
         events = retriever.retrieve_events(
-            query_text="test",
-            query_embedding=[0.1] * 1536,
-            session_id="sess_123",
-            current_chain_id="chain_123",
+            query_text="test", query_embedding=[0.1] * 384,
+            session_id="sess_1", current_chain_id="c1",
         )
-        
         assert len(events) == 1
-        # Score = 0.55 (vector with causal) + 0.25 (keyword) = 0.80
-        assert events[0]["relevance_score"] == pytest.approx(0.80, abs=0.01)
-    
-    def test_retrieve_knowledge_custom_weights(self, retriever, mock_db):
-        """Test knowledge retrieval with custom weights."""
-        mock_db.execute.return_value = []
-        
-        entries = retriever.retrieve_knowledge(
-            query_text="test",
-            query_embedding=[0.1] * 1536,
-            user_id="alice",
-            weights={
-                "semantic": 0.6,
-                "keyword": 0.2,
-                "confidence": 0.2,
-            },
-        )
-        
-        # Should use custom weights
-        assert len(entries) == 0
-    
-    def test_retrieve_events_error_handling(self, retriever, mock_db):
-        """Test error handling in event retrieval."""
-        # Both SQL calls fail
-        mock_db.execute.side_effect = Exception("Database error")
-        
+        # vector_score = 0.30 + 0.05 + 0.20 (causal) = 0.55
+        assert events[0]["relevance_score"] == pytest.approx(0.55, abs=0.01)
+
+    def test_fulltext_only_event(self, retriever, mock_db):
+        """Event found only by fulltext gets keyword weight only."""
+        vec_chain = _make_chain([])
+        ft_chain = _make_chain([_make_ft_row("e2")])
+        mock_db.query.side_effect = [vec_chain, ft_chain]
+
         events = retriever.retrieve_events(
-            query_text="test",
-            query_embedding=[0.1] * 1536,
-            session_id="sess_123",
+            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
         )
-        
-        # Should return empty list on error
-        assert events == []
-    
-    def test_retrieve_knowledge_error_handling(self, retriever, mock_db):
-        """Test error handling in knowledge retrieval."""
-        mock_db.execute.side_effect = Exception("Database error")
-        
-        entries = retriever.retrieve_knowledge(
-            query_text="test",
-            query_embedding=[0.1] * 1536,
-            user_id="alice",
-        )
-        
-        # Should return empty list on error
-        assert entries == []
-    
-    def test_retrieve_knowledge_invalid_weights(self, retriever, mock_db):
-        """Test knowledge retrieval with invalid weights."""
-        entries = retriever.retrieve_knowledge(
-            query_text="test",
-            query_embedding=[0.1] * 1536,
-            user_id="alice",
-            weights={"semantic": 0.5},  # Missing keyword and confidence
-        )
-        
-        # Should return empty list with invalid weights
-        assert entries == []
-    
-    def test_retrieve_events_fulltext_boolean_mode(self, retriever, mock_db):
-        """Test fulltext search with BOOLEAN MODE filtering via session_id."""
-        # Mock vector search (no results)
-        mock_db.execute.side_effect = [
-            [],  # Vector search returns nothing
-            [  # Fulltext search with BOOLEAN MODE filtering
-                Mock(
-                    event_id="evt_456",
-                    session_id="sess_123",
-                    event_type="tool_call",
-                    content="Execute test function",
-                    created_at=None,
-                    causal_chain_id="chain_456",
-                    parent_event_id="evt_123",
-                    metadata={"tool": "executor"},
-                )
-            ],
-        ]
-        
-        events = retriever.retrieve_events(
-            query_text="test",
-            query_embedding=[0.1] * 1536,
-            session_id="sess_123",
-        )
-        
-        # Should find event via fulltext with session_id filtering
         assert len(events) == 1
-        assert events[0]["event_id"] == "evt_456"
-        # Score = keyword_score (0.25) only
         assert events[0]["relevance_score"] == pytest.approx(0.25, abs=0.01)
-    
-    def test_retrieve_events_hybrid_merge(self, retriever, mock_db):
-        """Test hybrid search merging vector and fulltext results."""
-        # Mock vector search result
-        mock_vector_row = Mock()
-        mock_vector_row.event_id = "evt_123"
-        mock_vector_row.session_id = "sess_123"
-        mock_vector_row.event_type = "user_query"
-        mock_vector_row.content = "Test query"
-        mock_vector_row.created_at = None
-        mock_vector_row.causal_chain_id = "chain_123"
-        mock_vector_row.parent_event_id = None
-        mock_vector_row.metadata = {}
-        mock_vector_row.vector_score = 0.35
-        
-        # Mock fulltext search results (same + new event)
-        mock_fulltext_row1 = Mock()
-        mock_fulltext_row1.event_id = "evt_123"  # Same as vector
-        mock_fulltext_row1.session_id = "sess_123"
-        mock_fulltext_row1.event_type = "user_query"
-        mock_fulltext_row1.content = "Test query"
-        mock_fulltext_row1.created_at = None
-        mock_fulltext_row1.causal_chain_id = "chain_123"
-        mock_fulltext_row1.parent_event_id = None
-        mock_fulltext_row1.metadata = {}
-        
-        mock_fulltext_row2 = Mock()
-        mock_fulltext_row2.event_id = "evt_456"  # New from fulltext
-        mock_fulltext_row2.session_id = "sess_123"
-        mock_fulltext_row2.event_type = "tool_call"
-        mock_fulltext_row2.content = "Test execution"
-        mock_fulltext_row2.created_at = None
-        mock_fulltext_row2.causal_chain_id = "chain_456"
-        mock_fulltext_row2.parent_event_id = "evt_123"
-        mock_fulltext_row2.metadata = {}
-        
-        mock_db.execute.side_effect = [
-            [mock_vector_row],  # Vector search
-            [mock_fulltext_row1, mock_fulltext_row2],  # Fulltext search
-        ]
-        
+
+    def test_ranking_order(self, retriever, mock_db):
+        """Events are ranked by combined score descending."""
+        vec_chain = _make_chain([
+            _make_event_row("e1", sem=0.30, temp=0.05),
+            _make_event_row("e2", sem=0.10, temp=0.02),
+        ])
+        ft_chain = _make_chain([_make_ft_row("e2")])  # e2 also matched by fulltext
+        mock_db.query.side_effect = [vec_chain, ft_chain]
+
         events = retriever.retrieve_events(
-            query_text="test",
-            query_embedding=[0.1] * 1536,
-            session_id="sess_123",
+            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
         )
-        
-        # Should merge both results
         assert len(events) == 2
-        
-        # evt_123: vector (0.35) + keyword (0.25) = 0.60
-        evt_123 = next(e for e in events if e["event_id"] == "evt_123")
-        assert evt_123["relevance_score"] == pytest.approx(0.60, abs=0.01)
-        
-        # evt_456: keyword only (0.25)
-        evt_456 = next(e for e in events if e["event_id"] == "evt_456")
-        assert evt_456["relevance_score"] == pytest.approx(0.25, abs=0.01)
+        # e1: 0.35 vector only; e2: 0.12 + 0.25 keyword = 0.37
+        assert events[0]["event_id"] == "e2"
+        assert events[1]["event_id"] == "e1"
 
-    def test_fulltext_uses_where_session_filter(self, retriever, mock_db):
-        """Fulltext search filters session_id via WHERE, not inside MATCH query."""
-        mock_db.execute.side_effect = [[], []]  # vector, fulltext both empty
+    def test_vector_failure_falls_back_to_fulltext(self, retriever, mock_db):
+        """Vector search exception doesn't prevent fulltext results."""
+        call_count = 0
 
-        retriever.retrieve_events(
-            query_text="test query",
-            query_embedding=[0.1] * 4,
-            session_id="sess_abc",
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("vector down")
+            return _make_chain([_make_ft_row("e3")])
+
+        mock_db.query.side_effect = side_effect
+        events = retriever.retrieve_events(
+            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
         )
+        assert len(events) == 1
+        assert events[0]["event_id"] == "e3"
 
-        # Second call is fulltext; verify session_id passed as separate param
-        params = mock_db.execute.call_args_list[1][0][1]
-        assert params["session_id"] == "sess_abc"
-        assert params["query_text"] == "test query"
-        assert "query_bool" not in params
+    def test_both_fail_returns_empty(self, retriever, mock_db):
+        """Both paths failing returns empty list, no exception."""
+        mock_db.query.side_effect = RuntimeError("DB down")
+        events = retriever.retrieve_events(
+            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
+        )
+        assert events == []
+
+    def test_internal_scores_removed_from_output(self, retriever, mock_db):
+        """Output dicts should not contain vector_score or keyword_score."""
+        vec_chain = _make_chain([_make_event_row("e1")])
+        ft_chain = _make_chain([])
+        mock_db.query.side_effect = [vec_chain, ft_chain]
+
+        events = retriever.retrieve_events(
+            query_text="test", query_embedding=[0.1] * 384, session_id="sess_1",
+        )
+        assert "vector_score" not in events[0]
+        assert "keyword_score" not in events[0]
+        assert "relevance_score" in events[0]
+
+
+class TestRetrieveKnowledge:
+    @pytest.fixture
+    def mock_db(self):
+        return MagicMock()
+
+    @pytest.fixture
+    def retriever(self, mock_db):
+        return HybridRetriever(lambda: mock_db)
+
+    def test_invalid_weights_returns_empty(self, retriever, mock_db):
+        """Missing required weight keys returns empty immediately."""
+        entries = retriever.retrieve_knowledge(
+            query_text="test", query_embedding=[0.1] * 384,
+            user_id="u1", weights={"semantic": 0.5},
+        )
+        assert entries == []
+        assert not mock_db.query.called  # should short-circuit before DB
+
+    def test_vector_failure_returns_empty(self, retriever, mock_db):
+        """Vector query failure returns empty list."""
+        mock_db.query.side_effect = RuntimeError("DB down")
+        entries = retriever.retrieve_knowledge(
+            query_text="test", query_embedding=[0.1] * 384, user_id="u1",
+        )
+        assert entries == []

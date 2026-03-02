@@ -3,6 +3,11 @@
 Validates new memories in an isolated branch before committing to main table.
 All SQL uses parameterized queries — no f-string interpolation of user data.
 
+NOTE: This module uses raw SQL instead of ORM because branch tables are
+dynamically created via ``data branch create table`` DDL — they have no
+static ORM model binding.  Table names are internally generated (uuid hex),
+never user input.
+
 Supports explain=True for EXPLAIN ANALYZE style execution stats.
 """
 
