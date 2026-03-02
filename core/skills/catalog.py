@@ -732,28 +732,7 @@ class SkillCatalog(DbConsumer):
             ).filter(
                 SkillModel.source == source, SkillModel.is_active == 1,
             ).order_by(SkillModel.created_at.desc()).limit(limit).all()
-            # Convert Row tuples to dict manually (can't use _row_to_dict with tuples)
-            return [
-                {
-                    "skill_id": r.skill_id,
-                    "skill_name": r.skill_name,
-                    "version": r.version,
-                    "description": r.description,
-                    "skill_definition": r.skill_definition,
-                    "git_commit_hash": r.git_commit_hash,
-                    "source": r.source,
-                    "status": r.status,
-                    "is_active": r.is_active,
-                    "created_by": r.created_by,
-                    "category": r.category,
-                    "cost_estimate": r.cost_estimate,
-                    "triggers": r.triggers,
-                    "dependencies": r.dependencies,
-                    "priority": r.priority,
-                    "created_at": r.created_at.isoformat() if r.created_at else None,
-                }
-                for r in rows
-            ]
+            return [self._row_tuple_to_dict(r) for r in rows]
 
     def list_by_owner(self, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
         """List skills created by a specific user.
@@ -784,27 +763,7 @@ class SkillCatalog(DbConsumer):
             ).filter(
                 SkillModel.created_by == user_id,
             ).order_by(SkillModel.created_at.desc()).limit(limit).all()
-            return [
-                {
-                    "skill_id": r.skill_id,
-                    "skill_name": r.skill_name,
-                    "version": r.version,
-                    "description": r.description,
-                    "skill_definition": r.skill_definition,
-                    "git_commit_hash": r.git_commit_hash,
-                    "source": r.source,
-                    "status": r.status,
-                    "is_active": r.is_active,
-                    "created_by": r.created_by,
-                    "category": r.category,
-                    "cost_estimate": r.cost_estimate,
-                    "triggers": r.triggers,
-                    "dependencies": r.dependencies,
-                    "priority": r.priority,
-                    "created_at": r.created_at.isoformat() if r.created_at else None,
-                }
-                for r in rows
-            ]
+            return [self._row_tuple_to_dict(r) for r in rows]
 
     def list_active(self, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """List all active skills with pagination."""
@@ -986,6 +945,32 @@ class SkillCatalog(DbConsumer):
             "triggers": getattr(row, "triggers", None),
             "dependencies": getattr(row, "dependencies", None),
             "priority": getattr(row, "priority", None),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+
+    @staticmethod
+    def _row_tuple_to_dict(row) -> dict[str, Any]:
+        """Convert query result tuple (from column projection) to metadata dict.
+        
+        Used when querying specific columns instead of full ORM objects.
+        Returns same shape as _row_to_dict() for consistency.
+        """
+        return {
+            "skill_id": row.skill_id,
+            "skill_name": row.skill_name,
+            "version": row.version,
+            "description": row.description,
+            "skill_definition": row.skill_definition,
+            "git_commit_hash": row.git_commit_hash,
+            "source": row.source,
+            "status": row.status,
+            "is_active": row.is_active,
+            "created_by": row.created_by,
+            "category": row.category,
+            "cost_estimate": row.cost_estimate,
+            "triggers": row.triggers,
+            "dependencies": row.dependencies,
+            "priority": row.priority,
             "created_at": row.created_at.isoformat() if row.created_at else None,
         }
 
