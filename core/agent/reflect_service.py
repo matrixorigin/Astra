@@ -61,10 +61,16 @@ class ReflectService(DbConsumer):
         with self._db() as db:
             # 1. Event trail
             from api.models.agent import Event as EventModel
+            from sqlalchemy import case
+
+            content_col = case(
+                (EventModel.event_type.in_(("tool_call", "tool_result")), EventModel.content),
+                else_=None,
+            ).label("content")
 
             rows = (
                 db.query(
-                    EventModel.event_type, EventModel.content, EventModel.event_metadata,
+                    EventModel.event_type, content_col, EventModel.event_metadata,
                     EventModel.created_at, EventModel.llm_model_used, EventModel.skill_name,
                     EventModel.token_usage,
                 )
@@ -351,7 +357,7 @@ class ReflectService(DbConsumer):
         self, session_id: str, user_id: str, question: str, db: Any,
         result: dict[str, Any],
     ) -> None:
-        """Find similar queries from past sessions using multi-keyword AND match."""
+        """Find similar queries from past sessions via index scan + Python filter."""
         from datetime import datetime, timedelta, timezone
         from api.models.agent import Event as EventModel
 
@@ -364,24 +370,32 @@ class ReflectService(DbConsumer):
             result["related_history"] = []
             return
 
-        keywords = [w for w in cur_text.lower().split() if len(w) > 3][:3]
+        keywords = [w.lower() for w in cur_text.split() if len(w) > 3][:3]
         if not keywords:
             result["related_history"] = []
             return
 
+        # Index scan on (user_id, event_type, created_at), then Python keyword filter
         cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-        q = db.query(EventModel.session_id, EventModel.content, EventModel.created_at).filter(
-            EventModel.user_id == user_id,
-            EventModel.event_type == "user_query",
-            EventModel.session_id != session_id,
-            EventModel.created_at >= cutoff,
+        candidates = (
+            db.query(EventModel.session_id, EventModel.content, EventModel.created_at)
+            .filter(
+                EventModel.user_id == user_id,
+                EventModel.event_type == "user_query",
+                EventModel.session_id != session_id,
+                EventModel.created_at >= cutoff,
+            )
+            .order_by(EventModel.created_at.desc())
+            .limit(100)
+            .all()
         )
-        for kw in keywords:
-            escaped = _escape_like(kw)
-            q = q.filter(EventModel.content.like(f"%{escaped}%", escape="\\"))
 
-        past_rows = q.order_by(EventModel.created_at.desc()).limit(5).all()
-        result["related_history"] = [
-            {"session_id": r[0], "query": (r[1] or "")[:200], "ts": str(r[2])}
-            for r in past_rows
-        ]
+        matched = []
+        for r in candidates:
+            text_lower = (r[1] or "").lower()
+            if all(kw in text_lower for kw in keywords):
+                matched.append({"session_id": r[0], "query": (r[1] or "")[:200], "ts": str(r[2])})
+                if len(matched) >= 5:
+                    break
+
+        result["related_history"] = matched

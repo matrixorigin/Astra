@@ -49,6 +49,7 @@ class Event(Base):
     __tablename__ = "agent_events"
     __table_args__ = (
         FulltextIndex("ft_content_session", ["content", "session_id"], parser=FulltextParserType.NGRAM),
+        Index("idx_events_user_type_time", "user_id", "event_type", "created_at"),
     )
 
     event_id = Column(String(36), primary_key=True)
