@@ -1146,6 +1146,7 @@ def _persist_turn_events(
     llm_params: dict[str, Any] | None = None,
     history: list[dict[str, Any]] | None = None,
     turn_count: int = 0,
+    agent_id: str | None = None,
 ) -> None:
     """Persist events for this turn: user query, tool results, LLM response.
 
@@ -1308,7 +1309,7 @@ def _persist_turn_events(
                 session_id, parent_event_id, tool_calls, full_text,
                 context_capture_id, model_used=model_used,
             )
-            hooks.record_skill_selection(session_id, user_content or "", tool_calls)
+            hooks.record_skill_selection(session_id, user_content or "", tool_calls, agent_id=agent_id)
 
         # Observer: only on final reply (no tool_calls, has text).
         # Intermediate turns (tool_call→tool_result cycles) have no meaningful
@@ -1810,6 +1811,7 @@ async def chat_turn(
                 llm_params=llm_params,
                 history=copy.deepcopy(current_history),
                 turn_count=current_turn_count,
+                agent_id=request.agent_id,
             )
             _t = threading.Thread(target=_persist_turn_events, kwargs=_persist_args, daemon=True)
             _persist_threads.append(_t)

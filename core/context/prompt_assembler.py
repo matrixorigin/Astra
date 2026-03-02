@@ -18,11 +18,14 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import func as sa_func, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+
+from api.models.skill import SkillSelectionEvent
 from core.db_consumer import DbConsumer, DbFactory
 
 # Context window management (feature-flagged)
@@ -554,52 +557,47 @@ class PromptAssembler(DbConsumer):
                 result += "\nFor full details, use `get_agent_info`."
             return result
 
+    _LEARNED_INSIGHT_THRESHOLD = 50
+    _INSIGHT_WINDOW_DAYS = 30
+
     def _get_learned_insight(self, agent_id: str | None, agent_type: str) -> str:
         """Load procedural memory insights, or cold start baseline.
 
-        Gracefully handles missing skill_selection_events table (returns baseline).
-        The table is created by migration and may not exist in all environments.
+        Uses (agent_id, created_at) composite index — range scan on last 30 days.
+        Called once per session (turn 1 only, then cached).
+        Returns data-driven insight after ≥50 interactions with execution data,
+        otherwise falls back to baseline by agent type.
         """
-        with self._db() as db:
-            if agent_id:
-                try:
-                    # JSON_EXTRACT is supported by MatrixOne (MySQL-compatible syntax).
-                    # Parameterized :aid prevents SQL injection; JSON path is a constant.
-                    row = db.execute(
-                        text("""
-                            SELECT COUNT(*) as cnt FROM skill_selection_events
-                            WHERE JSON_EXTRACT(metadata, '$.agent_id') = :aid
-                        """),
-                        {"aid": agent_id},
-                    ).fetchone()
-                    if row and row[0] and row[0] >= 50:
-                        return self._query_procedural_insights(agent_id)
-                except SQLAlchemyError:
-                    # Table may not exist yet (pre-migration) — fall through to baseline
-                    pass
+        if not agent_id:
             return _BASELINE_INSIGHTS.get(agent_type, _DEFAULT_INSIGHT)
 
-    def _query_procedural_insights(self, agent_id: str) -> str:
-        """Query actual performance data from skill selection history."""
-        with self._db() as db:
-            try:
-                row = db.execute(
-                    text("""
-                        SELECT
-                            COUNT(*) as total,
-                            SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) as successes
-                        FROM skill_selection_events
-                        WHERE JSON_EXTRACT(metadata, '$.agent_id') = :aid
-                          AND created_at > NOW() - INTERVAL 30 DAY
-                    """),
-                    {"aid": agent_id},
-                ).fetchone()
-                if row and row[0] and row[0] > 0:
-                    rate = (row[1] or 0) / row[0] * 100
-                    return f"Based on recent history: {rate:.0f}% skill selection accuracy over {row[0]} interactions."
-            except SQLAlchemyError:
-                pass
-            return _DEFAULT_INSIGHT
+        try:
+            # Naive UTC to match DB column (func.now() stores naive datetimes).
+            cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+                days=self._INSIGHT_WINDOW_DAYS
+            )
+            with self._db() as db:
+                total, successes = (
+                    db.query(
+                        sa_func.count(SkillSelectionEvent.event_id),
+                        sa_func.sum(SkillSelectionEvent.execution_success),
+                    )
+                    .filter(
+                        SkillSelectionEvent.agent_id == agent_id,
+                        SkillSelectionEvent.execution_success.isnot(None),
+                        SkillSelectionEvent.created_at >= cutoff,
+                    )
+                    .one()
+                )
+                if total and total >= self._LEARNED_INSIGHT_THRESHOLD:
+                    rate = (successes or 0) / total * 100
+                    return (
+                        f"Based on recent history: {rate:.0f}% skill selection "
+                        f"accuracy over {total} interactions."
+                    )
+        except SQLAlchemyError:
+            logger.debug("Learned insight query failed", exc_info=True)
+        return _BASELINE_INSIGHTS.get(agent_type, _DEFAULT_INSIGHT)
 
     def _build_project_context(self, edge_context: EdgeContext | None) -> str | None:
         """§3: Project rules + edge profile."""
