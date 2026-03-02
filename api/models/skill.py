@@ -13,8 +13,12 @@ from api.models._types import NullableJSON as JSON
 
 class SkillRegistry(Base):
     __tablename__ = "skills_registry"
+    __table_args__ = (
+        Index("idx_skill_name_active_time", "skill_name", "is_active", "created_at"),
+    )
+
     skill_id = Column(String(255), primary_key=True)  # skill_name@version
-    skill_name = Column(String(255), nullable=False, index=True)
+    skill_name = Column(String(255), nullable=False)
     version = Column(String(32), nullable=False)
     description = Column(Text)
     skill_definition = Column(JSON)

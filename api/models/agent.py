@@ -28,11 +28,15 @@ class Agent(Base):
 
 class Session(Base):
     __tablename__ = "agent_sessions"
+    __table_args__ = (
+        Index("idx_sessions_user_status", "user_id", "status"),
+    )
+
     session_id = Column(String(36), primary_key=True)
-    user_id = Column(String(36), nullable=False, index=True)
+    user_id = Column(String(36), nullable=False)
     agent_id = Column(String(36), nullable=True, index=True)
     title = Column(String(255), nullable=True)
-    status = Column(String(20), default="active", nullable=False, index=True)
+    status = Column(String(20), default="active", nullable=False)
     event_count = Column(Integer, default=0, nullable=False)
     last_event_id = Column(String(36), nullable=True)
     summary_status = Column(String(20), nullable=True)
@@ -51,6 +55,8 @@ class Event(Base):
         FulltextIndex("ft_content_session", ["content", "session_id"], parser=FulltextParserType.NGRAM),
         Index("idx_events_user_type_time", "user_id", "event_type", "created_at"),
         Index("idx_events_session_time", "session_id", "created_at"),
+        Index("idx_events_parent_type", "parent_event_id", "event_type"),
+        Index("idx_events_chain_time", "causal_chain_id", "created_at"),
     )
 
     event_id = Column(String(36), primary_key=True)
@@ -60,8 +66,8 @@ class Event(Base):
     agent_version = Column(String(32), nullable=False, default="1.0.0")
     event_type = Column(String(50), nullable=False)
     content = Column(Text, nullable=False)
-    parent_event_id = Column(String(36), nullable=True, index=True)
-    causal_chain_id = Column(String(36), nullable=False, index=True)
+    parent_event_id = Column(String(36), nullable=True)
+    causal_chain_id = Column(String(36), nullable=False)
     desensitized_content = Column(Text)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     event_metadata = Column("metadata", JSON)

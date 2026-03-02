@@ -181,13 +181,8 @@ class UserManager(DbConsumer):
     def store_refresh_token(self, user_id: str, token: str, expires_at: datetime) -> str:
         """Store refresh token using ORM.
 
-        Args:
-            user_id: User ID
-            token: Refresh token
-            expires_at: Token expiration time
-
-        Returns:
-            Token ID
+        Stores a token_prefix (first 16 chars, plaintext) for indexed lookup,
+        plus the full bcrypt hash for verification.
         """
         with self._db() as db:
             from core.auth.password import hash_password
@@ -197,6 +192,7 @@ class UserManager(DbConsumer):
                 token_id=token_id,
                 user_id=user_id,
                 token_hash=hash_password(token),
+                token_prefix=token[:16],
                 expires_at=expires_at,
                 is_revoked=False,
                 created_at=datetime.now(timezone.utc)
@@ -208,40 +204,46 @@ class UserManager(DbConsumer):
     def verify_refresh_token(self, token: str) -> str | None:
         """Verify refresh token using ORM.
 
-        Args:
-            token: Refresh token
-
-        Returns:
-            User ID if token is valid, None otherwise
+        Uses token_prefix index to narrow candidates to ~1 row,
+        then bcrypt-verifies only that row.
         """
         with self._db() as db:
             from core.auth.password import verify_password
 
-            rt = db.query(RefreshToken).filter(RefreshToken.expires_at > datetime.now(timezone.utc)).all()
+            now = datetime.now(timezone.utc)
+            candidates = (
+                db.query(RefreshToken)
+                .filter(
+                    RefreshToken.token_prefix == token[:16],
+                    RefreshToken.is_revoked == 0,
+                    RefreshToken.expires_at > now,
+                )
+                .all()
+            )
 
-            for refresh_token in rt:
-                if verify_password(token, refresh_token.token_hash) and not refresh_token.is_revoked:
-                    return refresh_token.user_id
+            for rt in candidates:
+                if verify_password(token, rt.token_hash):
+                    return rt.user_id
 
             return None
 
     def revoke_refresh_token(self, token: str) -> bool:
         """Revoke refresh token using ORM.
 
-        Args:
-            token: Refresh token
-
-        Returns:
-            True if revoked successfully, False if token not found
+        Uses token_prefix index to narrow candidates before bcrypt.
         """
         with self._db() as db:
             from core.auth.password import verify_password
 
-            rt = db.query(RefreshToken).all()
+            candidates = (
+                db.query(RefreshToken)
+                .filter(RefreshToken.token_prefix == token[:16])
+                .all()
+            )
 
-            for refresh_token in rt:
-                if verify_password(token, refresh_token.token_hash):
-                    refresh_token.is_revoked = True
+            for rt in candidates:
+                if verify_password(token, rt.token_hash):
+                    rt.is_revoked = True
                     db.commit()
                     return True
 

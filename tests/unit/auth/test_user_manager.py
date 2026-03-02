@@ -214,21 +214,14 @@ class TestRefreshToken:
         assert user_id is None
 
     def test_verify_refresh_token_revoked(self, user_manager, mock_db_session):
-        """Test verifying revoked refresh token."""
-        from api.models import RefreshToken
-        from unittest.mock import patch
+        """Test verifying revoked refresh token.
+        
+        Revoked tokens are excluded by the SQL filter (is_revoked == 0),
+        so the query returns no candidates.
+        """
+        mock_db_session.query.return_value.filter.return_value.all.return_value = []
 
-        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-        token_obj = RefreshToken(
-            token_hash="hashed_token",
-            user_id="user_123",
-            expires_at=expires_at,
-            is_revoked=True
-        )
-        mock_db_session.query.return_value.filter.return_value.all.return_value = [token_obj]
-
-        with patch("core.auth.password.verify_password", return_value=True):
-            user_id = user_manager.verify_refresh_token("token_abc")
+        user_id = user_manager.verify_refresh_token("token_abc")
 
         assert user_id is None
 
@@ -250,7 +243,7 @@ class TestRefreshToken:
         from unittest.mock import patch
         
         token_obj = RefreshToken(token_hash="hashed_token", is_revoked=False)
-        mock_db_session.query.return_value.all.return_value = [token_obj]
+        mock_db_session.query.return_value.filter.return_value.all.return_value = [token_obj]
 
         with patch("core.auth.password.verify_password", return_value=True):
             result = user_manager.revoke_refresh_token("token_abc")
@@ -261,7 +254,7 @@ class TestRefreshToken:
 
     def test_revoke_refresh_token_not_found(self, user_manager, mock_db_session):
         """Test revoking non-existent token."""
-        mock_db_session.query.return_value.all.return_value = []
+        mock_db_session.query.return_value.filter.return_value.all.return_value = []
 
         result = user_manager.revoke_refresh_token("token_abc")
 
