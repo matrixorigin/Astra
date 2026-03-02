@@ -83,6 +83,10 @@ class SkillCatalog(DbConsumer):
         # prevents repeated DB queries for nonexistent skills.
         self._metadata_cache: dict[tuple, dict | object] = {}
 
+    def list_skills(self) -> list[Skill]:
+        """Return a snapshot of all registered in-memory skills (thread-safe)."""
+        return list(self._skills.values())
+
     # ── Registration (builtin / marketplace Python skills) ────────
 
     def register(

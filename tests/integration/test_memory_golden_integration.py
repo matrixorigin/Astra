@@ -113,6 +113,32 @@ class TestMemoryStoreRealDB:
         active = store.list_active(user_id, MemoryType.SEMANTIC)
         assert len(active) >= 3
 
+    def test_list_active_with_limit(self, db_factory, cleanup_memories):
+        """list_active(limit=N) returns at most N rows via SQL LIMIT."""
+        store = MemoryStore(db_factory)
+        user_id = _uid()
+
+        # Create 5 memories
+        for i in range(5):
+            mem = Memory(
+                memory_id=f"lim_{uuid7().hex}",
+                user_id=user_id,
+                memory_type=MemoryType.PROCEDURAL,
+                content=f"Lesson {i}",
+                initial_confidence=0.8,
+                observed_at=datetime.now(timezone.utc),
+            )
+            cleanup_memories.append(mem.memory_id)
+            store.create(mem)
+
+        # With limit=2, get at most 2
+        limited = store.list_active(user_id, MemoryType.PROCEDURAL, limit=2)
+        assert len(limited) == 2
+
+        # Without limit, get all 5
+        unlimited = store.list_active(user_id, MemoryType.PROCEDURAL)
+        assert len(unlimited) >= 5
+
     def test_supersede_memory(self, db_factory, cleanup_memories):
         """Supersede an old memory with a new one."""
         store = MemoryStore(db_factory)

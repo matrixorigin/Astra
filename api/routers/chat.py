@@ -817,236 +817,17 @@ def _build_reflect_evidence(
     session_id: str, user_id: str, focus: _ReflectFocus, last_n: int,
     question: str = "",
 ) -> dict[str, Any]:
-    """Unified diagnostic evidence: events, skill decisions, tool selection, cross-session history.
+    """Thin wrapper kept for backward compatibility with existing tests.
 
-    Dispatches to focused sub-functions (_gather_tool_selection, _gather_history)
-    that each handle one concern.  All DB queries share a single session.
+    Delegates to :class:`core.agent.reflect_service.ReflectService`.
     """
-    result: dict[str, Any] = {"session_id": session_id, "focus": focus}
-    hints: list[str] = []
-
-    with SessionLocal() as db:
-        # 1. Event trail — server-side events with timing and token usage
-        from api.models.agent import Event as EventModel
-        rows = (
-            db.query(
-                EventModel.event_type, EventModel.content, EventModel.event_metadata,
-                EventModel.created_at, EventModel.llm_model_used, EventModel.skill_name,
-                EventModel.token_usage,
-            )
-            .filter(EventModel.session_id == session_id)
-            .order_by(EventModel.created_at.desc())
-            .limit(int(last_n))
-            .all()
-        )
-
-        events = []
-        fail_counts: dict[str, int] = {}
-        # Token accumulators
-        total_prompt = 0
-        total_completion = 0
-        llm_calls = 0
-        cost_by_model: dict[str, dict[str, int]] = {}  # model → {prompt, completion, calls}
-
-        for r in reversed(rows):
-            evt = {"type": r[0], "ts": str(r[3]) if r[3] else None}
-            if r[4]:
-                evt["model"] = r[4]
-            if r[5]:
-                evt["skill"] = r[5]
-
-            # Accumulate token usage from LLM responses
-            if r[0] == "llm_response" and r[6]:
-                usage = r[6] if isinstance(r[6], dict) else {}
-                try:
-                    if isinstance(r[6], str):
-                        usage = json.loads(r[6])
-                except (json.JSONDecodeError, TypeError):
-                    usage = {}
-                p = usage.get("prompt_tokens", usage.get("prompt", 0)) or 0
-                c = usage.get("completion_tokens", usage.get("completion", 0)) or 0
-                total_prompt += p
-                total_completion += c
-                llm_calls += 1
-                model = r[4] or "unknown"
-                entry = cost_by_model.setdefault(model, {"prompt": 0, "completion": 0, "calls": 0})
-                entry["prompt"] += p
-                entry["completion"] += c
-                entry["calls"] += 1
-            # Parse content for tool_result success/failure
-            if r[0] == "tool_result" and r[1]:
-                try:
-                    content = json.loads(r[1])
-                    evt["tool_name"] = content.get("name", "")
-                    result_str = str(content.get("result", ""))[:200]
-                    evt["result_preview"] = result_str
-                    if "Error" in result_str or "error" in result_str:
-                        evt["failed"] = True
-                        name = content.get("name", "unknown")
-                        fail_counts[name] = fail_counts.get(name, 0) + 1
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            elif r[0] == "tool_call" and r[1]:
-                try:
-                    content = json.loads(r[1])
-                    evt["tool_name"] = content.get("name", "")
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            events.append(evt)
-        result["event_summary"] = events
-
-        # Auto-detect focus from events: scan for the most relevant signal.
-        if focus == "auto":
-            has_failure = any(e.get("failed") for e in events)
-            has_missing_provenance = any(
-                e.get("type") == "tool_result" and e.get("result_preview")
-                and "data_source" not in e.get("result_preview", "")
-                for e in events
-            )
-            if has_failure:
-                focus = "skill_failure"
-            elif has_missing_provenance:
-                focus = "data_quality"
-            else:
-                focus = "unexpected_result"
-            result["focus"] = focus
-
-        # Repeated failure hint
-        for name, count in fail_counts.items():
-            if count >= 2:
-                hints.append(f"Skill '{name}' failed {count} times in this session")
-
-        # 2. Skill selection history — candidate scores, reasoning, outcomes
-        from api.models.skill import SkillSelectionEvent
-        sel_rows = (
-            db.query(
-                SkillSelectionEvent.skill_name, SkillSelectionEvent.selected_skills,
-                SkillSelectionEvent.selection_reasoning, SkillSelectionEvent.execution_success,
-                SkillSelectionEvent.execution_time_ms, SkillSelectionEvent.created_at,
-            )
-            .filter(SkillSelectionEvent.session_id == session_id)
-            .order_by(SkillSelectionEvent.created_at.desc())
-            .limit(5)
-            .all()
-        )
-        result["skill_history"] = [
-            {
-                "skill": r[0], "selected": r[1], "reasoning": (r[2] or "")[:200],
-                "success": bool(r[3]) if r[3] is not None else None,
-                "time_ms": r[4], "ts": str(r[5]) if r[5] else None,
-            }
-            for r in sel_rows
-        ]
-
-        # 3. Past lessons — procedural memories relevant to this session
-        try:
-            from core.memory.store import MemoryStore
-            from core.memory.types import MemoryType
-            store = MemoryStore(SessionLocal)
-            memories = store.list_active(user_id, MemoryType.PROCEDURAL)
-            result["past_lessons"] = [m.content for m in memories[:5]]
-            # Match hint
-            for m in memories[:5]:
-                for name in fail_counts:
-                    if name in m.content:
-                        hints.append(f"Past lesson matches: {m.content[:150]}")
-                        break
-        except Exception:
-            result["past_lessons"] = []
-
-        # 4. Implicit feedback signals
-        try:
-            from api.models.context import PromptFeedback
-            user_event_ids = [
-                r[0] for r in
-                db.query(EventModel.event_id)
-                .filter(EventModel.session_id == session_id, EventModel.event_type == "user_query")
-                .all()
-            ]
-            if user_event_ids:
-                fb_rows = (
-                    db.query(PromptFeedback.user_comment, PromptFeedback.created_at)
-                    .filter(PromptFeedback.llm_request_id.in_(user_event_ids))
-                    .order_by(PromptFeedback.created_at.desc())
-                    .limit(5)
-                    .all()
-                )
-            else:
-                fb_rows = []
-            result["feedback_signals"] = [
-                {"signal": r[0], "ts": str(r[1]) if r[1] else None}
-                for r in fb_rows
-            ]
-        except Exception:
-            result["feedback_signals"] = []
-
-        # 5. Data quality hints — check tool results for missing provenance
-        for evt in events:
-            if evt.get("type") == "tool_result" and evt.get("result_preview"):
-                preview = evt.get("result_preview", "")
-                if "data_source" not in preview and evt.get("tool_name"):
-                    hints.append(f"Tool '{evt['tool_name']}' result has no data_source provenance")
-                    break  # one hint is enough
-
-        # 6. Tool selection: cloud skills, edge tools, usage counts
-        if focus in ("tool_selection", "auto"):
-            _gather_tool_selection(session_id, question, db, hints, result)
-
-        # 7. Cross-session history: similar queries from past sessions
-        if focus in ("history", "auto"):
-            _gather_history(session_id, user_id, question, db, result)
-
-        # 8. Token summary — aggregated from LLM response events
-        result["token_summary"] = {
-            "total_prompt_tokens": total_prompt,
-            "total_completion_tokens": total_completion,
-            "total_tokens": total_prompt + total_completion,
-            "llm_calls": llm_calls,
-            "by_model": {
-                model: {"prompt_tokens": v["prompt"], "completion_tokens": v["completion"], "calls": v["calls"]}
-                for model, v in cost_by_model.items()
-            },
-        }
-
-        # 9. Tool quality summary — from tool_result_quality events (if firewall enabled)
-        try:
-            tq_rows = (
-                db.query(EventModel.event_metadata)
-                .filter(
-                    EventModel.session_id == session_id,
-                    EventModel.event_type == "tool_result_quality",
-                )
-                .order_by(EventModel.created_at.desc())
-                .limit(20)
-                .all()
-            )
-            quality_items = []
-            for (meta,) in tq_rows:
-                if not meta:
-                    continue
-                m = meta if isinstance(meta, dict) else {}
-                try:
-                    if isinstance(meta, str):
-                        m = json.loads(meta)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                grade = m.get("quality_grade", "")
-                if grade and grade != "complete":
-                    quality_items.append({
-                        "tool": m.get("tool_name", "unknown"),
-                        "grade": grade,
-                        "score": m.get("quality_score"),
-                        "missing_fields": m.get("missing_fields", []),
-                    })
-            result["tool_quality_summary"] = quality_items
-        except Exception:
-            result["tool_quality_summary"] = []
-
-        if total_prompt > 50000:
-            hints.append(f"High token usage: {total_prompt + total_completion:,} total tokens across {llm_calls} LLM calls")
-
-    result["diagnosis_hints"] = hints
-    return result
+    from core.agent.reflect_service import ReflectService
+    svc = ReflectService(
+        db_factory=SessionLocal,
+        skill_registry=_get_shared_skill_registry(),
+        peek_session=_peek_session_entry,
+    )
+    return svc.build_evidence(session_id, user_id, focus, last_n, question)
 
 
 def _get_or_create_session_entry(session_id: str) -> dict[str, Any]:
@@ -1668,9 +1449,16 @@ async def reflect_session(
     user_id = current_user["user_id"]
     _verify_session_owner(user_id, session_id)
 
+    from core.agent.reflect_service import ReflectService
+    svc = ReflectService(
+        db_factory=SessionLocal,
+        skill_registry=_get_shared_skill_registry(),
+        peek_session=_peek_session_entry,
+    )
+
     import asyncio
     return await asyncio.to_thread(
-        _build_reflect_evidence, session_id, user_id, focus, last_n, question,
+        svc.build_evidence, session_id, user_id, focus, last_n, question,
     )
 
 
@@ -1685,9 +1473,16 @@ async def decision_trace(
     user_id = current_user["user_id"]
     _verify_session_owner(user_id, session_id)
 
+    from core.agent.reflect_service import ReflectService
+    svc = ReflectService(
+        db_factory=SessionLocal,
+        skill_registry=_get_shared_skill_registry(),
+        peek_session=_peek_session_entry,
+    )
+
     import asyncio
     return await asyncio.to_thread(
-        _build_reflect_evidence, session_id, user_id, "tool_selection", 20, question,
+        svc.build_evidence, session_id, user_id, "tool_selection", 20, question,
     )
 
 

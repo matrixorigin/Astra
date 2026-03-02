@@ -81,6 +81,7 @@ class MemoryStore(DbConsumer):
         self,
         user_id: str,
         memory_type: Optional[MemoryType] = None,
+        limit: Optional[int] = None,
     ) -> list[Memory]:
         with self._db() as db:
             q = db.query(MemoryRecord).filter(
@@ -89,6 +90,8 @@ class MemoryStore(DbConsumer):
             )
             if memory_type:
                 q = q.filter(MemoryRecord.memory_type == memory_type.value)
+            if limit is not None:
+                q = q.limit(limit)
             return [_to_domain(r) for r in q.all()]
 
     def supersede(self, old_id: str, new_memory: Memory) -> Memory:
