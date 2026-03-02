@@ -50,10 +50,9 @@ Intelligent agent platform with auditable decisions, safe iteration, and version
 # 1. Setup environment
 conda create -n dev-agent python=3.11
 conda activate dev-agent
-make setup
 
 # 2. Initialize and start (< 10 seconds)
-make dev-init          # Auto-generate keys, fix config
+make dev-init          # Auto-generate keys, install deps, fix config
 make dev-start         # Start all services
 
 # 3. Check status

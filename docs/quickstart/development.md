@@ -36,27 +36,25 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ### 3. Install Dependencies
 
 ```bash
-make setup
-```
-
-This will:
-- Install Python dependencies from `pyproject.toml`
-- Install development tools (pytest, ruff, mypy)
-- Set up pre-commit hooks (optional)
-
-### 4. Configure Environment
-
-```bash
-# Initialize environment (auto-generates keys)
 make dev-init
 ```
 
-This automatically:
+This will:
+- Copy `.env.example` to `.env` (if not exists)
+- Install all Python dependencies via Poetry (runtime + dev + test)
+- Auto-generate encryption keys
+- Validate configuration
+
+All dependencies are defined in `pyproject.toml`. See [Dependencies Reference](../reference/dependencies.md) for details.
+
+### 4. Configure Environment
+
+`dev-init` automatically:
 - Generates `TOKEN_ENCRYPTION_KEY` if missing
 - Fixes common configuration errors (e.g., `OPENAI_AKI_KEY` → `OPENAI_API_KEY`)
 - Validates LLM provider/model configuration
 
-**Manual configuration (optional):**
+If you need to customize beyond what `dev-init` generates:
 ```bash
 cp .env.example .env
 # Edit .env with your settings

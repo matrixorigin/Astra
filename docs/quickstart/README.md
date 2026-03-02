@@ -18,10 +18,9 @@ git clone https://github.com/matrixorigin/mo-agent.git
 cd mo-agent
 conda create -n dev-agent python=3.11
 conda activate dev-agent
-make setup
 
 # 2. Initialize and start (< 10 seconds)
-make dev-init          # Auto-generate keys, fix config
+make dev-init          # Auto-generate keys, install deps, fix config
 make dev-start         # Start all services
 
 # 3. Check status

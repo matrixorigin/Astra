@@ -3,10 +3,10 @@
 ## Local Development
 
 ```bash
-make setup      # Install dependencies
-make dev-up     # Start MatrixOne + Redis (Docker Compose)
-make test       # Run all tests (527 tests)
-make dev-down   # Stop services
+make dev-init      # Complete setup: .env + dependencies + config
+make dev-start     # Start all services (MatrixOne + Redis + API)
+make test          # Run all tests
+make dev-stop      # Stop services
 ```
 
 ## Project Structure

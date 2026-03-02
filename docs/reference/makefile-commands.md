@@ -7,7 +7,9 @@ Complete reference for all available make commands.
 | Command | Description |
 |---------|-------------|
 | `make help` | Show all available commands |
-| `make setup` | Install dependencies |
+| `make setup` | Copy .env.example to .env |
+| `make install-dev-deps` | Install all dependencies (runtime + dev + test) |
+| `make install-check-deps` | Install check dependencies (lint + type-check, lighter) |
 | `make dev-start` | Start all services |
 | `make dev-stop` | Stop all services |
 | `make dev-status` | Check service status |
@@ -74,7 +76,9 @@ Complete reference for all available make commands.
 
 | Command | Description |
 |---------|-------------|
-| `make setup` | Install all dependencies |
+| `make setup` | Copy .env.example to .env (one-time) |
+| `make install-dev-deps` | Install all dependencies (runtime + dev + test) |
+| `make install-check-deps` | Install check dependencies (lint + type-check, lighter) |
 | `make install` | Install package in development mode |
 | `make clean` | Remove build artifacts |
 
@@ -108,6 +112,60 @@ These commands still work but show deprecation warnings:
 | `make dev-logs` | `make dev-deps-logs` | ⚠️ Deprecated |
 
 ## Detailed Command Reference
+
+### setup
+
+Copy `.env.example` to `.env` (one-time setup).
+
+```bash
+make setup
+```
+
+**What it does:**
+- Checks if `.env` exists
+- If not, copies `.env.example` to `.env`
+- Prompts user to review and customize
+
+**Use when:**
+- First time setup (manual approach)
+- Need to reset environment configuration
+
+**Note:** This does NOT install dependencies. Use `make install-dev-deps` or `make dev-init` for complete setup.
+
+### install-dev-deps
+
+Install all Python dependencies (runtime + dev + test).
+
+```bash
+make install-dev-deps
+```
+
+**What it does:**
+- Runs `poetry install --with dev -E local-embedding`
+- All dependencies are defined in `pyproject.toml` (single source of truth)
+
+**Use when:**
+- First time setup
+- After pulling dependency changes
+- Dependency installation issues
+
+**Note:** For complete initialization, use `make dev-init` instead.
+
+### install-check-deps
+
+Install dependencies for static checks (lint, type-check) — skips `sentence-transformers`.
+
+```bash
+make install-check-deps
+```
+
+**What it does:**
+- Runs `poetry install --with dev` (no `-E local-embedding`)
+- Faster install, smaller footprint
+
+**Use when:**
+- CI static-check jobs (lint, mypy)
+- Local linting without full test dependencies
 
 ### dev-start
 
@@ -175,15 +233,18 @@ make dev-init
 ```
 
 **What it does:**
-1. Generates `TOKEN_ENCRYPTION_KEY` if missing
-2. Fixes `OPENAI_AKI_KEY` → `OPENAI_API_KEY`
-3. Validates LLM provider/model configuration
-4. Updates `.env` file
+1. Copies `.env.example` to `.env` (if not exists)
+2. Installs all dependencies (runtime + dev + test)
+3. Generates `TOKEN_ENCRYPTION_KEY` if missing
+4. Fixes `OPENAI_AKI_KEY` → `OPENAI_API_KEY`
+5. Validates LLM provider/model configuration
 
 **Use when:**
 - First time setup
 - After cloning repository
 - After configuration errors
+
+**Note:** This is the recommended way to set up the development environment.
 
 ### dev-clean
 

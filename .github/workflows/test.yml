@@ -2,14 +2,14 @@ name: Test Suite
 
 on:
   push:
-    branches: [ main, dev ]
+    branches: [ main, develop ]
   pull_request:
-    branches: [ main, dev ]
+    branches: [ main, develop ]
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    
+
     services:
       matrixone:
         image: matrixorigin/matrixone:latest
@@ -20,7 +20,7 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-      
+
       redis:
         image: redis:7-alpine
         ports:
@@ -30,49 +30,45 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
-      
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Cache Poetry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-dev-${{ hashFiles('poetry.lock') }}
+          restore-keys: ${{ runner.os }}-poetry-dev-
+
+      # Single source of truth for dev dependencies — see Makefile.
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-      
+        run: make install-dev-deps
+
       - name: Run unit tests (parallel)
         env:
           DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
           REDIS_URL: redis://localhost:6379/0
         run: |
-          python -m pytest tests/unit/ -n auto --dist loadscope -v --tb=short
-      
+          poetry run pytest tests/unit/ -n auto --dist loadscope -v --tb=short
+
       - name: Run integration tests (parallel)
         env:
           DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
           REDIS_URL: redis://localhost:6379/0
         run: |
-          python -m pytest tests/integration/ -n auto --dist loadscope -v --tb=short
-      
-      - name: Run schema validation tests
-        env:
-          DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
-          REDIS_URL: redis://localhost:6379/0
-        run: |
-          python -m pytest tests/integration/test_schema_validation.py -v
-      
-      - name: Run transaction integrity tests
-        env:
-          DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
-          REDIS_URL: redis://localhost:6379/0
-        run: |
-          python -m pytest tests/integration/test_transaction_integrity.py -v
-      
+          poetry run pytest tests/integration/ -n auto --dist loadscope -v --tb=short
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4

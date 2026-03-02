@@ -4,8 +4,7 @@
 
 ```bash
 # First time setup
-make setup              # Copy .env, install dependencies
-make dev-init           # Initialize environment (generate keys, fix config)
+make dev-init           # Complete setup: .env + dependencies + config
 
 # Daily development
 make dev-start          # Start all services (< 10 seconds)

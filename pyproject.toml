@@ -34,6 +34,10 @@ cryptography = "^42.0.0"
 openai = "^1.0.0"
 rich = ">=13.0"
 prompt_toolkit = ">=3.0"
+sentence-transformers = {version = ">=2.2.0", optional = true}
+
+[tool.poetry.extras]
+local-embedding = ["sentence-transformers"]
 
 [tool.poetry.scripts]
 mo-agent = "cli.mo_agent_api:cli"

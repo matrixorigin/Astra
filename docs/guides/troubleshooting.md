@@ -103,7 +103,7 @@ cat .env
 make dev-api-restart
 
 # 6. If failing, reinstall dependencies
-make setup
+make install-dev-deps
 make dev-api-start
 ```
 
@@ -537,7 +537,7 @@ find . -type d -name __pycache__ -exec rm -rf {} +
 
 ```bash
 # 1. Reinstall dependencies
-make setup
+make install-dev-deps
 
 # 2. Install specific package
 pip install <package>

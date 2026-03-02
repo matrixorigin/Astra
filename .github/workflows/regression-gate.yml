@@ -42,9 +42,20 @@ jobs:
         with:
           python-version: '3.11'
       
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - name: Cache Poetry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-dev-${{ hashFiles('poetry.lock') }}
+          restore-keys: ${{ runner.os }}-poetry-dev-
+
+      # Single source of truth for dev dependencies — see Makefile.
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+        run: make install-dev-deps
       
       - name: Detect change type
         id: detect-change
@@ -75,7 +86,7 @@ jobs:
           DATABASE_URL: mysql://root:111@localhost:6001/mo_agent
           REDIS_URL: redis://localhost:6379/0
         run: |
-          python -m core.evaluation.gate_cli run \
+          poetry run python -m core.evaluation.gate_cli run \
             --change-type ${{ steps.detect-change.outputs.change_type }} \
             --change-id ${{ steps.detect-change.outputs.change_id }} \
             --change-file change.json \
@@ -88,7 +99,7 @@ jobs:
       - name: Generate report
         if: always()
         run: |
-          python -m core.evaluation.gate_cli report \
+          poetry run python -m core.evaluation.gate_cli report \
             --input gate_result.json \
             --format github-comment \
             --output gate_comment.md

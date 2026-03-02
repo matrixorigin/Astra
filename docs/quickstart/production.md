@@ -11,6 +11,32 @@ Deploy mo-agent to production environments.
 - Load balancer (nginx, AWS ALB, etc.)
 - SSL certificates
 
+## Optional Dependencies
+
+### Local Embedding Models
+
+If you want to use local embedding models (LocalProvider) instead of cloud-based embeddings:
+
+```bash
+# Install sentence-transformers in production
+pip install sentence-transformers
+
+# Or build Docker image with optional dependencies
+docker build -t mo-agent:latest --build-arg INSTALL_EXTRAS="local-embedding" .
+```
+
+**When to use:**
+- Privacy requirements (no data sent to external APIs)
+- Cost optimization (no per-request embedding fees)
+- Offline deployment (no internet access)
+
+**Trade-offs:**
+- Larger Docker image (~2GB additional)
+- Higher memory usage (~1-2GB per model)
+- Slower embedding generation vs cloud APIs
+
+See [Dependencies Reference](../reference/dependencies.md) for details.
+
 ## Deployment Options
 
 ### 1. Docker Compose (Small to Medium Scale)

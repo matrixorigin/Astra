@@ -28,6 +28,7 @@ Welcome to mo-agent documentation! This guide will help you find the information
 - [Makefile Commands](reference/makefile-commands.md) - All available make commands
 - [CLI Commands](reference/cli-commands.md) - mo-agent and mo-admin CLI reference
 - [Configuration](reference/configuration.md) - Environment variables and configuration
+- [Dependencies](reference/dependencies.md) - Dependency groups, installation, and optional extras
 
 ## 🏗️ Design & Architecture
 

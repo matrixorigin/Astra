@@ -48,8 +48,9 @@ help:
 	@echo "Environment Setup:"
 	@echo "  make dev-init           - Complete initialization (setup + deps + config)"
 	@echo "  make dev-setup-demo     - Interactive demo setup (admin + model + user)"
-	@echo "  make setup              - Copy .env.example → .env (one-time)"
-	@echo "  make install-dev-deps   - Install Python dev dependencies"
+	@echo "  make setup              - Copy .env.example → .env (one-time, no deps)"
+	@echo "  make install-dev-deps   - Install all dependencies (runtime + dev + test)"
+	@echo "  make install-check-deps - Install check dependencies (lint + type-check, lighter)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make check              - Run all static checks"
@@ -93,11 +94,21 @@ setup:
 
 .PHONY: install-dev-deps
 install-dev-deps:
-	@echo "Installing all dependencies (runtime + dev)..."
-	@pip install -e .
-	@pip install pytest pytest-asyncio pytest-cov pytest-xdist ruff mypy types-pymysql freezegun vcrpy pre-commit responses
-	@echo "✅ Dependencies installed"
-	@echo "✅ Python dependencies installed"
+	@echo "Installing all dependencies (runtime + dev + test)..."
+	@# pyproject.toml is the single source of truth for all dependencies.
+	@# --with dev includes test deps (sentence-transformers, freezegun, etc.)
+	@# -E local-embedding installs optional extras for full test coverage.
+	@command -v poetry >/dev/null 2>&1 || { echo "❌ Poetry not found. Install: pip install poetry"; exit 1; }
+	@poetry install --with dev -E local-embedding
+	@echo "✅ All dependencies installed"
+
+# Lighter install for static checks (lint, type-check) — skips sentence-transformers.
+.PHONY: install-check-deps
+install-check-deps:
+	@echo "Installing check dependencies (runtime + dev, no extras)..."
+	@command -v poetry >/dev/null 2>&1 || { echo "❌ Poetry not found. Install: pip install poetry"; exit 1; }
+	@poetry install --with dev
+	@echo "✅ Check dependencies installed"
 
 .PHONY: install-runtime
 install-runtime:
