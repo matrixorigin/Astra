@@ -59,7 +59,7 @@ class TestSessionInjection:
     def test_pipeline_requires_session(self):
         """SkillPipeline takes a db_factory callable."""
         mock_session = Mock(spec=Session)
-        mock_session.query.return_value.filter.return_value.all.return_value = []
+        mock_session.query.return_value.filter.return_value.limit.return_value.all.return_value = []
         pipeline = SkillPipeline(lambda: mock_session, llm_client=None)
         assert pipeline._modern._db_factory is not None
 
@@ -69,7 +69,7 @@ class TestSessionInjection:
             ModernSkillSelector(db_factory="not_callable")
 
         mock_session = Mock(spec=Session)
-        mock_session.query.return_value.filter.return_value.all.return_value = []
+        mock_session.query.return_value.filter.return_value.limit.return_value.all.return_value = []
         selector = ModernSkillSelector(db_factory=lambda: mock_session)
         assert selector._db_factory is not None
 
@@ -102,7 +102,7 @@ class TestSessionSharing:
 
     def test_pipeline_shares_session(self):
         mock_session = Mock(spec=Session)
-        mock_session.query.return_value.filter.return_value.all.return_value = []
+        mock_session.query.return_value.filter.return_value.limit.return_value.all.return_value = []
         factory = lambda: mock_session
         pipeline = SkillPipeline(factory, llm_client=None)
         assert pipeline._modern._db_factory is factory
@@ -128,6 +128,7 @@ class TestNoSessionCreation:
     def test_modules_dont_have_lazy_session(self):
         mock_session = Mock(spec=Session)
         mock_session.query.return_value.filter.return_value.all.return_value = []
+        mock_session.query.return_value.filter.return_value.limit.return_value.all.return_value = []
         modules = [
             GitForData(lambda: mock_session),
             EventLogger.from_session(mock_session),

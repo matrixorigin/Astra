@@ -49,7 +49,7 @@ class MockSkill(Skill):
 class TestAgentArchitecture(unittest.TestCase):
     def setUp(self):
         self.db = Mock(spec=Session)
-        self.db.query.return_value.filter.return_value.all.return_value = []
+        self.db.query.return_value.filter.return_value.limit.return_value.all.return_value = []
 
         self.registry = MagicMock()
         self.llm_client = MagicMock()

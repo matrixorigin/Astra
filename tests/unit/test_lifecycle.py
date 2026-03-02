@@ -23,8 +23,8 @@ class TestMemoryGovernanceEngine:
     
     def test_hourly_tasks(self, engine, mock_db):
         """Test hourly governance tasks."""
-        # Mock scratchpad query
-        mock_db.query.return_value.filter.return_value.all.return_value = []
+        # Mock UPDATE: query().filter().update() returns rowcount
+        mock_db.query.return_value.filter.return_value.update.return_value = 0
         
         results = engine.run_hourly_tasks()
         
@@ -47,14 +47,15 @@ class TestMemoryGovernanceEngine:
         mock_db.query.return_value.filter.return_value.all.return_value = []
         # Mock SQL aggregation for contradictions (empty)
         mock_db.query.return_value.filter.return_value.group_by.return_value.having.return_value.limit.return_value.all.return_value = []
-        # Mock distinct users query
-        from sqlalchemy import distinct
-        mock_db.query.return_value.all.return_value = [("alice",), ("bob",)]
+        # Mock health reports GROUP BY query: query().group_by().limit().all()
+        mock_db.query.return_value.group_by.return_value.limit.return_value.all.return_value = [
+            ("alice", 5, 0.6, 1), ("bob", 3, 0.8, 0),
+        ]
         
         results = engine.run_weekly_tasks()
         
         assert "contradictions_found" in results
-        assert "health_reports" in results
+        assert results["health_reports"] == 2
     
     def test_quarantine_low_confidence(self, engine, mock_db):
         """Test quarantine sets confidence to 0 and logs entry_ids."""
@@ -98,15 +99,10 @@ class TestMemoryGovernanceEngine:
         assert count == 1
     
     def test_memory_health_stats(self, engine, mock_db):
-        """Test memory health statistics."""
-        # Create mock entries
-        entries = [
-            Mock(confidence=0.8),
-            Mock(confidence=0.6),
-            Mock(confidence=0.2),
-        ]
-        
-        mock_db.query.return_value.filter.return_value.all.return_value = entries
+        """Test memory health statistics via aggregate query."""
+        # Mock aggregate: query(count, avg, sum_case).filter().first()
+        mock_row = (3, 0.533, 1)  # total=3, avg=0.533, low_confidence=1
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_row
         
         stats = engine._get_user_memory_stats("alice")
         

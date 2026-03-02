@@ -10,7 +10,7 @@ The `memories` table governance is handled by core.memory.governance.GovernanceS
 
 from datetime import datetime
 from typing import Any
-from sqlalchemy import func
+from sqlalchemy import case, func
 from core.logging_config import get_logger
 from core.db_consumer import DbConsumer, DbFactory
 
@@ -19,6 +19,14 @@ logger = get_logger(__name__)
 
 # Re-export for backward compatibility — canonical source is core.memory.types
 from core.memory.types import trust_tier_defaults  # noqa: F401
+
+
+_LOW_CONFIDENCE_THRESHOLD = 0.3
+
+
+def _low_confidence_expr(model, threshold: float = _LOW_CONFIDENCE_THRESHOLD):
+    """Reusable SQL expression: COUNT entries below confidence threshold."""
+    return func.sum(case((model.confidence < threshold, 1), else_=0))
 
 
 class MemoryGovernanceEngine(DbConsumer):
@@ -33,10 +41,14 @@ class MemoryGovernanceEngine(DbConsumer):
         super().__init__(db_factory)
         self.llm_client = llm_client
 
+    # Safety caps for background batch queries — prevents runaway scans.
+    _MAX_AGENTS = 100
+    _MAX_HEALTH_REPORT_USERS = 200
+
     def _get_agent_ids(self) -> list[str]:
         with self._db() as db:
             from api.models import Agent
-            return [a.agent_id for a in db.query(Agent.agent_id).all()]
+            return [a.agent_id for a in db.query(Agent.agent_id).limit(self._MAX_AGENTS).all()]
 
     # ── Hourly ────────────────────────────────────────────────────────
 
@@ -88,10 +100,14 @@ class MemoryGovernanceEngine(DbConsumer):
     def _archive_closed_notes(self) -> int:
         with self._db() as db:
             from api.models import AgentScratchpad
-            notes = db.query(AgentScratchpad).filter(
+            count = db.query(AgentScratchpad).filter(
                 AgentScratchpad.status == "completed"
-            ).all()
-            count = len(notes)
+            ).update(
+                {AgentScratchpad.status: "archived", AgentScratchpad.updated_at: datetime.now()},
+                synchronize_session=False,
+            )
+            if count:
+                db.commit()
             logger.debug("Archived %d completed notes", count)
             return count
 
@@ -195,50 +211,76 @@ class MemoryGovernanceEngine(DbConsumer):
     def _generate_health_reports(self) -> int:
         with self._db() as db:
             from api.models import KnowledgeEntry
-            from sqlalchemy import distinct
-            users = db.query(distinct(KnowledgeEntry.user_id)).all()
-            reports = 0
-            for (user_id,) in users:
-                stats = self._get_user_memory_stats(user_id)
+            low_expr = _low_confidence_expr(KnowledgeEntry)
+            rows = db.query(
+                KnowledgeEntry.user_id,
+                func.count(KnowledgeEntry.entry_id),
+                func.avg(KnowledgeEntry.confidence),
+                low_expr,
+            ).group_by(KnowledgeEntry.user_id).limit(self._MAX_HEALTH_REPORT_USERS).all()
+            for user_id, total, avg_conf, low_conf in rows:
                 logger.info(
                     "Memory health for %s: %d entries, avg confidence %.2f, %d low confidence",
-                    user_id, stats["total_entries"], stats["avg_confidence"], stats["low_confidence"],
+                    user_id, total, float(avg_conf or 0), int(low_conf or 0),
                 )
-                reports += 1
-            return reports
+            return len(rows)
 
     def _get_user_memory_stats(self, user_id: str) -> dict[str, Any]:
         with self._db() as db:
             from api.models import KnowledgeEntry
-            entries = db.query(KnowledgeEntry).filter(KnowledgeEntry.user_id == user_id).all()
-            if not entries:
+            low_expr = _low_confidence_expr(KnowledgeEntry)
+            row = db.query(
+                func.count(KnowledgeEntry.entry_id),
+                func.avg(KnowledgeEntry.confidence),
+                low_expr,
+            ).filter(KnowledgeEntry.user_id == user_id).first()
+            total = row[0] or 0
+            if total == 0:
                 return {"total_entries": 0, "avg_confidence": 0.0, "low_confidence": 0}
-            total = len(entries)
-            avg_conf = sum(e.confidence for e in entries) / total
-            low_conf = sum(1 for e in entries if e.confidence < 0.3)
-            return {"total_entries": total, "avg_confidence": avg_conf, "low_confidence": low_conf}
+            return {
+                "total_entries": total,
+                "avg_confidence": float(row[1] or 0),
+                "low_confidence": int(row[2] or 0),
+            }
 
     def governance_stats(self) -> dict[str, Any]:
         with self._db() as db:
             from api.models import KnowledgeEntry
-            entries = db.query(KnowledgeEntry).all()
-            total = len(entries)
+
+            low_expr = _low_confidence_expr(KnowledgeEntry)
+            row = db.query(
+                func.count(KnowledgeEntry.entry_id),
+                func.avg(KnowledgeEntry.confidence),
+                func.min(KnowledgeEntry.confidence),
+                low_expr,
+            ).first()
+            total = row[0] or 0
             if total == 0:
                 return {"total_entries": 0}
-            confidences = [e.confidence for e in entries]
-            tier_counts: dict[str, int] = {}
-            quarantined = 0
-            for e in entries:
-                tier_counts[e.trust_tier] = tier_counts.get(e.trust_tier, 0) + 1
-                if e.confidence < 0.3:
-                    quarantined += 1
-            contradictions = self._scan_contradictions()
+            quarantined = int(row[3] or 0)
+
+            tier_rows = db.query(
+                KnowledgeEntry.trust_tier,
+                func.count(KnowledgeEntry.entry_id),
+            ).group_by(KnowledgeEntry.trust_tier).all()
+            tier_counts = {r[0]: r[1] for r in tier_rows}
+
+            contradiction_count = db.query(
+                func.count(func.distinct(
+                    func.concat(KnowledgeEntry.category, ':', KnowledgeEntry.key_name)
+                ))
+            ).filter(
+                KnowledgeEntry.confidence > _LOW_CONFIDENCE_THRESHOLD
+            ).having(
+                func.count(func.distinct(KnowledgeEntry.value)) > 1
+            ).scalar() or 0
+
             return {
                 "total_entries": total,
-                "avg_confidence": sum(confidences) / total,
-                "min_confidence": min(confidences),
+                "avg_confidence": float(row[1] or 0),
+                "min_confidence": float(row[2] or 0),
                 "quarantined": quarantined,
                 "quarantine_pct": round(quarantined / total * 100, 1),
                 "tier_distribution": tier_counts,
-                "contradictions": contradictions,
+                "contradictions": contradiction_count,
             }

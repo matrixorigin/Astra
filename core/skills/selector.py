@@ -50,17 +50,21 @@ class SkillMetadata:
 class SkillSelector:
     """Rule-based skill selector with keyword matching."""
 
+    _MAX_SKILLS = 500  # Safety cap; log warning if hit
+
     def __init__(self, db_factory: Callable[[], Session] | None = None):
         self._db_factory = db_factory or (lambda: next(get_db_session()))
         self._load_skills()
 
     def _load_skills(self):
-        """Load skills with metadata from database."""
+        """Load active skills metadata from database."""
         self.skills = {}
 
         db = self._db_factory()
         try:
-            skills_data = db.query(SkillModel).filter(SkillModel.is_active == 1).all()
+            skills_data = db.query(SkillModel).filter(
+                SkillModel.is_active == 1
+            ).limit(self._MAX_SKILLS).all()
 
             for skill in skills_data:
                 metadata = SkillMetadata(
@@ -75,6 +79,9 @@ class SkillSelector:
                     cost_estimate=skill.cost_estimate or "medium",
                 )
                 self.skills[metadata.name] = metadata
+
+            if len(skills_data) >= self._MAX_SKILLS:
+                logger.warning("Skill load hit cap (%d) — some active skills may be missing", self._MAX_SKILLS)
         finally:
             db.close()
 
