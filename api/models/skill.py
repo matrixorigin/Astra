@@ -93,9 +93,10 @@ class SkillSelectionEvent(Base):
     __tablename__ = "skill_selection_events"
     __table_args__ = (
         Index("ix_sse_skill_created", "skill_name", "created_at"),
+        Index("ix_sse_session_created", "session_id", "created_at"),
     )
     event_id = Column(String(36), primary_key=True)
-    session_id = Column(String(36), index=True)
+    session_id = Column(String(36))
     user_query = Column(Text)
     context_snapshot = Column(String(255))
     available_skills = Column(JSON)

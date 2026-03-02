@@ -50,14 +50,15 @@ class Event(Base):
     __table_args__ = (
         FulltextIndex("ft_content_session", ["content", "session_id"], parser=FulltextParserType.NGRAM),
         Index("idx_events_user_type_time", "user_id", "event_type", "created_at"),
+        Index("idx_events_session_time", "session_id", "created_at"),
     )
 
     event_id = Column(String(36), primary_key=True)
-    session_id = Column(String(36), nullable=False, index=True)
-    user_id = Column(String(36), nullable=False, index=True)
+    session_id = Column(String(36), nullable=False)
+    user_id = Column(String(36), nullable=False)
     agent_id = Column(String(36), nullable=False, default="system")
     agent_version = Column(String(32), nullable=False, default="1.0.0")
-    event_type = Column(String(50), nullable=False, index=True)
+    event_type = Column(String(50), nullable=False)
     content = Column(Text, nullable=False)
     parent_event_id = Column(String(36), nullable=True, index=True)
     causal_chain_id = Column(String(36), nullable=False, index=True)

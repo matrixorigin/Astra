@@ -70,7 +70,7 @@ class ReflectService(DbConsumer):
 
             rows = (
                 db.query(
-                    EventModel.event_type, content_col, EventModel.event_metadata,
+                    EventModel.event_type, content_col,
                     EventModel.created_at, EventModel.llm_model_used, EventModel.skill_name,
                     EventModel.token_usage,
                 )
@@ -88,17 +88,17 @@ class ReflectService(DbConsumer):
             cost_by_model: dict[str, dict[str, int]] = {}
 
             for r in reversed(rows):
-                evt: dict[str, Any] = {"type": r[0], "ts": str(r[3]) if r[3] else None}
+                evt: dict[str, Any] = {"type": r[0], "ts": str(r[2]) if r[2] else None}
+                if r[3]:
+                    evt["model"] = r[3]
                 if r[4]:
-                    evt["model"] = r[4]
-                if r[5]:
-                    evt["skill"] = r[5]
+                    evt["skill"] = r[4]
 
-                if r[0] == "llm_response" and r[6]:
-                    usage = r[6] if isinstance(r[6], dict) else {}
+                if r[0] == "llm_response" and r[5]:
+                    usage = r[5] if isinstance(r[5], dict) else {}
                     try:
-                        if isinstance(r[6], str):
-                            usage = json.loads(r[6])
+                        if isinstance(r[5], str):
+                            usage = json.loads(r[5])
                     except (json.JSONDecodeError, TypeError):
                         usage = {}
                     p = usage.get("prompt_tokens", usage.get("prompt", 0)) or 0
@@ -106,7 +106,7 @@ class ReflectService(DbConsumer):
                     total_prompt += p
                     total_completion += c
                     llm_calls += 1
-                    model = r[4] or "unknown"
+                    model = r[3] or "unknown"
                     entry = cost_by_model.setdefault(model, {"prompt": 0, "completion": 0, "calls": 0})
                     entry["prompt"] += p
                     entry["completion"] += c
@@ -182,7 +182,7 @@ class ReflectService(DbConsumer):
                 from core.memory.types import MemoryType
 
                 store = MemoryStore(self._db_factory)
-                memories = store.list_active(user_id, MemoryType.PROCEDURAL, limit=5)
+                memories = store.list_active(user_id, MemoryType.PROCEDURAL, limit=5, load_embedding=False)
                 result["past_lessons"] = [m.content for m in memories]
                 for m in memories:
                     for name in fail_counts:
@@ -329,19 +329,17 @@ class ReflectService(DbConsumer):
         ]
 
         from api.models.agent import Event as EventModel
+        from sqlalchemy import func as sa_func
 
         usage_rows = (
-            db.query(EventModel.content)
+            db.query(sa_func.json_unquote(sa_func.json_extract(EventModel.content, "$.name")))
             .filter(EventModel.session_id == session_id, EventModel.event_type == "tool_call")
             .order_by(EventModel.created_at.desc()).limit(50).all()
         )
         tool_usage: dict[str, int] = {}
-        for (c,) in usage_rows:
-            try:
-                name = json.loads(c).get("name", "unknown") if c else "unknown"
-                tool_usage[name] = tool_usage.get(name, 0) + 1
-            except (json.JSONDecodeError, TypeError):
-                pass
+        for (name,) in usage_rows:
+            n = name or "unknown"
+            tool_usage[n] = tool_usage.get(n, 0) + 1
         result["tool_usage_counts"] = tool_usage
 
         unused = {s["name"] for s in result.get("cloud_skills", [])} - set(tool_usage)

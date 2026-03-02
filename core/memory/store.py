@@ -36,6 +36,26 @@ def _to_domain(row: MemoryRecord) -> Memory:
     )
 
 
+def _to_domain_light(row) -> Memory:
+    """Convert a column-tuple row (without embedding) to Memory."""
+    return Memory(
+        memory_id=row.memory_id,
+        user_id=row.user_id,
+        memory_type=MemoryType(row.memory_type),
+        content=row.content,
+        initial_confidence=row.initial_confidence,
+        embedding=None,
+        source_event_ids=row.source_event_ids or [],
+        superseded_by=row.superseded_by,
+        is_active=bool(row.is_active),
+        session_id=row.session_id,
+        observed_at=row.observed_at,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        trust_tier=TrustTier(row.trust_tier) if row.trust_tier else TrustTier.T3_INFERRED,
+    )
+
+
 class MemoryStore(DbConsumer):
     """CRUD operations on the memories table."""
 
@@ -82,9 +102,16 @@ class MemoryStore(DbConsumer):
         user_id: str,
         memory_type: Optional[MemoryType] = None,
         limit: Optional[int] = None,
+        load_embedding: bool = True,
     ) -> list[Memory]:
         with self._db() as db:
-            q = db.query(MemoryRecord).filter(
+            if load_embedding:
+                q = db.query(MemoryRecord)
+            else:
+                # Skip embedding column (~6KB/row) when not needed
+                cols = [c for c in MemoryRecord.__table__.columns if c.name != "embedding"]
+                q = db.query(*cols)
+            q = q.filter(
                 MemoryRecord.user_id == user_id,
                 MemoryRecord.is_active == 1,
             )
@@ -92,7 +119,9 @@ class MemoryStore(DbConsumer):
                 q = q.filter(MemoryRecord.memory_type == memory_type.value)
             if limit is not None:
                 q = q.limit(limit)
-            return [_to_domain(r) for r in q.all()]
+            if load_embedding:
+                return [_to_domain(r) for r in q.all()]
+            return [_to_domain_light(r) for r in q.all()]
 
     def supersede(self, old_id: str, new_memory: Memory) -> Memory:
         if not new_memory.memory_id:
