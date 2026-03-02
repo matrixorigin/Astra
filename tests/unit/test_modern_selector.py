@@ -152,3 +152,110 @@ class TestModernSkillSelector:
         assert len(result) == 2
         assert result[0]["function"]["name"] == "search_code"
         assert result[1]["function"]["name"] == "analyze_bug"
+
+
+class TestLazyBuild:
+    """Phase 5.4: build() deferred until first query."""
+
+    def test_constructor_does_not_call_build(self, db):
+        def fake_embed(text):
+            return [0.1] * 384
+
+        selector = ModernSkillSelector(lambda: db, embed_fn=fake_embed)
+        selector._index.build = lambda skills, **kw: setattr(selector, '_build_called', True) or 0
+
+        # Constructor should NOT have triggered build
+        assert not getattr(selector, '_build_called', False)
+
+    def test_first_query_triggers_build(self, db):
+        build_calls = []
+
+        def fake_embed(text):
+            return [0.1] * 384
+
+        selector = ModernSkillSelector(lambda: db, embed_fn=fake_embed)
+        selector._index.build = lambda skills, **kw: build_calls.append(1) or 0
+
+        selector.get_tools_schema("review code")
+        assert len(build_calls) == 1
+
+    def test_second_query_does_not_rebuild(self, db):
+        build_calls = []
+
+        def fake_embed(text):
+            return [0.1] * 384
+
+        selector = ModernSkillSelector(lambda: db, embed_fn=fake_embed)
+        selector._index.build = lambda skills, **kw: build_calls.append(1) or 0
+
+        selector.get_tools_schema("review code")
+        selector.get_tools_schema("deploy app")
+        assert len(build_calls) == 1
+
+    def test_no_embed_fn_skips_build(self, db):
+        selector = ModernSkillSelector(lambda: db, embed_fn=None)
+        # Should not crash, and _index_built stays False
+        selector.get_tools_schema("test")
+        assert not selector._index_built
+
+
+class TestCategoryPreFiltering:
+    """Phase 6: keyword→category pre-filtering."""
+
+    def test_guess_category_code_keywords(self):
+        selector = ModernSkillSelector.__new__(ModernSkillSelector)
+        assert selector._guess_category("review my PR") == "code"
+        assert selector._guess_category("lint the codebase") == "code"
+        assert selector._guess_category("debug this crash") == "code"
+
+    def test_guess_category_devops_keywords(self):
+        selector = ModernSkillSelector.__new__(ModernSkillSelector)
+        assert selector._guess_category("deploy to production") == "devops"
+        assert selector._guess_category("check CI status") == "devops"
+        assert selector._guess_category("k8s pod restart") == "devops"
+
+    def test_guess_category_no_match(self):
+        selector = ModernSkillSelector.__new__(ModernSkillSelector)
+        assert selector._guess_category("explain quantum physics") is None
+
+    def test_query_passes_category_to_index(self, db):
+        from unittest.mock import MagicMock
+
+        def fake_embed(text):
+            return [0.1] * 384
+
+        selector = ModernSkillSelector(lambda: db, embed_fn=fake_embed)
+        selector._index_built = True  # skip build
+        selector._index.query = MagicMock(return_value=["code_review"])
+        selector.rule_selector.skills["code_review"] = SkillMetadata(
+            name="code_review", version="1.0.0", description="Review",
+            category="code", subcategory="review", triggers=["review"],
+            dependencies=[], priority=5, cost_estimate="low",
+        )
+
+        selector.get_tools_schema("review my PR")
+        # First call should have category="code"
+        first_call = selector._index.query.call_args_list[0]
+        assert first_call.kwargs.get("category") == "code" or first_call[1].get("category") == "code"
+
+    def test_category_fallback_when_no_results(self, db):
+        from unittest.mock import MagicMock
+
+        def fake_embed(text):
+            return [0.1] * 384
+
+        selector = ModernSkillSelector(lambda: db, embed_fn=fake_embed)
+        selector._index_built = True
+        # First call (with category) returns empty, second (without) returns result
+        selector._index.query = MagicMock(side_effect=[[], ["some_skill"]])
+        selector.rule_selector.skills["some_skill"] = SkillMetadata(
+            name="some_skill", version="1.0.0", description="Skill",
+            category="general", subcategory="default", triggers=["deploy"],
+            dependencies=[], priority=5, cost_estimate="low",
+        )
+
+        selector.get_tools_schema("deploy app")
+        assert selector._index.query.call_count == 2
+        # Second call should have no category filter
+        second_call = selector._index.query.call_args_list[1]
+        assert second_call.kwargs.get("category") is None

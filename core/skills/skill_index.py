@@ -146,11 +146,13 @@ class SkillIndex(DbConsumer):
 
     def query(
         self, text_query: str, top_k: int = 10, max_distance: float | None = None,
+        category: str | None = None,
     ) -> list[str]:
         """Return top-k skill names by L2 distance to *text_query*.
 
         Returns empty list if no embeddings exist or embed_fn/db_factory is None.
         Skills with L2 distance > *max_distance* are excluded.
+        When *category* is given, only skills in that category are searched.
         """
         if not self._embed or not self._db_factory:
             return []
@@ -176,16 +178,16 @@ class SkillIndex(DbConsumer):
 
         with self._db() as db:
             try:
-                rows = (
+                q = (
                     db.query(SkillRegistry.skill_name, dist_expr)
                     .filter(
                         SkillRegistry.is_active == 1,
                         SkillRegistry.embedding.isnot(None),
                     )
-                    .order_by("dist")
-                    .limit(top_k)
-                    .all()
                 )
+                if category:
+                    q = q.filter(SkillRegistry.category == category)
+                rows = q.order_by("dist").limit(top_k).all()
             except Exception as e:
                 # Dimension mismatch from stale embeddings — clear them and
                 # return empty so the caller falls back to keyword matching.

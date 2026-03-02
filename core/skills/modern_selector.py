@@ -39,8 +39,31 @@ class ModernSkillSelector:
         # Semantic index — primary retrieval path when available
         from core.skills.skill_index import SkillIndex
         self._index = SkillIndex(embed_fn=embed_fn, db_factory=db_factory)
-        if embed_fn:
-            self._index.build(list(self.rule_selector.skills.values()))
+        self._embed_fn = embed_fn
+        self._index_built = False
+
+    # Lightweight keyword → category mapping for pre-filtering.
+    _CATEGORY_HINTS: dict[str, str] = {
+        "review": "code", "pr": "code", "lint": "code", "refactor": "code",
+        "test": "code", "debug": "code", "fix": "code", "search": "code",
+        "deploy": "devops", "ci": "devops", "pipeline": "devops", "docker": "devops",
+        "kubernetes": "devops", "k8s": "devops", "monitor": "devops",
+    }
+
+    def _guess_category(self, query: str) -> str | None:
+        """Return a category hint if any keyword matches a whole word, else None."""
+        words = set(query.lower().split())
+        for keyword, cat in self._CATEGORY_HINTS.items():
+            if keyword in words:
+                return cat
+        return None
+
+    def _ensure_index_built(self):
+        """Lazy-build embeddings on first query, not at construction time."""
+        if self._index_built or not self._embed_fn:
+            return
+        self._index_built = True
+        self._index.build(list(self.rule_selector.skills.values()))
 
     def get_tools_schema(
         self,
@@ -63,7 +86,12 @@ class ModernSkillSelector:
         """
         # --- Stage 1: retrieve candidates ---
         # Prefer semantic index; fall back to keyword matching
-        hit_names = self._index.query(query, top_k=max_candidates * 2)
+        self._ensure_index_built()
+        category_hint = self._guess_category(query)
+        hit_names = self._index.query(query, top_k=max_candidates * 2, category=category_hint)
+        if not hit_names and category_hint:
+            # Category too narrow — retry without filter
+            hit_names = self._index.query(query, top_k=max_candidates * 2)
         if hit_names:
             candidates = [
                 self.rule_selector.skills[n]
