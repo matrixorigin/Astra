@@ -93,18 +93,15 @@ class TestTaskBoard:
 
     def test_get_open_tasks(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchall=Mock(
-                return_value=[
-                    (
-                        "task-1",
-                        "Review auth.py",
-                        '{"team_id":"team-1","description":"Check security","status":"open","created_by":"lead"}',
-                        datetime(2026, 1, 1, tzinfo=timezone.utc),
-                    ),
-                ]
-            )
-        )
+        # ORM query chain: db.query().filter().order_by().all()
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            (
+                "task-1",
+                "Review auth.py",
+                {"team_id": "team-1", "description": "Check security", "status": "open", "created_by": "lead"},
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+            ),
+        ]
 
         tb = TaskBoard(lambda: db)
         tasks = tb.get_open_tasks("team-1", "sess-1")
@@ -137,18 +134,15 @@ class TestTaskBoard:
 
     def test_get_messages_for_agent(self):
         db = _mock_db()
-        db.execute.return_value = Mock(
-            fetchall=Mock(
-                return_value=[
-                    (
-                        "msg-1",
-                        "Please review my fix",
-                        '{"to_agent":"agent-2","from_agent":"agent-1"}',
-                        datetime(2026, 1, 1, tzinfo=timezone.utc),
-                    ),
-                ]
-            )
-        )
+        # ORM query chain: db.query().filter().order_by().limit().all()
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [
+            (
+                "msg-1",
+                "Please review my fix",
+                {"to_agent": "agent-2", "from_agent": "agent-1"},
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+            ),
+        ]
 
         tb = TaskBoard(lambda: db)
         messages = tb.get_messages_for_agent("agent-2", "sess-1")
@@ -160,7 +154,7 @@ class TestTaskBoard:
 
     def test_get_messages_for_agent_empty(self):
         db = _mock_db()
-        db.execute.return_value = Mock(fetchall=Mock(return_value=[]))
+        db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = []
 
         tb = TaskBoard(lambda: db)
         messages = tb.get_messages_for_agent("agent-1", "sess-1")

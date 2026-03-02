@@ -20,8 +20,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, text
-from sqlalchemy.orm import Session
+from sqlalchemy import text
+
+from api.models.agent import Event
 from core.db_consumer import DbConsumer, DbFactory
 
 logger = logging.getLogger(__name__)
@@ -244,33 +245,25 @@ class TaskBoard(DbConsumer):
     def get_open_tasks(self, team_id: str, session_id: str) -> list[Task]:
         """Get all open tasks for a team.
 
-        Args:
-            team_id: Team identifier
-            session_id: Session ID
-
-        Returns:
-            List of open tasks
+        Uses (session_id, created_at) composite index, then Python-side
+        metadata filter for team_id/status (avoids JSON_EXTRACT in WHERE).
         """
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT event_id, content, metadata, created_at "
-                    "FROM agent_events "
-                    "WHERE session_id = :sid AND event_type = 'team_task' "
-                    "AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.team_id')) = :team_id "
-                    "AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.status')) = 'open' "
-                    "ORDER BY created_at ASC"
-                ),
-                {"sid": session_id, "team_id": team_id},
-            ).fetchall()
+            rows = (
+                db.query(Event.event_id, Event.content, Event.event_metadata, Event.created_at)
+                .filter(Event.session_id == session_id, Event.event_type == "team_task")
+                .order_by(Event.created_at.asc())
+                .all()
+            )
 
             tasks = []
-            for row in rows:
-                task_id, title, meta_json, created_at = row
-                meta = json.loads(meta_json) if meta_json else {}
+            for eid, title, meta, created_at in rows:
+                meta = meta or {}
+                if meta.get("team_id") != team_id or meta.get("status") != "open":
+                    continue
                 tasks.append(
                     Task(
-                        task_id=task_id,
+                        task_id=eid,
                         team_id=team_id,
                         title=title,
                         description=meta.get("description", ""),
@@ -341,34 +334,29 @@ class TaskBoard(DbConsumer):
     ) -> list[dict[str, Any]]:
         """Get recent messages for an agent.
 
-        Args:
-            agent_id: Agent ID
-            session_id: Session ID
-            limit: Max messages to return
-
-        Returns:
-            List of messages
+        Uses (session_id, created_at) composite index, then Python-side
+        metadata filter for to_agent (avoids JSON_EXTRACT in WHERE).
         """
         with self._db() as db:
-            rows = db.execute(
-                text(
-                    "SELECT event_id, content, metadata, created_at "
-                    "FROM agent_events "
-                    "WHERE session_id = :sid AND event_type = 'agent_message' "
-                    "AND JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.to_agent')) = :agent_id "
-                    "ORDER BY created_at DESC LIMIT :limit"
-                ),
-                {"sid": session_id, "agent_id": agent_id, "limit": limit},
-            ).fetchall()
+            rows = (
+                db.query(Event.event_id, Event.content, Event.event_metadata, Event.created_at)
+                .filter(Event.session_id == session_id, Event.event_type == "agent_message")
+                .order_by(Event.created_at.desc())
+                .limit(limit * 5)
+                .all()
+            )
 
             messages = []
-            for row in rows:
-                msg_id, content, meta_json, created_at = row
-                meta = json.loads(meta_json) if meta_json else {}
+            for msg_id, content, meta, created_at in rows:
+                meta = meta or {}
+                if meta.get("to_agent") != agent_id:
+                    continue
                 messages.append({
                     "message_id": msg_id,
                     "from_agent": meta.get("from_agent", ""),
                     "content": content,
                     "created_at": created_at.isoformat() if created_at else None,
                 })
+                if len(messages) >= limit:
+                    break
             return messages

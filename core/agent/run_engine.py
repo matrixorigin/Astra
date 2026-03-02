@@ -892,7 +892,7 @@ class RunEngine(DbConsumer):
                 rows = db.execute(
                     text(
                         "SELECT event_type, content, `metadata` FROM agent_events "
-                        "WHERE JSON_UNQUOTE(JSON_EXTRACT(`metadata`, '$.run_id')) = :run_id "
+                        "WHERE run_id = :run_id "
                         "ORDER BY created_at"
                     ),
                     {"run_id": run_id},

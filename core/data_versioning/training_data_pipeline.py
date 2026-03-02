@@ -179,13 +179,13 @@ class TrainingDataPipeline(DbConsumer):
                 SELECT 
                     event_id,
                     session_id,
-                    JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.skill_name')) as skill_name,
+                    skill_name,
                     content,
-                    CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.quality_score')) AS DECIMAL(3,2)) as quality_score,
+                    quality_score,
                     created_at
                 FROM {branch_name}.agent_events
                 WHERE event_type = 'llm_response'
-                AND CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.quality_score')) AS DECIMAL(3,2)) >= :quality_threshold
+                AND quality_score >= :quality_threshold
             """
         
             if limit:
