@@ -306,9 +306,11 @@ class TestExecutionNodeAscii:
 class TestBuildExecutionTree:
     """Unit tests for _build_execution_tree and _build_basic_tree."""
 
-    def _make_row(self, event_id, event_type, content, skill_name, ts, agent_id="agent", metadata=None):
-        """Create a fake DB row tuple matching the SELECT column order."""
-        return (event_id, event_type, content, skill_name, ts, agent_id, metadata or {})
+    def _make_row(self, event_id, event_type, content, skill_name, ts, agent_id="agent", metadata=None,
+                  token_usage=None, llm_model=None):
+        """Create a fake DB row tuple matching the SELECT column order (9 columns)."""
+        return (event_id, event_type, content, skill_name, ts, agent_id, metadata or {},
+                token_usage, llm_model)
 
     def _make_analyzer(self):
         from core.agent.session_analyzer import SessionAnalyzer
@@ -467,6 +469,45 @@ class TestBuildExecutionTree:
         uq = tree.children[0]
         assert uq.duration_s == pytest.approx(20.0)
 
+    def test_token_usage_and_model_merged_into_tree(self):
+        """token_usage and llm_model_used columns should populate ExecutionNode metrics."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "q", None, t0),
+            self._make_row(
+                "e2", "llm_response", "r", None, t0 + timedelta(seconds=2),
+                token_usage={"prompt_tokens": 1000, "completion_tokens": 200},
+                llm_model="gpt-4o",
+            ),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        llm = tree.children[0].children[0]
+        assert llm.tokens_in == 1000
+        assert llm.tokens_out == 200
+        assert llm.cost_usd is not None and llm.cost_usd > 0
+
+    def test_tool_result_metadata_from_row(self):
+        """Tool result metadata (duration_ms, result_size_bytes) should be available."""
+        analyzer = self._make_analyzer()
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            self._make_row("e1", "user_query", "q", None, t0),
+            self._make_row("e2", "llm_response", "r", None, t0 + timedelta(seconds=1)),
+            self._make_row("e3", "tool_call", json.dumps({"name": "bash"}), "bash", t0 + timedelta(seconds=2)),
+            self._make_row(
+                "e4", "tool_result", json.dumps({"name": "bash", "result": "ok"}), "bash",
+                t0 + timedelta(seconds=5),
+                metadata={"duration_ms": 3000, "result_size_bytes": 4096, "result_size_tokens": 500},
+            ),
+        ]
+        tree = analyzer._build_execution_tree(rows)
+        llm = tree.children[0].children[0]
+        tc = llm.children[0]
+        tr = tc.children[0]
+        assert tr.metadata["duration_ms"] == 3000
+        assert tr.metadata["result_size_bytes"] == 4096
+
 
 class TestCalculateMetrics:
     """Unit tests for _calculate_metrics issue detection."""
@@ -562,12 +603,12 @@ class TestBuildSummary:
         from core.agent.session_analyzer import SessionAnalyzer
         return SessionAnalyzer(db_factory=lambda: None)
 
-    def test_leaf_only_time_accounting(self):
-        """Only leaf nodes should contribute to time_by_category (no double-counting)."""
+    def test_self_time_accounting(self):
+        """Time uses 'self time' (node - children), not leaf-only."""
         from core.agent.session_analyzer import ExecutionNode
         analyzer = self._make_analyzer()
 
-        # Parent with 10s, child with 8s — only child (leaf) should count
+        # llm_response: 10s total, child tool_result: 8s → self time = 2s
         child = ExecutionNode(
             node_id="c", node_type="tool_result", event_id="c",
             ts=datetime(2026, 1, 1), duration_s=8.0,
@@ -577,16 +618,21 @@ class TestBuildSummary:
             ts=datetime(2026, 1, 1), duration_s=10.0,
             children=[child],
         )
-        root = ExecutionNode(
-            node_id="r", node_type="session", event_id=None,
+        uq = ExecutionNode(
+            node_id="uq", node_type="user_query", event_id="uq",
             ts=datetime(2026, 1, 1), duration_s=10.0,
             children=[parent],
         )
+        root = ExecutionNode(
+            node_id="r", node_type="session", event_id=None,
+            ts=datetime(2026, 1, 1), duration_s=10.0,
+            children=[uq],
+        )
 
         summary = analyzer._build_summary(root)
-        # tool_execution should be 8s, llm_inference should NOT be 10s (it has children)
+        # tool_execution gets 8s (leaf), llm_inference gets 2s (self time)
         assert summary.time_by_category.get("tool_execution", 0) == pytest.approx(8.0)
-        assert "llm_inference" not in summary.time_by_category  # parent is not a leaf
+        assert summary.time_by_category.get("llm_inference", 0) == pytest.approx(2.0)
 
     def test_token_aggregation(self):
         from core.agent.session_analyzer import ExecutionNode

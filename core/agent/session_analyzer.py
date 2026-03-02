@@ -305,8 +305,9 @@ class SessionAnalyzer(DbConsumer):
     def analyze(self, session_id: str) -> SessionReport:
         with self._db() as db:
             rows = db.execute(text(
-                "SELECT event_id, event_type, content, skill_name, created_at, agent_id, metadata "
-                "FROM agent_events WHERE session_id = :sid ORDER BY created_at"
+                "SELECT event_id, event_type, content, skill_name, created_at,"
+                " agent_id, metadata, token_usage, llm_model_used"
+                " FROM agent_events WHERE session_id = :sid ORDER BY created_at"
             ), {"sid": session_id}).fetchall()
 
         if not rows:
@@ -325,7 +326,7 @@ class SessionAnalyzer(DbConsumer):
         cloud_loop_count = 0
 
         for r in rows:
-            event_id, event_type, content, skill_name, ts, agent_id, metadata = r
+            event_id, event_type, content, skill_name, ts, agent_id, metadata, _tu, _model = r
 
             # Compute gap
             gap_s = None
@@ -483,14 +484,25 @@ class SessionAnalyzer(DbConsumer):
 
         events = []
         for r in rows:
-            event_id, event_type, content, skill_name, ts, _agent_id, metadata = r
+            event_id, event_type, content, skill_name, ts, _agent_id, metadata, token_usage, llm_model = r
+            # Merge token_usage and llm_model into metadata for uniform access
+            merged_meta = metadata if isinstance(metadata, dict) else {}
+            if token_usage:
+                tu = token_usage if isinstance(token_usage, dict) else {}
+                merged_meta = {
+                    **merged_meta,
+                    "prompt_tokens": tu.get("prompt_tokens", tu.get("prompt", 0)),
+                    "completion_tokens": tu.get("completion_tokens", tu.get("completion", 0)),
+                }
+            if llm_model:
+                merged_meta = {**merged_meta, "model": llm_model}
             events.append({
                 "event_id": event_id,
                 "event_type": event_type,
                 "content": content,
                 "skill_name": skill_name,
                 "ts": ts,
-                "metadata": metadata if isinstance(metadata, dict) else {},
+                "metadata": merged_meta,
             })
 
         root = self._build_basic_tree(events)
@@ -682,30 +694,36 @@ class SessionAnalyzer(DbConsumer):
         for child in node.children:
             self._enrich_llm_metrics(child, events)
 
+    # Node types that are structural containers — not actionable for issue detection.
+    _CONTAINER_TYPES = frozenset({"session", "user_query"})
+
     def _calculate_metrics(self, node: ExecutionNode, parent: ExecutionNode | None) -> None:
-        """Calculate derived metrics (duration_pct, issues)."""
-        # Calculate parent duration percentage
+        """Calculate derived metrics (duration_pct, issues).
+
+        Container nodes (session, user_query) are excluded from issue detection
+        because they always span the full duration and would generate noise.
+        """
         if parent and parent.duration_s > 0:
             node.parent_duration_pct = (node.duration_s / parent.duration_s) * 100
 
-        # Detect issues
-        if node.duration_s >= SLOW_NODE_THRESHOLD_S:
-            node.issues.append("SLOW")
+        # Only flag issues on non-container nodes
+        if node.node_type not in self._CONTAINER_TYPES:
+            if node.duration_s >= SLOW_NODE_THRESHOLD_S:
+                node.issues.append("SLOW")
 
-        if node.parent_duration_pct is not None and node.parent_duration_pct > 50:
-            node.issues.append("BOTTLENECK")
+            if node.parent_duration_pct is not None and node.parent_duration_pct > 50:
+                node.issues.append("BOTTLENECK")
 
-        if node.tokens_in is not None and node.tokens_in > HIGH_TOKEN_THRESHOLD:
-            node.issues.append("HIGH_TOKEN")
+            if node.tokens_in is not None and node.tokens_in > HIGH_TOKEN_THRESHOLD:
+                node.issues.append("HIGH_TOKEN")
 
-        if node.cost_usd is not None and node.cost_usd > EXPENSIVE_THRESHOLD_USD:
-            node.issues.append("EXPENSIVE")
+            if node.cost_usd is not None and node.cost_usd > EXPENSIVE_THRESHOLD_USD:
+                node.issues.append("EXPENSIVE")
 
-        # Check tool result size
-        if node.node_type == "tool_result" and node.metadata:
-            result_tokens = node.metadata.get("result_size_tokens", 0)
-            if result_tokens > LARGE_CONTEXT_THRESHOLD:
-                node.issues.append("LARGE_CONTEXT")
+            if node.node_type == "tool_result" and node.metadata:
+                result_tokens = node.metadata.get("result_size_tokens", 0)
+                if result_tokens > LARGE_CONTEXT_THRESHOLD:
+                    node.issues.append("LARGE_CONTEXT")
 
         for child in node.children:
             self._calculate_metrics(child, node)
@@ -713,18 +731,18 @@ class SessionAnalyzer(DbConsumer):
     def _build_summary(self, root: ExecutionNode) -> ExecutionSummary:
         """Build aggregated summary from execution tree.
 
-        Time accounting: only *leaf* nodes contribute to ``time_by_category``
-        so that parent durations (which include children) are not double-counted.
+        Time accounting uses "self time" — each node's duration minus the sum
+        of its direct children's durations.  This correctly attributes time:
+        an llm_response that took 2s total but spawned a 1.5s tool_call
+        contributes 0.5s of "llm_inference" self-time.
 
-        Turn numbering: each llm_response encountered (depth-first) increments
-        the global turn counter, so sibling llm_responses under the same
-        user_query get distinct turn numbers.
+        Container nodes (session, user_query) are excluded from root causes.
         """
         time_by_category: dict[str, float] = {}
         tokens_by_source: dict[str, int] = {}
         cost_by_turn: dict[int, float] = {}
         root_causes: list[str] = []
-        turn_counter = [0]  # mutable counter shared across recursion
+        turn_counter = [0]
 
         def traverse(node: ExecutionNode) -> None:
             category = node.node_type
@@ -736,9 +754,13 @@ class SessionAnalyzer(DbConsumer):
 
             current_turn = max(turn_counter[0], 1)
 
-            # Only leaf nodes contribute time to avoid double-counting.
-            if not node.children:
-                time_by_category[category] = time_by_category.get(category, 0) + node.duration_s
+            # Self time = node duration - sum of direct children durations.
+            # This avoids double-counting while still attributing time to
+            # non-leaf nodes (e.g. llm_response inference time).
+            children_time = sum(c.duration_s for c in node.children)
+            self_time = max(node.duration_s - children_time, 0)
+            if self_time > 0 and node.node_type not in self._CONTAINER_TYPES:
+                time_by_category[category] = time_by_category.get(category, 0) + self_time
 
             if node.tokens_in is not None:
                 tokens_by_source["prompt"] = tokens_by_source.get("prompt", 0) + node.tokens_in
@@ -748,10 +770,12 @@ class SessionAnalyzer(DbConsumer):
             if node.cost_usd is not None and node.cost_usd > 0:
                 cost_by_turn[current_turn] = cost_by_turn.get(current_turn, 0) + node.cost_usd
 
-            if "SLOW" in node.issues:
-                root_causes.append(f"{node.node_type} '{node.detail}' took {node.duration_s:.1f}s")
-            if "HIGH_TOKEN" in node.issues and node.tokens_in is not None:
-                root_causes.append(f"{node.node_type} used {node.tokens_in:,} tokens")
+            # Root causes — only from non-container nodes
+            if node.node_type not in self._CONTAINER_TYPES:
+                if "SLOW" in node.issues:
+                    root_causes.append(f"{node.node_type} '{node.detail}' took {node.duration_s:.1f}s")
+                if "HIGH_TOKEN" in node.issues and node.tokens_in is not None:
+                    root_causes.append(f"{node.node_type} used {node.tokens_in:,} tokens")
 
             for child in node.children:
                 traverse(child)

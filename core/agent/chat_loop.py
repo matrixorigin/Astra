@@ -694,6 +694,10 @@ class ChatLoop:
                     {"ms": _elapsed_ms, "skill": fn_name},
                 )
 
+        _tool_elapsed_ms = (time.monotonic() - _t0) * 1000
+        _result_size_bytes = len(result_str.encode("utf-8", errors="replace")) if result_str else 0
+        _result_size_tokens = len(result_str.split()) if result_str else 0  # rough estimate
+
         tool_result_event = self.event_logger.create_stream_event(
             user_id=user_id,
             session_id=session_id,
@@ -701,6 +705,11 @@ class ChatLoop:
             content=json.dumps({"call_id": tc["id"], "result": result_str[:500]}),
             parent_event_id=user_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
+            metadata={
+                "duration_ms": _tool_elapsed_ms,
+                "result_size_bytes": _result_size_bytes,
+                "result_size_tokens": _result_size_tokens,
+            },
         )
         yield StreamEvent(
             event_type=StreamEventType.TOOL_RESULT,

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -164,6 +165,8 @@ class AssembledPrompt:
     cache_prefix_tokens: int = 0
     sections: dict[str, str] = field(default_factory=dict)
     memory_stats: dict[str, Any] | None = None  # Populated when explain=True
+    assembly_duration_ms: float = 0.0  # Total prompt assembly wall-clock time
+    memory_duration_ms: float = 0.0  # Time spent in _build_memory
 
 
 class PromptAssembler(DbConsumer):
@@ -198,6 +201,8 @@ class PromptAssembler(DbConsumer):
         sections: dict[str, str] = {}
         breakdown: dict[str, int] = {}
         memory_stats: dict[str, Any] | None = None
+        _t0 = time.monotonic()
+        _mem_duration_ms = 0.0
         
         # Phase 1: Compute zone budgets based on model context size
         # This provides the foundation for measuring compression effectiveness
@@ -245,7 +250,9 @@ class PromptAssembler(DbConsumer):
             breakdown["project_context"] = _estimate_tokens(project_ctx)
 
         # §4 Memory (continuity + observations + few-shot)
+        _mem_t0 = time.monotonic()
         memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain)
+        _mem_duration_ms = (time.monotonic() - _mem_t0) * 1000
         if memory:
             sections["memory"] = memory
             breakdown["memory"] = _estimate_tokens(memory)
@@ -326,6 +333,8 @@ class PromptAssembler(DbConsumer):
             cache_prefix_tokens=cache_prefix,
             sections=sections,
             memory_stats=memory_stats,
+            assembly_duration_ms=(time.monotonic() - _t0) * 1000,
+            memory_duration_ms=_mem_duration_ms,
         )
 
     # ------------------------------------------------------------------
