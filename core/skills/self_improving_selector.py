@@ -203,7 +203,20 @@ class SelfImprovingSelector(DbConsumer):
                 EventModel.user_feedback_score < self.thresholds.low_satisfaction,  # Low satisfaction
             ]
         
-            events = db.query(EventModel).filter(
+            # Projection: only load fields needed for signal extraction (skip large JSON columns)
+            events = db.query(
+                EventModel.event_id,
+                EventModel.user_query,
+                EventModel.selected_skills,
+                EventModel.correction_suggestion,
+                EventModel.execution_time_ms,
+                EventModel.execution_cost,
+                EventModel.user_feedback_score,
+                EventModel.selection_correctness,
+                EventModel.session_id,
+                EventModel.selection_method,
+                EventModel.context_snapshot,
+            ).filter(
                 or_(*conditions),
                 EventModel.created_at >= cutoff
             ).order_by(EventModel.created_at.desc()).limit(limit).all()
@@ -669,24 +682,44 @@ class SelfImprovingSelector(DbConsumer):
             runtime_config = self._load_runtime_config()
             decay = runtime_config["decay"]
 
-            learnings = db.query(LearningModel).all()
+            # Optimized: query only fields needed for confidence calculation (not SELECT *)
+            learnings = db.query(
+                LearningModel.learning_id,
+                LearningModel.confidence,
+                LearningModel.signal_type,
+                LearningModel.created_at,
+                LearningModel.evidence_count,
+            ).all()
             total = len(learnings)
             effective_confidences = [
-                self._effective_confidence(learning, decay, learning.signal_type)
-                for learning in learnings
+                self._effective_confidence(
+                    type('Learning', (), {
+                        'confidence': l.confidence,
+                        'signal_type': l.signal_type,
+                        'created_at': l.created_at,
+                        'evidence_count': l.evidence_count,
+                    })(),
+                    decay,
+                    l.signal_type
+                )
+                for l in learnings
             ]
             high_confidence = sum(1 for c in effective_confidences if c >= 0.7)
             avg_confidence = (
                 sum(effective_confidences) / total * 100.0 if total > 0 else 0.0
             )
         
-            # Breakdown by signal type
-            signal_breakdown = {}
+            # Optimized: single GROUP BY query instead of 5 separate counts
+            from sqlalchemy import func
+            signal_counts = db.query(
+                LearningModel.signal_type,
+                func.count(LearningModel.learning_id).label('count')
+            ).group_by(LearningModel.signal_type).all()
+            signal_breakdown = {row.signal_type: row.count for row in signal_counts}
+            # Fill in zeros for signal types with no learnings
             for signal_type in SignalType:
-                count = db.query(LearningModel).filter(
-                    LearningModel.signal_type == signal_type.value
-                ).count()
-                signal_breakdown[signal_type.value] = count
+                if signal_type.value not in signal_breakdown:
+                    signal_breakdown[signal_type.value] = 0
         
             # Query regression gate results (validates selector changes before deployment)
             # Wrapped in try/except because eval_gate_results table may not exist yet

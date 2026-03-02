@@ -62,7 +62,18 @@ class SkillSelector:
 
         db = self._db_factory()
         try:
-            skills_data = db.query(SkillModel).filter(
+            # Projection: only load fields needed for SkillMetadata (skip embedding, definition, etc.)
+            skills_data = db.query(
+                SkillModel.skill_name,
+                SkillModel.version,
+                SkillModel.description,
+                SkillModel.category,
+                SkillModel.subcategory,
+                SkillModel.triggers,
+                SkillModel.dependencies,
+                SkillModel.priority,
+                SkillModel.cost_estimate,
+            ).filter(
                 SkillModel.is_active == 1
             ).limit(self._MAX_SKILLS).all()
 

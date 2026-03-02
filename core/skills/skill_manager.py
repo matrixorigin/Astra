@@ -292,7 +292,13 @@ class SkillManager(DbConsumer):
         - skills_dict: {name: {version, depends_on}} for all active skills
         - tools_dict: {name: version} for skills with source='edge_tool'
         """
-        rows = db.query(SkillRegistry).filter_by(is_active=1).all()
+        # Projection: only load fields needed for dependency graph
+        rows = db.query(
+            SkillRegistry.skill_name,
+            SkillRegistry.version,
+            SkillRegistry.manifest,
+            SkillRegistry.source,
+        ).filter_by(is_active=1).all()
         skills: dict[str, dict] = {}
         tools: dict[str, str] = {}
         for r in rows:

@@ -283,7 +283,16 @@ class ContextManager(DbConsumer):
         """Retrieve candidate events for context (fallback method)."""
         from api.models import Event
         with self._db() as db:
-            events = db.query(Event).filter(
+            # Projection: only load fields needed for scoring (skip embedding, snapshots, etc.)
+            events = db.query(
+                Event.event_id,
+                Event.event_type,
+                Event.content,
+                Event.created_at,
+                Event.parent_event_id,
+                Event.causal_chain_id,
+                Event.event_metadata,
+            ).filter(
                 Event.session_id == session_id
             ).order_by(Event.created_at.desc()).limit(100).all()
 
@@ -296,7 +305,7 @@ class ContextManager(DbConsumer):
                 "created_at": e.created_at,  # Keep as datetime for scorer
                 "parent_event_id": e.parent_event_id,
                 "causal_chain_id": e.causal_chain_id,
-                "metadata": e.metadata,
+                "metadata": e.event_metadata,
             }
             for e in events
         ]

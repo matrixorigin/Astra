@@ -706,18 +706,95 @@ class SkillCatalog(DbConsumer):
     def list_by_source(self, source: str) -> list[dict[str, Any]]:
         """List skills filtered by source."""
         with self._db() as db:
-            rows = db.query(SkillModel).filter(
+            # Projection: skip embedding column (not returned by _row_to_dict anyway)
+            rows = db.query(
+                SkillModel.skill_id,
+                SkillModel.skill_name,
+                SkillModel.version,
+                SkillModel.description,
+                SkillModel.skill_definition,
+                SkillModel.git_commit_hash,
+                SkillModel.source,
+                SkillModel.status,
+                SkillModel.is_active,
+                SkillModel.created_by,
+                SkillModel.category,
+                SkillModel.cost_estimate,
+                SkillModel.triggers,
+                SkillModel.dependencies,
+                SkillModel.priority,
+                SkillModel.created_at,
+            ).filter(
                 SkillModel.source == source, SkillModel.is_active == 1,
             ).order_by(SkillModel.created_at.desc()).all()
-            return [self._row_to_dict(r) for r in rows]
+            # Convert Row tuples to dict manually (can't use _row_to_dict with tuples)
+            return [
+                {
+                    "skill_id": r.skill_id,
+                    "skill_name": r.skill_name,
+                    "version": r.version,
+                    "description": r.description,
+                    "skill_definition": r.skill_definition,
+                    "git_commit_hash": r.git_commit_hash,
+                    "source": r.source,
+                    "status": r.status,
+                    "is_active": r.is_active,
+                    "created_by": r.created_by,
+                    "category": r.category,
+                    "cost_estimate": r.cost_estimate,
+                    "triggers": r.triggers,
+                    "dependencies": r.dependencies,
+                    "priority": r.priority,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
 
     def list_by_owner(self, user_id: str) -> list[dict[str, Any]]:
         """List skills created by a specific user."""
         with self._db() as db:
-            rows = db.query(SkillModel).filter(
+            # Projection: skip embedding column
+            rows = db.query(
+                SkillModel.skill_id,
+                SkillModel.skill_name,
+                SkillModel.version,
+                SkillModel.description,
+                SkillModel.skill_definition,
+                SkillModel.git_commit_hash,
+                SkillModel.source,
+                SkillModel.status,
+                SkillModel.is_active,
+                SkillModel.created_by,
+                SkillModel.category,
+                SkillModel.cost_estimate,
+                SkillModel.triggers,
+                SkillModel.dependencies,
+                SkillModel.priority,
+                SkillModel.created_at,
+            ).filter(
                 SkillModel.created_by == user_id,
             ).order_by(SkillModel.created_at.desc()).all()
-            return [self._row_to_dict(r) for r in rows]
+            return [
+                {
+                    "skill_id": r.skill_id,
+                    "skill_name": r.skill_name,
+                    "version": r.version,
+                    "description": r.description,
+                    "skill_definition": r.skill_definition,
+                    "git_commit_hash": r.git_commit_hash,
+                    "source": r.source,
+                    "status": r.status,
+                    "is_active": r.is_active,
+                    "created_by": r.created_by,
+                    "category": r.category,
+                    "cost_estimate": r.cost_estimate,
+                    "triggers": r.triggers,
+                    "dependencies": r.dependencies,
+                    "priority": r.priority,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
 
     def list_active(self, limit: int = 100, offset: int = 0) -> dict[str, Any]:
         """List all active skills with pagination."""
