@@ -201,6 +201,17 @@ async def _consume_turn(
                     name = event.get("name", "")
                     if hasattr(renderer, "thinking"):
                         renderer.thinking(f"Generating {name}…")
+                elif etype == "cloud_loop_progress":
+                    _flush_dedup()
+                    loop_n = event.get("loop", 0)
+                    n_skills = event.get("cloud_skills", 0)
+                    if hasattr(renderer, "thinking"):
+                        renderer.thinking(f"Executing cloud skill (step {loop_n + 1})…")
+                elif etype == "cloud_tool_result":
+                    _flush_dedup()
+                    name = event.get("name", "")
+                    if hasattr(renderer, "thinking"):
+                        renderer.thinking(f"Cloud skill {name} done, continuing…")
                 elif etype == "tool_call":
                     _flush_dedup()
                     # Hide thinking before collecting tool calls — the LLM

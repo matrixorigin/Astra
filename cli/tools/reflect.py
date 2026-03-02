@@ -26,17 +26,20 @@ class ReflectTool(EdgeTool):
         "event trails with timing, skill selection history, available cloud skills "
         "and their schemas, tool usage counts, past lessons, and similar queries "
         "from previous sessions. "
+        "Use focus='performance' when user asks about slow responses, high token usage, or why something took so long. "
+        "Use focus='skill_failure' after a tool fails or returns an error. "
+        "Use focus='unexpected_result' when the answer was wrong or surprising. "
         "Use focus='tool_selection' to see what tools are available and why one wasn't used. "
-        "Use focus='skill_failure' after a tool fails. "
-        "Use focus='history' to find how similar questions were handled before."
+        "Use focus='history' to find how similar questions were handled before. "
+        "The response includes session_report_markdown — present it directly to the user as the analysis."
     )
     parameters = {
         "type": "object",
         "properties": {
             "focus": {
                 "type": "string",
-                "enum": ["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history"],
-                "description": "What to investigate. 'tool_selection' shows available skills and usage. 'history' finds similar past queries.",
+                "enum": ["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history", "performance"],
+                "description": "What to investigate. 'tool_selection' shows available skills and usage. 'history' finds similar past queries. 'performance' analyzes timing, gaps, and bottlenecks.",
             },
             "question": {
                 "type": "string",

@@ -223,7 +223,7 @@ class TestReflectTool:
         assert schema["function"]["name"] == "reflect"
         assert set(schema["function"]["parameters"]["properties"]["focus"]["enum"]) == {
             "auto", "skill_failure", "unexpected_result", "data_quality",
-            "tool_selection", "history"}
+            "tool_selection", "history", "performance"}
 
 
 # ============================================================================
@@ -437,6 +437,56 @@ class TestBuildReflectEvidence:
 
         hints = reflect_svc.build_evidence(sid, uid, "auto", 20)["diagnosis_hints"]
         assert any("token" in h.lower() for h in hints)
+
+    def test_cloud_skills_truncated_when_many(self, reflect_session, db_factory):
+        """With 50 skills, only used + question-matched + 10 unused are returned in full."""
+        sid, uid, _ = reflect_session
+        from core.agent.reflect_service import ReflectService
+
+        # Create 50 mock skills
+        skills = {}
+        for i in range(50):
+            s = MagicMock()
+            s.name = f"skill_{i:03d}"
+            s.description = f"Skill number {i}"
+            s.to_openai_schema.return_value = {
+                "function": {"parameters": {"type": "object", "properties": {}}}
+            }
+            skills[s.name] = s
+        mock_reg = MagicMock()
+        mock_reg._skills = skills
+
+        svc = ReflectService(db_factory=db_factory, skill_registry=mock_reg)
+        result = svc.build_evidence(sid, uid, "tool_selection", 20)
+
+        # Session used read_file and bash (from reflect_session fixture)
+        # Those won't match mock skill names, so only 10 unused detail returned
+        assert len(result["cloud_skills"]) <= 12  # 10 unused + up to 2 used
+        assert result["cloud_skills_total"] == 50
+        assert result.get("cloud_skills_omitted", 0) > 0
+
+    def test_cloud_skills_question_match_included(self, reflect_session, db_factory):
+        """Skills matching the question keyword are always included."""
+        sid, uid, _ = reflect_session
+        from core.agent.reflect_service import ReflectService
+
+        skills = {}
+        for i in range(30):
+            s = MagicMock()
+            s.name = f"skill_{i:03d}" if i != 15 else "deploy_service"
+            s.description = f"Skill {i}" if i != 15 else "Deploy a service to production"
+            s.to_openai_schema.return_value = {
+                "function": {"parameters": {"type": "object", "properties": {}}}
+            }
+            skills[s.name] = s
+        mock_reg = MagicMock()
+        mock_reg._skills = skills
+
+        svc = ReflectService(db_factory=db_factory, skill_registry=mock_reg)
+        result = svc.build_evidence(sid, uid, "tool_selection", 20, question="deploy")
+
+        names = [s["name"] for s in result["cloud_skills"]]
+        assert "deploy_service" in names
 
 
 # ============================================================================

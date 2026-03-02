@@ -87,7 +87,16 @@ def _try_repair_tool_args(tc_name: str, raw: str) -> dict | None:
         i += 1
     s = "".join(fixed)
 
-    # 4. Try parsing now
+    # 4. Bare-word values: e.g. "key": advice → "key": "advice"
+    #    Skip JSON literals true/false/null.
+    def _quote_bare(m):
+        word = m.group(1)
+        if word in ("true", "false", "null"):
+            return m.group(0)
+        return f': "{word}"{m.group(2)}'
+    s = _re.sub(r':\s*([a-zA-Z_]\w*)(\s*[,}\]])', _quote_bare, s)
+
+    # 5. Try parsing now
     try:
         return json.loads(s)
     except json.JSONDecodeError:
@@ -703,7 +712,7 @@ def _verify_session_owner(user_id: str, session_id: str, db: Session | None = No
             _check(conn)
 
 
-_ReflectFocus = Literal["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history"]
+_ReflectFocus = Literal["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history", "performance"]
 
 
 def _escape_like(text: str) -> str:
@@ -1442,7 +1451,7 @@ def _get_shared_embed_fn():
 async def reflect_session(
     session_id: str,
     current_user: Annotated[dict, Depends(get_current_user)],
-    focus: _ReflectFocus = Query(default="auto", description="Focus: auto, skill_failure, unexpected_result, data_quality, tool_selection, history"),
+    focus: _ReflectFocus = Query(default="auto", description="Focus: auto, skill_failure, unexpected_result, data_quality, tool_selection, history, performance"),
     last_n: int = Query(default=20, ge=1, le=100),
     question: str = Query(default="", description="Optional: what to investigate (for tool_selection focus)"),
 ):
@@ -1699,6 +1708,8 @@ async def chat_turn(
                         for tc in cloud_tcs
                     ]
                     _current_llm_messages = _current_llm_messages + [assistant_msg_loop]
+
+                    yield f"data: {json.dumps({'type': 'cloud_loop_progress', 'loop': _cloud_loop, 'cloud_skills': len(cloud_tcs), 'edge_skills': len(edge_tcs)})}\n\n"
 
                     for tc in cloud_tcs:
                         tc_name = tc.get("function", {}).get("name", "?")

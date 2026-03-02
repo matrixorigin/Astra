@@ -71,9 +71,18 @@ class SkillCatalog(DbConsumer):
         self,
         db_factory: DbFactory,
         gate_trigger: GateTrigger | None = None,
+        embed_fn=None,
     ):
         super().__init__(db_factory)
         self.gate_trigger = gate_trigger
+        # Resolve embed_fn: explicit > EmbeddingClient singleton > None
+        if embed_fn is None:
+            try:
+                from core.context.embeddings import get_embedding_client
+                embed_fn = get_embedding_client().embed
+            except Exception:
+                pass
+        self._embed_fn = embed_fn
         self._skills: dict[str, Skill] = {}  # name@version or name -> Skill
         # Manual metadata cache — avoids the memory-leak pitfall of
         # @lru_cache on an instance method (lru_cache holds a strong ref
@@ -248,8 +257,12 @@ class SkillCatalog(DbConsumer):
         """Shared DB upsert logic for register() and register_from_api().
 
         Deactivates old versions of the same skill (if ``is_active``),
-        then inserts or updates the row.
+        then inserts or updates the row.  Computes embedding inline when
+        ``embed_fn`` is available.
         """
+        # Compute embedding from name + description + triggers
+        embedding_val = self._compute_embedding(skill_name, description, triggers)
+
         with self._db() as db:
             if is_active:
                 db.query(SkillModel).filter(
@@ -273,6 +286,8 @@ class SkillCatalog(DbConsumer):
                 existing.priority = priority
                 existing.cost_estimate = cost_estimate
                 existing.side_effect_profile = side_effect_profile
+                if embedding_val is not None:
+                    existing.embedding = embedding_val
             else:
                 db.add(SkillModel(
                     skill_id=skill_id,
@@ -293,8 +308,27 @@ class SkillCatalog(DbConsumer):
                     priority=priority,
                     cost_estimate=cost_estimate,
                     side_effect_profile=side_effect_profile,
+                    embedding=embedding_val,
                 ))
             db.commit()
+
+    def _compute_embedding(
+        self, name: str, description: str | None, triggers: list | None,
+    ) -> str | None:
+        """Return vector literal for DB storage, or None if embedding unavailable."""
+        if not self._embed_fn:
+            return None
+        parts = [name]
+        if description:
+            parts.append(description)
+        if triggers:
+            parts.append(" ".join(str(t) for t in triggers))
+        try:
+            vec = self._embed_fn(" | ".join(parts))
+            return "[" + ",".join(str(v) for v in vec) + "]"
+        except Exception as e:
+            logger.warning("Failed to embed skill %s: %s", name, e)
+            return None
 
     # ── User skill publish / unpublish ────────────────────────────
 

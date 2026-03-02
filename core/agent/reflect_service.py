@@ -10,7 +10,7 @@ logger = get_logger(__name__)
 
 _ReflectFocus = Literal[
     "auto", "skill_failure", "unexpected_result",
-    "data_quality", "tool_selection", "history",
+    "data_quality", "tool_selection", "history", "performance",
 ]
 
 
@@ -55,6 +55,7 @@ class ReflectService(DbConsumer):
         question: str = "",
     ) -> dict[str, Any]:
         """Unified diagnostic evidence: events, skill decisions, tool selection, history."""
+        original_focus = focus
         result: dict[str, Any] = {"session_id": session_id, "focus": focus}
         hints: list[str] = []
 
@@ -281,6 +282,22 @@ class ReflectService(DbConsumer):
                 hints.append(f"High token usage: {total_prompt + total_completion:,} total tokens across {llm_calls} LLM calls")
 
         result["diagnosis_hints"] = hints
+
+        # 10. Session performance analysis (timeline, gaps, root cause)
+        if original_focus in ("performance", "auto"):
+            try:
+                from core.agent.session_analyzer import SessionAnalyzer
+                analyzer = SessionAnalyzer(self._db_factory)
+                report = analyzer.analyze(session_id)
+                result["session_report"] = report.to_dict()
+                result["session_report_markdown"] = report.to_markdown()
+                # Merge analyzer issues into hints
+                for issue in report.issues:
+                    hints.append(f"[{issue['type']}] {issue['description']}")
+                result["diagnosis_hints"] = hints
+            except Exception:
+                logger.debug("Session analysis failed", exc_info=True)
+
         return result
 
     # ------------------------------------------------------------------
@@ -291,43 +308,14 @@ class ReflectService(DbConsumer):
         self, session_id: str, question: str, db: Any,
         hints: list[str], result: dict[str, Any],
     ) -> None:
-        """Cloud skills, edge tools, and usage counts."""
-        try:
-            cloud_skills: list[dict[str, Any]] = []
-            seen_skills: set[str] = set()
-            if self._registry:
-                skills_iter = getattr(self._registry, 'list_skills', None)
-                if callable(skills_iter):
-                    try:
-                        skills = skills_iter()
-                        if not isinstance(skills, list):
-                            raise TypeError
-                    except (TypeError, AttributeError):
-                        skills = list(self._registry._skills.values())
-                else:
-                    skills = list(self._registry._skills.values())
-                for skill in skills:
-                    if skill.name in seen_skills:
-                        continue
-                    seen_skills.add(skill.name)
-                    schema = skill.to_openai_schema()
-                    cloud_skills.append({
-                        "name": skill.name,
-                        "description": skill.description,
-                        "parameters": schema.get("function", {}).get("parameters", {}),
-                    })
-            result["cloud_skills"] = cloud_skills
-        except Exception:
-            logger.debug("Failed to load cloud skills for tool_selection", exc_info=True)
-            result["cloud_skills"] = []
+        """Cloud skills, edge tools, and usage counts.
 
-        entry = self._peek_session(session_id)
-        result["edge_tools"] = [
-            {"name": t.get("function", {}).get("name", "?"),
-             "description": t.get("function", {}).get("description", "")[:80]}
-            for t in (entry.get("tools", []) if entry else [])
-        ]
-
+        To avoid bloating the response when hundreds of skills exist,
+        only return full details for: (1) skills used in this session,
+        (2) skills matching the question, (3) up to 10 unused skills.
+        The rest are summarized as a count.
+        """
+        # 1. Collect usage counts first — we need them to filter
         from api.models.agent import Event as EventModel
         from sqlalchemy import func as sa_func
 
@@ -341,14 +329,77 @@ class ReflectService(DbConsumer):
             n = name or "unknown"
             tool_usage[n] = tool_usage.get(n, 0) + 1
         result["tool_usage_counts"] = tool_usage
+        used_names = set(tool_usage)
 
-        unused = {s["name"] for s in result.get("cloud_skills", [])} - set(tool_usage)
-        if unused:
+        # 2. Build full skill index (name-deduped)
+        _MAX_UNUSED_DETAIL = 10
+        question_words = [w.lower() for w in (question or "").split() if len(w) > 2]
+
+        try:
+            all_skills: dict[str, dict[str, Any]] = {}
+            if self._registry:
+                skills_iter = getattr(self._registry, 'list_skills', None)
+                if callable(skills_iter):
+                    try:
+                        skills = skills_iter()
+                        if not isinstance(skills, list):
+                            raise TypeError
+                    except (TypeError, AttributeError):
+                        skills = list(self._registry._skills.values())
+                else:
+                    skills = list(self._registry._skills.values())
+                for skill in skills:
+                    if skill.name in all_skills:
+                        continue
+                    all_skills[skill.name] = {
+                        "name": skill.name,
+                        "description": skill.description,
+                        "parameters": skill.to_openai_schema().get("function", {}).get("parameters", {}),
+                    }
+
+            # 3. Partition: used / question-relevant / other
+            cloud_skills: list[dict[str, Any]] = []
+            other_names: list[str] = []
+
+            for name, info in all_skills.items():
+                if name in used_names:
+                    cloud_skills.append(info)
+                elif question_words and any(w in name.lower() or w in (info["description"] or "").lower()
+                                            for w in question_words):
+                    cloud_skills.append(info)
+                else:
+                    other_names.append(name)
+
+            # Include up to N unused skills with full detail
+            for name in other_names[:_MAX_UNUSED_DETAIL]:
+                cloud_skills.append(all_skills[name])
+
+            omitted = len(other_names) - _MAX_UNUSED_DETAIL
+            result["cloud_skills"] = cloud_skills
+            result["cloud_skills_total"] = len(all_skills)
+            if omitted > 0:
+                result["cloud_skills_omitted"] = omitted
+
+        except Exception:
+            logger.debug("Failed to load cloud skills for tool_selection", exc_info=True)
+            result["cloud_skills"] = []
+
+        entry = self._peek_session(session_id)
+        result["edge_tools"] = [
+            {"name": t.get("function", {}).get("name", "?"),
+             "description": t.get("function", {}).get("description", "")[:80]}
+            for t in (entry.get("tools", []) if entry else [])
+        ]
+
+        unused = {s["name"] for s in result.get("cloud_skills", [])} - used_names
+        if unused and len(unused) <= 20:
             hints.append(f"Cloud skills available but never called: {', '.join(sorted(unused))}")
+        elif unused:
+            hints.append(f"{len(unused)} cloud skills available but never called in this session")
 
-        if question:
+        if question_words:
             for s in result.get("cloud_skills", []):
-                if any(w in s["name"] for w in question.lower().split()):
+                if any(w in s["name"] for w in question_words):
                     hints.append(f"Skill '{s['name']}' params: {json.dumps(s['parameters'])[:200]}")
 
     def _gather_history(
