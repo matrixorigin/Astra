@@ -3,7 +3,7 @@
 > **Status**: Core Design — single source of truth for skill system, packaging, selection, and tool integration
 > **Last Updated**: 2026-02-28
 >
-> 🔵 **Implementation Status**: `SkillManager` (install/uninstall/credential CRUD) and `SkillPipeline` (unified selection) are implemented.
+> 🔵 **Implementation Status**: `SkillManager` (install/uninstall/upgrade/rollback with full dependency validation, credential CRUD) and `SkillPipeline` (unified selection) are implemented.
 > Marketplace discovery, publishing, RBAC, and MatrixOne Publication distribution are Design Targets.
 
 ---
@@ -1204,24 +1204,22 @@ Phase 3. Current skills are all platform-built (trusted). Sandbox mode becomes c
 
 ## 12. Dependency Management Enhancement
 
-Dependency versioning is partially implemented. The install-time validation is complete; upgrade/rollback/uninstall validation is designed (see §5 Lifecycle) but not yet implemented.
+Dependency versioning is fully implemented across all mutation paths.
 
-**Implemented** (install path):
+**Implemented**:
 - Semantic versioning with pip-style constraints (`>=1.0,<2.0`, `~=1.2.3`, etc.)
 - Typed dependencies: `Dependency(name, version_constraint, type=skill|tool)`
 - Full dependency tree validation: cycles, missing, version conflicts, transitive deps
 - Topological sort for install ordering
 - Backward compatible with old `depends_on: ["name"]` format
 - CLI `upgrade-check` command for impact analysis
-
-**Not yet implemented** (mutation paths):
-- `upgrade()` — does not validate that new version satisfies dependents' constraints
-- `rollback()` — does not validate that old version satisfies dependents' constraints
-- `uninstall()` — does not check for reverse dependencies
-- `require_executable()` — checks dependency existence but not version compatibility
+- `upgrade()` — validates new version satisfies dependents' constraints + forward deps resolvable
+- `rollback()` — validates old version satisfies dependents' constraints + forward deps installed
+- `uninstall()` — rejects if reverse dependents exist (supports `force=True` to bypass)
+- `require_executable()` — checks dependency existence and version compatibility (defense-in-depth)
+- API layer (`marketplace.py`) — returns 409 CONFLICT for all dependency errors
 
 See [Skill Dependencies Guide](../guides/skill-dependencies.md) for usage documentation.
-See [Enhancement Plan](../../plans/skill-tool-dependency-versioning.md) for full task breakdown.
 
 ---
 

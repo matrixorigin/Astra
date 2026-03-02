@@ -1558,14 +1558,13 @@ def skill():
 
 
 @skill.command("list")
-@click.option("--active-only", is_flag=True)
 @click.pass_context
-def skill_list(ctx, active_only):
+def skill_list(ctx):
     """List skills."""
     client = ctx.obj["client"]
     require_auth(client)
     try:
-        skills = client.list_skills(active_only=active_only)
+        skills = client.list_skills()
         if not skills:
             click.echo("No skills found")
             return
@@ -1629,7 +1628,7 @@ def skill_upgrade_check(ctx, skill_name, new_version):
     client = ctx.obj["client"]
     require_auth(client)
     try:
-        skills = client.list_skills(active_only=True)
+        skills = client.list_skills()
         if not skills:
             click.echo("No skills found")
             return

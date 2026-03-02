@@ -186,10 +186,22 @@ def get_users_with_skills() -> list[dict]:
 
 ### MatrixOne-Specific: Don't Assume, Ask
 
-**MatrixOne ≠ MySQL ≠ PostgreSQL. When something behaves unexpectedly:**
-- Don't conclude "it's impossible" — check MatrixOne docs first
+**MatrixOne ≠ MySQL ≠ PostgreSQL. But it's 99% MySQL-compatible.**
+
+MatrixOne is a hyper-converged HTAP database. Key facts:
+- **99% MySQL compatible** — use existing MySQL tools, ORMs, SQLAlchemy, all work
+- **Git for Data** — snapshots, time-travel, branch & merge, instant rollback
+- **Vector search** — built-in IVF/HNSW indexing, no external vector DB needed
+- **Fulltext search** — built-in, no Elasticsearch needed
+- **HTAP** — OLTP + OLAP in one database, no ETL
+- **Cloud-native** — storage-compute separation, elastic scaling
+
+**When something behaves unexpectedly:**
+- Don't conclude "it's impossible" — check [MatrixOne docs](https://docs.matrixorigin.cn/en) first
 - Don't silently work around with weaker code — it might be a bug worth reporting
 - Don't downgrade the design — if stuck, **ask the user** before compromising
+- MatrixOne docs: https://docs.matrixorigin.cn/en
+- MatrixOne GitHub: https://github.com/matrixorigin/matrixone
 
 ---
 

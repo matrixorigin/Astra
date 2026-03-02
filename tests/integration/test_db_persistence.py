@@ -332,37 +332,47 @@ class TestAdminAPIPersistence:
 
 
 class TestAuthenticationPersistence:
-    """Database persistence tests for authentication requirements."""
+    """Verify CLI commands reject unauthenticated access."""
 
-    def test_agent_cli_requires_auth_for_protected_commands(self, runner):
-        """Test that protected agent CLI commands require authentication."""
-        # These commands should fail without valid credentials
-        protected_commands = [
-            ["session", "list"],
-            ["session", "show", "s1"],
-            ["skill", "list"],
-            ["replay", "s1"]
-        ]
-        
-        for cmd in protected_commands:
-            # Without mocking, these would fail with auth error
-            # Verify the require_auth function is called
-            from cli.mo_agent_api import require_auth
-            assert callable(require_auth)
+    def test_agent_cli_rejects_unauthenticated(self, runner):
+        """Protected agent CLI commands exit non-zero without credentials."""
+        from unittest.mock import MagicMock, patch
 
-    def test_admin_cli_requires_auth_for_all_commands(self, runner):
-        """Test that all admin CLI commands require authentication."""
-        protected_commands = [
-            ["init"],
-            ["token", "list"],
-            ["audit", "logs"],
-            ["feedback", "stats"]
-        ]
-        
-        for cmd in protected_commands:
-            # Verify the require_auth function is called
-            from cli.mo_admin_api import require_auth
-            assert callable(require_auth)
+        with patch("cli.mo_agent_api.SyncAPIClient") as mock_cls:
+            client = MagicMock()
+            mock_cls.return_value = client
+            client.ensure_authenticated.return_value = False
+
+            for cmd in [
+                ["session", "list"],
+                ["skill", "list"],
+            ]:
+                from cli.mo_agent_api import cli as agent_cli
+                result = runner.invoke(agent_cli, cmd)
+                assert result.exit_code != 0 or "login" in result.output.lower(), (
+                    f"Command {cmd} should require auth"
+                )
+
+    def test_admin_cli_rejects_unauthenticated(self, runner):
+        """Protected admin CLI commands exit non-zero without credentials."""
+        from unittest.mock import MagicMock, patch
+
+        with patch("cli.mo_admin_api.SyncAPIClient") as mock_cls:
+            client = MagicMock()
+            mock_cls.return_value = client
+            client.ensure_authenticated.return_value = False
+
+            for cmd in [
+                ["init"],
+                ["token", "list"],
+                ["audit", "logs"],
+                ["feedback", "stats"],
+            ]:
+                from cli.mo_admin_api import cli as admin_cli
+                result = runner.invoke(admin_cli, cmd)
+                assert result.exit_code != 0 or "login" in result.output.lower(), (
+                    f"Command {cmd} should require auth"
+                )
 
 
 class TestDataConsistency:

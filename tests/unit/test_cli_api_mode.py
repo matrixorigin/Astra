@@ -1,17 +1,23 @@
-"""Tests for API-mode CLI commands."""
+"""Tests for API-mode CLI commands.
+
+Note: SyncAPIClient uses __getattr__ to proxy methods to the underlying
+APIClient, so spec=SyncAPIClient would block access to proxied methods
+(login, list_skills, etc.).  We use plain MagicMock and rely on
+assert_called_once_with() to catch parameter errors instead.
+"""
 
 import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 from click.testing import CliRunner
-from unittest.mock import patch, MagicMock, AsyncMock
 
-from cli.mo_agent_api import cli as agent_cli
 from cli.mo_admin_api import cli as admin_cli
+from cli.mo_agent_api import cli as agent_cli
 
 
 def _make_chat_mock(mock_client):
     """Configure a MagicMock SyncAPIClient for chat command tests."""
-    import asyncio
     mock_client._run.side_effect = lambda coro: asyncio.run(coro)
     mock_client._ensure_client.return_value = mock_client
     return mock_client
@@ -31,10 +37,11 @@ class TestAgentCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.login.return_value = {"email": "alice@example.com"}
-            
+
             result = runner.invoke(agent_cli, ["login"], input="alice@example.com\npassword\n")
             assert result.exit_code == 0
             assert "✅ Logged in" in result.output
+            mock_client.login.assert_called_once_with("alice@example.com", "password")
 
     def test_register_success(self, runner):
         """Test successful registration."""
@@ -42,7 +49,7 @@ class TestAgentCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.register.return_value = {"email": "bob@example.com"}
-            
+
             result = runner.invoke(
                 agent_cli,
                 ["register"],
@@ -50,6 +57,9 @@ class TestAgentCLI:
             )
             assert result.exit_code == 0
             assert "✅ Registered" in result.output
+            mock_client.register.assert_called_once_with(
+                "bob", "password", "bob@example.com",
+            )
 
     def test_whoami_authenticated(self, runner):
         """Test whoami when authenticated."""
@@ -60,7 +70,7 @@ class TestAgentCLI:
                 "email": "alice@example.com",
                 "user_id": "u_alice"
             }
-            
+
             result = runner.invoke(agent_cli, ["whoami"])
             assert result.exit_code == 0
             assert "alice@example.com" in result.output
@@ -78,10 +88,11 @@ class TestAgentCLI:
                     "event_count": 5
                 }
             ]
-            
+
             result = runner.invoke(agent_cli, ["session", "list"])
             assert result.exit_code == 0
             assert "s1" in result.output
+            mock_client.list_sessions.assert_called_once_with(limit=20)
 
     def test_session_list_empty(self, runner):
         """Test session list when no sessions."""
@@ -89,7 +100,7 @@ class TestAgentCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.list_sessions.return_value = []
-            
+
             result = runner.invoke(agent_cli, ["session", "list"])
             assert result.exit_code == 0
             assert "No sessions found" in result.output
@@ -105,10 +116,11 @@ class TestAgentCLI:
                 "status": "active",
                 "event_count": 5
             }
-            
+
             result = runner.invoke(agent_cli, ["session", "show", "s1"])
             assert result.exit_code == 0
             assert "s1" in result.output
+            mock_client.get_session.assert_called_once_with("s1")
 
     def test_skill_list(self, runner):
         """Test skill list command."""
@@ -123,10 +135,11 @@ class TestAgentCLI:
                     "description": "Summarize text"
                 }
             ]
-            
+
             result = runner.invoke(agent_cli, ["skill", "list"])
             assert result.exit_code == 0
             assert "summarize" in result.output
+            mock_client.list_skills.assert_called_once_with()
 
     def test_skill_list_empty(self, runner):
         """Test skill list when no skills."""
@@ -134,7 +147,7 @@ class TestAgentCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.list_skills.return_value = []
-            
+
             result = runner.invoke(agent_cli, ["skill", "list"])
             assert result.exit_code == 0
             assert "No skills found" in result.output
@@ -148,7 +161,7 @@ class TestAgentCLI:
                 "status": "success",
                 "events_replayed": 5
             }
-            
+
             result = runner.invoke(agent_cli, ["replay", "s1"])
             assert result.exit_code == 0
             assert "5" in result.output
@@ -163,10 +176,13 @@ class TestAdminCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.login.return_value = {"email": "admin@example.com"}
-            
+
             result = runner.invoke(admin_cli, ["login"], input="admin@example.com\npassword\n")
             assert result.exit_code == 0
             assert "✅ Logged in" in result.output
+            mock_client.login.assert_called_once_with(
+                "admin@example.com", "password",
+            )
 
     def test_init_database(self, runner):
         """Test database initialization."""
@@ -174,10 +190,11 @@ class TestAdminCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.admin_init.return_value = {"tables_created": 15}
-            
+
             result = runner.invoke(admin_cli, ["init"])
             assert result.exit_code == 0
             assert "✅ Database initialized" in result.output
+            mock_client.admin_init.assert_called_once_with()
 
     def test_token_create(self, runner):
         """Test token creation."""
@@ -189,7 +206,7 @@ class TestAdminCLI:
                 "provider": "openai",
                 "scope_type": "global"
             }
-            
+
             result = runner.invoke(
                 admin_cli,
                 ["token", "create", "--type", "llm", "--provider", "openai"],
@@ -212,7 +229,7 @@ class TestAdminCLI:
                     "is_active": True
                 }
             ]
-            
+
             result = runner.invoke(admin_cli, ["token", "list"])
             assert result.exit_code == 0
             assert "openai" in result.output
@@ -223,7 +240,7 @@ class TestAdminCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.admin_list_tokens.return_value = []
-            
+
             result = runner.invoke(admin_cli, ["token", "list"])
             assert result.exit_code == 0
             assert "No tokens found" in result.output
@@ -240,7 +257,7 @@ class TestAdminCLI:
                     "user_id": "admin"
                 }
             ]
-            
+
             result = runner.invoke(admin_cli, ["audit", "logs"])
             assert result.exit_code == 0
             assert "token_created" in result.output
@@ -251,7 +268,7 @@ class TestAdminCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.admin_auth_audit_logs.return_value = []
-            
+
             result = runner.invoke(admin_cli, ["audit", "logs"])
             assert result.exit_code == 0
             assert "No logs found" in result.output
@@ -267,7 +284,7 @@ class TestAdminCLI:
                 "negative": 10,
                 "avg_rating": 4.2
             }
-            
+
             result = runner.invoke(admin_cli, ["feedback", "stats"])
             assert result.exit_code == 0
             assert "100" in result.output
@@ -284,7 +301,7 @@ class TestAdminCLI:
                 "status": "queued",
                 "download_url": None
             }
-            
+
             result = runner.invoke(admin_cli, ["feedback", "export"])
             assert result.exit_code == 0
             assert "Export job created" in result.output or "Export ready" in result.output
@@ -298,7 +315,7 @@ class TestAdminCLI:
                 "email": "admin@example.com",
                 "role": "admin"
             }
-            
+
             result = runner.invoke(admin_cli, ["whoami"])
             assert result.exit_code == 0
             assert "admin@example.com" in result.output
@@ -314,7 +331,7 @@ class TestAdminCLI:
                 "role_name": "mo_agent_admin",
                 "message": "Role granted successfully"
             }
-            
+
             result = runner.invoke(admin_cli, ["user", "grant-role", "alice", "mo_agent_admin"])
             assert result.exit_code == 0
             assert "✅" in result.output
@@ -326,7 +343,7 @@ class TestAdminCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = False
-            
+
             result = runner.invoke(admin_cli, ["user", "grant-role", "alice", "mo_agent_admin"])
             assert result.exit_code == 1
             assert "login first" in result.output.lower()
@@ -337,7 +354,7 @@ class TestAdminCLI:
             mock_client = MagicMock()
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = "session_expired"
-            
+
             result = runner.invoke(admin_cli, ["user", "grant-role", "alice", "mo_agent_admin"])
             assert result.exit_code == 1
             assert "expired" in result.output.lower()
@@ -353,7 +370,7 @@ class TestAdminCLI:
                 "role_name": "mo_agent_admin",
                 "message": "Role revoked successfully"
             }
-            
+
             result = runner.invoke(admin_cli, ["user", "revoke-role", "alice", "mo_agent_admin"])
             assert result.exit_code == 0
             assert "✅" in result.output
@@ -374,8 +391,8 @@ class TestCLIEdgeMode:
 
     def test_run_edge_turn_registers_all_tools(self):
         """_run_edge_turn initializes router with all 10 tools."""
-        import asyncio
-        from unittest.mock import MagicMock, AsyncMock, patch
+        from unittest.mock import AsyncMock, patch
+
         from cli.mo_agent_api import _run_edge_turn
 
         captured = {}

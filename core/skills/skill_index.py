@@ -12,7 +12,7 @@ chain with keyword-based SkillSelector as a fallback.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from core.logging_config import get_logger

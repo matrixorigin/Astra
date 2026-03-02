@@ -92,13 +92,16 @@ class TestPublicQueries:
         assert inst.status == "installed"
 
     def test_list_installed_empty(self, mgr):
-        assert mgr.list_installed(_uid("nb")) == []
+        rows, total = mgr.list_installed(_uid("nb"))
+        assert rows == []
+        assert total == 0
 
     def test_list_installed(self, mgr, skill_env):
         name, uid = skill_env.create()
         mgr.install(uid, name)
-        installed = mgr.list_installed(uid)
+        installed, total = mgr.list_installed(uid)
         assert any(i.skill_name == name for i in installed)
+        assert total >= 1
 
 
 class TestInstallEdgeCases:

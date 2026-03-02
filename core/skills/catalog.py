@@ -719,44 +719,73 @@ class SkillCatalog(DbConsumer):
             info["install_count"] = install_count
             return info
 
-    def get_visible_skills(self, user_id: str) -> dict[str, list[dict[str, Any]]]:
-        """Get all skills visible to a user, grouped by source."""
+    def get_visible_skills(
+        self, user_id: str, *, per_group: int = 50,
+    ) -> dict[str, Any]:
+        """Get skills visible to a user, grouped by source.
+
+        Each group returns at most *per_group* items plus a total count,
+        so the caller knows whether to fetch more via the dedicated
+        ``GET /skills?source=...`` list endpoint.
+        """
         from api.models import SkillInstallation
 
         with self._db() as db:
             # Builtin + marketplace (active)
-            platform_skills = db.query(SkillModel).filter(
+            platform_q = db.query(SkillModel).filter(
                 SkillModel.is_active == 1,
                 SkillModel.source.in_([SOURCE_BUILTIN, SOURCE_MARKETPLACE]),
-            ).all()
+            )
+            platform_total = platform_q.count()
+            platform_skills = (
+                platform_q.order_by(SkillModel.created_at.desc())
+                .limit(per_group).all()
+            )
 
             # User's own published skills
-            user_skills = db.query(SkillModel).filter(
+            user_q = db.query(SkillModel).filter(
                 SkillModel.created_by == user_id,
                 SkillModel.source == SOURCE_USER,
-            ).all()
+            )
+            user_total = user_q.count()
+            user_skills = (
+                user_q.order_by(SkillModel.created_at.desc())
+                .limit(per_group).all()
+            )
 
-            # Installed marketplace skills (may include inactive ones user installed)
-            installed_names = {
-                r.skill_name for r in db.query(SkillInstallation.skill_name).filter(
-                    SkillInstallation.user_id == user_id,
-                    SkillInstallation.status == "installed",
-                ).all()
-            }
+            # Installed skill names — scoped to current page across all groups
+            page_names = (
+                [s.skill_name for s in platform_skills]
+                + [s.skill_name for s in user_skills]
+            )
+            if page_names:
+                installed_names = {
+                    r.skill_name for r in db.query(
+                        SkillInstallation.skill_name,
+                    ).filter(
+                        SkillInstallation.user_id == user_id,
+                        SkillInstallation.status == "installed",
+                        SkillInstallation.skill_name.in_(page_names),
+                    ).all()
+                }
+            else:
+                installed_names = set()
 
-            # Convert ORM objects to dicts while session is still open
-            # to avoid DetachedInstanceError on lazy-loaded attributes.
-            result: dict[str, list[dict[str, Any]]] = {
+            result: dict[str, Any] = {
                 SOURCE_BUILTIN: [],
                 SOURCE_MARKETPLACE: [],
                 SOURCE_USER: [],
+                "platform_total": platform_total,
+                "user_total": user_total,
             }
             for s in platform_skills:
                 d = self._row_to_dict(s)
                 d["installed"] = s.skill_name in installed_names
                 result[s.source or SOURCE_BUILTIN].append(d)
             for s in user_skills:
-                result[SOURCE_USER].append(self._row_to_dict(s))
+                d = self._row_to_dict(s)
+                d["installed"] = s.skill_name in installed_names
+                result[SOURCE_USER].append(d)
 
         return result
 

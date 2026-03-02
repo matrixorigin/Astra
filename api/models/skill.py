@@ -15,6 +15,9 @@ class SkillRegistry(Base):
     __tablename__ = "skills_registry"
     __table_args__ = (
         Index("idx_skill_name_active_time", "skill_name", "is_active", "created_at"),
+        Index("idx_skill_category", "category"),
+        Index("idx_skill_created_by", "created_by"),
+        Index("idx_skill_source_active", "source", "is_active"),
     )
 
     skill_id = Column(String(255), primary_key=True)  # skill_name@version

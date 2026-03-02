@@ -19,13 +19,14 @@ Note: Mock return values should match real API response formats.
 If API changes response format, these tests must be updated.
 """
 
+import json
+from unittest.mock import MagicMock, patch
+
 import pytest
 from click.testing import CliRunner
-from unittest.mock import patch, MagicMock
-import json
 
-from cli.mo_agent_api import cli as agent_cli
 from cli.mo_admin_api import cli as admin_cli
+from cli.mo_agent_api import cli as agent_cli
 
 
 @pytest.fixture
@@ -35,7 +36,13 @@ def runner():
 
 @pytest.fixture
 def mock_api_client():
-    """Mock API client to verify CLI → API calls."""
+    """Mock API client to verify CLI → API calls.
+
+    Note: SyncAPIClient uses __getattr__ to proxy methods to APIClient,
+    so spec=SyncAPIClient would block access to proxied methods like
+    login(), list_skills(), etc.  Instead we use unspecced MagicMock
+    and rely on assert_called_once_with() to catch parameter errors.
+    """
     with patch("cli.mo_agent_api.SyncAPIClient") as mock:
         client_instance = MagicMock()
         # _run must actually execute coroutines for chat tests
@@ -61,13 +68,13 @@ class TestAgentCLIToAPI:
     def test_login_calls_api_client(self, runner, mock_api_client):
         """Test login command calls API client login method."""
         mock_api_client.login.return_value = {"email": "test@example.com"}
-        
+
         result = runner.invoke(
             agent_cli,
             ["login"],
             input="test@example.com\npassword123\n"
         )
-        
+
         assert result.exit_code == 0
         mock_api_client.login.assert_called_once_with("test@example.com", "password123")
         assert "✅ Logged in" in result.output
@@ -75,13 +82,13 @@ class TestAgentCLIToAPI:
     def test_register_calls_api_client(self, runner, mock_api_client):
         """Test register command calls API client register method."""
         mock_api_client.register.return_value = {"email": "new@example.com"}
-        
+
         result = runner.invoke(
             agent_cli,
             ["register"],
             input="new@example.com\npassword123\npassword123\ntestuser\n"
         )
-        
+
         assert result.exit_code == 0
         mock_api_client.register.assert_called_once_with("testuser", "password123", "new@example.com")
         assert "✅ Registered" in result.output
@@ -97,10 +104,10 @@ class TestAgentCLIToAPI:
             ],
             "total": 2
         }
-        
+
         # API filters by JWT automatically, no --user-id parameter
         result = runner.invoke(agent_cli, ["session", "list"])
-        
+
         assert result.exit_code == 0
         mock_api_client.list_sessions.assert_called_once_with(limit=20)
         assert "sess-1" in result.output
@@ -114,9 +121,9 @@ class TestAgentCLIToAPI:
             "status": "active",
             "event_count": 5
         }
-        
+
         result = runner.invoke(agent_cli, ["session", "show", "sess-123"])
-        
+
         assert result.exit_code == 0
         mock_api_client.get_session.assert_called_once_with("sess-123")
         assert "sess-123" in result.output
@@ -129,11 +136,11 @@ class TestAgentCLIToAPI:
             {"skill_name": "code_search", "version": "1.0", "is_active": True, "description": "Search code"},
             {"skill_name": "web_search", "version": "1.0", "is_active": True, "description": "Search web"},
         ]
-        
+
         result = runner.invoke(agent_cli, ["skill", "list"])
-        
+
         assert result.exit_code == 0
-        mock_api_client.list_skills.assert_called_once()
+        mock_api_client.list_skills.assert_called_once_with()
         assert "code_search" in result.output
 
     def test_skill_register_calls_api_client(self, runner, mock_api_client, tmp_path):
@@ -145,12 +152,12 @@ class TestAgentCLIToAPI:
             "description": "Test skill"
         }
         skill_file.write_text(json.dumps(skill_data))
-        
+
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.register_skill.return_value = {"skill_name": "test_skill", "version": "1.0"}
-        
+
         result = runner.invoke(agent_cli, ["skill", "register", str(skill_file)])
-        
+
         assert result.exit_code == 0
         mock_api_client.register_skill.assert_called_once()
         assert "✅ Registered" in result.output
@@ -162,9 +169,9 @@ class TestAgentCLIToAPI:
             "replay_id": "replay-123",
             "events_replayed": 5
         }
-        
+
         result = runner.invoke(agent_cli, ["replay", "sess-123"])
-        
+
         assert result.exit_code == 0
         # Check that replay_session was called (don't enforce exact kwargs)
         mock_api_client.replay_session.assert_called_once()
@@ -182,13 +189,13 @@ class TestAdminCLIToAPI:
             "token_type": "llm",
             "provider": "openai"
         }
-        
+
         result = runner.invoke(
             admin_cli,
             ["token", "create", "--type", "llm", "--provider", "openai"],
             input="sk-test-key\n"
         )
-        
+
         assert result.exit_code == 0
         mock_admin_api_client.admin_create_token.assert_called_once()
         assert "✅" in result.output or "tok-123" in result.output
@@ -200,9 +207,9 @@ class TestAdminCLIToAPI:
             {"token_id": "tok-1", "type": "llm", "provider": "openai", "is_active": True, "scope_type": "global"},
             {"token_id": "tok-2", "type": "github", "provider": "github", "is_active": True, "scope_type": "global"},
         ]
-        
+
         result = runner.invoke(admin_cli, ["token", "list"])
-        
+
         assert result.exit_code == 0
         mock_admin_api_client.admin_list_tokens.assert_called_once()
         assert "tok-1" in result.output
@@ -214,9 +221,9 @@ class TestAdminCLIToAPI:
             {"user_id": "alice", "action": "login", "timestamp": "2026-02-23T10:00:00Z"},
             {"user_id": "bob", "action": "create_session", "timestamp": "2026-02-23T11:00:00Z"},
         ]
-        
+
         result = runner.invoke(admin_cli, ["audit", "logs", "--user", "alice"])
-        
+
         assert result.exit_code == 0
         mock_admin_api_client.admin_auth_audit_logs.assert_called_once()
         assert "alice" in result.output
@@ -230,9 +237,9 @@ class TestAdminCLIToAPI:
             "negative": 20,
             "avg_rating": 4.2
         }
-        
+
         result = runner.invoke(admin_cli, ["feedback", "stats"])
-        
+
         assert result.exit_code == 0
         mock_admin_api_client.admin_feedback_stats.assert_called_once()
         assert "100" in result.output
@@ -244,14 +251,14 @@ class TestEdgeChatE2E:
 
     def test_chat_calls_edge_turn(self, runner, mock_api_client):
         """Chat command calls _run_edge_turn, not chat_stream."""
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import AsyncMock, patch
 
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.create_session.return_value = {"session_id": "sess-123"}
         mock_api_client.close_session.return_value = {}
 
         with patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
-            result = runner.invoke(
+            runner.invoke(
                 agent_cli,
                 ["chat", "--user-id", "alice"],
                 input="test message\nexit\n",
@@ -261,7 +268,7 @@ class TestEdgeChatE2E:
 
     def test_chat_debug_shows_traceback(self, runner, mock_api_client):
         """--debug flag prints full traceback on error."""
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import AsyncMock, patch
 
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.create_session.return_value = {"session_id": "sess-123"}

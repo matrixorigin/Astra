@@ -102,6 +102,8 @@ class SkillStatusResponse(BaseModel):
     builtin: list[dict[str, Any]]
     marketplace: list[dict[str, Any]]
     user: list[dict[str, Any]]
+    platform_total: int = 0
+    user_total: int = 0
 
 
 # ── CRUD endpoints ────────────────────────────────────────────────────────────
@@ -144,10 +146,11 @@ async def list_skills(
 
 @router.get("/status", response_model=SkillStatusResponse)
 async def get_skill_status(
+    per_group: int = Query(50, ge=1, le=200),
     current_user: dict = Depends(get_current_user),
 ):
     """Get all skills visible to the current user, grouped by source."""
-    return _catalog().get_visible_skills(current_user["user_id"])
+    return _catalog().get_visible_skills(current_user["user_id"], per_group=per_group)
 
 
 @router.post("/publish", status_code=status.HTTP_201_CREATED)

@@ -279,7 +279,9 @@ class TestCredentials:
 
 class TestListInstalled:
     def test_empty(self, mgr):
-        assert mgr.list_installed(_uid()) == []
+        rows, total = mgr.list_installed(_uid())
+        assert rows == []
+        assert total == 0
 
     def test_lists_only_installed(self, mgr, db_session):
         defn1 = _seed_skill(db_session)
@@ -288,6 +290,7 @@ class TestListInstalled:
         mgr.install(uid, defn1.skill_name)
         mgr.install(uid, defn2.skill_name)
         mgr.uninstall(uid, defn2.skill_name)
-        installed = mgr.list_installed(uid)
+        installed, total = mgr.list_installed(uid)
         assert len(installed) == 1
+        assert total == 1
         assert installed[0].skill_name == defn1.skill_name

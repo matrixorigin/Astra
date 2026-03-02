@@ -51,6 +51,9 @@ class InstallationResponse(BaseModel):
 
 class InstalledListResponse(BaseModel):
     installations: list[InstallationResponse]
+    total: int
+    limit: int
+    offset: int
 
 
 # ── skill lifecycle ──────────────────────────────────────────────────────────
@@ -135,10 +138,12 @@ async def rollback_skill(
 
 @router.get("/installed", response_model=InstalledListResponse)
 async def list_installed(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
     current_user: dict = Depends(get_current_user),
 ):
     """List all installed skills for the current user."""
-    rows = _mgr().list_installed(current_user["user_id"])
+    rows, total = _mgr().list_installed(current_user["user_id"], limit=limit, offset=offset)
     return InstalledListResponse(
         installations=[
             InstallationResponse(
@@ -148,7 +153,10 @@ async def list_installed(
                 status=r.status,
             )
             for r in rows
-        ]
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
     )
 
 

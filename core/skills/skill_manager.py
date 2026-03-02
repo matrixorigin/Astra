@@ -87,12 +87,24 @@ class SkillManager(DbConsumer):
                 db.expunge(row)
             return row
 
-    def list_installed(self, user_id: str) -> list[SkillInstallation]:
+    def list_installed(
+        self, user_id: str, *, limit: int = 50, offset: int = 0,
+    ) -> tuple[list[SkillInstallation], int]:
+        """Return (rows, total_count) for paginated installed skills."""
         with self._db() as db:
-            rows = db.query(SkillInstallation).filter_by(user_id=user_id, status="installed").all()
+            base = db.query(SkillInstallation).filter_by(
+                user_id=user_id, status="installed",
+            )
+            total = base.count()
+            rows = (
+                base.order_by(SkillInstallation.installed_at.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
             for r in rows:
                 db.expunge(r)
-            return rows
+            return rows, total
 
     # ── runtime enforcement ──────────────────────────────────────────────────
 
@@ -300,29 +312,36 @@ class SkillManager(DbConsumer):
         """Find installed skills that depend on *skill_name*.
 
         Returns list of (dependent_name, version_constraint).
-
-        Performance: O(N) queries where N = number of installed skills.
-        Acceptable for low-frequency mutation operations (uninstall/upgrade/rollback).
-        If this becomes a bottleneck, batch-load all SkillRegistry rows in one query.
         """
         installed = (
             db.query(SkillInstallation)
             .filter_by(user_id=user_id, status="installed")
             .all()
         )
+        names = [i.skill_name for i in installed if i.skill_name != skill_name]
+        if not names:
+            return []
+        # Batch load definitions in one query.  The IN list size is bounded
+        # by the number of skills a single user has installed — practically
+        # < 1000.  If this ever exceeds DB packet limits, switch to a
+        # subquery JOIN on skill_installations.
+        defns = (
+            db.query(SkillRegistry)
+            .filter(SkillRegistry.skill_name.in_(names), SkillRegistry.is_active == 1)
+            .all()
+        )
+        defn_map = {d.skill_name: d for d in defns}
         result: list[tuple[str, str]] = []
-        for inst in installed:
-            if inst.skill_name == skill_name:
-                continue
-            defn = self._get_definition(db, inst.skill_name)
-            if defn is None or not defn.manifest:
+        for name in names:
+            defn = defn_map.get(name)
+            if not defn or not defn.manifest:
                 continue
             raw_deps = defn.manifest.get("depends_on", [])
             if not raw_deps:
                 continue
             for dep in parse_depends_on(raw_deps):
                 if dep.name == skill_name and dep.type == DependencyType.SKILL:
-                    result.append((inst.skill_name, dep.version_constraint))
+                    result.append((name, dep.version_constraint))
         return result
 
     def _check_version_satisfies_dependents(

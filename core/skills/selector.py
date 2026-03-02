@@ -9,11 +9,19 @@ This module contains internal implementation details used by ModernSkillSelector
 External code should use SkillPipeline from core.skills.pipeline.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from api.database import get_db_session
 from api.models import SkillRegistry as SkillModel
 from core.logging_config import get_logger
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from sqlalchemy.orm import Session
 
 logger = get_logger(__name__)
 
@@ -42,16 +50,14 @@ class SkillMetadata:
 class SkillSelector:
     """Rule-based skill selector with keyword matching."""
 
-    def __init__(self, db_factory: "Callable[[], Session] | None" = None):
-        from collections.abc import Callable
-        from sqlalchemy.orm import Session
+    def __init__(self, db_factory: Callable[[], Session] | None = None):
         self._db_factory = db_factory or (lambda: next(get_db_session()))
         self._load_skills()
 
     def _load_skills(self):
         """Load skills with metadata from database."""
         self.skills = {}
-        
+
         db = self._db_factory()
         try:
             skills_data = db.query(SkillModel).filter(SkillModel.is_active == 1).all()

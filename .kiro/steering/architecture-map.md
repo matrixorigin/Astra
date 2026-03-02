@@ -42,9 +42,12 @@ inclusion: always
 ┌──────────────────────────▼──────────────────────────────────┐
 │                    Data Layer                                │
 │  MatrixOne (HTAP DB)          Redis (Cache)                 │
-│  - Time-travel queries        - Session cache               │
-│  - Zero-copy branching        - Rate limiting               │
-│  - Event sourcing store       - Pub/sub                     │
+│  - 99% MySQL compatible       - Session cache               │
+│  - Git for Data (snapshot,    - Rate limiting               │
+│    time-travel, branch/merge) - Pub/sub                     │
+│  - Vector search (IVF/HNSW)                                 │
+│  - Fulltext search                                          │
+│  - OLTP + OLAP in one DB                                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -512,10 +515,28 @@ core/evaluation/regression_gate.py
 ## Key Design Decisions
 
 ### Why MatrixOne?
-- **Time-travel queries**: Read data at any historical point
-- **Zero-copy branching**: Instant full-data copies for sandbox
-- **HTAP**: Both transactional and analytical workloads
-- **Event sourcing friendly**: Append-heavy workload
+
+MatrixOne ([GitHub](https://github.com/matrixorigin/matrixone)) is a hyper-converged cloud-native HTAP database, 99% MySQL-compatible with unique capabilities:
+
+- **99% MySQL compatible** — use existing MySQL tools, ORMs (SQLAlchemy), drivers. Drop-in replacement
+- **Git for Data** — instant snapshots, time-travel queries, branch & merge, instant rollback
+- **Vector search** — built-in IVF/HNSW indexing, no external Pinecone/Milvus needed
+- **Fulltext search** — built-in boolean/natural language search, no Elasticsearch needed
+- **HTAP** — OLTP + OLAP in one database, real-time analytics, no ETL
+- **Cloud-native** — storage-compute separation, elastic scaling, Kubernetes-native
+
+**What this means for our project:**
+- Time-travel queries → audit trail, context snapshots, "what did the agent see?"
+- Zero-copy branching → sandbox isolation, regression testing
+- Vector search → memory retrieval, semantic search
+- Fulltext search → hybrid retrieval (vector + keyword)
+- HTAP → event sourcing (write-heavy) + analytics (read-heavy) in one DB
+
+**⚠️ When encountering unexpected behavior:**
+- It's 99% MySQL — most MySQL syntax works as-is
+- But it has extra features MySQL doesn't have (snapshots, vectors, etc.)
+- If something doesn't work as expected, check [MatrixOne docs](https://docs.matrixorigin.cn/en) first
+- Don't assume "it can't be done" — ask the user before giving up
 
 ### Why Event Sourcing?
 - Every state change is an event → full audit trail
