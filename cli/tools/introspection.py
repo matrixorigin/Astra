@@ -99,6 +99,8 @@ class GetAgentInfoTool(EdgeTool):
                 "turn": self._session.get("turn", 0),
                 "agent_id": self._session.get("agent_id"),
                 "model": self._session.get("model"),
+                "prompt_tokens": self._session.get("prompt_tokens"),
+                "completion_tokens": self._session.get("completion_tokens"),
             }
 
         if dimension in ("memory", "all"):

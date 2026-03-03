@@ -1505,6 +1505,10 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                 state["last_response"] = result_text or ""
                 state["turn_history"].append({"role": "user", "preview": user_input[:80]})
                 state["turn_history"].append({"role": "assistant", "preview": (result_text or "")[:80]})
+                session_info["turn"] = turn_count
+                if loop_result.usage:
+                    session_info["prompt_tokens"] = loop_result.usage.get("prompt_tokens", 0)
+                    session_info["completion_tokens"] = loop_result.usage.get("completion_tokens", 0)
                 if status_bar:
                     status_bar.update(turn=turn_count)
             except AuthenticationError:

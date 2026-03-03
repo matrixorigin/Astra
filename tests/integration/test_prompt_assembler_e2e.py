@@ -729,7 +729,35 @@ class TestGetAgentInfoTool:
         assert "memory" in result
         assert "identity" in result
 
-    def test_tool_schema_valid_openai_format(self):
+    @pytest.mark.asyncio
+    async def test_state_turn_reflects_dynamic_update(self):
+        """turn in session_info is mutable — updates are reflected immediately."""
+        tool = self._make_tool()
+        # Initially turn=3 (set in _make_tool)
+        result = json.loads(await tool.execute(dimension="state"))
+        assert result["state"]["turn"] == 3
+
+        # Simulate chat loop updating session_info after a turn
+        tool._session["turn"] = 5
+        result = json.loads(await tool.execute(dimension="state"))
+        assert result["state"]["turn"] == 5
+
+    @pytest.mark.asyncio
+    async def test_state_includes_token_usage(self):
+        """prompt_tokens and completion_tokens are exposed in state dimension."""
+        from cli.tools.introspection import GetAgentInfoTool
+        session_info = {
+            "session_id": "ses_tok",
+            "turn": 2,
+            "prompt_tokens": 1234,
+            "completion_tokens": 567,
+        }
+        tool = GetAgentInfoTool(session_info=session_info)
+        result = json.loads(await tool.execute(dimension="state"))
+        assert result["state"]["prompt_tokens"] == 1234
+        assert result["state"]["completion_tokens"] == 567
+
+
         tool = self._make_tool()
         schema = tool.to_openai_schema()
         assert schema["type"] == "function"
