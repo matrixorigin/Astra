@@ -246,11 +246,23 @@ class TestIntrospectionMemory:
             db.commit()
 
     def test_semantic_health_all_fields(self, client, auth_headers, db, test_user):
-        """Snapshot with proper budget → verify every health field."""
+        """Snapshot with proper budget → verify every health field including new ones."""
         import json
+        from api.models.agent import Event as EventModel
         from api.models.context import ContextSnapshot
         s = self._create_session(db, test_user.user_id)
         budget = {"history": {"allocated": 1000, "used": 850}, "code": {"allocated": 500, "used": 100}}
+        # Insert llm_response so health gets real LLM data
+        ev = EventModel(
+            event_id=str(uuid4()),
+            session_id=s.session_id,
+            user_id=test_user.user_id,
+            event_type="llm_response",
+            content="response",
+            causal_chain_id=str(uuid4()),
+            token_usage={"prompt": 5000, "completion": 200, "total": 5200},
+        )
+        db.add(ev)
         snap = ContextSnapshot(
             context_capture_id=str(uuid4()),
             session_id=s.session_id,
@@ -266,8 +278,13 @@ class TestIntrospectionMemory:
             sem = resp.json()["semantic"]
             assert sem["ctx_snapshots"] == 1
             assert sem["peak_tokens"] == 950
-            assert sem["current_tokens"] == 950
+            assert sem["context_managed_tokens"] == 950
             assert sem["last_assembly_ms"] == 42
+
+            # Top-level LLM usage fields
+            assert sem["llm_prompt_tokens"] == 5000
+            assert sem["llm_completion_tokens"] == 200
+            assert sem["llm_total_tokens"] == 5200
 
             h = sem["health"]
             assert isinstance(h["zones"], list)
@@ -282,8 +299,44 @@ class TestIntrospectionMemory:
             assert code_zone["status"] == "ok"
 
             assert h["bottleneck"] == "history"
-            assert h["trend"] == "stable"  # only 1 snapshot
+            assert h["overall_status"] == "high"
+            assert h["trend"] == "stable"  # only 1 event
             assert "compaction recommended" in h["recommendation"]
+
+            # llm_usage in health
+            assert h["llm_usage"]["prompt"] == 5000
+            assert h["llm_usage"]["completion"] == 200
+            assert h["llm_usage"]["context_window"] == 128000
+            assert h["llm_usage"]["utilization"] == round(5000 / 128000, 3)
+        finally:
+            db.delete(snap)
+            db.delete(ev)
+            db.delete(s)
+            db.commit()
+
+    def test_semantic_no_llm_data_shows_note(self, client, auth_headers, db, test_user):
+        """No llm_response events → llm_usage is null with explanatory note."""
+        from api.models.context import ContextSnapshot
+        s = self._create_session(db, test_user.user_id)
+        snap = ContextSnapshot(
+            context_capture_id=str(uuid4()),
+            session_id=s.session_id,
+            event_id=str(uuid4()),
+            token_budget={"history": {"allocated": 1000, "used": 500}},
+            total_tokens=500,
+            assembly_time_ms=10,
+        )
+        db.add(snap)
+        db.commit()
+        try:
+            sem = client.get("/introspection/memory", headers=auth_headers,
+                             params={"session_id": s.session_id}).json()["semantic"]
+            # No top-level llm fields when no data
+            assert "llm_prompt_tokens" not in sem
+            # Health should have llm_usage=None and note
+            h = sem["health"]
+            assert h["llm_usage"] is None
+            assert "not available" in h["llm_usage_note"]
         finally:
             db.delete(snap)
             db.delete(s)
@@ -306,7 +359,7 @@ class TestIntrospectionMemory:
         try:
             sem = client.get("/introspection/memory", headers=auth_headers,
                              params={"session_id": s.session_id}).json()["semantic"]
-            assert sem["current_tokens"] == 0
+            assert sem["context_managed_tokens"] == 0
             assert sem["last_assembly_ms"] == 0
         finally:
             db.delete(snap)
@@ -314,7 +367,7 @@ class TestIntrospectionMemory:
             db.commit()
 
     def test_semantic_no_snapshot_keys_absent(self, client, auth_headers, db, test_user):
-        """No snapshots → health/current_tokens/last_assembly_ms must not appear."""
+        """No snapshots → health/context_managed_tokens/last_assembly_ms must not appear."""
         s = self._create_session(db, test_user.user_id)
         try:
             sem = client.get("/introspection/memory", headers=auth_headers,
@@ -486,16 +539,22 @@ class TestAnalysisFunctions:
         assert result["bottleneck"] == "history"
 
     def test_analyze_context_health_flat_format(self):
-        """Flat budget {zone: int} — real format from context manager — must not crash."""
+        """Flat budget {zone: int} — real format from context manager."""
         from api.routers.introspection import _analyze_context_health
         budget = {"constraints": 543, "identity": 23, "memory": 9, "project_context": 23, "self_model": 372}
-        result = _analyze_context_health(budget, [970])
+        result = _analyze_context_health(budget, [4000, 5000, 6000], llm_prompt_tokens=6000)
         zones = {z["name"] for z in result["zones"]}
         assert "constraints" in zones
         assert "memory" in zones
-        # flat format: used == allocated → utilization 1.0
+        # flat format: zones have tokens + share, not utilization
         for z in result["zones"]:
-            assert z["utilization"] == 1.0
+            assert "tokens" in z
+            assert "share" in z
+            assert "utilization" not in z
+        # overall health based on LLM prompt vs context window
+        assert result["llm_usage"]["prompt"] == 6000
+        assert result["llm_usage"]["utilization"] == round(6000 / 128000, 3)
+        assert result["overall_status"] == "ok"  # 6000/128000 = 4.7% → ok
 
     def test_analyze_context_health_mixed_format(self):
         """Mixed budget (some nested, some flat) — should not crash."""
@@ -562,61 +621,73 @@ class TestContextTrend:
     """Tests for GET /introspection/context/trend — verify all response fields."""
 
     @staticmethod
-    def _setup(db, user_id, token_list=(7000, 8000, 9000)):
-        from api.models.agent import Session as SessionModel
-        from api.models.context import ContextSnapshot
+    def _setup(db, user_id, prompt_list=(7000, 8000, 9000)):
+        """Insert llm_response events with real token_usage data."""
+        from api.models.agent import Session as SessionModel, Event as EventModel
         from datetime import datetime, timezone, timedelta
         s = SessionModel(session_id=str(uuid4()), user_id=user_id, status="active", event_count=0)
         db.add(s)
         db.flush()
         now = datetime.now(timezone.utc)
-        snaps = []
-        for i, tokens in enumerate(token_list):
-            snap = ContextSnapshot(
-                context_capture_id=str(uuid4()),
-                session_id=s.session_id,
+        events = []
+        for i, prompt in enumerate(prompt_list):
+            ev = EventModel(
                 event_id=str(uuid4()),
-                total_tokens=tokens,
-                assembly_time_ms=10 + i,
+                session_id=s.session_id,
+                user_id=user_id,
+                event_type="llm_response",
+                content="response",
+                causal_chain_id=str(uuid4()),
+                token_usage={"prompt": prompt, "completion": 100, "total": prompt + 100},
                 created_at=now + timedelta(seconds=i),
             )
-            db.add(snap)
-            snaps.append(snap)
+            db.add(ev)
+            events.append(ev)
         db.commit()
-        return s, snaps
+        return s, events
 
     def test_trend_growing_all_fields(self, client, auth_headers, db, test_user):
-        s, snaps = self._setup(db, test_user.user_id, [7000, 8000, 9000])
+        s, events = self._setup(db, test_user.user_id, [7000, 8000, 9000])
         try:
             resp = client.get("/introspection/context/trend", headers=auth_headers,
                               params={"session_id": s.session_id})
             assert resp.status_code == 200
             data = resp.json()
 
-            # Top-level fields
             assert data["turns_sampled"] == 3
             assert data["trend"] == "growing"
-            assert data["current_tokens"] == 9000
+            # current_tokens is now a dict with real LLM usage
+            ct = data["current_tokens"]
+            assert ct["prompt"] == 9000
+            assert ct["completion"] == 100
+            assert ct["total"] == 9100
 
-            # Forecast — all fields
+            # utilization vs context window
+            assert "utilization" in data
+            assert data["context_window_limit"] == 128000
+
+            # per_turn list
+            assert len(data["per_turn"]) == 3
+
+            # Forecast
             fc = data["forecast"]
             assert isinstance(fc["turns_remaining"], int)
             assert fc["turns_remaining"] > 0
             assert fc["growth_rate_per_turn"] == 1000.0
 
-            # Compaction history — all fields
+            # Compaction history
             ch = data["compaction_history"]
             assert ch["compactions_detected"] == 0
             assert ch["status"] == "none observed"
         finally:
-            for snap in snaps:
-                db.delete(snap)
+            for ev in events:
+                db.delete(ev)
             db.delete(s)
             db.commit()
 
     def test_trend_with_compaction_detected(self, client, auth_headers, db, test_user):
         """Token drop > 20% between turns → compaction detected."""
-        s, snaps = self._setup(db, test_user.user_id, [8000, 9000, 5000, 8500])
+        s, events = self._setup(db, test_user.user_id, [8000, 9000, 5000, 8500])
         try:
             data = client.get("/introspection/context/trend", headers=auth_headers,
                               params={"session_id": s.session_id}).json()
@@ -625,8 +696,8 @@ class TestContextTrend:
             assert ch["avg_reduction_pct"] > 0
             assert "effective" in ch["status"] or "weak" in ch["status"]
         finally:
-            for snap in snaps:
-                db.delete(snap)
+            for ev in events:
+                db.delete(ev)
             db.delete(s)
             db.commit()
 
@@ -706,7 +777,7 @@ class TestContextSnapshot:
             assert data["turn"] == 1
             assert data["total_turns"] == 1
             assert data["task_type"] == "code_gen"
-            assert data["total_tokens"] == 950
+            assert data["context_managed_tokens"] == 950
             assert data["assembly_ms"] == 15
 
             # Health — all fields
@@ -835,18 +906,18 @@ class TestContextSnapshot:
                             params={"session_id": s.session_id, "turn_index": 1}).json()
             assert d1["turn"] == 1
             assert d1["total_turns"] == 3
-            assert d1["total_tokens"] == 5000
+            assert d1["context_managed_tokens"] == 5000
 
             # Turn 3 = newest = 9000 tokens
             d3 = client.get("/introspection/context/snapshot", headers=auth_headers,
                             params={"session_id": s.session_id, "turn_index": 3}).json()
             assert d3["turn"] == 3
-            assert d3["total_tokens"] == 9000
+            assert d3["context_managed_tokens"] == 9000
 
             # Default (no turn_index) = latest
             dl = client.get("/introspection/context/snapshot", headers=auth_headers,
                             params={"session_id": s.session_id}).json()
-            assert dl["total_tokens"] == 9000
+            assert dl["context_managed_tokens"] == 9000
         finally:
             for snap in snaps:
                 db.delete(snap)
@@ -868,12 +939,21 @@ class TestContextSnapshot:
 
     def test_flat_budget_format(self, client, auth_headers, db, test_user):
         """Flat token_budget {zone: int} — real format written by context manager — must not 500."""
-        from api.models.agent import Session as SessionModel
+        from api.models.agent import Session as SessionModel, Event as EventModel
         from api.models.context import ContextSnapshot
         s = SessionModel(session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0)
         db.add(s)
         db.flush()
-        # Real format: zone → token count (int), no allocated/used nesting
+        ev = EventModel(
+            event_id=str(uuid4()),
+            session_id=s.session_id,
+            user_id=test_user.user_id,
+            event_type="llm_response",
+            content="response",
+            causal_chain_id=str(uuid4()),
+            token_usage={"prompt": 6000, "completion": 200, "total": 6200},
+        )
+        db.add(ev)
         snap = ContextSnapshot(
             context_capture_id=str(uuid4()),
             session_id=s.session_id,
@@ -889,17 +969,67 @@ class TestContextSnapshot:
                               params={"session_id": s.session_id})
             assert resp.status_code == 200, resp.text
             data = resp.json()
-            # health must be present and not crash
             assert "health" in data
             zones = {z["name"] for z in data["health"]["zones"]}
             assert "constraints" in zones
             assert "memory" in zones
-            # flat format: utilization is always 1.0 (used == allocated)
+            # flat format: zones have tokens + share, not utilization
             for z in data["health"]["zones"]:
-                assert z["utilization"] == 1.0
-                assert z["status"] == "high"
-            # zone_balance must also not crash
+                assert "tokens" in z
+                assert "share" in z
+            # llm_usage from real event
+            lu = data["health"]["llm_usage"]
+            assert lu["prompt"] == 6000
+            assert lu["completion"] == 200
+            assert lu["total"] == 6200
+            assert lu["context_window"] == 128000
+            assert lu["utilization"] == round(6000 / 128000, 3)
+            assert data["health"]["overall_status"] == "ok"  # 6000/128000 = 4.7%
+            # zone_note present (don't assert exact wording)
+            assert isinstance(data["health"].get("zone_note"), str)
+            assert len(data["health"]["zone_note"]) > 0
+            # top-level field renamed
+            assert data["context_managed_tokens"] == 970
+            assert "total_tokens" not in data
+            # top-level LLM usage (not buried in health)
+            assert data["llm_prompt_tokens"] == 6000
+            assert data["llm_completion_tokens"] == 200
+            assert data["llm_total_tokens"] == 6200
             assert "zone_balance" in data
+        finally:
+            db.delete(snap)
+            db.delete(ev)
+            db.delete(s)
+            db.commit()
+
+    def test_no_llm_response_shows_note(self, client, auth_headers, db, test_user):
+        """When no llm_response exists, health.llm_usage is null and llm_usage_note explains why."""
+        from api.models.agent import Session as SessionModel
+        from api.models.context import ContextSnapshot
+        s = SessionModel(session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0)
+        db.add(s)
+        db.flush()
+        snap = ContextSnapshot(
+            context_capture_id=str(uuid4()),
+            session_id=s.session_id,
+            event_id=str(uuid4()),
+            token_budget={"constraints": 543, "identity": 23, "memory": 9},
+            total_tokens=575,
+            assembly_time_ms=10,
+        )
+        db.add(snap)
+        db.commit()
+        try:
+            resp = client.get("/introspection/context/snapshot", headers=auth_headers,
+                              params={"session_id": s.session_id})
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            h = data["health"]
+            assert h["llm_usage"] is None
+            assert "llm_usage_note" in h
+            assert "not available" in h["llm_usage_note"]
+            # No top-level LLM fields when no data
+            assert "llm_prompt_tokens" not in data
         finally:
             db.delete(snap)
             db.delete(s)

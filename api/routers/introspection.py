@@ -63,6 +63,18 @@ def _verify_session_owner(db: Session, session_id: str, user_id: str) -> None:
         raise HTTPException(status_code=404, detail="Session not found")
 
 
+def _parse_token_usage(raw: object) -> dict | None:
+    """Parse token_usage column from agent_events. Returns None on failure."""
+    if isinstance(raw, dict):
+        return raw
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return None
+
+
 def _compute_trend(token_history: list[int]) -> str:
     """Single trend computation used by all callers."""
     if len(token_history) < 2:
@@ -80,48 +92,104 @@ def _compute_trend(token_history: list[int]) -> str:
 # Pure analysis functions (no DB access, fully testable)
 # ---------------------------------------------------------------------------
 
-def _analyze_context_health(budget: dict, total_tokens_history: list[int]) -> dict:
+def _analyze_context_health(
+    budget: dict,
+    total_tokens_history: list[int],
+    llm_prompt_tokens: int | None = None,
+    llm_usage: dict | None = None,
+    context_window: int = 128000,
+) -> dict:
     """Compute zone utilization, bottleneck, trend, recommendation.
 
     Supports two budget formats:
-    - Nested: {"zone": {"allocated": N, "used": M}}
-    - Flat:   {"zone": N}  (token count only; treat as fully utilized)
+    - Nested: {"zone": {"allocated": N, "used": M}}  — utilization = used/allocated per zone
+    - Flat:   {"zone": N}  — token count only; overall util from LLM prompt vs context_window
     """
+    is_flat = all(isinstance(v, (int, float)) for v in budget.values() if v is not None)
+    cw = max(context_window, 1)  # guard against division by zero
+
     zones = []
     bottleneck_zone = None
     bottleneck_util = 0.0
-    for zone, vals in budget.items():
-        if isinstance(vals, dict):
-            allocated = vals.get("allocated", 0)
-            used = vals.get("used", 0)
-        elif isinstance(vals, (int, float)):
-            allocated = used = vals
-        else:
-            continue
-        if allocated <= 0:
-            continue
-        util = round(used / allocated, 2)
-        status = "high" if util >= ZONE_UTIL_HIGH else ("medium" if util >= ZONE_UTIL_MEDIUM else "ok")
-        zones.append({"name": zone, "utilization": util, "status": status})
-        if util > bottleneck_util:
-            bottleneck_util = util
-            bottleneck_zone = zone
 
+    if is_flat:
+        ref_tokens = llm_prompt_tokens or sum(v for v in budget.values() if isinstance(v, (int, float)))
+        for zone, val in budget.items():
+            if not isinstance(val, (int, float)) or val <= 0:
+                continue
+            share = round(val / ref_tokens, 3) if ref_tokens > 0 else 0.0
+            zones.append({"name": zone, "tokens": int(val), "share": share})
+        overall_util = round(ref_tokens / cw, 3)
+        recommendation_base = f"prompt {ref_tokens:,} / {cw:,} tokens ({overall_util:.0%})"
+    else:
+        for zone, vals in budget.items():
+            if isinstance(vals, dict):
+                allocated = vals.get("allocated", 0)
+                used = vals.get("used", 0)
+            elif isinstance(vals, (int, float)):
+                allocated = used = vals
+            else:
+                continue
+            if allocated <= 0:
+                continue
+            util = round(used / allocated, 2)
+            status = "high" if util >= ZONE_UTIL_HIGH else ("medium" if util >= ZONE_UTIL_MEDIUM else "ok")
+            zones.append({"name": zone, "utilization": util, "status": status})
+            if util > bottleneck_util:
+                bottleneck_util = util
+                bottleneck_zone = zone
+        overall_util = bottleneck_util
+        recommendation_base = f"{bottleneck_zone} zone near limit" if bottleneck_zone else "all zones"
+
+    status = "high" if overall_util >= ZONE_UTIL_HIGH else ("medium" if overall_util >= ZONE_UTIL_MEDIUM else "ok")
     trend = _compute_trend(total_tokens_history)
 
-    if bottleneck_util >= ZONE_UTIL_HIGH:
-        recommendation = f"{bottleneck_zone} zone near limit — compaction recommended"
+    if overall_util >= ZONE_UTIL_HIGH:
+        recommendation = f"{recommendation_base} — compaction recommended"
     elif trend == "growing" and len(total_tokens_history) >= 3:
-        recommendation = "token usage growing — monitor for compaction trigger"
+        recommendation = f"{recommendation_base} — token usage growing, monitor for compaction trigger"
     else:
         recommendation = "context healthy"
 
-    return {
+    result: dict = {
         "zones": zones,
         "bottleneck": bottleneck_zone,
         "trend": trend,
+        "overall_status": status,
         "recommendation": recommendation,
     }
+    if llm_usage:
+        prompt = llm_usage.get("prompt") or 0
+        util = round(prompt / cw, 3)
+        result["llm_usage"] = {
+            "prompt": llm_usage.get("prompt"),
+            "completion": llm_usage.get("completion"),
+            "total": llm_usage.get("total"),
+            "context_window": cw,
+            "utilization": util,
+        }
+        if is_flat:
+            zone_total = sum(z["tokens"] for z in zones)
+            unmanaged = max(0, prompt - zone_total)
+            result["zone_note"] = (
+                f"The {zone_total} managed tokens above are a subset of the full LLM prompt "
+                f"({prompt} tokens total). The remaining {unmanaged} tokens come from "
+                f"conversation history, tool schemas, and user query."
+            )
+    elif llm_prompt_tokens is not None:
+        result["llm_usage"] = {
+            "prompt": llm_prompt_tokens,
+            "context_window": cw,
+            "utilization": round(llm_prompt_tokens / cw, 3),
+        }
+    else:
+        result["llm_usage"] = None
+        result["llm_usage_note"] = (
+            "LLM token usage not available for this turn "
+            "(first turn or response not yet persisted). "
+            "The zones above show only the context-manager-managed portion."
+        )
+    return result
 
 
 def _zone_balance(budget: dict, task_type: str | None) -> dict:
@@ -378,13 +446,41 @@ def _get_semantic_stats(db: Session, session_id: str) -> dict:
         if rows:
             latest = rows[0]
             if latest[1] is not None:
-                result["current_tokens"] = latest[1]
+                result["context_managed_tokens"] = latest[1]
             if latest[2] is not None:
                 result["last_assembly_ms"] = latest[2]
+
+            # Single query for all LLM usage (newest first) — used for both
+            # top-level fields (latest) and health trend (all).
+            usage_rows = db.execute(
+                text("""
+                    SELECT token_usage FROM agent_events
+                    WHERE session_id = :sid AND event_type = 'llm_response'
+                      AND token_usage IS NOT NULL
+                    ORDER BY created_at DESC
+                """),
+                {"sid": session_id},
+            ).fetchall()
+
+            llm_usage: dict | None = None
+            if usage_rows:
+                llm_usage = _parse_token_usage(usage_rows[0][0])
+
+            if llm_usage:
+                result["llm_prompt_tokens"] = llm_usage.get("prompt")
+                result["llm_completion_tokens"] = llm_usage.get("completion")
+                result["llm_total_tokens"] = llm_usage.get("total")
+
             if latest[0] is not None:
                 try:
                     budget = json.loads(latest[0])
-                    result["health"] = _analyze_context_health(budget, token_history)
+                    prompt_history = [
+                        u["prompt"] for r in usage_rows
+                        if (u := _parse_token_usage(r[0])) and u.get("prompt") is not None
+                    ]
+                    result["health"] = _analyze_context_health(
+                        budget, prompt_history, llm_usage=llm_usage,
+                    )
                 except (ValueError, TypeError):
                     pass
 
@@ -471,16 +567,18 @@ def get_introspection_skills(
 def get_context_trend(
     session_id: str = Query(...),
     turns: int = Query(10, ge=2, le=50),
-    compaction_limit: int = Query(12000),
+    context_window: int = Query(128000),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db_session),
 ) -> dict:
-    """Token usage trend + compaction forecast for the last N turns."""
+    """Token usage trend across the last N turns — uses real LLM token counts."""
     _verify_session_owner(db, session_id, current_user["user_id"])
+
     rows = db.execute(
         text("""
-            SELECT total_tokens FROM ctx_snapshots
-            WHERE session_id = :sid
+            SELECT token_usage FROM agent_events
+            WHERE session_id = :sid AND event_type = 'llm_response'
+              AND token_usage IS NOT NULL
             ORDER BY created_at DESC
             LIMIT :n
         """),
@@ -490,15 +588,28 @@ def get_context_trend(
     if not rows:
         return {"turns_sampled": 0, "trend": "no_data"}
 
-    token_history = [r[0] for r in rows if r[0] is not None]
-    trend = _compute_trend(token_history)
+    usages = [u for r in rows if (u := _parse_token_usage(r[0])) is not None]
+    prompt_history = [u["prompt"] for u in usages if u.get("prompt") is not None]
+
+    trend = _compute_trend(prompt_history)
+    current = usages[0] if usages else {}
 
     return {
         "turns_sampled": len(rows),
         "trend": trend,
-        "current_tokens": token_history[0] if token_history else None,
-        "forecast": _compaction_forecast(token_history, compaction_limit),
-        "compaction_history": _compaction_effectiveness(token_history),
+        "current_tokens": {
+            "prompt": current.get("prompt"),
+            "completion": current.get("completion"),
+            "total": current.get("total"),
+        },
+        "context_window_limit": context_window,
+        "utilization": round(current.get("prompt", 0) / max(context_window, 1), 3),
+        "forecast": _compaction_forecast(prompt_history, context_window),
+        "compaction_history": _compaction_effectiveness(prompt_history),
+        "per_turn": [
+            {"prompt": u.get("prompt"), "completion": u.get("completion"), "total": u.get("total")}
+            for u in usages
+        ],
     }
 
 
@@ -544,7 +655,8 @@ def get_context_snapshot(
     row = db.execute(
         text(f"""
             SELECT context_capture_id, token_budget, total_tokens,
-                   assembly_time_ms, relevance_scores, task_type{content_cols}
+                   assembly_time_ms, relevance_scores, task_type,
+                   llm_response_id{content_cols}
             FROM ctx_snapshots
             WHERE session_id = :sid
             ORDER BY created_at ASC
@@ -559,20 +671,70 @@ def get_context_snapshot(
         "turn": actual_turn,
         "total_turns": total_turns,
         "task_type": row[5],
-        "total_tokens": row[2],
+        # context_managed_tokens: tokens in zones managed by PromptAssembler
+        # (identity/self_model/constraints/memory/history/tool_schemas/user_query).
+        # This is a SUBSET of the full LLM prompt — see health.llm_usage for the real total.
+        "context_managed_tokens": row[2],
         "assembly_ms": row[3],
     }
 
     if row[1]:
         try:
             budget = json.loads(row[1])
-            # For health trend, fetch just total_tokens column (lightweight)
-            token_rows = db.execute(
-                text("SELECT total_tokens FROM ctx_snapshots WHERE session_id = :sid ORDER BY created_at DESC"),
-                {"sid": session_id},
+            llm_response_id: str | None = row[6]
+
+            # Primary: JOIN via llm_response_id (exact, safe under concurrency)
+            current_usage: dict | None = None
+            if llm_response_id:
+                lr = db.execute(
+                    text("SELECT token_usage FROM agent_events WHERE event_id = :eid"),
+                    {"eid": llm_response_id},
+                ).fetchone()
+                if lr:
+                    current_usage = _parse_token_usage(lr[0])
+
+            # Fallback: time-order match (llm_response_id not yet written by bg thread)
+            if current_usage is None:
+                fallback = db.execute(
+                    text("""
+                        SELECT token_usage FROM agent_events
+                        WHERE session_id = :sid AND event_type = 'llm_response'
+                          AND token_usage IS NOT NULL
+                        ORDER BY created_at ASC
+                        LIMIT 1 OFFSET :off
+                    """),
+                    {"sid": session_id, "off": max(0, actual_turn - 1)},
+                ).fetchone()
+                if fallback:
+                    current_usage = _parse_token_usage(fallback[0])
+
+            # Trend history: all llm_response prompt tokens up to this turn
+            trend_rows = db.execute(
+                text("""
+                    SELECT token_usage FROM agent_events
+                    WHERE session_id = :sid AND event_type = 'llm_response'
+                      AND token_usage IS NOT NULL
+                    ORDER BY created_at ASC
+                    LIMIT :n
+                """),
+                {"sid": session_id, "n": actual_turn},
             ).fetchall()
-            token_history = [r[0] for r in token_rows if r[0] is not None]
-            result["health"] = _analyze_context_health(budget, token_history)
+            trend_prompts = [
+                u["prompt"] for r in trend_rows
+                if (u := _parse_token_usage(r[0])) and u.get("prompt") is not None
+            ]
+
+            current_prompt = current_usage.get("prompt") if current_usage else None
+            # Promote LLM usage to top-level so it's impossible for LLM to miss
+            if current_usage:
+                result["llm_prompt_tokens"] = current_usage.get("prompt")
+                result["llm_completion_tokens"] = current_usage.get("completion")
+                result["llm_total_tokens"] = current_usage.get("total")
+            result["health"] = _analyze_context_health(
+                budget, list(reversed(trend_prompts)),
+                llm_prompt_tokens=current_prompt,
+                llm_usage=current_usage,
+            )
             result["zone_balance"] = _zone_balance(budget, row[5])
         except (ValueError, TypeError):
             pass
@@ -588,10 +750,10 @@ def get_context_snapshot(
     # Layer 2 & 3
     if detail or raw:
         content = _SnapshotContentRow(
-            selected_events=row[6],
-            code_context=row[7],
-            skill_definitions=row[8],
-            documentation=row[9],
+            selected_events=row[7],
+            code_context=row[8],
+            skill_definitions=row[9],
+            documentation=row[10],
         )
         result["contents"] = _summarize_contents(content)
         if raw:

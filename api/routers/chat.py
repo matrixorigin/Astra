@@ -1859,19 +1859,21 @@ async def chat_turn(
                         try:
                             from api.models.agent import Event as EventModel
                             _db = SessionLocal()
-                            _db.add(EventModel(
-                                event_id=str(uuid7()),
-                                session_id=session_id,
-                                user_id=user_id,
-                                agent_id=request.agent_id or "edge",
-                                event_type="tool_call",
-                                content=json.dumps({"name": tc_name, "arguments": tc_args, "source": "cloud"}),
-                                causal_chain_id=_turn_chain_id,
-                            ))
-                            _db.commit()
-                            _db.close()
+                            try:
+                                _db.add(EventModel(
+                                    event_id=str(uuid7()),
+                                    session_id=session_id,
+                                    user_id=user_id,
+                                    agent_id=request.agent_id or "edge",
+                                    event_type="tool_call",
+                                    content=json.dumps({"name": tc_name, "arguments": tc_args, "source": "cloud"}),
+                                    causal_chain_id=_turn_chain_id,
+                                ))
+                                _db.commit()
+                            finally:
+                                _db.close()
                         except Exception:
-                            pass
+                            logger.debug("Failed to record cloud tool_call event", exc_info=True)
                         yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': cloud_result[:500]})}\n\n"
                         # Truncate before quality assessment (assess full, truncate for LLM)
                         from core.context.compaction import truncate_tool_result

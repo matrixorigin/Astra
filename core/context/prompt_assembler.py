@@ -328,8 +328,18 @@ class PromptAssembler(DbConsumer):
         # Tools schema (edge tools passed through for now; unified catalog in Phase 4)
         tools_schema = (edge_context.edge_tools or []) if edge_context else []
 
+        # Build snapshot_breakdown = breakdown + tool_schemas + user_query
+        # so ctx_snapshots.token_budget has a complete picture of the prompt.
+        # These are NOT added to token_breakdown (returned to caller) because
+        # they don't participate in compression and would skew budget checks.
+        snapshot_breakdown = dict(breakdown)
+        if tools_schema:
+            snapshot_breakdown["tool_schemas"] = _estimate_tokens(json.dumps(tools_schema))
+        if user_query:
+            snapshot_breakdown["user_query"] = _estimate_tokens(user_query)
+
         # Persist snapshot
-        snapshot_id = self._save_snapshot(session_id, sections, breakdown)
+        snapshot_id = self._save_snapshot(session_id, sections, snapshot_breakdown)
 
         return AssembledPrompt(
             system_message=system_message,
@@ -399,7 +409,14 @@ class PromptAssembler(DbConsumer):
         parts = [sections[k] for k in _SECTION_ORDER if k in sections]
         system_message = "\n\n".join(parts)
 
-        snapshot_id = self._save_snapshot(session_id, sections, breakdown)
+        # snapshot_breakdown includes user_query so ctx_snapshots has a more
+        # complete picture.  tool_schemas is unavailable here (caller caches
+        # them from the initial assemble call).
+        snapshot_breakdown = dict(breakdown)
+        if user_query:
+            snapshot_breakdown["user_query"] = _estimate_tokens(user_query)
+
+        snapshot_id = self._save_snapshot(session_id, sections, snapshot_breakdown)
 
         return AssembledPrompt(
             system_message=system_message,

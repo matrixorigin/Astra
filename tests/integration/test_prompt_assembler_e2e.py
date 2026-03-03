@@ -373,6 +373,49 @@ class TestPromptAssemblerSnapshot:
         expected_total = sum(v for v in budget.values() if isinstance(v, (int, float)))
         assert row[0] == expected_total, f"total_tokens {row[0]} != sum(budget) {expected_total}"
 
+    def test_snapshot_budget_includes_user_query(self, db_session):
+        """token_budget in ctx_snapshots must include user_query key when query is non-empty."""
+        from core.context.prompt_assembler import PromptAssembler
+        import json as _json
+
+        pa = PromptAssembler(lambda: db_session)
+        result = pa.assemble(
+            agent_id=None, user_query="what is event sourcing?",
+            session_id=unique_test_id(), user_id=unique_test_id(),
+        )
+        row = db_session.execute(
+            sql_text("SELECT token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"),
+            {"cid": result.snapshot_id},
+        ).fetchone()
+        budget = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        assert "user_query" in budget, f"user_query missing from token_budget: {budget}"
+        assert budget["user_query"] > 0
+
+        # token_breakdown returned to caller must NOT include user_query (not a section)
+        assert "user_query" not in result.token_breakdown
+
+    def test_refresh_memory_snapshot_includes_user_query(self, db_session):
+        """refresh_memory path must also write user_query to token_budget."""
+        from core.context.prompt_assembler import PromptAssembler
+        import json as _json
+
+        pa = PromptAssembler(lambda: db_session)
+        sid, uid = unique_test_id(), unique_test_id()
+        first = pa.assemble(agent_id=None, user_query="first", session_id=sid, user_id=uid)
+
+        refreshed = pa.refresh_memory(
+            session_id=sid, user_id=uid, user_query="second question here",
+            current_sections=first.sections,
+        )
+        row = db_session.execute(
+            sql_text("SELECT token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"),
+            {"cid": refreshed.snapshot_id},
+        ).fetchone()
+        budget = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        assert "user_query" in budget, f"user_query missing from refresh snapshot: {budget}"
+        assert budget["user_query"] > 0
+        assert "user_query" not in refreshed.token_breakdown
+
 
 # ============================================================================
 # 4. Prompt Injection Defense
