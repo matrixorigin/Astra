@@ -169,6 +169,36 @@ class TestSessionAnalyzer:
         has_error_rec = any("error" in r.lower() for r in report.recommendations)
         assert has_latency_rec or has_error_rec
 
+    def test_user_query_gap_not_flagged_as_issue(self):
+        """Gap before user_query is user think time — must NOT be reported as slow_gap."""
+        from core.agent.session_analyzer import SessionAnalyzer
+        from unittest.mock import patch, MagicMock
+
+        t0 = datetime(2026, 1, 1, 0, 0, 0)
+        rows = [
+            # First turn
+            ("e1", "user_query", "first question", None, t0, None, {}, None, None),
+            ("e2", "llm_response", "answer 1", None, t0 + timedelta(seconds=2), None, {}, None, None),
+            # 445s user think time before second user_query — must NOT be flagged
+            ("e3", "user_query", "second question", None, t0 + timedelta(seconds=447), None, {}, None, None),
+            ("e4", "llm_response", "answer 2", None, t0 + timedelta(seconds=449), None, {}, None, None),
+        ]
+
+        mock_db = MagicMock()
+        mock_db.__enter__ = MagicMock(return_value=mock_db)
+        mock_db.__exit__ = MagicMock(return_value=False)
+        mock_result = MagicMock()
+        mock_result.fetchall.return_value = rows
+        mock_db.execute.return_value = mock_result
+
+        analyzer = SessionAnalyzer(db_factory=lambda: mock_db)
+        report = analyzer.analyze("test-session")
+
+        slow_gaps = [i for i in report.issues if i["type"] == "slow_gap"]
+        assert len(slow_gaps) == 0, (
+            f"user_query gap should not be flagged as slow_gap, but got: {slow_gaps}"
+        )
+
     def test_summarize_event_types(self, analyzer):
         from core.agent.session_analyzer import SessionAnalyzer
         assert SessionAnalyzer._summarize_event("user_query", "hello world", None) == "hello world"

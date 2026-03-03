@@ -29,7 +29,7 @@ loop is a sibling under the same `user_query`.
 
 ### 2. ExecutionSummary — Aggregated Stats
 
-- Time breakdown by category (leaf nodes only — no double-counting)
+- Time breakdown by category (self-time per node — no double-counting)
 - Token breakdown (prompt vs completion)
 - Cost breakdown by turn
 - Auto-detected root causes

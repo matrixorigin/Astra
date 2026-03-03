@@ -206,7 +206,7 @@ class SessionReport:
         lines.append("|---|---|---|---|")
         for e in self.timeline:
             gap = ""
-            if e.gap_s is not None and e.gap_s >= GAP_THRESHOLD_S:
+            if e.gap_s is not None and e.gap_s >= GAP_THRESHOLD_S and e.event_type != "user_query":
                 gap = f"⚠️ {e.gap_s:.0f}s"
             ts = e.ts.strftime("%H:%M:%S")
             lines.append(f"| {ts} | {e.event_type} | {e.detail} | {gap} |")
@@ -341,8 +341,8 @@ class SessionAnalyzer(DbConsumer):
                 skill=skill_name, gap_s=gap_s,
             ))
 
-            # Detect issues
-            if gap_s is not None and gap_s >= GAP_THRESHOLD_S:
+            # Detect issues — skip gaps before user_query (that's user think time, not system latency)
+            if gap_s is not None and gap_s >= GAP_THRESHOLD_S and event_type != "user_query":
                 issues.append({
                     "type": "slow_gap",
                     "description": f"{gap_s:.0f}s gap before {event_type}"
