@@ -27,17 +27,87 @@ class TestPassthrough:
         assert a.grade == "complete"
         assert a.signals == []
     
-    def test_get_agent_info_not_passthrough(self):
-        """get_agent_info returns structured metadata and should be assessed."""
-        # Empty metadata should be detected as degraded
+    def test_get_agent_info_is_passthrough(self):
+        """get_agent_info zeros are legitimate (new session) — no penalty."""
         a = assess_tool_result("get_agent_info", {"agent_id": "", "capabilities": []})
-        assert a.grade != "complete"
-    
-    def test_reflect_not_passthrough(self):
-        """reflect returns structured analysis and should be assessed."""
-        # Empty reflection should be detected as degraded
+        assert a.score == 1.0
+        assert a.grade == "complete"
+
+    def test_reflect_is_passthrough(self):
+        """reflect zeros are legitimate — no penalty."""
         a = assess_tool_result("reflect", {"insights": [], "recommendations": []})
-        assert a.grade != "complete"
+        assert a.score == 1.0
+        assert a.grade == "complete"
+
+
+# ── Regression: session 019cb34f — get_agent_info false degradation ──────────
+
+
+class TestRegressionGetAgentInfoFalseDegradation:
+    """Reproduce and verify fix for session 019cb34f-ca66-73e3-8fce-0054d768eabf.
+
+    Root cause: get_agent_info(dimension="memory") on a new session's first turn
+    returned legitimate zeros (0 events, 0 tool_calls, etc.). The tool quality
+    firewall detected 5 numeric zeros → zero_cluster penalty → score 0.4
+    (degraded). The LLM then faithfully reported "数据质量问题（评分0.4）",
+    which was a firewall false positive, not a real data quality issue.
+
+    Fix: add get_agent_info to PASSTHROUGH_TOOLS so its zeros are not penalised.
+    """
+
+    # Exact payload from the session's tool_result event 019cb350-8711
+    MEMORY_RESULT = {
+        "memory": {
+            "has_project_rules": True,
+            "has_edge_profile": True,
+            "episodic": {"total_events": 0, "user_queries": 0, "tool_calls": 0},
+            "semantic": {"ctx_snapshots": 1, "peak_snapshot_tokens": 0},
+            "procedural": {"skill_selections": 0, "accuracy_rate": None},
+        }
+    }
+
+    def test_old_behaviour_would_score_degraded(self):
+        """Prove the bug: without passthrough, this data scores 0.4."""
+        # Temporarily remove get_agent_info from passthrough to reproduce
+        from core.verification.tool_quality import (
+            _score_to_grade, flatten_json,
+        )
+        leaves = list(flatten_json(self.MEMORY_RESULT))
+        total = len(leaves)
+        empty_count = sum(
+            1 for _, v in leaves if v is None or v == {} or v == [] or v == ""
+        )
+        zero_count = sum(
+            1 for _, v in leaves if isinstance(v, (int, float)) and v == 0
+        )
+        numeric_count = sum(1 for _, v in leaves if isinstance(v, (int, float)))
+
+        # Reproduce the zero_cluster penalty logic
+        non_empty = total - empty_count
+        score = non_empty / total if total > 0 else 0.0
+        if zero_count >= 3 and numeric_count > 0 and zero_count / numeric_count > 0.5:
+            score = min(score, 0.4)
+
+        assert score == pytest.approx(0.4), (
+            f"Without fix, score should be 0.4 (degraded), got {score}"
+        )
+        assert _score_to_grade(score) == "degraded"
+
+    def test_fix_scores_complete(self):
+        """After fix: get_agent_info is passthrough → score 1.0."""
+        assert "get_agent_info" in PASSTHROUGH_TOOLS
+        a = assess_tool_result("get_agent_info", self.MEMORY_RESULT)
+        assert a.score == 1.0
+        assert a.grade == "complete"
+        assert a.signals == []
+
+    def test_annotation_not_injected(self):
+        """No misleading [TOOL QUALITY: DEGRADED] annotation for LLM to parrot."""
+        a = assess_tool_result("get_agent_info", self.MEMORY_RESULT)
+        tool_result = {"name": "get_agent_info", "result": json.dumps(self.MEMORY_RESULT)}
+        annotated = annotate_tool_result(tool_result, a)
+        # Should be unchanged — no annotation prepended
+        assert annotated == tool_result
 
 
 # ── Tier 2: structural inference ─────────────────────────────────────────────

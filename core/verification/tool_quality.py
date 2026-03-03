@@ -23,11 +23,14 @@ logger = get_logger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-# Tools that return raw data (file content, shell output) where structural
-# assessment is meaningless. get_agent_info and reflect are excluded because
-# they return structured metadata that should always be complete.
+# Tools where structural quality assessment is not meaningful:
+# - File/shell tools return raw data (no expected schema)
+# - get_agent_info / reflect return runtime metadata where zeros are
+#   legitimate (e.g. new session has 0 events) — penalising them causes
+#   the LLM to hallucinate "data quality issues" on perfectly valid data.
 PASSTHROUGH_TOOLS: frozenset[str] = frozenset({
     "read_file", "write_file", "bash", "grep", "glob", "list_dir", "git",
+    "get_agent_info", "reflect",
 })
 
 _MAX_DEPTH = 4
