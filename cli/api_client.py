@@ -347,7 +347,7 @@ class APIClient:
             return False
 
     async def register(self, username: str, password: str, email: str) -> dict[str, Any]:
-        """Register new user."""
+        """Register new user and automatically login."""
         self._access_token = None
         self._refresh_token = None
         response = await self._request(
@@ -355,7 +355,10 @@ class APIClient:
             "/auth/register",
             json={"username": username, "password": password, "email": email},
         )
-        return response.json()
+        result = response.json()
+        # Auto-login after registration so credentials are persisted
+        await self.login(username, password)
+        return result
 
     async def login(self, username: str, password: str) -> dict[str, Any]:
         """Login and get JWT tokens."""
@@ -768,13 +771,16 @@ class APIClient:
         password: str,
         email: str,
     ) -> dict[str, Any]:
-        """Register new admin user."""
+        """Register new admin user and automatically login."""
         response = await self._request(
             "POST",
             "/auth/register",
             json={"username": username, "password": password, "email": email},
         )
-        return response.json()
+        result = response.json()
+        # Auto-login after registration so credentials are persisted
+        await self.login(username, password)
+        return result
 
     async def admin_create_model(
         self,

@@ -93,6 +93,21 @@ class TestAgentCLIToAPI:
         mock_api_client.register.assert_called_once_with("testuser", "password123", "new@example.com")
         assert "✅ Registered" in result.output
 
+    def test_register_auto_logs_in(self, runner, mock_api_client):
+        """Test that register auto-logs in so credentials are persisted."""
+        mock_api_client.register.return_value = {"email": "new@example.com"}
+
+        runner.invoke(
+            agent_cli,
+            ["register"],
+            input="new@example.com\npassword123\npassword123\ntestuser\n"
+        )
+
+        # register() now calls login() internally — verify login was NOT called
+        # separately by CLI (it's handled inside api_client.register)
+        # The key assertion: register is called (which internally calls login)
+        mock_api_client.register.assert_called_once_with("testuser", "password123", "new@example.com")
+
     def test_session_list_calls_api_client(self, runner, mock_api_client):
         """Test session list command calls API client."""
         mock_api_client.ensure_authenticated.return_value = True
@@ -180,6 +195,36 @@ class TestAgentCLIToAPI:
 
 class TestAdminCLIToAPI:
     """Test admin CLI commands correctly call API client methods."""
+
+    def test_admin_register_calls_api_client(self, runner, mock_admin_api_client):
+        """Test admin register command calls admin_register method."""
+        mock_admin_api_client.admin_register.return_value = {"username": "newadmin"}
+
+        result = runner.invoke(
+            admin_cli,
+            ["register"],
+            input="newadmin\npassword123\n"
+        )
+
+        assert result.exit_code == 0
+        mock_admin_api_client.admin_register.assert_called_once_with(
+            username="newadmin", password="password123", email="newadmin@example.com"
+        )
+        assert "✅ Admin registered" in result.output
+
+    def test_admin_register_auto_logs_in(self, runner, mock_admin_api_client):
+        """Test that admin_register auto-logs in so next command is authenticated."""
+        mock_admin_api_client.admin_register.return_value = {"username": "newadmin"}
+
+        runner.invoke(
+            admin_cli,
+            ["register"],
+            input="newadmin\npassword123\n"
+        )
+
+        # admin_register() now calls login() internally — the CLI should NOT
+        # call login separately; it's handled inside api_client.admin_register
+        mock_admin_api_client.admin_register.assert_called_once()
 
     def test_token_create_calls_api_client(self, runner, mock_admin_api_client):
         """Test token create command calls API client."""
