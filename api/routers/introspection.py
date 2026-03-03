@@ -683,35 +683,10 @@ def get_context_snapshot(
             budget = json.loads(row[1])
             llm_response_id: str | None = row[6]
 
-            # Primary: JOIN via llm_response_id (exact, safe under concurrency)
-            current_usage: dict | None = None
-            if llm_response_id:
-                lr = db.execute(
-                    text("SELECT token_usage FROM agent_events WHERE event_id = :eid"),
-                    {"eid": llm_response_id},
-                ).fetchone()
-                if lr:
-                    current_usage = _parse_token_usage(lr[0])
-
-            # Fallback: time-order match (llm_response_id not yet written by bg thread)
-            if current_usage is None:
-                fallback = db.execute(
-                    text("""
-                        SELECT token_usage FROM agent_events
-                        WHERE session_id = :sid AND event_type = 'llm_response'
-                          AND token_usage IS NOT NULL
-                        ORDER BY created_at ASC
-                        LIMIT 1 OFFSET :off
-                    """),
-                    {"sid": session_id, "off": max(0, actual_turn - 1)},
-                ).fetchone()
-                if fallback:
-                    current_usage = _parse_token_usage(fallback[0])
-
-            # Trend history: all llm_response prompt tokens up to this turn
+            # One query: all llm_response usage up to this turn (oldest first)
             trend_rows = db.execute(
                 text("""
-                    SELECT token_usage FROM agent_events
+                    SELECT event_id, token_usage FROM agent_events
                     WHERE session_id = :sid AND event_type = 'llm_response'
                       AND token_usage IS NOT NULL
                     ORDER BY created_at ASC
@@ -719,9 +694,21 @@ def get_context_snapshot(
                 """),
                 {"sid": session_id, "n": actual_turn},
             ).fetchall()
+
+            # Find current turn's usage: prefer exact match by llm_response_id,
+            # fallback to last row (time-order position)
+            current_usage: dict | None = None
+            if llm_response_id:
+                for tr in trend_rows:
+                    if tr[0] == llm_response_id:
+                        current_usage = _parse_token_usage(tr[1])
+                        break
+            if current_usage is None and trend_rows:
+                current_usage = _parse_token_usage(trend_rows[-1][1])
+
             trend_prompts = [
                 u["prompt"] for r in trend_rows
-                if (u := _parse_token_usage(r[0])) and u.get("prompt") is not None
+                if (u := _parse_token_usage(r[1])) and u.get("prompt") is not None
             ]
 
             current_prompt = current_usage.get("prompt") if current_usage else None
