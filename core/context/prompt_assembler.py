@@ -22,9 +22,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func as sa_func, text
+from sqlalchemy import func as sa_func
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session
 
 from api.models.skill import SkillSelectionEvent
 from core.db_consumer import DbConsumer, DbFactory
@@ -203,7 +203,7 @@ class PromptAssembler(DbConsumer):
         memory_stats: dict[str, Any] | None = None
         _t0 = time.monotonic()
         _mem_duration_ms = 0.0
-        
+
         # Phase 1: Compute zone budgets based on model context size
         # This provides the foundation for measuring compression effectiveness
         zone_budgets = None
@@ -221,7 +221,7 @@ class PromptAssembler(DbConsumer):
                     # For GPT-3.5: 16K context, typical budget 4K
                     model_context_size = max_tokens * 4
                     logger.debug(f"Estimating model context size: {model_context_size} (4x budget of {max_tokens})")
-                
+
                 zone_budgets = compute_zone_budgets(model_context_size)
                 logger.info(f"Zone budgets computed for {model_context_size} context: "
                            f"fixed={zone_budgets.fixed}, managed={zone_budgets.managed}, elastic={zone_budgets.elastic}")
@@ -276,6 +276,11 @@ class PromptAssembler(DbConsumer):
             "- Verify changes before presenting\n"
             "- If uncertain, say so rather than guess\n"
             "- For questions about YOUR capabilities, answer from Self-Model — don't explore files\n"
+            "\nAmbiguity resolution rules:\n"
+            "- When user asks about 'the process', 'what happened', 'the flow', 'call chain', or 'decision process' "
+            "without specifying code vs conversation, ASSUME they mean YOUR recent actions in this conversation "
+            "(tool calls, decisions, errors) — not code-level function calls\n"
+            "- If still ambiguous after applying this rule, ask for clarification before answering\n"
             "\nData integrity rules:\n"
             "- NEVER fabricate data. If a skill returns success=False, report the error honestly\n"
             "- NEVER invent numbers, dates, or facts not present in skill output\n"
@@ -296,18 +301,19 @@ class PromptAssembler(DbConsumer):
             "- To edit existing files, ALWAYS use str_replace — never rewrite the entire file with write_file\n"
             "- Use write_file ONLY to create new files that don't exist yet\n"
             "- For multiple changes to one file, call str_replace once per change\n"
-            "- Include enough context in old_str to match exactly one location"
+            "- Include enough context in old_str to match exactly one location\n"
+            "- NEVER use bash rm to delete a file and then recreate it — this bypasses safety checks and is blocked"
         )
         sections["constraints"] = constraints
         breakdown["constraints"] = _estimate_tokens(constraints)
 
         # Compress if over budget
         total = sum(breakdown.values())
-        
+
         # Phase 1: Check zone budget overflows and log
         if zone_budgets and _COMPRESSION_AVAILABLE:
             self._check_zone_overflows(breakdown, zone_budgets, session_id)
-        
+
         if total > max_tokens:
             sections, breakdown = self._compress(sections, breakdown, max_tokens)
 
@@ -705,7 +711,7 @@ class PromptAssembler(DbConsumer):
         """§6: Budget-capped conversation history with optional compression."""
         # Feature flag: enable reference-aware compression
         enable_compression = os.getenv("ENABLE_HISTORY_COMPRESSION", "false").lower() == "true"
-        
+
         with self._db() as db:
             budget_chars = int(max_tokens * _MAX_HISTORY_RATIO) * 4
             try:
@@ -719,17 +725,17 @@ class PromptAssembler(DbConsumer):
                 ).fetchall()
                 if not rows:
                     return None
-                
+
                 # Use compression if enabled and available
                 if enable_compression and _COMPRESSION_AVAILABLE:
                     return self._build_history_compressed(rows, budget_chars)
                 else:
                     return self._build_history_simple(rows, budget_chars)
-                    
+
             except SQLAlchemyError as e:
                 logger.debug("History skipped: %s", e)
                 return None
-    
+
     def _build_history_simple(self, rows, budget_chars: int) -> str | None:
         """Original simple history formatting."""
         lines = []
@@ -748,7 +754,7 @@ class PromptAssembler(DbConsumer):
             lines.append(line)
             used += len(line)
         return "Recent conversation:\n" + "\n".join(lines) if lines else None
-    
+
     def _build_history_compressed(self, rows, budget_chars: int) -> str | None:
         """
         Reference-aware compressed history formatting.
@@ -760,30 +766,30 @@ class PromptAssembler(DbConsumer):
             # Convert rows to history format
             history = []
             current_turn = {}
-            
+
             for row in reversed(rows):
                 # Validate row structure
                 if len(row) < 4:
                     logger.warning(f"Invalid row structure: expected 4 columns, got {len(row)}")
                     continue
-                
+
                 event_id, event_type, content, metadata = row
-                
+
                 if event_type == "user_query":
                     # Start new turn
                     if current_turn:
                         history.append(current_turn)
                     current_turn = {"user_query": content or ""}
-                
+
                 elif event_type == "llm_response":
                     # Add response to current turn
                     current_turn["llm_response"] = content or ""
-                
+
                 elif event_type == "tool_result":
                     # Add tool result to current turn
                     if "tool_results" not in current_turn:
                         current_turn["tool_results"] = []
-                    
+
                     # Parse metadata with error handling
                     meta = {}
                     if metadata:
@@ -795,22 +801,22 @@ class PromptAssembler(DbConsumer):
                         except json.JSONDecodeError as e:
                             logger.warning(f"Failed to parse metadata JSON: {e}")
                             meta = {}
-                    
+
                     current_turn["tool_results"].append({
                         "event_id": event_id,
                         "tool_name": meta.get("tool_name", "unknown"),
                         "content": content or "",
                         "args": meta.get("args", {})
                     })
-            
+
             # Add last turn
             if current_turn:
                 history.append(current_turn)
-            
+
             # If no valid history, return None
             if not history:
                 return None
-            
+
             # Use compression integration
             return integrate_compression_into_prompt(
                 history=history,
@@ -819,7 +825,7 @@ class PromptAssembler(DbConsumer):
                 elastic_budget=budget_chars // 4,  # Convert chars to tokens
                 enable_compression=True
             )
-        
+
         except Exception as e:
             # On any error, fall back to simple format
             logger.error(f"Compression failed, falling back to simple format: {e}")
@@ -828,7 +834,7 @@ class PromptAssembler(DbConsumer):
     # ------------------------------------------------------------------
     # Compression
     # ------------------------------------------------------------------
-    
+
     def _check_zone_overflows(
         self,
         breakdown: dict[str, int],
@@ -848,27 +854,27 @@ class PromptAssembler(DbConsumer):
         fixed_sections = ["identity", "self_model", "project_context", "constraints"]
         managed_sections = ["memory", "working_memory"]
         elastic_sections = ["history"]
-        
+
         # Calculate actual usage per zone
         fixed_usage = sum(breakdown.get(s, 0) for s in fixed_sections)
         managed_usage = sum(breakdown.get(s, 0) for s in managed_sections)
         elastic_usage = sum(breakdown.get(s, 0) for s in elastic_sections)
-        
+
         # Check overflows and log
         overflows = []
-        
+
         if fixed_usage > zone_budgets.fixed:
             overflow_pct = ((fixed_usage - zone_budgets.fixed) / zone_budgets.fixed) * 100
             overflows.append(f"fixed: {fixed_usage}/{zone_budgets.fixed} (+{overflow_pct:.1f}%)")
-        
+
         if managed_usage > zone_budgets.managed:
             overflow_pct = ((managed_usage - zone_budgets.managed) / zone_budgets.managed) * 100
             overflows.append(f"managed: {managed_usage}/{zone_budgets.managed} (+{overflow_pct:.1f}%)")
-        
+
         if elastic_usage > zone_budgets.elastic:
             overflow_pct = ((elastic_usage - zone_budgets.elastic) / zone_budgets.elastic) * 100
             overflows.append(f"elastic: {elastic_usage}/{zone_budgets.elastic} (+{overflow_pct:.1f}%)")
-        
+
         if overflows:
             logger.warning(
                 f"Zone budget overflows in session {session_id}: {', '.join(overflows)}. "

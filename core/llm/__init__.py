@@ -1,6 +1,6 @@
 """LLM integration."""
 
-from core.llm.client import BudgetExceededError, LLMClient
+from core.llm.client import BudgetExceededError, ContextOverflowError, LLMClient
 from core.llm.models import LLMMessage, LLMProvider, LLMRequest, LLMResponse
 from core.llm.rate_limiter import CircuitBreaker, RateLimiter
 from core.llm.router import (
@@ -16,6 +16,7 @@ from core.llm.router import (
 __all__ = [
     "BudgetExceededError",
     "CircuitBreaker",
+    "ContextOverflowError",
     "CostOptimizedStrategy",
     "FallbackChainStrategy",
     "LLMClient",

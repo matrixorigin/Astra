@@ -39,6 +39,17 @@ router = APIRouter()
 HEARTBEAT_INTERVAL_S = 15
 SERVER_TURN_TIMEOUT_S = 240
 
+# ---------------------------------------------------------------------------
+# History Compaction (prevents context overflow)
+# ---------------------------------------------------------------------------
+# Target token limit for history compaction. Set conservatively to leave room
+# for response tokens. This is a fallback — ideally we'd use the model's actual
+# context_window, but that requires passing model info through the call chain.
+# 100K tokens works for 128K models (DeepSeek, GPT-4), leaves 28K for response.
+# For smaller models (64K), the LLM client's _check_context_overflow will catch
+# overflow before the API call.
+_HISTORY_COMPACTION_LIMIT = 100000
+
 _HEARTBEAT_SENTINEL = object()
 
 
@@ -1097,6 +1108,14 @@ def _build_turn_messages(
                     "tool_call_id": tc_id,
                     "content": str(result) if not isinstance(result, str) else result,
                 })
+
+    # ── History Compaction ──────────────────────────────────────────────
+    # Compact history to avoid context overflow. See _HISTORY_COMPACTION_LIMIT
+    # at file top for rationale on the 100K limit.
+    from core.context.compaction import compact, needs_compaction
+    if needs_compaction(history, _HISTORY_COMPACTION_LIMIT):
+        history = compact(history, _HISTORY_COMPACTION_LIMIT)
+        logger.debug("History compacted to fit context window")
 
     entry["history"] = history
     if cached_sections:

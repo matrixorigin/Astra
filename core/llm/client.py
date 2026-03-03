@@ -32,6 +32,12 @@ class BudgetExceededError(Exception):
     pass
 
 
+class ContextOverflowError(Exception):
+    """Raised when prompt tokens would exceed model's context window."""
+
+    pass
+
+
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o",
     "deepseek": "deepseek-chat",
@@ -370,6 +376,46 @@ class LLMClient(DbConsumer):
                 f"(spent ${self._total_spend_usd:.4f} of ${budget:.2f})"
             )
 
+    def _check_context_overflow(self, model: str, messages: list | None = None):
+        """Check if messages would overflow the model's context window.
+
+        Raises ContextOverflowError if estimated prompt tokens exceed context window,
+        which would cause API errors like 'max_tokens must be at least 1, got -31608'.
+        """
+        if not messages:
+            return
+
+        # Estimate prompt tokens (~4 chars per token for ASCII, ~1 for CJK)
+        char_count = 0
+        for m in messages:
+            if isinstance(m, dict):
+                content = m.get("content", "") or ""
+                char_count += len(content)
+                # Tool calls can be large
+                if m.get("tool_calls"):
+                    char_count += len(str(m["tool_calls"]))
+
+        # Conservative estimate: ASCII ~4 chars/token, but CJK ~1 char/token
+        # Use 3 as middle ground to avoid underestimating
+        estimated_tokens = char_count // 3
+
+        # Get model's context window (default 128K if unknown)
+        context_window = 128000
+        for cfg in self._active_router.list_models():
+            if cfg.model_name == model:
+                context_window = cfg.context_window or 128000
+                break
+
+        # Reserve at least 1000 tokens for response
+        max_prompt_tokens = context_window - 1000
+
+        if estimated_tokens > max_prompt_tokens:
+            raise ContextOverflowError(
+                f"Context overflow: estimated {estimated_tokens:,} prompt tokens "
+                f"exceeds model's context window ({context_window:,} tokens). "
+                f"Start a new session with /session new to clear history."
+            )
+
     def _record_spend(self, cost: float):
         self._total_spend_usd += cost
 
@@ -480,6 +526,7 @@ class LLMClient(DbConsumer):
 
         msg_dicts = self._normalize_messages(messages)
         self._check_budget(model, msg_dicts)
+        self._check_context_overflow(model, msg_dicts)
 
         try:
             response, model_cfg = self._dispatch(
@@ -532,6 +579,7 @@ class LLMClient(DbConsumer):
         """Chat with function calling."""
         model = self._resolve_model(model)
         self._check_budget(model, messages)
+        self._check_context_overflow(model, messages)
         temp = self.config.get("temperature", 0.7)
         max_tok = self.config.get("max_tokens")
 
@@ -560,6 +608,7 @@ class LLMClient(DbConsumer):
         trace_id = str(uuid7())
         model = self._resolve_model(model)
         self._check_budget(model, messages)
+        self._check_context_overflow(model, messages)
         temp = self.config.get("temperature", 0.7)
         max_tok = self.config.get("max_tokens")
 
@@ -622,7 +671,7 @@ class LLMClient(DbConsumer):
                     "success",
                 )
                 return
-            except (BudgetExceededError, PermissionError):
+            except (BudgetExceededError, ContextOverflowError, PermissionError):
                 raise
             except Exception as e:
                 breaker.record_failure()
@@ -645,6 +694,7 @@ class LLMClient(DbConsumer):
         trace_id = str(uuid7())
         model = self._resolve_model(model)
         self._check_budget(model, messages)
+        self._check_context_overflow(model, messages)
         temp = self.config.get("temperature", 0.7)
         max_tok = self.config.get("max_tokens")
 
@@ -702,7 +752,7 @@ class LLMClient(DbConsumer):
                 yield {"type": "usage", "prompt": usage["prompt"], "completion": usage["completion"],
                        "cache_read": usage["cache_read"], "cache_creation": usage["cache_creation"]}
                 return
-            except (BudgetExceededError, PermissionError):
+            except (BudgetExceededError, ContextOverflowError, PermissionError):
                 raise
             except Exception as e:
                 breaker.record_failure()
