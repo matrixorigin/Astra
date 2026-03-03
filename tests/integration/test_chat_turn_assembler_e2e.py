@@ -648,7 +648,7 @@ class TestIntrospectionMemoryEndpoint:
             data = response.json()
 
             # Verify structure AND values for empty session
-            assert data["episodic"] == {"total_events": 0, "user_queries": 0, "tool_calls": 0}
+            assert data["episodic"] == {"total_events": 0, "user_queries": 0, "tool_calls": 0, "turns": 0}
             assert data["semantic"] == {"ctx_snapshots": 0, "peak_snapshot_tokens": 0}
             assert data["procedural"]["skill_selections"] == 0
             assert data["procedural"]["accuracy_rate"] is None

@@ -174,6 +174,7 @@ class TestIntrospectionMemory:
             assert "semantic" in data
             assert "procedural" in data
             assert data["episodic"]["total_events"] == 0
+            assert data["episodic"]["turns"] == 0
             assert data["semantic"]["ctx_snapshots"] == 0
             assert data["procedural"]["skill_selections"] == 0
         finally:
@@ -218,8 +219,70 @@ class TestIntrospectionMemory:
             assert data["episodic"]["total_events"] == 4
             assert data["episodic"]["user_queries"] == 2
             assert data["episodic"]["tool_calls"] == 1
+            assert data["episodic"]["turns"] == 2
         finally:
             db.execute(text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": sid})
+            db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
+            db.commit()
+
+    def test_semantic_stats_include_token_budget(self, client, auth_headers, db, test_user):
+        """When ctx_snapshots exist, semantic stats include current_token_budget."""
+        import json
+        sid = self._create_session(db, test_user.user_id)
+        budget = {"identity": 50, "memory": 200, "constraints": 300}
+        ctx_id = str(uuid4())
+        db.execute(text(
+            "INSERT INTO ctx_snapshots "
+            "(context_capture_id, session_id, event_id, token_budget, total_tokens, assembly_time_ms, created_at) "
+            "VALUES (:cid, :sid, :eid, :budget, 550, 42, NOW())"
+        ), {"cid": ctx_id, "sid": sid, "eid": str(uuid4()), "budget": json.dumps(budget)})
+        db.commit()
+        try:
+            resp = client.get("/introspection/memory", headers=auth_headers, params={"session_id": sid})
+            data = resp.json()
+            sem = data["semantic"]
+            assert sem["ctx_snapshots"] == 1
+            assert sem["peak_snapshot_tokens"] == 550
+            assert sem["current_token_budget"] == budget
+            assert sem["current_total_tokens"] == 550
+            assert sem["last_assembly_ms"] == 42
+        finally:
+            db.execute(text("DELETE FROM ctx_snapshots WHERE session_id = :sid"), {"sid": sid})
+            db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
+            db.commit()
+
+    def test_semantic_stats_zero_tokens_not_dropped(self, client, auth_headers, db, test_user):
+        """total_tokens=0 and assembly_time_ms=0 must be returned, not dropped by falsy check."""
+        import json
+        sid = self._create_session(db, test_user.user_id)
+        ctx_id = str(uuid4())
+        db.execute(text(
+            "INSERT INTO ctx_snapshots "
+            "(context_capture_id, session_id, event_id, token_budget, total_tokens, assembly_time_ms, created_at) "
+            "VALUES (:cid, :sid, :eid, :budget, 0, 0, NOW())"
+        ), {"cid": ctx_id, "sid": sid, "eid": str(uuid4()), "budget": json.dumps({"identity": 10})})
+        db.commit()
+        try:
+            resp = client.get("/introspection/memory", headers=auth_headers, params={"session_id": sid})
+            sem = resp.json()["semantic"]
+            assert sem["current_total_tokens"] == 0, "0 is a valid value, must not be dropped"
+            assert sem["last_assembly_ms"] == 0, "0 is a valid value, must not be dropped"
+        finally:
+            db.execute(text("DELETE FROM ctx_snapshots WHERE session_id = :sid"), {"sid": sid})
+            db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
+            db.commit()
+
+    def test_semantic_stats_no_snapshot_no_budget_key(self, client, auth_headers, db, test_user):
+        """When no snapshots exist, current_token_budget key must not appear."""
+        sid = self._create_session(db, test_user.user_id)
+        try:
+            resp = client.get("/introspection/memory", headers=auth_headers, params={"session_id": sid})
+            sem = resp.json()["semantic"]
+            assert sem["ctx_snapshots"] == 0
+            assert "current_token_budget" not in sem
+            assert "current_total_tokens" not in sem
+            assert "last_assembly_ms" not in sem
+        finally:
             db.execute(text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
             db.commit()
 
@@ -238,7 +301,7 @@ class TestIntrospectionErrorPaths:
         db = MagicMock()
         db.execute.side_effect = Exception("connection lost")
         result = _get_episodic_stats(db, "any")
-        assert result == {"total_events": 0, "user_queries": 0, "tool_calls": 0}
+        assert result == {"total_events": 0, "user_queries": 0, "tool_calls": 0, "turns": 0}
 
     def test_semantic_stats_db_error(self):
         """_get_semantic_stats returns zeros on DB error."""

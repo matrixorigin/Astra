@@ -1,5 +1,7 @@
 """Introspection API — cloud-side data for get_agent_info tool."""
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -39,7 +41,12 @@ def get_introspection_memory(
 
 
 def _get_episodic_stats(db: Session, session_id: str) -> dict:
-    """Count conversation events by type for this session."""
+    """Conversation event counts for this session.
+
+    ``turns`` counts user_query events — each user message starts a new turn.
+    Exposed as a separate field because LLM consumers interpret "turn" more
+    naturally than "user_queries" when reporting session state.
+    """
     try:
         row = db.execute(
             text("""
@@ -52,35 +59,66 @@ def _get_episodic_stats(db: Session, session_id: str) -> dict:
             """),
             {"sid": session_id},
         ).fetchone()
+        user_queries = row[1] or 0
         return {
             "total_events": row[0] or 0,
-            "user_queries": row[1] or 0,
+            "user_queries": user_queries,
             "tool_calls": row[2] or 0,
+            "turns": user_queries,
         }
     except Exception as exc:
         logger.warning("episodic stats query failed: %s", exc)
-        return {"total_events": 0, "user_queries": 0, "tool_calls": 0}
+        return {"total_events": 0, "user_queries": 0, "tool_calls": 0, "turns": 0}
 
 
 def _get_semantic_stats(db: Session, session_id: str) -> dict:
-    """Count context snapshots and peak token total.
+    """Current + historical context window stats from ctx_snapshots.
 
-    Uses total_tokens column from ctx_snapshots table
-    (see api/models.py ContextSnapshot).
+    Single query returns both aggregate stats (count, peak) and the latest
+    snapshot's token budget breakdown.  The budget tells the LLM exactly how
+    the current context window is allocated across zones (identity, memory,
+    constraints, etc.) — this is what users mean when they ask "how is my
+    context doing?".
     """
     try:
-        row = db.execute(
+        # Single query: aggregate + latest snapshot via ORDER BY … LIMIT 1
+        # trick.  We fetch the latest row and compute aggregates in Python
+        # to avoid a subquery (MatrixOne handles simple queries faster).
+        rows = db.execute(
             text("""
-                SELECT COUNT(*), MAX(total_tokens)
+                SELECT token_budget, total_tokens, assembly_time_ms, created_at
                 FROM ctx_snapshots
                 WHERE session_id = :sid
+                ORDER BY created_at DESC
             """),
             {"sid": session_id},
-        ).fetchone()
-        return {
-            "ctx_snapshots": row[0] or 0,
-            "peak_snapshot_tokens": row[1] or 0,
+        ).fetchall()
+
+        count = len(rows)
+        result: dict = {
+            "ctx_snapshots": count,
+            "peak_snapshot_tokens": max(
+                (r[1] for r in rows if r[1] is not None), default=0,
+            ),
         }
+
+        if rows:
+            latest = rows[0]
+            # token_budget is a JSON column; parse it for the LLM to see
+            # per-zone allocation (identity, memory, constraints, etc.).
+            if latest[0] is not None:
+                try:
+                    result["current_token_budget"] = json.loads(latest[0])
+                except (ValueError, TypeError):
+                    pass
+            # Use `is not None` — 0 is a legitimate value (e.g. total_tokens=0
+            # on first turn, assembly_time_ms=0 for cached prompts).
+            if latest[1] is not None:
+                result["current_total_tokens"] = latest[1]
+            if latest[2] is not None:
+                result["last_assembly_ms"] = latest[2]
+
+        return result
     except Exception as exc:
         logger.warning("semantic stats query failed: %s", exc)
         return {"ctx_snapshots": 0, "peak_snapshot_tokens": 0}
