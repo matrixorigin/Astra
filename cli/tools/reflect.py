@@ -22,17 +22,19 @@ class ReflectTool(EdgeTool):
 
     name = "reflect"
     description = (
-        "Diagnose PAST events by querying server-side data invisible to your context: "
-        "event trails with timing, skill selection history, available cloud skills "
-        "and their schemas, tool usage counts, and past tool call patterns. "
-        "Use focus='performance' when user asks why a response was slow or why something took so long. "
+        "Diagnose PAST behavior by querying server-side data invisible to your context: "
+        "event trails with timing, skill selection history, tool usage counts, "
+        "and past tool call patterns. "
+        "Use focus='performance' when user asks why a response was slow, "
+        "why token usage was high, or why something took so long. "
         "Use focus='skill_failure' after a tool fails or returns an error. "
         "Use focus='unexpected_result' when the answer was wrong or surprising. "
         "Use focus='tool_selection' to see what tools are available and why one wasn't used. "
+        "Use focus='data_quality' when retrieved context seems irrelevant or stale. "
         "Use focus='history' to find how similar TOOL CALLS were handled in past sessions. "
-        "DO NOT use this tool when the user asks about context window size, token usage, "
-        "memory contents, or current session state — use get_agent_info for those. "
-        "The response includes session_report_markdown — present it directly to the user as the analysis."
+        "DO NOT use this tool for current token counts or context snapshot — "
+        "use get_agent_info(dimension='context_snapshot') for those. "
+        "The response includes session_report_markdown — present it directly to the user."
     )
     parameters = {
         "type": "object",
@@ -40,11 +42,23 @@ class ReflectTool(EdgeTool):
             "focus": {
                 "type": "string",
                 "enum": ["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history", "performance"],
-                "description": "What to investigate. 'tool_selection' shows available skills and usage. 'history' finds similar past queries. 'performance' analyzes timing, gaps, and bottlenecks.",
+                "description": (
+                    "What to investigate. "
+                    "'performance': timing, gaps, bottlenecks, high token usage. "
+                    "'skill_failure': why a tool failed. "
+                    "'unexpected_result': wrong or surprising answer. "
+                    "'data_quality': irrelevant or stale context. "
+                    "'tool_selection': available skills and why one wasn't used. "
+                    "'history': similar past tool calls across sessions."
+                ),
             },
             "question": {
                 "type": "string",
-                "description": "Optional: what to investigate, e.g. 'why wasn't list_prs used?'",
+                "description": (
+                    "What specifically to investigate. Always provide this for better results. "
+                    "Examples: 'why wasn't list_prs used?', 'why was the last response slow?', "
+                    "'why did search return irrelevant results?'"
+                ),
             },
             "last_n": {
                 "type": "integer",

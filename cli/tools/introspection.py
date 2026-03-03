@@ -47,8 +47,10 @@ class GetAgentInfoTool(EdgeTool):
             "Examples: 'what tools do you have?', 'how many tokens did that use?', "
             "'show me context usage', '上下文用了多少', 'token 用了多少', "
             "'what's in your memory?', 'what's your session id?'. "
-            "For diagnosing past tool failures or slow responses, use reflect instead. "
-            "For general identity questions ('who are you?'), answer from your Self-Model section."
+            "IMPORTANT: The response contains llm_prompt_tokens (total tokens sent to LLM) "
+            "and context_managed_tokens (subset managed by context zones). "
+            "Always present llm_prompt_tokens as the primary token count to the user. "
+            "For diagnosing WHY token usage was high or responses were slow, use reflect instead."
         )
 
     @property

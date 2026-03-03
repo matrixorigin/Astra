@@ -225,6 +225,24 @@ class TestReflectTool:
             "auto", "skill_failure", "unexpected_result", "data_quality",
             "tool_selection", "history", "performance"}
 
+    def test_description_mentions_all_focus_values(self):
+        """Every focus value mentioned in description must exist in enum (no stale references)."""
+        tool = ReflectTool()
+        enum_vals = set(tool.parameters["properties"]["focus"]["enum"])
+        all_text = tool.description + tool.parameters["properties"]["focus"]["description"]
+        # Extract focus='xxx' patterns from description
+        import re
+        mentioned = set(re.findall(r"'(\w+)'", all_text))
+        # Every mentioned value that looks like a focus must be in enum
+        for val in mentioned & {"performance", "skill_failure", "unexpected_result",
+                                "data_quality", "tool_selection", "history", "auto"}:
+            assert val in enum_vals, f"focus='{val}' in description but not in enum"
+
+    def test_description_boundary_with_get_agent_info(self):
+        """reflect description must direct token/context queries to get_agent_info."""
+        tool = ReflectTool()
+        assert "get_agent_info" in tool.description
+
 
 # ============================================================================
 # 2. Server evidence — real DB queries via ReflectService

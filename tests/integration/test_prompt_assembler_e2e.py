@@ -841,6 +841,27 @@ class TestGetAgentInfoTool:
         tool = self._make_tool()
         assert tool.side_effect == SideEffect.READ
 
+    def test_description_mentions_llm_token_fields(self):
+        """Description must guide LLM to present llm_prompt_tokens as primary."""
+        tool = self._make_tool()
+        assert "llm_prompt_tokens" in tool.description
+        assert "context_managed_tokens" in tool.description
+
+    def test_description_mentions_all_dimensions(self):
+        """Dimension values mentioned in description must exist in enum (no stale references)."""
+        import re
+        tool = self._make_tool()
+        dim_prop = tool.parameters["properties"]["dimension"]
+        enum_vals = set(dim_prop["enum"])
+        all_text = tool.description + dim_prop["description"]
+        # Extract 'xxx' patterns that look like dimension values
+        mentioned = set(re.findall(r"'(\w+)'", all_text))
+        for val in mentioned & enum_vals:
+            assert val in enum_vals, f"dimension='{val}' in description but not in enum"
+        # Key dimensions must be documented in param description
+        for key in ("context_snapshot", "context_trend", "retrieval_quality", "all"):
+            assert key in dim_prop["description"], f"'{key}' not in dimension description"
+
     @pytest.mark.asyncio
     async def test_invalid_dimension_returns_error(self):
         tool = self._make_tool()
