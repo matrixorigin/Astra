@@ -4,7 +4,8 @@ import uuid
 
 import pytest
 
-from api.models import SkillInstallation, SkillRegistry as SkillModel
+from api.models import SkillInstallation
+from api.models import SkillRegistry as SkillModel
 from core.exceptions import SkillNotFoundError
 from core.skills.base import (
     AccessScope,
@@ -23,7 +24,6 @@ from core.skills.catalog import (
     NameConflictError,
     SkillCatalog,
 )
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -498,3 +498,184 @@ class TestNegativeCaching:
         # Register a skill — should clear all cache including negative entries
         catalog.register(StubSkill(_name()), source=SOURCE_BUILTIN)
         assert len(catalog._metadata_cache) == 0
+
+
+# ── Consistency checks (orphaned skills) ──────────────────────────────────────
+
+
+class TestOrphanedSkills:
+    """Test detection and cleanup of orphaned skills (DB records without local files)."""
+
+    def test_find_orphaned_skills_with_empty_paths(self, catalog, db_session):
+        """With empty loader_paths, all user skills are orphans."""
+        n = _name()
+        uid = _uid()
+        catalog.publish_user_skill(uid, n, "1.0.0", "test skill")
+
+        # With empty paths, our skill should be in orphans
+        orphans = catalog.find_orphaned_skills(source="user", loader_paths=[])
+        orphan_names = [o["skill_name"] for o in orphans]
+        assert n in orphan_names
+
+    def test_find_orphaned_skills_detects_missing_local_files(self, catalog, db_session, tmp_path):
+        """Skills in DB but not on disk are detected as orphans."""
+        n = _name()
+        uid = _uid()
+        catalog.publish_user_skill(uid, n, "1.0.0", "orphan skill")
+
+        # tmp_path is empty, so the skill is orphaned
+        orphans = catalog.find_orphaned_skills(source="user", loader_paths=[tmp_path])
+        # Check our skill is in the orphans list (other tests may leave data)
+        orphan_names = [o["skill_name"] for o in orphans]
+        assert n in orphan_names
+        our_orphan = next(o for o in orphans if o["skill_name"] == n)
+        assert our_orphan["skill_id"] == f"{n}@1.0.0"
+
+    def test_find_orphaned_skills_excludes_loadable_skills(self, catalog, db_session, tmp_path):
+        """Skills that can be loaded from disk are not orphans."""
+        # Use unique skill name
+        local_skill_name = _name("local")
+
+        # Create a local skill file
+        skill_dir = tmp_path / local_skill_name
+        skill_dir.mkdir()
+        (skill_dir / "__init__.py").write_text("")
+        (skill_dir / "skill.py").write_text(f'''
+from core.skills.base import Skill, SkillInput, SkillOutput, SkillRequirement
+
+class MyInput(SkillInput):
+    pass
+
+class MyOutput(SkillOutput):
+    pass
+
+class MySkill(Skill[MyInput, MyOutput]):
+    name = "{local_skill_name}"
+    version = "1.0.0"
+    description = "test"
+    requirements = SkillRequirement()
+
+    def execute(self, input_data, context=None):
+        return MyOutput()
+''')
+
+        # Register the same skill in DB
+        uid = _uid()
+        catalog.publish_user_skill(uid, local_skill_name, "1.0.0", "test")
+
+        # Also register an orphan
+        orphan_name = _name("orphan")
+        catalog.publish_user_skill(uid, orphan_name, "1.0.0", "orphan")
+
+        # Find orphans - local_skill_name should NOT be in the list
+        orphans = catalog.find_orphaned_skills(source="user", loader_paths=[tmp_path])
+        orphan_names = [o["skill_name"] for o in orphans]
+        assert local_skill_name not in orphan_names
+        assert orphan_name in orphan_names
+
+    def test_mark_orphaned_updates_status(self, catalog, db_session):
+        """mark_orphaned() sets is_active=0 and status='orphaned'."""
+        n = _name()
+        uid = _uid()
+        catalog.publish_user_skill(uid, n, "1.0.0", "will be orphaned")
+
+        skill_id = f"{n}@1.0.0"
+        count = catalog.mark_orphaned([skill_id])
+        assert count == 1
+
+        db_session.expire_all()
+        row = db_session.query(SkillModel).filter(SkillModel.skill_id == skill_id).first()
+        assert row.is_active == 0
+        assert row.status == "orphaned"
+
+    def test_mark_orphaned_empty_list_returns_zero(self, catalog):
+        """mark_orphaned([]) returns 0 without DB query."""
+        assert catalog.mark_orphaned([]) == 0
+
+    def test_cleanup_orphaned_finds_and_marks(self, catalog, db_session, tmp_path):
+        """cleanup_orphaned() combines find + mark in one call."""
+        n = _name()
+        uid = _uid()
+        catalog.publish_user_skill(uid, n, "1.0.0", "orphan")
+
+        count = catalog.cleanup_orphaned(source="user", loader_paths=[tmp_path])
+        assert count >= 1  # At least our skill should be marked
+
+        db_session.expire_all()
+        row = db_session.query(SkillModel).filter(SkillModel.skill_name == n).first()
+        assert row.status == "orphaned"
+        assert row.is_active == 0
+
+    def test_cleanup_orphaned_returns_zero_when_no_orphans(self, catalog, db_session, tmp_path):
+        """cleanup_orphaned() returns 0 when no orphans exist."""
+        # Use unique skill name
+        real_skill_name = _name("real")
+
+        # Create a skill that exists both in DB and on disk
+        skill_dir = tmp_path / real_skill_name
+        skill_dir.mkdir()
+        (skill_dir / "__init__.py").write_text("")
+        (skill_dir / "skill.py").write_text(f'''
+from core.skills.base import Skill, SkillInput, SkillOutput, SkillRequirement
+
+class RealInput(SkillInput):
+    pass
+
+class RealOutput(SkillOutput):
+    pass
+
+class RealSkill(Skill[RealInput, RealOutput]):
+    name = "{real_skill_name}"
+    version = "1.0.0"
+    description = "exists on disk"
+    requirements = SkillRequirement()
+
+    def execute(self, input_data, context=None):
+        return RealOutput()
+''')
+
+        uid = _uid()
+        catalog.publish_user_skill(uid, real_skill_name, "1.0.0", "exists on disk")
+
+        # Only check this specific skill - use a filter that matches only our skill
+        orphans = catalog.find_orphaned_skills(source="user", loader_paths=[tmp_path])
+        our_orphans = [o for o in orphans if o["skill_name"] == real_skill_name]
+        assert len(our_orphans) == 0  # Our skill should NOT be orphaned
+
+    def test_orphaned_skill_not_returned_by_list_active(self, catalog, db_session, tmp_path):
+        """After marking as orphaned, skill should not appear in list_active()."""
+        n = _name()
+        uid = _uid()
+        catalog.publish_user_skill(uid, n, "1.0.0", "orphan")
+
+        # Verify it's active initially
+        result = catalog.list_active()
+        assert n in [s["skill_name"] for s in result["skills"]]
+
+        # Mark as orphaned
+        catalog.cleanup_orphaned(source="user", loader_paths=[tmp_path])
+
+        # Should no longer appear in active list
+        result = catalog.list_active()
+        assert n not in [s["skill_name"] for s in result["skills"]]
+
+    def test_re_register_after_orphaned_reactivates(self, catalog, db_session, tmp_path):
+        """Re-registering an orphaned skill should reactivate it."""
+        n = _name()
+        uid = _uid()
+        catalog.publish_user_skill(uid, n, "1.0.0", "will be orphaned then restored")
+
+        # Mark as orphaned
+        catalog.mark_orphaned([f"{n}@1.0.0"])
+
+        db_session.expire_all()
+        row = db_session.query(SkillModel).filter(SkillModel.skill_name == n).first()
+        assert row.status == "orphaned"
+
+        # Re-register with new version
+        catalog.publish_user_skill(uid, n, "2.0.0", "restored")
+
+        db_session.expire_all()
+        v2 = db_session.query(SkillModel).filter(SkillModel.skill_id == f"{n}@2.0.0").first()
+        assert v2.is_active == 1
+        assert v2.status == "active"

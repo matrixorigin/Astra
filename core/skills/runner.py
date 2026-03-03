@@ -9,6 +9,8 @@ import argparse
 import json
 import sys
 
+DIAGNOSE_HINT = "Run 'diagnose_skills' to check skill health"
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a skill in isolation")
@@ -38,7 +40,10 @@ def main() -> None:
 
         skill = registry.get(args.skill)
         if not skill:
-            print(json.dumps({"error": f"Skill '{args.skill}' not found"}), file=sys.stderr)
+            print(json.dumps({
+                "error": f"Skill '{args.skill}' not found",
+                "hint": DIAGNOSE_HINT,
+            }), file=sys.stderr)
             sys.exit(1)
 
         import asyncio
@@ -53,8 +58,22 @@ def main() -> None:
             output = {"output": str(result)}
 
         json.dump(output, sys.stdout)
+    except ImportError as e:
+        print(json.dumps({
+            "error": f"Failed to load skill: {e}",
+            "hint": DIAGNOSE_HINT,
+        }), file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
-        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        err_type = type(e).__name__
+        # Skill-related errors get the hint
+        if "skill" in str(e).lower() or "load" in str(e).lower():
+            print(json.dumps({
+                "error": f"{err_type}: {e}",
+                "hint": DIAGNOSE_HINT,
+            }), file=sys.stderr)
+        else:
+            print(json.dumps({"error": f"{err_type}: {e}"}), file=sys.stderr)
         sys.exit(1)
 
 

@@ -907,6 +907,89 @@ class SkillCatalog(DbConsumer):
                 available.append(skill)
         return available
 
+    # ── Consistency checks ────────────────────────────────────────
+
+    def find_orphaned_skills(
+        self,
+        source: str = SOURCE_USER,
+        loader_paths: list | None = None,
+    ) -> list[dict[str, Any]]:
+        """Find skills in DB that cannot be loaded from disk.
+
+        Args:
+            source: Only check skills from this source (default: user skills)
+            loader_paths: Paths to search for local skills. If None, uses
+                default paths from SkillLoader.
+
+        Returns:
+            List of orphaned skill metadata dicts (skill_id, skill_name, version, etc.)
+        """
+        from pathlib import Path
+
+        from core.skills.loader import SkillLoader
+
+        # Get loadable skill names from disk
+        if loader_paths is None:
+            # Default: project skills/ directory
+            project_root = Path(__file__).resolve().parent.parent.parent
+            loader_paths = [project_root / "skills"]
+
+        local_skills = SkillLoader.discover([Path(p) for p in loader_paths])
+        loadable_names = {s.skill.name for s in local_skills if s.skill}
+
+        # Find active DB skills that aren't loadable
+        orphans = []
+        with self._db() as db:
+            active_skills = db.query(SkillModel).filter(
+                SkillModel.is_active == 1,
+                SkillModel.source == source,
+            ).all()
+
+            for skill in active_skills:
+                if skill.skill_name not in loadable_names:
+                    orphans.append(self._row_to_dict(skill))
+
+        return orphans
+
+    def mark_orphaned(self, skill_ids: list[str]) -> int:
+        """Mark orphaned skills as inactive with status 'orphaned'.
+
+        Args:
+            skill_ids: List of skill_id values to mark as orphaned
+
+        Returns:
+            Number of skills updated
+        """
+        if not skill_ids:
+            return 0
+
+        with self._db() as db:
+            count = db.query(SkillModel).filter(
+                SkillModel.skill_id.in_(skill_ids),
+            ).update({"is_active": 0, "status": "orphaned"}, synchronize_session="fetch")
+            db.commit()
+
+        self._invalidate_cache()
+        logger.info("Marked %d skills as orphaned: %s", count, skill_ids)
+        return count
+
+    def cleanup_orphaned(self, source: str = SOURCE_USER, loader_paths: list | None = None) -> int:
+        """Find and mark orphaned skills in one operation.
+
+        Args:
+            source: Only check skills from this source
+            loader_paths: Paths to search for local skills
+
+        Returns:
+            Number of skills marked as orphaned
+        """
+        orphans = self.find_orphaned_skills(source=source, loader_paths=loader_paths)
+        if not orphans:
+            return 0
+
+        orphan_ids = [o["skill_id"] for o in orphans]
+        return self.mark_orphaned(orphan_ids)
+
     # ── Internal helpers ──────────────────────────────────────────
 
     def _invalidate_cache(self) -> None:

@@ -144,6 +144,29 @@ async def list_skills(
 
 # Static routes BEFORE parameterized routes — see module docstring.
 
+@router.get("/health", response_model=dict)
+async def check_skill_health(
+    level: str = Query("summary", description="'summary' or 'detailed'"),
+    source: str = Query("all", description="'user', 'builtin', 'marketplace', or 'all'"),
+    skill_name: str | None = Query(None, description="Specific skill to diagnose (detailed mode)"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Check skill health: find orphaned, broken, or mismatched skills."""
+    from skills.diagnose_skills.skill import DiagnoseSkillsInput, DiagnoseSkillsSkill, DiagnosisLevel
+
+    db = SessionLocal()
+    try:
+        skill = DiagnoseSkillsSkill(db=db)
+        result = await skill.execute(DiagnoseSkillsInput(
+            level=DiagnosisLevel.DETAILED if level == "detailed" else DiagnosisLevel.SUMMARY,
+            source=source,
+            skill_name=skill_name,
+        ))
+        return result.model_dump()
+    finally:
+        db.close()
+
+
 @router.get("/status", response_model=SkillStatusResponse)
 async def get_skill_status(
     per_group: int = Query(50, ge=1, le=200),

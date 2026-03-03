@@ -21,6 +21,8 @@ class SkillError(AgentError):
 class SkillNotFoundError(SkillError):
     """Skill not found in registry."""
 
+    hint = "Run 'diagnose_skills' to check skill health"
+
     def __init__(self, skill_name: str, version: str | None = None):
         message = f"Skill '{skill_name}'"
         if version:

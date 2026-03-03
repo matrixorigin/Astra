@@ -118,6 +118,7 @@ def cmd_help(console, **_):
         ("/skill new <name>", "Create a new skill"),
         ("/skill test <name>", "Test a skill with full output"),
         ("/skill dev <name>", "Enter AI-assisted skill dev mode"),
+        ("/skill doctor", "Check skill health (orphaned, broken, mismatched)"),
         ("/explain", "Toggle explain mode (auto-show stats after each turn)"),
         ("/verbose", "Show status bar"),
         ("/compact", "Hide status bar"),
@@ -158,8 +159,9 @@ def cmd_model(console, client=None, selected_model=None, cmd_arg=None, state=Non
                 t.add_column("Model")
                 t.add_column("Provider", style="dim")
                 t.add_column("Description", style="dim")
+                current = state.get("selected_model") or (active[0]["name"] if active else None)
                 for m in active:
-                    marker = "→" if state.get("selected_model") == m["name"] else ""
+                    marker = "→" if current == m["name"] else ""
                     desc = m.get("description") or ""
                     t.add_row(marker, m["name"], m["provider"], desc)
                 console.print(t)
@@ -267,7 +269,7 @@ def cmd_logout(console, client=None, **_):
 
 
 def cmd_skill(console, cmd_arg=None, client=None, state=None, **kw):
-    """List, test, create, or develop local skills."""
+    """List, test, create, develop, or diagnose skills."""
     import os
     from core.skills.loader import SkillLoader
 
@@ -277,6 +279,11 @@ def cmd_skill(console, cmd_arg=None, client=None, state=None, **kw):
     parts = (cmd_arg or "").split(maxsplit=1)
     sub = parts[0] if parts else "list"
     rest = parts[1] if len(parts) > 1 else ""
+
+    # --- /skill doctor [name] ---
+    if sub == "doctor":
+        _cmd_skill_doctor(console, rest.strip(), client)
+        return
 
     # --- /skill list (default) ---
     if sub in ("list", ""):
@@ -503,8 +510,59 @@ TODO: describe this skill for the LLM.
 
     console.print(
         "[dim]Usage: /skill list | new <name> | test <name> [args] "
-        "| validate <name> | dev <name> | example[/dim]"
+        "| validate <name> | dev <name> | doctor [name] | example[/dim]"
     )
+
+
+def _cmd_skill_doctor(console, skill_name: str | None, client):
+    """Check skill health: find orphaned, broken, or mismatched skills."""
+    from api.database import SessionLocal
+    from skills.diagnose_skills.skill import DiagnoseSkillsInput, DiagnoseSkillsSkill, DiagnosisLevel
+
+    db = SessionLocal()
+    try:
+        skill = DiagnoseSkillsSkill(db=db)
+        level = DiagnosisLevel.DETAILED if skill_name else DiagnosisLevel.SUMMARY
+        result = asyncio.get_event_loop().run_until_complete(
+            skill.execute(DiagnoseSkillsInput(level=level, skill_name=skill_name or None))
+        )
+
+        # Status indicator
+        status_icon = {"healthy": "✓", "warning": "⚠", "critical": "✗"}
+        status_color = {"healthy": "green", "warning": "yellow", "critical": "red"}
+        icon = status_icon.get(result.health_status, "?")
+        color = status_color.get(result.health_status, "white")
+        console.print(f"[{color}]{icon}[/{color}] Skill Health: [{color}]{result.health_status.upper()}[/{color}]")
+
+        # Summary
+        console.print(f"  Total: {result.total_skills} | Healthy: {result.healthy}")
+        if result.orphaned:
+            console.print(f"  [red]Orphaned ({result.orphaned}):[/red] {', '.join(result.orphaned_names)}")
+        if result.load_errors:
+            console.print(f"  [red]Load errors ({result.load_errors}):[/red] {', '.join(result.load_error_names)}")
+        if result.version_mismatches:
+            console.print(f"  [yellow]Version mismatches ({result.version_mismatches}):[/yellow] {', '.join(result.mismatch_names)}")
+        if result.more_issues:
+            console.print("  [dim]... more issues exist. Use /skill doctor <name> for details[/dim]")
+
+        # Detailed diagnosis
+        if result.diagnosis:
+            d = result.diagnosis
+            console.print(f"\n[bold]Diagnosis: {d['skill_name']}[/bold]")
+            console.print(f"  Type: {d['issue_type']}")
+            console.print(f"  Message: {d['message']}")
+            if d.get('suggestion'):
+                console.print(f"  [cyan]Fix:[/cyan] {d['suggestion']}")
+
+        # Suggestions
+        if result.suggestions and not result.diagnosis:
+            console.print("\n[dim]Suggestions:[/dim]")
+            for s in result.suggestions:
+                console.print(f"  • {s}")
+    except Exception as e:
+        console.print(f"[red]✗[/red] Error: {e}")
+    finally:
+        db.close()
 
 
 def _normalize_skill_name(name: str) -> str:
