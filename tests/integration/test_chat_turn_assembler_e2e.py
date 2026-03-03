@@ -293,7 +293,10 @@ class TestToolRegistration:
         assert info_schema["type"] == "function"
         params = info_schema["function"]["parameters"]
         assert "dimension" in params["properties"]
-        assert set(params["properties"]["dimension"]["enum"]) == {"capability", "state", "memory", "identity", "all"}
+        assert set(params["properties"]["dimension"]["enum"]) == {
+            "capability", "state", "memory", "identity", "all",
+            "context_snapshot", "context_trend", "retrieval_quality",
+        }
 
 
 # ============================================================================

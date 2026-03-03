@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from uuid_utils import uuid7
 from api.sse_errors import SSE_HEADERS, status_to_error_code
 
 from api.database import SessionLocal
@@ -1245,6 +1246,8 @@ def _persist_turn_events(
     history: list[dict[str, Any]] | None = None,
     turn_count: int = 0,
     agent_id: str | None = None,
+    turn_chain_id: str | None = None,
+    user_query_event_id: str | None = None,
 ) -> None:
     """Persist events for this turn: user query, tool results, LLM response.
 
@@ -1256,13 +1259,12 @@ def _persist_turn_events(
     PromptAssembler (the correct timing). The snapshot ID is passed in via
     context_capture_id so DecisionAudit can reference it.
     """
-    from uuid_utils import uuid7
     from core.events.event_logger import EventLogger
 
     user_content = next((m["content"] for m in messages if m.get("role") == "user"), None)
     el = EventLogger(SessionLocal)
     parent_event_id = None
-    causal_chain_id = str(uuid7())
+    causal_chain_id = turn_chain_id or str(uuid7())
 
     # Resolve skill versions for tool events (best-effort, single query).
     # Returns the latest active version per skill name.
@@ -1283,7 +1285,11 @@ def _persist_turn_events(
     # Phase 1: persist user query
     try:
         if user_content:
-            user_ev = el.create_user_query(user_id=user_id, session_id=session_id, content=user_content)
+            user_ev = el.create_user_query(
+                user_id=user_id, session_id=session_id, content=user_content,
+                causal_chain_id=causal_chain_id,
+                event_id=user_query_event_id,
+            )
             parent_event_id = user_ev.event_id
             causal_chain_id = user_ev.causal_chain_id
     except Exception as e:
@@ -1431,6 +1437,30 @@ def _persist_turn_events(
         hooks.detect_reflection_learning(session_id, user_id, tool_calls, tool_results)
     except Exception as e:
         logger.warning("Phase 4 (TurnHooks) failed: %s", e)
+
+    # Phase 5: update session activity (event_count, last_active_at)
+    try:
+        _sdb = SessionLocal()
+        try:
+            from sqlalchemy import text as _text
+            from datetime import datetime, timezone
+            _count = _sdb.execute(
+                _text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"),
+                {"sid": session_id},
+            ).scalar() or 0
+            _sdb.execute(
+                _text("""
+                    UPDATE agent_sessions
+                    SET event_count = :cnt, last_active_at = :now, updated_at = :now
+                    WHERE session_id = :sid
+                """),
+                {"cnt": _count, "sid": session_id, "now": datetime.now(timezone.utc)},
+            )
+            _sdb.commit()
+        finally:
+            _sdb.close()
+    except Exception as e:
+        logger.warning("Phase 5 (session activity) failed: %s", e)
 
 
 # Lazy-initialized shared LLM client for background tasks (Observer).
@@ -1607,6 +1637,12 @@ async def chat_turn(
                 session_id = _ensure_session(db, user_id, request.session_id, request.agent_id)
             finally:
                 db.close()
+
+            # Causal chain + user_query event_id for this turn — both generated
+            # here (streaming time) so their uuid7 timestamps reflect when the
+            # turn actually happened, not when the persist thread ran.
+            _turn_chain_id = str(uuid7())
+            _user_query_event_id = str(uuid7())
 
             # Detect tool changes: compare new edge_tools with cached set.
             tools_changed = False
@@ -1824,13 +1860,13 @@ async def chat_turn(
                             from api.models.agent import Event as EventModel
                             _db = SessionLocal()
                             _db.add(EventModel(
-                                event_id=str(__import__('uuid').uuid4()),
+                                event_id=str(uuid7()),
                                 session_id=session_id,
                                 user_id=user_id,
                                 agent_id=request.agent_id or "edge",
                                 event_type="tool_call",
                                 content=json.dumps({"name": tc_name, "arguments": tc_args, "source": "cloud"}),
-                                causal_chain_id=session_id,
+                                causal_chain_id=_turn_chain_id,
                             ))
                             _db.commit()
                             _db.close()
@@ -1912,6 +1948,8 @@ async def chat_turn(
                 history=copy.deepcopy(current_history),
                 turn_count=current_turn_count,
                 agent_id=request.agent_id,
+                turn_chain_id=_turn_chain_id,
+                user_query_event_id=_user_query_event_id,
             )
             _t = threading.Thread(target=_persist_turn_events, kwargs=_persist_args, daemon=True)
             _persist_threads.append(_t)

@@ -948,8 +948,8 @@ class PromptAssembler(DbConsumer):
                 db.execute(
                     text("""
                         INSERT INTO ctx_snapshots
-                            (context_capture_id, session_id, event_id, system_prompt, token_budget, created_at)
-                        VALUES (:cid, :sess, :eid, :prompt, :budget, NOW())
+                            (context_capture_id, session_id, event_id, system_prompt, token_budget, total_tokens, created_at)
+                        VALUES (:cid, :sess, :eid, :prompt, :budget, :total, NOW())
                     """),
                     {
                         "cid": capture_id,
@@ -960,6 +960,7 @@ class PromptAssembler(DbConsumer):
                             "token_breakdown": breakdown,
                         }),
                         "budget": json.dumps(breakdown),
+                        "total": sum(breakdown.values()),
                     },
                 )
                 db.commit()

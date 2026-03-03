@@ -255,6 +255,7 @@ class EventLogger(DbConsumer):
         agent_version: str = "0.1.0",
         parent_event_id: str | None = None,
         causal_chain_id: str | None = None,
+        event_id: str | None = None,
     ) -> ConversationEvent:
         """Create and log a user query event.
 
@@ -266,12 +267,15 @@ class EventLogger(DbConsumer):
             agent_version: Agent version
             parent_event_id: Parent event ID in causal chain
             causal_chain_id: Causal chain identifier
+            event_id: Pre-generated event ID (uuid7). If None, a new uuid7 is generated.
+                      Pass a pre-generated ID when the event_id must reflect the time
+                      the turn started (not when the persist thread ran).
 
         Returns:
             ConversationEvent: Created event
         """
         event = ConversationEvent(
-            event_id=str(uuid7()),
+            event_id=event_id or str(uuid7()),
             user_id=user_id,
             session_id=session_id,
             agent_id=agent_id,

@@ -1,9 +1,11 @@
 # Context Window Management
 
 > **Status**: Core Design  
-> **Last Updated**: 2026-03-01  
+> **Last Updated**: 2026-03-03  
 > **Builds On**: [context-overflow-optimization.md](../implementation/context-overflow-optimization.md) (tool result handling via memory system)  
-> **Related**: [prompt-lifecycle.md](prompt-lifecycle.md), [memory-architecture.md](memory-architecture.md), [edge-cloud-execution.md](edge-cloud-execution.md)
+> **Related**: [prompt-lifecycle.md](prompt-lifecycle.md), [memory-architecture.md](memory-architecture.md), [edge-cloud-execution.md](edge-cloud-execution.md), [agent-loop-reliability.md](agent-loop-reliability.md)
+>
+> ⚠️ **2026-03-03 Update**: Eager output compression is now unconditional — `tool_output_handler.py` is called without the `_memory_store` guard. See [agent-loop-reliability.md](agent-loop-reliability.md) for the ChatLoop restructuring that enables this. `compaction.py` remains as the history-level safety net.
 
 ---
 

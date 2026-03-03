@@ -917,6 +917,36 @@ class APIClient:
         response = await self._request("GET", "/introspection/skills")
         return response.json()
 
+    async def get_introspection_context_snapshot(
+        self, session_id: str, turn_index: int | None = None, detail: bool = False
+    ) -> dict[str, Any]:
+        """Get context snapshot for a specific turn (or latest)."""
+        params: dict[str, Any] = {"session_id": session_id, "detail": detail}
+        if turn_index is not None:
+            params["turn_index"] = turn_index
+        response = await self._request("GET", "/introspection/context/snapshot", params=params)
+        return response.json()
+
+    async def get_introspection_context_trend(
+        self, session_id: str, turns: int = 10
+    ) -> dict[str, Any]:
+        """Get token usage trend across recent turns."""
+        response = await self._request(
+            "GET", "/introspection/context/trend",
+            params={"session_id": session_id, "turns": turns},
+        )
+        return response.json()
+
+    async def get_introspection_retrieval_quality(
+        self, session_id: str, turns: int = 5
+    ) -> dict[str, Any]:
+        """Get retrieval quality trend across recent turns."""
+        response = await self._request(
+            "GET", "/introspection/context/retrieval_quality",
+            params={"session_id": session_id, "turns": turns},
+        )
+        return response.json()
+
     async def get_reflect(self, session_id: str, focus: str = "auto", last_n: int = 20, question: str = "") -> dict[str, Any]:
         """Get unified diagnostic evidence (reflect + tool selection + history)."""
         params: dict[str, Any] = {"focus": focus, "last_n": last_n}

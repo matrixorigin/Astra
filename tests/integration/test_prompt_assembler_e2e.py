@@ -345,6 +345,34 @@ class TestPromptAssemblerSnapshot:
         assert "token_breakdown" in snap
         assert "sections" in snap
 
+    def test_snapshot_total_tokens_persisted(self, db_session):
+        """total_tokens must be written to ctx_snapshots — not None.
+
+        Regression: prompt_assembler._save_snapshot omitted total_tokens,
+        causing /introspection/context/trend to return current_tokens=null.
+        """
+        from core.context.prompt_assembler import PromptAssembler
+
+        pa = PromptAssembler(lambda: db_session)
+        result = pa.assemble(
+            agent_id=None, user_query="token count test", session_id=unique_test_id(), user_id=unique_test_id(),
+        )
+
+        assert result.snapshot_id is not None
+        row = db_session.execute(
+            sql_text("SELECT total_tokens, token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"),
+            {"cid": result.snapshot_id},
+        ).fetchone()
+        assert row is not None
+        assert row[0] is not None, "total_tokens must not be None"
+        assert row[0] > 0, "total_tokens must be positive"
+
+        # Verify total_tokens == sum of token_budget values
+        import json as _json
+        budget = _json.loads(row[1]) if isinstance(row[1], str) else row[1]
+        expected_total = sum(v for v in budget.values() if isinstance(v, (int, float)))
+        assert row[0] == expected_total, f"total_tokens {row[0]} != sum(budget) {expected_total}"
+
 
 # ============================================================================
 # 4. Prompt Injection Defense
@@ -833,6 +861,103 @@ class TestGetAgentInfoTool:
         assert result["memory"]["has_project_rules"] is True
         # Cloud fields not present
         assert "episodic" not in result["memory"]
+
+
+    @pytest.mark.asyncio
+    async def test_context_snapshot_dimension(self):
+        """context_snapshot dimension calls get_introspection_context_snapshot."""
+        from unittest.mock import AsyncMock
+        from cli.tools.introspection import GetAgentInfoTool
+
+        mock_api = AsyncMock()
+        mock_api.get_introspection_context_snapshot.return_value = {
+            "turn": 3, "total_tokens": 5000, "health": {"status": "healthy"},
+        }
+        tool = GetAgentInfoTool(
+            tool_router=None,
+            session_info={"session_id": "ses_1"},
+            api_client=mock_api,
+        )
+        result = json.loads(await tool.execute(dimension="context_snapshot"))
+        assert result["context_snapshot"]["turn"] == 3
+        assert result["context_snapshot"]["total_tokens"] == 5000
+        mock_api.get_introspection_context_snapshot.assert_called_once_with(
+            "ses_1", turn_index=None, detail=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_context_snapshot_with_turn_index(self):
+        """turn_index kwarg is forwarded to api_client."""
+        from unittest.mock import AsyncMock
+        from cli.tools.introspection import GetAgentInfoTool
+
+        mock_api = AsyncMock()
+        mock_api.get_introspection_context_snapshot.return_value = {"turn": 2}
+        tool = GetAgentInfoTool(
+            tool_router=None, session_info={"session_id": "ses_1"}, api_client=mock_api
+        )
+        await tool.execute(dimension="context_snapshot", turn_index=2)
+        mock_api.get_introspection_context_snapshot.assert_called_once_with(
+            "ses_1", turn_index=2, detail=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_context_trend_dimension(self):
+        """context_trend dimension calls get_introspection_context_trend."""
+        from unittest.mock import AsyncMock
+        from cli.tools.introspection import GetAgentInfoTool
+
+        mock_api = AsyncMock()
+        mock_api.get_introspection_context_trend.return_value = {
+            "trend": "growing", "current_tokens": 8000,
+        }
+        tool = GetAgentInfoTool(
+            tool_router=None, session_info={"session_id": "ses_1"}, api_client=mock_api
+        )
+        result = json.loads(await tool.execute(dimension="context_trend"))
+        assert result["context_trend"]["trend"] == "growing"
+        mock_api.get_introspection_context_trend.assert_called_once_with("ses_1")
+
+    @pytest.mark.asyncio
+    async def test_retrieval_quality_dimension(self):
+        """retrieval_quality dimension calls get_introspection_retrieval_quality."""
+        from unittest.mock import AsyncMock
+        from cli.tools.introspection import GetAgentInfoTool
+
+        mock_api = AsyncMock()
+        mock_api.get_introspection_retrieval_quality.return_value = {
+            "overall_quality": "good", "mean_relevance": 0.75,
+        }
+        tool = GetAgentInfoTool(
+            tool_router=None, session_info={"session_id": "ses_1"}, api_client=mock_api
+        )
+        result = json.loads(await tool.execute(dimension="retrieval_quality"))
+        assert result["retrieval_quality"]["overall_quality"] == "good"
+        mock_api.get_introspection_retrieval_quality.assert_called_once_with("ses_1")
+
+    @pytest.mark.asyncio
+    async def test_new_dimensions_graceful_on_api_failure(self):
+        """API failure on new dimensions returns error key, doesn't crash."""
+        from unittest.mock import AsyncMock
+        from cli.tools.introspection import GetAgentInfoTool
+
+        mock_api = AsyncMock()
+        mock_api.get_introspection_context_snapshot.side_effect = ConnectionError("offline")
+        tool = GetAgentInfoTool(
+            tool_router=None, session_info={"session_id": "ses_1"}, api_client=mock_api
+        )
+        result = json.loads(await tool.execute(dimension="context_snapshot"))
+        assert "error" in result["context_snapshot"]
+
+    @pytest.mark.asyncio
+    async def test_new_dimensions_no_session(self):
+        """Without session_id, new dimensions return error gracefully."""
+        from cli.tools.introspection import GetAgentInfoTool
+
+        tool = GetAgentInfoTool(tool_router=None, session_info={}, api_client=None)
+        for dim in ("context_snapshot", "context_trend", "retrieval_quality"):
+            result = json.loads(await tool.execute(dimension=dim))
+            assert "error" in result[dim]
 
 
 # ============================================================================

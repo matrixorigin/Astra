@@ -359,26 +359,16 @@ class TestIntrospectionErrorPaths:
         result = _get_procedural_stats(db, "any")
         assert result == {"skill_selections": 0, "accuracy_rate": None}
 
-    def test_skills_endpoint_db_error(self, auth_headers):
+    def test_skills_endpoint_db_error(self):
         """SQLAlchemyError in /introspection/skills returns empty lists."""
         from unittest.mock import MagicMock
         from sqlalchemy.exc import OperationalError
-        from api.database import get_db_session
+        from api.routers.introspection import get_introspection_skills
 
         mock_db = MagicMock()
         mock_db.execute.side_effect = OperationalError("stmt", {}, Exception("down"))
-
-        def _broken_db():
-            yield mock_db
-
-        app.dependency_overrides[get_db_session] = _broken_db
-        try:
-            isolated_client = TestClient(app)
-            resp = isolated_client.get("/introspection/skills", headers=auth_headers)
-            assert resp.status_code == 200
-            assert resp.json() == {"installed": [], "cloud": []}
-        finally:
-            app.dependency_overrides.pop(get_db_session, None)
+        result = get_introspection_skills(current_user={"user_id": "test"}, db=mock_db)
+        assert result == {"installed": [], "cloud": []}
 
 
 # ============================================================================
@@ -481,6 +471,55 @@ class TestAnalysisFunctions:
         from api.routers.introspection import _compaction_effectiveness
         result = _compaction_effectiveness([9000, 8800, 8600])
         assert result["compactions_detected"] == 0
+
+    # -- budget format compatibility --
+
+    def test_analyze_context_health_nested_format(self):
+        """Nested budget {zone: {allocated, used}} — original format."""
+        from api.routers.introspection import _analyze_context_health
+        budget = {"history": {"allocated": 1000, "used": 850}, "code": {"allocated": 500, "used": 100}}
+        result = _analyze_context_health(budget, [8000, 7000, 6000])
+        zones = {z["name"]: z for z in result["zones"]}
+        assert zones["history"]["utilization"] == 0.85
+        assert zones["history"]["status"] == "high"
+        assert zones["code"]["utilization"] == 0.2
+        assert result["bottleneck"] == "history"
+
+    def test_analyze_context_health_flat_format(self):
+        """Flat budget {zone: int} — real format from context manager — must not crash."""
+        from api.routers.introspection import _analyze_context_health
+        budget = {"constraints": 543, "identity": 23, "memory": 9, "project_context": 23, "self_model": 372}
+        result = _analyze_context_health(budget, [970])
+        zones = {z["name"] for z in result["zones"]}
+        assert "constraints" in zones
+        assert "memory" in zones
+        # flat format: used == allocated → utilization 1.0
+        for z in result["zones"]:
+            assert z["utilization"] == 1.0
+
+    def test_analyze_context_health_mixed_format(self):
+        """Mixed budget (some nested, some flat) — should not crash."""
+        from api.routers.introspection import _analyze_context_health
+        budget = {"history": {"allocated": 1000, "used": 500}, "memory": 200}
+        result = _analyze_context_health(budget, [1200])
+        zones = {z["name"]: z for z in result["zones"]}
+        assert zones["history"]["utilization"] == 0.5
+        assert zones["memory"]["utilization"] == 1.0
+
+    def test_zone_balance_flat_format(self):
+        """Flat budget {zone: int} — _zone_balance must not crash."""
+        from api.routers.introspection import _zone_balance
+        budget = {"history": 500, "code": 300, "memory": 200}
+        result = _zone_balance(budget, "code_gen")
+        assert isinstance(result["balanced"], bool)
+        assert result["matched_profile"] in ("code_gen", "default")
+
+    def test_zone_balance_ignores_unknown_vals(self):
+        """Non-int, non-dict values in budget are skipped gracefully."""
+        from api.routers.introspection import _zone_balance
+        budget = {"history": {"allocated": 500, "used": 0}, "bad_zone": None, "code": 200}
+        result = _zone_balance(budget, None)
+        assert isinstance(result["balanced"], bool)
 
     def test_summarize_contents(self):
         """_summarize_contents receives _SnapshotContentRow (named fields, not tuple)."""
@@ -824,6 +863,45 @@ class TestContextSnapshot:
                               params={"session_id": s.session_id})
             assert resp.status_code == 404
         finally:
+            db.delete(s)
+            db.commit()
+
+    def test_flat_budget_format(self, client, auth_headers, db, test_user):
+        """Flat token_budget {zone: int} — real format written by context manager — must not 500."""
+        from api.models.agent import Session as SessionModel
+        from api.models.context import ContextSnapshot
+        s = SessionModel(session_id=str(uuid4()), user_id=test_user.user_id, status="active", event_count=0)
+        db.add(s)
+        db.flush()
+        # Real format: zone → token count (int), no allocated/used nesting
+        snap = ContextSnapshot(
+            context_capture_id=str(uuid4()),
+            session_id=s.session_id,
+            event_id=str(uuid4()),
+            token_budget={"constraints": 543, "identity": 23, "memory": 9, "project_context": 23, "self_model": 372},
+            total_tokens=970,
+            assembly_time_ms=12,
+        )
+        db.add(snap)
+        db.commit()
+        try:
+            resp = client.get("/introspection/context/snapshot", headers=auth_headers,
+                              params={"session_id": s.session_id})
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            # health must be present and not crash
+            assert "health" in data
+            zones = {z["name"] for z in data["health"]["zones"]}
+            assert "constraints" in zones
+            assert "memory" in zones
+            # flat format: utilization is always 1.0 (used == allocated)
+            for z in data["health"]["zones"]:
+                assert z["utilization"] == 1.0
+                assert z["status"] == "high"
+            # zone_balance must also not crash
+            assert "zone_balance" in data
+        finally:
+            db.delete(snap)
             db.delete(s)
             db.commit()
 

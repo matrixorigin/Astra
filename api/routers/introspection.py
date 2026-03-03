@@ -81,13 +81,23 @@ def _compute_trend(token_history: list[int]) -> str:
 # ---------------------------------------------------------------------------
 
 def _analyze_context_health(budget: dict, total_tokens_history: list[int]) -> dict:
-    """Compute zone utilization, bottleneck, trend, recommendation."""
+    """Compute zone utilization, bottleneck, trend, recommendation.
+
+    Supports two budget formats:
+    - Nested: {"zone": {"allocated": N, "used": M}}
+    - Flat:   {"zone": N}  (token count only; treat as fully utilized)
+    """
     zones = []
     bottleneck_zone = None
     bottleneck_util = 0.0
     for zone, vals in budget.items():
-        allocated = vals.get("allocated", 0)
-        used = vals.get("used", 0)
+        if isinstance(vals, dict):
+            allocated = vals.get("allocated", 0)
+            used = vals.get("used", 0)
+        elif isinstance(vals, (int, float)):
+            allocated = used = vals
+        else:
+            continue
         if allocated <= 0:
             continue
         util = round(used / allocated, 2)
@@ -116,13 +126,20 @@ def _analyze_context_health(budget: dict, total_tokens_history: list[int]) -> di
 
 def _zone_balance(budget: dict, task_type: str | None) -> dict:
     """Check if zone allocation matches the task type's ideal distribution."""
+    def _alloc(v: object) -> int:
+        if isinstance(v, dict):
+            return v.get("allocated", 0)
+        if isinstance(v, (int, float)):
+            return int(v)
+        return 0
+
     managed_zones = {k: v for k, v in budget.items()
-                     if k not in ("system", "skills", "reserve") and v.get("allocated", 0) > 0}
+                     if k not in ("system", "skills", "reserve") and _alloc(v) > 0}
     if not managed_zones:
         return {"balanced": True, "misallocated_zone": None, "matched_profile": None}
 
-    total_alloc = sum(v["allocated"] for v in managed_zones.values())
-    actual = {k: v["allocated"] / total_alloc for k, v in managed_zones.items()}
+    total_alloc = sum(_alloc(v) for v in managed_zones.values())
+    actual = {k: _alloc(v) / total_alloc for k, v in managed_zones.items()}
 
     profile = task_type or ""
     ideal = _IDEAL_ZONE_WEIGHTS.get(profile, _DEFAULT_WEIGHTS)

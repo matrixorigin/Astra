@@ -26,7 +26,8 @@ class TestPersistFieldCompleteness:
 
     def _run_persist(self, *, tool_calls=None, full_text="response",
                      model_used="gpt-4o", token_usage=None,
-                     messages=None, tool_results=None):
+                     messages=None, tool_results=None,
+                     turn_chain_id=None, user_query_event_id=None):
         """Helper: run _persist_turn_events and capture all EventLogger calls."""
         tool_calls = tool_calls or []
         messages = messages or [{"role": "user", "content": "hello"}]
@@ -61,6 +62,8 @@ class TestPersistFieldCompleteness:
                 context_capture_id="snap1",
                 model_used=model_used,
                 token_usage=token_usage,
+                turn_chain_id=turn_chain_id,
+                user_query_event_id=user_query_event_id,
             )
         return captured
 
@@ -115,6 +118,28 @@ class TestPersistFieldCompleteness:
         c = self._run_persist()
         assert c["user_query"]["user_id"] == "u1"
         assert c["user_query"]["session_id"] == "s1"
+
+    # -- turn_chain_id propagation --
+
+    def test_turn_chain_id_used_when_provided(self):
+        """When turn_chain_id is passed, create_user_query receives it."""
+        c = self._run_persist(turn_chain_id="pre-generated-chain")
+        assert c["user_query"]["causal_chain_id"] == "pre-generated-chain"
+
+    def test_user_query_event_id_used_when_provided(self):
+        """Pre-generated user_query_event_id is forwarded to create_user_query.
+
+        Regression: event_id was generated inside the persist thread, so its
+        uuid7 timestamp reflected persist time (potentially Turn N+1) rather
+        than the time the turn actually started.
+        """
+        c = self._run_persist(user_query_event_id="pre-generated-event-id")
+        assert c["user_query"]["event_id"] == "pre-generated-event-id"
+
+    def test_user_query_event_id_none_when_not_provided(self):
+        """When user_query_event_id is not passed, event_id is None (EventLogger generates it)."""
+        c = self._run_persist()
+        assert c["user_query"].get("event_id") is None
 
     # -- tool_call event fields --
 
@@ -497,3 +522,40 @@ class TestNullableJSON:
         """NullableJSON must NOT override process_result_value — no backward compat."""
         from api.models._types import NullableJSON
         assert "process_result_value" not in NullableJSON.__dict__
+
+
+class TestSessionActivityUpdate:
+    """Phase 5: _persist_turn_events updates session event_count."""
+
+    def test_event_count_updated_after_persist(self):
+        """session event_count is set to actual event count in DB."""
+        mock_db = MagicMock()
+        # First execute = SELECT COUNT(*), second = UPDATE
+        mock_scalar = MagicMock(return_value=7)
+        mock_db.execute.return_value.scalar.return_value = 7
+
+        with patch("api.routers.chat.SessionLocal", return_value=mock_db), \
+             patch("core.events.event_logger.EventLogger") as mock_el_cls, \
+             patch("core.agent.turn_hooks.TurnHooks"):
+            mock_el = MagicMock()
+            mock_el.create_user_query.return_value = MagicMock(
+                event_id="ev1", causal_chain_id="cc1",
+            )
+            mock_el.create_llm_response.return_value = MagicMock()
+            mock_el.create_stream_event.return_value = MagicMock()
+            mock_el_cls.return_value = mock_el
+
+            from api.routers.chat import _persist_turn_events
+            _persist_turn_events(
+                "u1", "s1",
+                [{"role": "user", "content": "hi"}], None,
+                "response", [],
+            )
+
+        # Phase 5 issues a SELECT COUNT + UPDATE via execute()
+        all_calls = mock_db.execute.call_args_list
+        # The last two execute calls should be the count query and the update
+        update_call = all_calls[-1]
+        update_params = update_call[1][0] if update_call[1] else update_call[0][1]
+        assert update_params["cnt"] == 7
+        assert update_params["sid"] == "s1"

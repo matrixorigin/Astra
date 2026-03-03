@@ -28,6 +28,7 @@ Five problems block AI agents from production adoption:
 | 3 | **Memory is broken** | Agents forget across sessions. Knowledge updates silently invalidate past answers. No memory lifecycle. | ✅ **SOLVED**: Episodic/semantic/procedural memory with automated governance (confidence decay, quarantine, compression). Distributed scheduling ensures multi-instance safety. |
 | 4 | **Experimentation is expensive** | Testing on production data requires full copies. Most teams skip it. |
 | 5 | **Trust is unverifiable** | No confidence signals, no claim verification, no audit trail for compliance. |
+| 6 | **Agent loops are unreliable** | Wrong tool selection, futile retries, context bloat, silent failures. No cost governance. | 🔵 **DESIGNED**: See [agent-loop-reliability.md](agent-loop-reliability.md) — ChatLoop restructured into unified execution pipeline with TurnState, intent routing, circuit breaker, and structured failure reporting. |
 
 ## Core Thesis
 

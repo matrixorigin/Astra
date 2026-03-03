@@ -1,10 +1,13 @@
 # Skills and Tools
 
 > **Status**: Core Design — single source of truth for skill system, packaging, selection, and tool integration
-> **Last Updated**: 2026-02-28
+> **Last Updated**: 2026-03-03
+> **Related**: [agent-loop-reliability.md](agent-loop-reliability.md) (pre-LLM task routing and tool scoping)
 >
 > 🔵 **Implementation Status**: `SkillManager` (install/uninstall/upgrade/rollback with full dependency validation, credential CRUD) and `SkillPipeline` (unified selection) are implemented.
 > Marketplace discovery, publishing, RBAC, and MatrixOne Publication distribution are Design Targets.
+>
+> ⚠️ **2026-03-03 Update**: Intent-based tool scoping (ROUTE stage in ChatLoop's execution pipeline) post-filters `ModernSkillSelector` output. See [agent-loop-reliability.md](agent-loop-reliability.md). The selector does semantic retrieval; the router does intent-based scoping on the result.
 
 ---
 

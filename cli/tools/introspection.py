@@ -38,13 +38,17 @@ class GetAgentInfoTool(EdgeTool):
     @property
     def description(self) -> str:
         return (
-            "Query your own runtime state: available tools, session info, "
-            "active permissions, and turn count. "
-            "Use this when the user asks about your current capabilities at runtime "
-            "(e.g. 'what tools do you have right now?', 'what's your session id?', "
-            "'how many turns have we used?'). "
-            "For general identity questions ('who are you?', 'what can you do?'), "
-            "answer from your Self-Model section instead of calling this tool."
+            "Query your CURRENT runtime state and context usage. "
+            "Use this when the user asks about: "
+            "context window usage (上下文使用详情), token consumption (token 用量/消耗), "
+            "how much context was used for a question (这个问题用了多少上下文), "
+            "memory contents or stats (记忆/memory), "
+            "available tools right now, session id, turn count, or active permissions. "
+            "Examples: 'what tools do you have?', 'how many tokens did that use?', "
+            "'show me context usage', '上下文用了多少', 'token 用了多少', "
+            "'what's in your memory?', 'what's your session id?'. "
+            "For diagnosing past tool failures or slow responses, use reflect instead. "
+            "For general identity questions ('who are you?'), answer from your Self-Model section."
         )
 
     @property
@@ -54,8 +58,18 @@ class GetAgentInfoTool(EdgeTool):
             "properties": {
                 "dimension": {
                     "type": "string",
-                    "enum": ["capability", "state", "memory", "identity", "all"],
-                    "description": "Which dimension to query. 'all' returns everything.",
+                    "enum": ["capability", "state", "memory", "identity", "context_snapshot", "context_trend", "retrieval_quality", "all"],
+                    "description": (
+                        "Which dimension to query. "
+                        "'context_snapshot': token usage, zone balance, relevance, pollution for a specific turn (上下文使用详情/某个问题用了多少上下文). "
+                        "'context_trend': token growth trend across recent turns (token趋势/上下文增长). "
+                        "'retrieval_quality': how well memory retrieval is working (检索质量). "
+                        "'all' returns everything except raw context content."
+                    ),
+                },
+                "turn_index": {
+                    "type": "integer",
+                    "description": "For context_snapshot: which turn to inspect (1-based). Omit for latest turn.",
                 },
             },
             "required": ["dimension"],
@@ -65,7 +79,7 @@ class GetAgentInfoTool(EdgeTool):
     def side_effect(self) -> SideEffect:
         return SideEffect.READ
 
-    _VALID_DIMENSIONS = {"capability", "state", "memory", "identity", "all"}
+    _VALID_DIMENSIONS = {"capability", "state", "memory", "identity", "context_snapshot", "context_trend", "retrieval_quality", "all"}
 
     async def execute(self, dimension: str = "all", **kwargs: Any) -> str:
         if dimension not in self._VALID_DIMENSIONS:
@@ -127,5 +141,37 @@ class GetAgentInfoTool(EdgeTool):
                 "agent_id": self._session.get("agent_id"),
                 "agent_type": self._session.get("agent_type", "default"),
             }
+
+        session_id = self._session.get("session_id")
+
+        if dimension in ("context_snapshot",):
+            turn_index = kwargs.get("turn_index")
+            if self._api_client and session_id:
+                try:
+                    info["context_snapshot"] = await self._api_client.get_introspection_context_snapshot(
+                        session_id, turn_index=turn_index, detail=True
+                    )
+                except Exception as exc:
+                    info["context_snapshot"] = {"error": str(exc)}
+            else:
+                info["context_snapshot"] = {"error": "no session or api_client"}
+
+        if dimension in ("context_trend",):
+            if self._api_client and session_id:
+                try:
+                    info["context_trend"] = await self._api_client.get_introspection_context_trend(session_id)
+                except Exception as exc:
+                    info["context_trend"] = {"error": str(exc)}
+            else:
+                info["context_trend"] = {"error": "no session or api_client"}
+
+        if dimension in ("retrieval_quality",):
+            if self._api_client and session_id:
+                try:
+                    info["retrieval_quality"] = await self._api_client.get_introspection_retrieval_quality(session_id)
+                except Exception as exc:
+                    info["retrieval_quality"] = {"error": str(exc)}
+            else:
+                info["retrieval_quality"] = {"error": "no session or api_client"}
 
         return json.dumps(info, indent=2)
