@@ -30,7 +30,7 @@ logger = get_logger(__name__)
 #   the LLM to hallucinate "data quality issues" on perfectly valid data.
 PASSTHROUGH_TOOLS: frozenset[str] = frozenset({
     "read_file", "write_file", "bash", "grep", "glob", "list_dir", "git",
-    "get_agent_info", "reflect",
+    "get_agent_info", "reflect", "introspection",
 })
 
 _MAX_DEPTH = 4

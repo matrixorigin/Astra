@@ -110,6 +110,65 @@ class TestRegressionGetAgentInfoFalseDegradation:
         assert annotated == tool_result
 
 
+class TestRegressionCloudIntrospectionFalseDegradation:
+    """Reproduce session 019cb35c: cloud path uses tool name 'introspection',
+    not 'get_agent_info'. Without passthrough, zeros → 0.4 → LLM parrots
+    '数据质量降级（得分0.4）'.
+
+    Same root cause as get_agent_info (019cb34f) but different tool name:
+    - CLI edge path → tool name 'get_agent_info'
+    - Cloud API path → tool name 'introspection'
+    Both return runtime metadata where zeros are legitimate on first turn.
+    """
+
+    # Payload from cloud /introspection/memory endpoint on a new session's
+    # first turn (0 events, 0 snapshots, 0 skill selections).
+    # Structure matches api/routers/introspection.py _get_*_stats() returns.
+    CLOUD_RESULT = {
+        "episodic": {"total_events": 0, "user_queries": 0, "tool_calls": 0},
+        "semantic": {"ctx_snapshots": 0, "peak_snapshot_tokens": 0},
+        "procedural": {"skill_selections": 0, "accuracy_rate": None},
+    }
+
+    def test_old_behaviour_would_score_degraded(self):
+        """Prove the bug: without passthrough, all-zero cloud payload scores 0.4."""
+        from core.verification.tool_quality import _score_to_grade, flatten_json
+
+        leaves = list(flatten_json(self.CLOUD_RESULT))
+        total = len(leaves)
+        empty_count = sum(
+            1 for _, v in leaves if v is None or v == {} or v == [] or v == ""
+        )
+        zero_count = sum(
+            1 for _, v in leaves if isinstance(v, (int, float)) and v == 0
+        )
+        numeric_count = sum(1 for _, v in leaves if isinstance(v, (int, float)))
+
+        non_empty = total - empty_count
+        score = non_empty / total if total > 0 else 0.0
+        if zero_count >= 3 and numeric_count > 0 and zero_count / numeric_count > 0.5:
+            score = min(score, 0.4)
+
+        assert score == pytest.approx(0.4), (
+            f"Without fix, score should be 0.4 (degraded), got {score}"
+        )
+        assert _score_to_grade(score) == "degraded"
+
+    def test_fix_scores_complete(self):
+        """After fix: introspection is passthrough → score 1.0."""
+        assert "introspection" in PASSTHROUGH_TOOLS
+        a = assess_tool_result("introspection", self.CLOUD_RESULT)
+        assert a.score == 1.0
+        assert a.grade == "complete"
+        assert a.signals == []
+
+    def test_no_annotation_injected(self):
+        """No misleading [TOOL QUALITY: DEGRADED] annotation for LLM to parrot."""
+        a = assess_tool_result("introspection", self.CLOUD_RESULT)
+        tr = {"name": "introspection", "result": json.dumps(self.CLOUD_RESULT)}
+        assert annotate_tool_result(tr, a) == tr
+
+
 # ── Tier 2: structural inference ─────────────────────────────────────────────
 
 class TestStructuralInference:
