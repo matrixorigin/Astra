@@ -422,8 +422,17 @@ class TestCLIEdgeMode:
 
     def test_chat_uses_edge_path(self, runner):
         """Chat always uses _run_edge_turn."""
+        from cli.edge_chat_loop import ChatLoopResult
+
+        call_count = 0
+
+        async def fake_edge(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return ChatLoopResult(text="ok")
+
         with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
-             patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
+             patch("cli.mo_agent_api._run_edge_turn", new=fake_edge):
             mock_client = _make_chat_mock(MagicMock())
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = True
@@ -431,12 +440,22 @@ class TestCLIEdgeMode:
             mock_client.create_session.return_value = {"session_id": "ses_1"}
 
             runner.invoke(agent_cli, ["chat"], input="hello\n/exit\n")
-            assert mock_edge.called
+            assert call_count > 0
 
     def test_auto_approve_flag_passed(self, runner):
         """--auto-approve flag is forwarded to _run_edge_turn."""
+        from cli.edge_chat_loop import ChatLoopResult
+
+        captured_kwargs: dict = {}
+
+        async def fake_edge(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            # auto_approve is the 6th positional arg
+            captured_kwargs["auto_approve"] = args[5] if len(args) > 5 else None
+            return ChatLoopResult(text="ok")
+
         with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
-             patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
+             patch("cli.mo_agent_api._run_edge_turn", new=fake_edge):
             mock_client = _make_chat_mock(MagicMock())
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = True
@@ -444,13 +463,15 @@ class TestCLIEdgeMode:
             mock_client.create_session.return_value = {"session_id": "ses_1"}
 
             runner.invoke(agent_cli, ["chat", "--auto-approve"], input="hello\n/exit\n")
-            assert args[0][5] is True if (args := mock_edge.call_args) else False
+            assert captured_kwargs.get("auto_approve") is True
 
     def test_debug_flag_shows_traceback(self, runner):
         """--debug prints full traceback on error."""
+        async def raise_boom(*args, **kwargs):
+            raise ValueError("test boom")
+
         with patch("cli.mo_agent_api.SyncAPIClient") as mock_client_class, \
-             patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
-            mock_edge.side_effect = ValueError("test boom")
+             patch("cli.mo_agent_api._run_edge_turn", new=raise_boom):
             mock_client = _make_chat_mock(MagicMock())
             mock_client_class.return_value = mock_client
             mock_client.ensure_authenticated.return_value = True

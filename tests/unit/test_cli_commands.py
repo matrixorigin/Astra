@@ -45,12 +45,16 @@ def mock_api_client():
     """
     with patch("cli.mo_agent_api.SyncAPIClient") as mock:
         client_instance = MagicMock()
-        # _run must actually execute coroutines for chat tests
+        # _run must actually execute coroutines for chat tests.
+        # Use a dedicated event loop (mirrors real SyncAPIClient behaviour).
         import asyncio
-        client_instance._run.side_effect = lambda coro: asyncio.run(coro)
+
+        _loop = asyncio.new_event_loop()
+        client_instance._run.side_effect = _loop.run_until_complete
         client_instance._ensure_client.return_value = client_instance
         mock.return_value = client_instance
         yield client_instance
+        _loop.close()
 
 
 @pytest.fixture
@@ -92,21 +96,6 @@ class TestAgentCLIToAPI:
         assert result.exit_code == 0
         mock_api_client.register.assert_called_once_with("testuser", "password123", "new@example.com")
         assert "✅ Registered" in result.output
-
-    def test_register_auto_logs_in(self, runner, mock_api_client):
-        """Test that register auto-logs in so credentials are persisted."""
-        mock_api_client.register.return_value = {"email": "new@example.com"}
-
-        runner.invoke(
-            agent_cli,
-            ["register"],
-            input="new@example.com\npassword123\npassword123\ntestuser\n"
-        )
-
-        # register() now calls login() internally — verify login was NOT called
-        # separately by CLI (it's handled inside api_client.register)
-        # The key assertion: register is called (which internally calls login)
-        mock_api_client.register.assert_called_once_with("testuser", "password123", "new@example.com")
 
     def test_session_list_calls_api_client(self, runner, mock_api_client):
         """Test session list command calls API client."""
@@ -212,20 +201,6 @@ class TestAdminCLIToAPI:
         )
         assert "✅ Admin registered" in result.output
 
-    def test_admin_register_auto_logs_in(self, runner, mock_admin_api_client):
-        """Test that admin_register auto-logs in so next command is authenticated."""
-        mock_admin_api_client.admin_register.return_value = {"username": "newadmin"}
-
-        runner.invoke(
-            admin_cli,
-            ["register"],
-            input="newadmin\npassword123\n"
-        )
-
-        # admin_register() now calls login() internally — the CLI should NOT
-        # call login separately; it's handled inside api_client.admin_register
-        mock_admin_api_client.admin_register.assert_called_once()
-
     def test_token_create_calls_api_client(self, runner, mock_admin_api_client):
         """Test token create command calls API client."""
         mock_admin_api_client.ensure_authenticated.return_value = True
@@ -296,31 +271,41 @@ class TestEdgeChatE2E:
 
     def test_chat_calls_edge_turn(self, runner, mock_api_client):
         """Chat command calls _run_edge_turn, not chat_stream."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
+        from cli.edge_chat_loop import ChatLoopResult
 
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.create_session.return_value = {"session_id": "sess-123"}
         mock_api_client.close_session.return_value = {}
 
-        with patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
+        call_count = 0
+
+        async def fake_edge(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return ChatLoopResult(text="ok")
+
+        with patch("cli.mo_agent_api._run_edge_turn", new=fake_edge):
             runner.invoke(
                 agent_cli,
                 ["chat", "--user-id", "alice"],
                 input="test message\nexit\n",
             )
-            mock_edge.assert_called()
+            assert call_count > 0
             assert not mock_api_client.chat_stream.called
 
     def test_chat_debug_shows_traceback(self, runner, mock_api_client):
         """--debug flag prints full traceback on error."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import patch
 
         mock_api_client.ensure_authenticated.return_value = True
         mock_api_client.create_session.return_value = {"session_id": "sess-123"}
         mock_api_client.close_session.return_value = {}
 
-        with patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
-            mock_edge.side_effect = ValueError("boom")
+        async def raise_boom(*args, **kwargs):
+            raise ValueError("boom")
+
+        with patch("cli.mo_agent_api._run_edge_turn", new=raise_boom):
             result = runner.invoke(
                 agent_cli,
                 ["chat", "--debug"],
@@ -328,6 +313,37 @@ class TestEdgeChatE2E:
             )
             assert "Traceback" in result.output
             assert "boom" in result.output
+
+    def test_session_info_persists_across_turns(self, runner, mock_api_client):
+        """session_info is reused across turns so turn count accumulates correctly."""
+        from unittest.mock import patch
+        from cli.edge_chat_loop import ChatLoopResult
+
+        mock_api_client.ensure_authenticated.return_value = True
+        mock_api_client.create_session.return_value = {"session_id": "sess-123"}
+        mock_api_client.close_session.return_value = {}
+
+        captured_session_infos = []
+
+        async def fake_edge_turn(*args, session_info=None, **kwargs):
+            captured_session_infos.append(session_info)
+            return ChatLoopResult(text="ok", usage={"prompt_tokens": 100, "completion_tokens": 20})
+
+        with patch("cli.mo_agent_api._run_edge_turn", new=fake_edge_turn):
+            runner.invoke(
+                agent_cli,
+                ["chat", "--user-id", "alice"],
+                input="first message\nsecond message\nexit\n",
+            )
+
+        assert len(captured_session_infos) == 2
+        # Same dict object reused across turns
+        assert captured_session_infos[0] is captured_session_infos[1]
+        # turn incremented after each turn
+        assert captured_session_infos[1]["turn"] == 2
+        # token usage updated
+        assert captured_session_infos[1]["prompt_tokens"] == 100
+        assert captured_session_infos[1]["completion_tokens"] == 20
 
 
 class TestLogoutCommand:

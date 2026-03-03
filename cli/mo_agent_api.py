@@ -1153,7 +1153,7 @@ async def _prefetch_cloud_skills(api_client) -> str | None:
         return None
 
 
-async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False):
+async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False, session_info=None):
     """Run one edge chat loop turn using the provided APIClient."""
     import os
     from cli.edge_chat_loop import edge_chat_loop
@@ -1181,7 +1181,8 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
 
     from cli.tools.introspection import GetAgentInfoTool
     from cli.tools.reflect import ReflectTool
-    session_info = {"session_id": session_id, "agent_id": agent_id, "model": model, "turn": 0}
+    if session_info is None:
+        session_info = {"session_id": session_id, "agent_id": agent_id or "default-agent", "model": model, "turn": 0}
     perms = PermissionManager(auto_approve=auto_approve)
 
     router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client))
@@ -1370,6 +1371,12 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
         "selected_model": selected_model,
         "last_response": "",
         "turn_history": [],
+        "session_info": {
+            "session_id": session_id,
+            "agent_id": user_id or "default-agent",
+            "model": selected_model,
+            "turn": 0,
+        },
     }
 
     # --- Choose renderer + input method ---
@@ -1461,6 +1468,11 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                 # Determine if explain is enabled (CLI flag or interactive toggle)
                 should_explain = explain or state.get("explain_mode", False)
 
+                # Sync mutable fields from state into session_info before each turn,
+                # so /model and /clear changes are visible to GetAgentInfoTool.
+                state["session_info"]["session_id"] = state["session_id"]
+                state["session_info"]["model"] = state.get("selected_model")
+
                 if hasattr(renderer, "begin_response"):
                     renderer.begin_response()
                 loop_result = client._run(_run_edge_turn(
@@ -1469,6 +1481,7 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                     renderer=renderer,
                     extra_rules=skill_dev_rules,
                     explain=should_explain,
+                    session_info=state["session_info"],
                 ))
                 result_text = loop_result.text
                 if hasattr(renderer, "end_response"):
@@ -1505,10 +1518,10 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                 state["last_response"] = result_text or ""
                 state["turn_history"].append({"role": "user", "preview": user_input[:80]})
                 state["turn_history"].append({"role": "assistant", "preview": (result_text or "")[:80]})
-                session_info["turn"] = turn_count
+                state["session_info"]["turn"] = turn_count
                 if loop_result.usage:
-                    session_info["prompt_tokens"] = loop_result.usage.get("prompt_tokens", 0)
-                    session_info["completion_tokens"] = loop_result.usage.get("completion_tokens", 0)
+                    state["session_info"]["prompt_tokens"] = loop_result.usage.get("prompt_tokens", 0)
+                    state["session_info"]["completion_tokens"] = loop_result.usage.get("completion_tokens", 0)
                 if status_bar:
                     status_bar.update(turn=turn_count)
             except AuthenticationError:

@@ -816,16 +816,24 @@ class TestChatStreamingRealE2E:
     
     def test_chat_uses_edge_execution(self, authenticated_runner, db, client):
         """Test that chat command uses edge execution path."""
-        from unittest.mock import patch, AsyncMock
+        from unittest.mock import patch
+        from cli.edge_chat_loop import ChatLoopResult
 
-        with patch("cli.mo_agent_api._run_edge_turn", new_callable=AsyncMock) as mock_edge:
-            result = authenticated_runner.invoke(
+        call_count = 0
+
+        async def fake_edge(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return ChatLoopResult(text="ok")
+
+        with patch("cli.mo_agent_api._run_edge_turn", new=fake_edge):
+            authenticated_runner.invoke(
                 agent_cli,
                 ["--api-url", "http://test", "chat"],
                 input="Hello\n/exit\n"
             )
             # Should have called edge turn, not cloud chat
-            mock_edge.assert_called()
+            assert call_count > 0
 
 
 class TestUserRegistrationRealE2E:
