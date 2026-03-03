@@ -154,6 +154,34 @@ def register_summary_strategy(tool_name: str, strategy: Callable[[str], str]) ->
     SUMMARY_GENERATORS[tool_name] = strategy
 
 
+def _summarize_list_dir(output: str) -> str:
+    """Summarize directory listing: top-level dirs with file counts."""
+    stripped = output.strip()
+    lines = stripped.split('\n') if stripped else []
+    top_dirs = []
+    top_files = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Top-level dir: first segment contains "/" but no deeper nesting
+        # e.g. "api/", "api/  (42 files)", but not "api/models/foo.py"
+        first_slash = stripped.find('/')
+        if first_slash >= 0:
+            after_slash = stripped[first_slash + 1:].lstrip()
+            # Top-level if nothing after slash, or only "(N files)" annotation
+            if not after_slash or after_slash.startswith('('):
+                top_dirs.append(stripped)
+        else:
+            top_files.append(stripped)
+    return (
+        f"Directory listing: {len(lines)} entries\n"
+        f"Top-level directories:\n" + '\n'.join(top_dirs[:30]) +
+        (f"\n... and {len(top_dirs)-30} more dirs" if len(top_dirs) > 30 else "") +
+        (f"\n{len(top_files)} files in root" if top_files else "")
+    )
+
+
 def _summarize_json(output: str) -> str:
     """Summarize JSON output: keys + sample values."""
     try:
@@ -187,6 +215,8 @@ SUMMARY_GENERATORS.update({
     "read_file": _summarize_file_content,
     "web_fetch": _summarize_default,  # HTML too varied for rules
     "api_call": _summarize_json,
+    "list_dir": _summarize_list_dir,
+    "list_directory": _summarize_list_dir,
 })
 
 

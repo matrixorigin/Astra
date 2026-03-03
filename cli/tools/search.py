@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from cli.tools.base import EdgeTool, SideEffect
+from cli.tools._gitignore import load_gitignore
 
 MAX_MATCHES = 200
 MAX_OUTPUT = 30 * 1024  # 30KB (~7K tokens)
@@ -15,6 +16,7 @@ MAX_OUTPUT = 30 * 1024  # 30KB (~7K tokens)
 class GrepTool(EdgeTool):
     def __init__(self, project_root: str):
         self._root = project_root
+        self._ignore_spec = load_gitignore(project_root)
 
     name = "grep"
     description = "Search for a regex pattern in files. Returns matching lines with file paths and line numbers."
@@ -84,10 +86,16 @@ class GrepTool(EdgeTool):
 
     def _iter_files(self, root: Path, include: str | None) -> list[Path]:
         files = []
-        skip = {".git", "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache", "dist", "build"}
         for item in root.rglob("*"):
-            if any(p in item.parts for p in skip):
+            if item.name.startswith(".") or any(p.startswith(".") for p in item.relative_to(root).parts):
                 continue
+            if self._ignore_spec:
+                try:
+                    rel = str(item.relative_to(Path(self._root)))
+                    if self._ignore_spec.match_file(rel + ("/" if item.is_dir() else "")):
+                        continue
+                except ValueError:
+                    pass  # item outside project root (e.g. symlink); skip filter
             if item.is_file():
                 if include and not fnmatch.fnmatch(item.name, include):
                     continue
@@ -98,6 +106,7 @@ class GrepTool(EdgeTool):
 class GlobTool(EdgeTool):
     def __init__(self, project_root: str):
         self._root = project_root
+        self._ignore_spec = load_gitignore(project_root)
 
     name = "glob"
     description = "Find files matching a glob pattern."
@@ -116,11 +125,19 @@ class GlobTool(EdgeTool):
         if not base.is_dir():
             return f"Error: Not a directory: {path}"
 
-        skip = {".git", "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache"}
+        # .git is not in .gitignore (git never ignores itself), so hardcode it
+        skip = {".git"}
         results: list[str] = []
         for match in sorted(base.glob(pattern)):
             if any(p in match.parts for p in skip):
                 continue
+            if self._ignore_spec:
+                try:
+                    rel_str = str(match.relative_to(Path(self._root)))
+                    if self._ignore_spec.match_file(rel_str + ("/" if match.is_dir() else "")):
+                        continue
+                except ValueError:
+                    pass
             rel = match.relative_to(Path(self._root))
             results.append(f"{rel}/" if match.is_dir() else str(rel))
             if len(results) >= MAX_MATCHES:

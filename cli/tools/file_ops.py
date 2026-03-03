@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from cli.tools.base import EdgeTool, SideEffect
+from cli.tools._gitignore import load_gitignore
 
 # Safety limits
 MAX_READ_SIZE = 512 * 1024  # 512KB
@@ -135,33 +136,78 @@ class StrReplaceTool(EdgeTool):
 
 
 class ListDirTool(EdgeTool):
+    """List directory with progressive disclosure: directories show child counts."""
+
+    _MAX_CHILD_SCAN = 10000  # Cap rglob scan to avoid blocking on huge dirs
+
     def __init__(self, project_root: str):
         self._root = project_root
+        self._ignore_spec = load_gitignore(project_root)
 
     name = "list_dir"
-    description = "List directory contents recursively."
+    description = (
+        "List directory contents. Directories show (N files) count. "
+        "Use depth>1 to expand subdirectories. Set include_ignored=true to include gitignored files."
+    )
     parameters = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Directory path (default: project root)"},
             "depth": {"type": "integer", "description": "Max recursion depth (default: 1)"},
+            "include_ignored": {"type": "boolean", "description": "Include gitignored files (default: false)"},
         },
     }
     side_effect = SideEffect.READ
 
-    async def execute(self, path: str = ".", depth: int = 1, **_: Any) -> str:
+    def _is_ignored(self, rel: str, is_dir: bool) -> bool:
+        """Check if path matches .gitignore."""
+        if not self._ignore_spec:
+            return False
+        return self._ignore_spec.match_file(rel + ("/" if is_dir else ""))
+
+    def _count_children(self, directory: Path, base: Path, include_ignored: bool) -> int:
+        """Count non-ignored file children recursively.
+
+        Caps scan at _MAX_CHILD_SCAN to avoid blocking on huge directories
+        (e.g. node_modules with include_ignored=True). Returns a lower-bound
+        estimate when the cap is hit.
+        """
+        count = 0
+        scanned = 0
+        try:
+            for item in directory.rglob("*"):
+                scanned += 1
+                if scanned > self._MAX_CHILD_SCAN:
+                    return count  # lower-bound estimate
+                if item.name.startswith("."):
+                    continue
+                if not include_ignored:
+                    rel = str(item.relative_to(base))
+                    if self._is_ignored(rel, item.is_dir()):
+                        continue
+                if item.is_file():
+                    count += 1
+        except (PermissionError, OSError):
+            pass
+        return count
+
+    async def execute(self, path: str = ".", depth: int = 1, include_ignored: bool = False, **_: Any) -> str:
         resolved = _resolve_path(path, self._root)
         if not resolved.is_dir():
             return f"Error: Not a directory: {path}"
 
+        base = _resolve_path(".", self._root)
         entries: list[str] = []
         depth = min(depth, MAX_LIST_DEPTH)
-        self._walk(resolved, resolved, 0, depth, entries)
+        self._walk(resolved, resolved, base, 0, depth, include_ignored, entries)
         if len(entries) >= MAX_LIST_ENTRIES:
             entries.append(f"... truncated at {MAX_LIST_ENTRIES} entries")
         return "\n".join(entries)
 
-    def _walk(self, base: Path, current: Path, level: int, max_depth: int, out: list[str]) -> None:
+    def _walk(
+        self, base: Path, current: Path, project_base: Path,
+        level: int, max_depth: int, include_ignored: bool, out: list[str],
+    ) -> None:
         if len(out) >= MAX_LIST_ENTRIES:
             return
         try:
@@ -173,10 +219,20 @@ class ListDirTool(EdgeTool):
             if item.name.startswith("."):
                 continue
             rel = item.relative_to(base)
+            # .gitignore filtering
+            if not include_ignored:
+                # Both paths are .resolve()'d by _resolve_path, so comparison is safe
+                proj_rel = str(item.relative_to(project_base)) if project_base != base else str(rel)
+                if self._is_ignored(proj_rel, item.is_dir()):
+                    continue
             if item.is_dir():
-                out.append(f"{rel}/")
                 if level < max_depth:
-                    self._walk(base, item, level + 1, max_depth, out)
+                    out.append(f"{rel}/")
+                    self._walk(base, item, project_base, level + 1, max_depth, include_ignored, out)
+                else:
+                    # At depth limit: show count instead of expanding
+                    count = self._count_children(item, project_base, include_ignored)
+                    out.append(f"{rel}/  ({count} files)")
             else:
                 out.append(str(rel))
             if len(out) >= MAX_LIST_ENTRIES:

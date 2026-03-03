@@ -13,6 +13,7 @@ Distributed-safe: stateless — operates on the in-memory message list only.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,47 @@ _TOOL_CLEARED = "[tool output cleared — already processed]"
 
 # Max chars for a single tool result in the message chain (~2K tokens)
 MAX_TOOL_RESULT_CHARS = 8000
+
+
+_COMPACT_HISTORY_THRESHOLD = 60000  # chars; trigger lightweight compaction above this
+_COMPACT_TOOL_KEEP_CHARS = 500     # chars to keep from old tool results
+
+
+def compact_history_messages(messages: list[dict[str, Any]], max_total_chars: int = _COMPACT_HISTORY_THRESHOLD) -> list[dict[str, Any]]:
+    """Compact conversation history by shrinking old tool results.
+
+    Keeps recent 2 user turns full, compresses older tool results to
+    ``_COMPACT_TOOL_KEEP_CHARS`` chars.  This is a lightweight pre-pass
+    before the heavier ``compact()`` function.
+
+    Returns a new list; original messages are not mutated.
+    """
+    total = sum(len(m.get("content") or "") for m in messages)
+    if total <= max_total_chars:
+        return messages
+
+    # Find boundary: keep messages from the last 2 user turns verbatim
+    user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+    keep_from = user_indices[-2] if len(user_indices) >= 2 else 0
+
+    result = []
+    for i, m in enumerate(messages):
+        if i >= keep_from:
+            result.append(m.copy())
+        elif m.get("role") == "tool":
+            content = m.get("content") or ""
+            if len(content) > _COMPACT_TOOL_KEEP_CHARS:
+                # Preserve memory references so LLM can still expand them
+                refs = re.findall(r'\[(?:Full output.*?)?memory:[^\]]+\]', content)
+                kept = content[:_COMPACT_TOOL_KEEP_CHARS] + f"\n... [{len(content)} chars truncated]"
+                if refs:
+                    kept += "\n" + "\n".join(refs)
+                result.append({**m, "content": kept})
+            else:
+                result.append(m.copy())
+        else:
+            result.append(m.copy())
+    return result
 
 
 def truncate_tool_result(content: str) -> str:

@@ -20,6 +20,10 @@ logger = get_logger(__name__)
 _UNSET = object()  # Sentinel for "not yet checked"
 
 MAX_TOOL_ROUNDS = 10
+
+# Hard ceiling on any single tool result in the message chain (~3K tokens).
+# Acts as a safety net when mo-trustmem and budget tracker are both unavailable.
+MAX_SINGLE_TOOL_RESULT_CHARS = 12000
 TOOL_TIMEOUT_SECONDS = 120
 
 # Scratchpad tool schemas — injected alongside skill tools when scratchpad is enabled
@@ -299,8 +303,12 @@ class ChatLoop:
         for _round in range(MAX_TOOL_ROUNDS):
 
             # Compact if approaching context limit
-            from core.context.compaction import compact, needs_compaction
+            from core.context.compaction import compact, compact_history_messages, needs_compaction
             max_tokens = self.llm.config.get("max_context_tokens", 128000)
+
+            # Lightweight pre-pass: shrink old tool results
+            messages = compact_history_messages(messages)
+
             if isinstance(max_tokens, int) and needs_compaction(messages, max_tokens):
                 # Use LLM for summarization if available
                 def llm_summarize(text: str) -> str:
@@ -529,6 +537,10 @@ class ChatLoop:
                     from core.context.compaction import truncate_tool_result
                     result_str = truncate_tool_result(result_str)
                 
+                # Hard limit: no single tool result should exceed this regardless of other processing
+                if len(result_str) > MAX_SINGLE_TOOL_RESULT_CHARS:
+                    result_str = result_str[:MAX_SINGLE_TOOL_RESULT_CHARS] + f"\n... [hard-truncated from {len(result_str)} chars]"
+
                 messages.append(
                     {
                         "role": "tool",
@@ -963,8 +975,12 @@ class ChatLoop:
         for _round in range(MAX_TOOL_ROUNDS):
 
             # Compact if approaching context limit
-            from core.context.compaction import compact, needs_compaction
+            from core.context.compaction import compact, compact_history_messages, needs_compaction
             max_tokens = self.llm.config.get("max_context_tokens", 128000)
+
+            # Lightweight pre-pass: shrink old tool results
+            messages = compact_history_messages(messages)
+
             if isinstance(max_tokens, int) and needs_compaction(messages, max_tokens):
                 def llm_summarize(text: str) -> str:
                     try:
