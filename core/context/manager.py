@@ -79,6 +79,7 @@ class Context:
     relevance_scores: dict[str, float]
     task_type: TaskType
     retrieved_events: list[dict[str, Any]] | None = None  # Raw retrieval for replay
+    topic_shift_score: float = 0.0  # 0=same topic, 1=new topic; used by ChatLoop for STALE_CONTEXT feedback
 
     def to_prompt(self) -> str:
         """Convert context to LLM prompt."""
@@ -213,7 +214,8 @@ class ContextManager(DbConsumer):
             context = self._assemble_context(
                 selected, budget, task_type, 
                 assembly_time_ms=int((time.time() - start_time) * 1000),
-                retrieved_events=candidates  # Store raw retrieval for replay
+                retrieved_events=candidates,  # Store raw retrieval for replay
+                topic_shift_score=getattr(self, "_last_topic_shift", 0.0),
             )
 
             logger.info(
@@ -434,14 +436,36 @@ class ContextManager(DbConsumer):
         - Temporal: Recent events score higher
         - Causal: Events in same chain score higher
         - Keyword: Exact matches score higher
+
+        When a topic shift is detected, temporal and causal weights are
+        suppressed so that stale context from the old topic does not
+        dominate the selection.
         """
-        # Use the new configurable scorer
-        scored_with_signals = self.scorer.score_candidates(query, candidates, session_id, task_type)
+        # Detect topic shift from recent events.
+        # Uses stored embeddings when available (1 embed call for query only).
+        # Sort by created_at descending to ensure we compare against the most
+        # recent events regardless of the order forced_retrieval provides.
+        recent_for_shift = sorted(
+            [c for c in candidates if c.get("created_at")],
+            key=lambda c: c["created_at"],
+            reverse=True,
+        )[:3]
+        topic_shift = self.scorer.detect_topic_shift(query, recent_for_shift)
+
+        # Use the new configurable scorer with topic shift awareness
+        scored_with_signals = self.scorer.score_candidates(
+            query, candidates, session_id, task_type, topic_shift=topic_shift,
+        )
 
         # Convert to old format (candidate, score) for compatibility
         scored = [(candidate, score) for candidate, score, _signals in scored_with_signals]
 
-        logger.debug(f"Scored {len(scored)} candidates using task-aware weights")
+        logger.debug(
+            "Scored %d candidates (task=%s, topic_shift=%.2f)",
+            len(scored), task_type.value, topic_shift,
+        )
+        # Store for build_context to propagate to Context dataclass
+        self._last_topic_shift = topic_shift
         return scored
 
     def _select_within_budget(
@@ -471,6 +495,7 @@ class ContextManager(DbConsumer):
         task_type: TaskType,
         assembly_time_ms: int,
         retrieved_events: list[dict[str, Any]] | None = None,
+        topic_shift_score: float = 0.0,
     ) -> Context:
         """Assemble final context."""
         system_prompt = self._get_system_prompt(task_type)
@@ -509,6 +534,7 @@ class ContextManager(DbConsumer):
             relevance_scores=relevance_scores,
             task_type=task_type,
             retrieved_events=retrieved_events,
+            topic_shift_score=topic_shift_score,
         )
 
     def _get_system_prompt(self, task_type: TaskType) -> str:

@@ -386,6 +386,32 @@ def register_builtin_skills(
         except Exception as e:
             logger.warning(f"Failed to register execute_code skill: {e}")
 
+    # Register introspection skill (zero LLM cost, answers agent self-queries)
+    try:
+        from skills.introspection.skill import IntrospectionSkill
+        introspection_skill = IntrospectionSkill(db_factory=db_factory)
+        registry.register(
+            skill=introspection_skill,
+            is_active=True,
+            category="system",
+            subcategory="introspection",
+            triggers=[
+                # Chinese: agent self-queries
+                "上下文", "多大", "多少轮", "能力", "状态",
+                # English: multi-word triggers to avoid false positives
+                # (e.g. "token" alone would match "session token in web app")
+                "context size", "context window", "token usage",
+                "how many turns", "what model", "agent status",
+                "my capabilities",
+            ],
+            dependencies=[],
+            priority=8,
+            cost_estimate="low",
+        )
+        logger.info(f"Registered {introspection_skill.name}@{introspection_skill.version}")
+    except Exception as e:
+        logger.warning(f"Failed to register introspection skill: {e}")
+
     # Register delegation skill for multi-agent collaboration
     if agent_registry and chat_loop_factory:
         try:

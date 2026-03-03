@@ -1,6 +1,7 @@
 """Configurable relevance scorer for context selection.
 
 Implements multi-signal relevance scoring with task-aware weights.
+Includes topic shift detection to suppress stale context on topic changes.
 """
 
 import time
@@ -10,8 +11,47 @@ from typing import Any
 from core.context.manager import TaskType
 from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
+from core.skills.learning_similarity import cosine_similarity as _cosine_similarity
 
 logger = get_logger(__name__)
+
+
+@dataclass
+class TopicShiftConfig:
+    """Configurable parameters for topic shift detection.
+
+    Loaded from ``infra_configs`` table (key ``topic_shift_config``).
+    Defaults are used when no DB override exists.
+    The ContextBudgetTuner (or a future TopicShiftTuner) can update these
+    through the standard Observe → Diagnose → Propose → Gate → Deploy loop.
+    """
+
+    threshold: float = 0.5       # shift_score below this → no adjustment
+    temporal_floor: float = 0.05 # minimum temporal weight after adjustment
+    causal_floor: float = 0.05   # minimum causal weight after adjustment
+    semantic_ceiling: float = 0.8  # maximum semantic weight after adjustment
+
+    @staticmethod
+    def from_dict(d: dict[str, Any]) -> "TopicShiftConfig":
+        """Parse from JSON dict (as stored in configs table)."""
+        return TopicShiftConfig(
+            threshold=float(d.get("threshold", 0.5)),
+            temporal_floor=float(d.get("temporal_floor", 0.05)),
+            causal_floor=float(d.get("causal_floor", 0.05)),
+            semantic_ceiling=float(d.get("semantic_ceiling", 0.8)),
+        )
+
+    def to_dict(self) -> dict[str, float]:
+        return {
+            "threshold": self.threshold,
+            "temporal_floor": self.temporal_floor,
+            "causal_floor": self.causal_floor,
+            "semantic_ceiling": self.semantic_ceiling,
+        }
+
+
+# Module-level default; overridden by DB config when available
+_DEFAULT_TOPIC_SHIFT_CONFIG = TopicShiftConfig()
 
 
 @dataclass
@@ -28,6 +68,38 @@ class ScoringWeights:
         total = self.semantic + self.temporal + self.causal + self.keyword
         if abs(total - 1.0) > 0.01:
             raise ValueError(f"Weights must sum to 1.0, got {total}")
+
+    def adjust_for_topic_shift(
+        self, shift_score: float, config: TopicShiftConfig | None = None,
+    ) -> "ScoringWeights":
+        """Return new weights adjusted for topic shift.
+
+        When the user switches topics, temporal and causal signals become noise
+        (they boost old-topic events). Redistribute their weight to semantic
+        so the scorer favours content relevant to the *new* query.
+
+        Args:
+            shift_score: 0.0 = same topic, 1.0 = completely new topic.
+                         Values below config.threshold are treated as "same topic".
+            config: Tunable parameters. Loaded from DB by RelevanceScorer;
+                    defaults used if None.
+
+        Returns:
+            New ScoringWeights instance (original is not mutated).
+        """
+        cfg = config or _DEFAULT_TOPIC_SHIFT_CONFIG
+        if shift_score < cfg.threshold:
+            return self
+        new_temporal = max(cfg.temporal_floor, self.temporal * (1 - shift_score))
+        new_causal = max(cfg.causal_floor, self.causal * (1 - shift_score))
+        new_keyword = self.keyword
+        new_semantic = min(cfg.semantic_ceiling, 1.0 - new_temporal - new_causal - new_keyword)
+        return ScoringWeights(
+            semantic=new_semantic,
+            temporal=new_temporal,
+            causal=new_causal,
+            keyword=new_keyword,
+        )
 
 
 # Task-specific weight profiles
@@ -73,6 +145,114 @@ class RelevanceScorer(DbConsumer):
         super().__init__(db_factory)
         self.embeddings = embeddings
         self.weights = weights or TASK_WEIGHTS[TaskType.GENERAL]
+        # Per-instance cache — not shared across instances (avoids race conditions
+        # in parallel requests and pytest-xdist workers).
+        self._topic_shift_config: TopicShiftConfig | None = None
+        self._topic_shift_config_ts: float = 0.0
+        self._TOPIC_SHIFT_CONFIG_TTL: float = 60.0  # seconds
+
+    def _load_topic_shift_config(self) -> TopicShiftConfig:
+        """Load TopicShiftConfig from configs table with TTL cache.
+
+        Same pattern as ContextManager._load_budget_ratios and
+        SelfImprovingSelector._load_runtime_config.
+        """
+        now = time.monotonic()
+        if self._topic_shift_config is not None and (now - self._topic_shift_config_ts) < self._TOPIC_SHIFT_CONFIG_TTL:
+            return self._topic_shift_config
+
+        try:
+            import json as _json
+            with self._db() as db:
+                from api.models import Config
+                row = db.query(Config.value).filter(Config.key_name == "topic_shift_config").first()
+            if row:
+                raw = _json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                self._topic_shift_config = TopicShiftConfig.from_dict(raw)
+            else:
+                self._topic_shift_config = _DEFAULT_TOPIC_SHIFT_CONFIG
+        except Exception as e:
+            logger.debug("Failed to load topic_shift_config, using defaults: %s", e)
+            self._topic_shift_config = _DEFAULT_TOPIC_SHIFT_CONFIG
+        self._topic_shift_config_ts = now
+        return self._topic_shift_config
+
+    def detect_topic_shift(
+        self,
+        query: str,
+        recent_events: list[dict[str, Any]],
+    ) -> float:
+        """Detect topic shift by comparing query embedding to recent conversation.
+
+        Compares the query embedding against the mean embedding of the last few
+        events.  Cost: one embed call for the query only — recent event embeddings
+        are looked up from the event_embeddings table (already computed by
+        EmbeddingWorker on ingest).  Falls back to inline embedding if stored
+        embeddings are unavailable.
+
+        Args:
+            query: Current user query.
+            recent_events: Last N events (must have ``content`` and ``event_id`` keys).
+
+        Returns:
+            0.0 (same topic) to 1.0 (completely new topic).
+        """
+        if not recent_events:
+            return 0.0
+
+        try:
+            query_emb = self.embeddings.embed_text(query)
+        except Exception as e:
+            logger.debug("Topic shift detection skipped (embed failed): %s", e)
+            return 0.0
+
+        # Collect embeddings for recent events.
+        # Prefer stored embeddings (zero cost); fall back to inline embed.
+        recent_embs: list[list[float]] = []
+        for event in recent_events[-3:]:
+            if not event.get("content"):
+                continue
+            # Try stored embedding first (from event_embeddings table)
+            stored = self._get_stored_embedding(event.get("event_id"))
+            if stored is not None:
+                recent_embs.append(stored)
+                continue
+            # Fallback: embed inline (costs one API call per event)
+            try:
+                recent_embs.append(self.embeddings.embed_text(event["content"]))
+            except Exception:
+                continue
+
+        if not recent_embs:
+            return 0.0
+
+        dim = len(recent_embs[0])
+        mean_emb = [sum(e[i] for e in recent_embs) / len(recent_embs) for i in range(dim)]
+
+        similarity = _cosine_similarity(query_emb, mean_emb)
+        shift = max(0.0, 1.0 - similarity)
+        logger.debug("Topic shift score: %.3f (similarity=%.3f, %d recent events)", shift, similarity, len(recent_embs))
+        return shift
+
+    def _get_stored_embedding(self, event_id: str | None) -> list[float] | None:
+        """Look up a pre-computed embedding from event_embeddings table.
+
+        Returns None if not found or on any error (caller falls back to inline embed).
+        """
+        if not event_id:
+            return None
+        try:
+            from core.skills.learning_similarity import parse_embedding
+            from api.models.context import EventEmbedding
+            with self._db() as db:
+                row = db.query(EventEmbedding.embedding).filter(
+                    EventEmbedding.event_id == event_id
+                ).first()
+            if row:
+                return parse_embedding(row[0])
+        except Exception:
+            pass
+        return None
 
     def score_candidates(
         self,
@@ -80,6 +260,7 @@ class RelevanceScorer(DbConsumer):
         candidates: list[dict[str, Any]],
         session_id: str,
         task_type: TaskType = TaskType.GENERAL,
+        topic_shift: float | None = None,
     ) -> list[tuple[dict[str, Any], float, dict[str, float]]]:
         """Score candidates by relevance.
 
@@ -88,6 +269,8 @@ class RelevanceScorer(DbConsumer):
             candidates: List of candidate events
             session_id: Session ID
             task_type: Task type for weight selection
+            topic_shift: Pre-computed topic shift score (0-1). If provided,
+                         weights are adjusted to suppress stale context.
 
         Returns:
             List of (candidate, total_score, signal_scores)
@@ -105,8 +288,11 @@ class RelevanceScorer(DbConsumer):
             logger.warning("Empty session_id provided to scorer")
             return [(c, 0.0, {}) for c in candidates]
 
-        # Use task-specific weights
+        # Use task-specific weights, adjusted for topic shift
         weights = TASK_WEIGHTS.get(task_type, self.weights)
+        if topic_shift is not None:
+            ts_config = self._load_topic_shift_config()
+            weights = weights.adjust_for_topic_shift(topic_shift, config=ts_config)
 
         # Generate query embedding
         try:

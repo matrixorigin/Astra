@@ -13,6 +13,7 @@ class SignalType(str, Enum):
     LOW_SATISFACTION = "low_satisfaction"
     LOW_DATA_QUALITY = "low_data_quality"
     EXECUTION_TIME = "execution_time"  # Raw execution time data for learning
+    STALE_CONTEXT = "stale_context"    # Topic shift caused irrelevant context selection
 
 
 @dataclass

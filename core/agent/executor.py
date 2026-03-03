@@ -76,6 +76,12 @@ class AgentExecutor(DbConsumer):
         if "user_id" not in params:
             params["user_id"] = getattr(self, "_current_user_id", "system")
 
+        # 1.5b. Auto-inject runtime_state for introspection skill.
+        # The introspection skill needs live context stats that only the
+        # executor knows at call time.  Other skills ignore this field.
+        if skill_name == "introspection":
+            params.setdefault("runtime_state", self._build_runtime_state(session_id))
+
         # 1.6. Enforce skill installation for marketplace skills
         self._enforce_runtime_checks(skill_name, params)
 
@@ -202,6 +208,27 @@ class AgentExecutor(DbConsumer):
                 db.commit()
         except Exception as e:
             logger.debug("backfill selection event failed: %s", e)
+
+    def _build_runtime_state(self, session_id: str) -> dict[str, Any]:
+        """Collect live runtime stats for the introspection skill."""
+        state: dict[str, Any] = {"session_id": session_id}
+        try:
+            from api.models.agent import Event, Session as SessionModel
+            from api.models.skill import SkillRegistry as SkillModel
+            from sqlalchemy import func
+            with self._db() as db:
+                sess = db.query(SessionModel.agent_id, SessionModel.event_count).filter(
+                    SessionModel.session_id == session_id
+                ).first()
+                if sess:
+                    state["agent_id"] = sess.agent_id
+                    state["turn_count"] = sess.event_count or 0
+                state["skills_loaded"] = db.query(func.count()).select_from(
+                    SkillModel
+                ).filter(SkillModel.is_active == 1).scalar() or 0
+        except Exception as e:
+            logger.debug("Failed to build runtime_state: %s", e)
+        return state
 
     def _record_execution_metrics(
         self,
