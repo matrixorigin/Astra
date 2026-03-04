@@ -9,8 +9,9 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from api.database import SessionLocal
+from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
 from core.exceptions import SkillNotFoundError
 from core.skills.catalog import NameConflictError, SkillCatalog
@@ -150,21 +151,18 @@ async def check_skill_health(
     source: str = Query("all", description="'user', 'builtin', 'marketplace', or 'all'"),
     skill_name: str | None = Query(None, description="Specific skill to diagnose (detailed mode)"),
     current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
 ):
     """Check skill health: find orphaned, broken, or mismatched skills."""
     from skills.diagnose_skills.skill import DiagnoseSkillsInput, DiagnoseSkillsSkill, DiagnosisLevel
 
-    db = SessionLocal()
-    try:
-        skill = DiagnoseSkillsSkill(db=db)
-        result = await skill.execute(DiagnoseSkillsInput(
-            level=DiagnosisLevel.DETAILED if level == "detailed" else DiagnosisLevel.SUMMARY,
-            source=source,
-            skill_name=skill_name,
-        ))
-        return result.model_dump()
-    finally:
-        db.close()
+    skill = DiagnoseSkillsSkill(db=db)
+    result = await skill.execute(DiagnoseSkillsInput(
+        level=DiagnosisLevel.DETAILED if level == "detailed" else DiagnosisLevel.SUMMARY,
+        source=source,
+        skill_name=skill_name,
+    ))
+    return result.model_dump()
 
 
 @router.get("/status", response_model=SkillStatusResponse)

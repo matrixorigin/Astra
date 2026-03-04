@@ -20,6 +20,7 @@ from api.routers import (
     replay,
     sandbox,
     sessions,
+    skill_config,
     skills,
     streaming,
 )
@@ -244,6 +245,7 @@ app.include_router(events.router, prefix="/events", tags=["events"])
 app.include_router(sandbox.router, tags=["sandbox"])
 app.include_router(replay.router, tags=["replay"])
 app.include_router(skills.router, prefix="/skills", tags=["skills"])
+app.include_router(skill_config.router, prefix="/skills", tags=["skill-config"])
 app.include_router(marketplace.router, prefix="/marketplace", tags=["marketplace"])
 app.include_router(context.router, prefix="/context", tags=["context"])
 app.include_router(decisions.router, prefix="/decisions", tags=["decisions"])
