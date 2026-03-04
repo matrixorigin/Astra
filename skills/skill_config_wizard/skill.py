@@ -52,10 +52,12 @@ class SkillConfigWizardSkill(Skill[ConfigWizardInput, ConfigWizardOutput]):
     name = "skill_config_wizard"
     version = "1.0.0"
     description = (
-        "Guide the user through configuring a skill. "
-        "Shows what settings, secrets, and resource bindings are needed, "
-        "what's already configured, and what's missing. "
-        "Use when the user wants to set up or configure a skill."
+        "Show what configuration a skill needs and what's already set. "
+        "Call this when the user explicitly asks to configure a skill, or when a skill call fails due to missing config. "
+        "Do NOT call this proactively before using a skill — just call the skill directly. "
+        "For GitHub skills (summarize_pr, list_prs, ci_status, list_issues, get_issue, create_issue), "
+        "use skill_name='github' — they all share one token. "
+        "Returns missing required fields and instructions for what to set."
     )
     requirements = SkillRequirement(timeout_seconds=10)
     side_effect_profile = SideEffectProfile(category=SideEffectCategory.READ)

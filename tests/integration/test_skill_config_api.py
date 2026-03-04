@@ -60,6 +60,8 @@ def center(db_factory, cred_mgr):
     skill_config._center = c
     yield c
     skill_config._center = None
+    # Clear lru_cache so next test gets a fresh namespace resolution
+    skill_config._resolve_config_namespace.cache_clear()
 
 
 @pytest.fixture

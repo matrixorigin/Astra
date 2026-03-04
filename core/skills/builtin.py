@@ -209,7 +209,9 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
         "detailed (adds per-job status + failed job names), full (adds failed step details). "
         "Use brief unless user explicitly asks for more detail. "
         "repo can be 'owner/repo' (e.g. 'matrixorigin/matrixone') or just a project name "
-        "(e.g. 'milvus') — the skill will search GitHub for the best match automatically."
+        "(e.g. 'milvus') — the skill will search GitHub for the best match automatically. "
+        "If resolved_by_search=True in the result, tell the user which repo was used "
+        "and ask them to confirm if it looks wrong."
     )
     requirements = SkillRequirement(
         repo_types=[RepoType.CI, RepoType.CODE],
