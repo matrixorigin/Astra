@@ -11,6 +11,20 @@ from api.models._constants import EMBEDDING_DIM
 from api.models._types import NullableJSON as JSON
 
 
+class PromptFragment(Base):
+    """Content-addressed storage for prompt sections.
+
+    Fixed sections (identity, self_model, constraints) are stored once and
+    referenced by hash. This deduplicates repeated content across turns/sessions.
+    """
+    __tablename__ = "ctx_prompt_fragments"
+    fragment_hash = Column(String(64), primary_key=True)  # SHA256 prefix
+    content = Column(Text, nullable=False)
+    token_count = Column(Integer, nullable=False)
+    fragment_type = Column(String(32), nullable=False, index=True)  # identity, self_model, etc.
+    created_at = Column(DateTime, default=func.now())
+
+
 class ContextSnapshot(Base):
     __tablename__ = "ctx_snapshots"
     context_capture_id = Column(String(36), primary_key=True)

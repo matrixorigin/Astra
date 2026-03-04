@@ -385,3 +385,117 @@ class TestPromptDescription:
 
         s = TestSkill()
         assert s.prompt_description == ""
+
+
+class TestSnapshotDeduplication:
+    """Test _save_snapshot content-addressed deduplication."""
+
+    def test_fixed_sections_stored_by_hash(self, db_session):
+        """Verify fixed sections are stored in ctx_prompt_fragments with correct hash."""
+        import hashlib
+        import uuid
+
+        from api.models.context import PromptFragment
+        from core.context.prompt_assembler import PromptAssembler
+
+        unique_id = str(uuid.uuid4())[:8]
+        pa = PromptAssembler(lambda: db_session)
+        identity_content = f"You are a helpful assistant. ID={unique_id}"
+        sections = {
+            "identity": identity_content,
+            "self_model": f"## Self-Model\nI can help with coding. ID={unique_id}",
+            "constraints": f"Rules:\n- Be helpful. ID={unique_id}",
+            "history": "User: Hello\nAssistant: Hi!",  # Variable, not stored as fragment
+        }
+        breakdown = {"identity": 10, "self_model": 20, "constraints": 15, "history": 25}
+
+        snapshot_id = pa._save_snapshot("test_session", sections, breakdown)
+        assert snapshot_id is not None
+
+        # Verify identity fragment was created with correct hash
+        expected_hash = hashlib.sha256(identity_content.encode()).hexdigest()
+        fragment = db_session.query(PromptFragment).filter_by(
+            fragment_hash=expected_hash
+        ).first()
+
+        assert fragment is not None, "Fragment should be created"
+        assert fragment.content == identity_content
+        assert fragment.fragment_type == "identity"
+        assert fragment.token_count == 10
+
+        # Verify history (variable) is NOT stored as fragment
+        history_fragments = db_session.query(PromptFragment).filter(
+            PromptFragment.content.contains("Hello")
+        ).all()
+        assert len(history_fragments) == 0, "Variable sections should not be fragments"
+
+    def test_same_content_reuses_hash(self, db_session):
+        """Verify identical content reuses existing fragment (no duplicates)."""
+        import hashlib
+        import uuid
+
+        from api.models.context import PromptFragment
+        from core.context.prompt_assembler import PromptAssembler
+
+        unique_id = str(uuid.uuid4())[:8]
+        identity_content = f"You are a helpful assistant. ID={unique_id}"
+        pa = PromptAssembler(lambda: db_session)
+        sections = {
+            "identity": identity_content,
+            "constraints": f"Rules:\n- Be helpful. ID={unique_id}",
+        }
+        breakdown = {"identity": 10, "constraints": 15}
+
+        # Save twice with same content
+        pa._save_snapshot("session_1", sections, breakdown)
+        pa._save_snapshot("session_2", sections, breakdown)
+
+        # Verify only one fragment exists for this content
+        expected_hash = hashlib.sha256(identity_content.encode()).hexdigest()
+        identity_fragments = db_session.query(PromptFragment).filter_by(
+            fragment_hash=expected_hash
+        ).all()
+
+        assert len(identity_fragments) == 1, "Same content should produce exactly 1 fragment"
+
+    def test_variable_sections_stored_inline(self, db_session):
+        """Verify variable sections are stored in snapshot, not fragments."""
+        import json
+        import uuid
+
+        from sqlalchemy import text as sql_text
+
+        from core.context.prompt_assembler import PromptAssembler
+
+        unique_id = str(uuid.uuid4())[:8]
+        pa = PromptAssembler(lambda: db_session)
+        sections = {
+            "identity": f"Assistant ID={unique_id}",
+            "history": f"User: What is 2+2?\nAssistant: 4. ID={unique_id}",
+            "memory": f"User prefers concise answers. ID={unique_id}",
+        }
+        breakdown = {"identity": 5, "history": 20, "memory": 10}
+
+        snapshot_id = pa._save_snapshot("test_session", sections, breakdown)
+
+        # Query snapshot
+        row = db_session.execute(sql_text(
+            "SELECT system_prompt FROM ctx_snapshots WHERE context_capture_id = :cid"
+        ), {"cid": snapshot_id}).fetchone()
+
+        data = json.loads(row[0])
+
+        # Variable sections should be inline with full content
+        assert "variable_sections" in data
+        assert "history" in data["variable_sections"]
+        assert "memory" in data["variable_sections"]
+        assert unique_id in data["variable_sections"]["history"]
+        assert unique_id in data["variable_sections"]["memory"]
+
+        # Fixed sections should be hashes only (not content)
+        assert "fixed_hashes" in data
+        assert "identity" in data["fixed_hashes"]
+        assert len(data["fixed_hashes"]["identity"]) == 64  # SHA256 hex length
+
+        # identity should NOT be in variable_sections
+        assert "identity" not in data["variable_sections"]

@@ -343,7 +343,9 @@ class TestPromptAssemblerSnapshot:
         assert row is not None
         snap = json.loads(row[0])
         assert "token_breakdown" in snap
-        assert "sections" in snap
+        # New format uses fixed_hashes + variable_sections
+        assert "fixed_hashes" in snap, "Snapshot should use new deduplication format"
+        assert "variable_sections" in snap, "Snapshot should have variable_sections"
 
     def test_snapshot_total_tokens_persisted(self, db_session):
         """total_tokens must be written to ctx_snapshots — not None.
