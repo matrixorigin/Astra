@@ -125,14 +125,14 @@ class TestCumulativeToolOutputOverflow:
         # Simulate used budget from previous turn
         loop._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
         loop._turn_budget.record(100000)  # Exhaust budget
-        
+
         # Verify budget is exhausted
         assert loop._turn_budget.used_tokens == 25000
-        
-        # The reset happens at "# 6. Multi-turn tool use loop" in run_step
-        # We can verify the code path by checking the source
+
+        # The reset happens in run_step_stream (run_step is now a thin wrapper).
+        # Verify the code path by checking run_step_stream source.
         import inspect
-        source = inspect.getsource(loop.run_step)
+        source = inspect.getsource(loop.run_step_stream)
         assert "_turn_budget = None" in source  # Reset is in the code
 
 

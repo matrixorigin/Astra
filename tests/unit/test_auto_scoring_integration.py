@@ -135,7 +135,9 @@ class TestAllPathsPassFirewallResult:
         src = Path("core/agent/chat_loop.py").read_text()
         # Find all _log_response( calls
         calls = list(re.finditer(r"self\._log_response\(", src))
-        assert len(calls) >= 7, f"Expected >=7 _log_response calls, found {len(calls)}"
+        # After Task 0.4 refactor: run_step is now a thin wrapper around run_step_stream,
+        # so there are fewer direct _log_response calls (5 instead of 7).
+        assert len(calls) >= 5, f"Expected >=5 _log_response calls, found {len(calls)}"
 
         for match in calls:
             # Extract the full call (up to the closing paren at same indent)

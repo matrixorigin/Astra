@@ -56,6 +56,9 @@ class TestAgentArchitecture(unittest.TestCase):
         self.event_logger = MagicMock()
         self.event_logger.create_user_query.return_value.event_id = "user_event_1"
         self.event_logger.create_user_query.return_value.causal_chain_id = "chain_1"
+        # Mock create_stream_event to return objects with real event_id strings
+        self.event_logger.create_stream_event.return_value.event_id = "stream_event_1"
+        self.event_logger.create_stream_event.return_value.causal_chain_id = "chain_1"
 
         self.mock_skill = MockSkill()
         self.registry.get.return_value = self.mock_skill
@@ -112,15 +115,21 @@ class TestAgentArchitecture(unittest.TestCase):
             return_value=SkillOutput(success=True, result="Skill Result")
         )
 
-        self.llm_client.chat_with_tools.side_effect = [
-            {
-                "content": None,
-                "tool_calls": [
-                    {"id": "tc_1", "function": {"name": "test_skill", "arguments": '{"param": "value"}'}},
-                ],
-            },
-            {"content": "Final Answer", "tool_calls": []},
-        ]
+        # Mock chat_with_tools_stream as async generator
+        call_count = [0]
+
+        async def mock_stream(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First call: tool call
+                yield {"type": "tool_call", "data": {
+                    "id": "tc_1", "function": {"name": "test_skill", "arguments": '{"param": "value"}'}
+                }}
+            else:
+                # Second call: final answer
+                yield {"type": "text", "content": "Final Answer"}
+
+        self.llm_client.chat_with_tools_stream = mock_stream
 
         result = asyncio.run(self.chat_loop.run_step("User Input", "session_1", "user_1"))
 
