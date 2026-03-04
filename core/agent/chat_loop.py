@@ -9,11 +9,11 @@ from typing import Any
 from core.agent.executor import AgentExecutor
 from core.agent.planner import Planner, PlanStatus, restore_plan_from_events
 from core.events.event_logger import EventLogger
-from core.skills.pipeline import SkillPipeline
-from core.skills.learning_signals import SignalType
 from core.events.models import StreamEvent, StreamEventType
 from core.llm.models import LLMMessage
 from core.logging_config import get_logger
+from core.skills.learning_signals import SignalType
+from core.skills.pipeline import SkillPipeline
 
 logger = get_logger(__name__)
 
@@ -225,7 +225,6 @@ class ChatLoop:
         # 2. Build context and save context snapshot (always enabled).
         #    This is a *business-level* snapshot of what the LLM sees (system prompt,
         #    selected events, skills, docs). NOT a MatrixOne database-level snapshot.
-        from core.context.manager import TaskType
 
         ctx = self.context_manager.build_context(
             session_id=session_id, query=user_input,
@@ -256,11 +255,12 @@ class ChatLoop:
         # Get model from context
         model = (context or {}).get("model")
         model_source = (context or {}).get("_model_source", "request" if model else "default")
-        
+
         # Audit: log model selection
         if model:
-            from core.events.models import ConversationEvent, EventType
             from uuid_utils import uuid7
+
+            from core.events.models import ConversationEvent, EventType
             self.event_logger.log_event(ConversationEvent(
                 event_id=str(uuid7()),
                 user_id=user_id,
@@ -269,7 +269,7 @@ class ChatLoop:
                 content=model,
                 metadata={"model": model, "source": model_source},
             ))
-        
+
         if not tools_schema:
             # No tools available — plain chat
             response = self.llm.chat(
@@ -321,7 +321,7 @@ class ChatLoop:
                         return result.get("content", text[:1000])
                     except Exception:
                         return text[:1000]  # Fallback to truncation
-                
+
                 messages = compact(messages, max_tokens, llm_summarize=llm_summarize)
 
             # Get model from context or use SLO escalation
@@ -330,7 +330,7 @@ class ChatLoop:
                 request_model=(context or {}).get("model"),
                 slo_escalation_model=self._check_slo_escalation(session_id),
             )
-            
+
             try:
                 llm_result = self.llm.chat_with_tools(
                     messages=messages,
@@ -506,7 +506,7 @@ class ChatLoop:
                     "skill_name": fn_name,
                     "skill_params": params
                 }
-                
+
                 self.event_logger.create_stream_event(
                     user_id=user_id,
                     session_id=session_id,
@@ -523,7 +523,7 @@ class ChatLoop:
                 if not hasattr(self, '_turn_budget') or self._turn_budget is None:
                     from core.context.budget_manager import TurnBudgetTracker
                     self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
-                
+
                 remaining = self._turn_budget.remaining
                 result_str = process_tool_output(
                     output=result_str,
@@ -536,7 +536,7 @@ class ChatLoop:
                     force_full=False,
                 )
                 self._turn_budget.record(len(result_str))
-                
+
                 # Hard limit: no single tool result should exceed this regardless of other processing
                 if len(result_str) > MAX_SINGLE_TOOL_RESULT_CHARS:
                     result_str = result_str[:MAX_SINGLE_TOOL_RESULT_CHARS] + f"\n... [hard-truncated from {len(result_str)} chars]"
@@ -569,6 +569,14 @@ class ChatLoop:
             # Task 1.2: Check if all tools are blocked after this round
             if self._all_tools_blocked(tools_schema):
                 failure_report = self._build_failure_report()
+                # Task 4.1: Record routing failure for self-improving selector
+                if self._last_selection_event_id:
+                    self._pipeline.record_feedback(
+                        self._last_selection_event_id,
+                        SignalType.TOOL_ROUTING_FAILURE,
+                        {"query": user_input, "blocked_tools": sorted(self._blocked_tools),
+                         "failures": {k: v[-1] for k, v in self._tool_failures.items()}},
+                    )
                 self._log_response(
                     user_id, session_id, failure_report,
                     user_event.event_id, user_event.causal_chain_id,
@@ -778,7 +786,7 @@ class ChatLoop:
         if not hasattr(self, '_turn_budget') or self._turn_budget is None:
             from core.context.budget_manager import TurnBudgetTracker
             self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
-        
+
         remaining = self._turn_budget.remaining
         result_str = process_tool_output(
             output=result_str,
@@ -835,7 +843,6 @@ class ChatLoop:
         # 2. Build context and save context snapshot (same as non-stream path).
         #    This is a *business-level* snapshot of what the LLM sees (system prompt,
         #    selected events, skills, docs). NOT a MatrixOne database-level snapshot.
-        from core.context.manager import TaskType
 
         ctx = self.context_manager.build_context(
             session_id=session_id, query=user_input,
@@ -1080,7 +1087,7 @@ class ChatLoop:
                         return result.get("content", text[:1000])
                     except Exception:
                         return text[:1000]
-                
+
                 messages = compact(messages, max_tokens, llm_summarize=llm_summarize)
 
             full_text = ""
@@ -1179,15 +1186,15 @@ class ChatLoop:
 
             # Execute tools
             messages.append({"role": "assistant", "content": full_text, "tool_calls": tool_calls})
-            
+
             # Check for parallel delegation (multiple delegate_task calls)
             delegation_calls = [tc for tc in tool_calls if tc["function"]["name"] == "delegate_task"]
-            
+
             if len(delegation_calls) > 1:
                 last_skill_name = "delegate_task"
                 # Parallel delegation: fan-out/fan-in
                 from core.skills.delegation import DelegateTaskInput
-                
+
                 # Emit TOOL_CALL_START for all delegations
                 for tc in delegation_calls:
                     tool_start_event = self.event_logger.create_stream_event(
@@ -1205,7 +1212,7 @@ class ChatLoop:
                         causal_chain_id=user_event.causal_chain_id,
                         agent_id=self.agent_id,
                     )
-                
+
                 # Build inputs for parallel execution
                 inputs = []
                 for tc in delegation_calls:
@@ -1217,24 +1224,24 @@ class ChatLoop:
                         session_id=session_id,
                         user_id=user_id,
                     ))
-                
+
                 # Execute parallel streaming
                 skill = self.executor.skill_registry.get("delegate_task")
                 results = {}  # call_id -> result_text
                 agent_to_call = {}  # agent_id -> call_id mapping
                 completed_agents = set()  # Track which agents have completed
                 execution_times = {}  # call_id -> execution time
-                
+
                 # Build agent_id to call_id mapping
                 for tc in delegation_calls:
                     params = json.loads(tc["function"]["arguments"])
                     agent_to_call[params.get("agent_id")] = tc["id"]
-                
+
                 _t0 = time.monotonic()
                 try:
                     async for event in skill.execute_parallel_stream(inputs):
                         yield event
-                        
+
                         # Collect results from TEXT_DONE events (only first one per agent)
                         if event.event_type == StreamEventType.TEXT_DONE:
                             agent_id = event.agent_id
@@ -1257,13 +1264,13 @@ class ChatLoop:
                             if call_id and call_id not in results:  # Don't overwrite existing results
                                 error_msg = event.data.get("error", "Unknown error")
                                 results[call_id] = f"Error: {error_msg}"
-                
+
                 except Exception as e:
                     logger.error(f"Error in parallel delegation: {e}", exc_info=True)
                     # Mark all incomplete delegations as failed
                     for tc in delegation_calls:
                         if tc["id"] not in results:
-                            results[tc["id"]] = f"Error: Parallel execution failed - {str(e)}"
+                            results[tc["id"]] = f"Error: Parallel execution failed - {e!s}"
                 finally:
                     # Record feedback for parallel execution
                     _elapsed_ms = (time.monotonic() - _t0) * 1000
@@ -1273,7 +1280,7 @@ class ChatLoop:
                             SignalType.EXECUTION_TIME,
                             {"ms": _elapsed_ms, "skill": "delegate_task", "parallel": True, "count": len(delegation_calls)},
                         )
-                
+
                 # Emit TOOL_RESULT for each delegation
                 for tc in delegation_calls:
                     result_str = results.get(tc["id"], "No result")
@@ -1322,6 +1329,14 @@ class ChatLoop:
             # Task 1.2: Check if all tools are blocked after this round
             if self._all_tools_blocked(tools_schema):
                 failure_report = self._build_failure_report()
+                # Task 4.1: Record routing failure for self-improving selector
+                if self._last_selection_event_id:
+                    self._pipeline.record_feedback(
+                        self._last_selection_event_id,
+                        SignalType.TOOL_ROUTING_FAILURE,
+                        {"query": user_input, "blocked_tools": sorted(self._blocked_tools),
+                         "failures": {k: v[-1] for k, v in self._tool_failures.items()}},
+                    )
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DELTA,
                     data={"chunk": failure_report},
@@ -1457,7 +1472,6 @@ class ChatLoop:
             self.event_logger.flush_critical()  # Must be visible for build_context
 
         if not context_capture_id:
-            from core.context.manager import TaskType
             ctx = self.context_manager.build_context(
                 session_id=session_id, query=user_input,
             )
@@ -1588,7 +1602,7 @@ class ChatLoop:
 
                 # Execute step through SkillPipeline to enable learning
                 skill_name = step.skill_hint
-                
+
                 if skill_name:
                     # Get tools schema through pipeline (includes selector/auditor/validator)
                     _sel = self._pipeline.get_tools_schema(
@@ -1598,7 +1612,7 @@ class ChatLoop:
                     )
                     tools_schema = _sel.tools
                     selection_event_id = _sel.event_id
-                    
+
                     # Find the tool in schema
                     tool_found = any(t["function"]["name"] == skill_name for t in tools_schema)
                     if not tool_found and tools_schema:
@@ -1608,7 +1622,7 @@ class ChatLoop:
                             f"Skill hint '{step.skill_hint}' not in candidates, "
                             f"using selector recommendation: {skill_name}"
                         )
-                    
+
                     if tool_found or tools_schema:
                         # CoT audit: check for goal hijacking before execution
                         from core.verification.cot_audit import audit_tool_call
@@ -1878,38 +1892,101 @@ class ChatLoop:
     # ------------------------------------------------------------------
 
     def _reset_breaker(self) -> None:
-        """Reset per-turn breaker state."""
+        """Reset per-turn breaker state and load persisted state (1 SELECT).
+
+        Cross-turn failure accumulation: persisted consecutive_failures are seeded
+        into _tool_failures so _should_break() considers failures from prior turns.
+        Example: 2 failures in turn 1 + 1 failure in turn 2 = 3 total → breaker trips.
+        """
         self._tool_failures = {}
         self._blocked_tools = set()
+        self._breaker_records: dict[str, Any] = {}  # Actually dict[str, BreakerRecord]
+        try:
+            if hasattr(self.event_logger, '_db_factory'):
+                from core.agent.breaker_store import load_breaker_state
+                db = self.event_logger._db_factory()
+                try:
+                    user_id = getattr(self, '_current_user_id', None)
+                    if user_id:
+                        self._breaker_records = load_breaker_state(db, user_id)
+                        for name, rec in self._breaker_records.items():
+                            if rec.in_cooldown:
+                                self._blocked_tools.add(name)
+                                logger.info("Breaker cooldown active for %s until %s", name, rec.cooldown_until)
+                            # Seed in-memory failures from persisted count so cross-turn
+                            # accumulation works: _should_break sees prior failures.
+                            # Use unique placeholders to avoid false "similar error" matches —
+                            # only the "3 any failures" threshold should consider these.
+                            if rec.consecutive_failures > 0:
+                                self._tool_failures[name] = [
+                                    f"[prior-turn-failure-{i + 1}-{name}]"
+                                    for i in range(rec.consecutive_failures)
+                                ]
+                finally:
+                    db.close()
+        except Exception as e:
+            logger.debug("Breaker state load failed (non-fatal): %s", e)
+
+    def _flush_breaker(self) -> None:
+        """Persist dirty breaker records at turn end (1 batch transaction)."""
+        try:
+            records = getattr(self, '_breaker_records', {})
+            if not any(r.dirty for r in records.values()):
+                return
+            if hasattr(self.event_logger, '_db_factory'):
+                from core.agent.breaker_store import flush_breaker_state
+                db = self.event_logger._db_factory()
+                try:
+                    flush_breaker_state(db, records)
+                finally:
+                    db.close()
+        except Exception as e:
+            logger.debug("Breaker flush failed (non-fatal): %s", e)
 
     def _is_tool_blocked(self, fn_name: str) -> bool:
-        return fn_name in self._blocked_tools
+        return fn_name in getattr(self, '_blocked_tools', set())
 
     def _record_tool_failure(self, fn_name: str, error_msg: str) -> None:
-        """Record a tool failure and check if breaker should trip."""
+        """Record a tool failure and check breaker. In-memory only — flushed at turn end.
+
+        Every failure is persisted (not just breaker-tripping ones) so cross-turn
+        accumulation works: 2 failures in turn 1 + 1 in turn 2 = 3 total → trips.
+        """
         self._tool_failures.setdefault(fn_name, []).append(error_msg)
+        # Always persist failure count — not just on breaker trip
+        records = getattr(self, '_breaker_records', {})
+        if fn_name not in records:
+            from core.agent.breaker_store import BreakerRecord
+            records[fn_name] = BreakerRecord(
+                user_id=getattr(self, '_current_user_id', "") or "",
+                tool_name=fn_name,
+            )
+        records[fn_name].record_failure()
         from core.agent.pipeline_stages import _should_break
         if _should_break(self._tool_failures[fn_name]):
             self._blocked_tools.add(fn_name)
             logger.warning("Circuit breaker tripped for tool %s", fn_name)
 
     def _record_tool_success(self, fn_name: str) -> None:
-        """Clear failure history on success."""
+        """Clear failure history on success. In-memory only — flushed at turn end."""
         self._tool_failures.pop(fn_name, None)
+        records = getattr(self, '_breaker_records', {})
+        if fn_name in records:
+            records[fn_name].record_success()
 
     def _all_tools_blocked(self, tools_schema: list[dict]) -> bool:
         """Check if all available tools are blocked."""
         active = [
             t for t in tools_schema
-            if t.get("function", {}).get("name") not in self._blocked_tools
+            if t.get("function", {}).get("name") not in getattr(self, '_blocked_tools', set())
         ]
         return len(active) == 0 and len(tools_schema) > 0
 
     def _build_failure_report(self) -> str:
         """Build user-facing failure report from breaker state."""
         lines = ["I was unable to complete the task. The following tools encountered repeated errors:"]
-        for tool, errors in self._tool_failures.items():
-            if tool in self._blocked_tools:
+        for tool, errors in getattr(self, '_tool_failures', {}).items():
+            if tool in getattr(self, '_blocked_tools', set()):
                 last_err = errors[-1] if errors else "unknown error"
                 lines.append(f"- **{tool}**: {last_err}")
         lines.append("\nPlease check the tool configuration or try a different approach.")
@@ -2189,6 +2266,27 @@ class ChatLoop:
                     score_chain(_score_db, causal_chain_id, session_id)
             except Exception as e:
                 logger.warning("Chain-level scoring failed (non-fatal): %s", e)
+        # Task 4.2: Log route_feedback event for learning (non-fatal)
+        try:
+            blocked = getattr(self, '_blocked_tools', set())
+            failures = getattr(self, '_tool_failures', {})
+            if blocked or failures:
+                self.event_logger.create_stream_event(
+                    user_id=user_id,
+                    session_id=session_id,
+                    event_type="stream_run_finished",
+                    content=json.dumps({
+                        "route_feedback": True,
+                        "blocked_tools": sorted(blocked),
+                        "tool_failures": {k: len(v) for k, v in failures.items()},
+                    }),
+                    parent_event_id=parent_event_id,
+                    causal_chain_id=causal_chain_id,
+                )
+        except Exception:
+            pass
+        # Task 4.3: Flush dirty breaker records (1 batch transaction per turn)
+        self._flush_breaker()
         # Post-turn: run Observer via TurnHooks (shared with /chat/turn)
         if messages:
             from api.database import SessionLocal

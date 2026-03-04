@@ -14,12 +14,13 @@ class SignalType(str, Enum):
     LOW_DATA_QUALITY = "low_data_quality"
     EXECUTION_TIME = "execution_time"  # Raw execution time data for learning
     STALE_CONTEXT = "stale_context"    # Topic shift caused irrelevant context selection
+    TOOL_ROUTING_FAILURE = "tool_routing_failure"  # Circuit breaker tripped, all tools blocked
 
 
 @dataclass
 class LearningSignal:
     """A learning signal extracted from skill selection feedback."""
-    
+
     signal_type: SignalType
     query_pattern: str
     wrong_skills: list[str]
@@ -27,7 +28,7 @@ class LearningSignal:
     target_metrics: dict[str, float]  # e.g., {"time_ms": 500, "cost": 0.01}
     confidence: float = 10.0
     context_features: dict[str, Any] | None = None  # Optional context features
-    
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage."""
         return {
@@ -44,12 +45,12 @@ class LearningSignal:
 @dataclass
 class SignalWeights:
     """Weights for multi-dimensional scoring."""
-    
+
     accuracy: float = 0.4
     speed: float = 0.3
     cost: float = 0.2
     satisfaction: float = 0.1
-    
+
     def __post_init__(self):
         """Validate weights sum to 1.0 and are in valid range."""
         # Check individual weights
@@ -59,12 +60,12 @@ class SignalWeights:
                 raise ValueError(f"Weight '{name}' cannot be negative: {value}")
             if value > 1.0:
                 raise ValueError(f"Weight '{name}' cannot exceed 1.0: {value}")
-        
+
         # Check sum
         total = self.accuracy + self.speed + self.cost + self.satisfaction
         if abs(total - 1.0) > 0.01:
             raise ValueError(f"Weights must sum to 1.0, got {total}")
-    
+
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary."""
         return {
@@ -78,12 +79,12 @@ class SignalWeights:
 @dataclass
 class SignalThresholds:
     """Thresholds for signal extraction."""
-    
+
     slow_execution_ms: int = 5000  # 5 seconds
     high_cost_usd: float = 0.10  # $0.10
     low_satisfaction: int = 3  # < 3 stars (out of 5)
     low_data_quality: float = 0.5  # quality score < 0.5 triggers signal
-    
+
     def to_dict(self) -> dict[str, float]:
         """Convert to dictionary."""
         return {

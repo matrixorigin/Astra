@@ -558,6 +558,59 @@ class TestRoutingExternalFetch:
 
 
 # ---------------------------------------------------------------------------
+# Routing: real IntentClassification object (not just string)
+# ---------------------------------------------------------------------------
+
+
+class TestRoutingWithIntentClassification:
+    """RouteStage must handle IntentClassification objects from the real classifier."""
+
+    @pytest.mark.asyncio
+    async def test_real_classify_intent_returns_object(self):
+        """classify_intent returns IntentClassification, not a bare string."""
+        from core.skills.intent_router import classify_intent
+
+        async def mock_llm_call(messages, tools, **kw):
+            return {"content": "Hi!", "tool_calls": []}
+
+        state = _make_state()
+        # Use the real sync classify_intent — RouteStage must handle it
+        await _collect_events(
+            execute_turn(
+                state,
+                llm_call=mock_llm_call,
+                tool_execute=AsyncMock(),
+                classify_intent=classify_intent,
+            )
+        )
+        # "Hello" is not in the default user_input ("test query"), so DEFAULT
+        assert state.outcome is not None
+        assert state.outcome.status == TurnStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_conversational_with_real_classifier(self):
+        """Real classifier on 'hello' → CONVERSATIONAL → tools cleared."""
+        from core.skills.intent_router import classify_intent
+
+        async def mock_llm_call(messages, tools, **kw):
+            return {"content": "Hi there!", "tool_calls": []}
+
+        state = _make_state(user_input="hello")
+        await _collect_events(
+            execute_turn(
+                state,
+                llm_call=mock_llm_call,
+                tool_execute=AsyncMock(),
+                classify_intent=classify_intent,
+            )
+        )
+        assert state.tools_schema == []
+        assert state.max_rounds == 0
+        assert state.outcome.status == TurnStatus.SUCCESS
+        assert state.outcome.content == "Hi there!"
+
+
+# ---------------------------------------------------------------------------
 # Parallel execution
 # ---------------------------------------------------------------------------
 

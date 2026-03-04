@@ -10,8 +10,8 @@ Handles large tool outputs by:
 
 from __future__ import annotations
 
-import json
-from typing import TYPE_CHECKING, Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from core.memory.types import MemoryType
 
@@ -36,11 +36,11 @@ def compute_dynamic_threshold(remaining_tokens: int | None) -> int:
     """
     if remaining_tokens is None:
         return SUMMARY_THRESHOLD
-    
+
     # Heuristic: allow ~20% of remaining budget for tool output
     # 1 token ≈ 4 chars
     budget_bytes = int(remaining_tokens * 4 * 0.2)
-    
+
     # Clamp to reasonable range
     return max(MIN_THRESHOLD, min(MAX_THRESHOLD, budget_bytes))
 
@@ -50,7 +50,7 @@ def compute_dynamic_threshold(remaining_tokens: int | None) -> int:
 def _summarize_grep(output: str) -> str:
     """Summarize grep output: per-file stats + samples with line numbers."""
     lines = output.strip().split('\n')
-    
+
     # Group by file with line numbers
     file_matches: dict[str, list[tuple[int, str]]] = {}
     for line in lines[:1000]:
@@ -64,24 +64,24 @@ def _summarize_grep(output: str) -> str:
                     file_matches[file].append((int(lineno), content.strip()[:80]))
                 except ValueError:
                     pass
-    
+
     # Sort files by match count (descending)
     sorted_files = sorted(file_matches.items(), key=lambda x: -len(x[1]))
-    
+
     # Build summary with per-file breakdown
     summary_parts = [f"Found {len(lines)} matches in {len(file_matches)} files."]
     summary_parts.append("\nPer-file breakdown:")
-    
+
     for file, matches in sorted_files[:10]:
         line_nums = [m[0] for m in matches[:5]]
         summary_parts.append(f"  {file}: {len(matches)} matches (lines: {line_nums})")
         # Show 1-2 samples per file with line numbers
         for lineno, content in matches[:2]:
             summary_parts.append(f"    L{lineno}: {content}")
-    
+
     if len(sorted_files) > 10:
         summary_parts.append(f"  ... and {len(sorted_files) - 10} more files")
-    
+
     return '\n'.join(summary_parts)
 
 
@@ -90,11 +90,11 @@ def _summarize_shell(output: str) -> str:
     lines = output.strip().split('\n')
     if len(lines) <= 20:
         return output
-    
+
     return (
         f"Output: {len(lines)} lines, {len(output)} bytes\n"
         f"First 10:\n" + '\n'.join(lines[:10]) + "\n...\n"
-        f"Last 5:\n" + '\n'.join(lines[-5:])
+        "Last 5:\n" + '\n'.join(lines[-5:])
     )
 
 
@@ -132,7 +132,7 @@ def is_summarizable(tool_name: str, output: str) -> bool:
     # Explicit non-summarizable tools
     if tool_name in NON_SUMMARIZABLE_TOOLS:
         return False
-    
+
     # Heuristics for code content (need full structure)
     code_indicators = ["def ", "class ", "import ", "function ", "const ", "let ", "var "]
     if any(ind in output[:2000] for ind in code_indicators):
@@ -140,7 +140,7 @@ def is_summarizable(tool_name: str, output: str) -> bool:
         lines = output.split('\n')
         if len(lines) < 200:  # Small code file, keep full
             return False
-    
+
     return True
 
 
@@ -205,7 +205,7 @@ def _summarize_file_content(output: str) -> str:
     return (
         f"File content: {len(lines)} lines, {len(output)} bytes\n"
         f"First 15 lines:\n" + '\n'.join(lines[:15]) + "\n...\n"
-        f"Last 10 lines:\n" + '\n'.join(lines[-10:])
+        "Last 10 lines:\n" + '\n'.join(lines[-10:])
     )
 
 
@@ -254,16 +254,16 @@ def process_tool_output(
         Original output (if small) or summary + memory reference (if large)
     """
     from core.agent.tool_context_metrics import record_tool_output
-    
+
     threshold = compute_dynamic_threshold(remaining_tokens)
-    
+
     # Check if should skip summarization
     skip_summary = force_full or not is_summarizable(tool_name, output)
-    
+
     if len(output) <= threshold or (skip_summary and len(output) <= threshold * 3):
         record_tool_output(tool_name, len(output), len(output), was_summarized=False)
         return output
-    
+
     # No memory store — fall back to rule-based summary + truncation
     if memory_store is None:
         summary = generate_structured_summary(output, tool_name)
@@ -273,6 +273,7 @@ def process_tool_output(
 
     # 1. Store full output in mo-trustmem
     import uuid
+
     from core.memory.types import Memory
     source_events = [turn_event_id] if turn_event_id else []
     try:
@@ -289,16 +290,16 @@ def process_tool_output(
         # Fallback: truncate if mo-trustmem write fails
         record_tool_output(tool_name, len(output), threshold, was_summarized=True)
         return output[:threshold] + f"\n... [truncated, mo-trustmem unavailable: {e}]"
-    
+
     # 2. Generate rule-based summary
     summary = generate_structured_summary(output, tool_name)
-    
+
     # 3. Store summary text for replay determinism (摘要也需要持久化)
     result = f"{summary}\n\n[Full output ({len(output)} bytes): memory:{memory.memory_id}]"
-    
+
     # 4. Record metrics
     record_tool_output(tool_name, len(output), len(result), was_summarized=True)
-    
+
     return result
 
 
@@ -326,14 +327,14 @@ def find_similar_result(
         Memory reference if similar result found, None otherwise
     """
     from datetime import datetime, timedelta
-    
+
     # Build query from tool name + key params
     query_parts = [tool_name]
     for key in ("pattern", "path", "command", "query"):
         if key in params:
             query_parts.append(str(params[key]))
     query = ' '.join(query_parts)
-    
+
     results, _ = retriever.retrieve(
         user_id=user_id,
         query_text=query,
@@ -341,24 +342,24 @@ def find_similar_result(
         memory_types=[MemoryType.TOOL_RESULT],
         limit=1,
     )
-    
+
     if not results:
         return None
-    
+
     result = results[0]
-    
+
     # Staleness check: reject if too old
     ref_time = result.observed_at or result.created_at
     if ref_time:
         age = datetime.now() - ref_time
         if age > timedelta(seconds=max_age_seconds):
             return None
-    
+
     # Check key param match (e.g., same grep pattern)
     if "pattern" in params:
         if params["pattern"] not in result.content[:1000]:
             return None
-    
+
     return f"[Reusing previous {tool_name} result: memory:{result.memory_id}]"
 
 
@@ -388,18 +389,18 @@ def expand_memory_reference(
     memory = memory_store.get(memory_id)
     if not memory:
         return f"Error: Memory {memory_id} not found"
-    
+
     content = memory.content
     lines = content.split('\n')
     total_lines = len(lines)
-    
+
     # Apply line range filter
     if start_line is not None or end_line is not None:
         start = (start_line or 1) - 1
         end = end_line or len(lines)
         lines = lines[start:end]
         content = '\n'.join(lines)
-    
+
     # Apply query filter
     if query:
         matching = [l for l in lines if query.lower() in l.lower()]
@@ -407,11 +408,11 @@ def expand_memory_reference(
             content = f"Filtered {len(matching)} of {total_lines} lines matching '{query}':\n" + '\n'.join(matching[:100])
         else:
             content = f"No lines matching '{query}' in {total_lines} lines"
-    
+
     # Truncate to prevent context re-explosion
     if len(content) > max_chars:
         content = content[:max_chars] + f"\n... [truncated, use start_line/end_line for pagination, total {len(memory.content)} chars]"
-    
+
     return content
 
 

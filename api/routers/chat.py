@@ -14,20 +14,23 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-
 from uuid_utils import uuid7
-from api.sse_errors import SSE_HEADERS, status_to_error_code
 
 from api.database import SessionLocal
 from api.dependencies import get_current_user
+from api.sse_errors import SSE_HEADERS, status_to_error_code
+from core.history_utils import (
+    append_recovered_events as _append_recovered_events,
+)
 from core.history_utils import (
     merge_tool_results_into_history as _merge_tool_results_into_history,
-    append_recovered_events as _append_recovered_events,
 )
 from core.logging_config import get_logger
 from core.verification.tool_quality import (
-    assess_tool_result as _assess_tool_result,
     annotate_tool_result as _annotate_tool_result,
+)
+from core.verification.tool_quality import (
+    assess_tool_result as _assess_tool_result,
 )
 
 logger = get_logger(__name__)
@@ -321,8 +324,8 @@ def _build_chat_loop(db_factory):
     # Create EventPipeline for async writes (feature-flagged)
     pipeline = None
     try:
-        from core.events.pipeline import EventPipeline
         from core.events.event_logger import _PIPELINE_ENABLED
+        from core.events.pipeline import EventPipeline
         if _PIPELINE_ENABLED:
             pipeline = EventPipeline(db_factory)
             pipeline.start()
@@ -401,12 +404,12 @@ async def chat(
         db.close()
 
     engine = _get_engine()
-    
+
     # Pass model to context if specified
     context = request.context or {}
     if request.model:
         context["model"] = request.model
-    
+
     run = engine.create_run(
         session_id=session_id,
         user_id=user_id,
@@ -1000,7 +1003,7 @@ def _build_turn_messages(
     if not history or force_rebuild_system:
         user_query = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
 
-        from core.context.prompt_assembler import PromptAssembler, EdgeContext
+        from core.context.prompt_assembler import EdgeContext, PromptAssembler
         edge_ctx = EdgeContext(
             project_rules=project_rules,
             edge_tools=edge_tools or [],
@@ -1442,8 +1445,9 @@ def _persist_turn_events(
     try:
         _sdb = SessionLocal()
         try:
-            from sqlalchemy import text as _text
             from datetime import datetime, timezone
+
+            from sqlalchemy import text as _text
             _count = _sdb.execute(
                 _text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"),
                 {"sid": session_id},
@@ -1493,10 +1497,10 @@ def _get_shared_skill_registry():
     if _shared_skill_registry is None:
         with _shared_skill_registry_lock:
             if _shared_skill_registry is None:
-                from core.skills.registry import SkillRegistry
-                from core.skills.builtin import register_builtin_skills
                 from core.code_executor import CodeExecutor
                 from core.runtime import IsolationLevel, create_runtime
+                from core.skills.builtin import register_builtin_skills
+                from core.skills.registry import SkillRegistry
                 registry = SkillRegistry(SessionLocal)
                 code_executor = CodeExecutor(
                     runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
@@ -1530,7 +1534,6 @@ def _get_cloud_skill_schemas(registry) -> list[dict[str, Any]]:
 
 async def _execute_cloud_skill(registry, tc_name: str, tc_args: dict[str, Any]) -> str:
     """Execute a cloud skill server-side and return result as string."""
-    from core.skills.base import Skill as SkillBase
     from core.exceptions import SkillNotFoundError
     try:
         skill = registry.get(tc_name)
@@ -2024,6 +2027,7 @@ async def chat_turn(
             if full_text and snapshot_id:
                 try:
                     import asyncio
+
                     from core.context.manager import ContextManager
                     from core.verification.firewall import HallucinationFirewall
                     ctx_mgr = ContextManager(SessionLocal)
@@ -2051,13 +2055,25 @@ async def chat_turn(
                     explain_event["memory"] = _memory_stats
                 yield f"data: {json.dumps(explain_event)}\n\n"
 
-            yield f"data: {json.dumps({'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0})}\n\n"
+            # Task 4.4: Include execution_state for edge-cloud breaker sync.
+            # The cloud turn endpoint doesn't run a ChatLoop, so it validates and
+            # echoes back the edge's breaker state. The edge uses this to confirm
+            # the cloud accepted its state (from_wire applies validation: max_rounds
+            # capped at 20, unknown status → FAILURE). Future: cloud-side breaker
+            # state could be merged here if the cloud tracks its own tool failures.
+            _turn_complete_data: dict = {'type': 'turn_complete', 'has_tool_calls': len(tool_calls) > 0}
+            if hasattr(request, 'execution_state') and request.execution_state:
+                from core.agent.turn_state import TurnState
+                _ts = TurnState.from_wire(request.execution_state, messages=[], tools_schema=[])
+                _turn_complete_data['execution_state'] = _ts.to_wire()
+            yield f"data: {json.dumps(_turn_complete_data)}\n\n"
 
         except Exception as e:
             logger.error("chat_turn error: %s", e, exc_info=True)
-            from core.llm.client import BudgetExceededError
-            from core.exceptions import LLMRateLimitError, LLMTimeoutError, TransientError
             from sqlalchemy.exc import SQLAlchemyError
+
+            from core.exceptions import LLMRateLimitError, LLMTimeoutError, TransientError
+            from core.llm.client import BudgetExceededError
             err: dict[str, Any] = {"type": "error", "message": str(e)}
             if isinstance(e, HTTPException):
                 err["message"] = e.detail

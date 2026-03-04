@@ -94,7 +94,21 @@ class RouteStage:
             yield TurnEvent(event_type="stage_complete", data={"stage": "route", "classification": "DEFAULT"})
             return
 
-        classification = await self._classify(state.user_input)
+        # Support both sync and async classify callables
+        result = self._classify(state.user_input)
+        if hasattr(result, "__await__"):
+            result = await result
+
+        # Normalize: classify_intent returns IntentClassification with .intent attr,
+        # but callers may also pass a simple string-returning callable.
+        if hasattr(result, "intent"):
+            classification = result.intent
+        elif isinstance(result, str):
+            classification = result
+        else:
+            # Unknown type (e.g., dict) — fall back to DEFAULT
+            logger.warning("classify_intent returned unexpected type %s, using DEFAULT", type(result))
+            classification = "DEFAULT"
 
         if classification == "CONVERSATIONAL":
             state.tools_schema = []
