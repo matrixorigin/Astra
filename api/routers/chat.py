@@ -1746,7 +1746,7 @@ async def chat_turn(
                     _llm_start = time.monotonic()
 
                     if _cloud_skill_failed:
-                        logger.info("Cloud loop: final LLM call via chat_stream (no tools)")
+                        logger.warning("Cloud loop: final LLM call via chat_stream (no tools), loop=%d", _cloud_loop)
                     stream: AsyncIterator = (
                         llm.chat_with_tools_stream(
                             _current_llm_messages, merged_tools_schema, model=model, task_hint=task_hint,
@@ -1813,6 +1813,12 @@ async def chat_turn(
 
                     if not _loop_tool_calls:
                         # No tool calls — final answer, exit loop.
+                        # If cloud skill failed and LLM returned empty text, use the error message directly.
+                        if _cloud_skill_failed and not _loop_text.strip():
+                            _fallback = _cloud_skill_error_msg or "The requested operation failed."
+                            _loop_text = f"\n\n{_fallback}"
+                            full_text += _loop_text
+                            yield f"data: {json.dumps({'type': 'text_delta', 'content': _loop_text})}\n\n"
                         break
 
                     # If a previous cloud skill failed, ignore any new tool_calls from LLM.
@@ -1935,6 +1941,7 @@ async def chat_turn(
                     if _cloud_skill_failed:
                         tool_calls = []
                         # Loop will continue → LLM sees tool_result + hard-stop → returns text only
+                        logger.warning("Cloud loop: continuing for final LLM call (loop=%d)", _cloud_loop)
                         continue
 
                     # If there are also edge tool_calls, emit them and break.
