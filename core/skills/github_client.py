@@ -97,14 +97,14 @@ class GitHubClient:
         """
         return self._api.resolve_repo(repo)
 
-    async def get_pr(self, repo_id, pr_number: int) -> dict:
-        return await self._api.get_pr(self._resolve_repo(repo_id), pr_number)
+    async def get_pr(self, repo_id, pr_number: int, detail: str = "normal") -> dict:
+        return await self._api.get_pr(self._resolve_repo(repo_id), pr_number, detail=detail)
 
     async def get_pr_diff(self, repo_id, pr_number: int) -> str:
         return await self._api.get_pr_diff(self._resolve_repo(repo_id), pr_number)
 
-    async def list_prs(self, repo_id, state: str = "open", limit: int = 10) -> list[dict]:
-        return await self._api.list_prs(self._resolve_repo(repo_id), state, limit)
+    async def list_prs(self, repo_id, state: str = "open", limit: int = 10, detail: str = "brief") -> list[dict]:
+        return await self._api.list_prs(self._resolve_repo(repo_id), state, limit, detail=detail)
 
     async def list_wf_runs(self, repo_id, limit: int = 5, detail: str = "brief") -> list[dict]:
         return await self._api.list_wf_runs(self._resolve_repo(repo_id), limit, detail=detail)
