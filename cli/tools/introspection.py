@@ -48,8 +48,10 @@ class GetAgentInfoTool(EdgeTool):
             "'show me context usage', '上下文用了多少', 'token 用了多少', "
             "'what's in your memory?', 'what's your session id?'. "
             "IMPORTANT: The response contains llm_prompt_tokens (total tokens sent to LLM) "
-            "and context_managed_tokens (subset managed by context zones). "
-            "Always present llm_prompt_tokens as the primary token count to the user. "
+            "and health.zones (complete breakdown of ALL llm_prompt_tokens, including "
+            "conversation_history_and_tools). "
+            "Always present llm_prompt_tokens as the primary token count to the user, "
+            "then show health.zones as the full distribution of that total. "
             "For diagnosing WHY token usage was high or responses were slow, use reflect instead."
         )
 

@@ -114,11 +114,25 @@ def _analyze_context_health(
 
     if is_flat:
         ref_tokens = llm_prompt_tokens or sum(v for v in budget.values() if isinstance(v, (int, float)))
+        zone_total = 0
         for zone, val in budget.items():
             if not isinstance(val, (int, float)) or val <= 0:
                 continue
             share = round(val / ref_tokens, 3) if ref_tokens > 0 else 0.0
             zones.append({"name": zone, "tokens": int(val), "share": share})
+            zone_total += int(val)
+        # Append the unmanaged portion as an explicit zone so that all zones sum to
+        # llm_prompt_tokens. "Unmanaged" means tokens not tracked by PromptAssembler
+        # zone budgets: conversation history turns + tool/function schemas injected
+        # directly by the chat loop. We cannot break these down further here because
+        # token_usage only records the aggregate prompt total, not per-component counts.
+        if llm_prompt_tokens and llm_prompt_tokens > zone_total:
+            unmanaged = llm_prompt_tokens - zone_total
+            zones.append({
+                "name": "conversation_history_and_tools",
+                "tokens": unmanaged,
+                "share": round(unmanaged / ref_tokens, 3),
+            })
         overall_util = round(ref_tokens / cw, 3)
         recommendation_base = f"prompt {ref_tokens:,} / {cw:,} tokens ({overall_util:.0%})"
     else:
@@ -168,14 +182,6 @@ def _analyze_context_health(
             "context_window": cw,
             "utilization": util,
         }
-        if is_flat:
-            zone_total = sum(z["tokens"] for z in zones)
-            unmanaged = max(0, prompt - zone_total)
-            result["zone_note"] = (
-                f"The {zone_total} managed tokens above are a subset of the full LLM prompt "
-                f"({prompt} tokens total). The remaining {unmanaged} tokens come from "
-                f"conversation history, tool schemas, and user query."
-            )
     elif llm_prompt_tokens is not None:
         result["llm_usage"] = {
             "prompt": llm_prompt_tokens,

@@ -847,10 +847,11 @@ class TestGetAgentInfoTool:
         assert tool.side_effect == SideEffect.READ
 
     def test_description_mentions_llm_token_fields(self):
-        """Description must guide LLM to present llm_prompt_tokens as primary."""
+        """Description must guide LLM to present llm_prompt_tokens as primary and
+        health.zones as the complete distribution of that total."""
         tool = self._make_tool()
         assert "llm_prompt_tokens" in tool.description
-        assert "context_managed_tokens" in tool.description
+        assert "health.zones" in tool.description
 
     def test_description_mentions_all_dimensions(self):
         """Dimension values mentioned in description must exist in enum (no stale references)."""

@@ -985,9 +985,15 @@ class TestContextSnapshot:
             assert lu["context_window"] == 128000
             assert lu["utilization"] == round(6000 / 128000, 3)
             assert data["health"]["overall_status"] == "ok"  # 6000/128000 = 4.7%
-            # zone_note present (don't assert exact wording)
-            assert isinstance(data["health"].get("zone_note"), str)
-            assert len(data["health"]["zone_note"]) > 0
+            # zone_note removed — unmanaged portion is now an explicit zone in the list
+            zones = data["health"]["zones"]
+            zone_names = [z["name"] for z in zones]
+            assert "conversation_history_and_tools" in zone_names
+            unmanaged_zone = next(z for z in zones if z["name"] == "conversation_history_and_tools")
+            managed_tokens = sum(v for v in snap.token_budget.values())  # 543+23+9+23+372 = 970
+            assert unmanaged_zone["tokens"] == 6000 - managed_tokens
+            assert unmanaged_zone["share"] == round((6000 - managed_tokens) / 6000, 3)
+            assert "note" not in unmanaged_zone  # no extra fields vs other zones
             # top-level field renamed
             assert data["context_managed_tokens"] == 970
             assert "total_tokens" not in data
