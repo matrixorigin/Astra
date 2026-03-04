@@ -1059,7 +1059,7 @@ class TestHighConfidenceBeforeBuildMessages:
         import api.routers.chat as chat_module
 
         source = inspect.getsource(chat_module.chat_turn)
-        hc_pos = source.find("High-confidence tool selection optimization")
+        hc_pos = source.find("Tool selection optimization")
         build_sync_pos = source.find("def _build_sync()")
 
         assert hc_pos != -1, "High-confidence block not found in chat_turn"
@@ -1085,6 +1085,50 @@ class TestHighConfidenceBeforeBuildMessages:
         assert "edge_tools=merged_tools_schema" not in build_sync_body, (
             "_build_sync must NOT pass merged_tools_schema to edge_tools"
         )
+
+    def test_uses_llm_not_embedding_for_tool_selection(self):
+        """Tool selection must use LLM (not embedding) for cross-lingual support."""
+        import inspect
+        import api.routers.chat as chat_module
+
+        source = inspect.getsource(chat_module.chat_turn)
+        hc_start = source.find("Tool selection optimization")
+        build_sync_start = source.find("def _build_sync()")
+        hc_block = source[hc_start:build_sync_start]
+
+        assert "catalog_prompt" in hc_block, "Must build catalog prompt for LLM selection"
+        assert "embed_fn(" not in hc_block, "Must not use embed_fn for tool selection"
+        assert "np.dot(" not in hc_block, "Must not use numpy dot product"
+
+    def test_no_full_tools_fallback(self):
+        """On selection failure, fallback to all tools (not empty) to avoid broken turns."""
+        import inspect
+        import api.routers.chat as chat_module
+
+        source = inspect.getsource(chat_module.chat_turn)
+        hc_start = source.find("Tool selection optimization")
+        build_sync_start = source.find("def _build_sync()")
+        hc_block = source[hc_start:build_sync_start]
+
+        # Must NOT set effective_tools_schema = [] (causes no-tool broken turns)
+        assert "effective_tools_schema = []" not in hc_block, (
+            "Must never set effective_tools_schema to empty — causes broken turns"
+        )
+        # Must have fuzzy matching for LLM output
+        assert "strip(" in hc_block, "Must strip LLM output for fuzzy matching"
+
+    def test_tool_result_turn_keeps_only_used_tools(self):
+        """When tool_results arrive, only keep the tool(s) already in use."""
+        import inspect
+        import api.routers.chat as chat_module
+
+        source = inspect.getsource(chat_module.chat_turn)
+        hc_start = source.find("Tool selection optimization")
+        build_sync_start = source.find("def _build_sync()")
+        hc_block = source[hc_start:build_sync_start]
+
+        assert "tool_results" in hc_block, "Must handle tool_result turns"
+        assert "used_names" in hc_block, "Must track which tools are in use"
 
 
     """Integration tests for tool/non-tool token separation in DB and APIs."""

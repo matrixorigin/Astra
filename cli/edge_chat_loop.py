@@ -328,7 +328,14 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
         c = t.get("completion_tokens") or 0
         total_in += p
         total_out += c
-        w(f"{dim}Turn {t['turn']}  {ms}ms  tokens: {p}→{c}{reset}\n")
+        # Tool selection info
+        ts = t.get("tools_selected", "?")
+        ta = t.get("tools_available", "?")
+        sel = t.get("tool_selection")
+        tool_info = f"  tools: {ts}/{ta}"
+        if sel:
+            tool_info += f" → {sel}"
+        w(f"{dim}Turn {t['turn']}  {ms}ms  tokens: {p}→{c}{tool_info}{reset}\n")
 
         # Memory retrieval stats
         mem = t.get("memory")

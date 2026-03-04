@@ -1266,7 +1266,7 @@ def _persist_turn_events(
 
     user_content = next((m["content"] for m in messages if m.get("role") == "user"), None)
     el = EventLogger(SessionLocal)
-    parent_event_id = None
+    parent_event_id = user_query_event_id  # default to pre-generated ID for continuation turns
     causal_chain_id = turn_chain_id or str(uuid7())
 
     # Resolve skill versions for tool events (best-effort, single query).
@@ -1669,8 +1669,18 @@ async def chat_turn(
             # Causal chain + user_query event_id for this turn — both generated
             # here (streaming time) so their uuid7 timestamps reflect when the
             # turn actually happened, not when the persist thread ran.
-            _turn_chain_id = str(uuid7())
-            _user_query_event_id = str(uuid7())
+            #
+            # Continuation turns (tool_results without new user_query) reuse the
+            # previous turn's chain_id so the entire multi-step tool loop shares
+            # one causal chain per user intent.
+            _has_new_user_query = any(m.get("role") == "user" for m in request.messages)
+            _prev_entry = _peek_session_entry(session_id)
+            if not _has_new_user_query and request.tool_results and _prev_entry:
+                _turn_chain_id = _prev_entry.get("turn_chain_id") or str(uuid7())
+                _user_query_event_id = _prev_entry.get("user_query_event_id") or str(uuid7())
+            else:
+                _turn_chain_id = str(uuid7())
+                _user_query_event_id = str(uuid7())
 
             # Detect tool changes: compare new edge_tools with cached set.
             tools_changed = False
@@ -1705,8 +1715,9 @@ async def chat_turn(
 
             import asyncio
 
-            # ── High-confidence tool selection optimization ──────────────
-            # Run BEFORE _build_turn_messages so the snapshot records actual tokens.
+            # ── Tool selection optimization ──────────────────────────────
+            # Use LLM catalog selection to pick the most relevant tool(s).
+            # This reduces tool_schemas from ~5000 tokens to ~500.
             effective_tools_schema = merged_tools_schema
             _high_confidence_skill: str | None = None
 
@@ -1714,56 +1725,56 @@ async def chat_turn(
                 user_query = next((m.get("content", "") for m in request.messages if m.get("role") == "user"), "")
                 if user_query:
                     try:
-                        from core.skills.modern_selector import ModernSkillSelector
-                        selector = ModernSkillSelector(
-                            rule_selector=None,
-                            db_factory=SessionLocal,
-                            embed_fn=_get_shared_embed_fn(),
+                        tool_names_map = {
+                            t.get("function", {}).get("name", ""): t
+                            for t in merged_tools_schema
+                        }
+                        catalog = "\n".join(
+                            f"- {name}: {t.get('function', {}).get('description', '')[:80]}"
+                            for name, t in tool_names_map.items()
                         )
-                        sel_result = selector.select_tools(
-                            query=user_query,
-                            context_budget=2000,
-                            max_candidates=5,
+                        catalog_prompt = (
+                            f"Given this user query, select the single most appropriate tool.\n"
+                            f"Query: {user_query}\n\nAvailable tools:\n{catalog}\n\n"
+                            f"Reply with ONLY the tool name, nothing else."
                         )
-                        if sel_result.high_confidence_skill:
-                            top_tool = next(
-                                (t for t in merged_tools_schema
-                                 if t.get("function", {}).get("name") == sel_result.high_confidence_skill),
-                                None
-                            )
-                            if top_tool:
-                                effective_tools_schema = [top_tool]
-                                _high_confidence_skill = sel_result.high_confidence_skill
-                                logger.info(
-                                    "High-confidence mode: using only %s (score=%.2f)",
-                                    _high_confidence_skill,
-                                    sel_result.scores[0][1] if sel_result.scores else 0,
-                                )
-                        elif sel_result.catalog and len(merged_tools_schema) > 1:
-                            from core.llm.client import LLMClient
-                            llm_for_catalog = _get_shared_llm_client()
-                            catalog_prompt = f"""Given this user query, select the most appropriate tool from the catalog.
-Query: {user_query}
-
-Available tools:
-{sel_result.catalog}
-
-Reply with ONLY the tool name, nothing else."""
-                            try:
-                                resp = llm_for_catalog.chat([{"role": "user", "content": catalog_prompt}])
-                                selected_name = resp.get("content", "").strip()
-                                selected_tool = next(
-                                    (t for t in merged_tools_schema
-                                     if t.get("function", {}).get("name") == selected_name),
-                                    None
-                                )
-                                if selected_tool:
-                                    effective_tools_schema = [selected_tool]
-                                    logger.info("Catalog selection: %s", selected_name)
-                            except Exception as e:
-                                logger.debug("Catalog selection failed: %s", e)
+                        resp = _get_shared_llm_client().chat([{"role": "user", "content": catalog_prompt}])
+                        raw = resp.get("content", "").strip().strip("`\"'")
+                        # Fuzzy match: exact first, then substring
+                        matched = tool_names_map.get(raw)
+                        if not matched:
+                            for name, t in tool_names_map.items():
+                                if name in raw or raw in name:
+                                    matched = t
+                                    raw = name
+                                    break
+                        if matched:
+                            effective_tools_schema = [matched]
+                            _high_confidence_skill = raw
+                            logger.info("LLM tool selection: %s", raw)
+                        else:
+                            logger.warning("LLM tool selection returned unmatched '%s', using all %d tools", raw, len(merged_tools_schema))
                     except Exception as e:
-                        logger.debug("High-confidence selection failed: %s", e)
+                        logger.warning("Tool selection failed, using all %d tools: %s", len(merged_tools_schema), e)
+                elif request.tool_results:
+                    # tool_result turn: keep only the tool(s) already in use
+                    used_names = set()
+                    for tr in request.tool_results:
+                        name = tr.get("name") or ""
+                        if not name and isinstance(tr.get("result"), str):
+                            try:
+                                parsed = json.loads(tr["result"])
+                                name = parsed.get("name", "")
+                            except Exception:
+                                pass
+                        if name:
+                            used_names.add(name)
+                    if used_names:
+                        effective_tools_schema = [
+                            t for t in merged_tools_schema
+                            if t.get("function", {}).get("name", "") in used_names
+                        ]
+                        logger.info("Tool result turn: keeping %s", used_names)
 
             def _build_sync():
                 db = SessionLocal()
@@ -1981,6 +1992,7 @@ Reply with ONLY the tool name, nothing else."""
                                     event_type="tool_call",
                                     content=json.dumps({"name": tc_name, "arguments": tc_args, "source": "cloud"}),
                                     causal_chain_id=_turn_chain_id,
+                                    parent_event_id=_user_query_event_id,
                                 ))
                                 _db.commit()
                             finally:
@@ -2074,6 +2086,9 @@ Reply with ONLY the tool name, nothing else."""
                     assistant_msg["tool_calls"] = tool_calls
                 _entry.setdefault("history", []).append(assistant_msg)
                 _entry["turn_count"] = _entry.get("turn_count", 0) + 1
+                # Store chain IDs so continuation turns (tool_results) reuse them
+                _entry["turn_chain_id"] = _turn_chain_id
+                _entry["user_query_event_id"] = _user_query_event_id
                 _session_cache[session_id] = _entry
                 current_turn_count = _entry["turn_count"]
                 current_history = list(_entry.get("history", []))
@@ -2129,11 +2144,16 @@ Reply with ONLY the tool name, nothing else."""
 
             if request.explain:
                 _total_ms = round((time.monotonic() - _turn_start) * 1000)
+                _tool_count = len(effective_tools_schema) if effective_tools_schema else 0
+                _all_count = len(merged_tools_schema) if merged_tools_schema else 0
                 explain_event: dict[str, Any] = {
                     "type": "explain",
                     "total_ms": _total_ms,
                     "prompt_tokens": _total_prompt_tokens if _has_usage else None,
                     "completion_tokens": _total_completion_tokens if _has_usage else None,
+                    "tools_selected": _tool_count,
+                    "tools_available": _all_count,
+                    "tool_selection": _high_confidence_skill,
                     "steps": _explain_steps,
                 }
                 if _memory_stats:
