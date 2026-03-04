@@ -201,6 +201,15 @@ resolved_by_search: bool = False
 > "If `resolved_by_search=True` in the result, tell the user which repo was used
 > and ask them to confirm if it looks wrong."
 
+**LLM description must also say:**
+> "If the user gives `owner/repo` format and it returns an error (404/not found),
+> do NOT retry with just the project name — tell the user the repo was not found
+> or is private. Auto-search is only for bare project names."
+
+**Why this matters:** GitHub Search API ranks by star count. A bare name like
+`mo-auto-test` may match a completely unrelated high-star repo. Auto-search is
+best-effort and only appropriate when the user explicitly gives a bare name.
+
 ---
 
 ## Skill Description Template
