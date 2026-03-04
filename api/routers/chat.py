@@ -1877,6 +1877,7 @@ async def chat_turn(
                         yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': cloud_result[:500]})}\n\n"
                         # Truncate before quality assessment (assess full, truncate for LLM)
                         from core.context.compaction import truncate_tool_result
+                        _cloud_result_raw = cloud_result  # preserve for success check before annotation
                         # Quality badge for cloud tool results
                         if _TOOL_QUALITY_ENABLED:
                             _cqa = _assess_tool_result(tc_name, cloud_result)
@@ -1891,9 +1892,10 @@ async def chat_turn(
                         # retrying with different params or using bash/curl to work around the failure.
                         _cloud_skill_failed = False
                         try:
-                            _cr_parsed = json.loads(cloud_result) if isinstance(cloud_result, str) else cloud_result
+                            _cr_parsed = json.loads(_cloud_result_raw) if isinstance(_cloud_result_raw, str) else _cloud_result_raw
                             if isinstance(_cr_parsed, dict) and _cr_parsed.get("success") is False:
                                 _cloud_skill_failed = True
+                                logger.warning("Cloud skill %s returned success=False, stopping cloud loop", tc_name)
                                 _current_llm_messages = _current_llm_messages + [{
                                     "role": "system",
                                     "content": (
@@ -1904,7 +1906,7 @@ async def chat_turn(
                                     ),
                                 }]
                         except Exception:
-                            pass
+                            logger.exception("Failed to parse cloud_result for success check")
                         if _cloud_skill_failed:
                             break
 
