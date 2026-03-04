@@ -790,9 +790,17 @@ class PromptAssembler(DbConsumer):
         return None
 
     def _build_history(self, session_id: str, max_tokens: int) -> str | None:
-        """§6: Budget-capped conversation history with optional compression."""
-        # Feature flag: enable reference-aware compression
-        enable_compression = os.getenv("ENABLE_HISTORY_COMPRESSION", "false").lower() == "true"
+        """§6: Budget-capped conversation history with tiered compression.
+
+        Compression is enabled by default for token efficiency:
+        - Tier 1: Last 2 turns kept in full fidelity
+        - Tier 2: Older turns compressed (80 char summaries, unreferenced tool results omitted)
+        - Tier 3: Synopsis for very long histories (>6 turns)
+
+        Set ENABLE_HISTORY_COMPRESSION=false to disable.
+        """
+        # Default: compression enabled for token efficiency
+        enable_compression = os.getenv("ENABLE_HISTORY_COMPRESSION", "true").lower() != "false"
 
         with self._db() as db:
             budget_chars = int(max_tokens * _MAX_HISTORY_RATIO) * 4
