@@ -3,14 +3,16 @@
 
 import sys
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import asyncio
 import json
 import logging
-import re
 import subprocess
+
 import click
+
 from cli.api_client import APIClient, AuthenticationError
 
 logger = logging.getLogger(__name__)
@@ -272,6 +274,7 @@ def cmd_logout(console, client=None, **_):
 def cmd_skill(console, cmd_arg=None, client=None, state=None, **kw):
     """List, test, create, develop, or diagnose skills."""
     import os
+
     from core.skills.loader import SkillLoader
 
     project_root = os.getcwd()
@@ -292,8 +295,9 @@ def cmd_skill(console, cmd_arg=None, client=None, state=None, **kw):
         if not skills:
             console.print("[dim]No local skills found in .mo-agent/skills/[/dim]")
             return
-        from core.skills.markdown_skill import MarkdownSkill
         from rich.table import Table
+
+        from core.skills.markdown_skill import MarkdownSkill
         t = Table(show_header=True, box=None)
         t.add_column("Skill")
         t.add_column("Type", style="dim")
@@ -366,7 +370,7 @@ TODO: describe this skill for the LLM.
         console.print(f"  input:  {json.dumps(args, ensure_ascii=False)}")
 
         try:
-            from cli.tools.router import ToolRouter, ToolCall
+            from cli.tools.router import ToolCall, ToolRouter
             router = ToolRouter()
             router.register(match.skill)
             coro = router.execute([ToolCall(id="test", name=name, arguments=args)])
@@ -414,7 +418,7 @@ TODO: describe this skill for the LLM.
                     for msg in warnings:
                         console.print(f"  [yellow]WARN[/yellow]: {msg}")
                 else:
-                    console.print(f"[green]✓[/green] Validation passed")
+                    console.print("[green]✓[/green] Validation passed")
             state.pop("skill_dev_context", None)
             state.pop("skill_dev_name", None)
             state.pop("skill_dev_dir", None)
@@ -468,7 +472,7 @@ TODO: describe this skill for the LLM.
         console.print()
         console.print(f"  [dim]Test manually:  /skill test {name} {{\"param\": \"value\"}}[/dim]")
         console.print(f"  [dim]Validate:       /skill validate {name}[/dim]")
-        console.print(f"  [dim]Exit dev mode:  /skill dev off[/dim]")
+        console.print("  [dim]Exit dev mode:  /skill dev off[/dim]")
         sb = kw.get("status_bar")
         if sb:
             sb.update(skill_dev=state_name)
@@ -523,7 +527,11 @@ TODO: describe this skill for the LLM.
 def _cmd_skill_doctor(console, skill_name: str | None, client):
     """Check skill health: find orphaned, broken, or mismatched skills."""
     from api.database import SessionLocal
-    from skills.diagnose_skills.skill import DiagnoseSkillsInput, DiagnoseSkillsSkill, DiagnosisLevel
+    from skills.diagnose_skills.skill import (
+        DiagnoseSkillsInput,
+        DiagnoseSkillsSkill,
+        DiagnosisLevel,
+    )
 
     db = SessionLocal()
     try:
@@ -696,19 +704,19 @@ def _build_skill_dev_context(name: str, skill_dir: Path) -> str:
         "4. If the test fails or returns empty data, fix the code and re-test",
         "",
         "Use the shell tool to test:",
-        f'```bash',
+        '```bash',
         f'cd {skill_dir.parent.parent.parent} && python -c "',
-        f'import asyncio, json',
-        f'from core.skills.loader import SkillLoader',
-        f'from pathlib import Path',
+        'import asyncio, json',
+        'from core.skills.loader import SkillLoader',
+        'from pathlib import Path',
         f'skills = SkillLoader.discover([Path(\"{skill_dir.parent}\")])',
         f's = next((s for s in skills if s.skill.name == \"{name}\"), None)',
-        f'if s:',
-        f'    inp = s.skill.validate_input({{\"query\": \"test\"}})',
-        f'    r = asyncio.run(s.skill.execute(inp))',
-        f'    print(json.dumps(r.model_dump(), indent=2, ensure_ascii=False, default=str))',
-        f'"',
-        f'```',
+        'if s:',
+        '    inp = s.skill.validate_input({\"query\": \"test\"})',
+        '    r = asyncio.run(s.skill.execute(inp))',
+        '    print(json.dumps(r.model_dump(), indent=2, ensure_ascii=False, default=str))',
+        '"',
+        '```',
         "",
         "DO NOT consider the skill done until you have seen a successful test output with real data.",
         "",
@@ -1250,13 +1258,14 @@ async def _prefetch_cloud_skills(api_client) -> str | None:
 async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False, session_info=None):
     """Run one edge chat loop turn using the provided APIClient."""
     import os
+
     from cli.edge_chat_loop import edge_chat_loop
     from cli.permissions import PermissionManager
-    from cli.tools.router import ToolRouter
     from cli.tools.file_ops import register_file_tools
-    from cli.tools.shell import register_shell_tools
     from cli.tools.git import register_git_tools
+    from cli.tools.router import ToolRouter
     from cli.tools.search import register_search_tools
+    from cli.tools.shell import register_shell_tools
 
     project_root = os.getcwd()
     router = ToolRouter()
@@ -1283,6 +1292,10 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
     router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client))
     router.register(ReflectTool(api_client=api_client, session_info=session_info))
     register_skill_config_tools(router, api_client)
+
+    # Skill discovery tool for large catalogs
+    from cli.tools.skill_discovery import FindSkillsTool
+    router.register(FindSkillsTool())
 
     # Prefetch cloud skill summaries so LLM knows about them on turn 0.
     cloud_hint = await _prefetch_cloud_skills(api_client)
@@ -1486,7 +1499,8 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
     # --- Choose renderer + input method ---
     if is_tty:
         from cli.ui.renderer import RichRenderer
-        from cli.ui.repl import create_session as create_repl_session, get_input
+        from cli.ui.repl import create_session as create_repl_session
+        from cli.ui.repl import get_input
         from cli.ui.status_bar import StatusBar
 
         status_bar = StatusBar()
@@ -1546,7 +1560,7 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                             skill_dev=state.get("skill_dev_name", ""),
                         )
                 else:
-                    console.print(f"[red]Unknown command.[/red] Type [cyan]/help[/cyan]")
+                    console.print("[red]Unknown command.[/red] Type [cyan]/help[/cyan]")
                 continue
 
             if user_input.lower() in ("exit", "quit"):
@@ -1615,7 +1629,7 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                             for msg in warnings:
                                 console.print(f"    [yellow]WARN[/yellow]: {msg}")
                         else:
-                            console.print(f"  [green]✓ Auto-validate: passed[/green]")
+                            console.print("  [green]✓ Auto-validate: passed[/green]")
                             console.print(f"    [dim]Test it: /skill test {state.get('skill_dev_name', '')} {{\"param\": \"value\"}}[/dim]")
 
                 turn_count += 1
@@ -1674,6 +1688,7 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
 def doctor(ctx):
     """Run diagnostics."""
     from rich.console import Console
+
     from cli.ui.doctor import run_doctor
     run_doctor(Console(stderr=True), ctx.obj["client"])
 
@@ -1781,6 +1796,7 @@ def skill_register(ctx, skill_file):
 def skill_scaffold(yaml_file, output_dir):
     """Generate skill package from YAML declaration."""
     import yaml as _yaml
+
     from core.skills.scaffold import SkillSpec, generate_files
     try:
         data = _yaml.safe_load(Path(yaml_file).read_text())

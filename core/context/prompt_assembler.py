@@ -191,7 +191,7 @@ class PromptAssembler(DbConsumer):
     ) -> AssembledPrompt:
         """
         Assemble system prompt with zone-based budget tracking.
-        
+
         Phase 1 Integration: Computes zone budgets based on model context size
         and tracks which zones overflow. This enables data-driven optimization.
 
@@ -475,7 +475,11 @@ class PromptAssembler(DbConsumer):
         edge_context: EdgeContext | None,
         user_id: str | None = None,
     ) -> str:
-        """§2: Agent self-awareness — capabilities, boundaries, learned insights."""
+        """§2: Agent self-awareness — capabilities, boundaries, learned insights.
+
+        Optimized for large skill catalogs: uses category summary instead of
+        listing individual skills. Full skill list available via get_agent_info.
+        """
         with self._db() as db:
             parts = ["## Self-Model"]
             parts.append("When users ask about YOUR skills, capabilities, or what you can do, answer from this section — do not explore the filesystem.")
@@ -492,69 +496,27 @@ class PromptAssembler(DbConsumer):
             else:
                 parts.append("- Local tools: file operations, shell commands, git, search")
 
-            # User-installed skills — personalized to the current user.
-            # These are skills the user explicitly installed via `/skill install`,
-            # distinct from globally active cloud skills below.
-            # Capped at 10 to stay within the self-model token budget;
-            # full list available via get_agent_info tool at runtime.
+            # User-installed skills — only show names, not full descriptions
             installed_names: set[str] = set()
             if user_id:
                 try:
-                    from api.models import SkillInstallation, SkillRegistry
+                    from api.models import SkillInstallation
                     installed = (
-                        db.query(SkillInstallation.skill_name, SkillInstallation.skill_version)
+                        db.query(SkillInstallation.skill_name)
                         .filter(SkillInstallation.user_id == user_id, SkillInstallation.status == "installed")
                         .limit(10)
                         .all()
                     )
                     if installed:
                         installed_names = {r[0] for r in installed}
-                        descs = (
-                            db.query(SkillRegistry.skill_name, SkillRegistry.description)
-                            .filter(
-                                SkillRegistry.skill_name.in_(list(installed_names)),
-                                SkillRegistry.is_active == 1,
-                            )
-                            .all()
-                        )
-                        # Deduplicate: keep first description per skill_name
-                        desc_map: dict[str, str] = {}
-                        for name, d in descs:
-                            if d and name not in desc_map:
-                                desc_map[name] = d
-                        lines = []
-                        for name, version in installed:
-                            desc = desc_map.get(name)
-                            lines.append(f"  - {name} (v{version})" + (f": {desc}" if desc else ""))
-                        parts.append("- My installed skills:\n" + "\n".join(lines))
+                        parts.append(f"- My installed skills: {', '.join(installed_names)}")
                 except SQLAlchemyError:
                     pass
 
-            # Cloud skills — globally active skills available to all users.
-            # Excludes already-installed skills to avoid redundancy and save
-            # token budget (Self-Model has a 600-token hard cap).
-            # Capped at 10; full catalog available via get_agent_info tool.
-            try:
-                from api.models import SkillRegistry
-                query = db.query(SkillRegistry.skill_name, SkillRegistry.description).filter(
-                    SkillRegistry.is_active == 1,
-                ).order_by(SkillRegistry.skill_name)
-                rows = query.limit(30).all()
-                if rows:
-                    # Deduplicate multi-version rows and exclude installed skills.
-                    seen: set[str] = set()
-                    lines = []
-                    for name, desc in rows:
-                        if name in seen or name in installed_names:
-                            continue
-                        seen.add(name)
-                        lines.append(f"  - {name}" + (f": {desc}" if desc else ""))
-                        if len(lines) >= 10:
-                            break
-                    if lines:
-                        parts.append("- Available cloud skills:\n" + "\n".join(lines))
-            except SQLAlchemyError:
-                pass
+            # Cloud skills — category summary instead of full list (O(categories) not O(skills))
+            skill_summary = self._build_skill_categories(db, installed_names)
+            if skill_summary:
+                parts.append(skill_summary)
 
             # Delegation
             if agent_id:
@@ -661,6 +623,107 @@ class PromptAssembler(DbConsumer):
             if info:
                 parts.append("# Project Profile\n" + "\n".join(info))
         return "\n\n".join(parts) if parts else None
+
+    def _build_skill_categories(self, db, exclude_names: set[str] | None = None) -> str | None:
+        """Build skill category summary for Self-Model section.
+
+        Design: O(categories) not O(skills) — scales to 1000+ skills without prompt bloat.
+        
+        Returns a compact summary like:
+          "- 42 cloud skills in 5 categories:
+             - github (15): list_prs, ci_status, get_pr
+             - aws (12): ec2_status, s3_list, lambda_invoke
+           - Use find_skills('task') to discover relevant skills"
+        
+        Args:
+            db: Database session
+            exclude_names: Set of skill names to exclude (e.g., user's installed skills)
+        
+        Returns:
+            Formatted category summary string, or None if no skills exist
+        """
+        try:
+            from api.models import SkillRegistry
+
+            # Step 1: Count distinct skill names per category
+            # (not skill_id, which would count multiple versions as separate skills)
+            # Exclude user's installed skills from the count
+            
+            # Build base query
+            query = db.query(
+                SkillRegistry.category,
+                SkillRegistry.skill_name,
+            ).filter(SkillRegistry.is_active == 1)
+            
+            # Exclude installed skills from cloud skills section
+            if exclude_names:
+                query = query.filter(~SkillRegistry.skill_name.in_(exclude_names))
+            
+            # Get all distinct (category, skill_name) pairs
+            all_skills = query.distinct().all()
+            
+            if not all_skills:
+                logger.debug("No active skills found")
+                return None
+
+            # Step 2: Group by category and count
+            category_counts: dict[str, int] = {}
+            for cat, _ in all_skills:
+                category_counts[cat or "general"] = category_counts.get(cat or "general", 0) + 1
+            
+            logger.debug("Category counts: %s", category_counts)
+            
+            # Sort by count descending, limit to top 10
+            sorted_cats = sorted(category_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+            
+            if not sorted_cats:
+                logger.debug("No categories after sorting")
+                return None
+
+            # Step 3: Calculate total
+            total = sum(cnt for _, cnt in sorted_cats)
+            
+            # Step 4: Get top 3 skill examples per category (ordered by priority)
+            # Note: MatrixOne requires ORDER BY columns to be in SELECT list when using DISTINCT
+            # Also exclude installed skills from examples
+            category_examples: dict[str, list[str]] = {}
+            for cat, _ in sorted_cats:
+                query = (
+                    db.query(SkillRegistry.skill_name, SkillRegistry.priority)
+                    .filter(
+                        SkillRegistry.is_active == 1,
+                        SkillRegistry.category == cat,
+                    )
+                )
+                # Exclude installed skills from examples too
+                if exclude_names:
+                    query = query.filter(~SkillRegistry.skill_name.in_(exclude_names))
+                
+                examples = (
+                    query
+                    .order_by(SkillRegistry.priority.desc())  # Top priority skills first
+                    .distinct()  # Avoid duplicates from multiple versions
+                    .limit(3)
+                    .all()
+                )
+                # Extract just the skill names (priority was needed for ORDER BY)
+                category_examples[cat] = [e[0] for e in examples]
+
+            # Step 5: Format output
+            lines = [f"- {total} cloud skills in {len(sorted_cats)} categories:"]
+            for cat, cnt in sorted_cats:
+                example_str = ", ".join(category_examples.get(cat, []))
+                lines.append(f"  - {cat} ({cnt}): {example_str}")
+
+            lines.append("- Use find_skills('task') or get_agent_info for full catalog")
+            return "\n".join(lines)
+
+        except SQLAlchemyError as e:
+            logger.error("Skill categories query failed: %s", e, exc_info=True)
+            return None
+        except Exception as e:
+            logger.error("Unexpected error in _build_skill_categories: %s", e, exc_info=True)
+            return None
 
     def _build_memory(
         self, user_id: str, session_id: str, query: str, explain: bool = False,
@@ -777,7 +840,7 @@ class PromptAssembler(DbConsumer):
     def _build_history_compressed(self, rows, budget_chars: int) -> str | None:
         """
         Reference-aware compressed history formatting.
-        
+
         Converts DB rows to history format and applies compression.
         Handles malformed data gracefully with fallback to simple format.
         """
@@ -862,11 +925,11 @@ class PromptAssembler(DbConsumer):
     ) -> None:
         """
         Phase 1: Check which zones exceed their budgets and log for observability.
-        
+
         This enables data-driven optimization by identifying bottlenecks.
         Maps prompt sections to zone budgets:
         - Fixed zone: identity, self_model, project_context, constraints
-        - Managed zone: memory, working_memory  
+        - Managed zone: memory, working_memory
         - Elastic zone: history
         """
         # Map sections to zones

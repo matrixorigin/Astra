@@ -154,6 +154,18 @@ class SkillIndex(DbConsumer):
         Skills with L2 distance > *max_distance* are excluded.
         When *category* is given, only skills in that category are searched.
         """
+        results = self.query_with_scores(text_query, top_k, max_distance, category)
+        return [name for name, _ in results]
+
+    def query_with_scores(
+        self, text_query: str, top_k: int = 10, max_distance: float | None = None,
+        category: str | None = None,
+    ) -> list[tuple[str, float]]:
+        """Return top-k (skill_name, relevance_score) by L2 distance.
+
+        Relevance score is normalized: 1.0 = perfect match, 0.0 = at threshold.
+        Returns empty list if no embeddings exist or embed_fn/db_factory is None.
+        """
         if not self._embed or not self._db_factory:
             return []
         try:
@@ -195,7 +207,15 @@ class SkillIndex(DbConsumer):
                 db.rollback()
                 self._clear_stale_embeddings(db)
                 return []
-            return [name for name, dist in rows if dist <= threshold]
+
+            # Convert L2 distance to relevance score: 1.0 = perfect, 0.0 = at threshold
+            results = []
+            for name, dist in rows:
+                if dist <= threshold:
+                    # Normalize: dist=0 → score=1.0, dist=threshold → score=0.0
+                    score = max(0.0, 1.0 - (dist / threshold)) if threshold > 0 else 1.0
+                    results.append((name, round(score, 3)))
+            return results
 
     def _clear_stale_embeddings(self, db) -> int:
         """NULL out all embeddings so next build() re-embeds with correct dimension.

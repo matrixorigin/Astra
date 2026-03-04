@@ -121,7 +121,23 @@ class Skill(ABC, Generic[InputT, OutputT]):
     name: str
     version: str = "1.0.0"
     description: str = ""
+    short_description: str = ""  # <=80 chars for system prompt; auto-truncates if empty
     requirements: SkillRequirement = SkillRequirement()
+
+    @property
+    def prompt_description(self) -> str:
+        """Short description for system prompt (<=80 chars).
+
+        Used in category summaries and skill listings where token budget is tight.
+        Falls back to truncated description if short_description not set.
+        """
+        if self.short_description:
+            return self.short_description
+        if not self.description:
+            return ""
+        if len(self.description) <= 80:
+            return self.description
+        return self.description[:77] + "..."
     side_effect_profile: SideEffectProfile = SideEffectProfile(
         category=SideEffectCategory.READ,
     )
