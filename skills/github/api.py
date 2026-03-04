@@ -139,26 +139,127 @@ class GitHubSkillAPI:
     # PR operations
     # ------------------------------------------------------------------
 
-    async def get_pr(self, repo: str, pr_number: int) -> dict:
-        """Fetch PR details. Caches in user DB if available."""
+    # Normalize GitHub conclusion values to a fixed vocabulary.
+    _CONCLUSION_MAP: dict[str | None, str] = {
+        "success": "success",
+        "failure": "failure",
+        "cancelled": "cancelled",
+        "skipped": "skipped",
+        "timed_out": "failure",
+        None: "pending",
+        "in_progress": "pending",
+        "queued": "pending",
+        "waiting": "pending",
+        "requested": "pending",
+        "action_required": "pending",
+        "neutral": "skipped",
+        "stale": "cancelled",
+    }
+
+    @staticmethod
+    def _fmt_ts(dt: datetime | None) -> str | None:
+        """Format datetime to 'YYYY-MM-DD HH:MM' (LLM-friendly). Returns None if dt is None."""
+        if dt is None:
+            return None
+        return dt.strftime("%Y-%m-%d %H:%M")
+
+    @staticmethod
+    def _trunc(text: str | None, limit: int) -> str | None:
+        """Truncate text to limit chars, appending '[truncated]' if cut."""
+        if not text:
+            return text
+        return text[:limit] + " [truncated]" if len(text) > limit else text
+
+    async def get_pr(self, repo: str, pr_number: int, detail: str = "normal") -> dict:
+        """Fetch PR details.
+
+        detail levels:
+          brief    — number, title (80), author, state, created_at, ci_conclusion, changed_files
+          normal   — brief + body (200), labels, reviewers, additions/deletions
+          detailed — normal + key changed files (top 10), review_comments count, merge status
+          full     — detailed + complete body (2000), all review comments (200 each)
+        """
         await self._check_rate_limit()
         try:
             gh_repo = self._get_repo(repo)
             pr = gh_repo.get_pull(pr_number)
-            result = {
+
+            # Get CI conclusion from latest commit status
+            ci_conclusion: str = "pending"
+            try:
+                commit = gh_repo.get_commit(pr.head.sha)
+                checks = list(commit.get_check_runs())
+                if checks:
+                    conclusions = [c.conclusion for c in checks]
+                    if "failure" in conclusions:
+                        ci_conclusion = "failure"
+                    elif all(c == "success" for c in conclusions):
+                        ci_conclusion = "success"
+                    elif any(c is None for c in conclusions):
+                        ci_conclusion = "pending"
+                    else:
+                        ci_conclusion = "success"
+            except Exception:
+                pass
+
+            result: dict = {
                 "number": pr.number,
-                "title": pr.title,
-                "body": pr.body or "",
+                "title": self._trunc(pr.title, 80),
+                "author": pr.user.login,
                 "state": pr.state,
-                "files_changed": pr.changed_files,
-                "additions": pr.additions,
-                "deletions": pr.deletions,
-                "user": pr.user.login,
-                "created_at": pr.created_at.isoformat(),
-                "updated_at": pr.updated_at.isoformat(),
+                "created_at": self._fmt_ts(pr.created_at),
+                "ci_conclusion": ci_conclusion,
+                "changed_files": pr.changed_files,
                 "html_url": pr.html_url,
             }
-            self._cache_pr(repo, result)
+            if detail == "brief":
+                self._cache_pr(repo, {**result, "body": pr.body or ""})
+                return result
+
+            # normal+
+            result.update({
+                "body": self._trunc(pr.body or "", 200),
+                "labels": [lb.name for lb in pr.labels],
+                "reviewers": [r.login for r in pr.requested_reviewers],
+                "additions": pr.additions,
+                "deletions": pr.deletions,
+                "updated_at": self._fmt_ts(pr.updated_at),
+            })
+            if detail == "normal":
+                self._cache_pr(repo, {**result, "body": pr.body or ""})
+                return result
+
+            # detailed+
+            files = list(pr.get_files())
+            files_sorted = sorted(files, key=lambda f: f.changes, reverse=True)[:10]
+            result.update({
+                "key_files": [
+                    {"filename": f.filename, "changes": f.changes, "status": f.status}
+                    for f in files_sorted
+                ],
+                "review_comments": pr.review_comments,
+                "mergeable": pr.mergeable,
+                "merge_state": getattr(pr, "mergeable_state", None),
+            })
+            if detail == "detailed":
+                self._cache_pr(repo, {**result, "body": pr.body or ""})
+                return result
+
+            # full
+            result["body"] = self._trunc(pr.body or "", 2000)
+            try:
+                reviews = []
+                for rv in pr.get_reviews():
+                    reviews.append({
+                        "user": rv.user.login,
+                        "state": rv.state,
+                        "body": self._trunc(rv.body, 200),
+                        "submitted_at": self._fmt_ts(rv.submitted_at),
+                    })
+                result["reviews"] = reviews
+            except Exception:
+                result["reviews"] = []
+            self._cache_pr(repo, {**result, "body": pr.body or ""})
             return result
         except (GitHubError, GitHubRateLimitError):
             raise
@@ -192,8 +293,13 @@ class GitHubSkillAPI:
                 f"Failed to fetch diff: {e.data.get('message', str(e))}", status_code=e.status
             ) from e
 
-    async def list_prs(self, repo: str, state: str = "open", limit: int = 10) -> list[dict]:
-        """List PRs in a repo."""
+    async def list_prs(self, repo: str, state: str = "open", limit: int = 10, detail: str = "brief") -> list[dict]:
+        """List PRs in a repo.
+
+        detail levels:
+          brief  — number, title (80), author, state, created_at, html_url
+          normal — brief + body (200), labels, reviewers, changed_files, ci_conclusion
+        """
         await self._check_rate_limit()
         try:
             gh_repo = self._get_repo(repo)
@@ -202,14 +308,21 @@ class GitHubSkillAPI:
             for i, pr in enumerate(prs):
                 if i >= limit:
                     break
-                item = {
+                item: dict = {
                     "number": pr.number,
-                    "title": pr.title,
-                    "user": pr.user.login,
+                    "title": self._trunc(pr.title, 80),
+                    "author": pr.user.login,
                     "state": pr.state,
-                    "created_at": pr.created_at.isoformat(),
+                    "created_at": self._fmt_ts(pr.created_at),
                     "html_url": pr.html_url,
                 }
+                if detail != "brief":
+                    item.update({
+                        "body": self._trunc(pr.body or "", 200),
+                        "labels": [lb.name for lb in pr.labels],
+                        "reviewers": [r.login for r in pr.requested_reviewers],
+                        "changed_files": pr.changed_files,
+                    })
                 result.append(item)
             return result
         except (GitHubError, GitHubRateLimitError):
@@ -263,67 +376,81 @@ class GitHubSkillAPI:
     # Issue operations
     # ------------------------------------------------------------------
 
-    _VALID_DETAIL_LEVELS = frozenset({"brief", "normal", "full"})
+    _VALID_DETAIL_LEVELS = frozenset({"brief", "normal", "detailed", "full"})
 
-    @staticmethod
-    def _format_issue(issue, detail: str = "normal") -> dict:
+    def _format_issue(self, issue, detail: str = "normal") -> dict:
         """Format an issue object at the requested detail level.
 
         detail levels:
-          brief  — number, title, state, user, labels, html_url (list-friendly)
-          normal — brief + body, assignees, created/updated, comments, milestone
-          full   — normal + reactions, closed_at, closed_by, state_reason, locked,
-                   timeline (recent comments)
+          brief    — number, title (80), state, user, labels, created_at, html_url
+          normal   — brief + body (200), assignees, comment_count, milestone
+          detailed — normal + recent 3 comments (200 each), linked PRs
+          full     — detailed + complete body (2000), all comments (200 each, up to 20)
         """
         if detail not in GitHubSkillAPI._VALID_DETAIL_LEVELS:
-            raise ValueError(f"Invalid detail level {detail!r}, must be one of: brief, normal, full")
+            raise ValueError(f"Invalid detail level {detail!r}, must be one of: brief, normal, detailed, full")
         d: dict = {
             "number": issue.number,
-            "title": issue.title,
+            "title": self._trunc(issue.title, 80),
             "state": issue.state,
             "user": issue.user.login,
             "labels": [lb.name for lb in issue.labels],
+            "created_at": self._fmt_ts(issue.created_at),
             "html_url": issue.html_url,
         }
         if detail == "brief":
             return d
-        # normal
+
+        # normal+
         d.update({
-            "body": issue.body or "",
+            "body": self._trunc(issue.body or "", 200),
             "assignees": [a.login for a in issue.assignees],
-            "created_at": issue.created_at.isoformat(),
-            "updated_at": issue.updated_at.isoformat(),
-            "comments": issue.comments,
+            "comment_count": issue.comments,
             "milestone": issue.milestone.title if issue.milestone else None,
+            "updated_at": self._fmt_ts(issue.updated_at),
         })
         if detail == "normal":
             return d
-        # full
-        # PyGithub Issue.reactions is typed as dict (see github/Issue.py:301),
-        # so isinstance check is correct here — it guards against unexpected None.
-        d.update({
-            "reactions": issue.reactions if isinstance(issue.reactions, dict) else {},
-            "closed_at": issue.closed_at.isoformat() if issue.closed_at else None,
-            "closed_by": issue.closed_by.login if issue.closed_by else None,
-            "state_reason": getattr(issue, "state_reason", None),
-            "locked": issue.locked,
-        })
-        # Fetch recent comments (up to 5) — costs 1 extra API call.
-        # get_comments() returns a PaginatedList; break early to avoid fetching all pages.
+
+        # detailed+ — fetch recent comments (up to 3)
         try:
             recent = []
             for c in issue.get_comments():
-                if len(recent) >= 5:
+                if len(recent) >= 3:
                     break
                 recent.append({
                     "user": c.user.login,
-                    "created_at": c.created_at.isoformat(),
-                    "body": c.body[:500] if c.body else "",
+                    "created_at": self._fmt_ts(c.created_at),
+                    "body": self._trunc(c.body, 200),
                 })
             d["recent_comments"] = recent
         except Exception as exc:
             logger.warning("Failed to fetch comments for issue #%s: %s", issue.number, exc)
             d["recent_comments"] = []
+        if detail == "detailed":
+            return d
+
+        # full — expand body, fetch up to 20 comments
+        d["body"] = self._trunc(issue.body or "", 2000)
+        d.update({
+            "reactions": issue.reactions if isinstance(issue.reactions, dict) else {},
+            "closed_at": self._fmt_ts(issue.closed_at),
+            "closed_by": issue.closed_by.login if issue.closed_by else None,
+            "locked": issue.locked,
+        })
+        try:
+            all_comments = []
+            for c in issue.get_comments():
+                if len(all_comments) >= 20:
+                    break
+                all_comments.append({
+                    "user": c.user.login,
+                    "created_at": self._fmt_ts(c.created_at),
+                    "body": self._trunc(c.body, 200),
+                })
+            d["recent_comments"] = all_comments
+        except Exception as exc:
+            logger.warning("Failed to fetch comments for issue #%s: %s", issue.number, exc)
         return d
 
     async def list_issues(
@@ -484,19 +611,19 @@ class GitHubSkillAPI:
 
                 item: dict = {
                     "workflow": run.name or "Unnamed",
-                    "conclusion": run.conclusion,   # success/failure/skipped/cancelled/None
-                    "status": run.status,           # queued/in_progress/completed
+                    "conclusion": self._CONCLUSION_MAP.get(run.conclusion, "unknown"),
                     "branch": run.head_branch,
                     "pr_number": pr_number,
                     "actor": run.actor.login if run.actor else None,
-                    "created_at": run.created_at.isoformat(),
+                    "triggered_at": self._fmt_ts(run.created_at),
                     "url": run.html_url,
                 }
 
                 if detail in ("normal", "detailed", "full"):
                     item["pr_title"] = pr_title
-                    item["commit_message"] = (run.head_commit.message.split("\n")[0]
-                                              if run.head_commit else None)
+                    item["commit_message"] = self._trunc(
+                        run.head_commit.message.split("\n")[0] if run.head_commit else None, 80
+                    )
                     if run.updated_at and run.created_at:
                         item["duration_seconds"] = int(
                             (run.updated_at - run.created_at).total_seconds()
@@ -508,12 +635,12 @@ class GitHubSkillAPI:
                         job_list = []
                         failed_jobs = []
                         for job in jobs:
+                            job_conclusion = self._CONCLUSION_MAP.get(job.conclusion, "unknown")
                             job_list.append({
                                 "name": job.name,
-                                "conclusion": job.conclusion,
-                                "status": job.status,
+                                "conclusion": job_conclusion,
                             })
-                            if job.conclusion == "failure":
+                            if job_conclusion == "failure":
                                 failed_jobs.append(job.name)
                         item["jobs"] = job_list
                         item["failed_jobs"] = failed_jobs

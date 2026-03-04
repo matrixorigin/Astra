@@ -137,16 +137,16 @@ class SummarizePRSkill(Skill[SummarizePRInput, SummarizePROutput]):
 
     async def execute(self, input: SummarizePRInput) -> SummarizePROutput:
         """Execute the skill"""
-        # 1. Fetch PR from GitHub
+        # 1. Fetch PR from GitHub — use full detail for LLM analysis
         repo = input.repo or input.repo_id
-        pr = await self.github.get_pr(repo, input.pr_number)
+        pr = await self.github.get_pr(repo, input.pr_number, detail="full")
 
         # 2. Build prompt
         prompt = f"""Summarize this PR concisely:
 
 Title: {pr["title"]}
 Description: {pr["body"]}
-Files changed: {pr["files_changed"]}
+Files changed: {pr["changed_files"]}
 """
         if input.include_diff:
             diff = await self.github.get_pr_diff(repo, input.pr_number)
@@ -170,7 +170,7 @@ Files changed: {pr["files_changed"]}
             success=True,
             result=response.content,
             summary=response.content,
-            files_changed=pr["files_changed"],
+            files_changed=pr["changed_files"],
             additions=pr["additions"],
             deletions=pr["deletions"],
             cost=response.cost_usd,
@@ -188,6 +188,7 @@ class ListPRsInput(SkillInput):
     repo: str = ""  # "owner/repo", e.g. "matrixorigin/matrixone"
     state: str = "open"  # open, closed, all
     limit: int = 10
+    detail: str = "brief"  # brief | normal
 
 
 class ListPRsOutput(SkillOutput):
@@ -209,6 +210,7 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
         "Use this when user asks about PRs, recent changes, or what's being worked on. "
         "repo can be 'owner/repo' or just a project name — auto-resolved via GitHub search. "
         "If resolved_by_search=True in the result, tell the user which repo was used and ask to confirm if wrong. "
+        "detail: 'brief' (default) = number/title/author/state/created_at; 'normal' adds body summary + labels + reviewers + changed_files. "
         "Use state='open' for active PRs, 'closed' for merged/closed, 'all' for both."
     )
     requirements = SkillRequirement(
@@ -229,21 +231,9 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
             return ListPRsOutput(success=False, result="repo is required (e.g. 'matrixorigin/matrixone')", prs=[])
         resolved_by_search = isinstance(repo, str) and "/" not in repo
         resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
-        prs = await self.github.list_prs(resolved, input.state, input.limit)
-
-        result = [
-            {
-                "number": pr["number"],
-                "title": pr["title"],
-                "author": pr["user"],
-                "created_at": pr["created_at"],
-                "url": pr["html_url"],
-            }
-            for pr in prs
-        ]
-
+        prs = await self.github.list_prs(resolved, input.state, input.limit, input.detail)
         return ListPRsOutput(
-            success=True, result=result, prs=result,
+            success=True, result=prs, prs=prs,
             resolved_repo=resolved if resolved_by_search else None,
             resolved_by_search=resolved_by_search,
         )

@@ -147,18 +147,17 @@ async def test_summarize_pr_skill(db_session, llm, github, monkeypatch):
         )
 
     # Mock GitHub API calls
-    async def mock_get_pr(repo_id, pr_number):
+    async def mock_get_pr(repo_id, pr_number, detail="normal"):
         return {
             "number": pr_number,
             "title": f"PR #{pr_number}",
             "body": "This is a test PR",
             "state": "open",
-            "files_changed": 5,
+            "changed_files": 5,
             "additions": 120,
             "deletions": 30,
-            "user": "test_user",
-            "created_at": "2026-02-10T00:00:00Z",
-            "updated_at": "2026-02-10T00:00:00Z",
+            "author": "test_user",
+            "created_at": "2026-02-10 00:00",
             "html_url": f"https://github.com/owner/repo/pull/{pr_number}",
         }
 
@@ -193,14 +192,14 @@ async def test_list_prs_skill(db_session, github, monkeypatch):
     """Test list_prs skill execution"""
 
     # Mock GitHub API call
-    async def mock_list_prs(repo_id, state, limit):
+    async def mock_list_prs(repo_id, state, limit, detail="brief"):
         return [
             {
                 "number": i,
                 "title": f"PR #{i}",
-                "user": "user",
+                "author": "user",
                 "state": state,
-                "created_at": "2026-02-10T00:00:00Z",
+                "created_at": "2026-02-10 00:00",
                 "html_url": f"https://github.com/owner/repo/pull/{i}",
             }
             for i in range(1, limit + 1)
@@ -318,7 +317,7 @@ async def test_summarize_pr_works_with_sync_llm(db_session):
     fake_gh = MagicMock()
     fake_gh.get_pr = AsyncMock(return_value={
         "number": 1, "title": "test", "body": "desc",
-        "files_changed": 2, "additions": 10, "deletions": 5,
+        "changed_files": 2, "additions": 10, "deletions": 5,
     })
     fake_gh.get_pr_diff = AsyncMock(return_value="diff")
 

@@ -263,10 +263,10 @@ class TestGitHubAPIMethods:
         mock_gh_client.get_repo.return_value = mock_repo
         result = await api.list_issues("owner/repo", detail="normal")
         assert result[0]["body"] == "issue body"
-        assert result[0]["comments"] == 3
+        assert result[0]["comment_count"] == 3
         assert result[0]["assignees"] == ["bob"]
         assert result[0]["milestone"] is None
-        assert result[0]["created_at"] == "2026-01-01T00:00:00+00:00"
+        assert result[0]["created_at"] == "2026-01-01 00:00"
         assert "reactions" not in result[0]
 
     @pytest.mark.asyncio
@@ -351,8 +351,7 @@ class TestGitHubAPIMethods:
         assert result["title"] == "Specific bug"
         assert result["body"] == "issue body"
         assert result["assignees"] == ["bob"]
-        assert result["created_at"] == "2026-01-01T00:00:00+00:00"
-        assert "reactions" not in result
+        assert result["created_at"] == "2026-01-01 00:00"
 
     @pytest.mark.asyncio
     async def test_get_issue_full_detail(self, api, mock_gh_client):
@@ -363,7 +362,6 @@ class TestGitHubAPIMethods:
         result = await api.get_issue("owner/repo", 42, detail="full")
         assert result["reactions"] == {"total_count": 2, "+1": 1, "-1": 0, "laugh": 1}
         assert result["locked"] is False
-        assert result["state_reason"] is None
         assert result["closed_at"] is None
         assert result["closed_by"] is None
         assert "recent_comments" in result
@@ -541,9 +539,10 @@ class TestGitHubAPIMethods:
         mock_repo.get_issue.return_value = issue
         mock_gh_client.get_repo.return_value = mock_repo
         result = await api.get_issue("owner/repo", 42, detail="full")
-        assert len(result["recent_comments"]) == 5
+        # full level returns up to 20 comments; 10 mocked → all 10 returned
+        assert len(result["recent_comments"]) == 10
         assert result["recent_comments"][0]["user"] == "user0"
-        assert result["recent_comments"][4]["user"] == "user4"
+        assert result["recent_comments"][9]["user"] == "user9"
 
     @pytest.mark.asyncio
     async def test_get_issue_repo_not_found_propagates(self, api, mock_gh_client):

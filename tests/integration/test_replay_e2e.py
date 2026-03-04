@@ -89,10 +89,10 @@ async def test_e2e_skill_version_replay(
             latency_ms=1000, cost_usd=0.002,
         )
 
-    async def mock_get_pr(repo_id, pr_number):
+    async def mock_get_pr(repo_id, pr_number, detail="normal"):
         return {
             "number": pr_number, "title": f"PR #{pr_number}", "body": "Test PR",
-            "state": "open", "files_changed": 5, "additions": 120, "deletions": 30,
+            "state": "open", "changed_files": 5, "additions": 120, "deletions": 30,
             "user": "test_user", "created_at": "2026-02-10T00:00:00Z",
             "updated_at": "2026-02-10T00:00:00Z",
             "html_url": f"https://github.com/owner/repo/pull/{pr_number}",

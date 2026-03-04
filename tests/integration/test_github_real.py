@@ -81,7 +81,7 @@ async def test_real_github_get_pr(github_client):
     assert "title" in pr
     assert "body" in pr
     assert pr["state"] in ["open", "closed"]
-    assert pr["files_changed"] >= 0
+    assert pr["changed_files"] >= 0
 
 
 @pytest.mark.skipif(
