@@ -65,7 +65,7 @@ We don't compete on "smarter LLM." We compete on **trust infrastructure**: every
 │  Identity: users, roles, permissions                        │
 │  Runtime: sessions, events, decisions, snapshots, audit     │
 │  Catalog: skills_registry, skill_permissions, models         │
-│  Credentials: user_credentials (encrypted)                  │
+│  Credentials: skill_settings, skill_resource_bindings        │
 ├─────────────────────────────────────────────────────────────┤
 │              SKILL DATA (sk_{skill}_{table} prefix)         │
 │  sk_github_repos, sk_github_pr_cache                        │
@@ -98,7 +98,7 @@ This is the index. Each document is the **single source of truth** for its domai
 |----------|-------|
 | [Memory Architecture](memory-architecture.md) | Cognitive architecture: episodic/semantic/procedural memory, context engineering, attention budget, compaction, memory lifecycle |
 | [Trust and Safety](trust-and-safety.md) | Decision audit, hallucination firewall, uncertainty quantification, regression gate, observability, guardrails |
-| [Skills and Tools](skills-and-tools.md) | Skill system: Skill-as-Package (stateful architecture, schema, install lifecycle, credential management), selection pipeline (retrieve → audit → feedback), MCP compatibility, tool design, progressive disclosure, marketplace |
+| [Skills and Tools](skills-and-tools.md) | Skill system: Skill-as-Package (stateful architecture, schema, install lifecycle, credential management, configuration center), selection pipeline (retrieve → audit → feedback), MCP compatibility, tool design, progressive disclosure, marketplace |
 | [Agents and Orchestration](agents-and-orchestration.md) | ChatLoop, PAOR planning, multi-agent delegation, streaming, sub-agent architecture |
 | [Data Versioning](data-versioning.md) | Git for Data: time travel, sandbox, branching, cost-aware branching, training data pipeline |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Quality scoring, replay gating, prompt auto-evolution, implicit feedback mining, self-improving agents, meta-learning closed loop |

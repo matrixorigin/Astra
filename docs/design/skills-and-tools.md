@@ -1,11 +1,14 @@
 # Skills and Tools
 
 > **Status**: Core Design — single source of truth for skill system, packaging, selection, and tool integration
-> **Last Updated**: 2026-03-03
+> **Last Updated**: 2026-03-04
 > **Related**: [agent-loop-reliability.md](agent-loop-reliability.md) (pre-LLM task routing and tool scoping)
 >
 > 🔵 **Implementation Status**: `SkillManager` (install/uninstall/upgrade/rollback with full dependency validation, credential CRUD) and `SkillPipeline` (unified selection) are implemented.
 > Marketplace discovery, publishing, RBAC, and MatrixOne Publication distribution are Design Targets.
+> Skill Configuration Center (§13) — unified settings/secrets/resource-bindings with scope chain, validation, and management API — is Designed, not yet implemented. Will replace current `SkillUserCredential` table.
+> Sandbox Mode (§11) promoted to P1 — mandatory for third-party skills before marketplace opens.
+> Skill Table Registry (§14), Historical Code Replay (§2), and Self-Learning Upgrade Path (§3) are Design Targets.
 >
 > ⚠️ **2026-03-03 Update**: Intent-based tool scoping (ROUTE stage in ChatLoop's execution pipeline) post-filters `ModernSkillSelector` output. See [agent-loop-reliability.md](agent-loop-reliability.md). The selector does semantic retrieval; the router does intent-based scoping on the result.
 
@@ -29,6 +32,7 @@ A skill is a **versioned, stateful capability package** with:
 - **Schema**: database tables defined by platform (`sk_{skill}_{table}` in platform DB)
 - **API layer**: typed interface for data access (users don't write direct SQL)
 - **Credentials**: what secrets it needs (e.g. GitHub token, per-user encrypted)
+- **Configuration**: settings, secrets, and per-resource bindings (see §13 Skill Configuration Center)
 - **Requirements**: what it needs (permissions, platform capabilities)
 - **Side-effect profile**: read / write / destructive (see [Trust and Safety](trust-and-safety.md))
 - **Progressive disclosure**: metadata → summary → full instructions
@@ -43,7 +47,9 @@ All tables — core and skill — live in the **same platform database**. Skill 
 
 Users interact with skill data through **skill APIs**, not direct SQL:
 ```python
-github.save_token(token)                    # → encrypted in user_credentials
+github.set_config(default_token=token)      # → encrypted in skill_settings (§13)
+github.bind_repo("matrixorigin/matrixone",  # → skill_resource_bindings (§13)
+    read_token=read_tok, write_token=write_tok)
 github.add_repo("matrixorigin/matrixone")   # → INSERT INTO sk_github_repos
 github.list_prs(repo, state="open")         # → GitHub API + cache
 github.get_pr_checks(repo, pr_number)       # → GitHub API + cache
@@ -62,7 +68,8 @@ github.get_pr_checks(repo, pr_number)       # → GitHub API + cache
 │                                                               │
 │  Skill infrastructure tables (no prefix, part of core):       │
 │    skills_registry, skill_permissions,                        │
-│    skill_installations, user_credentials                      │
+│    skill_installations, skill_settings,                       │
+│    skill_resource_bindings                                    │
 │                                                               │
 │  Skill business tables (sk_{skill}_ prefix):                  │
 │    sk_github_repos, sk_github_pr_cache                        │
@@ -78,7 +85,7 @@ github.get_pr_checks(repo, pr_number)       # → GitHub API + cache
 | Category | Prefix | Defined in | Examples |
 |----------|--------|------------|----------|
 | Core platform | (none) | `api/models/` | `users`, `roles`, `sessions`, `agents` |
-| Skill infrastructure | (none) | `api/models/skill.py` | `skills_registry`, `skill_installations`, `skill_permissions`, `user_credentials` |
+| Skill infrastructure | (none) | `api/models/skill.py` | `skills_registry`, `skill_installations`, `skill_permissions`, `skill_settings`, `skill_resource_bindings` |
 | Skill business data | `sk_{skill}_` | `skills/{skill}/models.py` | `sk_github_repos`, `sk_github_pr_cache` |
 
 Rules:
@@ -126,6 +133,8 @@ tables:
   - sk_github_repos
   - sk_github_pr_cache
 
+# ⚠️ Legacy format (deprecated — see §13 Skill Configuration Center for new format)
+# New manifests should use settings: / secrets: / resources: sections instead.
 credentials:
   - name: github_token
     type: secret
@@ -193,10 +202,12 @@ class SkGithubPRCache(Base):
 class GitHubSkillAPI:
     """API layer for GitHub skill data. Uses platform DB session."""
 
-    def __init__(self, db: Session, credentials: dict[str, str]):
+    def __init__(self, db: Session, config: "SkillConfig"):
         self._db = db  # platform DB session
-        self._token = credentials.get("github_token")
-        self._client = Github(auth=Auth.Token(self._token)) if self._token else None
+        # Resource-specific token if available, else skill-level default (§13)
+        token = (config.resource or {}).get("read_token") or config.secrets.get("default_token")
+        self._base_url = config.settings.get("api_base_url", "https://api.github.com")
+        self._client = Github(auth=Auth.Token(token), base_url=self._base_url) if token else None
 
     def add_repo(self, owner: str, name: str) -> dict:
         """Register a repository for tracking."""
@@ -266,11 +277,25 @@ version: 2.1.0
 description: Review code changes for quality, security, and style
 table_prefix: code_review    # tables: code_review_{table_name}
 
-credentials:
+# Configuration — see §13 Skill Configuration Center for full spec
+settings:
+  - name: review_depth
+    type: enum
+    values: [thorough, quick, security-only]
+    default: "thorough"
+
+secrets:
   - name: github_token
-    type: secret
-    description: GitHub Personal Access Token
-    required: true
+    description: "GitHub Personal Access Token (fallback)"
+
+resources:
+  type: repo
+  key_pattern: "{owner}/{name}"
+  bindings:
+    - name: token
+      type: secret
+      description: "Repo-specific GitHub token"
+      required: true
 
 triggers:
   keywords: [review, PR, pull request, code quality]
@@ -343,11 +368,17 @@ async def execute_skill(user_id, skill_name, params):
     if not installation:
         raise SkillNotInstalled(f"Install first: /skill install {skill_name}")
 
-    # 2. Get credentials
-    creds = get_decrypted_credentials(user_id, skill_name)
+    # 2. Resolve configuration (§13 Skill Configuration Center)
+    config = config_center.resolve_all(
+        skill_name=skill_name, user_id=user_id,
+        tenant_id=tenant_id, resource_key=params.get("resource_key")
+    )
+    errors = config_center.validate(skill_name, user_id, tenant_id, params.get("resource_key"))
+    if errors:
+        raise SkillConfigError(errors)
 
-    # 3. Create skill API instance (uses platform DB session)
-    api = GitHubSkillAPI(db=db, credentials=creds)
+    # 3. Create skill API instance (receives resolved config)
+    api = GitHubSkillAPI(config=config)
 
     # 4. Execute action
     action = skill.get_action(params["action_name"])
@@ -401,6 +432,24 @@ Active:      Available to agents, regression-tested
 Deprecated:  Still works, but new selections discouraged
 Archived:    Read-only, available for replay only
 ```
+
+### Historical Code Replay
+
+Replay requires executing the exact skill code that ran during the original session. The platform maintains a **skill artifact registry** to guarantee code-level reproducibility.
+
+**Publish flow**: `mo-admin skill publish` packages the skill directory into a tarball, computes `code_hash` (SHA-256), and stores it in the artifact registry (local filesystem or object storage). The `skills_registry.code_hash` column records the hash for each published version.
+
+**Replay flow**:
+```
+Replay engine reads session event → extracts skill_id + version
+  ├─ Fetch tarball from artifact registry
+  ├─ Verify SHA-256(tarball) == event.metadata.code_hash
+  │     └─ Mismatch → reject replay with CodeIntegrityError (no silent fallback)
+  ├─ Extract to temp directory
+  └─ SandboxedExecutor loads skill from extracted path (read-only mount)
+```
+
+This ensures replay never silently runs newer code against historical sessions.
 
 ---
 
@@ -558,7 +607,7 @@ LEARNING CYCLE (triggered manually or scheduled):
 |--------|---------|---------|
 | `WRONG_SKILL` | User corrects skill choice | "I wanted create_pr, not list_prs" |
 | `SLOW_EXECUTION` | Execution > 5000ms | Skill took too long |
-| `HIGH_COST` | Cost > $0.10 | Expensive LLM calls in skill |
+| `HIGH_COST` | Cost > $0.10 | Expensive LLM calls in skill (carries `actual_tokens` + `actual_usd`) |
 | `LOW_SATISFACTION` | User rating < 3 | Poor result quality |
 
 **Multi-factor scoring** combines dimensions with configurable weights:
@@ -585,11 +634,17 @@ score = accuracy_weight × accuracy_score + speed_weight × speed_score
 - Retry limit: 3 retries per signal on flush failure, then dropped with warning
 - Process crash = buffered signals lost (acceptable: feedback is optimization data, not correctness-critical)
 
+**Cost signal closed-loop**: `record_feedback(signal_type=HIGH_COST)` now carries `actual_tokens` and `actual_usd` in its payload. These flow into two consumers:
+1. **Agent Loop budget gate** — `ChatLoop` reads per-skill cost from `skill_learning_signals` to enforce session-level budget caps before the next skill call (resolves Open Question #3).
+2. **Learning weight adjustment** — `SelfImprovingSelector` uses actual cost to dynamically adjust `SignalWeights.cost` relative to other dimensions, so expensive skills are penalized proportionally rather than by a fixed threshold.
+
 **Performance**:
 | Operation | Latency | Storage |
 |-----------|---------|---------|
 | `get_tools_schema()` | ~10ms | 1KB/event |
 | `learn()` | 1-5s | 500B/learning |
+
+**Observability**: `SkillPipeline.stats()` exposes per-skill selection rate, success rate, and average token cost. These metrics are exported to Prometheus via the standard `/metrics` endpoint. An optional `LLM-as-Judge` pass periodically evaluates high-confidence successful executions and promotes them into the golden set for regression gate testing — automating golden session curation.
 
 For usage guide (weights configuration, selective learning, troubleshooting), see [Multi-Dimensional Learning Guide](../guides/multi-dimensional-learning-guide.md).
 
@@ -598,6 +653,14 @@ For usage guide (weights configuration, selective learning, troubleshooting), se
 `core/skills/procedural_memory.py` provides a type-layer adapter that converts `skill_selection_learnings` rows into `Memory` domain objects. This enables the Skill Selector to use memory-system APIs (governance, confidence decay, trust tiers) without duplicating data.
 
 **Design boundary**: skill selection learnings are Skill Selector internal correction rules, NOT general-purpose procedural memory. The bridge is consumed only during skill selection — it is NOT injected into `MemoryRetriever`.
+
+### Self-Learning Upgrade Path (Design Target)
+
+Two planned enhancements to the learning cycle:
+
+1. **Test-Time Self-Improvement (TT-SI)**: At inference time, the selector generates multiple candidate skill rankings, scores them against recent feedback, and picks the best — a lightweight search over its own output space. No model fine-tuning required; works with any LLM backend.
+2. **Lightweight RL for weight tuning**: Replace static `SignalWeights` with a bandit that adjusts `accuracy_weight`, `speed_weight`, `cost_weight`, `satisfaction_weight` per-skill based on reward signal (composite score delta). Exploration via ε-greedy with decay.
+3. **Tool Maps**: An abstraction layer mapping logical operations (e.g., "create issue") to multiple skill implementations (GitHub Issues, Jira, Linear). The selector picks the skill; the Tool Map ensures the correct operation binding. Enables skill substitution without retraining learnings.
 
 ---
 
@@ -728,7 +791,9 @@ class SkillInstallation(Base):
     updated_at = Column(DateTime)
 ```
 
-#### user_credentials — per-user encrypted secrets
+#### user_credentials — per-user encrypted secrets (deprecated → §13)
+
+> ⚠️ **Deprecated**: Replaced by `skill_settings` (is_secret=1) + `skill_resource_bindings` in §13 Skill Configuration Center. The new design adds scope chain (global → tenant → user), per-resource bindings, and type validation. See §13 for migration path.
 
 ```python
 class UserCredential(Base):
@@ -784,7 +849,11 @@ User: "install github skill"
   │     ├─ Version constraint validation (all constraints in tree)
   │     └─ Topological sort (install order)
   ├─ 3. Verify all skill-type deps are installed for this user
-  ├─ 4. Prompt for credentials (if required) → encrypt and store in user_credentials
+  ├─ 4. Parse manifest → extract settings/secrets/resources schema (§13)
+  │     ├─ Prompt for required secrets without defaults
+  │     ├─ Apply manifest defaults for settings
+  │     ├─ Validate types and constraints
+  │     └─ Store in skill_settings (scope=user)
   └─ 5. Record installation → INSERT INTO skill_installations
 ```
 No DDL execution. Tables already exist in platform DB (created by `init_db()`).
@@ -821,7 +890,7 @@ User: "uninstall github skill"
   │     "Cannot uninstall 'github': required by 'code_review', 'pr_tracker'.
   │      Uninstall dependents first, or use --force to skip this check."
   ├─ 2. Mark as uninstalled in skill_installations
-  └─ 3. Delete credentials from user_credentials
+  └─ 3. Delete settings, secrets, and resource bindings (skill_settings + skill_resource_bindings)
 ```
 No DROP TABLE. Skill data remains in platform DB.
 
@@ -948,7 +1017,7 @@ Comparison focuses on **stateful skill management** — persistent data, lifecyc
 | Install lifecycle | ❌ | ❌ | ❌ | ✅ |
 | Skill API layer | ❌ direct SQL | ❌ | ❌ | ✅ typed API |
 | Marketplace + RBAC | ❌ | ❌ | ❌ | ✅ |
-| Per-user credentials | ❌ env vars | ❌ env vars | ❌ | ✅ encrypted |
+| Per-user credentials | ❌ env vars | ❌ env vars | ❌ | ✅ encrypted, scoped, per-resource (§13) |
 | Skill-local models | ❌ | ❌ | ❌ | ✅ `skills/{name}/models.py` |
 | Self-improving selection | ❌ | ❌ | ❌ | ✅ closed-loop learning |
 | Unified selection pipeline | ❌ | ❌ | ❌ | ✅ retrieve → audit → feedback |
@@ -963,9 +1032,13 @@ Comparison focuses on **stateful skill management** — persistent data, lifecyc
 2. **Schema evolution**: how to handle ALTER TABLE when platform upgrades a skill?
    - Same as any other migration — platform-level, applied by operator
 
-3. **Skill cost → budget gate integration**: `SignalWeights.cost` (0.2) drives learning, but skill execution cost doesn't flow back to the budget control system in [Deployment Architecture](deployment-architecture.md). Need: execution cost recorded per-skill → aggregated per-session → checked against session budget before next skill call.
+3. ~~**Skill cost → budget gate integration**: `SignalWeights.cost` (0.2) drives learning, but skill execution cost doesn't flow back to the budget control system in [Deployment Architecture](deployment-architecture.md). Need: execution cost recorded per-skill → aggregated per-session → checked against session budget before next skill call.~~
+   **Resolved** — `record_feedback(HIGH_COST)` now carries `actual_tokens` + `actual_usd`; ChatLoop reads per-skill cost for budget gate enforcement. See §3 "Cost signal closed-loop".
 
 4. **Prompt evolution → skill regression gate**: `InputFaceLearner` can modify prompts, but prompt changes may alter which skills the LLM selects. Should prompt changes trigger the skill selection regression gate? Current answer: no (they are independent input faces). May need cross-face regression testing.
+
+5. ~~**Skill configuration center**: skills need non-secret parameters (URLs, timeouts, review styles) with scoped defaults and install-time validation.~~
+   **Resolved** — see §13 Skill Configuration Center below.
 
 ---
 
@@ -1029,6 +1102,18 @@ class SkillDataBridge:
 
 **Implementation priority**: Phase 2. Current skills (github, knowledge) don't yet need cross-skill access. When the first real use case appears, implement `SkillDataBridge`.
 
+### Direct JOIN Optimization (P2, opt-in)
+
+For performance-sensitive queries, skills can declare `direct_join: true` in their manifest dependency:
+
+```yaml
+depends_on:
+  - name: github
+    direct_join: true   # opt-in: allow raw SQL JOINs against github tables
+```
+
+When enabled, `SkillDataBridge.query()` returns a SQLAlchemy `Subquery` instead of materialized dicts, allowing the caller to compose JOINs in a single DB round-trip. The bridge still validates the dependency declaration and logs the access. This is strictly opt-in — default remains dict-based to preserve schema decoupling.
+
 ---
 
 ## 10. Low-Code Skill Template
@@ -1050,13 +1135,24 @@ version: "1.0.0"
 description: "Jira integration — issues, sprints, boards"
 table_prefix: sk_jira
 
-credentials:
-  - name: jira_token
-    type: secret
-    required: true
-  - name: jira_url
+settings:
+  - name: default_project
     type: string
-    required: true
+    description: "Default project key"
+
+secrets:
+  - name: api_token
+    description: "Jira API token (fallback)"
+
+resources:
+  type: project
+  key_pattern: "{project_key}"
+  bindings:
+    - name: api_token
+      type: secret
+      required: true
+    - name: board_id
+      type: integer
 
 tables:
   issues:
@@ -1121,6 +1217,23 @@ mo-admin skill scaffold skill.yaml
 - **No magic**: generated code is readable, follows the same patterns as hand-written skills
 - **Escape hatch**: after scaffolding, developers modify generated files freely
 - **Validation**: `skill.yaml` is validated against a JSON Schema before generation
+
+### Validation & Testing (P1)
+
+`mo-admin skill validate <skill_dir>` performs post-scaffold consistency checks:
+- Generated code matches manifest declarations (actions, tables, config keys)
+- Type annotations are consistent between YAML types and Python signatures
+- Required config keys have no missing defaults
+- Action side-effect categories match manifest declarations
+
+Optional: `--generate-tests` flag auto-generates a pytest skeleton per action (happy path + missing-required-config error case).
+
+### Web YAML Editor (P2, Optional)
+
+A lightweight browser-based YAML editor with:
+- Live JSON Schema validation (red squiggles on invalid fields)
+- Visual table/action builder (form → YAML, not the other way around)
+- One-click "Scaffold & Download" that calls `mo-admin skill scaffold` server-side
 
 ---
 
@@ -1198,10 +1311,16 @@ The platform acts as a proxy — the skill declares what tables it needs in the 
 
 ### Implementation Priority
 
-Phase 3. Current skills are all platform-built (trusted). Sandbox mode becomes critical when:
-1. Marketplace opens to third-party skill authors
-2. Users can upload custom skills
-3. Skills need to execute user-provided code
+**Promoted to P1.** Minimum viable sandbox ships before marketplace opens:
+
+| Phase | Scope | Effort |
+|-------|-------|--------|
+| P1 | Two-tier runtime: Trusted (in-process) + Sandboxed (Docker + stdin/stdout proxy) | 3 days |
+| P1 | Mandatory sandbox for `source != "builtin"` skills at install time | 0.5 day |
+| P2 | Strict tier (gVisor + no-network) for user-uploaded skills | 2 days |
+| P2 | Resource quota enforcement (memory/CPU/timeout) | 1 day |
+
+**P1 gate**: No third-party skill may execute in-process. `SkillManager.install()` rejects marketplace skills that declare `sandbox.enabled: false`.
 
 ---
 
@@ -1223,6 +1342,750 @@ Dependency versioning is fully implemented across all mutation paths.
 - API layer (`marketplace.py`) — returns 409 CONFLICT for all dependency errors
 
 See [Skill Dependencies Guide](../guides/skill-dependencies.md) for usage documentation.
+
+---
+
+## 13. Skill Configuration Center
+
+### Problem
+
+Skills need runtime parameters to function. The current system has three separate, incomplete mechanisms:
+
+1. **`SkillUserCredential` table** — encrypted per-user secrets, but no type validation, no scoping beyond user, no install-time prompting, no pre-execution gate.
+2. **`ScopeResolver` + `Token` table** — scope-chain resolution for LLM tokens (`repo > project > user > global`), but not connected to the skill system at all.
+3. **`RepoRegistry`** — per-repo token linking, but only for repo-level access, not generalized to arbitrary skill resources.
+
+These three systems solve overlapping problems with incompatible designs. Meanwhile, real-world skills need all of:
+
+- **Skill-level settings** — `api_base_url`, `timeout`, `review_style` (plaintext, scoped)
+- **Skill-level secrets** — `github_token`, `api_key` (encrypted, scoped)
+- **Resource-bound credentials** — repo A uses token X with read access, repo B uses token Y with write access (encrypted, per-resource, per-user)
+
+No current system handles all three. The result: skills either hardcode defaults, fail at runtime with missing config, or each skill reinvents its own config storage.
+
+### Design: Unified Configuration with Resource Bindings
+
+One system. Three value types (plaintext, secret, resource-bound secret). One scope chain. One resolution API. One validation gate.
+
+#### Core Model
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Skill Manifest                            │
+│                                                             │
+│  settings:          (plaintext, scoped)                     │
+│    - api_base_url   string, default "https://api.github.com"│
+│    - timeout        integer, default 30                     │
+│                                                             │
+│  secrets:           (encrypted, scoped)                     │
+│    - default_token  "Fallback token for all resources"      │
+│                                                             │
+│  resources:         (per-resource credential bindings)      │
+│    type: repo                                               │
+│    key_pattern: "{owner}/{name}"                            │
+│    bindings:                                                │
+│      - name: read_token   type: secret, required: true      │
+│      - name: write_token  type: secret, required: false     │
+│      - name: branch       type: string, default: "main"     │
+└─────────────────────────────────────────────────────────────┘
+                           │
+                    resolve(skill, user)
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  Effective Configuration                     │
+│                                                             │
+│  settings:                                                  │
+│    api_base_url: "https://github.corp.com/api/v3"  (tenant) │
+│    timeout: 30                              (manifest default)│
+│                                                             │
+│  secrets:                                                   │
+│    default_token: "ghp_xxx..."              (user)          │
+│                                                             │
+│  resources:                                                 │
+│    "matrixorigin/matrixone":                                │
+│      read_token: "ghp_aaa..."               (user+resource) │
+│      write_token: "ghp_bbb..."              (user+resource) │
+│      branch: "main"                         (manifest default)│
+│    "some-org/private":                                      │
+│      read_token: "ghp_ccc..."               (user+resource) │
+│      write_token: null                      (not set)       │
+│      branch: "develop"                      (user+resource) │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Manifest Declaration
+
+Three sections replace the old `credentials:` and add what was missing:
+
+```yaml
+# skills/github/manifest.yaml
+name: github
+version: "1.0.0"
+description: "GitHub integration — PRs, issues, CI status, code search"
+
+# ── Skill-level settings (plaintext, scoped) ──
+settings:
+  - name: api_base_url
+    type: string
+    description: "GitHub API base URL (for GitHub Enterprise)"
+    default: "https://api.github.com"
+  - name: request_timeout
+    type: integer
+    description: "HTTP request timeout in seconds"
+    default: 30
+    min: 5
+    max: 300
+  - name: pr_review_style
+    type: enum
+    values: [thorough, quick, security-only]
+    description: "Default review depth"
+    default: "thorough"
+  - name: max_files_per_review
+    type: integer
+    description: "Max files to include in a single review"
+    default: 50
+    min: 1
+    max: 500
+
+# ── Skill-level secrets (encrypted, scoped) ──
+secrets:
+  - name: default_token
+    description: "Fallback GitHub token when no resource-specific token is set"
+    required: false
+
+# ── Per-resource bindings (encrypted + plaintext, per resource instance) ──
+resources:
+  type: repo                          # resource type name
+  key_pattern: "{owner}/{name}"       # how resource keys are formatted
+  description: "GitHub repository"
+  bindings:
+    - name: read_token
+      type: secret
+      description: "Token with read access to this repo"
+      required: true
+    - name: write_token
+      type: secret
+      description: "Token with write access (PRs, issues, etc.)"
+      required: false
+    - name: default_branch
+      type: string
+      description: "Default branch for this repo"
+      default: "main"
+    - name: review_enabled
+      type: boolean
+      description: "Enable automatic PR review for this repo"
+      default: true
+```
+
+**Why three sections, not one?**
+
+| Section | Encrypted? | Scoped? | Per-resource? | Example |
+|---------|-----------|---------|---------------|---------|
+| `settings` | No | global → tenant → user | No | `api_base_url`, `timeout` |
+| `secrets` | Yes | global → tenant → user | No | `default_token`, `api_key` |
+| `resources` | Mixed | user only | Yes | repo tokens, channel webhooks |
+
+Collapsing these into one flat list (the old `credentials:` approach) loses the semantic distinction. A `timeout` doesn't need encryption. A per-repo `write_token` doesn't inherit from tenant scope — it's bound to a specific resource instance.
+
+#### Type System
+
+```yaml
+# Supported types for settings, secrets, and resource bindings
+types:
+  string:
+    constraints: [min_length, max_length, pattern]
+  integer:
+    constraints: [min, max]
+  float:
+    constraints: [min, max]
+  boolean:
+    constraints: []
+  enum:
+    constraints: [values]  # required: list of allowed values
+  secret:
+    constraints: []        # always encrypted, no plaintext validation
+  url:
+    constraints: [schemes]  # e.g. [https, http]
+    # Syntactic sugar for string + URL pattern validation
+
+# Universal fields (apply to all entries in settings, secrets, and resources.bindings):
+#   required: bool   — default false. If true, validation fails when value is missing.
+#   default: Any     — default value from manifest (lowest priority in scope chain).
+#   description: str — human-readable description for CLI prompts and API docs.
+```
+
+#### Database Schema
+
+**Replace** `skill_user_credentials` with two tables:
+
+```python
+class SkillSetting(Base):
+    """Skill configuration: settings (plaintext) and secrets (encrypted).
+    
+    Scope chain: user → tenant → global → manifest default.
+    Secrets are encrypted via CredentialManager before storage.
+    """
+    __tablename__ = "skill_settings"
+    __table_args__ = (
+        UniqueConstraint(
+            "skill_name", "setting_name", "scope_type", "scope_id",
+            name="uq_skill_setting_scope"
+        ),
+    )
+
+    setting_id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    skill_name = Column(String(100), nullable=False, index=True)
+    setting_name = Column(String(100), nullable=False)
+    setting_value = Column(Text, nullable=False)       # plaintext or encrypted
+    is_secret = Column(SmallInteger, nullable=False, default=0)  # 0=plaintext, 1=encrypted
+    scope_type = Column(String(20), nullable=False)    # "global" | "tenant" | "user"
+    scope_id = Column(String(36), nullable=True)       # NULL for global
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    updated_by = Column(String(36), nullable=False)
+
+
+class SkillResourceBinding(Base):
+    """Per-resource credential and config bindings.
+    
+    Each row = one (user, skill, resource_key, binding_name) tuple.
+    Example: user=alice, skill=github, resource_key=matrixorigin/matrixone,
+             binding_name=read_token, value=<encrypted token>
+    """
+    __tablename__ = "skill_resource_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "skill_name", "resource_key", "binding_name",
+            name="uq_skill_resource_binding"
+        ),
+    )
+
+    binding_id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id = Column(String(36), nullable=False, index=True)
+    skill_name = Column(String(100), nullable=False, index=True)
+    resource_type = Column(String(50), nullable=False)   # "repo", "channel", "project"
+    # Denormalized from manifest — same for all rows with same (skill_name, resource_key).
+    # Stored per-row for query convenience (filter by type without joining manifest).
+    resource_key = Column(String(500), nullable=False)   # "matrixorigin/matrixone"
+    binding_name = Column(String(100), nullable=False)   # "read_token", "write_token"
+    binding_value = Column(Text, nullable=False)         # plaintext or encrypted
+    is_secret = Column(SmallInteger, nullable=False, default=0)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+```
+
+**Why two tables instead of one?**
+
+`skill_settings` has scope chain (global → tenant → user) with no resource dimension.
+`skill_resource_bindings` has resource dimension with no scope chain (always per-user — you don't inherit someone else's repo token).
+
+Merging them into one table would require nullable `resource_key` + nullable `scope_type` with a CHECK constraint to enforce mutual exclusivity. Two tables is cleaner and queryable.
+
+**Migration from `skill_user_credentials`:**
+
+```sql
+-- One-time migration: move existing credentials to skill_settings
+INSERT INTO skill_settings (setting_id, skill_name, setting_name, setting_value, is_secret, scope_type, scope_id, updated_by)
+SELECT credential_id, skill_name, credential_name, value_encrypted, 1, 'user', user_id, user_id
+FROM skill_user_credentials;
+
+-- Then drop old table
+DROP TABLE IF EXISTS skill_user_credentials;
+```
+
+#### Scope Resolution
+
+```
+                    skill_settings scope chain
+                    ───────────────────────────
+                    
+user (scope_type="user", scope_id=alice)        ← highest priority
+  ↓ fallback
+tenant (scope_type="tenant", scope_id=acme)
+  ↓ fallback
+global (scope_type="global", scope_id=NULL)
+  ↓ fallback
+manifest default                                 ← lowest priority
+
+
+                    skill_resource_bindings
+                    ───────────────────────
+                    
+user + resource_key (exact match)                ← only level
+  ↓ fallback
+skill-level secret (from skill_settings)         ← e.g. default_token
+  ↓ fallback
+not set → validation error if required
+```
+
+**Example resolution for GitHub skill, user alice:**
+
+```
+api_base_url:
+  skill_settings WHERE skill=github, name=api_base_url, scope=user, scope_id=alice  → miss
+  skill_settings WHERE skill=github, name=api_base_url, scope=tenant, scope_id=acme → "https://github.corp.com/api/v3"
+  ✓ resolved: "https://github.corp.com/api/v3" (from tenant)
+
+read_token for matrixorigin/matrixone:
+  skill_resource_bindings WHERE user=alice, skill=github, resource_key=matrixorigin/matrixone, name=read_token → "ghp_aaa..."
+  ✓ resolved: "ghp_aaa..." (from resource binding)
+
+read_token for unknown-org/new-repo:
+  skill_resource_bindings WHERE user=alice, skill=github, resource_key=unknown-org/new-repo, name=read_token → miss
+  skill_settings WHERE skill=github, name=default_token, scope=user, scope_id=alice → "ghp_fallback..."
+  ✓ resolved: "ghp_fallback..." (fallback to skill-level default_token)
+
+write_token for unknown-org/new-repo:
+  skill_resource_bindings → miss
+  skill_settings default_token → "ghp_fallback..." (same token for read/write)
+  ✓ resolved: "ghp_fallback..." (fallback)
+```
+
+#### Core API
+
+```python
+class SkillConfigCenter:
+    """Unified configuration center for skills.
+    
+    Handles settings (plaintext), secrets (encrypted), and resource bindings.
+    Single entry point for all skill configuration needs.
+    """
+
+    def __init__(
+        self,
+        db_factory: Callable[[], Session],
+        credential_mgr: CredentialManager,
+        manifest_loader: Callable[[str], dict | None],
+    ):
+        self.db_factory = db_factory
+        self.credential_mgr = credential_mgr
+        self.manifest_loader = manifest_loader
+
+    # ── Settings & Secrets (scoped) ──
+    # Note: set_setting takes explicit (scope_type, scope_id) because the caller
+    # chooses WHERE to write (user scope, tenant scope, or global).
+    # get_setting takes (user_id, tenant_id) because it resolves the full chain
+    # automatically: user → tenant → global → manifest default.
+
+    def set_setting(
+        self, skill_name: str, setting_name: str, value: Any,
+        scope_type: str = "user", scope_id: str | None = None,
+        updated_by: str = "",
+    ) -> None:
+        """Set a setting or secret at a specific scope level.
+        Auto-encrypts if manifest declares it as secret."""
+        ...
+
+    def get_setting(
+        self, skill_name: str, setting_name: str,
+        user_id: str, tenant_id: str | None = None,
+    ) -> Any:
+        """Resolve effective setting value through scope chain + manifest default.
+        Walks: user → tenant → global → manifest default, returns first hit."""
+        ...
+
+    # ── Resource Bindings ──
+
+    def bind_resource(
+        self, user_id: str, skill_name: str,
+        resource_key: str, bindings: dict[str, Any],
+    ) -> None:
+        """Bind credentials/config to a specific resource.
+        
+        Example:
+            center.bind_resource("alice", "github", "matrixorigin/matrixone", {
+                "read_token": "ghp_aaa...",
+                "write_token": "ghp_bbb...",
+                "default_branch": "main",
+            })
+        """
+        ...
+
+    def get_resource_binding(
+        self, user_id: str, skill_name: str,
+        resource_key: str, binding_name: str,
+    ) -> Any:
+        """Get a specific resource binding, falling back to skill-level secret."""
+        ...
+
+    def get_resource_bindings(
+        self, user_id: str, skill_name: str,
+        resource_key: str,
+    ) -> dict[str, Any]:
+        """Get all bindings for a resource, with fallbacks applied."""
+        ...
+
+    def list_resources(
+        self, user_id: str, skill_name: str,
+    ) -> list[dict]:
+        """List all resources the user has configured for a skill.
+        
+        Returns: [{"resource_key": "matrixorigin/matrixone", "resource_type": "repo", ...}]
+        """
+        ...
+
+    def unbind_resource(
+        self, user_id: str, skill_name: str, resource_key: str,
+    ) -> None:
+        """Remove all bindings for a resource."""
+        ...
+
+    # ── Bulk Resolution (for skill execution) ──
+
+    def resolve_all(
+        self, skill_name: str, user_id: str,
+        tenant_id: str | None = None,
+        resource_key: str | None = None,
+    ) -> SkillConfig:
+        """Resolve complete effective configuration for skill execution.
+        
+        Returns a SkillConfig with all settings, secrets, and resource bindings resolved.
+        This is the single call made before skill execution.
+        """
+        ...
+
+    # ── Validation ──
+
+    def validate(
+        self, skill_name: str, user_id: str,
+        tenant_id: str | None = None,
+        resource_key: str | None = None,
+    ) -> list[ConfigValidationError]:
+        """Validate all required config is present and well-typed.
+        
+        Returns empty list if valid, otherwise list of missing/invalid items.
+        Called at install time and pre-execution.
+        """
+        ...
+
+    def get_schema(self, skill_name: str) -> SkillConfigSchema:
+        """Return the config schema from manifest (settings + secrets + resources)."""
+        ...
+
+
+@dataclass
+class SkillConfig:
+    """Resolved configuration passed to skill at execution time."""
+    settings: dict[str, Any]           # {"api_base_url": "...", "timeout": 30}
+    secrets: dict[str, str]            # {"default_token": "ghp_xxx"}
+    resource: dict[str, Any] | None    # {"read_token": "ghp_aaa", "branch": "main"} if resource_key provided
+    resource_type: str | None          # "repo", "project", etc. — from manifest, for multi-resource-type skills
+    resource_key: str | None           # "matrixorigin/matrixone" — echo back for logging/debugging
+
+
+@dataclass
+class ConfigValidationError:
+    """A missing or invalid configuration item."""
+    section: str          # "settings" | "secrets" | "resources"
+    name: str             # "read_token"
+    resource_key: str | None  # "matrixorigin/matrixone" or None
+    error: str            # "required but not set" | "invalid type: expected integer"
+```
+
+#### Skill Consumption Pattern
+
+Skills receive a single `SkillConfig` object — they never touch the database or know about scopes:
+
+```python
+class GitHubSkillAPI:
+    """GitHub skill receives resolved config. Zero knowledge of config storage."""
+
+    def __init__(self, config: SkillConfig):
+        self._base_url = config.settings.get("api_base_url", "https://api.github.com")
+        self._timeout = config.settings.get("request_timeout", 30)
+        # Resource-specific token if available, else skill-level default
+        token = (config.resource or {}).get("read_token") or config.secrets.get("default_token")
+        self._client = Github(auth=Auth.Token(token), base_url=self._base_url, timeout=self._timeout)
+
+    def list_prs(self, repo: str, state: str = "open") -> list[dict]:
+        ...
+```
+
+**Execution flow with resource context:**
+
+```
+Agent: "review PR #42 on matrixorigin/matrixone"
+  │
+  ├─ 1. Skill selector picks github skill
+  ├─ 2. Extract resource_key from tool call args: "matrixorigin/matrixone"
+  ├─ 3. config = config_center.resolve_all(
+  │        skill_name="github",
+  │        user_id="alice",
+  │        tenant_id="acme",
+  │        resource_key="matrixorigin/matrixone"
+  │     )
+  ├─ 4. errors = config_center.validate(...)
+  │     If errors → return SkillConfigError to agent
+  │     Agent can ask user: "I need a read token for matrixorigin/matrixone. Please configure it."
+  ├─ 5. api = GitHubSkillAPI(config)
+  └─ 6. result = api.review_pr(42)
+```
+
+#### Install-Time and Pre-Execution Validation
+
+**Install flow** (replaces old step 4 "Prompt for credentials"):
+
+```
+User: "install github skill"
+  ├─ 1. Check permission
+  ├─ 2. Resolve dependency tree
+  ├─ 3. Verify dependencies installed
+  ├─ 4. Parse manifest → extract settings/secrets/resources schema
+  ├─ 5. Prompt for required secrets without defaults
+  │     "GitHub skill needs a default_token (optional). Provide now or later?"
+  ├─ 6. Apply manifest defaults for settings
+  ├─ 7. Store provided values in skill_settings (scope=user)
+  ├─ 8. Record installation
+  └─ 9. Show resource binding instructions:
+        "To use GitHub skill with specific repos, run:
+         mo-agent skill config github --resource matrixorigin/matrixone"
+```
+
+**Pre-execution gate** (replaces old `require_executable`):
+
+```
+Agent calls skill during session
+  ├─ 1. Verify skill installed and active
+  ├─ 2. Verify dependencies
+  ├─ 3. Verify permission
+  ├─ 4. Determine resource_key from tool call args (if applicable)
+  ├─ 5. config_center.validate(skill, user, tenant, resource_key)
+  │     ├─ Missing required setting → SkillConfigError
+  │     ├─ Missing required secret → SkillConfigError
+  │     ├─ Missing required resource binding → SkillConfigError
+  │     └─ Type validation failure → SkillConfigError
+  ├─ 6. config = config_center.resolve_all(skill, user, tenant, resource_key)
+  └─ 7. Inject config into skill execution context
+```
+
+#### REST API
+
+```
+# ── Settings & Secrets ──
+GET    /skills/{skill}/config                          # Effective config (resolved for current user)
+GET    /skills/{skill}/config/schema                   # Config schema from manifest
+PUT    /skills/{skill}/config/{name}                   # Set setting/secret (user scope)
+DELETE /skills/{skill}/config/{name}                   # Reset to inherited/default
+PUT    /skills/{skill}/config/{name}?scope=global      # Admin: set global default
+PUT    /skills/{skill}/config/{name}?scope=tenant      # Admin: set tenant default
+
+# ── Resource Bindings ──
+GET    /skills/{skill}/resources                       # List configured resources
+GET    /skills/{skill}/resources/{key}                 # Get bindings for a resource
+PUT    /skills/{skill}/resources/{key}                 # Set/update resource bindings
+DELETE /skills/{skill}/resources/{key}                 # Remove resource bindings
+
+# ── Validation ──
+GET    /skills/{skill}/config/validate                 # Validate all config present
+GET    /skills/{skill}/config/validate?resource={key}  # Validate including resource
+```
+
+**Example API calls:**
+
+```bash
+# Set company-wide GitHub Enterprise URL (admin)
+PUT /skills/github/config/api_base_url?scope=global
+{"value": "https://github.corp.example.com/api/v3"}
+
+# Set personal default token
+PUT /skills/github/config/default_token
+{"value": "ghp_personal_token_xxx"}
+
+# Bind tokens to a specific repo
+PUT /skills/github/resources/matrixorigin%2Fmatrixone
+{
+  "read_token": "ghp_read_only_xxx",
+  "write_token": "ghp_write_xxx",
+  "default_branch": "main"
+}
+
+# Check what's configured
+GET /skills/github/config
+→ {
+    "settings": {"api_base_url": "https://github.corp.example.com/api/v3", "timeout": 30, ...},
+    "secrets": {"default_token": "***"},
+    "resources_configured": 2
+  }
+
+# Validate before execution
+GET /skills/github/config/validate?resource=matrixorigin/matrixone
+→ {"valid": true, "errors": []}
+
+GET /skills/github/config/validate?resource=unknown-org/new-repo
+→ {"valid": false, "errors": [{"section": "resources", "name": "read_token", "error": "required but not set"}]}
+```
+
+#### CLI Commands
+
+```bash
+# Interactive config setup
+mo-agent skill config github
+# → Shows current settings, prompts for missing required items
+
+# Set a setting
+mo-agent skill config github --set api_base_url=https://github.corp.com/api/v3
+
+# Set a secret
+mo-agent skill config github --secret default_token
+# → Prompts for value (hidden input)
+
+# Bind a resource
+mo-agent skill config github --resource matrixorigin/matrixone
+# → Prompts for read_token (required), write_token (optional), default_branch
+
+# List resources
+mo-agent skill config github --list-resources
+
+# Validate
+mo-agent skill config github --validate
+```
+
+#### Event Sourcing
+
+All config mutations are events:
+
+```python
+# Setting changed (plaintext — value included)
+event_type: "skill_config_changed"
+content: {
+    "skill": "github", "section": "settings",
+    "name": "api_base_url", "scope": "tenant",
+    "old_value": null, "new_value": "https://github.corp.com/api/v3"
+}
+
+# Secret changed (value NEVER logged — only the fact that it changed)
+event_type: "skill_config_changed"
+content: {
+    "skill": "github", "section": "secrets",
+    "name": "default_token", "scope": "user"
+    # No old_value / new_value fields for secrets.
+}
+
+# Resource bound (binding names listed, secret values omitted)
+event_type: "skill_resource_bound"
+content: {
+    "skill": "github", "resource_type": "repo",
+    "resource_key": "matrixorigin/matrixone",
+    "bindings_set": ["read_token", "write_token", "default_branch"]
+    # Secret binding values are never logged. Non-secret values may be included.
+}
+
+# Resource unbound
+event_type: "skill_resource_unbound"
+content: {"skill": "github", "resource_key": "matrixorigin/matrixone"}
+```
+
+#### Relationship to Existing Systems
+
+| Old Component | Disposition | Replacement |
+|---------------|-------------|-------------|
+| `SkillUserCredential` table | **DROP** | `skill_settings` (is_secret=1) |
+| `CredentialManager` | **KEEP** | Still handles encrypt/decrypt |
+| `SkillManager` credential CRUD | **REPLACE** | `SkillConfigCenter` |
+| `ScopeResolver` | **REUSE pattern** | `SkillConfigCenter` implements same scope chain |
+| `RepoRegistry.token_id` | **KEEP for LLM tokens** | Skill resource bindings handle skill-specific tokens |
+| `SkillManager.require_executable()` | **EXTEND** | Calls `config_center.validate()` |
+
+#### Another Skill Example: Jira
+
+To show this isn't GitHub-specific:
+
+```yaml
+# skills/jira/manifest.yaml
+name: jira
+version: "1.0.0"
+
+settings:
+  - name: instance_url
+    type: url
+    schemes: [https]
+    description: "Jira instance URL"
+    required: true    # No default — must be configured
+  - name: default_project
+    type: string
+    description: "Default project key for new issues"
+
+secrets:
+  - name: api_token
+    description: "Jira API token (fallback for all projects)"
+    required: false
+
+resources:
+  type: project
+  key_pattern: "{project_key}"
+  description: "Jira project"
+  bindings:
+    - name: api_token
+      type: secret
+      description: "Project-specific API token"
+      required: true
+    - name: board_id
+      type: integer
+      description: "Default board ID for this project"
+    - name: issue_type
+      type: enum
+      values: [Bug, Story, Task, Epic]
+      description: "Default issue type"
+      default: "Task"
+```
+
+Resolution for Jira skill, user bob:
+```
+instance_url → skill_settings (tenant scope): "https://jira.corp.com"
+api_token for PROJECT-A → skill_resource_bindings: "jira_token_for_project_a"
+api_token for PROJECT-B → miss → fallback to skill_settings secret: "jira_default_token"
+board_id for PROJECT-A → skill_resource_bindings: 42
+```
+
+#### Implementation Priority
+
+| Phase | Scope | Effort |
+|-------|-------|--------|
+| P0 | `skill_settings` + `skill_resource_bindings` tables | 0.5 day |
+| P0 | `SkillConfigCenter` core (set/get/resolve/validate) | 1.5 days |
+| P0 | Manifest parsing (`settings:` / `secrets:` / `resources:`) | 0.5 day |
+| P0 | Pre-execution validation in `require_executable()` | 0.5 day |
+| P0 | Migration from `skill_user_credentials` | 0.5 day |
+| P1 | REST API endpoints | 1 day |
+| P1 | CLI `mo-agent skill config` commands | 1 day |
+| P2 | Tenant-scope admin endpoints | 0.5 day |
+| P2 | Config change events | 0.5 day |
+
+---
+
+## 14. Skill Table Registry
+
+> **Status**: Design Target — P2
+
+### Problem
+
+All skill tables live in the same database schema with `sk_{skill}_` prefix convention. As skill count grows, this creates: (a) no enforcement that skills only touch their own tables, (b) no way to migrate a skill's tables independently, (c) no path to per-skill schema isolation if needed later.
+
+### Solution: SkillTableRegistry
+
+A platform-level registry that tracks which tables belong to which skill and enforces access boundaries:
+
+```python
+class SkillTableRegistry:
+    """Tracks skill → table ownership. Enforces access at query time."""
+
+    def tables_for(self, skill_name: str) -> list[str]:
+        """Return table names owned by this skill."""
+
+    def owner_of(self, table_name: str) -> str | None:
+        """Return skill that owns this table, or None if platform table."""
+
+    def validate_access(self, skill_name: str, table_name: str) -> bool:
+        """True if skill is allowed to access this table (own tables + declared depends_on)."""
+```
+
+**Per-skill schema separation** (optional, MatrixOne-native): Skills can opt into a dedicated database (`CREATE DATABASE sk_github`) instead of shared prefix. The registry abstracts this — callers use logical table names, the registry resolves to physical `{db}.{table}`. Migration between shared-prefix and separate-database is a registry config change, not a code change.
+
+**Integration points**:
+- `SandboxRunner` uses `validate_access()` before proxying DB queries for sandboxed skills
+- `SkillDataBridge` uses `tables_for()` to validate cross-skill access
+- `init_db()` populates the registry from skill manifests at startup
 
 ---
 
