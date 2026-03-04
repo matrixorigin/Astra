@@ -22,8 +22,76 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Summarize PR Skill
+# Cloud Skill Design Rules
 # ============================================================================
+#
+# PRINCIPLE: The skill controls information density. The LLM must NOT do
+# secondary trimming — it receives exactly what it needs, no more, no less.
+#
+# DETAIL LEVELS (all data-fetching skills must support `detail` parameter):
+#
+#   brief    — default. Minimum viable for a decision. Used for lists/overviews.
+#   normal   — user asks "what is this" / "tell me about X". Key context added.
+#   detailed — user asks "why did it fail" / "show me details". Diagnostic info.
+#   full     — user explicitly asks for "everything". Near-raw, noise stripped.
+#
+# Each level is a strict superset of the level below it.
+# `full` still truncates at a token budget — it is NOT "no truncation".
+#
+# TRUNCATION LIMITS (apply consistently):
+#
+#   Title/name:        80 chars across all levels (full: unlimited)
+#   Body/description:  omit | 200 | 500 | 2000 chars
+#   Log/diff content:  omit | omit | 500 | 2000 chars
+#   List items:        10   | 10   | 20  | 50
+#   Total output:      ~500 | ~1500 | ~4000 | ~8000 chars
+#
+#   Always append "[truncated]" when content is cut. Never silently drop.
+#
+# STRUCTURED OUTPUT:
+#   - Fixed field set per level — LLM never checks `if field in result`
+#   - Normalize API values (e.g. GitHub conclusion → success/failure/pending/
+#     skipped/cancelled). Never pass through raw API strings.
+#   - Timestamps: always "YYYY-MM-DD HH:MM", never ISO 8601.
+#
+# REPO AUTO-RESOLUTION (all GitHub skills):
+#   - Accept bare project name (e.g. "milvus") OR "owner/repo"
+#   - Standard pattern:
+#       resolved_by_search = isinstance(repo, str) and "/" not in repo
+#       resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
+#   - Output must include: resolved_repo: str | None, resolved_by_search: bool
+#   - LLM description must say: "If resolved_by_search=True, tell user which
+#     repo was used and ask to confirm if it looks wrong."
+#
+# SKILL DESCRIPTION must cover (in order):
+#   1. What it does (one sentence)
+#   2. When to use it (trigger conditions)
+#   3. repo format — auto-resolved from bare name
+#   4. detail levels — what each level adds
+#   5. resolved_by_search — confirmation instruction
+#   6. "Do NOT call proactively" (if applicable)
+#
+# CI SKILL field requirements by level:
+#   brief:    workflow name, conclusion, branch, triggered_at
+#   normal:   + pr_number, pr_title, commit message (80 chars), duration
+#   detailed: + failed job names, first failed step + error (200 chars each)
+#   full:     + all job statuses, failed step log snippets (500 chars each)
+#
+# PR SKILL field requirements by level:
+#   brief:    number, title (80), author, state, created_at, ci_conclusion
+#   normal:   + body (200), labels, reviewers, changed_files count
+#   detailed: + additions/deletions, key changed files (top 10), review count
+#   full:     + complete body (2000), per-file diff (500/file), all reviews
+#
+# ISSUE SKILL field requirements by level:
+#   brief:    number, title (80), state, labels, created_at
+#   normal:   + body (200), assignee, milestone, comment_count
+#   detailed: + recent 3 comments (200 each), linked PRs
+#   full:     + complete body (2000), all comments (200 each, up to 20)
+#
+# See also: .kiro/steering/cloud-skill-design.md
+# ============================================================================
+
 
 
 class SummarizePRInput(SkillInput):
