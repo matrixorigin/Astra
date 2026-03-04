@@ -106,23 +106,81 @@ class TestGitHubAPIMethods:
         return pr
 
     @pytest.mark.asyncio
-    async def test_get_pr(self, api, mock_gh_client, db_session):
+    async def test_get_pr_brief(self, api, mock_gh_client):
+        """brief: fixed field set, no body/labels/reviewers."""
         mock_repo = MagicMock()
         mock_repo.get_pull.return_value = self._make_mock_pr(42, "My PR")
+        mock_repo.get_commit.return_value.get_check_runs.return_value = []
         mock_gh_client.get_repo.return_value = mock_repo
 
-        result = await api.get_pr("owner/repo", 42)
+        result = await api.get_pr("owner/repo", 42, detail="brief")
         assert result["number"] == 42
         assert result["title"] == "My PR"
+        assert result["author"] == "alice"
+        assert result["state"] == "open"
+        assert result["created_at"] == "2026-01-01 00:00"
+        assert result["changed_files"] == 3
+        assert result["ci_conclusion"] == "pending"  # no checks → pending
+        assert "body" not in result
+        assert "labels" not in result
+        assert "additions" not in result
 
+    @pytest.mark.asyncio
+    async def test_get_pr_normal(self, api, mock_gh_client, db_session):
+        """normal: adds body/labels/reviewers/additions/deletions. Cache NOT written (only full caches)."""
+        mock_repo = MagicMock()
+        mock_repo.get_pull.return_value = self._make_mock_pr(42, "My PR")
+        mock_repo.get_commit.return_value.get_check_runs.return_value = []
+        mock_gh_client.get_repo.return_value = mock_repo
+
+        result = await api.get_pr("owner/repo", 42, detail="normal")
+        assert result["body"] == "body"
+        assert result["additions"] == 10
+        assert result["deletions"] == 5
+        assert result["updated_at"] == "2026-01-02 00:00"
+        assert "key_files" not in result
+
+        # normal does not write to cache
         cached = db_session.query(SkGithubPRCache).filter_by(
             repo_full_name="owner/repo", pr_number=42
         ).one_or_none()
-        assert cached is not None
-        assert cached.title == "My PR"
+        assert cached is None
 
     @pytest.mark.asyncio
-    async def test_list_prs(self, api, mock_gh_client):
+    async def test_get_pr_ci_conclusion_failure(self, api, mock_gh_client):
+        """ci_conclusion=failure when any check run failed."""
+        mock_repo = MagicMock()
+        mock_repo.get_pull.return_value = self._make_mock_pr(1)
+        check_pass = MagicMock(); check_pass.conclusion = "success"
+        check_fail = MagicMock(); check_fail.conclusion = "failure"
+        mock_repo.get_commit.return_value.get_check_runs.return_value = [check_pass, check_fail]
+        mock_gh_client.get_repo.return_value = mock_repo
+
+        result = await api.get_pr("owner/repo", 1, detail="brief")
+        assert result["ci_conclusion"] == "failure"
+
+    @pytest.mark.asyncio
+    async def test_get_pr_ci_conclusion_success(self, api, mock_gh_client):
+        """ci_conclusion=success when all checks passed (including skipped)."""
+        mock_repo = MagicMock()
+        mock_repo.get_pull.return_value = self._make_mock_pr(1)
+        check1 = MagicMock(); check1.conclusion = "success"
+        check2 = MagicMock(); check2.conclusion = "skipped"
+        mock_repo.get_commit.return_value.get_check_runs.return_value = [check1, check2]
+        mock_gh_client.get_repo.return_value = mock_repo
+
+        result = await api.get_pr("owner/repo", 1, detail="brief")
+        assert result["ci_conclusion"] == "success"
+
+    @pytest.mark.asyncio
+    async def test_get_pr_invalid_detail(self, api, mock_gh_client):
+        mock_gh_client.get_repo.return_value = MagicMock()
+        with pytest.raises(ValueError, match="Invalid detail level"):
+            await api.get_pr("owner/repo", 1, detail="invalid")
+
+    @pytest.mark.asyncio
+    async def test_list_prs_brief_fields(self, api, mock_gh_client):
+        """brief: correct fields, normalized timestamp, no body/labels."""
         mock_repo = MagicMock()
         mock_repo.get_pulls.return_value = [
             self._make_mock_pr(1, "PR 1"),
@@ -131,6 +189,32 @@ class TestGitHubAPIMethods:
         mock_gh_client.get_repo.return_value = mock_repo
         result = await api.list_prs("owner/repo", state="open", limit=10)
         assert len(result) == 2
+        assert result[0]["number"] == 1
+        assert result[0]["title"] == "PR 1"
+        assert result[0]["author"] == "alice"
+        assert result[0]["created_at"] == "2026-01-01 00:00"
+        assert "body" not in result[0]
+        assert "labels" not in result[0]
+
+    @pytest.mark.asyncio
+    async def test_list_prs_normal_fields(self, api, mock_gh_client):
+        """normal: adds body, labels, reviewers, changed_files."""
+        mock_repo = MagicMock()
+        pr = self._make_mock_pr(1, "PR 1")
+        pr.labels = []
+        pr.requested_reviewers = []
+        mock_repo.get_pulls.return_value = [pr]
+        mock_gh_client.get_repo.return_value = mock_repo
+        result = await api.list_prs("owner/repo", detail="normal")
+        assert result[0]["body"] == "body"
+        assert result[0]["changed_files"] == 3
+        assert "labels" in result[0]
+
+    @pytest.mark.asyncio
+    async def test_list_prs_invalid_detail(self, api, mock_gh_client):
+        mock_gh_client.get_repo.return_value = MagicMock()
+        with pytest.raises(ValueError, match="Invalid detail level"):
+            await api.list_prs("owner/repo", detail="full")
 
     @pytest.mark.asyncio
     async def test_get_pr_diff(self, api, mock_gh_client):
@@ -524,8 +608,8 @@ class TestGitHubAPIMethods:
         assert result["recent_comments"] == []
 
     @pytest.mark.asyncio
-    async def test_format_issue_full_comments_capped_at_5(self, api, mock_gh_client):
-        """Full detail caps recent_comments at 5 even if more exist."""
+    async def test_format_issue_detailed_comments_capped_at_3(self, api, mock_gh_client):
+        """detailed level caps recent_comments at 3 even if more exist."""
         mock_repo = MagicMock()
         issue = self._make_mock_issue(42)
         comments = []
@@ -538,11 +622,37 @@ class TestGitHubAPIMethods:
         issue.get_comments.return_value = comments
         mock_repo.get_issue.return_value = issue
         mock_gh_client.get_repo.return_value = mock_repo
-        result = await api.get_issue("owner/repo", 42, detail="full")
-        # full level returns up to 20 comments; 10 mocked → all 10 returned
-        assert len(result["recent_comments"]) == 10
+        result = await api.get_issue("owner/repo", 42, detail="detailed")
+        assert len(result["recent_comments"]) == 3
         assert result["recent_comments"][0]["user"] == "user0"
-        assert result["recent_comments"][9]["user"] == "user9"
+        assert result["recent_comments"][2]["user"] == "user2"
+        # detailed does not include reactions/locked
+        assert "reactions" not in result
+
+    @pytest.mark.asyncio
+    async def test_format_issue_full_comments_capped_at_20(self, api, mock_gh_client):
+        """full level caps recent_comments at 20; get_comments called only once."""
+        mock_repo = MagicMock()
+        issue = self._make_mock_issue(42)
+        comments = []
+        for i in range(25):
+            c = MagicMock()
+            c.user.login = f"user{i}"
+            c.created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            c.body = f"comment {i}"
+            comments.append(c)
+        issue.get_comments.return_value = comments
+        mock_repo.get_issue.return_value = issue
+        mock_gh_client.get_repo.return_value = mock_repo
+        result = await api.get_issue("owner/repo", 42, detail="full")
+        assert len(result["recent_comments"]) == 20
+        assert result["recent_comments"][0]["user"] == "user0"
+        assert result["recent_comments"][19]["user"] == "user19"
+        # get_comments called exactly once (not twice)
+        assert issue.get_comments.call_count == 1
+        # full includes reactions/locked
+        assert "reactions" in result
+        assert "locked" in result
 
     @pytest.mark.asyncio
     async def test_get_issue_repo_not_found_propagates(self, api, mock_gh_client):

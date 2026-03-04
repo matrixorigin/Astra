@@ -78,7 +78,8 @@ logger = logging.getLogger(__name__)
 #   full:     + all job statuses, failed step log snippets (500 chars each)
 #
 # PR SKILL field requirements by level:
-#   brief:    number, title (80), author, state, created_at, ci_conclusion
+#   brief:    number, title (80), author, state, created_at, ci_conclusion, changed_files
+#             (ci_conclusion only in get_pr, not list_prs — requires extra API call per PR)
 #   normal:   + body (200), labels, reviewers, changed_files count
 #   detailed: + additions/deletions, key changed files (top 10), review count
 #   full:     + complete body (2000), per-file diff (500/file), all reviews
@@ -188,7 +189,7 @@ class ListPRsInput(SkillInput):
     repo: str = ""  # "owner/repo", e.g. "matrixorigin/matrixone"
     state: str = "open"  # open, closed, all
     limit: int = 10
-    detail: str = "brief"  # brief | normal
+    detail: str = "brief"  # brief | normal (ci_conclusion requires per-PR API call; use get_pr for that)
 
 
 class ListPRsOutput(SkillOutput):

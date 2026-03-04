@@ -136,29 +136,33 @@ class GitHubSkillAPI:
             logger.debug(f"Rate limit check failed (non-fatal): {exc}")
 
     # ------------------------------------------------------------------
-    # PR operations
+    # ------------------------------------------------------------------
+    # Shared helpers (used by PR, issue, and workflow methods)
     # ------------------------------------------------------------------
 
     # Normalize GitHub conclusion values to a fixed vocabulary.
+    # "neutral" means "check passed with warnings" — closer to success than skipped.
+    # "timed_out" is a failure mode.
+    # "stale" means the run was superseded — treat as cancelled.
     _CONCLUSION_MAP: dict[str | None, str] = {
         "success": "success",
         "failure": "failure",
         "cancelled": "cancelled",
         "skipped": "skipped",
         "timed_out": "failure",
+        "neutral": "success",   # passed with warnings, not skipped
+        "stale": "cancelled",
         None: "pending",
         "in_progress": "pending",
         "queued": "pending",
         "waiting": "pending",
         "requested": "pending",
         "action_required": "pending",
-        "neutral": "skipped",
-        "stale": "cancelled",
     }
 
     @staticmethod
     def _fmt_ts(dt: datetime | None) -> str | None:
-        """Format datetime to 'YYYY-MM-DD HH:MM' (LLM-friendly). Returns None if dt is None."""
+        """Format datetime to 'YYYY-MM-DD HH:MM' UTC (LLM-friendly). Returns None if dt is None."""
         if dt is None:
             return None
         return dt.strftime("%Y-%m-%d %H:%M")
@@ -170,6 +174,10 @@ class GitHubSkillAPI:
             return text
         return text[:limit] + " [truncated]" if len(text) > limit else text
 
+    # ------------------------------------------------------------------
+    # PR operations
+    # ------------------------------------------------------------------
+
     async def get_pr(self, repo: str, pr_number: int, detail: str = "normal") -> dict:
         """Fetch PR details.
 
@@ -178,29 +186,38 @@ class GitHubSkillAPI:
           normal   — brief + body (200), labels, reviewers, additions/deletions
           detailed — normal + key changed files (top 10), review_comments count, merge status
           full     — detailed + complete body (2000), all review comments (200 each)
+
+        ci_conclusion uses GitHub Checks API (check_runs on the head commit), which aggregates
+        all CI systems (Actions, CircleCI, etc.) at the PR level. This is intentionally different
+        from ci_status which lists workflow runs at the repo level — they serve different purposes.
         """
+        if detail not in self._VALID_DETAIL_LEVELS:
+            raise ValueError(f"Invalid detail level {detail!r}, must be one of: {', '.join(sorted(self._VALID_DETAIL_LEVELS))}")
         await self._check_rate_limit()
         try:
             gh_repo = self._get_repo(repo)
             pr = gh_repo.get_pull(pr_number)
 
-            # Get CI conclusion from latest commit status
+            # Get CI conclusion from check runs on the PR head commit.
+            # Only non-fatal errors are suppressed (e.g. no checks configured);
+            # rate limit errors are re-raised.
             ci_conclusion: str = "pending"
             try:
                 commit = gh_repo.get_commit(pr.head.sha)
                 checks = list(commit.get_check_runs())
                 if checks:
-                    conclusions = [c.conclusion for c in checks]
+                    conclusions = {self._CONCLUSION_MAP.get(c.conclusion, "unknown") for c in checks}
                     if "failure" in conclusions:
                         ci_conclusion = "failure"
-                    elif all(c == "success" for c in conclusions):
+                    elif conclusions <= {"success", "skipped"}:
+                        # All checks passed or were intentionally skipped
                         ci_conclusion = "success"
-                    elif any(c is None for c in conclusions):
-                        ci_conclusion = "pending"
                     else:
-                        ci_conclusion = "success"
+                        ci_conclusion = "pending"
+            except (GitHubError, GitHubRateLimitError):
+                raise
             except Exception:
-                pass
+                pass  # No checks configured or insufficient permissions — leave as "pending"
 
             result: dict = {
                 "number": pr.number,
@@ -213,7 +230,6 @@ class GitHubSkillAPI:
                 "html_url": pr.html_url,
             }
             if detail == "brief":
-                self._cache_pr(repo, {**result, "body": pr.body or ""})
                 return result
 
             # normal+
@@ -226,7 +242,6 @@ class GitHubSkillAPI:
                 "updated_at": self._fmt_ts(pr.updated_at),
             })
             if detail == "normal":
-                self._cache_pr(repo, {**result, "body": pr.body or ""})
                 return result
 
             # detailed+
@@ -242,10 +257,9 @@ class GitHubSkillAPI:
                 "merge_state": getattr(pr, "mergeable_state", None),
             })
             if detail == "detailed":
-                self._cache_pr(repo, {**result, "body": pr.body or ""})
                 return result
 
-            # full
+            # full — cache here only: this is the most complete representation
             result["body"] = self._trunc(pr.body or "", 2000)
             try:
                 reviews = []
@@ -257,9 +271,11 @@ class GitHubSkillAPI:
                         "submitted_at": self._fmt_ts(rv.submitted_at),
                     })
                 result["reviews"] = reviews
+            except (GitHubError, GitHubRateLimitError):
+                raise
             except Exception:
                 result["reviews"] = []
-            self._cache_pr(repo, {**result, "body": pr.body or ""})
+            self._cache_pr(repo, result)
             return result
         except (GitHubError, GitHubRateLimitError):
             raise
@@ -293,13 +309,21 @@ class GitHubSkillAPI:
                 f"Failed to fetch diff: {e.data.get('message', str(e))}", status_code=e.status
             ) from e
 
+    _LIST_PRS_DETAIL_LEVELS = frozenset({"brief", "normal"})
+
     async def list_prs(self, repo: str, state: str = "open", limit: int = 10, detail: str = "brief") -> list[dict]:
         """List PRs in a repo.
 
-        detail levels:
+        detail levels (list context — use get_pr for deeper detail on a single PR):
           brief  — number, title (80), author, state, created_at, html_url
-          normal — brief + body (200), labels, reviewers, changed_files, ci_conclusion
+          normal — brief + body (200), labels, reviewers, changed_files
+
+        Note: ci_conclusion is intentionally omitted from list_prs — fetching it requires
+        one extra API call per PR (get_check_runs), which is too expensive for a list.
+        Use get_pr(detail='brief') for a single PR with ci_conclusion.
         """
+        if detail not in self._LIST_PRS_DETAIL_LEVELS:
+            raise ValueError(f"Invalid detail level {detail!r} for list_prs, must be one of: brief, normal")
         await self._check_rate_limit()
         try:
             gh_repo = self._get_repo(repo)
@@ -412,25 +436,27 @@ class GitHubSkillAPI:
         if detail == "normal":
             return d
 
-        # detailed+ — fetch recent comments (up to 3)
+        # detailed+ — fetch comments once; limit depends on detail level
+        # (full reuses the same fetch, just with a higher cap)
+        comment_limit = 3 if detail == "detailed" else 20
         try:
-            recent = []
+            comments = []
             for c in issue.get_comments():
-                if len(recent) >= 3:
+                if len(comments) >= comment_limit:
                     break
-                recent.append({
+                comments.append({
                     "user": c.user.login,
                     "created_at": self._fmt_ts(c.created_at),
                     "body": self._trunc(c.body, 200),
                 })
-            d["recent_comments"] = recent
+            d["recent_comments"] = comments
         except Exception as exc:
             logger.warning("Failed to fetch comments for issue #%s: %s", issue.number, exc)
             d["recent_comments"] = []
         if detail == "detailed":
             return d
 
-        # full — expand body, fetch up to 20 comments
+        # full — expand body and add metadata
         d["body"] = self._trunc(issue.body or "", 2000)
         d.update({
             "reactions": issue.reactions if isinstance(issue.reactions, dict) else {},
@@ -438,19 +464,6 @@ class GitHubSkillAPI:
             "closed_by": issue.closed_by.login if issue.closed_by else None,
             "locked": issue.locked,
         })
-        try:
-            all_comments = []
-            for c in issue.get_comments():
-                if len(all_comments) >= 20:
-                    break
-                all_comments.append({
-                    "user": c.user.login,
-                    "created_at": self._fmt_ts(c.created_at),
-                    "body": self._trunc(c.body, 200),
-                })
-            d["recent_comments"] = all_comments
-        except Exception as exc:
-            logger.warning("Failed to fetch comments for issue #%s: %s", issue.number, exc)
         return d
 
     async def list_issues(
