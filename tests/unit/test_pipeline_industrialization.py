@@ -77,6 +77,7 @@ class TestCorrectionOrderPreservation:
     def _make_pipeline_with_tools(self, original_tools, corrected_candidates):
         """Build a SkillPipeline with mocked internals."""
         from core.skills.pipeline import SkillPipeline, SkillCandidate
+        from core.skills.modern_selector import SkillSelectionResult
 
         pipeline = SkillPipeline.__new__(SkillPipeline)
         pipeline._db_factory = Mock()
@@ -84,7 +85,13 @@ class TestCorrectionOrderPreservation:
         pipeline._learning = True
 
         mock_modern = Mock()
-        mock_modern.get_tools_schema.return_value = (original_tools, "keyword")
+        # select_tools returns SkillSelectionResult, not tuple
+        mock_modern.select_tools.return_value = SkillSelectionResult(
+            tools=original_tools,
+            retrieval_method="keyword",
+            scores=[],
+            high_confidence_skill=None,
+        )
         mock_modern._skill_to_tool_schema_by_name = Mock(return_value=None)
         pipeline._modern = mock_modern
 

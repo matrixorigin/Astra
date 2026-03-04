@@ -20,6 +20,61 @@ from cli.tools.router import ToolCall, ToolRouter
 MAX_TURNS = 25
 MAX_TURN_WALL_CLOCK_S = 300
 
+# Core tools always included regardless of query
+_CORE_TOOLS = {"reflect", "get_agent_info", "find_skills"}
+
+# Keyword → tool mapping for relevance filtering
+_TOOL_KEYWORDS: dict[str, set[str]] = {
+    "read_file": {"read", "file", "show", "cat", "view", "content"},
+    "write_file": {"write", "create", "save", "file"},
+    "str_replace": {"replace", "edit", "modify", "change", "update"},
+    "list_dir": {"list", "ls", "dir", "directory", "folder", "tree"},
+    "grep": {"grep", "search", "find", "pattern", "regex"},
+    "glob": {"glob", "find", "files", "pattern"},
+    "bash": {"bash", "shell", "run", "execute", "command", "terminal"},
+    "git_status": {"git", "status", "changes", "modified"},
+    "git_diff": {"git", "diff", "changes"},
+    "git_log": {"git", "log", "history", "commits"},
+}
+
+
+def _filter_relevant_tools(
+    query: str,
+    tools: list[dict[str, Any]],
+    max_tools: int = 8,
+) -> list[dict[str, Any]]:
+    """Filter tools by query relevance using keyword matching.
+    
+    Always includes core tools (reflect, get_agent_info, find_skills).
+    Returns at most max_tools schemas.
+    """
+    query_words = set(query.lower().split())
+    scored: list[tuple[dict[str, Any], int]] = []
+    
+    for tool in tools:
+        name = tool.get("function", {}).get("name", "")
+        
+        # Core tools always included with high score
+        if name in _CORE_TOOLS:
+            scored.append((tool, 100))
+            continue
+        
+        # Score by keyword overlap
+        keywords = _TOOL_KEYWORDS.get(name, set())
+        score = len(keywords & query_words)
+        
+        # Also check tool description
+        desc = tool.get("function", {}).get("description", "").lower()
+        for word in query_words:
+            if len(word) > 3 and word in desc:
+                score += 1
+        
+        scored.append((tool, score))
+    
+    # Sort by score descending, take top max_tools
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [t for t, _ in scored[:max_tools]]
+
 
 class Renderer(Protocol):
     """Pluggable output renderer (terminal, file, test stub)."""
@@ -364,10 +419,14 @@ async def edge_chat_loop(
         if session_info is not None:
             session_info["turn"] = turn
 
-        # Always send edge_tools so the server has them even after
-        # a restart (server-side session cache is in-memory only).
+        # Get edge tools - filter by relevance on turn 0
         current_schemas = tool_router.get_schemas()
-        send_edge_tools = current_schemas
+        if turn == 0 and len(current_schemas) > 5:
+            # Filter tools by query relevance (simple keyword matching)
+            send_edge_tools = _filter_relevant_tools(user_input, current_schemas)
+        else:
+            # Subsequent turns: send all tools (LLM may need different tools)
+            send_edge_tools = current_schemas
 
         # Call cloud with retry for transient errors
         _MAX_RETRIES = 2

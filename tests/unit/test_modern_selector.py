@@ -226,7 +226,7 @@ class TestCategoryPreFiltering:
 
         selector = ModernSkillSelector(lambda: db, embed_fn=fake_embed)
         selector._index_built = True  # skip build
-        selector._index.query = MagicMock(return_value=["code_review"])
+        selector._index.query_with_scores = MagicMock(return_value=[("code_review", 0.9)])
         selector.rule_selector.skills["code_review"] = SkillMetadata(
             name="code_review", version="1.0.0", description="Review",
             category="code", subcategory="review", triggers=["review"],
@@ -235,7 +235,7 @@ class TestCategoryPreFiltering:
 
         selector.get_tools_schema("review my PR")
         # First call should have category="code"
-        first_call = selector._index.query.call_args_list[0]
+        first_call = selector._index.query_with_scores.call_args_list[0]
         assert first_call.kwargs.get("category") == "code" or first_call[1].get("category") == "code"
 
     def test_category_fallback_when_no_results(self, db):
@@ -247,7 +247,7 @@ class TestCategoryPreFiltering:
         selector = ModernSkillSelector(lambda: db, embed_fn=fake_embed)
         selector._index_built = True
         # First call (with category) returns empty, second (without) returns result
-        selector._index.query = MagicMock(side_effect=[[], ["some_skill"]])
+        selector._index.query_with_scores = MagicMock(side_effect=[[], [("some_skill", 0.8)]])
         selector.rule_selector.skills["some_skill"] = SkillMetadata(
             name="some_skill", version="1.0.0", description="Skill",
             category="general", subcategory="default", triggers=["deploy"],
@@ -255,7 +255,7 @@ class TestCategoryPreFiltering:
         )
 
         selector.get_tools_schema("deploy app")
-        assert selector._index.query.call_count == 2
+        assert selector._index.query_with_scores.call_count == 2
         # Second call should have no category filter
-        second_call = selector._index.query.call_args_list[1]
+        second_call = selector._index.query_with_scores.call_args_list[1]
         assert second_call.kwargs.get("category") is None

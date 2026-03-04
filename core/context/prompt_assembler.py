@@ -269,43 +269,9 @@ class PromptAssembler(DbConsumer):
             sections["history"] = history
             breakdown["history"] = _estimate_tokens(history)
 
-        # §7 Constraints
-        constraints = (
-            "Rules:\n"
-            "- Think step-by-step before acting\n"
-            "- Verify changes before presenting\n"
-            "- If uncertain, say so rather than guess\n"
-            "- For questions about YOUR capabilities, answer from Self-Model — don't explore files\n"
-            "\nAmbiguity resolution rules:\n"
-            "- When user asks about 'the process', 'what happened', 'the flow', 'call chain', or 'decision process' "
-            "without specifying code vs conversation, ASSUME they mean YOUR recent actions in this conversation "
-            "(tool calls, decisions, errors) — not code-level function calls\n"
-            "- If still ambiguous after applying this rule, ask for clarification before answering\n"
-            "\nData integrity rules:\n"
-            "- NEVER fabricate data. If a skill returns success=False, report the error honestly\n"
-            "- NEVER invent numbers, dates, or facts not present in skill output\n"
-            "- If data is unavailable, say so explicitly\n"
-            "\nTool selection rules:\n"
-            "- Before using generic tools (bash, grep) for tasks that cloud skills handle (GitHub PRs, CI status), "
-            "check if a specialized cloud skill is available — they are faster and more reliable\n"
-            "- If a cloud skill requires a parameter you don't know (e.g. GitHub repo name in 'owner/repo' format), "
-            "ask the user directly — do NOT use bash/grep/read_file/list_dir to search for it\n"
-            "- If you are unsure which tool to use, call reflect(focus='tool_selection') to see all available cloud skills and their parameters\n"
-            "\nReflection rules:\n"
-            "- When a tool result is unexpected or a skill fails, review your recent actions before retrying\n"
-            "- If a reflect tool is available, use it to inspect decision history\n"
-            "- After reviewing, either retry with a corrected approach or report the problem honestly\n"
-            "- When the user asks WHY something happened (slow response, high token usage, wrong result, tool errors), "
-            "call reflect with the appropriate focus: 'performance' for speed/cost questions, "
-            "'skill_failure' for errors, 'unexpected_result' for wrong answers. "
-            "Present the session_report_markdown from the response as your analysis\n"
-            "\nFile editing rules:\n"
-            "- To edit existing files, ALWAYS use str_replace — never rewrite the entire file with write_file\n"
-            "- Use write_file ONLY to create new files that don't exist yet\n"
-            "- For multiple changes to one file, call str_replace once per change\n"
-            "- Include enough context in old_str to match exactly one location\n"
-            "- NEVER use bash rm to delete a file and then recreate it — this bypasses safety checks and is blocked"
-        )
+        # §7 Constraints - load only relevant rules based on task type
+        edge_tools = (edge_context.edge_tools or []) if edge_context else []
+        constraints = self._build_constraints(user_query, edge_tools)
         sections["constraints"] = constraints
         breakdown["constraints"] = _estimate_tokens(constraints)
 
@@ -432,6 +398,90 @@ class PromptAssembler(DbConsumer):
     # ------------------------------------------------------------------
     # Section builders
     # ------------------------------------------------------------------
+
+    # Core rules always included (~150 tokens)
+    _CORE_RULES = (
+        "Rules:\n"
+        "- Think step-by-step before acting\n"
+        "- If uncertain, say so rather than guess\n"
+        "- NEVER fabricate data — if unavailable, say so explicitly"
+    )
+
+    # Task-specific rule blocks
+    _RULE_BLOCKS: ClassVar[dict[str, str]] = {
+        "file_editing": (
+            "\nFile editing rules:\n"
+            "- To edit existing files, ALWAYS use str_replace — never rewrite entire file\n"
+            "- Use write_file ONLY for new files\n"
+            "- Include enough context in old_str to match exactly one location"
+        ),
+        "tool_selection": (
+            "\nTool selection rules:\n"
+            "- Prefer specialized cloud skills over generic tools (bash, grep)\n"
+            "- If a skill needs unknown params, ask user — don't search with bash/grep"
+        ),
+        "reflection": (
+            "\nReflection rules:\n"
+            "- When tool fails, review actions before retrying\n"
+            "- For WHY questions (slow, errors), use reflect with appropriate focus"
+        ),
+        "introspection": (
+            "\nIntrospection rules:\n"
+            "- For questions about YOUR capabilities, answer from Self-Model\n"
+            "- 'the process' without context means YOUR recent actions, not code"
+        ),
+    }
+
+    # Keywords that trigger specific rule blocks
+    _RULE_TRIGGERS: ClassVar[dict[str, list[str]]] = {
+        "file_editing": ["edit", "modify", "change", "update", "write", "create", "file"],
+        "tool_selection": ["tool", "skill", "how to", "which"],
+        "reflection": ["why", "error", "fail", "slow", "wrong"],
+        "introspection": ["you", "your", "can you", "what can", "capabilities"],
+    }
+
+    def _build_constraints(
+        self,
+        query: str | None,
+        tools_schema: list[dict[str, Any]] | None,
+    ) -> str:
+        """Build constraints section with only relevant rules.
+        
+        Core rules always included. Task-specific rules added based on:
+        - Query keywords
+        - Available tools (file editing rules only if file tools present)
+        """
+        parts = [self._CORE_RULES]
+        
+        if not query:
+            # No query context — include all rules
+            parts.extend(self._RULE_BLOCKS.values())
+            return "".join(parts)
+        
+        q_lower = query.lower()
+        included: set[str] = set()
+        
+        # Check query keywords
+        for block_name, triggers in self._RULE_TRIGGERS.items():
+            if any(t in q_lower for t in triggers):
+                included.add(block_name)
+        
+        # Check available tools
+        if tools_schema:
+            tool_names = {t.get("function", {}).get("name", "") for t in tools_schema}
+            if tool_names & {"write_file", "str_replace", "read_file"}:
+                included.add("file_editing")
+        
+        # Always include tool_selection if multiple tools available
+        if tools_schema and len(tools_schema) > 1:
+            included.add("tool_selection")
+        
+        # Add relevant blocks
+        for block_name in included:
+            if block_name in self._RULE_BLOCKS:
+                parts.append(self._RULE_BLOCKS[block_name])
+        
+        return "".join(parts)
 
     def _build_identity(self, agent_id: str | None) -> str:
         """§1: Load agent system prompt from DB, fallback to default.

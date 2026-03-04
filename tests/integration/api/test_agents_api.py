@@ -1,5 +1,7 @@
 """Integration tests for agents API with real database."""
 
+import uuid
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -33,8 +35,8 @@ def auth_token(client):
 @pytest.fixture(autouse=True)
 def setup_test_id():
     """Generate unique test ID."""
-    import time
-    pytest.test_id = str(int(time.time() * 1000))
+    import uuid
+    pytest.test_id = str(uuid.uuid4())
 
 
 def test_create_and_list_agents(client, auth_token):
@@ -187,7 +189,7 @@ def test_agent_permission_denied(client, auth_token):
     
     # Create another user
     import time
-    other_username = f"otheruser_{int(time.time() * 1000)}"
+    other_username = f"otheruser_{str(uuid.uuid4())}"
     client.post("/auth/register", json={
         "username": other_username,
         "email": f"{other_username}@test.com",

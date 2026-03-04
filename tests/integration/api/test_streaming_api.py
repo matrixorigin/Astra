@@ -1,5 +1,7 @@
 """Integration tests for streaming API with real database."""
 
+import uuid
+
 import pytest
 from starlette.testclient import TestClient
 
@@ -17,7 +19,7 @@ def client():
 def auth_token(client):
     """Get auth token by registering and logging in."""
     import time
-    username = f"streamuser_{int(time.time() * 1000)}"
+    username = f"streamuser_{str(uuid.uuid4())}"
     
     # Register
     client.post("/auth/register", json={

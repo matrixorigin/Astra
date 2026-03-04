@@ -16,10 +16,34 @@ logger = get_logger(__name__)
 
 _DEFAULT_CONTEXT_BUDGET = 2000  # tokens reserved for tool schemas
 
+# High-confidence thresholds for skipping LLM selection
+_HIGH_CONFIDENCE_SCORE = 0.85  # Top skill must score above this
+_HIGH_CONFIDENCE_GAP = 0.25    # Gap between top-1 and top-2 must exceed this
+
 
 def _estimate_tokens(obj: Any) -> int:
     """Estimate token count from serialized JSON size (~4 chars per token)."""
     return len(json.dumps(obj, default=str)) // 4
+
+
+class SkillSelectionResult:
+    """Result of skill selection with confidence info."""
+    
+    __slots__ = ("tools", "retrieval_method", "scores", "high_confidence_skill", "catalog")
+    
+    def __init__(
+        self,
+        tools: list[dict[str, Any]],
+        retrieval_method: str,
+        scores: list[tuple[str, float]] | None = None,
+        high_confidence_skill: str | None = None,
+        catalog: str | None = None,
+    ):
+        self.tools = tools
+        self.retrieval_method = retrieval_method
+        self.scores = scores or []
+        self.high_confidence_skill = high_confidence_skill  # Set if can skip LLM
+        self.catalog = catalog  # Lightweight tool list for two-phase selection
 
 
 class ModernSkillSelector:
@@ -73,41 +97,73 @@ class ModernSkillSelector:
         context_budget: int = _DEFAULT_CONTEXT_BUDGET,
     ) -> tuple[list[dict[str, Any]], str]:
         """Return OpenAI tool schemas using progressive disclosure.
-
-        Stage 1 (Index Tier): Retrieve candidates via rule-based matching on
-                          lightweight metadata. Zero prompt tokens.
-        Stage 2 (Schema Tier): Build full schema for each candidate, measure real
-                          token cost, include only if within budget.
-                          Skills that don't fit are excluded entirely —
-                          no empty stubs (they waste tokens and confuse LLMs).
         
         Returns:
             (tools, retrieval_method) where retrieval_method is "semantic" or "keyword"
         """
-        # --- Stage 1: retrieve candidates ---
-        # Prefer semantic index; fall back to keyword matching
+        result = self.select_tools(query, max_candidates, context_budget=context_budget)
+        return result.tools, result.retrieval_method
+
+    def select_tools(
+        self,
+        query: str,
+        max_candidates: int = 5,
+        *,
+        context_budget: int = _DEFAULT_CONTEXT_BUDGET,
+    ) -> SkillSelectionResult:
+        """Select tools with confidence scoring for potential LLM bypass.
+
+        Stage 1 (Index Tier): Semantic/keyword retrieval with scores.
+        Stage 2 (Confidence Check): If top-1 score >> top-2, mark for LLM bypass.
+        Stage 3 (Schema Tier): Build schemas within token budget.
+        
+        Returns:
+            SkillSelectionResult with tools, scores, and high_confidence_skill if applicable.
+        """
+        # --- Stage 1: retrieve candidates with scores ---
         self._ensure_index_built()
         category_hint = self._guess_category(query)
-        hit_names = self._index.query(query, top_k=max_candidates * 2, category=category_hint)
-        if not hit_names and category_hint:
-            # Category too narrow — retry without filter
-            hit_names = self._index.query(query, top_k=max_candidates * 2)
-        if hit_names:
-            candidates = [
-                self.rule_selector.skills[n]
-                for n in hit_names
-                if n in self.rule_selector.skills
-            ]
+        
+        # Get scores for confidence check
+        scored = self._index.query_with_scores(
+            query, top_k=max_candidates * 2, category=category_hint
+        )
+        if not scored and category_hint:
+            scored = self._index.query_with_scores(query, top_k=max_candidates * 2)
+        
+        if scored:
             retrieval_method = "semantic"
+            candidates = [
+                self.rule_selector.skills[name]
+                for name, _ in scored
+                if name in self.rule_selector.skills
+            ]
             logger.debug("Semantic retrieval: %d candidates", len(candidates))
         else:
+            # Keyword fallback (no scores)
             candidates = self.rule_selector.select_skills(query, max_skills=max_candidates * 2)
             retrieval_method = "keyword"
+            scored = [(c.name, 0.5) for c in candidates]  # Default score
             logger.debug("Keyword fallback: %d candidates", len(candidates))
+        
         if not candidates:
-            return [], retrieval_method
+            return SkillSelectionResult([], retrieval_method, [])
 
-        # --- Stage 2: budget-aware Schema Tier expansion ---
+        # --- Stage 2: confidence check for LLM bypass ---
+        high_confidence_skill = None
+        if len(scored) >= 1:
+            top_score = scored[0][1]
+            second_score = scored[1][1] if len(scored) > 1 else 0.0
+            gap = top_score - second_score
+            
+            if top_score >= _HIGH_CONFIDENCE_SCORE and gap >= _HIGH_CONFIDENCE_GAP:
+                high_confidence_skill = scored[0][0]
+                logger.info(
+                    "High confidence: %s (score=%.2f, gap=%.2f) — LLM selection skippable",
+                    high_confidence_skill, top_score, gap,
+                )
+
+        # --- Stage 3: budget-aware Schema Tier expansion ---
         budget_remaining = context_budget
         tools: list[dict[str, Any]] = []
 
@@ -122,12 +178,22 @@ class ModernSkillSelector:
             tools.append(schema)
             budget_remaining -= cost
 
+        # --- Generate lightweight catalog for two-phase selection ---
+        # Format: "tool_name: short_description" (~30 tokens per tool)
+        catalog_lines = []
+        for skill in candidates[:max_candidates]:
+            desc = getattr(skill, 'prompt_description', None)
+            if not desc:
+                desc = (skill.description or "")[:80]
+            catalog_lines.append(f"- {skill.name}: {desc}")
+        catalog = "\n".join(catalog_lines) if catalog_lines else None
+
         logger.info(
-            "Progressive disclosure: %d/%d candidates loaded, budget used %d/%d tokens",
+            "Progressive disclosure: %d/%d candidates, budget %d/%d tokens",
             len(tools), min(len(candidates), max_candidates),
             context_budget - budget_remaining, context_budget,
         )
-        return tools, retrieval_method
+        return SkillSelectionResult(tools, retrieval_method, scored, high_confidence_skill, catalog)
 
     def _skill_to_tool_schema_by_name(self, name: str) -> dict[str, Any] | None:
         """Look up a skill by exact name and return its tool schema, or None."""

@@ -45,6 +45,9 @@ class ToolsResult:
     candidates: int = 0                  # Candidates considered
     retrieval_method: str | None = None  # "semantic" or "keyword", None if unknown
     latency_ms: int = 0                  # End-to-end selection latency
+    high_confidence_skill: str | None = None  # If set, can skip LLM tool selection
+    scores: list[tuple[str, float]] = field(default_factory=list)  # (name, score) pairs
+    catalog: str | None = None           # Lightweight tool list for two-phase selection
 
 
 @dataclass
@@ -230,15 +233,18 @@ class SkillPipeline(DbConsumer):
     ) -> ToolsResult:
         """Select skills and return tools schema for LLM.
 
-        Stage 1: Retrieve candidates via rule-based + LLM ranking.
+        Stage 1: Retrieve candidates via semantic/keyword + confidence scoring.
                  Apply learned corrections if learning is enabled.
         Stage 2: Record audit event with selection metadata.
+        
+        If high_confidence_skill is set in result, caller can skip LLM tool selection.
         """
         t0 = time.monotonic()
-        # Stage 1a: retrieve + rank (progressive disclosure)
-        tools, retrieval_method = self._modern.get_tools_schema(
+        # Stage 1a: retrieve + rank with confidence scoring
+        selection = self._modern.select_tools(
             query, max_candidates=max_candidates, context_budget=context_budget,
         )
+        tools = selection.tools
         skill_names = [t["function"]["name"] for t in tools]
 
         # Stage 1b: apply learned corrections (order-preserving)
@@ -268,7 +274,7 @@ class SkillPipeline(DbConsumer):
         # Stage 2: audit
         event_id = None
         if self._audit:
-            event_id = self._record_selection(query, session_id, tools, retrieval_method)
+            event_id = self._record_selection(query, session_id, tools, selection.retrieval_method)
 
         # Opportunistic flush
         self._feedback.maybe_flush()
@@ -279,8 +285,11 @@ class SkillPipeline(DbConsumer):
             tools=tools,
             event_id=event_id,
             candidates=len(tools),
-            retrieval_method=retrieval_method,
+            retrieval_method=selection.retrieval_method,
             latency_ms=latency_ms,
+            high_confidence_skill=selection.high_confidence_skill,
+            scores=selection.scores,
+            catalog=selection.catalog,
         )
 
     # ------------------------------------------------------------------

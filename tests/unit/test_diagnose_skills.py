@@ -52,21 +52,28 @@ class TestDiagnoseSkills:
     @pytest.mark.asyncio
     async def test_detailed_specific_skill(self, skill, db_session):
         """Can diagnose a specific skill by name."""
+        import uuid
         from api.models import SkillRegistry as SkillModel
         
-        # Find any active skill
-        any_skill = db_session.query(SkillModel).filter(SkillModel.is_active == 1).first()
-        if not any_skill:
-            pytest.skip("No active skills in DB")
+        # Create a test skill to ensure we have one
+        test_skill = SkillModel(
+            skill_id=str(uuid.uuid4()),
+            skill_name="test_diagnose_skill",
+            version="1.0.0",
+            description="Test skill for diagnosis",
+            is_active=1,
+        )
+        db_session.merge(test_skill)
+        db_session.commit()
         
         result = await skill.execute(DiagnoseSkillsInput(
             level=DiagnosisLevel.DETAILED,
-            skill_name=any_skill.skill_name
+            skill_name="test_diagnose_skill"
         ))
         
         assert result.success is True
         assert result.diagnosis is not None
-        assert result.diagnosis["skill_name"] == any_skill.skill_name
+        assert result.diagnosis["skill_name"] == "test_diagnose_skill"
 
     @pytest.mark.asyncio
     async def test_detailed_nonexistent_skill(self, skill):
@@ -163,7 +170,7 @@ class TestDiagnoseSkills:
         
         # Create a skill with mismatched version in DB
         # diagnose_skills is v1.1.0 locally, register as v0.0.1 in DB
-        skill_id = f"diagnose_skills@0.0.1-test-{uuid.uuid4().hex[:8]}"
+        skill_id = f"diagnose_skills@0.0.1-test-{uuid.uuid4().hex}"
         db_session.add(SkillModel(
             skill_id=skill_id,
             skill_name="diagnose_skills",

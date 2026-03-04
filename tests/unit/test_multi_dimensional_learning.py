@@ -170,7 +170,6 @@ class TestMultiDimensionalLearning:
         db_session.commit()
 
     def test_per_signal_weights_override_positive(self, db_session):
-        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_weights"
         ).delete()
@@ -199,9 +198,12 @@ class TestMultiDimensionalLearning:
         db_session.add(learning)
         db_session.commit()
 
+        # Create selector AFTER data is committed to avoid stale cache
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
         selector.apply_learnings("review PR", candidates)
+        db_session.expire_all()
         learning_after = db_session.query(SkillSelectionLearning).filter(
             SkillSelectionLearning.learning_id == learning.learning_id
         ).first()
@@ -212,7 +214,6 @@ class TestMultiDimensionalLearning:
         db_session.commit()
 
     def test_per_signal_weights_partial_override(self, db_session):
-        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_weights"
         ).delete()
@@ -241,9 +242,12 @@ class TestMultiDimensionalLearning:
         db_session.add(learning)
         db_session.commit()
 
+        # Create selector AFTER data is committed to avoid stale cache
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
         selector.apply_learnings("review PR", candidates)
+        db_session.expire_all()
         learning_after = db_session.query(SkillSelectionLearning).filter(
             SkillSelectionLearning.learning_id == learning.learning_id
         ).first()
@@ -254,7 +258,6 @@ class TestMultiDimensionalLearning:
         db_session.commit()
 
     def test_per_signal_weights_invalid_override(self, db_session):
-        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         db_session.query(Config).filter(
             Config.key_name == "selector_learning_weights"
         ).delete()
@@ -283,9 +286,12 @@ class TestMultiDimensionalLearning:
         db_session.add(learning)
         db_session.commit()
 
+        # Create selector AFTER data is committed to avoid stale cache
+        selector = SelfImprovingSelector(_session_local(), llm_client=None)
         from core.skills.pipeline import SkillCandidate
         candidates = [SkillCandidate(name="summarize_pr"), SkillCandidate(name="code_review")]
         selector.apply_learnings("review PR", candidates)
+        db_session.expire_all()
         learning_after = db_session.query(SkillSelectionLearning).filter(
             SkillSelectionLearning.learning_id == learning.learning_id
         ).first()

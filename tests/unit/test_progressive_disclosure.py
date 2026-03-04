@@ -236,13 +236,13 @@ class TestProgressiveDisclosure:
     def test_semantic_retrieval_preferred_over_keyword(self, selector_with_skills):
         """When embed_fn is available, semantic index is used first."""
         sel = selector_with_skills
-        # Spy on the index
-        original_query = sel._index.query
+        # Spy on the index (now uses query_with_scores)
+        original_query = sel._index.query_with_scores
         called = []
         def spy_query(*a, **kw):
             called.append(True)
             return original_query(*a, **kw)
-        sel._index.query = spy_query
+        sel._index.query_with_scores = spy_query
 
         tools, _ = sel.get_tools_schema("review code", max_candidates=3)
         assert len(called) > 0, "Semantic index should have been queried"

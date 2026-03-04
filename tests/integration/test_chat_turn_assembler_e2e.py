@@ -31,7 +31,7 @@ from core.auth.password import hash_password
 # Helpers
 # ============================================================================
 
-from tests.integration.helpers import fake_stream_gen, fake_stream, parse_sse, NullRenderer
+from tests.integration.helpers import fake_stream_gen, fake_stream, parse_sse, get_session_id, NullRenderer
 from tests.conftest import flush_persist_threads
 
 
@@ -121,8 +121,9 @@ class TestAssemblerIsDefault:
 
         assert resp.status_code == 200
         system_msg = next(m["content"] for m in captured_messages if m["role"] == "system")
+        # Core rules should be present
         assert "Think step-by-step" in system_msg
-        assert "Verify changes" in system_msg
+        assert "NEVER fabricate data" in system_msg or "fabricate" in system_msg.lower()
 
     def test_no_feature_flag_in_settings(self):
         """use_unified_assembler flag is removed from Settings."""
@@ -402,7 +403,7 @@ class TestMultiTurnWithAssembler:
                 "edge_tools": [{"type": "function", "function": {"name": "read_file", "description": "r", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}],
                 "project_rules": "Use moerr.",
             }, headers=auth_headers)
-        session_id = parse_sse(r1.text)[0]["session_id"]
+        session_id = get_session_id(r1.text)
 
         # Turn 2: send tool results
         captured_messages = []
@@ -865,7 +866,7 @@ class TestCloudHistoryHealing:
                 "edge_tools": edge_tools,
             }, headers=auth_headers)
         assert r1.status_code == 200
-        session_id = parse_sse(r1.text)[0]["session_id"]
+        session_id = get_session_id(r1.text)
 
         # Turn 2: edge skips tool_results entirely, sends new user message.
         # Cloud must heal the orphaned tool_calls before calling LLM.
@@ -931,7 +932,7 @@ class TestCloudHistoryHealing:
                 "messages": [{"role": "user", "content": "read z.py"}],
                 "edge_tools": edge_tools,
             }, headers=auth_headers)
-        session_id = parse_sse(r1.text)[0]["session_id"]
+        session_id = get_session_id(r1.text)
 
         # Turn 2: edge sends user message without tool_results.
         # Patch _merge_tool_results_into_history to a no-op → history stays broken.
@@ -1003,7 +1004,7 @@ class TestCloudHistoryHealing:
                 "messages": [{"role": "user", "content": "read a.py"}],
                 "edge_tools": edge_tools,
             }, headers=auth_headers)
-        session_id = parse_sse(r1.text)[0]["session_id"]
+        session_id = get_session_id(r1.text)
 
         # Wait for persistence, then simulate cloud restart
         flush_persist_threads()
@@ -1080,7 +1081,7 @@ class TestCloudHistoryHealing:
                 "messages": [{"role": "user", "content": "read both"}],
                 "edge_tools": edge_tools,
             }, headers=auth_headers)
-        session_id = parse_sse(r1.text)[0]["session_id"]
+        session_id = get_session_id(r1.text)
 
         # Simulate cloud restart
         flush_persist_threads()

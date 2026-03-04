@@ -117,7 +117,9 @@ def _cleanup_worker_databases():
 @pytest.fixture(scope="session") 
 def test_session_factory(test_engine):
     """Create test session factory."""
-    return sessionmaker(bind=test_engine)
+    # expire_on_commit=False prevents "Could not refresh instance" errors
+    # when objects are accessed after commit in parallel tests
+    return sessionmaker(bind=test_engine, expire_on_commit=False)
 
 
 @pytest.fixture
@@ -133,6 +135,8 @@ def db_session(test_session_factory):
         session.rollback()
         raise
     finally:
+        # Expire all to prevent stale data in next test
+        session.expire_all()
         # Always close to release locks
         session.close()
 
@@ -142,7 +146,9 @@ def patch_db_engine(test_engine):
     """Ensure database module uses test engine throughout the session."""
     from api import database
     database.engine = test_engine
-    database.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
+    database.SessionLocal = sessionmaker(
+        autocommit=False, autoflush=False, bind=test_engine, expire_on_commit=False
+    )
     yield
 
 

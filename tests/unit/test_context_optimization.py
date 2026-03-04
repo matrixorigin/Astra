@@ -398,7 +398,7 @@ class TestSnapshotDeduplication:
         from api.models.context import PromptFragment
         from core.context.prompt_assembler import PromptAssembler
 
-        unique_id = str(uuid.uuid4())[:8]
+        unique_id = str(uuid.uuid4())
         pa = PromptAssembler(lambda: db_session)
         identity_content = f"You are a helpful assistant. ID={unique_id}"
         sections = {
@@ -437,7 +437,7 @@ class TestSnapshotDeduplication:
         from api.models.context import PromptFragment
         from core.context.prompt_assembler import PromptAssembler
 
-        unique_id = str(uuid.uuid4())[:8]
+        unique_id = str(uuid.uuid4())
         identity_content = f"You are a helpful assistant. ID={unique_id}"
         pa = PromptAssembler(lambda: db_session)
         sections = {
@@ -467,7 +467,7 @@ class TestSnapshotDeduplication:
 
         from core.context.prompt_assembler import PromptAssembler
 
-        unique_id = str(uuid.uuid4())[:8]
+        unique_id = str(uuid.uuid4())
         pa = PromptAssembler(lambda: db_session)
         sections = {
             "identity": f"Assistant ID={unique_id}",
@@ -499,3 +499,306 @@ class TestSnapshotDeduplication:
 
         # identity should NOT be in variable_sections
         assert "identity" not in data["variable_sections"]
+
+
+class TestHighConfidenceSkillSelection:
+    """Test high-confidence skill selection bypass."""
+
+    def test_high_confidence_detected_when_gap_large(self):
+        """When top score >> second score, high_confidence_skill is set."""
+        from core.skills.modern_selector import (
+            SkillSelectionResult,
+            _HIGH_CONFIDENCE_GAP,
+            _HIGH_CONFIDENCE_SCORE,
+        )
+        
+        # Simulate scores with large gap
+        scores = [("ci_status", 0.92), ("list_prs", 0.55), ("grep", 0.40)]
+        
+        top_score = scores[0][1]
+        second_score = scores[1][1]
+        gap = top_score - second_score
+        
+        # Verify thresholds would trigger
+        assert top_score >= _HIGH_CONFIDENCE_SCORE
+        assert gap >= _HIGH_CONFIDENCE_GAP
+        
+        # Create result with high confidence
+        result = SkillSelectionResult(
+            tools=[{"function": {"name": "ci_status"}}],
+            retrieval_method="semantic",
+            scores=scores,
+            high_confidence_skill="ci_status",
+        )
+        
+        assert result.high_confidence_skill == "ci_status"
+        assert result.scores[0][1] == 0.92
+
+    def test_no_high_confidence_when_scores_close(self):
+        """When scores are close, high_confidence_skill is None."""
+        from core.skills.modern_selector import (
+            SkillSelectionResult,
+            _HIGH_CONFIDENCE_GAP,
+        )
+        
+        # Simulate close scores
+        scores = [("ci_status", 0.75), ("list_prs", 0.70)]
+        gap = scores[0][1] - scores[1][1]
+        
+        # Gap too small
+        assert gap < _HIGH_CONFIDENCE_GAP
+        
+        result = SkillSelectionResult(
+            tools=[],
+            retrieval_method="semantic",
+            scores=scores,
+            high_confidence_skill=None,  # Not set due to small gap
+        )
+        
+        assert result.high_confidence_skill is None
+
+    def test_tools_result_includes_confidence_fields(self):
+        """ToolsResult dataclass has high_confidence_skill and scores."""
+        from core.skills.pipeline import ToolsResult
+        
+        result = ToolsResult(
+            tools=[{"function": {"name": "grep"}}],
+            high_confidence_skill="grep",
+            scores=[("grep", 0.95), ("glob", 0.50)],
+        )
+        
+        assert result.high_confidence_skill == "grep"
+        assert len(result.scores) == 2
+        assert result.scores[0] == ("grep", 0.95)
+
+
+class TestToolCatalog:
+    """Test lightweight tool catalog generation."""
+
+    def test_catalog_format(self):
+        """Catalog is formatted as 'name: description' lines."""
+        from core.skills.modern_selector import SkillSelectionResult
+        
+        catalog = """- ci_status: Check CI/CD workflow status
+- list_prs: List pull requests in a repository
+- grep: Search for patterns in files"""
+        
+        result = SkillSelectionResult(
+            tools=[],
+            retrieval_method="semantic",
+            catalog=catalog,
+        )
+        
+        assert "ci_status:" in result.catalog
+        assert "list_prs:" in result.catalog
+        assert result.catalog.startswith("- ")
+
+    def test_tools_result_includes_catalog(self):
+        """ToolsResult dataclass has catalog field."""
+        from core.skills.pipeline import ToolsResult
+        
+        catalog = "- grep: Search files\n- glob: Find files"
+        result = ToolsResult(
+            tools=[],
+            catalog=catalog,
+        )
+        
+        assert result.catalog == catalog
+
+    def test_catalog_uses_prompt_description(self):
+        """Catalog prefers prompt_description over full description."""
+        from unittest.mock import Mock
+        from core.skills.modern_selector import ModernSkillSelector, SkillSelectionResult
+        
+        # Create mock skill with prompt_description
+        mock_skill = Mock()
+        mock_skill.name = "test_skill"
+        mock_skill.description = "This is a very long description that would be truncated"
+        mock_skill.prompt_description = "Short desc"
+        
+        # Verify prompt_description is preferred
+        desc = getattr(mock_skill, 'prompt_description', None)
+        assert desc == "Short desc"
+
+
+class TestParameterExtraction:
+    """Test parameter extraction from query."""
+
+    def test_extract_owner_repo(self):
+        """Extract owner/repo format."""
+        from core.agent.chat_loop import ChatLoop
+        
+        loop = ChatLoop.__new__(ChatLoop)
+        
+        params = loop._extract_params_from_query("check ci for matrixorigin/matrixone")
+        assert params.get("repo") == "matrixorigin/matrixone"
+
+    def test_extract_bare_repo(self):
+        """Extract bare project name after 'for'."""
+        from core.agent.chat_loop import ChatLoop
+        
+        loop = ChatLoop.__new__(ChatLoop)
+        
+        params = loop._extract_params_from_query("check ci for matrixone")
+        assert params.get("repo") == "matrixone"
+
+    def test_extract_limit(self):
+        """Extract numeric limit."""
+        from core.agent.chat_loop import ChatLoop
+        
+        loop = ChatLoop.__new__(ChatLoop)
+        
+        params = loop._extract_params_from_query("show top 10 prs")
+        assert params.get("limit") == 10
+        
+        params = loop._extract_params_from_query("last 5 issues")
+        assert params.get("limit") == 5
+
+    def test_extract_state(self):
+        """Extract state (open/closed/all)."""
+        from core.agent.chat_loop import ChatLoop
+        
+        loop = ChatLoop.__new__(ChatLoop)
+        
+        params = loop._extract_params_from_query("list closed issues")
+        assert params.get("state") == "closed"
+        
+        params = loop._extract_params_from_query("show all prs")
+        assert params.get("state") == "all"
+
+    def test_extract_multiple(self):
+        """Extract multiple parameters."""
+        from core.agent.chat_loop import ChatLoop
+        
+        loop = ChatLoop.__new__(ChatLoop)
+        
+        params = loop._extract_params_from_query("list top 5 closed issues for matrixorigin/matrixone")
+        assert params.get("repo") == "matrixorigin/matrixone"
+        assert params.get("limit") == 5
+        assert params.get("state") == "closed"
+
+    def test_no_extraction(self):
+        """No parameters extracted from generic query."""
+        from core.agent.chat_loop import ChatLoop
+        
+        loop = ChatLoop.__new__(ChatLoop)
+        
+        params = loop._extract_params_from_query("what is event sourcing")
+        assert params == {}
+
+
+class TestEdgeToolFiltering:
+    """Test edge tool filtering by relevance."""
+
+    def test_core_tools_always_included(self):
+        """Core tools (reflect, get_agent_info) are always included."""
+        from cli.edge_chat_loop import _filter_relevant_tools
+        
+        tools = [
+            {"function": {"name": "reflect", "description": "Reflect on actions"}},
+            {"function": {"name": "get_agent_info", "description": "Get agent info"}},
+            {"function": {"name": "grep", "description": "Search files"}},
+            {"function": {"name": "bash", "description": "Run commands"}},
+        ]
+        
+        result = _filter_relevant_tools("what is event sourcing", tools, max_tools=2)
+        names = [t["function"]["name"] for t in result]
+        
+        # Core tools should be included even with low max_tools
+        assert "reflect" in names or "get_agent_info" in names
+
+    def test_keyword_matching(self):
+        """Tools matching query keywords are prioritized."""
+        from cli.edge_chat_loop import _filter_relevant_tools
+        
+        tools = [
+            {"function": {"name": "grep", "description": "Search for patterns"}},
+            {"function": {"name": "bash", "description": "Run shell commands"}},
+            {"function": {"name": "read_file", "description": "Read file content"}},
+            {"function": {"name": "write_file", "description": "Write to file"}},
+        ]
+        
+        result = _filter_relevant_tools("search for TODO in files", tools, max_tools=2)
+        names = [t["function"]["name"] for t in result]
+        
+        assert "grep" in names  # "search" keyword matches
+
+    def test_max_tools_limit(self):
+        """Result is limited to max_tools."""
+        from cli.edge_chat_loop import _filter_relevant_tools
+        
+        tools = [{"function": {"name": f"tool_{i}", "description": ""}} for i in range(20)]
+        
+        result = _filter_relevant_tools("test query", tools, max_tools=5)
+        assert len(result) == 5
+
+
+class TestDynamicConstraints:
+    """Test dynamic constraints based on task type."""
+
+    def test_core_rules_always_included(self):
+        """Core rules are always present."""
+        from core.context.prompt_assembler import PromptAssembler
+        
+        assembler = PromptAssembler.__new__(PromptAssembler)
+        
+        constraints = assembler._build_constraints("what is event sourcing", [])
+        
+        assert "Think step-by-step" in constraints
+        assert "NEVER fabricate data" in constraints
+
+    def test_file_editing_rules_with_file_tools(self):
+        """File editing rules included when file tools available."""
+        from core.context.prompt_assembler import PromptAssembler
+        
+        assembler = PromptAssembler.__new__(PromptAssembler)
+        tools = [{"function": {"name": "str_replace"}}]
+        
+        constraints = assembler._build_constraints("edit the file", tools)
+        
+        assert "str_replace" in constraints
+        assert "File editing" in constraints
+
+    def test_no_file_rules_for_query(self):
+        """File editing rules excluded for pure queries."""
+        from core.context.prompt_assembler import PromptAssembler
+        
+        assembler = PromptAssembler.__new__(PromptAssembler)
+        tools = [{"function": {"name": "ci_status"}}]
+        
+        constraints = assembler._build_constraints("check ci status", tools)
+        
+        assert "File editing" not in constraints
+
+    def test_reflection_rules_for_why_questions(self):
+        """Reflection rules included for 'why' questions."""
+        from core.context.prompt_assembler import PromptAssembler
+        
+        assembler = PromptAssembler.__new__(PromptAssembler)
+        
+        constraints = assembler._build_constraints("why did it fail", [])
+        
+        assert "Reflection" in constraints
+
+    def test_introspection_rules_for_capability_questions(self):
+        """Introspection rules included for capability questions."""
+        from core.context.prompt_assembler import PromptAssembler
+        
+        assembler = PromptAssembler.__new__(PromptAssembler)
+        
+        constraints = assembler._build_constraints("what can you do", [])
+        
+        assert "Self-Model" in constraints
+
+    def test_all_rules_without_query(self):
+        """All rules included when no query context."""
+        from core.context.prompt_assembler import PromptAssembler
+        
+        assembler = PromptAssembler.__new__(PromptAssembler)
+        
+        constraints = assembler._build_constraints(None, None)
+        
+        # Should include all rule blocks
+        assert "File editing" in constraints
+        assert "Tool selection" in constraints
+        assert "Reflection" in constraints

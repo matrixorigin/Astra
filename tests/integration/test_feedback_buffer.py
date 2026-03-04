@@ -738,14 +738,18 @@ class TestSkillPipelineIntegration:
         pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=True)
         
         # Mock modern selector to return both skills
+        from core.skills.modern_selector import SkillSelectionResult
         class MockModern:
-            def get_tools_schema(self, query, max_candidates=None, **kwargs):
-                return (
-                    [
+            def select_tools(self, query, max_candidates=None, **kwargs):
+                return SkillSelectionResult(
+                    tools=[
                         {"function": {"name": "wrong_skill"}},
                         {"function": {"name": "correct_skill"}},
                     ],
-                    "keyword"
+                    retrieval_method="keyword",
+                    scores=[],
+                    high_confidence_skill=None,
+                    catalog=None,
                 )
         
         pipeline._modern = MockModern()
@@ -765,11 +769,15 @@ class TestAuditDBVerification:
         pipeline = SkillPipeline(lambda: db, llm_client=None, audit=True, learning=False)
         
         # Mock modern selector to return semantic retrieval
+        from core.skills.modern_selector import SkillSelectionResult
         class MockModernSemantic:
-            def get_tools_schema(self, query, max_candidates=None, **kwargs):
-                return (
-                    [{"function": {"name": "test_skill"}}],
-                    "semantic"
+            def select_tools(self, query, max_candidates=None, **kwargs):
+                return SkillSelectionResult(
+                    tools=[{"function": {"name": "test_skill"}}],
+                    retrieval_method="semantic",
+                    scores=[],
+                    high_confidence_skill=None,
+                    catalog=None,
                 )
         
         pipeline._modern = MockModernSemantic()
@@ -790,11 +798,15 @@ class TestAuditDBVerification:
         pipeline = SkillPipeline(lambda: db, llm_client=None, audit=True, learning=False)
         
         # Mock modern selector to return keyword retrieval
+        from core.skills.modern_selector import SkillSelectionResult
         class MockModernKeyword:
-            def get_tools_schema(self, query, max_candidates=None, **kwargs):
-                return (
-                    [{"function": {"name": "test_skill"}}],
-                    "keyword"
+            def select_tools(self, query, max_candidates=None, **kwargs):
+                return SkillSelectionResult(
+                    tools=[{"function": {"name": "test_skill"}}],
+                    retrieval_method="keyword",
+                    scores=[],
+                    high_confidence_skill=None,
+                    catalog=None,
                 )
         
         pipeline._modern = MockModernKeyword()
@@ -814,11 +826,15 @@ class TestAuditDBVerification:
         """Verify retrieval_method is returned in ToolsResult."""
         pipeline = SkillPipeline(lambda: db, llm_client=None, audit=False, learning=False)
         
+        from core.skills.modern_selector import SkillSelectionResult
         class MockModern:
-            def get_tools_schema(self, query, max_candidates=None, **kwargs):
-                return (
-                    [{"function": {"name": "test_skill"}}],
-                    "semantic"
+            def select_tools(self, query, max_candidates=None, **kwargs):
+                return SkillSelectionResult(
+                    tools=[{"function": {"name": "test_skill"}}],
+                    retrieval_method="semantic",
+                    scores=[],
+                    high_confidence_skill=None,
+                    catalog=None,
                 )
         
         pipeline._modern = MockModern()

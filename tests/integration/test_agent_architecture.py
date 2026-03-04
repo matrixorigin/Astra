@@ -78,9 +78,10 @@ class TestAgentArchitecture(unittest.TestCase):
         )
 
         # Use SkillPipeline with mocked internals
+        from core.skills.modern_selector import SkillSelectionResult
         self.pipeline = SkillPipeline(lambda: self.db, self.llm_client, audit=False, learning=False)
-        self.pipeline._modern.get_tools_schema = MagicMock(return_value=(
-            [
+        self.pipeline._modern.select_tools = MagicMock(return_value=SkillSelectionResult(
+            tools=[
                 {
                     "type": "function",
                     "function": {
@@ -89,7 +90,10 @@ class TestAgentArchitecture(unittest.TestCase):
                     },
                 }
             ],
-            "keyword"
+            retrieval_method="keyword",
+            scores=[],
+            high_confidence_skill=None,
+            catalog=None,
         ))
 
         self.executor = AgentExecutor(lambda: self.db, self.registry, MockMode.PRODUCTION)

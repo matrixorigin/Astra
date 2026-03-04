@@ -30,7 +30,7 @@ def engine(db):
 
 @pytest.fixture
 def user_id():
-    return f"test-lc-{uuid7().hex[:8]}"
+    return f"lc-{uuid7().hex[:32]}"
 
 
 @pytest.fixture

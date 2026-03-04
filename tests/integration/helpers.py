@@ -42,3 +42,11 @@ def parse_sse(response_text: str) -> list[dict]:
         if line.startswith("data: "):
             events.append(json.loads(line[6:]))
     return events
+
+
+def get_session_id(response_text: str) -> str:
+    """Extract session_id from SSE response, searching all events."""
+    for event in parse_sse(response_text):
+        if "session_id" in event:
+            return event["session_id"]
+    raise KeyError("session_id not found in any SSE event")

@@ -172,6 +172,77 @@ class ChatLoop:
         except Exception:
             pass
 
+    async def _select_tool_from_catalog(
+        self,
+        query: str,
+        catalog: str,
+        available_tools: list[str],
+    ) -> str | None:
+        """Use LLM to select a tool from lightweight catalog.
+        
+        Two-phase selection: catalog (~150 tokens) instead of full schemas (~1000 tokens).
+        Returns selected tool name, or None to fall back to full schema mode.
+        """
+        prompt = f"""Given this user query, select the most appropriate tool from the catalog.
+Reply with ONLY the tool name, nothing else.
+
+Query: {query}
+
+Available tools:
+{catalog}
+
+Tool name:"""
+        
+        try:
+            response = self.llm.chat([
+                {"role": "user", "content": prompt}
+            ], max_tokens=20)
+            selected = response.get("content", "").strip().lower()
+            # Validate selection
+            for tool in available_tools:
+                if tool.lower() == selected or tool.lower() in selected:
+                    return tool
+            logger.debug("Catalog selection '%s' not in available tools", selected)
+            return None
+        except Exception as e:
+            logger.warning("Catalog selection failed: %s", e)
+            return None
+
+    def _extract_params_from_query(self, query: str) -> dict[str, Any]:
+        """Extract common parameters from query using simple patterns.
+        
+        Extracts:
+        - repo: "owner/repo" or bare project name
+        - limit/count: numeric values
+        - state: open/closed/all
+        """
+        import re
+        params: dict[str, Any] = {}
+        q = query.lower()
+        
+        # Extract repo: "owner/repo" pattern
+        repo_match = re.search(r'\b([a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+)\b', query)
+        if repo_match:
+            params["repo"] = repo_match.group(1)
+        else:
+            # Bare project name after "for", "in", "of"
+            bare_match = re.search(r'\b(?:for|in|of)\s+([a-zA-Z0-9_-]+)\b', q)
+            if bare_match:
+                params["repo"] = bare_match.group(1)
+        
+        # Extract limit/count
+        limit_match = re.search(r'\b(?:top|last|recent|limit)\s*(\d+)\b', q)
+        if limit_match:
+            params["limit"] = int(limit_match.group(1))
+        
+        # Extract state
+        if "closed" in q:
+            params["state"] = "closed"
+        elif "all" in q and ("issue" in q or "pr" in q):
+            params["state"] = "all"
+        
+        return params
+
     def _merge_context(self, ctx, context: dict[str, Any] | None) -> dict[str, Any]:
         """Merge ContextManager output into request context.
 
@@ -473,12 +544,49 @@ class ChatLoop:
         merged_ctx = self._merge_context(ctx, context)
         messages = self._build_messages(user_input, merged_ctx, session_id=session_id, user_id=user_id)
 
+        # 4.5. Extract parameters from query and add as hint
+        extracted_params = self._extract_params_from_query(user_input)
+        if extracted_params:
+            hint = "Extracted from query: " + ", ".join(f"{k}={v}" for k, v in extracted_params.items())
+            # Append hint to user message
+            if messages and messages[-1].get("role") == "user":
+                messages[-1]["content"] += f"\n\n[{hint}]"
+            logger.debug("Parameter extraction: %s", extracted_params)
+
         # 5. Get available tools schema (with audit + learning)
         _sel = self._pipeline.get_tools_schema(
             user_input, session_id, max_candidates=max_candidates,
         )
         tools_schema = _sel.tools
         self._last_selection_event_id = _sel.event_id
+
+        # High-confidence optimization: if semantic retrieval is very confident,
+        # only pass the top skill's schema to LLM (saves ~800 tokens)
+        if _sel.high_confidence_skill and tools_schema:
+            top_tool = next(
+                (t for t in tools_schema if t["function"]["name"] == _sel.high_confidence_skill),
+                None,
+            )
+            if top_tool:
+                logger.info(
+                    "High-confidence mode: using only %s (score=%.2f)",
+                    _sel.high_confidence_skill,
+                    _sel.scores[0][1] if _sel.scores else 0,
+                )
+                tools_schema = [top_tool]
+        # Low-confidence: two-phase selection using catalog
+        elif _sel.catalog and len(tools_schema) > 2:
+            selected_name = await self._select_tool_from_catalog(
+                user_input, _sel.catalog, [t["function"]["name"] for t in tools_schema]
+            )
+            if selected_name:
+                selected_tool = next(
+                    (t for t in tools_schema if t["function"]["name"] == selected_name),
+                    None,
+                )
+                if selected_tool:
+                    logger.info("Catalog selection: %s", selected_name)
+                    tools_schema = [selected_tool]
 
         if self.scratchpad:
             tools_schema = list(tools_schema) + _SCRATCHPAD_TOOLS

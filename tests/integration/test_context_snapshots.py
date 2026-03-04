@@ -4,6 +4,7 @@ import pytest
 
 from core.context.manager import ContextManager, TaskType
 from core.events.event_logger import EventLogger
+from core.utils.id_generator import generate_id
 
 
 @pytest.fixture
@@ -21,7 +22,7 @@ def event_logger(db_session):
 def test_context_snapshot_save_and_load(db_session, context_manager, event_logger):
     """Test saving and loading context snapshots."""
     # Create a session and event
-    session_id = "test_session_001"
+    session_id = generate_id()
     user_id = "test_user"
 
     # Log a user query
@@ -62,7 +63,7 @@ def test_context_snapshot_save_and_load(db_session, context_manager, event_logge
 
 def test_context_snapshot_with_events(db_session, context_manager, event_logger):
     """Test snapshot with actual conversation events."""
-    session_id = "test_session_003"
+    session_id = generate_id()
     user_id = "test_user"
 
     # Create multiple events
@@ -103,7 +104,7 @@ def test_context_snapshot_with_events(db_session, context_manager, event_logger)
 
 def test_context_snapshot_task_types(db_session, context_manager, event_logger):
     """Test snapshots for different task types."""
-    session_id = "test_session_004"
+    session_id = generate_id()
     user_id = "test_user_004"
 
     # Create a dummy event to satisfy FK constraint
@@ -135,7 +136,7 @@ def test_context_snapshot_task_types(db_session, context_manager, event_logger):
 
 def test_context_snapshot_relevance_scores(db_session, context_manager, event_logger):
     """Test that relevance scores are preserved in snapshots."""
-    session_id = "test_session_005"
+    session_id = generate_id()
     user_id = "test_user"
 
     # Create events
@@ -162,7 +163,7 @@ def test_context_snapshot_relevance_scores(db_session, context_manager, event_lo
 
 def test_context_snapshot_update_llm_ids(db_session, test_session_factory, context_manager, event_logger):
     """Test updating snapshot with LLM request/response IDs."""
-    session_id = "test_session_006"
+    session_id = generate_id()
     user_id = "test_user"
 
     # Create event

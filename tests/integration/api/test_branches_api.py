@@ -1,6 +1,6 @@
 """Integration tests for Branch API endpoints."""
 
-import time
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +14,7 @@ def client():
 
 @pytest.fixture(autouse=True)
 def setup_test_id():
-    pytest.test_id = str(int(time.time() * 1000))
+    pytest.test_id = str(uuid.uuid4())
 
 
 @pytest.fixture
