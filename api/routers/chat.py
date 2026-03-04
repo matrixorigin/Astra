@@ -1889,9 +1889,11 @@ async def chat_turn(
 
                         # If skill returned success=False, inject a hard stop to prevent LLM from
                         # retrying with different params or using bash/curl to work around the failure.
+                        _cloud_skill_failed = False
                         try:
                             _cr_parsed = json.loads(cloud_result) if isinstance(cloud_result, str) else cloud_result
                             if isinstance(_cr_parsed, dict) and _cr_parsed.get("success") is False:
+                                _cloud_skill_failed = True
                                 _current_llm_messages = _current_llm_messages + [{
                                     "role": "system",
                                     "content": (
@@ -1903,6 +1905,13 @@ async def chat_turn(
                                 }]
                         except Exception:
                             pass
+                        if _cloud_skill_failed:
+                            break
+
+                    # If a cloud skill failed, stop the entire cloud loop — do not call LLM again.
+                    if _cloud_skill_failed:
+                        tool_calls = []  # prevent emitting remaining tool_calls to edge
+                        break
 
                     # If there are also edge tool_calls, emit them and break.
                     # The edge will execute them and send results in the next /chat/turn.
