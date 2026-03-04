@@ -46,6 +46,14 @@ class LearningTriggerResponse(BaseModel):
     model_version: str = "v1.0"
 
 
+class SkillStatsEntry(BaseModel):
+    """Per-skill execution statistics."""
+    selection_count: int
+    success_rate: float
+    avg_cost_usd: float
+    avg_time_ms: float
+
+
 class LearningStatsResponse(BaseModel):
     """Learning statistics response."""
     total_learnings: int
@@ -61,6 +69,7 @@ class LearningStatsResponse(BaseModel):
     failed_gates: int
     pass_rate: float
     avg_improvement_pct: float
+    per_skill: dict[str, SkillStatsEntry] = {}
     last_learning_time: datetime | None = None
 
 
@@ -202,21 +211,23 @@ async def get_learning_stats(
         pipeline = SkillPipeline(SessionLocal, llm_client, audit=False, learning=True)
 
         stats = pipeline.stats()
+        learning = stats["learning"]
 
         return LearningStatsResponse(
-            total_learnings=stats["total_learnings"],
-            high_confidence=stats["high_confidence"],
-            low_confidence=stats["low_confidence"],
-            avg_confidence=stats["avg_confidence"],
-            by_signal_type=stats["by_signal_type"],
-            weights=stats["learnings"]["weights"],
-            weights_per_signal=stats["learnings"]["weights_per_signal"],
-            decay=stats["learnings"]["decay"],
-            total_gates=stats["regression_gates"]["total_gates"],
-            passed_gates=stats["regression_gates"]["passed"],
-            failed_gates=stats["regression_gates"]["failed"],
-            pass_rate=stats["regression_gates"]["pass_rate"],
-            avg_improvement_pct=stats["regression_gates"]["avg_improvement_pct"],
+            total_learnings=learning["total_learnings"],
+            high_confidence=learning["high_confidence"],
+            low_confidence=learning["low_confidence"],
+            avg_confidence=learning["avg_confidence"],
+            by_signal_type=learning["by_signal_type"],
+            weights=learning["learnings"]["weights"],
+            weights_per_signal=learning["learnings"]["weights_per_signal"],
+            decay=learning["learnings"]["decay"],
+            total_gates=learning["regression_gates"]["total_gates"],
+            passed_gates=learning["regression_gates"]["passed"],
+            failed_gates=learning["regression_gates"]["failed"],
+            pass_rate=learning["regression_gates"]["pass_rate"],
+            avg_improvement_pct=learning["regression_gates"]["avg_improvement_pct"],
+            per_skill=stats.get("per_skill", {}),
         )
 
     except Exception as e:

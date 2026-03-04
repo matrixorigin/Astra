@@ -319,10 +319,12 @@ class TestSkillPipelineLearn:
         
         stats = pipeline.stats()
         
-        assert 'total_learnings' in stats
-        assert 'high_confidence' in stats
-        assert 'by_signal_type' in stats
-        assert 'regression_gates' in stats
+        assert 'learning' in stats
+        assert 'per_skill' in stats
+        assert 'total_learnings' in stats['learning']
+        assert 'high_confidence' in stats['learning']
+        assert 'by_signal_type' in stats['learning']
+        assert 'regression_gates' in stats['learning']
 
     def test_skill_pipeline_selection_history(self, db, clean_db):
         """Test getting selection history."""
@@ -691,7 +693,8 @@ class TestSkillPipelineIntegration:
         
         result = pipeline.stats()
         
-        assert result.get("error") == "Learning disabled"
+        assert result["learning"].get("error") == "Learning disabled"
+        assert "per_skill" in result
 
     def test_skill_pipeline_learn_with_error(self, db, clean_db):
         """Test learn() error handling."""

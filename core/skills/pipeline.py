@@ -13,8 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from sqlalchemy import text
 
-from sqlalchemy.orm import Session
-from core.db_consumer import DbFactory
+from core.db_consumer import DbConsumer, DbFactory
 from uuid_utils import uuid7
 
 from core.logging_config import get_logger
@@ -169,7 +168,7 @@ class _FeedbackBuffer:
 # SkillPipeline
 # ---------------------------------------------------------------------------
 
-class SkillPipeline:
+class SkillPipeline(DbConsumer):
     """Unified skill selection: retrieve → audit → feedback.
 
     Usage in ChatLoop::
@@ -190,7 +189,7 @@ class SkillPipeline:
         learning_weights: SignalWeights | None = None,
         embed_fn=None,
     ):
-        self._db_factory = db_factory
+        super().__init__(db_factory)
         self._llm = llm_client
         self._audit = audit
         self._learning = learning
@@ -405,41 +404,82 @@ class SkillPipeline:
             pass  # improver handles its own sessions
 
     def stats(self) -> dict[str, Any]:
-        """Get learning statistics."""
-        if not self._improver:
-            return {"error": "Learning disabled"}
-        return self._improver.get_learning_stats()
+        """Get learning statistics and per-skill execution metrics.
+
+        Returns:
+            Dict with 'learning' (from SelfImprovingSelector) and 'per_skill'
+            (selection_count, success_rate, avg_cost_usd, avg_time_ms per skill).
+        """
+        from sqlalchemy import case, func
+
+        from api.models.skill import SkillSelectionEvent
+
+        result: dict[str, Any] = {}
+
+        # Learning stats
+        if self._improver:
+            result["learning"] = self._improver.get_learning_stats()
+        else:
+            result["learning"] = {"error": "Learning disabled"}
+
+        # Per-skill execution metrics via ORM
+        try:
+            with self._db() as db:
+                rows = db.query(
+                    SkillSelectionEvent.skill_name,
+                    func.count().label("selection_count"),
+                    func.sum(case(
+                        (SkillSelectionEvent.execution_success == 1, 1),
+                        else_=0,
+                    )).label("success_count"),
+                    func.avg(SkillSelectionEvent.execution_cost).label("avg_cost"),
+                    func.avg(SkillSelectionEvent.execution_time_ms).label("avg_time"),
+                ).filter(
+                    SkillSelectionEvent.skill_name.isnot(None),
+                ).group_by(
+                    SkillSelectionEvent.skill_name,
+                ).all()
+
+                per_skill = {}
+                for r in rows:
+                    total = r.selection_count
+                    per_skill[r.skill_name] = {
+                        "selection_count": total,
+                        "success_rate": (r.success_count or 0) / total if total else 0.0,
+                        "avg_cost_usd": round(float(r.avg_cost or 0), 6),
+                        "avg_time_ms": round(float(r.avg_time or 0), 1),
+                    }
+                result["per_skill"] = per_skill
+        except Exception as e:
+            logger.warning("Failed to query per-skill stats: %s", e)
+            result["per_skill"] = {}
+
+        return result
 
     def selection_history(
         self, session_id: str | None = None, limit: int = 100,
     ) -> list[dict[str, Any]]:
         """Get selection history for analysis."""
-        from sqlalchemy import text
+        from api.models.skill import SkillSelectionEvent
 
-        sql = "SELECT event_id, session_id, user_query, selected_skills, skill_name, selection_method, created_at FROM skill_selection_events"
-        params: dict[str, Any] = {}
-        if session_id:
-            sql += " WHERE session_id = :sid"
-            params["sid"] = session_id
-        sql += " ORDER BY created_at DESC LIMIT :lim"
-        params["lim"] = limit
-
-        db = self._db_factory()
         try:
-            rows = db.execute(text(sql), params).fetchall()
-            return [
-                {
-                    "event_id": r[0], "session_id": r[1], "user_query": r[2],
-                    "selected_skills": r[3], "skill_name": r[4],
-                    "selection_method": r[5], "created_at": str(r[6]),
-                }
-                for r in rows
-            ]
+            with self._db() as db:
+                q = db.query(SkillSelectionEvent)
+                if session_id:
+                    q = q.filter(SkillSelectionEvent.session_id == session_id)
+                rows = q.order_by(SkillSelectionEvent.created_at.desc()).limit(limit).all()
+                return [
+                    {
+                        "event_id": r.event_id, "session_id": r.session_id,
+                        "user_query": r.user_query, "selected_skills": r.selected_skills,
+                        "skill_name": r.skill_name, "selection_method": r.selection_method,
+                        "created_at": str(r.created_at),
+                    }
+                    for r in rows
+                ]
         except Exception as e:
             logger.error("Failed to get selection history: %s", e)
             return []
-        finally:
-            db.close()
 
     # ------------------------------------------------------------------
     # Internal
@@ -454,47 +494,40 @@ class SkillPipeline:
         the skill ChatLoop will actually invoke, so deprecation / regression
         queries that filter by ``skill_name`` match the *executed* skill.
         """
+        from api.models.skill import SkillRegistry as SkillModel, SkillSelectionEvent
+
         event_id = str(uuid7())
         skill_names = [t["function"]["name"] for t in tools]
         top_skill = skill_names[0] if skill_names else None
 
-        db = self._db_factory()
         try:
-            # Resolve current active version from registry
-            skill_version = None
-            if top_skill:
-                try:
-                    row = db.execute(
-                        text("SELECT version FROM skills_registry WHERE skill_name = :n AND is_active = 1 ORDER BY created_at DESC LIMIT 1"),
-                        {"n": top_skill},
-                    ).fetchone()
-                    if row:
-                        skill_version = row[0]
-                except Exception:
-                    pass  # version is best-effort
+            with self._db() as db:
+                # Resolve current active version from registry
+                skill_version = None
+                if top_skill:
+                    try:
+                        reg = db.query(SkillModel.version).filter(
+                            SkillModel.skill_name == top_skill,
+                            SkillModel.is_active == 1,
+                        ).order_by(SkillModel.created_at.desc()).first()
+                        if reg:
+                            skill_version = reg.version
+                    except Exception:
+                        pass  # version is best-effort
 
-            db.execute(
-                text("""INSERT INTO skill_selection_events
-                       (event_id, session_id, user_query, selected_skills,
-                        skill_name, skill_version, selection_method, created_at)
-                       VALUES (:event_id, :session_id, :user_query, :selected_skills,
-                        :skill_name, :skill_version, :selection_method, :created_at)"""),
-                {
-                    "event_id": event_id,
-                    "session_id": session_id,
-                    "user_query": query,
-                    "selected_skills": json.dumps(skill_names),
-                    "skill_name": top_skill,
-                    "skill_version": skill_version,
-                    "selection_method": retrieval_method,
-                    "created_at": datetime.now(timezone.utc).replace(tzinfo=None),
-                },
-            )
-            db.commit()
+                evt = SkillSelectionEvent(
+                    event_id=event_id,
+                    session_id=session_id,
+                    user_query=query,
+                    selected_skills=skill_names,
+                    skill_name=top_skill,
+                    skill_version=skill_version,
+                    selection_method=retrieval_method,
+                    created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+                db.add(evt)
+                db.commit()
         except Exception as e:
             logger.warning("Audit event write failed: %s", e)
-            db.rollback()
-        finally:
-            db.close()
 
         return event_id

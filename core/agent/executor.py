@@ -180,9 +180,13 @@ class AgentExecutor(DbConsumer):
 
             # Buffer feedback signal (existing path)
             if self._pipeline and selection_event_id:
-                from core.skills.learning_signals import SignalType
+                from core.skills.learning_signals import SignalType, SignalThresholds
                 
-                feedback_data = {"ms": _elapsed_ms, "skill": skill_name}
+                feedback_data: dict[str, Any] = {
+                    "ms": _elapsed_ms,
+                    "skill": skill_name,
+                    "actual_usd": _cost,
+                }
                 if extra_feedback_data:
                     feedback_data.update(extra_feedback_data)
                 
@@ -191,21 +195,43 @@ class AgentExecutor(DbConsumer):
                     SignalType.EXECUTION_TIME,
                     feedback_data,
                 )
+
+                # Emit HIGH_COST signal when cost exceeds threshold
+                thresholds = SignalThresholds()
+                if _cost > thresholds.high_cost_usd:
+                    self._pipeline.record_feedback(
+                        selection_event_id,
+                        SignalType.HIGH_COST,
+                        {
+                            "skill": skill_name,
+                            "actual_usd": _cost,
+                            "actual_tokens": extra_feedback_data.get("actual_tokens", 0) if extra_feedback_data else 0,
+                            "threshold_usd": thresholds.high_cost_usd,
+                        },
+                    )
     
     def _backfill_selection_event(
         self, event_id: str, time_ms: int, cost: float, success: bool,
     ) -> None:
-        """Update skill_selection_events with post-execution metrics."""
+        """Update skill_selection_events with post-execution metrics.
+
+        Uses an independent session (via self._db()) intentionally: backfill
+        is best-effort and must not interfere with the caller's transaction.
+        If it fails, the execution result is still returned to the user.
+        """
         try:
-            from sqlalchemy import text
+            from api.models.skill import SkillSelectionEvent
             with self._db() as db:
-                db.execute(
-                    text("""UPDATE skill_selection_events
-                            SET execution_time_ms = :t, execution_cost = :c, execution_success = :s
-                            WHERE event_id = :eid"""),
-                    {"t": time_ms, "c": cost, "s": 1 if success else 0, "eid": event_id},
-                )
-                db.commit()
+                evt = db.query(SkillSelectionEvent).filter(
+                    SkillSelectionEvent.event_id == event_id,
+                ).first()
+                if evt:
+                    evt.execution_time_ms = time_ms
+                    evt.execution_cost = cost
+                    evt.execution_success = 1 if success else 0
+                    db.commit()
+                else:
+                    logger.debug("backfill: event_id=%s not found, skipping", event_id)
         except Exception as e:
             logger.debug("backfill selection event failed: %s", e)
 
