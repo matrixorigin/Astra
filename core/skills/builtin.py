@@ -126,6 +126,8 @@ class ListPRsOutput(SkillOutput):
     """Output for list_prs skill"""
 
     prs: list[dict]
+    resolved_repo: str | None = None
+    resolved_by_search: bool = False
 
 
 class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
@@ -137,7 +139,8 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
     description = (
         "List pull requests in a GitHub repository. "
         "Use this when user asks about PRs, recent changes, or what's being worked on. "
-        "Requires repo in 'owner/repo' format, e.g. 'matrixorigin/matrixone'. "
+        "repo can be 'owner/repo' or just a project name — auto-resolved via GitHub search. "
+        "If resolved_by_search=True in the result, tell the user which repo was used and ask to confirm if wrong. "
         "Use state='open' for active PRs, 'closed' for merged/closed, 'all' for both."
     )
     requirements = SkillRequirement(
@@ -156,7 +159,9 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
         repo = input.repo or input.repo_id
         if not repo:
             return ListPRsOutput(success=False, result="repo is required (e.g. 'matrixorigin/matrixone')", prs=[])
-        prs = await self.github.list_prs(repo, input.state, input.limit)
+        resolved_by_search = isinstance(repo, str) and "/" not in repo
+        resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
+        prs = await self.github.list_prs(resolved, input.state, input.limit)
 
         result = [
             {
@@ -169,7 +174,11 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
             for pr in prs
         ]
 
-        return ListPRsOutput(success=True, result=result, prs=result)
+        return ListPRsOutput(
+            success=True, result=result, prs=result,
+            resolved_repo=resolved if resolved_by_search else None,
+            resolved_by_search=resolved_by_search,
+        )
 
 
 # ============================================================================
@@ -266,6 +275,8 @@ class ListIssuesOutput(SkillOutput):
     """Output for list_issues skill"""
 
     issues: list[dict]
+    resolved_repo: str | None = None
+    resolved_by_search: bool = False
 
 
 class ListIssuesSkill(Skill[ListIssuesInput, ListIssuesOutput]):
@@ -277,7 +288,8 @@ class ListIssuesSkill(Skill[ListIssuesInput, ListIssuesOutput]):
     description = (
         "List issues in a GitHub repository (excludes pull requests). "
         "Use when user asks about bugs, feature requests, or open issues. "
-        "Requires repo in 'owner/repo' format. "
+        "repo can be 'owner/repo' or just a project name — auto-resolved via GitHub search. "
+        "If resolved_by_search=True in the result, tell the user which repo was used and ask to confirm if wrong. "
         "Filters: state (open/closed/all), labels, assignee, creator, milestone, since (ISO datetime). "
         "Sort: created/updated/comments, direction: asc/desc. "
         "Detail: 'brief' for lists, 'normal' adds body/assignees, 'full' adds reactions/comments."
@@ -296,12 +308,18 @@ class ListIssuesSkill(Skill[ListIssuesInput, ListIssuesOutput]):
         repo = input.repo or input.repo_id
         if not repo:
             return ListIssuesOutput(success=False, result="repo is required (e.g. 'matrixorigin/matrixone')", issues=[])
+        resolved_by_search = isinstance(repo, str) and "/" not in repo
+        resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
         issues = await self.github.list_issues(
-            repo, input.state, input.labels, input.sort, input.direction,
+            resolved, input.state, input.labels, input.sort, input.direction,
             input.since, input.assignee, input.creator, input.milestone,
             input.limit, input.detail,
         )
-        return ListIssuesOutput(success=True, result=issues, issues=issues)
+        return ListIssuesOutput(
+            success=True, result=issues, issues=issues,
+            resolved_repo=resolved if resolved_by_search else None,
+            resolved_by_search=resolved_by_search,
+        )
 
 
 # ============================================================================
@@ -321,6 +339,8 @@ class GetIssueOutput(SkillOutput):
     """Output for get_issue skill"""
 
     issue: dict
+    resolved_repo: str | None = None
+    resolved_by_search: bool = False
 
 
 class GetIssueSkill(Skill[GetIssueInput, GetIssueOutput]):
@@ -331,6 +351,8 @@ class GetIssueSkill(Skill[GetIssueInput, GetIssueOutput]):
     version = "1.0.0"
     description = (
         "Get details of a specific GitHub issue by number. "
+        "repo can be 'owner/repo' or just a project name — auto-resolved via GitHub search. "
+        "If resolved_by_search=True in the result, tell the user which repo was used and ask to confirm if wrong. "
         "Detail: 'brief' for summary, 'normal' (default) adds body/assignees/milestone, "
         "'full' adds reactions, closed_by, and recent comments. "
         "Use when user asks about a specific issue."
@@ -349,8 +371,14 @@ class GetIssueSkill(Skill[GetIssueInput, GetIssueOutput]):
         repo = input.repo or input.repo_id
         if not repo:
             return GetIssueOutput(success=False, result="repo is required", issue={})
-        issue = await self.github.get_issue(repo, input.issue_number, input.detail)
-        return GetIssueOutput(success=True, result=issue, issue=issue)
+        resolved_by_search = isinstance(repo, str) and "/" not in repo
+        resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
+        issue = await self.github.get_issue(resolved, input.issue_number, input.detail)
+        return GetIssueOutput(
+            success=True, result=issue, issue=issue,
+            resolved_repo=resolved if resolved_by_search else None,
+            resolved_by_search=resolved_by_search,
+        )
 
 
 # ============================================================================
@@ -379,6 +407,8 @@ class CreateIssueOutput(SkillOutput):
     """Output for create_issue skill"""
 
     issue: dict
+    resolved_repo: str | None = None
+    resolved_by_search: bool = False
 
 
 class CreateIssueSkill(Skill[CreateIssueInput, CreateIssueOutput]):
@@ -389,8 +419,10 @@ class CreateIssueSkill(Skill[CreateIssueInput, CreateIssueOutput]):
     version = "1.0.0"
     description = (
         "Create a new GitHub issue. Use when user asks to file a bug report, "
-        "feature request, or any new issue. Requires repo ('owner/repo') and title. "
-        "Optionally set body, labels, and assignees."
+        "feature request, or any new issue. "
+        "repo can be 'owner/repo' or just a project name — auto-resolved via GitHub search. "
+        "If resolved_by_search=True in the result, tell the user which repo was used and ask to confirm if wrong. "
+        "Requires title. Optionally set body, labels, and assignees."
     )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.WRITE, llm_required=False
@@ -406,10 +438,16 @@ class CreateIssueSkill(Skill[CreateIssueInput, CreateIssueOutput]):
         repo = input.repo or input.repo_id
         if not repo:
             return CreateIssueOutput(success=False, result="repo is required", issue={})
+        resolved_by_search = isinstance(repo, str) and "/" not in repo
+        resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
         issue = await self.github.create_issue(
-            repo, input.title, input.body, input.labels, input.assignees
+            resolved, input.title, input.body, input.labels, input.assignees
         )
-        return CreateIssueOutput(success=True, result=issue, issue=issue)
+        return CreateIssueOutput(
+            success=True, result=issue, issue=issue,
+            resolved_repo=resolved if resolved_by_search else None,
+            resolved_by_search=resolved_by_search,
+        )
 
 
 # ============================================================================
