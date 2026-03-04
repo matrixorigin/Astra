@@ -213,3 +213,80 @@ class TestBreakerStoreIntegration:
         reloaded = load_breaker_state(db, "alice")
         assert reloaded["grep"].consecutive_failures == 3
         assert reloaded["grep"].in_cooldown
+
+
+class TestChatLoopBreakerIntegration:
+    """Test ChatLoop breaker methods with real DB."""
+
+    def test_cross_turn_breaker_via_chatloop(self, db):
+        """Full integration: ChatLoop loads persisted failures, accumulates, trips breaker.
+
+        Turn 1: tool fails 2x → persisted
+        Turn 2: ChatLoop loads state, tool fails 1x → total 3 → breaker trips
+        """
+        from unittest.mock import MagicMock, patch
+
+        # Setup: seed 2 failures in DB (simulating turn 1)
+        rec = BreakerRecord(user_id="alice", tool_name="grep")
+        rec.record_failure()
+        rec.record_failure()
+        flush_breaker_state(db, {"grep": rec})
+
+        # Verify setup
+        loaded = load_breaker_state(db, "alice")
+        assert loaded["grep"].consecutive_failures == 2
+
+        # Create minimal ChatLoop mock with real breaker methods
+        from core.agent.chat_loop import ChatLoop
+
+        loop = ChatLoop.__new__(ChatLoop)
+        loop._current_user_id = "alice"
+
+        # Mock event_logger with _db_factory that returns our test db
+        mock_logger = MagicMock()
+        mock_logger._db_factory = lambda: db
+        loop.event_logger = mock_logger
+
+        # Call _reset_breaker — should load persisted state and seed _tool_failures
+        loop._reset_breaker()
+
+        # Verify state loaded
+        assert "grep" in loop._breaker_records
+        assert loop._breaker_records["grep"].consecutive_failures == 2
+        # Verify _tool_failures seeded with placeholders
+        assert "grep" in loop._tool_failures
+        assert len(loop._tool_failures["grep"]) == 2
+
+        # Turn 2: one more failure
+        loop._record_tool_failure("grep", "Connection refused")
+
+        # Verify breaker tripped (3 total failures)
+        assert "grep" in loop._blocked_tools
+        assert loop._breaker_records["grep"].consecutive_failures == 3
+        assert loop._breaker_records["grep"].dirty
+
+        # Flush and verify persisted
+        loop._flush_breaker()
+        final = load_breaker_state(db, "alice")
+        assert final["grep"].consecutive_failures == 3
+        assert final["grep"].in_cooldown
+
+
+    def test_failure_report_shows_blocked_tools(self, db):
+        """_build_failure_report generates user-facing message with blocked tools."""
+        from unittest.mock import MagicMock
+        from core.agent.chat_loop import ChatLoop
+
+        loop = ChatLoop.__new__(ChatLoop)
+        loop._tool_failures = {
+            "grep": ["Error 1", "Error 2", "Connection refused"],
+            "shell": ["Permission denied"],
+        }
+        loop._blocked_tools = {"grep"}  # Only grep is blocked
+
+        report = loop._build_failure_report()
+
+        # Should mention grep (blocked) but not shell (not blocked)
+        assert "grep" in report
+        assert "Connection refused" in report  # Last error
+        assert "shell" not in report  # Not blocked, not in report
