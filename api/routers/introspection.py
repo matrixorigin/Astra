@@ -729,6 +729,23 @@ def get_context_snapshot(
                 llm_usage=current_usage,
             )
             result["zone_balance"] = _zone_balance(budget, row[5])
+            
+            # Tool tokens vs non-tool tokens breakdown
+            tool_tokens = budget.get("tool_schemas", 0)
+            non_tool_tokens = sum(v for k, v in budget.items() 
+                                  if k != "tool_schemas" and isinstance(v, (int, float)))
+            total_managed = tool_tokens + non_tool_tokens
+            result["token_breakdown"] = {
+                "tool_tokens": tool_tokens,
+                "non_tool_tokens": non_tool_tokens,
+                "total_managed": total_managed,
+                "tool_ratio": round(tool_tokens / total_managed, 2) if total_managed > 0 else 0,
+                "recommendation": (
+                    "tool_schemas dominating context — consider high-confidence or catalog selection"
+                    if total_managed > 0 and tool_tokens / total_managed > 0.7
+                    else "balanced"
+                ),
+            }
         except (ValueError, TypeError):
             pass
 

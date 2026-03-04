@@ -232,17 +232,47 @@ class ReflectService(DbConsumer):
             if focus in ("history", "auto"):
                 self._gather_history(session_id, user_id, question, db, result)
 
-            # 8. Token summary
+            # 8. Token summary with tool vs non-tool breakdown
+            # Query ctx_snapshots for token budget breakdown
+            tool_tokens_total = 0
+            non_tool_tokens_total = 0
+            try:
+                from sqlalchemy import text as sql_text
+                budget_rows = db.execute(
+                    sql_text("""
+                        SELECT token_budget FROM ctx_snapshots
+                        WHERE session_id = :sid
+                        ORDER BY created_at DESC LIMIT :n
+                    """),
+                    {"sid": session_id, "n": last_n},
+                ).fetchall()
+                for (budget_json,) in budget_rows:
+                    if budget_json:
+                        budget = json.loads(budget_json) if isinstance(budget_json, str) else budget_json
+                        tool_tokens_total += budget.get("tool_schemas", 0)
+                        non_tool_tokens_total += sum(
+                            v for k, v in budget.items()
+                            if k != "tool_schemas" and isinstance(v, (int, float))
+                        )
+            except Exception:
+                pass
+
+            total_managed = tool_tokens_total + non_tool_tokens_total
             result["token_summary"] = {
                 "total_prompt_tokens": total_prompt,
                 "total_completion_tokens": total_completion,
                 "total_tokens": total_prompt + total_completion,
                 "llm_calls": llm_calls,
+                "tool_tokens": tool_tokens_total,
+                "non_tool_tokens": non_tool_tokens_total,
+                "tool_ratio": round(tool_tokens_total / total_managed, 2) if total_managed > 0 else 0,
                 "by_model": {
                     model: {"prompt_tokens": v["prompt"], "completion_tokens": v["completion"], "calls": v["calls"]}
                     for model, v in cost_by_model.items()
                 },
             }
+            if total_managed > 0 and tool_tokens_total / total_managed > 0.6:
+                hints.append(f"Tool schemas consuming {tool_tokens_total / total_managed:.0%} of managed context — consider enabling high-confidence selection")
 
             # 9. Tool quality summary
             try:

@@ -1511,6 +1511,31 @@ def _get_shared_skill_registry():
     return _shared_skill_registry
 
 
+def _update_snapshot_tool_tokens(snapshot_id: str, actual_tool_tokens: int) -> None:
+    """Update snapshot's tool_schemas token count after high-confidence optimization."""
+    db = SessionLocal()
+    try:
+        from sqlalchemy import text
+        # Get current token_budget
+        row = db.execute(
+            text("SELECT token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"),
+            {"cid": snapshot_id}
+        ).fetchone()
+        if row and row[0]:
+            import json
+            budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            budget["tool_schemas"] = actual_tool_tokens
+            db.execute(
+                text("UPDATE ctx_snapshots SET token_budget = :budget WHERE context_capture_id = :cid"),
+                {"budget": json.dumps(budget), "cid": snapshot_id}
+            )
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 def _get_cloud_skill_schemas(registry) -> list[dict[str, Any]]:
     """Get OpenAI tool schemas for all in-memory cloud skills.
 
@@ -1680,6 +1705,66 @@ async def chat_turn(
 
             import asyncio
 
+            # ── High-confidence tool selection optimization ──────────────
+            # Run BEFORE _build_turn_messages so the snapshot records actual tokens.
+            effective_tools_schema = merged_tools_schema
+            _high_confidence_skill: str | None = None
+
+            if merged_tools_schema and len(merged_tools_schema) > 1:
+                user_query = next((m.get("content", "") for m in request.messages if m.get("role") == "user"), "")
+                if user_query:
+                    try:
+                        from core.skills.modern_selector import ModernSkillSelector
+                        selector = ModernSkillSelector(
+                            rule_selector=None,
+                            db_factory=SessionLocal,
+                            embed_fn=_get_shared_embed_fn(),
+                        )
+                        sel_result = selector.select_tools(
+                            query=user_query,
+                            context_budget=2000,
+                            max_candidates=5,
+                        )
+                        if sel_result.high_confidence_skill:
+                            top_tool = next(
+                                (t for t in merged_tools_schema
+                                 if t.get("function", {}).get("name") == sel_result.high_confidence_skill),
+                                None
+                            )
+                            if top_tool:
+                                effective_tools_schema = [top_tool]
+                                _high_confidence_skill = sel_result.high_confidence_skill
+                                logger.info(
+                                    "High-confidence mode: using only %s (score=%.2f)",
+                                    _high_confidence_skill,
+                                    sel_result.scores[0][1] if sel_result.scores else 0,
+                                )
+                        elif sel_result.catalog and len(merged_tools_schema) > 1:
+                            from core.llm.client import LLMClient
+                            llm_for_catalog = _get_shared_llm_client()
+                            catalog_prompt = f"""Given this user query, select the most appropriate tool from the catalog.
+Query: {user_query}
+
+Available tools:
+{sel_result.catalog}
+
+Reply with ONLY the tool name, nothing else."""
+                            try:
+                                resp = llm_for_catalog.chat([{"role": "user", "content": catalog_prompt}])
+                                selected_name = resp.get("content", "").strip()
+                                selected_tool = next(
+                                    (t for t in merged_tools_schema
+                                     if t.get("function", {}).get("name") == selected_name),
+                                    None
+                                )
+                                if selected_tool:
+                                    effective_tools_schema = [selected_tool]
+                                    logger.info("Catalog selection: %s", selected_name)
+                            except Exception as e:
+                                logger.debug("Catalog selection failed: %s", e)
+                    except Exception as e:
+                        logger.debug("High-confidence selection failed: %s", e)
+
             def _build_sync():
                 db = SessionLocal()
                 try:
@@ -1687,7 +1772,7 @@ async def chat_turn(
                         db, user_id, session_id,
                         request.messages, request.tool_results, request.project_rules,
                         agent_id=request.agent_id,
-                        edge_tools=merged_tools_schema,
+                        edge_tools=effective_tools_schema,
                         edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
                         force_rebuild_system=tools_changed,
                         username=current_user.get("username"),
@@ -1752,8 +1837,8 @@ async def chat_turn(
                         logger.warning("Cloud loop: final LLM call via chat_stream (no tools), loop=%d", _cloud_loop)
                     stream: AsyncIterator = (
                         llm.chat_with_tools_stream(
-                            _current_llm_messages, merged_tools_schema, model=model, task_hint=task_hint,
-                        ) if merged_tools_schema and not _cloud_skill_failed else
+                            _current_llm_messages, effective_tools_schema, model=model, task_hint=task_hint,
+                        ) if effective_tools_schema and not _cloud_skill_failed else
                         llm.chat_stream(
                             _current_llm_messages, user_id, session_id, model=model,
                         )

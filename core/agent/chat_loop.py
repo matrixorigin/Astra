@@ -574,8 +574,8 @@ Tool name:"""
                     _sel.scores[0][1] if _sel.scores else 0,
                 )
                 tools_schema = [top_tool]
-        # Low-confidence: two-phase selection using catalog
-        elif _sel.catalog and len(tools_schema) > 2:
+        # Low-confidence: two-phase selection using catalog (always try if catalog available)
+        elif _sel.catalog and len(tools_schema) > 1:
             selected_name = await self._select_tool_from_catalog(
                 user_input, _sel.catalog, [t["function"]["name"] for t in tools_schema]
             )

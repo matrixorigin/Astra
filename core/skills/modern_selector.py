@@ -17,8 +17,8 @@ logger = get_logger(__name__)
 _DEFAULT_CONTEXT_BUDGET = 2000  # tokens reserved for tool schemas
 
 # High-confidence thresholds for skipping LLM selection
-_HIGH_CONFIDENCE_SCORE = 0.85  # Top skill must score above this
-_HIGH_CONFIDENCE_GAP = 0.25    # Gap between top-1 and top-2 must exceed this
+_HIGH_CONFIDENCE_SCORE = 0.75  # Top skill must score above this (lowered from 0.85)
+_HIGH_CONFIDENCE_GAP = 0.20    # Gap between top-1 and top-2 must exceed this (lowered from 0.25)
 
 
 def _estimate_tokens(obj: Any) -> int:

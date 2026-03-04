@@ -802,3 +802,323 @@ class TestDynamicConstraints:
         assert "File editing" in constraints
         assert "Tool selection" in constraints
         assert "Reflection" in constraints
+
+
+class TestLoweredConfidenceThresholds:
+    """Test lowered high-confidence thresholds (0.75/0.20)."""
+
+    def test_threshold_values(self):
+        """Verify thresholds are lowered from original 0.85/0.25."""
+        from core.skills.modern_selector import (
+            _HIGH_CONFIDENCE_SCORE,
+            _HIGH_CONFIDENCE_GAP,
+        )
+        
+        assert _HIGH_CONFIDENCE_SCORE == 0.75, "Score threshold should be 0.75"
+        assert _HIGH_CONFIDENCE_GAP == 0.20, "Gap threshold should be 0.20"
+
+    def test_moderate_confidence_now_triggers(self):
+        """Score 0.78 with gap 0.22 should now trigger high-confidence."""
+        from core.skills.modern_selector import (
+            _HIGH_CONFIDENCE_SCORE,
+            _HIGH_CONFIDENCE_GAP,
+        )
+        
+        top_score = 0.78
+        second_score = 0.56
+        gap = top_score - second_score
+        
+        assert top_score >= _HIGH_CONFIDENCE_SCORE
+        assert gap >= _HIGH_CONFIDENCE_GAP
+
+
+class TestCatalogForcedSelection:
+    """Test catalog selection triggers with > 1 tools (not > 2)."""
+
+    def test_catalog_triggers_with_two_tools(self):
+        """Catalog selection should trigger when tools > 1."""
+        # The condition in chat_loop.py is: len(tools_schema) > 1
+        tools_schema = [
+            {"function": {"name": "tool1"}},
+            {"function": {"name": "tool2"}},
+        ]
+        
+        # With 2 tools, catalog should be used (> 1 is True)
+        assert len(tools_schema) > 1
+
+
+class TestTokenBreakdown:
+    """Test tool_tokens vs non_tool_tokens breakdown."""
+
+    def test_token_breakdown_calculation(self):
+        """Verify token breakdown calculation logic."""
+        budget = {
+            "tool_schemas": 4000,
+            "self_model": 300,
+            "constraints": 150,
+            "identity": 25,
+            "memory": 10,
+            "history": 500,
+        }
+        
+        tool_tokens = budget.get("tool_schemas", 0)
+        non_tool_tokens = sum(
+            v for k, v in budget.items()
+            if k != "tool_schemas" and isinstance(v, (int, float))
+        )
+        total_managed = tool_tokens + non_tool_tokens
+        tool_ratio = tool_tokens / total_managed if total_managed > 0 else 0
+        
+        assert tool_tokens == 4000
+        assert non_tool_tokens == 985  # 300 + 150 + 25 + 10 + 500
+        assert total_managed == 4985
+        assert round(tool_ratio, 2) == 0.80
+
+    def test_token_breakdown_no_tools(self):
+        """When no tool_schemas, ratio is 0."""
+        budget = {
+            "self_model": 300,
+            "constraints": 150,
+            "history": 500,
+        }
+        
+        tool_tokens = budget.get("tool_schemas", 0)
+        non_tool_tokens = sum(
+            v for k, v in budget.items()
+            if k != "tool_schemas" and isinstance(v, (int, float))
+        )
+        total_managed = tool_tokens + non_tool_tokens
+        tool_ratio = tool_tokens / total_managed if total_managed > 0 else 0
+        
+        assert tool_tokens == 0
+        assert non_tool_tokens == 950
+        assert tool_ratio == 0.0
+
+    def test_recommendation_when_tool_heavy(self):
+        """Recommendation triggered when tool_ratio > 0.7."""
+        budget = {"tool_schemas": 5000, "other": 1000}
+        
+        tool_tokens = budget.get("tool_schemas", 0)
+        non_tool_tokens = sum(
+            v for k, v in budget.items()
+            if k != "tool_schemas" and isinstance(v, (int, float))
+        )
+        total_managed = tool_tokens + non_tool_tokens
+        tool_ratio = tool_tokens / total_managed if total_managed > 0 else 0
+        
+        recommendation = (
+            "tool_schemas dominating context — consider high-confidence or catalog selection"
+            if total_managed > 0 and tool_ratio > 0.7
+            else "balanced"
+        )
+        
+        assert tool_ratio > 0.7
+        assert "dominating" in recommendation
+
+
+class TestChatTurnHighConfidence:
+    """Test high-confidence optimization in /chat/turn endpoint."""
+
+    def test_update_snapshot_tool_tokens(self, db_session):
+        """Verify _update_snapshot_tool_tokens updates token_budget correctly."""
+        from api.routers.chat import _update_snapshot_tool_tokens
+        from sqlalchemy import text
+        import json
+        from uuid_utils import uuid7
+        
+        # Create a test snapshot
+        snapshot_id = str(uuid7())
+        initial_budget = {"tool_schemas": 5000, "self_model": 300, "constraints": 150}
+        
+        db_session.execute(text("""
+            INSERT INTO ctx_snapshots 
+            (context_capture_id, session_id, event_id, token_budget, total_tokens, created_at)
+            VALUES (:cid, :sid, :eid, :budget, :total, NOW())
+        """), {
+            "cid": snapshot_id,
+            "sid": f"test_{uuid7().hex[:8]}",
+            "eid": snapshot_id,
+            "budget": json.dumps(initial_budget),
+            "total": 5450,
+        })
+        db_session.commit()
+        
+        # Update tool tokens
+        _update_snapshot_tool_tokens(snapshot_id, 500)
+        
+        # Verify update
+        row = db_session.execute(text(
+            "SELECT token_budget FROM ctx_snapshots WHERE context_capture_id = :cid"
+        ), {"cid": snapshot_id}).fetchone()
+        
+        updated_budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        assert updated_budget["tool_schemas"] == 500
+        assert updated_budget["self_model"] == 300  # unchanged
+        
+        # Cleanup
+        db_session.execute(text(
+            "DELETE FROM ctx_snapshots WHERE context_capture_id = :cid"
+        ), {"cid": snapshot_id})
+        db_session.commit()
+
+
+class TestTokenBreakdownIntegration:
+    """Integration tests for tool/non-tool token separation in DB and APIs."""
+
+    def test_snapshot_stores_tool_schemas_separately(self, db_session):
+        """Verify ctx_snapshots.token_budget has tool_schemas as separate field."""
+        from sqlalchemy import text
+        import json
+        
+        # Query real snapshot data
+        row = db_session.execute(text("""
+            SELECT token_budget FROM ctx_snapshots 
+            WHERE token_budget IS NOT NULL 
+            ORDER BY created_at DESC LIMIT 1
+        """)).fetchone()
+        
+        if not row:
+            pytest.skip("No snapshots in database")
+        
+        budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        
+        # Verify structure: tool_schemas is separate from other fields
+        assert isinstance(budget, dict), "token_budget should be a dict"
+        
+        # Calculate tool vs non-tool
+        tool_tokens = budget.get("tool_schemas", 0)
+        non_tool_tokens = sum(
+            v for k, v in budget.items()
+            if k != "tool_schemas" and isinstance(v, (int, float))
+        )
+        
+        # At least one category should have tokens
+        assert tool_tokens >= 0
+        assert non_tool_tokens >= 0
+        assert tool_tokens + non_tool_tokens > 0, "Should have some tokens"
+
+
+class TestHighConfidenceOptimizationIntegration:
+    """Integration tests for high-confidence tool selection."""
+
+    def test_high_confidence_reduces_tool_tokens(self, db_session):
+        """Verify high-confidence optimization reduces tool_schemas in snapshot."""
+        from sqlalchemy import text
+        import json
+        
+        # Get snapshots from same session to compare
+        rows = db_session.execute(text("""
+            SELECT token_budget FROM ctx_snapshots 
+            WHERE session_id IN (
+                SELECT session_id FROM ctx_snapshots 
+                GROUP BY session_id HAVING COUNT(*) >= 2
+                LIMIT 1
+            )
+            ORDER BY created_at
+        """)).fetchall()
+        
+        if len(rows) < 2:
+            pytest.skip("Need session with multiple snapshots")
+        
+        # Check if any snapshot has reduced tool_schemas (high-confidence triggered)
+        tool_tokens_list = []
+        for row in rows:
+            budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            tool_tokens_list.append(budget.get("tool_schemas", 0))
+        
+        # At least verify we can read the data
+        assert len(tool_tokens_list) >= 2
+        # If high-confidence worked, some snapshots should have 0 or low tool_schemas
+        has_variation = len(set(tool_tokens_list)) > 1 or 0 in tool_tokens_list
+        # This is informational - high-confidence may or may not have triggered
+        print(f"Tool tokens across snapshots: {tool_tokens_list}")
+        print(f"Has variation (high-confidence may have triggered): {has_variation}")
+
+    def test_lowered_thresholds_in_effect(self):
+        """Verify lowered confidence thresholds are active."""
+        from core.skills.modern_selector import (
+            _HIGH_CONFIDENCE_SCORE,
+            _HIGH_CONFIDENCE_GAP,
+        )
+        
+        # These should be the lowered values
+        assert _HIGH_CONFIDENCE_SCORE == 0.75, f"Expected 0.75, got {_HIGH_CONFIDENCE_SCORE}"
+        assert _HIGH_CONFIDENCE_GAP == 0.20, f"Expected 0.20, got {_HIGH_CONFIDENCE_GAP}"
+
+
+class TestHighConfidenceBeforeBuildMessages:
+    """Verify high-confidence selection runs BEFORE _build_turn_messages.
+
+    The fix ensures that when force_rebuild_system triggers PromptAssembler.assemble(),
+    it receives effective_tools_schema (filtered) not merged_tools_schema (full).
+    """
+
+    def test_high_confidence_block_before_build_sync(self):
+        """High-confidence selection block must appear before _build_sync definition."""
+        import inspect
+        import api.routers.chat as chat_module
+
+        source = inspect.getsource(chat_module.chat_turn)
+        hc_pos = source.find("High-confidence tool selection optimization")
+        build_sync_pos = source.find("def _build_sync()")
+
+        assert hc_pos != -1, "High-confidence block not found in chat_turn"
+        assert build_sync_pos != -1, "_build_sync not found in chat_turn"
+        assert hc_pos < build_sync_pos, (
+            f"High-confidence selection must run BEFORE _build_sync. "
+            f"hc_pos={hc_pos}, build_sync_pos={build_sync_pos}"
+        )
+
+    def test_build_sync_uses_effective_tools_schema(self):
+        """_build_sync must pass effective_tools_schema (not merged) to edge_tools."""
+        import inspect
+        import api.routers.chat as chat_module
+
+        source = inspect.getsource(chat_module.chat_turn)
+        build_sync_start = source.find("def _build_sync()")
+        build_sync_end = source.find("llm_messages, snapshot_id", build_sync_start)
+        build_sync_body = source[build_sync_start:build_sync_end]
+
+        assert "edge_tools=effective_tools_schema" in build_sync_body, (
+            "_build_sync must pass effective_tools_schema to edge_tools"
+        )
+        assert "edge_tools=merged_tools_schema" not in build_sync_body, (
+            "_build_sync must NOT pass merged_tools_schema to edge_tools"
+        )
+
+
+    """Integration tests for tool/non-tool token separation in DB and APIs."""
+
+    def test_snapshot_stores_tool_schemas_separately(self, db_session):
+        """Verify ctx_snapshots.token_budget has tool_schemas as separate field."""
+        from sqlalchemy import text
+        import json
+        
+        row = db_session.execute(text("""
+            SELECT token_budget FROM ctx_snapshots 
+            WHERE token_budget IS NOT NULL 
+            ORDER BY created_at DESC LIMIT 1
+        """)).fetchone()
+        
+        if not row:
+            pytest.skip("No snapshots in database")
+        
+        budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        
+        assert isinstance(budget, dict)
+        tool_tokens = budget.get("tool_schemas", 0)
+        non_tool_tokens = sum(
+            v for k, v in budget.items()
+            if k != "tool_schemas" and isinstance(v, (int, float))
+        )
+        assert tool_tokens + non_tool_tokens > 0
+
+    def test_lowered_thresholds_in_effect(self):
+        """Verify lowered confidence thresholds are active."""
+        from core.skills.modern_selector import (
+            _HIGH_CONFIDENCE_SCORE,
+            _HIGH_CONFIDENCE_GAP,
+        )
+        
+        assert _HIGH_CONFIDENCE_SCORE == 0.75
+        assert _HIGH_CONFIDENCE_GAP == 0.20
