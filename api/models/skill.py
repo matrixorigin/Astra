@@ -205,6 +205,7 @@ class SkillResourceBinding(Base):
     is_secret = Column(SmallInteger, nullable=False, default=0)
     created_at = Column(DateTime, default=func.now(), nullable=False)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    updated_by = Column(String(36), nullable=False)
 
 
 class SkillExecutionMetric(Base):

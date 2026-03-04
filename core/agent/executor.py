@@ -82,6 +82,20 @@ class AgentExecutor(DbConsumer):
         if skill_name == "introspection":
             params.setdefault("runtime_state", self._build_runtime_state(session_id))
 
+        # 1.5c. Inject config_center for skills that declare _config_center = None.
+        # Using hasattr + None-check avoids coupling executor to specific skill names.
+        # Skills that need a SkillConfigCenter declare `_config_center: SkillConfigCenter | None = None`
+        # and the executor fills it in lazily at first execution.
+        if hasattr(skill, "_config_center") and skill._config_center is None:
+            from core.skills.config_center import get_config_center
+            skill._config_center = get_config_center()
+
+        # 1.5d. Inject per-user credentials for skills that use external APIs.
+        # This replaces the server-wide token with the calling user's token,
+        # enabling multi-user deployments where each user has their own credentials.
+        user_id = params.get("user_id", "system")
+        self._inject_user_credentials(skill, skill_name, user_id)
+
         # 1.6. Enforce skill installation for marketplace skills
         self._enforce_runtime_checks(skill_name, params)
 
@@ -210,6 +224,47 @@ class AgentExecutor(DbConsumer):
                         },
                     )
     
+    def _inject_user_credentials(self, skill: Any, skill_name: str, user_id: str) -> None:
+        """Inject per-user credentials into skills that use external APIs.
+
+        Skills declare which external APIs they use via side_effect_profile.external_apis.
+        For each declared API, we look up the user's token from SkillConfigCenter
+        and patch it onto the skill's client object.
+
+        This enables multi-user deployments: each user's requests use their own token,
+        not the server-wide environment variable.
+        """
+        profile = getattr(skill, "side_effect_profile", None)
+        if not profile:
+            return
+        external_apis: list[str] = getattr(profile, "external_apis", []) or []
+        if not external_apis:
+            return
+
+        try:
+            from core.skills.config_center import get_config_center
+            center = get_config_center()
+        except RuntimeError:
+            # Config center not initialized (e.g. unit tests without full startup).
+            return
+        except Exception:
+            return
+
+        if "github" in external_apis and hasattr(skill, "github"):
+            try:
+                # Use config_namespace if declared (e.g. "github"), else fall back to skill.name
+                ns = getattr(skill, "config_namespace", None) or skill.name
+                token = center.get_setting(ns, "github_token", user_id)
+                if token:
+                    from github import Auth, Github
+                    skill.github.token = token
+                    skill.github._api._client = Github(
+                        auth=Auth.Token(token=token),
+                        base_url=skill.github._api._base_url,
+                    )
+            except Exception as e:
+                logger.debug("Failed to inject github token for user %s: %s", user_id, e)
+
     def _backfill_selection_event(
         self, event_id: str, time_ms: int, cost: float, success: bool,
     ) -> None:

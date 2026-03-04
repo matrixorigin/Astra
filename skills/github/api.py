@@ -84,6 +84,23 @@ class GitHubSkillAPI:
     # GitHub API helpers
     # ------------------------------------------------------------------
 
+    def resolve_repo(self, repo: str) -> str:
+        """Resolve a repo name to 'owner/repo' format.
+
+        If repo already contains '/', return as-is.
+        Otherwise search GitHub for the best-matching repository by star count.
+        """
+        if "/" in repo:
+            return repo
+        results = self._client.search_repositories(query=repo, sort="stars", order="desc")
+        best = next(iter(results), None)
+        if best is None:
+            raise GitHubError(f"No GitHub repository found for '{repo}'", status_code=404)
+        return best.full_name
+
+    # Internal alias used by _get_repo and other methods that already have owner/repo.
+    _resolve_repo = resolve_repo
+
     def _get_repo(self, repo: str):
         """Get PyGithub repo object by 'owner/repo' string."""
         try:
@@ -434,8 +451,15 @@ class GitHubSkillAPI:
     # Workflow runs
     # ------------------------------------------------------------------
 
-    async def list_wf_runs(self, repo: str, limit: int = 5) -> list[dict]:
-        """List workflow runs."""
+    async def list_wf_runs(self, repo: str, limit: int = 5, detail: str = "brief") -> list[dict]:
+        """List workflow runs with PR/branch context.
+
+        detail levels:
+          brief    — workflow, conclusion, branch/PR, actor, created_at, url
+          normal   — brief + PR title, commit message, duration_seconds
+          detailed — normal + per-job status list, failed job names
+          full     — detailed + failed job annotations/step errors (extra API calls)
+        """
         await self._check_rate_limit()
         try:
             gh_repo = self._get_repo(repo)
@@ -444,13 +468,77 @@ class GitHubSkillAPI:
             for i, run in enumerate(runs):
                 if i >= limit:
                     break
-                result.append({
-                    "name": run.name or "Unnamed workflow",
-                    "status": run.status,
-                    "conclusion": run.conclusion,
-                    "html_url": run.html_url,
+
+                # Resolve PR context — a run may be triggered by a PR
+                pr_number: int | None = None
+                pr_title: str | None = None
+                if run.pull_requests:
+                    pr = run.pull_requests[0]
+                    pr_number = pr.number
+                    if detail in ("normal", "detailed", "full"):
+                        try:
+                            pr_obj = gh_repo.get_pull(pr.number)
+                            pr_title = pr_obj.title
+                        except Exception:
+                            pass
+
+                item: dict = {
+                    "workflow": run.name or "Unnamed",
+                    "conclusion": run.conclusion,   # success/failure/skipped/cancelled/None
+                    "status": run.status,           # queued/in_progress/completed
+                    "branch": run.head_branch,
+                    "pr_number": pr_number,
+                    "actor": run.actor.login if run.actor else None,
                     "created_at": run.created_at.isoformat(),
-                })
+                    "url": run.html_url,
+                }
+
+                if detail in ("normal", "detailed", "full"):
+                    item["pr_title"] = pr_title
+                    item["commit_message"] = (run.head_commit.message.split("\n")[0]
+                                              if run.head_commit else None)
+                    if run.updated_at and run.created_at:
+                        item["duration_seconds"] = int(
+                            (run.updated_at - run.created_at).total_seconds()
+                        )
+
+                if detail in ("detailed", "full"):
+                    try:
+                        jobs = list(run.jobs())
+                        job_list = []
+                        failed_jobs = []
+                        for job in jobs:
+                            job_list.append({
+                                "name": job.name,
+                                "conclusion": job.conclusion,
+                                "status": job.status,
+                            })
+                            if job.conclusion == "failure":
+                                failed_jobs.append(job.name)
+                        item["jobs"] = job_list
+                        item["failed_jobs"] = failed_jobs
+
+                        if detail == "full":
+                            failed_steps = []
+                            for job in jobs:
+                                if job.conclusion != "failure":
+                                    continue
+                                for step in job.steps:
+                                    if step.conclusion == "failure":
+                                        failed_steps.append({
+                                            "job": job.name,
+                                            "step": step.name,
+                                            "number": step.number,
+                                        })
+                            item["failed_steps"] = failed_steps
+                    except (GitHubError, GitHubRateLimitError):
+                        raise  # propagate rate-limit / auth errors
+                    except Exception as e:
+                        # Non-fatal: job details unavailable (e.g. permissions).
+                        # Surface the error so the LLM can report it honestly.
+                        item["jobs_error"] = str(e)
+
+                result.append(item)
             return result
         except (GitHubError, GitHubRateLimitError):
             raise

@@ -47,6 +47,7 @@ class SummarizePRSkill(Skill[SummarizePRInput, SummarizePROutput]):
     """Summarize a GitHub PR with LLM"""
 
     name = "summarize_pr"
+    config_namespace = "github"
     version = "1.0.0"
     description = (
         "Summarize a specific GitHub PR using LLM analysis — includes diff review, "
@@ -131,6 +132,7 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
     """List PRs in a repository"""
 
     name = "list_prs"
+    config_namespace = "github"
     version = "1.0.0"
     description = (
         "List pull requests in a GitHub repository. "
@@ -180,24 +182,34 @@ class CIStatusInput(SkillInput):
 
     repo: str = ""  # "owner/repo", e.g. "matrixorigin/matrixone"
     limit: int = 5
+    detail: str = "brief"  # brief | normal | detailed | full
 
 
 class CIStatusOutput(SkillOutput):
     """Output for ci_status skill"""
 
     workflows: list[dict]
+    resolved_repo: str | None = None  # set when repo name was resolved via GitHub search
+    resolved_by_search: bool = False  # True = LLM should confirm repo with user if result looks wrong
 
 
 class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
     """Check CI workflow status"""
 
     name = "ci_status"
+    config_namespace = "github"
     version = "1.0.0"
     description = (
         "Check CI/CD workflow run status in a GitHub repository — shows recent workflow runs "
         "with pass/fail/pending status. Use this when user asks about build status, CI failures, "
-        "or whether tests are passing. For checking CI on a specific PR, use get_pr_checks instead. "
-        "Requires repo in 'owner/repo' format."
+        "or whether tests are passing. "
+        "Returns workflow name, conclusion (success/failure/skipped), triggering PR number+title, "
+        "branch, actor, and timestamp. "
+        "detail levels: brief (default), normal (adds PR title + commit message + duration), "
+        "detailed (adds per-job status + failed job names), full (adds failed step details). "
+        "Use brief unless user explicitly asks for more detail. "
+        "repo can be 'owner/repo' (e.g. 'matrixorigin/matrixone') or just a project name "
+        "(e.g. 'milvus') — the skill will search GitHub for the best match automatically."
     )
     requirements = SkillRequirement(
         repo_types=[RepoType.CI, RepoType.CODE],
@@ -215,20 +227,16 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
     async def execute(self, input: CIStatusInput) -> CIStatusOutput:
         """Execute the skill"""
         repo = input.repo or input.repo_id
-        runs = await self.github.list_wf_runs(repo, input.limit)
-
-        workflows = [
-            {
-                "workflow": run["name"],
-                "status": run["status"],
-                "conclusion": run["conclusion"],
-                "url": run["html_url"],
-                "created_at": run["created_at"],
-            }
-            for run in runs
-        ]
-
-        return CIStatusOutput(success=True, result=workflows, workflows=workflows)
+        resolved_by_search = isinstance(repo, str) and bool(repo) and "/" not in repo
+        resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
+        runs = await self.github.list_wf_runs(resolved, input.limit, detail=input.detail)
+        return CIStatusOutput(
+            success=True,
+            result=runs,
+            workflows=runs,
+            resolved_repo=resolved if resolved_by_search else None,
+            resolved_by_search=resolved_by_search,
+        )
 
 
 # ============================================================================
@@ -262,6 +270,7 @@ class ListIssuesSkill(Skill[ListIssuesInput, ListIssuesOutput]):
     """List issues in a repository (excludes PRs)"""
 
     name = "list_issues"
+    config_namespace = "github"
     version = "1.0.0"
     description = (
         "List issues in a GitHub repository (excludes pull requests). "
@@ -316,6 +325,7 @@ class GetIssueSkill(Skill[GetIssueInput, GetIssueOutput]):
     """Get details of a specific issue"""
 
     name = "get_issue"
+    config_namespace = "github"
     version = "1.0.0"
     description = (
         "Get details of a specific GitHub issue by number. "
@@ -373,6 +383,7 @@ class CreateIssueSkill(Skill[CreateIssueInput, CreateIssueOutput]):
     """Create a new GitHub issue"""
 
     name = "create_issue"
+    config_namespace = "github"
     version = "1.0.0"
     description = (
         "Create a new GitHub issue. Use when user asks to file a bug report, "
@@ -508,6 +519,19 @@ def register_builtin_skills(
     if llm is None:
         llm = LLMClient(db_factory)
 
+    # Load github manifest once — all github skills share it.
+    # Stored in skills_registry.manifest so SkillConfigCenter can find it
+    # without needing the skills/ directory at runtime.
+    import yaml
+    from pathlib import Path
+    _manifest_path = Path(__file__).parent.parent.parent / "skills" / "github" / "manifest.yaml"
+    _github_manifest: dict | None = None
+    if _manifest_path.exists():
+        try:
+            _github_manifest = yaml.safe_load(_manifest_path.read_text())
+        except Exception as e:
+            logger.warning("Failed to load github manifest: %s", e)
+
     # Register skills with metadata
     skills = [
         (
@@ -568,6 +592,9 @@ def register_builtin_skills(
 
     for skill, category, subcategory, triggers, dependencies, priority, cost in skills:
         try:
+            # Pass github manifest so SkillConfigCenter can find required secrets
+            # without needing the skills/ directory on the deployment server.
+            skill_manifest = _github_manifest if category == "github" or subcategory in ("pr_management", "ci_cd", "issue_management") else None
             registry.register(
                 skill=skill,
                 is_active=True,
@@ -577,6 +604,7 @@ def register_builtin_skills(
                 dependencies=dependencies,
                 priority=priority,
                 cost_estimate=cost,
+                manifest=skill_manifest,
             )
             logger.info(f"Registered {skill.name}@{skill.version}")
         except Exception as e:
@@ -625,6 +653,28 @@ def register_builtin_skills(
         logger.info(f"Registered {introspection_skill.name}@{introspection_skill.version}")
     except Exception as e:
         logger.warning(f"Failed to register introspection skill: {e}")
+
+    # Register skill config wizard (guided configuration via conversation)
+    try:
+        from skills.skill_config_wizard.skill import SkillConfigWizardSkill
+        wizard_skill = SkillConfigWizardSkill(db_factory=db_factory)
+        # config_center injected lazily at execution time via executor
+        registry.register(
+            skill=wizard_skill,
+            is_active=True,
+            category="system",
+            subcategory="configuration",
+            triggers=[
+                "configure skill", "set up skill", "skill config",
+                "配置", "设置 skill",
+            ],
+            dependencies=[],
+            priority=7,
+            cost_estimate="low",
+        )
+        logger.info(f"Registered {wizard_skill.name}@{wizard_skill.version}")
+    except Exception as e:
+        logger.warning(f"Failed to register skill_config_wizard: {e}")
 
     # Register delegation skill for multi-agent collaboration
     if agent_registry and chat_loop_factory:

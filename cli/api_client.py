@@ -34,6 +34,7 @@ class APIClient:
         base_url: str | None = None,
         credentials_path: Path | None = None,
         profile: str | None = None,
+        _transport: httpx.AsyncBaseTransport | None = None,
     ):
         """Initialize API client.
 
@@ -41,12 +42,14 @@ class APIClient:
             base_url: API server URL. Defaults to MO_AGENT_API_URL env var or http://localhost:8000
             credentials_path: Path to credentials file. Defaults to ~/.mo-agent/credentials.json
             profile: Profile name to use. Defaults to current_profile in credentials file
+            _transport: Optional httpx transport (e.g. ASGITransport for testing)
         """
         self.base_url = (
             base_url or os.getenv("MO_AGENT_API_URL", "http://localhost:8000")
         ).rstrip("/")
         self.credentials_path = credentials_path or Path.home() / ".mo-agent" / "credentials.json"
         self.profile = profile or os.getenv("MO_AGENT_PROFILE")
+        self._transport = _transport
         self._client: httpx.AsyncClient | None = None
         self._access_token: str | None = None
         self._refresh_token: str | None = None
@@ -76,7 +79,10 @@ class APIClient:
         """Async context manager entry."""
         # Ensure localhost is in NO_PROXY so httpx bypasses any http_proxy for local API
         self._ensure_no_proxy()
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0, read=30.0))
+        self._client = httpx.AsyncClient(
+            transport=self._transport,
+            timeout=httpx.Timeout(5.0, read=30.0),
+        )
         await self._load_credentials()
         return self
 

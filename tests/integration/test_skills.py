@@ -231,13 +231,16 @@ async def test_ci_status_skill(db_session, github, monkeypatch):
     """Test ci_status skill execution"""
 
     # Mock GitHub API call
-    async def mock_list_wf_runs(repo_id, limit):
+    async def mock_list_wf_runs(repo_id, limit, detail="brief"):
         return [
             {
-                "name": f"Workflow {i}",
+                "workflow": f"Workflow {i}",
                 "status": "completed",
                 "conclusion": "success",
-                "html_url": f"https://github.com/owner/repo/actions/runs/{i}",
+                "branch": "main",
+                "pr_number": None,
+                "actor": "alice",
+                "url": f"https://github.com/owner/repo/actions/runs/{i}",
                 "created_at": "2026-02-10T00:00:00Z",
             }
             for i in range(1, limit + 1)

@@ -80,6 +80,14 @@ class SkillConfigCenter(DbConsumer):
     def _load_manifest(self, skill_name: str) -> dict:
         return self._manifest_loader(skill_name) or {}
 
+    def get_manifest(self, skill_name: str) -> dict | None:
+        """Return the manifest for a skill, or None if not found.
+
+        Public API — use this instead of _load_manifest() from outside the class.
+        Returns None (not {}) so callers can distinguish "not found" from "empty manifest".
+        """
+        return self._manifest_loader(skill_name) or None
+
     def _manifest_settings(self, manifest: dict) -> list[dict]:
         return manifest.get("settings", [])
 
@@ -233,6 +241,7 @@ class SkillConfigCenter(DbConsumer):
                 if existing:
                     existing.binding_value = stored
                     existing.is_secret = is_secret
+                    existing.updated_by = user_id
                 else:
                     db.add(SkillResourceBinding(
                         binding_id=str(uuid7()),
@@ -243,6 +252,7 @@ class SkillConfigCenter(DbConsumer):
                         binding_name=name,
                         binding_value=stored,
                         is_secret=is_secret,
+                        updated_by=user_id,
                     ))
             db.commit()
 
@@ -420,34 +430,113 @@ class SkillConfigCenter(DbConsumer):
         resource_key: str | None = None,
     ) -> list[ConfigValidationError]:
         """Validate all required config is present. Returns empty list if valid."""
+        from api.models.skill import SkillResourceBinding, SkillSetting
+
         manifest = self._load_manifest(skill_name)
         errors: list[ConfigValidationError] = []
 
-        # Settings — required with no default
-        for s in self._manifest_settings(manifest):
-            if s.get("required") and "default" not in s:
-                val = self.get_setting(skill_name, s["name"], user_id, tenant_id)
-                if val is None:
-                    errors.append(ConfigValidationError("settings", s["name"], error="required but not set"))
+        scopes: list[tuple[str, str | None]] = [("user", user_id)]
+        if tenant_id:
+            scopes.append(("tenant", tenant_id))
+        scopes.append(("global", None))
 
-        # Secrets — same logic: required with no default
-        for s in self._manifest_secrets(manifest):
-            if s.get("required") and "default" not in s:
-                val = self.get_setting(skill_name, s["name"], user_id, tenant_id)
-                if val is None:
-                    errors.append(ConfigValidationError("secrets", s["name"], error="required but not set"))
+        with self._db() as db:
+            # Batch-load only settings relevant to this user's scope hierarchy
+            from sqlalchemy import or_
+            scope_ids = [s for _, s in scopes if s is not None]
+            all_rows = db.query(SkillSetting).filter(
+                SkillSetting.skill_name == skill_name,
+                or_(
+                    SkillSetting.scope_type == "global",
+                    SkillSetting.scope_id.in_(scope_ids),
+                ),
+            ).all()
+            row_index: dict[tuple[str, str, str | None], SkillSetting] = {
+                (r.setting_name, r.scope_type, r.scope_id): r for r in all_rows
+            }
 
-        # Resource bindings
-        res_spec = self._manifest_resources(manifest)
-        if resource_key and res_spec:
-            for bdef in res_spec.get("bindings", []):
-                if bdef.get("required") and "default" not in bdef:
-                    val = self.get_resource_binding(user_id, skill_name, resource_key, bdef["name"])
-                    if val is None:
-                        errors.append(ConfigValidationError(
-                            "resources", bdef["name"],
-                            resource_key=resource_key,
-                            error="required but not set",
-                        ))
+            def _resolve(name: str) -> Any:
+                for scope_type, scope_id in scopes:
+                    row = row_index.get((name, scope_type, scope_id))
+                    if row:
+                        return self._cred.decrypt(row.setting_value) if row.is_secret else row.setting_value
+                return None
+
+            for s in self._manifest_settings(manifest):
+                if s.get("required") and "default" not in s:
+                    if _resolve(s["name"]) is None:
+                        errors.append(ConfigValidationError("settings", s["name"], error="required but not set"))
+
+            for s in self._manifest_secrets(manifest):
+                if s.get("required") and "default" not in s:
+                    if _resolve(s["name"]) is None:
+                        errors.append(ConfigValidationError("secrets", s["name"], error="required but not set"))
+
+            res_spec = self._manifest_resources(manifest)
+            if resource_key and res_spec:
+                binding_rows = db.query(SkillResourceBinding).filter(
+                    SkillResourceBinding.user_id == user_id,
+                    SkillResourceBinding.skill_name == skill_name,
+                    SkillResourceBinding.resource_key == resource_key,
+                ).all()
+                binding_index = {r.binding_name: r for r in binding_rows}
+
+                for bdef in res_spec.get("bindings", []):
+                    if bdef.get("required") and "default" not in bdef:
+                        brow = binding_index.get(bdef["name"])
+                        if brow is None and _resolve(bdef["name"]) is None:
+                            errors.append(ConfigValidationError(
+                                "resources", bdef["name"],
+                                resource_key=resource_key,
+                                error="required but not set",
+                            ))
 
         return errors
+
+
+# ---------------------------------------------------------------------------
+# Singleton factory — use this instead of importing from api.routers
+# ---------------------------------------------------------------------------
+
+_shared_center: "SkillConfigCenter | None" = None
+
+
+def init_config_center(
+    db_factory: "DbFactory",
+    credential_mgr: "CredentialManager",
+    manifest_loader: "Callable[[str], dict | None]",
+) -> "SkillConfigCenter":
+    """Initialize the shared SkillConfigCenter singleton.
+
+    Must be called once at application startup (from api/ layer, which owns
+    SessionLocal and the ORM models). After initialization, core/ modules call
+    get_config_center() without any api/ imports.
+
+    This is the correct fix for the core/ → api/ layering problem: the api/
+    layer owns the DB session factory and passes it down, rather than core/
+    reaching up to import api/.
+    """
+    global _shared_center
+    _shared_center = SkillConfigCenter(db_factory, credential_mgr, manifest_loader)
+    return _shared_center
+
+
+def get_config_center() -> "SkillConfigCenter":
+    """Return the shared SkillConfigCenter singleton.
+
+    Raises RuntimeError if init_config_center() has not been called yet.
+    In tests, call init_config_center() in a fixture or use the test-injection
+    point in api/routers/skill_config.py (_center override).
+    """
+    if _shared_center is None:
+        raise RuntimeError(
+            "SkillConfigCenter not initialized. "
+            "Call init_config_center() at application startup."
+        )
+    return _shared_center
+
+
+def _reset_config_center_for_tests() -> None:
+    """Reset the singleton — for use in test teardown only."""
+    global _shared_center
+    _shared_center = None

@@ -1236,6 +1236,12 @@ async def _prefetch_cloud_skills(api_client) -> str | None:
             desc = s.get("description", "")
             if name:
                 lines.append(f"- **{name}**: {desc}")
+
+        # Inject config namespace rule so LLM sets token once, not per-skill
+        lines.append(
+            "\n# Skill Config Rules\n"
+            "- GitHub skills share ONE token. Always use skill_name='github' with skill_config_wizard and set_skill_setting."
+        )
         return "\n".join(lines) if len(lines) > 1 else None
     except Exception:
         return None
@@ -1269,17 +1275,27 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
 
     from cli.tools.introspection import GetAgentInfoTool
     from cli.tools.reflect import ReflectTool
+    from cli.tools.skill_config import register_skill_config_tools
     if session_info is None:
         session_info = {"session_id": session_id, "agent_id": agent_id or "default-agent", "model": model, "turn": 0}
     perms = PermissionManager(auto_approve=auto_approve)
 
     router.register(GetAgentInfoTool(tool_router=router, session_info=session_info, api_client=api_client))
     router.register(ReflectTool(api_client=api_client, session_info=session_info))
+    register_skill_config_tools(router, api_client)
 
     # Prefetch cloud skill summaries so LLM knows about them on turn 0.
     cloud_hint = await _prefetch_cloud_skills(api_client)
-    if cloud_hint:
-        extra_rules = (extra_rules + "\n\n" + cloud_hint) if extra_rules else cloud_hint
+
+    # Always inject skill usage rules regardless of prefetch success.
+    skill_rules = (
+        "\n# Skill Usage Rules\n"
+        "- When a skill exists for a task, call it directly. "
+        "If a required parameter is missing, ask the user — do NOT explore the filesystem to infer it.\n"
+        "- GitHub skills share ONE token: use skill_name='github' with skill_config_wizard and set_skill_setting."
+    )
+    hint = (cloud_hint + skill_rules) if cloud_hint else skill_rules
+    extra_rules = (extra_rules + "\n\n" + hint) if extra_rules else hint
 
     return await edge_chat_loop(
         user_input, api_client, router, perms,

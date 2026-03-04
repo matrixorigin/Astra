@@ -100,6 +100,11 @@ async def lifespan(app: FastAPI):
 
     set_schema_loader(_load_schema_from_db)
 
+    # Initialize SkillConfigCenter singleton — must happen before any skill execution.
+    # This is the only correct place: api/ owns SessionLocal and ORM models.
+    from api.routers.skill_config import initialize as _init_skill_config
+    _init_skill_config()
+
     # Periodic workflow cleanup (every hour)
     import asyncio
     async def _cleanup_loop():

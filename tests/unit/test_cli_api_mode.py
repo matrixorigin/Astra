@@ -413,6 +413,7 @@ class TestCLIEdgeMode:
             "read_file", "write_file", "str_replace", "list_dir",
             "bash", "git_status", "git_diff", "git_log", "grep", "glob",
             "get_agent_info", "reflect",
+            "skill_config_wizard", "set_skill_setting", "bind_skill_resource", "validate_skill_config",
         }
         assert set(captured["tools"]) == expected_tools
         assert captured["auto_approve"] is True

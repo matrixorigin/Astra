@@ -9,6 +9,8 @@ Tests all endpoints via HTTP with real DB:
 - Global scope requires admin
 """
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -101,6 +103,8 @@ class TestSettingsCRUD:
         assert row.updated_by == test_user.user_id
         assert row.is_secret == 0
         assert row.created_at is not None
+        assert row.updated_at is not None
+        assert row.setting_id is not None
 
         # GET effective config
         resp = client.get("/skills/github/config", headers=auth_headers)
@@ -247,16 +251,23 @@ class TestResourceBindings:
 
         # read_token: secret binding
         rt = by_name["read_token"]
+        assert rt.binding_id is not None
+        assert rt.user_id == test_user.user_id
+        assert rt.skill_name == "github"
+        assert rt.resource_key == "matrixorigin/matrixone"
         assert rt.resource_type == "repo"
         assert rt.is_secret == 1
         assert rt.binding_value != "ghp_abc"
         assert cred_mgr.decrypt(rt.binding_value) == "ghp_abc"
         assert rt.created_at is not None
+        assert rt.updated_at is not None
+        assert rt.updated_by == test_user.user_id
 
         # default_branch: plaintext binding
         db_row = by_name["default_branch"]
         assert db_row.is_secret == 0
         assert db_row.binding_value == "develop"
+        assert db_row.updated_by == test_user.user_id
 
         # List
         resp = client.get("/skills/github/resources", headers=auth_headers)
@@ -375,3 +386,100 @@ class TestAuth:
     def test_no_auth_on_put(self, client, center):
         resp = client.put("/skills/github/config/foo", json={"value": "bar"})
         assert resp.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# Edge tool integration tests — real APIClient + real HTTP + real DB
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def api_client_for_tools(auth_headers):
+    """Real APIClient wired to the test ASGI app via httpx transport.
+
+    This is the same client the edge tools use in production — no mocks.
+    The access token is injected directly so we skip the login flow.
+    """
+    import asyncio
+    import httpx
+    from cli.api_client import APIClient
+
+    transport = httpx.ASGITransport(app=app)
+    client = APIClient(base_url="http://testserver", _transport=transport)
+    client._client = httpx.AsyncClient(
+        transport=transport, timeout=httpx.Timeout(5.0, read=30.0),
+    )
+    # Inject token directly — no credentials file needed
+    client._access_token = auth_headers["Authorization"].removeprefix("Bearer ")
+    return client
+
+
+class TestEdgeToolsIntegration:
+    """SkillConfigWizardTool and friends against a real API + real DB.
+
+    These tests catch the async bug from session 019cb6ff: if execute() forgets
+    await, the real APIClient returns a coroutine and .get() raises TypeError.
+    """
+
+    def test_wizard_returns_missing_secrets(self, api_client_for_tools, center):
+        """Wizard must return JSON with missing fields — not a coroutine error."""
+        import asyncio
+        from cli.tools.skill_config import SkillConfigWizardTool
+
+        tool = SkillConfigWizardTool(api_client_for_tools)
+        result = json.loads(asyncio.run(tool.execute(skill_name="github")))
+
+        assert result["skill_name"] == "github"
+        assert result["valid"] is False
+        missing_names = {e["name"] for e in result["missing"]}
+        assert "api_key" in missing_names
+        assert "Ask the user" in result["instructions"]
+
+    def test_wizard_fully_configured(self, client, auth_headers, api_client_for_tools, center):
+        """After setting all required fields, wizard reports valid."""
+        import asyncio
+        from cli.tools.skill_config import SkillConfigWizardTool
+
+        client.put("/skills/github/config/instance_url",
+                   json={"value": "https://gh.corp.com"}, headers=auth_headers)
+        client.put("/skills/github/config/api_key",
+                   json={"value": "sk-123"}, headers=auth_headers)
+
+        tool = SkillConfigWizardTool(api_client_for_tools)
+        result = json.loads(asyncio.run(tool.execute(skill_name="github")))
+        assert result["valid"] is True
+
+    def test_set_skill_setting_tool(self, api_client_for_tools, center, db):
+        """SetSkillSettingTool must persist value to DB."""
+        import asyncio
+        from cli.tools.skill_config import SetSkillSettingTool
+
+        tool = SetSkillSettingTool(api_client_for_tools)
+        result = json.loads(asyncio.run(tool.execute(
+            skill_name="github", setting_name="instance_url", value="https://gh.corp.com",
+        )))
+        assert result["success"] is True
+
+        row = db.query(SkillSetting).filter_by(
+            skill_name="github", setting_name="instance_url",
+        ).one()
+        assert row.setting_value == "https://gh.corp.com"
+
+    def test_bind_skill_resource_tool(self, api_client_for_tools, center, db):
+        """BindSkillResourceTool must persist binding to DB."""
+        import asyncio
+        from cli.tools.skill_config import BindSkillResourceTool
+
+        tool = BindSkillResourceTool(api_client_for_tools)
+        result = json.loads(asyncio.run(tool.execute(
+            skill_name="github",
+            resource_key="org/repo",
+            bindings={"read_token": "ghp_test"},
+        )))
+        assert result["success"] is True
+
+        rows = db.query(SkillResourceBinding).filter_by(
+            skill_name="github", resource_key="org/repo",
+        ).all()
+        assert len(rows) == 1
+        assert rows[0].binding_name == "read_token"

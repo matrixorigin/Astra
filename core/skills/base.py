@@ -125,6 +125,10 @@ class Skill(ABC, Generic[InputT, OutputT]):
     side_effect_profile: SideEffectProfile = SideEffectProfile(
         category=SideEffectCategory.READ,
     )
+    # Skills that share credentials declare a config namespace.
+    # e.g. summarize_pr, list_prs, ci_status all set config_namespace = "github"
+    # so SkillConfigCenter looks up tokens under "github" not the individual skill name.
+    config_namespace: ClassVar[str | None] = None
 
     _input_cls: ClassVar[type["SkillInput"] | None] = None
     _output_cls: ClassVar[type["SkillOutput"] | None] = None

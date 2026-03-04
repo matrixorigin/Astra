@@ -28,38 +28,118 @@ if TYPE_CHECKING:
 
 router = APIRouter()
 
-# Module-level singleton — same pattern as skills.py _catalog_instance.
+# Test-injection point: tests can set _center to override the shared singleton.
+# In production this is always None and _get_center() uses get_config_center().
 _center: SkillConfigCenter | None = None
 
 
+def initialize() -> None:
+    """Initialize the shared SkillConfigCenter singleton.
+
+    Called once at application startup (from api/main.py lifespan).
+    This is the only place that imports api.models and api.database into
+    the config center initialization path — keeping core/ free of api/ imports.
+    """
+    import os
+    from api.models.skill import SkillRegistry
+    from core.skills.config_center import init_config_center
+
+    key = os.environ.get("TOKEN_ENCRYPTION_KEY", "dev-key")
+    cred_mgr = CredentialManager(key)
+
+    def _manifest_loader(skill_name: str) -> dict | None:
+        db = SessionLocal()
+        try:
+            row = db.query(
+                SkillRegistry.manifest, SkillRegistry.skill_definition,
+            ).filter(
+                SkillRegistry.skill_name == skill_name,
+                SkillRegistry.is_active == 1,
+            ).order_by(SkillRegistry.created_at.desc()).first()
+            if not row:
+                return None
+            if row[0]:
+                return row[0]
+            defn = row[1] or {}
+            return defn.get("manifest") or (defn.get("settings") and defn) or None
+        finally:
+            db.close()
+
+    init_config_center(SessionLocal, cred_mgr, _manifest_loader)
+
+
 def _get_center() -> SkillConfigCenter:
-    global _center
-    if _center is None:
-        import os
+    # Allow tests to inject a custom center (e.g. with a test manifest loader).
+    # In production _center is None and we use the shared core-layer singleton
+    # initialized by initialize() at startup.
+    if _center is not None:
+        return _center
+    from core.skills.config_center import get_config_center
+    return get_config_center()
 
-        from api.models.skill import SkillRegistry
 
-        key = os.environ.get("TOKEN_ENCRYPTION_KEY", "dev-key")
-        cred_mgr = CredentialManager(key)
-
-        def _manifest_loader(skill_name: str) -> dict | None:
-            db = SessionLocal()
-            try:
-                row = db.query(SkillRegistry.manifest).filter(
-                    SkillRegistry.skill_name == skill_name,
-                    SkillRegistry.is_active == 1,
-                ).order_by(SkillRegistry.created_at.desc()).first()
-                return row[0] if row and row[0] else None
-            finally:
-                db.close()
-
-        _center = SkillConfigCenter(SessionLocal, cred_mgr, _manifest_loader)
-    return _center
-
+from functools import lru_cache as _lru_cache
 
 # Only "user" and "global" scopes are supported.
 # Tenant scope is reserved — see module docstring.
 ApiScope = Literal["user", "global"]
+
+
+@_lru_cache(maxsize=256)
+def _resolve_config_namespace(skill_name: str) -> str:
+    """Resolve the config namespace for a skill (cached — namespaces are static).
+
+    Skills that share credentials (e.g. all github skills) store config under
+    a common namespace (e.g. 'github'). Resolution logic:
+      1. If skill has its own manifest → it IS the namespace (return skill_name).
+      2. Otherwise find another skill in the same category that has a manifest
+         and return that manifest's 'name' field as the namespace.
+      3. Fall back to skill_name if nothing found.
+
+    Single query: fetch skill_name, category, manifest for all active skills
+    in the same category as the requested skill, then resolve in Python.
+    """
+    from api.models.skill import SkillRegistry as SkillModel
+    from core.logging_config import get_logger as _get_logger
+    _log = _get_logger(__name__)
+
+    db = SessionLocal()
+    try:
+        # Single query: get this skill's category + manifest, and all siblings' manifests.
+        # We use a subquery to first get the category, then fetch all skills in that category.
+        own = db.query(SkillModel.category, SkillModel.manifest).filter(
+            SkillModel.skill_name == skill_name,
+            SkillModel.is_active == 1,
+        ).first()
+        if not own:
+            return skill_name
+
+        # If this skill has its own manifest, it is the namespace.
+        if own[1]:
+            return skill_name
+
+        category = own[0]
+        if not category:
+            return skill_name
+
+        # Find any sibling in the same category that has a manifest.
+        sibling = db.query(SkillModel.manifest).filter(
+            SkillModel.category == category,
+            SkillModel.is_active == 1,
+            SkillModel.manifest.isnot(None),
+        ).first()
+        if sibling and sibling[0]:
+            ns = sibling[0].get("name")
+            if ns:
+                return ns
+    except Exception as e:
+        _log.warning("_resolve_config_namespace(%r) failed: %s", skill_name, e)
+    finally:
+        db.close()
+    return skill_name
+
+
+
 
 
 def _resolve_scope(
@@ -111,7 +191,8 @@ async def validate_config(
 ):
     """Validate all required config is present."""
     center = _get_center()
-    errors = center.validate(skill_name, current_user["user_id"], resource_key=resource)
+    ns = _resolve_config_namespace(skill_name)
+    errors = center.validate(ns, current_user["user_id"], resource_key=resource)
     return ValidationResponse(
         valid=len(errors) == 0,
         errors=[{"section": e.section, "name": e.name,
@@ -129,12 +210,13 @@ async def get_effective_config(
 ):
     """Get effective resolved config for current user (secrets masked)."""
     center = _get_center()
-    config = center.resolve_all(skill_name, current_user["user_id"])
+    ns = _resolve_config_namespace(skill_name)
+    config = center.resolve_all(ns, current_user["user_id"])
     return ConfigResponse(
         settings=config.settings,
         secrets=dict.fromkeys(config.secrets, "***"),
         resources_configured=len(
-            center.list_resources(current_user["user_id"], skill_name)
+            center.list_resources(current_user["user_id"], ns)
         ),
     )
 

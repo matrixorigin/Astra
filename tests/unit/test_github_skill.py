@@ -192,13 +192,20 @@ class TestGitHubAPIMethods:
         mock_run.status = "completed"
         mock_run.conclusion = "success"
         mock_run.html_url = "url"
+        mock_run.head_branch = "main"
+        mock_run.actor.login = "alice"
+        mock_run.pull_requests = []
         mock_run.created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
         mock_repo = MagicMock()
         mock_repo.get_workflow_runs.return_value = [mock_run]
         mock_gh_client.get_repo.return_value = mock_repo
         result = await api.list_wf_runs("owner/repo", limit=5)
         assert len(result) == 1
-        assert result[0]["name"] == "Build"
+        assert result[0]["workflow"] == "Build"
+        assert result[0]["conclusion"] == "success"
+        assert result[0]["branch"] == "main"
+        assert result[0]["actor"] == "alice"
+        assert result[0]["pr_number"] is None
 
     # ── Issue operations ─────────────────────────────────────────────
 

@@ -113,6 +113,7 @@ class SkillCatalog(DbConsumer):
         cost_estimate: str = "medium",
         git_commit_hash: str | None = None,
         status: str = "active",
+        manifest: dict | None = None,
     ) -> None:
         """Register a Python skill (builtin or marketplace)."""
         if status not in _VALID_STATUSES:
@@ -145,6 +146,7 @@ class SkillCatalog(DbConsumer):
             priority=priority,
             cost_estimate=cost_estimate,
             side_effect_profile=se_profile,
+            manifest=manifest,
         )
 
         # In-memory cache
@@ -253,6 +255,7 @@ class SkillCatalog(DbConsumer):
         cost_estimate: str,
         side_effect_profile: dict | None,
         git_commit_hash: str | None = None,
+        manifest: dict | None = None,
     ) -> None:
         """Shared DB upsert logic for register() and register_from_api().
 
@@ -286,6 +289,8 @@ class SkillCatalog(DbConsumer):
                 existing.priority = priority
                 existing.cost_estimate = cost_estimate
                 existing.side_effect_profile = side_effect_profile
+                if manifest is not None:
+                    existing.manifest = manifest
                 if embedding_val is not None:
                     existing.embedding = embedding_val
             else:
@@ -308,6 +313,7 @@ class SkillCatalog(DbConsumer):
                     priority=priority,
                     cost_estimate=cost_estimate,
                     side_effect_profile=side_effect_profile,
+                    manifest=manifest,
                     embedding=embedding_val,
                 ))
             db.commit()
