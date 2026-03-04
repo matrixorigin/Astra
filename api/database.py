@@ -148,31 +148,29 @@ def init_db():
                         logger.warning("Migration: failed to add column %s: %s", col, e)
 
     # Create IVF-flat vector indexes for L2_DISTANCE queries.
-    # SQLAlchemy Index doesn't support USING ivfflat syntax, so we create via raw DDL.
-    # MatrixOne doesn't support IF NOT EXISTS for CREATE INDEX, so check first.
-    #
-    # lists parameter: controls IVF-flat partitioning. Should be ~sqrt(N) for optimal
-    # recall/speed tradeoff. We use lists=10 as a safe default for early-stage data
-    # (works well up to ~10K rows). Revisit when any table exceeds 10K embeddings.
-    _VECTOR_INDEXES = [
-        ("mem_memories", "idx_memory_embedding", "mem_memories(embedding)"),
-        ("ctx_ctx_event_embeddings", "idx_event_emb_vec", "ctx_ctx_event_embeddings(embedding)"),
-        ("sk_knowledge_entries", "idx_knowledge_emb_vec", "sk_knowledge_entries(embedding)"),
-        ("skill_selection_learningss", "idx_learning_emb_vec", "skill_selection_learningss(query_embedding)"),
+    # MatrixOne SDK handles SET experimental_ivf_index=1 and SQL generation.
+    # lists=10 is safe default for early-stage data (up to ~10K rows).
+    from matrixone import VectorIndex
+
+    vector_indexes = [
+        ("mem_memories", "idx_memory_embedding", "embedding"),
+        ("ctx_ctx_event_embeddings", "idx_event_emb_vec", "embedding"),
+        ("sk_knowledge_entries", "idx_knowledge_emb_vec", "embedding"),
+        ("skill_selection_learningss", "idx_learning_emb_vec", "query_embedding"),
     ]
-    for tbl, idx_name, idx_target in _VECTOR_INDEXES:
+    for tbl, idx_name, col_name in vector_indexes:
         if tbl in existing or tbl in {t.name for t in tables_to_create}:
             try:
                 with engine.begin() as conn:
                     idx_rows = conn.execute(text(f"SHOW INDEX FROM {tbl}")).fetchall()
-                    has_vec_idx = any(idx_name in str(r) for r in idx_rows)
-                    if not has_vec_idx:
-                        conn.execute(text(
-                            f"CREATE INDEX {idx_name} "
-                            f"USING ivfflat ON {idx_target} lists=10 op_type 'vector_l2_ops'"
-                        ))
+                    if not any(idx_name in str(r) for r in idx_rows):
+                        VectorIndex.create_index(
+                            engine, table_name=tbl, name=idx_name,
+                            column=col_name, index_type="ivfflat",
+                            lists=10, op_type="vector_l2_ops",
+                        )
             except Exception as e:
-                logger.warning("Migration: failed to create vector index %s: %s", idx_name, e)
+                logger.warning("Failed to create vector index %s: %s", idx_name, e)
 
 
 def _import_skill_models():

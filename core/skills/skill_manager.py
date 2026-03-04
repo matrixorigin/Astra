@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
 
 from api.models import (
     SkillInstallation,
@@ -19,8 +19,7 @@ from api.models import (
     UserCredential,
     UserRole,
 )
-from core.db_consumer import DbConsumer
-from core.skills.credential_manager import CredentialManager
+from core.db_consumer import DbConsumer, DbFactory
 from core.skills.dependencies import DependencyType, parse_depends_on
 from core.skills.resolver import (
     CircularDependencyError,
@@ -29,12 +28,23 @@ from core.skills.resolver import (
     DependencyResolver,
 )
 
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
+
+    from core.skills.config_center import SkillConfigCenter
+    from core.skills.credential_manager import CredentialManager
+
 
 class SkillNotFoundError(Exception):
     pass
 
 
 class SkillNotInstalledError(Exception):
+    pass
+
+
+class SkillConfigError(Exception):
+    """Skill is installed but missing required configuration."""
     pass
 
 
@@ -55,11 +65,19 @@ class SkillManager(DbConsumer):
         Factory that returns a new database session.
     credential_mgr : CredentialManager
         Encryption service for user credentials.
+    config_center : SkillConfigCenter | None
+        Optional config center for pre-execution validation.
     """
 
-    def __init__(self, db_factory, credential_mgr: CredentialManager):
+    def __init__(
+        self,
+        db_factory: DbFactory,
+        credential_mgr: CredentialManager,
+        config_center: SkillConfigCenter | None = None,
+    ):
         super().__init__(db_factory)
         self._cred = credential_mgr
+        self._config_center = config_center
 
     # ── internal queries (accept db to avoid nested sessions) ────────────────
 
@@ -117,13 +135,14 @@ class SkillManager(DbConsumer):
                 )
 
     def require_executable(self, user_id: str, skill_name: str) -> None:
-        """Runtime check: installed + active + has permission + all dependencies installed.
+        """Runtime check: installed + active + has permission + deps + config.
 
         No-op for builtin skills (not in skill_definitions).
 
         Raises:
             SkillNotInstalledError: skill not installed or dependency missing
             PermissionDeniedError: user lacks permission or skill deactivated
+            SkillConfigError: skill installed but missing required configuration
         """
         with self._db() as db:
             defn = db.query(SkillRegistry).filter_by(skill_name=skill_name).first()
@@ -173,6 +192,17 @@ class SkillManager(DbConsumer):
                                     )
                             except ValueError:
                                 pass  # malformed constraint — skip check
+
+            # Config validation runs inside the with block so it's skipped for
+            # builtin skills (which return early above) and only runs after all
+            # other checks pass.
+            if self._config_center:
+                errors = self._config_center.validate(skill_name, user_id)
+                if errors:
+                    names = ", ".join(f"{e.section}.{e.name}" for e in errors)
+                    raise SkillConfigError(
+                        f"Skill '{skill_name}' missing required config: {names}"
+                    )
 
     # ── permission check ──────────────────────────────────────────────────────
 

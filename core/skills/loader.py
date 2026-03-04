@@ -26,7 +26,9 @@ class SkillManifest:
     description: str = ""
     table_prefix: str = ""
     tables: list[str] = field(default_factory=list)
-    credentials: list[dict[str, Any]] = field(default_factory=list)
+    settings: list[dict[str, Any]] = field(default_factory=list)
+    secrets: list[dict[str, Any]] = field(default_factory=list)
+    resources: dict[str, Any] = field(default_factory=dict)
     requires: list[str] = field(default_factory=list)
     depends_on: list[Dependency] = field(default_factory=list)
     author: str = ""
@@ -68,7 +70,9 @@ def load_manifests(skills_root: Path | None = None) -> list[SkillManifest]:
                 description=data.get("description", ""),
                 table_prefix=data.get("table_prefix", ""),
                 tables=data.get("tables", []),
-                credentials=data.get("credentials", []),
+                settings=data.get("settings", []),
+                secrets=data.get("secrets", []),
+                resources=data.get("resources", {}),
                 requires=data.get("requires", []),
                 depends_on=parse_depends_on(data.get("depends_on", [])),
                 author=data.get("author", ""),
