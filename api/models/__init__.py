@@ -24,8 +24,10 @@ from api.models.skill import (  # noqa: F401
     SkillLearningSignal,
     SkillPermission,
     SkillRegistry,
+    SkillResourceBinding,
     SkillSelectionEvent,
     SkillSelectionLearning,
+    SkillSetting,
     SkillUserCredential,
 )
 

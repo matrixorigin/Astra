@@ -155,6 +155,58 @@ class SkillLearningSignal(Base):
     created_at = Column(DateTime, default=func.now(), index=True)
 
 
+class SkillSetting(Base):
+    """Skill configuration: settings (plaintext) and secrets (encrypted).
+
+    Scope chain: user → tenant → global → manifest default.
+    """
+    __tablename__ = "skill_settings"
+    __table_args__ = (
+        UniqueConstraint(
+            "skill_name", "setting_name", "scope_type", "scope_id",
+            name="uq_skill_setting_scope",
+        ),
+        Index("ix_ss_skill_scope", "skill_name", "scope_type", "scope_id"),
+    )
+
+    setting_id = Column(String(36), primary_key=True)
+    skill_name = Column(String(100), nullable=False, index=True)
+    setting_name = Column(String(100), nullable=False)
+    setting_value = Column(Text, nullable=False)
+    is_secret = Column(SmallInteger, nullable=False, default=0)
+    scope_type = Column(String(20), nullable=False)   # "global" | "tenant" | "user"
+    scope_id = Column(String(36), nullable=True)      # NULL for global
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    updated_by = Column(String(36), nullable=False)
+
+
+class SkillResourceBinding(Base):
+    """Per-resource credential and config bindings.
+
+    Each row = one (user, skill, resource_key, binding_name) tuple.
+    """
+    __tablename__ = "skill_resource_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "skill_name", "resource_key", "binding_name",
+            name="uq_skill_resource_binding",
+        ),
+        Index("ix_srb_user_skill", "user_id", "skill_name"),
+    )
+
+    binding_id = Column(String(36), primary_key=True)
+    user_id = Column(String(36), nullable=False, index=True)
+    skill_name = Column(String(100), nullable=False, index=True)
+    resource_type = Column(String(50), nullable=False)
+    resource_key = Column(String(500), nullable=False)
+    binding_name = Column(String(100), nullable=False)
+    binding_value = Column(Text, nullable=False)
+    is_secret = Column(SmallInteger, nullable=False, default=0)
+    created_at = Column(DateTime, default=func.now(), nullable=False)
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
 class SkillExecutionMetric(Base):
     __tablename__ = "skill_execution_metrics"
     metric_id = Column(String(36), primary_key=True)
