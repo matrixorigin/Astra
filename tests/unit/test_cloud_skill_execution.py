@@ -206,10 +206,13 @@ class TestCloudLoopStopsOnFailure:
                 {"type": "text", "content": "Repository matrixorigin/mo-auto-test was not found."},
             ])
 
-        llm_call_count = {"n": 0}
-        def llm_side_effect(*a, **kw):
-            llm_call_count["n"] += 1
-            return call_stream if llm_call_count["n"] == 1 else make_answer()
+        llm_call_count = {"tools": 0, "stream": 0}
+        def llm_tools_effect(*a, **kw):
+            llm_call_count["tools"] += 1
+            return call_stream
+        def llm_stream_effect(*a, **kw):
+            llm_call_count["stream"] += 1
+            return make_answer()
 
         mock_skill_output = MagicMock()
         mock_skill_output.model_dump.return_value = {
@@ -222,8 +225,8 @@ class TestCloudLoopStopsOnFailure:
             skill_call_count["n"] += 1
             return mock_skill_output
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=llm_side_effect), \
-             patch("core.llm.client.LLMClient.chat_stream", side_effect=lambda *a, **kw: make_answer()), \
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=llm_tools_effect), \
+             patch("core.llm.client.LLMClient.chat_stream", side_effect=llm_stream_effect), \
              patch("api.routers.chat._get_shared_skill_registry") as mock_reg_fn, \
              patch("api.routers.chat._get_cloud_skill_schemas", return_value=[
                  {"type": "function", "function": {"name": "ci_status", "description": "ci", "parameters": {}}}
@@ -249,8 +252,9 @@ class TestCloudLoopStopsOnFailure:
         # Skill was called exactly once — no retry
         assert skill_call_count["n"] == 1, f"Skill called {skill_call_count['n']} times, expected 1"
 
-        # LLM was called at least twice: once to get tool_call, once to get final text
-        assert llm_call_count["n"] >= 2, f"LLM called {llm_call_count['n']} times, expected >= 2"
+        # LLM tools called once (initial), then chat_stream once (final text-only)
+        assert llm_call_count["tools"] == 1, f"chat_with_tools_stream called {llm_call_count['tools']} times"
+        assert llm_call_count["stream"] == 1, f"chat_stream called {llm_call_count['stream']} times"
 
         # Final text contains the error message
         text_chunks = [e["content"] for e in events if e.get("type") == "text_delta"]
@@ -267,25 +271,25 @@ class TestCloudLoopStopsOnFailure:
 
         skill_call_count = {"n": 0}
 
-        # LLM call 1: tool_call
+        # LLM call 1 (with tools): returns tool_call
         call_stream = fake_llm_stream([
             {"type": "tool_call", "data": {
                 "id": "tc1", "function": {"name": "ci_status",
                     "arguments": '{"repo":"matrixorigin/mo-auto-test"}'}}},
         ])
-        # LLM call 2: ignores hard-stop, returns another tool_call
-        def make_retry():
+        # LLM call 2 (without tools via chat_stream): returns text
+        def make_answer():
             return fake_llm_stream([
-                {"type": "text", "content": "Repo not found. "},
-                {"type": "tool_call", "data": {
-                    "id": "tc2", "function": {"name": "ci_status",
-                        "arguments": '{"repo":"mo-auto-test"}'}}},
+                {"type": "text", "content": "Repo not found."},
             ])
 
-        llm_call_count = {"n": 0}
-        def llm_side_effect(*a, **kw):
-            llm_call_count["n"] += 1
-            return call_stream if llm_call_count["n"] == 1 else make_retry()
+        llm_call_count = {"tools": 0, "stream": 0}
+        def llm_tools_effect(*a, **kw):
+            llm_call_count["tools"] += 1
+            return call_stream
+        def llm_stream_effect(*a, **kw):
+            llm_call_count["stream"] += 1
+            return make_answer()
 
         mock_skill_output = MagicMock()
         mock_skill_output.model_dump.return_value = {
@@ -298,8 +302,8 @@ class TestCloudLoopStopsOnFailure:
             skill_call_count["n"] += 1
             return mock_skill_output
 
-        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=llm_side_effect), \
-             patch("core.llm.client.LLMClient.chat_stream", side_effect=lambda *a, **kw: make_retry()), \
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=llm_tools_effect), \
+             patch("core.llm.client.LLMClient.chat_stream", side_effect=llm_stream_effect), \
              patch("api.routers.chat._get_shared_skill_registry") as mock_reg_fn, \
              patch("api.routers.chat._get_cloud_skill_schemas", return_value=[
                  {"type": "function", "function": {"name": "ci_status", "description": "ci", "parameters": {}}}
@@ -320,7 +324,8 @@ class TestCloudLoopStopsOnFailure:
             }, headers=headers)
             assert resp.status_code == 200
 
-        # Skill called only once — second tool_call was ignored
+        # Skill called only once
         assert skill_call_count["n"] == 1
-        # LLM called twice (initial + final)
-        assert llm_call_count["n"] == 2
+        # Final call uses chat_stream (no tools) to prevent LLM from returning tool_calls
+        assert llm_call_count["tools"] == 1, "chat_with_tools_stream should be called once"
+        assert llm_call_count["stream"] == 1, "chat_stream should be called once for final reply"

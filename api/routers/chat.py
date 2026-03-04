@@ -1747,7 +1747,7 @@ async def chat_turn(
                     stream: AsyncIterator = (
                         llm.chat_with_tools_stream(
                             _current_llm_messages, merged_tools_schema, model=model, task_hint=task_hint,
-                        ) if merged_tools_schema else
+                        ) if merged_tools_schema and not _cloud_skill_failed else
                         llm.chat_stream(
                             _current_llm_messages, user_id, session_id, model=model,
                         )
@@ -1805,6 +1805,8 @@ async def chat_turn(
 
                     # If a previous cloud skill failed, ignore any new tool_calls from LLM.
                     if _cloud_skill_failed:
+                        logger.warning("Cloud loop: LLM returned %d tool_calls after failure (ignored), text=%r",
+                                       len(_loop_tool_calls), _loop_text[:200])
                         break
 
                     # Partition tool_calls into cloud vs edge.
