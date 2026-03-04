@@ -5,4 +5,4 @@
 mkdir -p /mo-logs
 
 # Start MatrixOne with logging to file (append mode to preserve history across restarts)
-/mo-service -launch /etc/quickstart/launch.toml 2>&1 | tee -a /mo-logs/matrixone.log
+/mo-service -launch /etc/quickstart/launch.toml -debug-http=:6060 2>&1 | tee -a /mo-logs/matrixone.log

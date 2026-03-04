@@ -276,12 +276,27 @@ class PromptAssembler(DbConsumer):
         breakdown["constraints"] = _estimate_tokens(constraints)
 
         # Compress if over budget
-        total = sum(breakdown.values())
+        # (total computed after zone rebalance which may shrink history)
 
         # Phase 1: Check zone budget overflows and log
         if zone_budgets and _COMPRESSION_AVAILABLE:
             self._check_zone_overflows(breakdown, zone_budgets, session_id)
+            # Proportional rebalance: if history exceeds its zone budget by >50%,
+            # compress it even when total is under max_tokens.
+            elastic_usage = sum(breakdown.get(s, 0) for s in ("history",))
+            if elastic_usage > zone_budgets.elastic * 1.5:
+                target = zone_budgets.elastic
+                if "history" in sections:
+                    keep_chars = target * 4
+                    truncated = sections["history"][:keep_chars]
+                    last_nl = truncated.rfind("\n")
+                    if last_nl > 0:
+                        truncated = truncated[:last_nl]
+                    sections["history"] = truncated + "\n[truncated]"
+                    breakdown["history"] = _estimate_tokens(sections["history"])
+                    logger.info("History zone rebalanced: %d → %d tokens", elastic_usage, breakdown["history"])
 
+        total = sum(breakdown.values())
         if total > max_tokens:
             sections, breakdown = self._compress(sections, breakdown, max_tokens)
 

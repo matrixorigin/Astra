@@ -78,6 +78,7 @@ class TurnHooks(DbConsumer):
         user_content: str,
         tool_calls: list[dict[str, Any]],
         agent_id: str | None = None,
+        skill_versions: dict[str, str] | None = None,
     ) -> str | None:
         """Record skill selection event if tools were called. Returns event_id."""
         tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
@@ -97,6 +98,7 @@ class TurnHooks(DbConsumer):
                     user_query=(user_content or "")[:2000],
                     selected_skills=tc_names,
                     skill_name=tc_names[0],
+                    skill_version=(skill_versions or {}).get(tc_names[0]),
                     selection_method="llm_tool_choice",
                 ))
                 db.commit()

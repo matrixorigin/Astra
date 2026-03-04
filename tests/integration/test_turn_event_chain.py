@@ -24,6 +24,7 @@ def turn_session(db):
     yield sid, uid
     # cleanup
     db.execute(sa.text("DELETE FROM agent_events WHERE session_id = :sid"), {"sid": sid})
+    db.execute(sa.text("DELETE FROM skill_selection_events WHERE session_id = :sid"), {"sid": sid})
     db.execute(sa.text("DELETE FROM agent_sessions WHERE session_id = :sid"), {"sid": sid})
     db.commit()
 
@@ -39,6 +40,9 @@ def _run_persist(session_id, user_id, turn_chain_id, user_query_event_id, **kwar
         tool_calls=kwargs.get("tool_calls", []),
         turn_chain_id=turn_chain_id,
         user_query_event_id=user_query_event_id,
+        history=kwargs.get("history"),
+        turn_count=kwargs.get("turn_count", 0),
+        agent_id=kwargs.get("agent_id"),
     )
     time.sleep(0.5)  # wait for daemon thread
 
@@ -367,3 +371,234 @@ class TestContinuationTurnChain:
                     f"{e['event_type']} has parent_event_id=None — "
                     "continuation turn events must reference the original user_query"
                 )
+
+
+class TestCloudToolCallOrdering:
+    """Verify cloud tool_call events are persisted in correct order.
+
+    Before the fix, cloud tool_calls were written inline during streaming
+    (before user_query), causing created_at to be earlier than user_query.
+    Now they are deferred to _persist_turn_events and written after user_query.
+    """
+
+    def test_cloud_tool_call_after_user_query(self, db, turn_session):
+        """Cloud tool_call event must have created_at >= user_query.created_at."""
+        sid, uid = turn_session
+        chain = str(uuid7())
+        uq_eid = str(uuid7())
+
+        # Simulate a turn with a cloud tool_call (marked with _source=cloud)
+        _run_persist(sid, uid, chain, uq_eid,
+                     tool_calls=[
+                         {"id": "cloud-tc1", "function": {"name": "ci_status", "arguments": "{}"}, "_source": "cloud"},
+                     ],
+                     full_text="Here are the CI results.")
+
+        events = _fetch_events(db, sid)
+        uq = next(e for e in events if e["event_type"] == "user_query")
+        tc = next(e for e in events if e["event_type"] == "tool_call")
+
+        assert uq["created_at"] <= tc["created_at"], (
+            f"user_query.created_at ({uq['created_at']}) must be <= "
+            f"tool_call.created_at ({tc['created_at']}). "
+            "Cloud tool_calls must be persisted after user_query."
+        )
+
+    def test_cloud_tool_call_preserves_source_marker(self, db, turn_session):
+        """Cloud tool_call content must include source='cloud' for traceability."""
+        sid, uid = turn_session
+        chain = str(uuid7())
+        uq_eid = str(uuid7())
+
+        _run_persist(sid, uid, chain, uq_eid,
+                     tool_calls=[
+                         {"id": "cloud-tc1", "function": {"name": "ci_status", "arguments": "{}"}, "_source": "cloud"},
+                     ],
+                     full_text="Results.")
+
+        events = _fetch_events(db, sid)
+        tc = next(e for e in events if e["event_type"] == "tool_call")
+
+        # Fetch full content
+        content_row = db.execute(sa.text(
+            "SELECT content FROM agent_events WHERE event_id = :eid"
+        ), {"eid": tc["event_id"]}).fetchone()
+        import json
+        content = json.loads(content_row[0])
+        assert content.get("source") == "cloud", (
+            f"Cloud tool_call must have source='cloud' in content, got: {content}"
+        )
+
+
+class TestHistorySnapshotCompaction:
+    """Verify session_history_snapshot truncates verbose tool results."""
+
+    def test_snapshot_truncates_tool_results(self, db, turn_session):
+        """Tool result content in snapshot must be truncated to 500 chars."""
+        sid, uid = turn_session
+        chain = str(uuid7())
+        uq_eid = str(uuid7())
+
+        # Build a history with a large tool result
+        large_result = "x" * 2000
+        history = [
+            {"role": "system", "content": "You are a helper."},
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "tc1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "tc1", "content": large_result},
+            {"role": "assistant", "content": "Done."},
+        ]
+
+        # turn_count=3 triggers snapshot (SNAPSHOT_TURN_INTERVAL=3)
+        _run_persist(sid, uid, chain, uq_eid,
+                     full_text="Done.",
+                     history=history,
+                     turn_count=3)
+
+        events = _fetch_events(db, sid)
+        snap = next((e for e in events if e["event_type"] == "session_history_snapshot"), None)
+        assert snap is not None, "Expected a session_history_snapshot event"
+
+        # Fetch full content
+        content_row = db.execute(sa.text(
+            "SELECT content FROM agent_events WHERE event_id = :eid"
+        ), {"eid": snap["event_id"]}).fetchone()
+        import json
+        snap_history = json.loads(content_row[0])
+
+        # Find the tool message
+        tool_msg = next(m for m in snap_history if m.get("role") == "tool")
+        assert len(tool_msg["content"]) <= 520, (  # 500 + " [truncated]"
+            f"Tool result in snapshot should be truncated, got {len(tool_msg['content'])} chars"
+        )
+        assert "[truncated]" in tool_msg["content"]
+
+
+class TestSkillSelectionMetrics:
+    """Verify skill_version and execution_success are persisted correctly."""
+
+    @pytest.fixture(autouse=True)
+    def _register_skill(self, db):
+        """Ensure a skill exists in the registry so _resolve_skill_versions finds it."""
+        from api.models.skill import SkillRegistry
+        sid = "ci_status@1.0.0"
+        existing = db.query(SkillRegistry).filter_by(skill_id=sid).first()
+        if not existing:
+            db.add(SkillRegistry(
+                skill_id=sid, skill_name="ci_status", version="1.0.0",
+                is_active=1, status="active",
+            ))
+            db.commit()
+
+    def _fetch_selection(self, db, session_id):
+        rows = db.execute(sa.text("""
+            SELECT skill_name, skill_version, execution_success, execution_time_ms
+            FROM skill_selection_events WHERE session_id = :sid
+            ORDER BY created_at
+        """), {"sid": session_id}).fetchall()
+        return [dict(r._mapping) for r in rows]
+
+    def test_skill_version_populated(self, db, turn_session):
+        """skill_version must be set from the registry, not NULL."""
+        sid, uid = turn_session
+        chain, uq_eid = str(uuid7()), str(uuid7())
+        _run_persist(sid, uid, chain, uq_eid,
+                     tool_calls=[{"id": "tc1", "function": {"name": "ci_status", "arguments": "{}"}}],
+                     agent_id="test")
+
+        rows = self._fetch_selection(db, sid)
+        assert len(rows) == 1
+        assert rows[0]["skill_name"] == "ci_status"
+        assert rows[0]["skill_version"] == "1.0.0"
+
+    def test_execution_success_backfilled_same_turn(self, db, turn_session):
+        """Cloud skill: tool_call + tool_result in same turn → execution_success=1."""
+        sid, uid = turn_session
+        chain, uq_eid = str(uuid7()), str(uuid7())
+        _run_persist(sid, uid, chain, uq_eid,
+                     tool_calls=[{"id": "tc1", "function": {"name": "ci_status", "arguments": "{}"}}],
+                     tool_results=[{"tool_call_id": "tc1", "name": "ci_status", "result": "ok"}],
+                     full_text="CI is green.",
+                     agent_id="test")
+
+        rows = self._fetch_selection(db, sid)
+        assert len(rows) == 1
+        assert rows[0]["execution_success"] == 1
+
+    def test_execution_success_null_without_tool_results(self, db, turn_session):
+        """Edge skill: tool_call only (no result yet) → execution_success stays NULL."""
+        sid, uid = turn_session
+        chain, uq_eid = str(uuid7()), str(uuid7())
+        _run_persist(sid, uid, chain, uq_eid,
+                     tool_calls=[{"id": "tc1", "function": {"name": "ci_status", "arguments": "{}"}}],
+                     full_text="",
+                     agent_id="test")
+
+        rows = self._fetch_selection(db, sid)
+        assert len(rows) == 1
+        assert rows[0]["execution_success"] is None
+
+
+class TestEventTimestampPrecision:
+    """Verify created_at has microsecond precision for deterministic ordering."""
+
+    def test_events_in_same_turn_have_distinct_timestamps(self, db, turn_session):
+        """Events persisted in one _persist_turn_events call must have distinct created_at."""
+        sid, uid = turn_session
+        chain, uq_eid = str(uuid7()), str(uuid7())
+        _run_persist(sid, uid, chain, uq_eid,
+                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+                     tool_results=[{"tool_call_id": "tc1", "name": "bash", "result": "ok"}],
+                     full_text="done")
+
+        events = _fetch_events(db, sid)
+        timestamps = [e["created_at"] for e in events]
+        # All timestamps should be unique (microsecond precision prevents collisions)
+        assert len(timestamps) == len(set(timestamps)), (
+            f"Timestamp collisions: {timestamps}"
+        )
+
+    def test_event_ordering_matches_causal_order(self, db, turn_session):
+        """user_query < tool_result < tool_call < llm_response in created_at order."""
+        sid, uid = turn_session
+        chain, uq_eid = str(uuid7()), str(uuid7())
+        _run_persist(sid, uid, chain, uq_eid,
+                     tool_calls=[{"id": "tc1", "function": {"name": "bash", "arguments": "{}"}}],
+                     tool_results=[{"tool_call_id": "tc0", "name": "prev", "result": "ok"}],
+                     full_text="response")
+
+        events = _fetch_events(db, sid)
+        types = [e["event_type"] for e in events]
+        uq_idx = types.index("user_query")
+        tr_idx = types.index("tool_result")
+        tc_idx = types.index("tool_call")
+        lr_idx = types.index("llm_response")
+        assert uq_idx < tr_idx < tc_idx < lr_idx, (
+            f"Wrong order: {types} — expected user_query < tool_result < tool_call < llm_response"
+        )
+
+    def test_microsecond_precision_stored(self, db, turn_session):
+        """created_at column must store microseconds, not truncate to seconds."""
+        sid, uid = turn_session
+        # Insert an event with a known microsecond value directly to avoid
+        # relying on datetime.now() which could theoretically return .000000.
+        from datetime import datetime, timezone
+        known_ts = datetime(2026, 6, 15, 12, 0, 0, 654321, tzinfo=timezone.utc)
+        eid = str(uuid7())
+        db.execute(sa.text("""
+            INSERT INTO agent_events
+                (event_id, session_id, user_id, agent_id, agent_version,
+                 event_type, content, causal_chain_id, created_at)
+            VALUES (:eid, :sid, :uid, 'sys', '1.0.0',
+                    'test', 'usec-test', 'chain-usec', :ts)
+        """), {"eid": eid, "sid": sid, "uid": uid, "ts": known_ts})
+        db.commit()
+
+        row = db.execute(sa.text(
+            "SELECT created_at FROM agent_events WHERE event_id = :eid"
+        ), {"eid": eid}).fetchone()
+        assert row[0].microsecond == 654321, (
+            f"Expected microsecond=654321, got {row[0].microsecond} — DATETIME(6) not working"
+        )

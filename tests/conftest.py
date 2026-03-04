@@ -68,6 +68,20 @@ def test_engine():
             missing = required - tables
             if missing:
                 raise RuntimeError(f"Tables missing after init_db: {missing}")
+            # Ensure microsecond precision on timestamp columns (idempotent).
+            # init_db only CREATEs — existing tables keep old DATETIME(0).
+            from sqlalchemy import text as sa_text
+            for ddl in [
+                "ALTER TABLE agent_events MODIFY COLUMN created_at DATETIME(6) NOT NULL",
+                "ALTER TABLE ctx_snapshots MODIFY COLUMN created_at DATETIME(6) NOT NULL",
+                "ALTER TABLE skill_selection_events MODIFY COLUMN created_at DATETIME(6)",
+            ]:
+                try:
+                    with engine.connect() as c:
+                        c.execute(sa_text(ddl))
+                        c.commit()
+                except Exception:
+                    pass  # Column already DATETIME(6), or table created with correct type
             break
         except Exception:
             if attempt == 4:

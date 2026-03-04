@@ -94,6 +94,14 @@ logger = logging.getLogger(__name__)
 # See also: .kiro/steering/cloud-skill-design.md
 # ============================================================================
 
+# Shared description fragments — injected into every GitHub skill description
+# to avoid repeating ~350 chars of boilerplate per skill.
+_GITHUB_BOILERPLATE = (
+    "repo: 'owner/repo' or bare name (auto-resolved by stars). "
+    "On 'owner/repo' error, report not found — do NOT retry bare. "
+    "If resolved_by_search=True, confirm repo with user. "
+    "On success=False, report error — no bash/curl fallback."
+)
 
 
 class SummarizePRInput(SkillInput):
@@ -208,16 +216,9 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
     config_namespace = "github"
     version = "1.0.0"
     description = (
-        "List pull requests in a GitHub repository. "
-        "Use this when user asks about PRs, recent changes, or what's being worked on. "
-        "repo can be 'owner/repo' or just a project name — bare names are auto-resolved via GitHub search. "
-        "IMPORTANT: if the user gives 'owner/repo' format and it returns an error, do NOT "
-        "retry with just the project name and do NOT substitute a similar-sounding repo — tell the user the repo was not found or is private. "
-        "If resolved_by_search=True in the result, tell the user which repo was used and ask to confirm if wrong. "
-        "CRITICAL: when success=False, stop immediately and report the error to the user — "
-        "do NOT use bash/curl/grep or any other tool to work around the failure. "
-        "detail: 'brief' (default) = number/title/author/state/created_at; 'normal' adds body summary + labels + reviewers + changed_files. "
-        "Use state='open' for active PRs, 'closed' for merged/closed, 'all' for both."
+        "List pull requests. "
+        "detail: brief=number/title/author/state/date; normal adds body+labels+reviewers+files. "
+        + _GITHUB_BOILERPLATE
     )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
@@ -278,23 +279,10 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
     config_namespace = "github"
     version = "1.0.0"
     description = (
-        "Check CI/CD workflow run status in a GitHub repository — shows recent workflow runs "
-        "with pass/fail/pending status. Use this when user asks about build status, CI failures, "
-        "or whether tests are passing. "
-        "Returns workflow name, conclusion (success/failure/skipped), triggering PR number+title, "
-        "branch, actor, and timestamp. "
-        "detail levels: brief (default), normal (adds PR title + commit message + duration), "
-        "detailed (adds per-job status + failed job names), full (adds failed step details). "
-        "Use brief unless user explicitly asks for more detail. "
-        "repo can be 'owner/repo' (e.g. 'matrixorigin/matrixone') or just a project name "
-        "(e.g. 'milvus') — bare names are auto-resolved via GitHub search by star count. "
-        "IMPORTANT: if the user gives 'owner/repo' format and it returns an error, do NOT "
-        "retry with just the project name and do NOT substitute a similar-sounding repo — "
-        "tell the user the repo was not found or is private. "
-        "If resolved_by_search=True in the result, tell the user which repo was used "
-        "and ask them to confirm if it looks wrong. "
-        "CRITICAL: when success=False, stop immediately and report the error to the user — "
-        "do NOT use bash/curl/grep or any other tool to work around the failure."
+        "Check CI/CD workflow run status — recent runs with pass/fail/pending. "
+        "detail: brief=workflow/conclusion/branch/date; normal +PR+commit+duration; "
+        "detailed +per-job+failed jobs; full +failed steps. "
+        + _GITHUB_BOILERPLATE
     )
     requirements = SkillRequirement(
         repo_types=[RepoType.CI, RepoType.CODE],
@@ -365,17 +353,9 @@ class ListIssuesSkill(Skill[ListIssuesInput, ListIssuesOutput]):
     config_namespace = "github"
     version = "1.0.0"
     description = (
-        "List issues in a GitHub repository (excludes pull requests). "
-        "Use when user asks about bugs, feature requests, or open issues. "
-        "repo can be 'owner/repo' or just a project name — bare names are auto-resolved via GitHub search. "
-        "IMPORTANT: if the user gives 'owner/repo' format and it returns an error, do NOT "
-        "retry with just the project name and do NOT substitute a similar-sounding repo — tell the user the repo was not found or is private. "
-        "If resolved_by_search=True in the result, tell the user which repo was used and ask to confirm if wrong. "
-        "CRITICAL: when success=False, stop immediately and report the error to the user — "
-        "do NOT use bash/curl/grep or any other tool to work around the failure. "
-        "Filters: state (open/closed/all), labels, assignee, creator, milestone, since (ISO datetime). "
-        "Sort: created/updated/comments, direction: asc/desc. "
-        "Detail: 'brief' for lists, 'normal' adds body/assignees, 'full' adds reactions/comments."
+        "List issues (excludes PRs). "
+        "detail: brief=title/state/labels; normal +body/assignees; full +reactions/comments. "
+        + _GITHUB_BOILERPLATE
     )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
@@ -438,16 +418,9 @@ class GetIssueSkill(Skill[GetIssueInput, GetIssueOutput]):
     config_namespace = "github"
     version = "1.0.0"
     description = (
-        "Get details of a specific GitHub issue by number. "
-        "repo can be 'owner/repo' or just a project name — bare names are auto-resolved via GitHub search. "
-        "IMPORTANT: if the user gives 'owner/repo' format and it returns an error, do NOT "
-        "retry with just the project name and do NOT substitute a similar-sounding repo — tell the user the repo was not found or is private. "
-        "If resolved_by_search=True in the result, tell the user which repo was used and ask to confirm if wrong. "
-        "CRITICAL: when success=False, stop immediately and report the error to the user — "
-        "do NOT use bash/curl/grep or any other tool to work around the failure. "
-        "Detail: 'brief' for summary, 'normal' (default) adds body/assignees/milestone, "
-        "'full' adds reactions, closed_by, and recent comments. "
-        "Use when user asks about a specific issue."
+        "Get a specific issue by number. "
+        "detail: brief=summary; normal +body/assignees/milestone; full +reactions/comments. "
+        + _GITHUB_BOILERPLATE
     )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
@@ -515,15 +488,8 @@ class CreateIssueSkill(Skill[CreateIssueInput, CreateIssueOutput]):
     config_namespace = "github"
     version = "1.0.0"
     description = (
-        "Create a new GitHub issue. Use when user asks to file a bug report, "
-        "feature request, or any new issue. "
-        "repo can be 'owner/repo' or just a project name — bare names are auto-resolved via GitHub search. "
-        "IMPORTANT: if the user gives 'owner/repo' format and it returns an error, do NOT "
-        "retry with just the project name and do NOT substitute a similar-sounding repo — tell the user the repo was not found or is private. "
-        "If resolved_by_search=True in the result, tell the user which repo was used and ask to confirm if wrong. "
-        "CRITICAL: when success=False, stop immediately and report the error to the user — "
-        "do NOT use bash/curl/grep or any other tool to work around the failure. "
-        "Requires title. Optionally set body, labels, and assignees."
+        "Create a new GitHub issue. Requires title. Optional: body, labels, assignees. "
+        + _GITHUB_BOILERPLATE
     )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.WRITE, llm_required=False

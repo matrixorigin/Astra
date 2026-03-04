@@ -16,6 +16,28 @@ logger = get_logger(__name__)
 
 _DEFAULT_CONTEXT_BUDGET = 2000  # tokens reserved for tool schemas
 
+# Lazy-initialized map of builtin skill input classes for schema generation.
+# Populated on first access to avoid circular imports (builtin → base → selector).
+_BUILTIN_INPUTS: dict[str, type] | None = None
+
+
+def _get_builtin_inputs() -> dict[str, type]:
+    global _BUILTIN_INPUTS
+    if _BUILTIN_INPUTS is None:
+        from core.skills.builtin import (
+            CIStatusInput, CreateIssueInput, GetIssueInput,
+            ListIssuesInput, ListPRsInput, SummarizePRInput,
+        )
+        _BUILTIN_INPUTS = {
+            "ci_status": CIStatusInput,
+            "list_prs": ListPRsInput,
+            "list_issues": ListIssuesInput,
+            "get_issue": GetIssueInput,
+            "create_issue": CreateIssueInput,
+            "summarize_pr": SummarizePRInput,
+        }
+    return _BUILTIN_INPUTS
+
 # High-confidence thresholds for skipping LLM selection
 _HIGH_CONFIDENCE_SCORE = 0.75  # Top skill must score above this (lowered from 0.85)
 _HIGH_CONFIDENCE_GAP = 0.20    # Gap between top-1 and top-2 must exceed this (lowered from 0.25)
@@ -315,7 +337,7 @@ class ModernSkillSelector:
 
     @staticmethod
     def _strip_framework_fields(schema: dict[str, Any]) -> dict[str, Any]:
-        """Remove framework-injected fields and inline $defs for OpenAI compatibility."""
+        """Remove framework-injected fields, inline $defs, and compact for token efficiency."""
         # Inline $ref/$defs — OpenAI function calling doesn't support JSON Schema references
         schema = ModernSkillSelector._inline_refs(schema)
         from core.skills.base import SkillInput
@@ -326,6 +348,21 @@ class ModernSkillSelector:
         req = schema.get("required", [])
         if req:
             schema["required"] = [r for r in req if r not in fw]
+        # Compact: strip noise fields, simplify nullable anyOf
+        schema.pop("title", None)
+        schema.pop("description", None)
+        for prop in props.values():
+            prop.pop("title", None)
+            # Simplify {"anyOf": [{"type": "string"}, {"type": "null"}]} → {"type": "string"}
+            # This drops nullability info, but all nullable fields have defaults so the LLM
+            # simply omits them rather than passing null — acceptable tradeoff for ~40% fewer
+            # schema tokens on fields like labels, assignee, since, etc.
+            if "anyOf" in prop and len(prop["anyOf"]) == 2:
+                types = prop["anyOf"]
+                non_null = [t for t in types if t != {"type": "null"}]
+                if len(non_null) == 1:
+                    prop.update(non_null[0])
+                    del prop["anyOf"]
         return schema
 
     @staticmethod
@@ -348,5 +385,12 @@ class ModernSkillSelector:
         return _resolve(schema)
 
     def _get_default_schema(self, skill_name: str) -> dict[str, Any]:
-        """Default schema for skills without a Pydantic model."""
+        """Default schema for skills without a Pydantic model.
+
+        Falls back to builtin skill input classes when the catalog doesn't
+        have the skill registered (common for cloud skills).
+        """
+        cls = _get_builtin_inputs().get(skill_name)
+        if cls and hasattr(cls, "model_json_schema"):
+            return self._strip_framework_fields(cls.model_json_schema())
         return {"type": "object", "properties": {}, "required": []}

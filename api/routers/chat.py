@@ -1356,10 +1356,13 @@ def _persist_turn_events(
                 tc_id = tc.get("id", "")
                 tc_func = tc.get("function", {})
                 tc_name = tc_func.get("name", "")
+                tc_content: dict[str, Any] = {"tool_call_id": tc_id, "name": tc_name, "arguments": tc_func.get("arguments", "{}")}
+                if tc.get("_source") == "cloud":
+                    tc_content["source"] = "cloud"
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
                     event_type="tool_call",
-                    content=json.dumps({"tool_call_id": tc_id, "name": tc_name, "arguments": tc_func.get("arguments", "{}")}),
+                    content=json.dumps(tc_content),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
                     metadata={"tool_call_id": tc_id, "name": tc_name},
@@ -1383,10 +1386,22 @@ def _persist_turn_events(
             llm_response_event_id = llm_resp_ev.event_id
 
         if history and turn_count > 0 and turn_count % _SNAPSHOT_TURN_INTERVAL == 0:
+            # Compact snapshot: strip verbose tool result content to reduce storage.
+            # Recovery only needs message structure (roles, tool_call_ids), not full results.
+            compact_history = []
+            for msg in history:
+                if msg.get("role") == "tool":
+                    content = msg.get("content", "")
+                    compact_history.append({
+                        **msg,
+                        "content": content[:500] + " [truncated]" if len(content) > 500 else content,
+                    })
+                else:
+                    compact_history.append(msg)
             el.create_stream_event(
                 user_id=user_id, session_id=session_id,
                 event_type="session_history_snapshot",
-                content=json.dumps(history),
+                content=json.dumps(compact_history),
                 parent_event_id=parent_event_id,
                 causal_chain_id=causal_chain_id,
                 metadata={"turn_count": turn_count},
@@ -1416,7 +1431,17 @@ def _persist_turn_events(
                 session_id, parent_event_id, tool_calls, full_text,
                 context_capture_id, model_used=model_used,
             )
-            hooks.record_skill_selection(session_id, user_content or "", tool_calls, agent_id=agent_id)
+            hooks.record_skill_selection(session_id, user_content or "", tool_calls, agent_id=agent_id, skill_versions=skill_versions)
+
+            # Backfill execution metrics when tool_results and selection happen in the same turn
+            # (cloud skills: user_query → tool_call → tool_result all in one persist call).
+            # Phase 2 backfill targets the *previous* turn's selection event, so it misses
+            # same-turn results. This second backfill catches the just-created selection row.
+            if tool_results and tool_calls:
+                try:
+                    hooks.backfill_selection_metrics(session_id, tool_results)
+                except Exception:
+                    logger.debug("Same-turn backfill failed", exc_info=True)
 
         # Observer: only on final reply (no tool_calls, has text).
         # Intermediate turns (tool_call→tool_result cycles) have no meaningful
@@ -1700,6 +1725,7 @@ async def chat_turn(
             cloud_skill_names: set[str] = set()
             cloud_registry = None
             merged_tools_schema = tools_schema
+            _cloud_tool_calls_for_persist: list[dict[str, Any]] = []
             if tools_schema:
                 try:
                     cloud_registry = _get_shared_skill_registry()
@@ -1979,26 +2005,12 @@ async def chat_turn(
                                 "in_bytes": len(json.dumps(tc_args)),
                                 "out_bytes": len(cloud_result),
                             })
-                        # Record cloud skill execution as event for decision_trace visibility.
-                        try:
-                            from api.models.agent import Event as EventModel
-                            _db = SessionLocal()
-                            try:
-                                _db.add(EventModel(
-                                    event_id=str(uuid7()),
-                                    session_id=session_id,
-                                    user_id=user_id,
-                                    agent_id=request.agent_id or "edge",
-                                    event_type="tool_call",
-                                    content=json.dumps({"name": tc_name, "arguments": tc_args, "source": "cloud"}),
-                                    causal_chain_id=_turn_chain_id,
-                                    parent_event_id=_user_query_event_id,
-                                ))
-                                _db.commit()
-                            finally:
-                                _db.close()
-                        except Exception:
-                            logger.debug("Failed to record cloud tool_call event", exc_info=True)
+                        # Collect cloud skill execution for deferred persistence
+                        # (written by _persist_turn_events in correct order after user_query).
+                        _cloud_tool_calls_for_persist.append({
+                            "id": tc_id, "function": {"name": tc_name, "arguments": json.dumps(tc_args)},
+                            "_source": "cloud",
+                        })
                         yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': cloud_result[:500]})}\n\n"
                         # Truncate before quality assessment (assess full, truncate for LLM)
                         from core.context.compaction import truncate_tool_result
@@ -2102,7 +2114,8 @@ async def chat_turn(
                 user_id=user_id, session_id=session_id,
                 messages=copy.deepcopy(request.messages),
                 tool_results=copy.deepcopy(request.tool_results or []),
-                full_text=full_text, tool_calls=copy.deepcopy(tool_calls),
+                full_text=full_text,
+                tool_calls=copy.deepcopy(_cloud_tool_calls_for_persist + tool_calls),
                 context_capture_id=snapshot_id, model_used=resolved_model,
                 token_usage=usage if usage else None,
                 llm_params=llm_params,
