@@ -9,7 +9,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from httpx_sse import aconnect_sse
@@ -584,6 +584,79 @@ class APIClient:
     async def get_skill_versions(self, skill_id: str) -> list[dict[str, Any]]:
         """List skill versions."""
         response = await self._request("GET", f"/skills/{skill_id}/versions")
+        return response.json()
+
+    # ============================================================================
+    # Skill Configuration (§13)
+    # ============================================================================
+
+    async def get_skill_config(self, skill_name: str) -> dict[str, Any]:
+        """Get effective resolved config (secrets masked)."""
+        response = await self._request("GET", f"/skills/{skill_name}/config")
+        return response.json()
+
+    async def set_skill_setting(
+        self,
+        skill_name: str,
+        setting_name: str,
+        value: str | int | float | bool,
+        scope: Literal["user", "global"] = "user",
+    ) -> dict[str, Any]:
+        """Set a setting or secret."""
+        response = await self._request(
+            "PUT", f"/skills/{skill_name}/config/{setting_name}",
+            json={"value": value}, params={"scope": scope},
+        )
+        return response.json()
+
+    async def delete_skill_setting(
+        self,
+        skill_name: str,
+        setting_name: str,
+        scope: Literal["user", "global"] = "user",
+    ) -> dict[str, Any]:
+        """Delete a setting at a specific scope."""
+        response = await self._request(
+            "DELETE", f"/skills/{skill_name}/config/{setting_name}",
+            params={"scope": scope},
+        )
+        return response.json()
+
+    async def validate_skill_config(
+        self, skill_name: str, resource: str | None = None,
+    ) -> dict[str, Any]:
+        """Validate required config is present."""
+        params: dict[str, str] = {}
+        if resource:
+            params["resource"] = resource
+        response = await self._request(
+            "GET", f"/skills/{skill_name}/config/validate", params=params,
+        )
+        return response.json()
+
+    async def list_skill_resources(self, skill_name: str) -> list[dict[str, Any]]:
+        """List configured resources for a skill."""
+        response = await self._request("GET", f"/skills/{skill_name}/resources")
+        return response.json()
+
+    async def bind_skill_resource(
+        self, skill_name: str, resource_key: str,
+        bindings: dict[str, str | int | float | bool],
+    ) -> dict[str, Any]:
+        """Bind credentials/config to a resource."""
+        response = await self._request(
+            "PUT", f"/skills/{skill_name}/resources/{resource_key}",
+            json={"bindings": bindings},
+        )
+        return response.json()
+
+    async def unbind_skill_resource(
+        self, skill_name: str, resource_key: str,
+    ) -> dict[str, Any]:
+        """Remove all bindings for a resource."""
+        response = await self._request(
+            "DELETE", f"/skills/{skill_name}/resources/{resource_key}",
+        )
         return response.json()
 
     # ============================================================================

@@ -6,7 +6,7 @@
 >
 > 🔵 **Implementation Status**: `SkillManager` (install/uninstall/upgrade/rollback with full dependency validation, credential CRUD) and `SkillPipeline` (unified selection) are implemented.
 > Marketplace discovery, publishing, RBAC, and MatrixOne Publication distribution are Design Targets.
-> Skill Configuration Center (§13) — unified settings/secrets/resource-bindings with scope chain, validation, and management API — is Designed, not yet implemented. Will replace current `SkillUserCredential` table.
+> Skill Configuration Center (§13) — P0 (ORM models, config_center core, manifest parsing, require_executable validation, migration), P1 (REST API + CLI commands) are implemented. P2 (tenant-scope admin, config change events) remains.
 > Sandbox Mode (§11) promoted to P1 — mandatory for third-party skills before marketplace opens.
 > Skill Table Registry (§14), Historical Code Replay (§2), and Self-Learning Upgrade Path (§3) are Design Targets.
 >
@@ -2040,17 +2040,17 @@ board_id for PROJECT-A → skill_resource_bindings: 42
 
 #### Implementation Priority
 
-| Phase | Scope | Effort |
-|-------|-------|--------|
-| P0 | `skill_settings` + `skill_resource_bindings` tables | 0.5 day |
-| P0 | `SkillConfigCenter` core (set/get/resolve/validate) | 1.5 days |
-| P0 | Manifest parsing (`settings:` / `secrets:` / `resources:`) | 0.5 day |
-| P0 | Pre-execution validation in `require_executable()` | 0.5 day |
-| P0 | Migration from `skill_user_credentials` | 0.5 day |
-| P1 | REST API endpoints | 1 day |
-| P1 | CLI `mo-agent skill config` commands | 1 day |
-| P2 | Tenant-scope admin endpoints | 0.5 day |
-| P2 | Config change events | 0.5 day |
+| Phase | Scope | Effort | Status |
+|-------|-------|--------|--------|
+| P0 | `skill_settings` + `skill_resource_bindings` tables | 0.5 day | ✅ Done |
+| P0 | `SkillConfigCenter` core (set/get/resolve/validate) | 1.5 days | ✅ Done |
+| P0 | Manifest parsing (`settings:` / `secrets:` / `resources:`) | 0.5 day | ✅ Done |
+| P0 | Pre-execution validation in `require_executable()` | 0.5 day | ✅ Done |
+| P0 | Migration from `skill_user_credentials` | 0.5 day | ✅ Done |
+| P1 | REST API endpoints (`api/routers/skill_config.py`) | 1 day | ✅ Done |
+| P1 | CLI `mo-agent skill config` commands | 1 day | ✅ Done |
+| P2 | Tenant-scope admin endpoints | 0.5 day | |
+| P2 | Config change events | 0.5 day | |
 
 ---
 

@@ -119,6 +119,7 @@ def cmd_help(console, **_):
         ("/skill test <name>", "Test a skill with full output"),
         ("/skill dev <name>", "Enter AI-assisted skill dev mode"),
         ("/skill doctor", "Check skill health (orphaned, broken, mismatched)"),
+        ("/skill config <name>", "Show/manage skill configuration"),
         ("/explain", "Toggle explain mode (auto-show stats after each turn)"),
         ("/verbose", "Show status bar"),
         ("/compact", "Hide status bar"),
@@ -502,6 +503,11 @@ TODO: describe this skill for the LLM.
                 console.print(f"  [yellow]WARN[/yellow]: {msg}")
         return
 
+    # --- /skill config <name> [--set K=V | --validate | --list-resources | --resource K] ---
+    if sub == "config":
+        _cmd_skill_config(console, rest.strip(), client=client)
+        return
+
     # --- /skill example ---
     if sub == "example":
         console.print("[bold]Complete Skill Example[/bold]\n")
@@ -510,7 +516,7 @@ TODO: describe this skill for the LLM.
 
     console.print(
         "[dim]Usage: /skill list | new <name> | test <name> [args] "
-        "| validate <name> | dev <name> | doctor [name] | example[/dim]"
+        "| validate <name> | dev <name> | doctor [name] | config <name> | example[/dim]"
     )
 
 
@@ -563,6 +569,88 @@ def _cmd_skill_doctor(console, skill_name: str | None, client):
         console.print(f"[red]✗[/red] Error: {e}")
     finally:
         db.close()
+
+
+def _cmd_skill_config(console: "Console", args: str, client: "SyncAPIClient | None" = None) -> None:
+    """Show or manage skill configuration via API.
+
+    Usage:
+      /skill config <name>                          — show effective config
+      /skill config <name> --set K=V [--scope S]    — set a setting (scope: user|global)
+      /skill config <name> --validate [resource]    — validate required config
+      /skill config <name> --list-resources         — list configured resources
+    """
+    import shlex
+
+    parts = shlex.split(args) if args else []
+    if not parts:
+        console.print("[red]Usage: /skill config <name> [--set K=V | --validate | --list-resources][/red]")
+        return
+
+    skill_name = parts[0]
+    flags = parts[1:]
+
+    if not client:
+        console.print("[red]Not connected to API server[/red]")
+        return
+
+    try:
+        if not flags:
+            # Show effective config
+            data = client.get_skill_config(skill_name)
+            console.print(f"[bold]{skill_name}[/bold] config")
+            settings = data.get("settings", {})
+            if settings:
+                for k, v in settings.items():
+                    console.print(f"  {k} = {v}")
+            secrets = data.get("secrets", {})
+            if secrets:
+                for k in secrets:
+                    console.print(f"  {k} = [dim]***[/dim]")
+            rc = data.get("resources_configured", 0)
+            if rc:
+                console.print(f"  [dim]{rc} resource(s) configured[/dim]")
+            if not settings and not secrets:
+                console.print("  [dim]No config set[/dim]")
+            return
+
+        if flags[0] == "--set" and len(flags) >= 2:
+            kv = flags[1]
+            if "=" not in kv:
+                console.print("[red]Format: --set KEY=VALUE[/red]")
+                return
+            key, value = kv.split("=", 1)
+            scope = "user"
+            if len(flags) >= 4 and flags[2] == "--scope":
+                scope = flags[3]
+            client.set_skill_setting(skill_name, key, value, scope=scope)
+            console.print(f"[green]✓[/green] {skill_name}.{key} = {value} (scope={scope})")
+            return
+
+        if flags[0] == "--validate":
+            resource = flags[1] if len(flags) > 1 else None
+            data = client.validate_skill_config(skill_name, resource=resource)
+            if data["valid"]:
+                console.print(f"[green]✓[/green] {skill_name}: all required config present")
+            else:
+                console.print(f"[red]✗[/red] {skill_name}: missing config")
+                for e in data["errors"]:
+                    rk = f" [{e['resource_key']}]" if e.get("resource_key") else ""
+                    console.print(f"  • {e['section']}.{e['name']}{rk}: {e['error']}")
+            return
+
+        if flags[0] == "--list-resources":
+            resources = client.list_skill_resources(skill_name)
+            if not resources:
+                console.print(f"[dim]No resources configured for {skill_name}[/dim]")
+            else:
+                for r in resources:
+                    console.print(f"  • {r['resource_key']} ({r['resource_type']})")
+            return
+
+        console.print(f"[red]Unknown flag: {flags[0]}[/red]")
+    except Exception as e:
+        console.print(f"[red]✗[/red] Error: {e}")
 
 
 def _normalize_skill_name(name: str) -> str:
@@ -1726,6 +1814,147 @@ def skill_upgrade_check(ctx, skill_name, new_version):
             click.echo(f"⚠️  Upgrading {skill_name} to {new_version} would break:")
             for dep_name, constraint in broken:
                 click.echo(f"  • {dep_name} (requires {constraint})")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
+@skill.group("config")
+def skill_config_group() -> None:
+    """Manage skill configuration (settings, secrets, resources)."""
+
+
+@skill_config_group.command("show")
+@click.argument("skill_name")
+@click.pass_context
+def skill_config_show(ctx, skill_name) -> None:
+    """Show effective config for a skill."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    try:
+        data = client.get_skill_config(skill_name)
+        click.echo(f"Skill: {skill_name}")
+        click.echo(f"Settings: {json.dumps(data.get('settings', {}), indent=2)}")
+        secrets = data.get("secrets", {})
+        if secrets:
+            click.echo(f"Secrets: {', '.join(f'{k}=***' for k in secrets)}")
+        click.echo(f"Resources configured: {data.get('resources_configured', 0)}")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
+@skill_config_group.command("set")
+@click.argument("skill_name")
+@click.argument("key_value")
+@click.option("--scope", default="user", type=click.Choice(["user", "global"]))
+@click.pass_context
+def skill_config_set(ctx, skill_name, key_value, scope) -> None:
+    """Set a setting (KEY=VALUE)."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    if "=" not in key_value:
+        click.echo("❌ Format: KEY=VALUE")
+        return
+    key, value = key_value.split("=", 1)
+    try:
+        client.set_skill_setting(skill_name, key, value, scope=scope)
+        click.echo(f"✅ {skill_name}.{key} = {value} (scope={scope})")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
+@skill_config_group.command("delete")
+@click.argument("skill_name")
+@click.argument("setting_name")
+@click.option("--scope", default="user", type=click.Choice(["user", "global"]))
+@click.pass_context
+def skill_config_delete(ctx, skill_name, setting_name, scope) -> None:
+    """Delete a setting at a specific scope."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    try:
+        client.delete_skill_setting(skill_name, setting_name, scope=scope)
+        click.echo(f"✅ Deleted {skill_name}.{setting_name} (scope={scope})")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
+@skill_config_group.command("validate")
+@click.argument("skill_name")
+@click.option("--resource", default=None, help="Resource key to validate")
+@click.pass_context
+def skill_config_validate(ctx, skill_name, resource) -> None:
+    """Validate required config is present."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    try:
+        data = client.validate_skill_config(skill_name, resource=resource)
+        if data["valid"]:
+            click.echo(f"✅ {skill_name}: all required config present")
+        else:
+            click.echo(f"❌ {skill_name}: missing config")
+            for e in data["errors"]:
+                rk = f" [{e['resource_key']}]" if e.get("resource_key") else ""
+                click.echo(f"  • {e['section']}.{e['name']}{rk}: {e['error']}")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
+@skill_config_group.command("resources")
+@click.argument("skill_name")
+@click.pass_context
+def skill_config_resources(ctx, skill_name) -> None:
+    """List configured resources."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    try:
+        resources = client.list_skill_resources(skill_name)
+        if not resources:
+            click.echo(f"No resources configured for {skill_name}")
+            return
+        click.echo(f"Resources for {skill_name}:")
+        for r in resources:
+            click.echo(f"  • {r['resource_key']} ({r['resource_type']})")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
+@skill_config_group.command("bind")
+@click.argument("skill_name")
+@click.argument("resource_key")
+@click.argument("bindings", nargs=-1)
+@click.pass_context
+def skill_config_bind(ctx, skill_name, resource_key, bindings) -> None:
+    """Bind resource credentials (KEY=VALUE pairs)."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    binding_dict = {}
+    for b in bindings:
+        if "=" not in b:
+            click.echo(f"❌ Invalid binding: {b} (expected KEY=VALUE)")
+            return
+        k, v = b.split("=", 1)
+        binding_dict[k] = v
+    if not binding_dict:
+        click.echo("❌ No bindings provided")
+        return
+    try:
+        client.bind_skill_resource(skill_name, resource_key, binding_dict)
+        click.echo(f"✅ Bound {len(binding_dict)} value(s) to {resource_key}")
+    except Exception as e:
+        click.echo(f"❌ Error: {e}")
+
+
+@skill_config_group.command("unbind")
+@click.argument("skill_name")
+@click.argument("resource_key")
+@click.pass_context
+def skill_config_unbind(ctx, skill_name, resource_key) -> None:
+    """Remove all bindings for a resource."""
+    client = ctx.obj["client"]
+    require_auth(client)
+    try:
+        result = client.unbind_skill_resource(skill_name, resource_key)
+        click.echo(f"✅ Removed {result.get('count', 0)} binding(s) for {resource_key}")
     except Exception as e:
         click.echo(f"❌ Error: {e}")
 

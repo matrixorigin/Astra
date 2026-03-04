@@ -226,7 +226,7 @@ class TestGlobalScope:
 
 
 class TestResourceBindings:
-    def test_bind_list_unbind(self, client, auth_headers, center):
+    def test_bind_list_unbind(self, client, auth_headers, test_user, center, db, cred_mgr):
         # Bind
         resp = client.put(
             "/skills/github/resources/matrixorigin/matrixone",
@@ -235,6 +235,28 @@ class TestResourceBindings:
         )
         assert resp.status_code == 200
         assert resp.json()["resource_key"] == "matrixorigin/matrixone"
+
+        # DB ground truth — verify every field
+        rows = db.query(SkillResourceBinding).filter_by(
+            user_id=test_user.user_id,
+            skill_name="github",
+            resource_key="matrixorigin/matrixone",
+        ).all()
+        assert len(rows) == 2
+        by_name = {r.binding_name: r for r in rows}
+
+        # read_token: secret binding
+        rt = by_name["read_token"]
+        assert rt.resource_type == "repo"
+        assert rt.is_secret == 1
+        assert rt.binding_value != "ghp_abc"
+        assert cred_mgr.decrypt(rt.binding_value) == "ghp_abc"
+        assert rt.created_at is not None
+
+        # default_branch: plaintext binding
+        db_row = by_name["default_branch"]
+        assert db_row.is_secret == 0
+        assert db_row.binding_value == "develop"
 
         # List
         resp = client.get("/skills/github/resources", headers=auth_headers)
@@ -250,7 +272,15 @@ class TestResourceBindings:
             headers=auth_headers,
         )
         assert resp.status_code == 200
-        assert resp.json()["count"] >= 1
+        assert resp.json()["count"] == 2
+
+        # DB ground truth — rows gone
+        remaining = db.query(SkillResourceBinding).filter_by(
+            user_id=test_user.user_id,
+            skill_name="github",
+            resource_key="matrixorigin/matrixone",
+        ).count()
+        assert remaining == 0
 
         # List again — empty
         resp = client.get("/skills/github/resources", headers=auth_headers)
