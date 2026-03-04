@@ -148,6 +148,9 @@ class ChatLoop:
         self._escalated_model: str | None | object = _UNSET  # SLO escalation cache
         self._memory_store = None  # For tool output storage
         self._budget_manager = None  # Global context budget manager
+        # Circuit breaker state (per-turn, reset on each run_step call)
+        self._tool_failures: dict[str, list[str]] = {}
+        self._blocked_tools: set[str] = set()
         try:
             from core.context.few_shot import FewShotRetriever
             if hasattr(llm_client, '_db_factory'):
@@ -298,8 +301,9 @@ class ChatLoop:
 
         # 6. Multi-turn tool use loop
         last_skill_name: str | None = None
-        # Reset turn budget tracker for this turn
+        # Reset turn budget tracker and circuit breaker for this turn
         self._turn_budget = None
+        self._reset_breaker()
         for _round in range(MAX_TOOL_ROUNDS):
 
             # Compact if approaching context limit
@@ -395,6 +399,12 @@ class ChatLoop:
                 raw_args = tc["function"]["arguments"]
                 tc_id = tc.get("id", fn_name)
 
+                # Circuit breaker check
+                if self._is_tool_blocked(fn_name):
+                    result_str = json.dumps({"error": f"Tool {fn_name} is blocked by circuit breaker"})
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": result_str})
+                    continue
+
                 # Log tool start
                 self.event_logger.create_stream_event(
                     user_id=user_id,
@@ -479,11 +489,13 @@ class ChatLoop:
                     result_str = (
                         json.dumps(result, default=str) if not isinstance(result, str) else result
                     )
+                    self._record_tool_success(fn_name)
                     if self.hitl_policy:
                         self.hitl_policy.record_outcome(fn_name, success=True)
                 except Exception as e:
                     logger.error(f"Skill {fn_name} failed: {e}")
                     result_str = json.dumps({"error": str(e)})
+                    self._record_tool_failure(fn_name, str(e))
                     if self.hitl_policy:
                         self.hitl_policy.record_outcome(fn_name, success=False)
 
@@ -505,37 +517,25 @@ class ChatLoop:
                     metadata=metadata
                 )
 
-                # Process tool output: large results → store in mo-trustmem + return summary
+                # Process tool output unconditionally: large results → summarize (+ store if memory available)
                 from core.agent.tool_output_handler import process_tool_output
-                if getattr(self, '_memory_store', None):
-                    # Use turn budget tracker for cumulative control
-                    remaining = None
-                    force_summarize = False
-                    if not hasattr(self, '_turn_budget') or self._turn_budget is None:
-                        from core.context.budget_manager import TurnBudgetTracker
-                        # Allow max 30K tokens for all tool outputs in a turn
-                        self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
-                    
-                    # Check if should force summarize due to cumulative budget
-                    force_summarize = self._turn_budget.should_force_summarize(len(result_str))
-                    remaining = self._turn_budget.remaining
-                    
-                    result_str = process_tool_output(
-                        output=result_str,
-                        tool_name=fn_name,
-                        session_id=session_id,
-                        user_id=user_id,
-                        memory_store=self._memory_store,
-                        turn_event_id=user_event.event_id,
-                        remaining_tokens=remaining,
-                        force_full=False,  # Let budget tracker decide
-                    )
-                    
-                    # Record usage after processing (use processed size)
-                    self._turn_budget.record(len(result_str))
-                else:
-                    from core.context.compaction import truncate_tool_result
-                    result_str = truncate_tool_result(result_str)
+                # Use turn budget tracker for cumulative control
+                if not hasattr(self, '_turn_budget') or self._turn_budget is None:
+                    from core.context.budget_manager import TurnBudgetTracker
+                    self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
+                
+                remaining = self._turn_budget.remaining
+                result_str = process_tool_output(
+                    output=result_str,
+                    tool_name=fn_name,
+                    session_id=session_id,
+                    user_id=user_id,
+                    memory_store=self._memory_store,  # May be None — handled gracefully
+                    turn_event_id=user_event.event_id,
+                    remaining_tokens=remaining,
+                    force_full=False,
+                )
+                self._turn_budget.record(len(result_str))
                 
                 # Hard limit: no single tool result should exceed this regardless of other processing
                 if len(result_str) > MAX_SINGLE_TOOL_RESULT_CHARS:
@@ -565,6 +565,17 @@ class ChatLoop:
                         })
                 except Exception:
                     pass
+
+            # Task 1.2: Check if all tools are blocked after this round
+            if self._all_tools_blocked(tools_schema):
+                failure_report = self._build_failure_report()
+                self._log_response(
+                    user_id, session_id, failure_report,
+                    user_event.event_id, user_event.causal_chain_id,
+                    messages=messages,
+                    firewall_result=None,
+                )
+                return failure_report
 
         # Exhausted rounds — ask LLM for a final answer without tools
         messages.append(
@@ -616,6 +627,19 @@ class ChatLoop:
         messages: list[dict],
     ) -> AsyncIterator[StreamEvent]:
         """Execute a single tool call — extracted to share between parallel-delegation and sequential paths."""
+        # Circuit breaker check
+        if self._is_tool_blocked(fn_name):
+            result_str = json.dumps({"error": f"Tool {fn_name} is blocked by circuit breaker"})
+            yield StreamEvent(
+                event_type=StreamEventType.TOOL_RESULT,
+                data={"call_id": tc["id"], "result": result_str, "blocked": True},
+                event_id=user_event.event_id,
+                causal_chain_id=user_event.causal_chain_id,
+                agent_id=self.agent_id,
+            )
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+            return
+
         tool_start_event = self.event_logger.create_stream_event(
             user_id=user_id,
             session_id=session_id,
@@ -707,11 +731,13 @@ class ChatLoop:
                             timeout=TOOL_TIMEOUT_SECONDS,
                         )
                     result_str = json.dumps(result, default=str) if not isinstance(result, str) else result
+                    self._record_tool_success(fn_name)
                     if self.hitl_policy:
                         self.hitl_policy.record_outcome(fn_name, success=True)
         except Exception as e:
             logger.error(f"Tool {fn_name} failed: {e}")
             result_str = json.dumps({"error": str(e)})
+            self._record_tool_failure(fn_name, str(e))
             if self.hitl_policy:
                 self.hitl_policy.record_outcome(fn_name, success=False)
         finally:
@@ -747,25 +773,23 @@ class ChatLoop:
             causal_chain_id=user_event.causal_chain_id,
             agent_id=self.agent_id,
         )
-        # Process tool output: large results → store in mo-trustmem + return summary
+        # Process tool output unconditionally: large results → summarize (+ store if memory available)
         from core.agent.tool_output_handler import process_tool_output
-        if getattr(self, '_memory_store', None):
-            # Use turn budget tracker for cumulative control
-            if not hasattr(self, '_turn_budget') or self._turn_budget is None:
-                from core.context.budget_manager import TurnBudgetTracker
-                self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
-            
-            remaining = self._turn_budget.remaining
-            result_str = process_tool_output(
-                output=result_str,
-                tool_name=fn_name,
-                session_id=session_id,
-                user_id=user_id,
-                memory_store=self._memory_store,
-                turn_event_id=user_event.event_id,
-                remaining_tokens=remaining,
-            )
-            self._turn_budget.record(len(result_str))
+        if not hasattr(self, '_turn_budget') or self._turn_budget is None:
+            from core.context.budget_manager import TurnBudgetTracker
+            self._turn_budget = TurnBudgetTracker(max_tool_output_tokens=30000)
+        
+        remaining = self._turn_budget.remaining
+        result_str = process_tool_output(
+            output=result_str,
+            tool_name=fn_name,
+            session_id=session_id,
+            user_id=user_id,
+            memory_store=getattr(self, '_memory_store', None),
+            turn_event_id=user_event.event_id,
+            remaining_tokens=remaining,
+        )
+        self._turn_budget.record(len(result_str))
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
 
         # If skill returned success=False, inject a hard stop to prevent LLM from
@@ -1004,9 +1028,43 @@ class ChatLoop:
 
         # Multi-turn tool use loop with streaming
         last_skill_name: str | None = None
-        # Reset turn budget tracker for this turn
+        # Reset turn budget tracker and circuit breaker for this turn
         self._turn_budget = None
-        for _round in range(MAX_TOOL_ROUNDS):
+        self._reset_breaker()
+
+        # Task 2.2: Intent routing — classify and potentially restrict tools/rounds
+        # Only restrict when the skill pipeline already selected tools.
+        # CONVERSATIONAL: only override if no tools were selected by pipeline
+        # (the existing `not tools_schema` path already handles plain chat).
+        # EXTERNAL_FETCH: filter local tools from the selected set.
+        _effective_max_rounds = MAX_TOOL_ROUNDS
+        from core.skills.intent_router import classify_intent
+        _intent = classify_intent(user_input)
+        if _intent.intent == "EXTERNAL_FETCH" and tools_schema:
+            from core.agent.pipeline_stages import _LOCAL_TOOLS
+            tools_schema = [
+                t for t in tools_schema
+                if t.get("function", {}).get("name") not in _LOCAL_TOOLS
+            ]
+            _effective_max_rounds = min(_effective_max_rounds, 3)
+            logger.info("Intent router: EXTERNAL_FETCH — filtered to %d tools, max %d rounds",
+                        len(tools_schema), _effective_max_rounds)
+
+        # Log intent classification event for future learning
+        self.event_logger.create_stream_event(
+            user_id=user_id,
+            session_id=session_id,
+            event_type="stream_intent_classification",
+            content=json.dumps({
+                "intent": _intent.intent,
+                "confidence": _intent.confidence,
+                "matched_keywords": _intent.matched_keywords,
+            }),
+            parent_event_id=user_event.event_id,
+            causal_chain_id=user_event.causal_chain_id,
+        )
+
+        for _round in range(_effective_max_rounds):
 
             # Compact if approaching context limit
             from core.context.compaction import compact, compact_history_messages, needs_compaction
@@ -1260,6 +1318,31 @@ class ChatLoop:
                         yield evt
                         if evt.data.get("wait_for"):
                             return
+
+            # Task 1.2: Check if all tools are blocked after this round
+            if self._all_tools_blocked(tools_schema):
+                failure_report = self._build_failure_report()
+                yield StreamEvent(
+                    event_type=StreamEventType.TEXT_DELTA,
+                    data={"chunk": failure_report},
+                    event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                    agent_id=self.agent_id,
+                )
+                self._log_response(
+                    user_id, session_id, failure_report,
+                    user_event.event_id, user_event.causal_chain_id,
+                    messages=messages,
+                    firewall_result=None,
+                )
+                yield StreamEvent(
+                    event_type=StreamEventType.RUN_FINISHED,
+                    data={"failure": "all_tools_blocked"},
+                    event_id=user_event.event_id,
+                    causal_chain_id=user_event.causal_chain_id,
+                    agent_id=self.agent_id,
+                )
+                return
 
         # Exhausted rounds — ask LLM for a final answer without tools
         messages.append(
@@ -1675,6 +1758,163 @@ class ChatLoop:
         )
 
     # ------------------------------------------------------------------
+    # Pipeline integration (Task 0.4)
+    # ------------------------------------------------------------------
+
+    def _make_llm_call(self, model: str | None = None):
+        """Create an async LLM call adapter for the pipeline engine."""
+        async def llm_call(messages, tools, **kw):
+            from core.context.compaction import compact, compact_history_messages, needs_compaction
+            max_tokens = self.llm.config.get("max_context_tokens", 128000)
+
+            def _summarize(text: str) -> str:
+                try:
+                    result = self.llm.chat([{"role": "user", "content": f"Summarize concisely:\n{text}"}])
+                    return result.get("content", text[:1000])
+                except Exception:
+                    return text[:1000]
+
+            messages = compact_history_messages(messages)
+            if isinstance(max_tokens, int) and needs_compaction(messages, max_tokens):
+                messages = compact(messages, max_tokens, llm_summarize=_summarize)
+
+            if not tools:
+                response = self.llm.chat(
+                    messages=[LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages],
+                    model=model,
+                )
+                return {"content": response.content or "", "tool_calls": []}
+
+            try:
+                return self.llm.chat_with_tools(
+                    messages=messages, tools=tools, tool_choice="auto", model=model,
+                )
+            except Exception as e:
+                if "context length" in str(e).lower() or "token" in str(e).lower():
+                    logger.warning("Context length exceeded, forcing compaction")
+                    messages = compact(messages, max_tokens // 2, llm_summarize=_summarize)
+                    return self.llm.chat_with_tools(
+                        messages=messages, tools=tools, tool_choice="auto", model=model,
+                    )
+                raise
+        return llm_call
+
+    def _make_tool_execute(self, session_id: str, user_id: str, user_input: str, user_event):
+        """Create an async tool execute adapter for the pipeline engine."""
+        async def tool_execute(fn_name: str, params: dict, **kw):
+            from core.verification.cot_audit import audit_tool_call
+            audit = audit_tool_call(
+                user_query=user_input,
+                tool_name=fn_name,
+                tool_args=params,
+                assistant_reasoning="",
+                llm_client=self.llm,
+            )
+            if not audit.safe:
+                raise RuntimeError(f"Blocked by CoT audit: {audit.reason}")
+
+            hitl_ok, hitl_msg = self._evaluate_hitl(fn_name, params)
+            if not hitl_ok:
+                raise RuntimeError(hitl_msg)
+
+            from core.agent.async_tools import get_async_tool_registry
+            _async_registry = get_async_tool_registry()
+
+            if _async_registry.is_async_tool(fn_name):
+                return await _async_registry.execute(fn_name, params, run_id=getattr(self, '_current_run_id', None))
+            elif fn_name.startswith("scratchpad_") and self.scratchpad:
+                return self._handle_scratchpad_tool(fn_name, params, session_id, user_id)
+            elif self.mcp_bridge and self.mcp_bridge.is_mcp_tool(fn_name):
+                return await asyncio.wait_for(
+                    self.mcp_bridge.call_tool(fn_name, params), timeout=TOOL_TIMEOUT_SECONDS,
+                )
+            else:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.executor.execute_skill_with_feedback,
+                        skill_name=fn_name,
+                        params=params,
+                        session_id=session_id,
+                        parent_event_id=user_event.event_id,
+                        selection_event_id=self._last_selection_event_id,
+                    ),
+                    timeout=TOOL_TIMEOUT_SECONDS,
+                )
+        return tool_execute
+
+    async def _execute_turn_pipeline(
+        self,
+        state,
+        model: str | None = None,
+        classify_intent=None,
+    ):
+        """Bridge between ChatLoop and the pipeline engine.
+
+        Yields TurnEvent objects from the pipeline.
+        """
+        from core.agent.pipeline_stages import execute_turn
+
+        async def final_answer_call(messages, **kw):
+            response = self.llm.chat(
+                messages=[LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages],
+                model=model,
+            )
+            return response.content or ""
+
+        async for event in execute_turn(
+            state,
+            llm_call=self._make_llm_call(model),
+            tool_execute=self._make_tool_execute(
+                state.session_id, state.user_id, state.user_input, state.user_event,
+            ),
+            classify_intent=classify_intent,
+            final_answer_call=final_answer_call,
+        ):
+            yield event
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Circuit breaker helpers (Task 1.1)
+    # ------------------------------------------------------------------
+
+    def _reset_breaker(self) -> None:
+        """Reset per-turn breaker state."""
+        self._tool_failures = {}
+        self._blocked_tools = set()
+
+    def _is_tool_blocked(self, fn_name: str) -> bool:
+        return fn_name in self._blocked_tools
+
+    def _record_tool_failure(self, fn_name: str, error_msg: str) -> None:
+        """Record a tool failure and check if breaker should trip."""
+        self._tool_failures.setdefault(fn_name, []).append(error_msg)
+        from core.agent.pipeline_stages import _should_break
+        if _should_break(self._tool_failures[fn_name]):
+            self._blocked_tools.add(fn_name)
+            logger.warning("Circuit breaker tripped for tool %s", fn_name)
+
+    def _record_tool_success(self, fn_name: str) -> None:
+        """Clear failure history on success."""
+        self._tool_failures.pop(fn_name, None)
+
+    def _all_tools_blocked(self, tools_schema: list[dict]) -> bool:
+        """Check if all available tools are blocked."""
+        active = [
+            t for t in tools_schema
+            if t.get("function", {}).get("name") not in self._blocked_tools
+        ]
+        return len(active) == 0 and len(tools_schema) > 0
+
+    def _build_failure_report(self) -> str:
+        """Build user-facing failure report from breaker state."""
+        lines = ["I was unable to complete the task. The following tools encountered repeated errors:"]
+        for tool, errors in self._tool_failures.items():
+            if tool in self._blocked_tools:
+                last_err = errors[-1] if errors else "unknown error"
+                lines.append(f"- **{tool}**: {last_err}")
+        lines.append("\nPlease check the tool configuration or try a different approach.")
+        return "\n".join(lines)
+
     # Helpers
     # ------------------------------------------------------------------
 

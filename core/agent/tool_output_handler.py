@@ -233,7 +233,7 @@ def process_tool_output(
     tool_name: str,
     session_id: str,
     user_id: str,
-    memory_store: MemoryStore,
+    memory_store: MemoryStore | None,
     turn_event_id: str | None = None,
     remaining_tokens: int | None = None,
     force_full: bool = False,  # Force return full content (no summarization)
@@ -245,7 +245,7 @@ def process_tool_output(
         tool_name: Name of the tool (grep, shell, etc.)
         session_id: Current session ID
         user_id: Current user ID
-        memory_store: mo-trustmem MemoryStore instance
+        memory_store: mo-trustmem MemoryStore instance (None = truncation-only fallback)
         turn_event_id: Optional event ID for provenance tracking
         remaining_tokens: Optional remaining context budget for dynamic threshold
         force_full: Force return full content (skip summarization check)
@@ -264,6 +264,13 @@ def process_tool_output(
         record_tool_output(tool_name, len(output), len(output), was_summarized=False)
         return output
     
+    # No memory store — fall back to rule-based summary + truncation
+    if memory_store is None:
+        summary = generate_structured_summary(output, tool_name)
+        result = f"{summary}\n\n[Full output ({len(output)} bytes) — truncated, no memory store]"
+        record_tool_output(tool_name, len(output), len(result), was_summarized=True)
+        return result
+
     # 1. Store full output in mo-trustmem
     import uuid
     from core.memory.types import Memory

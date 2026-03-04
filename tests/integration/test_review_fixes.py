@@ -87,6 +87,8 @@ class TestParallelDelegationMixedTools:
         loop.mcp_bridge = None
         loop.scratchpad = None
         loop._last_selection_event_id = None
+        loop._tool_failures = {}
+        loop._blocked_tools = set()
         loop._pipeline = MagicMock()
         loop._evaluate_hitl = MagicMock(return_value=(True, ""))
         loop.llm = MagicMock()
