@@ -1737,6 +1737,7 @@ async def chat_turn(
                 # edge tool_calls or a final text answer.
                 _MAX_CLOUD_LOOPS = 5
                 _current_llm_messages = llm_messages
+                _cloud_skill_failed = False
 
                 for _cloud_loop in range(_MAX_CLOUD_LOOPS + 1):
                     _loop_text = ""
@@ -1800,6 +1801,10 @@ async def chat_turn(
 
                     if not _loop_tool_calls:
                         # No tool calls — final answer, exit loop.
+                        break
+
+                    # If a previous cloud skill failed, ignore any new tool_calls from LLM.
+                    if _cloud_skill_failed:
                         break
 
                     # Partition tool_calls into cloud vs edge.
@@ -1911,9 +1916,11 @@ async def chat_turn(
                             break
 
                     # If a cloud skill failed, stop the entire cloud loop — do not call LLM again.
+                    # Instead, do one final LLM call with the hard-stop message to get a text reply.
                     if _cloud_skill_failed:
-                        tool_calls = []  # prevent emitting remaining tool_calls to edge
-                        break
+                        tool_calls = []
+                        # Loop will continue → LLM sees tool_result + hard-stop → returns text only
+                        continue
 
                     # If there are also edge tool_calls, emit them and break.
                     # The edge will execute them and send results in the next /chat/turn.
