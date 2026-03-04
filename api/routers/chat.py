@@ -1884,9 +1884,25 @@ async def chat_turn(
                                 yield f"data: {json.dumps({'type': 'tool_result_quality', 'tool_name': tc_name, 'grade': _cqa.grade, 'score': _cqa.score, 'signals': _cqa.signals[:5]})}\n\n"
                                 cloud_result = _annotate_tool_result({"result": cloud_result}, _cqa)["result"]
                         # Append tool result to messages for next LLM call.
-                        _current_llm_messages = _current_llm_messages + [
-                            {"role": "tool", "tool_call_id": tc_id, "content": truncate_tool_result(cloud_result)}
-                        ]
+                        _tool_msg: dict[str, Any] = {"role": "tool", "tool_call_id": tc_id, "content": truncate_tool_result(cloud_result)}
+                        _current_llm_messages = _current_llm_messages + [_tool_msg]
+
+                        # If skill returned success=False, inject a hard stop to prevent LLM from
+                        # retrying with different params or using bash/curl to work around the failure.
+                        try:
+                            _cr_parsed = json.loads(cloud_result) if isinstance(cloud_result, str) else cloud_result
+                            if isinstance(_cr_parsed, dict) and _cr_parsed.get("success") is False:
+                                _current_llm_messages = _current_llm_messages + [{
+                                    "role": "system",
+                                    "content": (
+                                        "The skill returned success=False. "
+                                        "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
+                                        "Do NOT use bash, curl, grep, or any other tool to work around this. "
+                                        "Report the error directly to the user and ask them to clarify."
+                                    ),
+                                }]
+                        except Exception:
+                            pass
 
                     # If there are also edge tool_calls, emit them and break.
                     # The edge will execute them and send results in the next /chat/turn.
