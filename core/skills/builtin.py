@@ -2,6 +2,9 @@
 
 import logging
 
+from pydantic import field_validator
+from sqlalchemy.orm import Session
+
 from core.llm import LLMClient
 from core.skills.base import (
     AccessScope,
@@ -14,8 +17,6 @@ from core.skills.base import (
     SkillRequirement,
 )
 from core.skills.github_client import GitHubClient
-from sqlalchemy.orm import Session
-from api.database import get_db_session
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,11 @@ class SummarizePRSkill(Skill[SummarizePRInput, SummarizePROutput]):
 
     name = "summarize_pr"
     version = "1.0.0"
-    description = "Summarize a GitHub PR with LLM analysis"
+    description = (
+        "Summarize a specific GitHub PR using LLM analysis — includes diff review, "
+        "change description, and impact assessment. Use this when user asks to review, "
+        "explain, or understand a specific PR. Requires repo ('owner/repo') and pr_number."
+    )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=True
     )
@@ -127,7 +132,12 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
 
     name = "list_prs"
     version = "1.0.0"
-    description = "List open/closed PRs in a GitHub repository. Requires repo in 'owner/repo' format, e.g. 'matrixorigin/matrixone'"
+    description = (
+        "List pull requests in a GitHub repository. "
+        "Use this when user asks about PRs, recent changes, or what's being worked on. "
+        "Requires repo in 'owner/repo' format, e.g. 'matrixorigin/matrixone'. "
+        "Use state='open' for active PRs, 'closed' for merged/closed, 'all' for both."
+    )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
     )
@@ -183,7 +193,12 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
 
     name = "ci_status"
     version = "1.0.0"
-    description = "Check CI workflow status in a GitHub repository. Requires repo in 'owner/repo' format"
+    description = (
+        "Check CI/CD workflow run status in a GitHub repository — shows recent workflow runs "
+        "with pass/fail/pending status. Use this when user asks about build status, CI failures, "
+        "or whether tests are passing. For checking CI on a specific PR, use get_pr_checks instead. "
+        "Requires repo in 'owner/repo' format."
+    )
     requirements = SkillRequirement(
         repo_types=[RepoType.CI, RepoType.CODE],
         min_access=AccessScope.READ,
@@ -217,6 +232,174 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
 
 
 # ============================================================================
+# List Issues Skill
+# ============================================================================
+
+
+class ListIssuesInput(SkillInput):
+    """Input for list_issues skill"""
+
+    repo: str = ""  # "owner/repo"
+    state: str = "open"  # open, closed, all
+    labels: list[str] | None = None
+    sort: str = "created"  # created, updated, comments
+    direction: str = "desc"  # asc, desc
+    since: str | None = None  # ISO datetime
+    assignee: str | None = None  # login, 'none', '*'
+    creator: str | None = None  # login
+    milestone: str | None = None  # title, 'none', '*'
+    limit: int = 10
+    detail: str = "brief"  # brief, normal, full
+
+
+class ListIssuesOutput(SkillOutput):
+    """Output for list_issues skill"""
+
+    issues: list[dict]
+
+
+class ListIssuesSkill(Skill[ListIssuesInput, ListIssuesOutput]):
+    """List issues in a repository (excludes PRs)"""
+
+    name = "list_issues"
+    version = "1.0.0"
+    description = (
+        "List issues in a GitHub repository (excludes pull requests). "
+        "Use when user asks about bugs, feature requests, or open issues. "
+        "Requires repo in 'owner/repo' format. "
+        "Filters: state (open/closed/all), labels, assignee, creator, milestone, since (ISO datetime). "
+        "Sort: created/updated/comments, direction: asc/desc. "
+        "Detail: 'brief' for lists, 'normal' adds body/assignees, 'full' adds reactions/comments."
+    )
+    requirements = SkillRequirement(
+        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ, external_apis=["github"]
+    )
+
+    def __init__(self, github: GitHubClient, session: Session | None = None):
+        self.github = github
+
+    async def execute(self, input: ListIssuesInput) -> ListIssuesOutput:
+        repo = input.repo or input.repo_id
+        if not repo:
+            return ListIssuesOutput(success=False, result="repo is required (e.g. 'matrixorigin/matrixone')", issues=[])
+        issues = await self.github.list_issues(
+            repo, input.state, input.labels, input.sort, input.direction,
+            input.since, input.assignee, input.creator, input.milestone,
+            input.limit, input.detail,
+        )
+        return ListIssuesOutput(success=True, result=issues, issues=issues)
+
+
+# ============================================================================
+# Get Issue Skill
+# ============================================================================
+
+
+class GetIssueInput(SkillInput):
+    """Input for get_issue skill"""
+
+    repo: str = ""  # "owner/repo"
+    issue_number: int
+    detail: str = "normal"  # brief, normal, full
+
+
+class GetIssueOutput(SkillOutput):
+    """Output for get_issue skill"""
+
+    issue: dict
+
+
+class GetIssueSkill(Skill[GetIssueInput, GetIssueOutput]):
+    """Get details of a specific issue"""
+
+    name = "get_issue"
+    version = "1.0.0"
+    description = (
+        "Get details of a specific GitHub issue by number. "
+        "Detail: 'brief' for summary, 'normal' (default) adds body/assignees/milestone, "
+        "'full' adds reactions, closed_by, and recent comments. "
+        "Use when user asks about a specific issue."
+    )
+    requirements = SkillRequirement(
+        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ, external_apis=["github"]
+    )
+
+    def __init__(self, github: GitHubClient, session: Session | None = None):
+        self.github = github
+
+    async def execute(self, input: GetIssueInput) -> GetIssueOutput:
+        repo = input.repo or input.repo_id
+        if not repo:
+            return GetIssueOutput(success=False, result="repo is required", issue={})
+        issue = await self.github.get_issue(repo, input.issue_number, input.detail)
+        return GetIssueOutput(success=True, result=issue, issue=issue)
+
+
+# ============================================================================
+# Create Issue Skill
+# ============================================================================
+
+
+class CreateIssueInput(SkillInput):
+    """Input for create_issue skill"""
+
+    repo: str = ""  # "owner/repo"
+    title: str  # non-empty enforced by Pydantic validator
+    body: str = ""
+    labels: list[str] | None = None
+    assignees: list[str] | None = None
+
+    @field_validator("title")
+    @classmethod
+    def title_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("title must not be empty")
+        return v
+
+
+class CreateIssueOutput(SkillOutput):
+    """Output for create_issue skill"""
+
+    issue: dict
+
+
+class CreateIssueSkill(Skill[CreateIssueInput, CreateIssueOutput]):
+    """Create a new GitHub issue"""
+
+    name = "create_issue"
+    version = "1.0.0"
+    description = (
+        "Create a new GitHub issue. Use when user asks to file a bug report, "
+        "feature request, or any new issue. Requires repo ('owner/repo') and title. "
+        "Optionally set body, labels, and assignees."
+    )
+    requirements = SkillRequirement(
+        repo_types=[RepoType.CODE], min_access=AccessScope.WRITE, llm_required=False
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.WRITE, external_apis=["github"]
+    )
+
+    def __init__(self, github: GitHubClient, session: Session | None = None):
+        self.github = github
+
+    async def execute(self, input: CreateIssueInput) -> CreateIssueOutput:
+        repo = input.repo or input.repo_id
+        if not repo:
+            return CreateIssueOutput(success=False, result="repo is required", issue={})
+        issue = await self.github.create_issue(
+            repo, input.title, input.body, input.labels, input.assignees
+        )
+        return CreateIssueOutput(success=True, result=issue, issue=issue)
+
+
+# ============================================================================
 # Execute Code Skill
 # ============================================================================
 
@@ -247,7 +430,11 @@ class ExecuteCodeSkill(Skill[ExecuteCodeInput, ExecuteCodeOutput]):
 
     name = "execute_code"
     version = "1.0.0"
-    description = "Execute Python code in isolated environment with optional database access"
+    description = (
+        "Execute Python code in isolated environment with optional database access. "
+        "Use when user asks to run code, query data, or perform calculations. "
+        "Set data_access='read' and source_db to query a database."
+    )
     requirements = SkillRequirement(
         repo_types=[],
         min_access=AccessScope.WRITE,
@@ -346,6 +533,33 @@ def register_builtin_skills(
             "github",
             "ci_cd",
             ["ci", "build", "workflow", "status"],
+            [],
+            7,
+            "low",
+        ),
+        (
+            ListIssuesSkill(github),
+            "github",
+            "issue_management",
+            ["issues", "bugs", "feature requests", "open issues"],
+            [],
+            5,
+            "low",
+        ),
+        (
+            GetIssueSkill(github),
+            "github",
+            "issue_management",
+            ["issue", "bug", "issue details"],
+            [],
+            5,
+            "low",
+        ),
+        (
+            CreateIssueSkill(github),
+            "github",
+            "issue_management",
+            ["create issue", "file bug", "report issue", "new issue"],
             [],
             7,
             "low",

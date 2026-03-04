@@ -16,10 +16,11 @@ import asyncio
 import os
 import time
 
+from sqlalchemy.orm import Session
+
 from config.settings import get_settings
 from core.logging_config import get_logger
 from skills.github.api import GitHubSkillAPI
-from sqlalchemy.orm import Session
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -96,6 +97,23 @@ class GitHubClient:
 
     async def list_wf_runs(self, repo_id, limit: int = 5) -> list[dict]:
         return await self._api.list_wf_runs(self._resolve_repo(repo_id), limit)
+
+    async def list_issues(
+        self, repo_id, state: str = "open", labels: list[str] | None = None,
+        sort: str = "created", direction: str = "desc", since: str | None = None,
+        assignee: str | None = None, creator: str | None = None,
+        milestone: str | None = None, limit: int = 10, detail: str = "brief",
+    ) -> list[dict]:
+        return await self._api.list_issues(
+            self._resolve_repo(repo_id), state, labels, sort, direction,
+            since, assignee, creator, milestone, limit, detail,
+        )
+
+    async def get_issue(self, repo_id, issue_number: int, detail: str = "normal") -> dict:
+        return await self._api.get_issue(self._resolve_repo(repo_id), issue_number, detail)
+
+    async def create_issue(self, repo_id, title: str, body: str = "", labels: list[str] | None = None, assignees: list[str] | None = None) -> dict:
+        return await self._api.create_issue(self._resolve_repo(repo_id), title, body, labels, assignees)
 
     def get_rate_limit(self) -> dict:
         return self._api.get_rate_limit()

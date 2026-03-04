@@ -243,6 +243,194 @@ class GitHubSkillAPI:
             ) from e
 
     # ------------------------------------------------------------------
+    # Issue operations
+    # ------------------------------------------------------------------
+
+    _VALID_DETAIL_LEVELS = frozenset({"brief", "normal", "full"})
+
+    @staticmethod
+    def _format_issue(issue, detail: str = "normal") -> dict:
+        """Format an issue object at the requested detail level.
+
+        detail levels:
+          brief  — number, title, state, user, labels, html_url (list-friendly)
+          normal — brief + body, assignees, created/updated, comments, milestone
+          full   — normal + reactions, closed_at, closed_by, state_reason, locked,
+                   timeline (recent comments)
+        """
+        if detail not in GitHubSkillAPI._VALID_DETAIL_LEVELS:
+            raise ValueError(f"Invalid detail level {detail!r}, must be one of: brief, normal, full")
+        d: dict = {
+            "number": issue.number,
+            "title": issue.title,
+            "state": issue.state,
+            "user": issue.user.login,
+            "labels": [lb.name for lb in issue.labels],
+            "html_url": issue.html_url,
+        }
+        if detail == "brief":
+            return d
+        # normal
+        d.update({
+            "body": issue.body or "",
+            "assignees": [a.login for a in issue.assignees],
+            "created_at": issue.created_at.isoformat(),
+            "updated_at": issue.updated_at.isoformat(),
+            "comments": issue.comments,
+            "milestone": issue.milestone.title if issue.milestone else None,
+        })
+        if detail == "normal":
+            return d
+        # full
+        # PyGithub Issue.reactions is typed as dict (see github/Issue.py:301),
+        # so isinstance check is correct here — it guards against unexpected None.
+        d.update({
+            "reactions": issue.reactions if isinstance(issue.reactions, dict) else {},
+            "closed_at": issue.closed_at.isoformat() if issue.closed_at else None,
+            "closed_by": issue.closed_by.login if issue.closed_by else None,
+            "state_reason": getattr(issue, "state_reason", None),
+            "locked": issue.locked,
+        })
+        # Fetch recent comments (up to 5) — costs 1 extra API call.
+        # get_comments() returns a PaginatedList; break early to avoid fetching all pages.
+        try:
+            recent = []
+            for c in issue.get_comments():
+                if len(recent) >= 5:
+                    break
+                recent.append({
+                    "user": c.user.login,
+                    "created_at": c.created_at.isoformat(),
+                    "body": c.body[:500] if c.body else "",
+                })
+            d["recent_comments"] = recent
+        except Exception as exc:
+            logger.warning("Failed to fetch comments for issue #%s: %s", issue.number, exc)
+            d["recent_comments"] = []
+        return d
+
+    async def list_issues(
+        self,
+        repo: str,
+        state: str = "open",
+        labels: list[str] | None = None,
+        sort: str = "created",
+        direction: str = "desc",
+        since: str | None = None,
+        assignee: str | None = None,
+        creator: str | None = None,
+        milestone: str | None = None,
+        limit: int = 10,
+        detail: str = "brief",
+    ) -> list[dict]:
+        """List issues in a repo (excludes pull requests).
+
+        Args:
+            state: open, closed, all
+            labels: filter by label names
+            sort: created, updated, comments
+            direction: asc, desc
+            since: ISO datetime — only issues updated after this time
+            assignee: filter by assignee login, or 'none'/'*'
+            creator: filter by creator login
+            milestone: filter by milestone title, or 'none'/'*'
+            limit: max results
+            detail: brief, normal, full
+        """
+        await self._check_rate_limit()
+        try:
+            gh_repo = self._get_repo(repo)
+            kwargs: dict = {"state": state, "sort": sort, "direction": direction}
+            if labels:
+                kwargs["labels"] = labels
+            if since:
+                from datetime import datetime as dt
+                try:
+                    kwargs["since"] = dt.fromisoformat(since)
+                except ValueError as exc:
+                    raise GitHubError(
+                        f"Invalid ISO datetime for 'since': {since!r}", status_code=422
+                    ) from exc
+            if assignee:
+                kwargs["assignee"] = assignee
+            if creator:
+                kwargs["creator"] = creator
+            if milestone:
+                kwargs["milestone"] = milestone
+            # Remove None values from optional filters (state/sort/direction are always
+            # non-None from defaults, but this keeps the pattern uniform if defaults change).
+            kwargs = {k: v for k, v in kwargs.items() if v is not None}
+            issues = gh_repo.get_issues(**kwargs)
+            result = []
+            for issue in issues:
+                if issue.pull_request is not None:
+                    continue  # GitHub API returns PRs as issues — no server-side filter
+                result.append(self._format_issue(issue, detail))
+                if len(result) >= limit:
+                    break
+            return result
+        except (GitHubError, GitHubRateLimitError):
+            raise
+        except GithubException as e:
+            if e.status == 403:
+                raise GitHubRateLimitError() from e
+            raise GitHubError(
+                f"Failed to list issues: {e.data.get('message', str(e))}", status_code=e.status
+            ) from e
+
+    async def get_issue(self, repo: str, issue_number: int, detail: str = "normal") -> dict:
+        """Fetch a single issue by number.
+
+        Args:
+            detail: brief, normal, full (full includes reactions + recent comments)
+        """
+        await self._check_rate_limit()
+        try:
+            gh_repo = self._get_repo(repo)
+            issue = gh_repo.get_issue(issue_number)
+            return self._format_issue(issue, detail)
+        except (GitHubError, GitHubRateLimitError):
+            raise
+        except GithubException as e:
+            if e.status == 404:
+                raise GitHubError(f"Issue #{issue_number} not found", status_code=404) from e
+            elif e.status == 403:
+                raise GitHubRateLimitError() from e
+            raise GitHubError(
+                f"Failed to fetch issue: {e.data.get('message', str(e))}", status_code=e.status
+            ) from e
+
+    async def create_issue(
+        self,
+        repo: str,
+        title: str,
+        body: str = "",
+        labels: list[str] | None = None,
+        assignees: list[str] | None = None,
+    ) -> dict:
+        """Create a new issue."""
+        await self._check_rate_limit()
+        try:
+            gh_repo = self._get_repo(repo)
+            kwargs: dict = {"title": title}
+            if body:
+                kwargs["body"] = body
+            if labels:
+                kwargs["labels"] = labels
+            if assignees:
+                kwargs["assignees"] = assignees
+            issue = gh_repo.create_issue(**kwargs)
+            return self._format_issue(issue, "normal")
+        except (GitHubError, GitHubRateLimitError):
+            raise
+        except GithubException as e:
+            if e.status == 403:
+                raise GitHubRateLimitError() from e
+            raise GitHubError(
+                f"Failed to create issue: {e.data.get('message', str(e))}", status_code=e.status
+            ) from e
+
+    # ------------------------------------------------------------------
     # Workflow runs
     # ------------------------------------------------------------------
 

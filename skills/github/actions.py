@@ -5,6 +5,8 @@ Each action wraps a GitHubSkillAPI method with typed input/output.
 
 from __future__ import annotations
 
+from pydantic import field_validator
+
 from core.skills.base import (
     AccessScope,
     RepoType,
@@ -16,7 +18,6 @@ from core.skills.base import (
     SkillRequirement,
 )
 from skills.github.api import GitHubSkillAPI
-
 
 # ------------------------------------------------------------------
 # List PRs
@@ -36,7 +37,12 @@ class ListPRsOutput(SkillOutput):
 class ListPRsAction(Skill[ListPRsInput, ListPRsOutput]):
     name = "github_list_prs"
     version = "1.0.0"
-    description = "List open/closed PRs in a GitHub repository"
+    description = (
+        "List pull requests in a GitHub repository. "
+        "Use when user asks about PRs, recent changes, or what's being worked on. "
+        "Requires repo in 'owner/repo' format. "
+        "Use state='open' for active PRs, 'closed' for merged/closed, 'all' for both."
+    )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
     )
@@ -80,7 +86,11 @@ class GetPRChecksOutput(SkillOutput):
 class GetPRChecksAction(Skill[GetPRChecksInput, GetPRChecksOutput]):
     name = "github_get_pr_checks"
     version = "1.0.0"
-    description = "Get CI/check run status for a specific PR"
+    description = (
+        "Get CI/check run status for a specific PR — shows individual check results "
+        "(pass/fail/pending) and overall status. Use when user asks about a PR's CI status "
+        "or why a PR can't be merged. For repo-wide CI status, use ci_status instead."
+    )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE, RepoType.CI], min_access=AccessScope.READ, llm_required=False
     )
@@ -122,7 +132,11 @@ class SummarizePROutput(SkillOutput):
 class SummarizePRAction(Skill[SummarizePRInput, SummarizePROutput]):
     name = "github_summarize_pr"
     version = "1.0.0"
-    description = "Summarize a GitHub PR with LLM analysis"
+    description = (
+        "Summarize a specific GitHub PR using LLM analysis — includes diff review, "
+        "change description, and impact assessment. Use when user asks to review, "
+        "explain, or understand a specific PR. Requires repo ('owner/repo') and pr_number."
+    )
     requirements = SkillRequirement(
         repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=True
     )
@@ -177,10 +191,160 @@ class CIStatusOutput(SkillOutput):
     workflows: list[dict]
 
 
+# ------------------------------------------------------------------
+# List Issues
+# ------------------------------------------------------------------
+
+
+class ListIssuesInput(SkillInput):
+    repo: str  # "owner/repo"
+    state: str = "open"  # open, closed, all
+    labels: list[str] | None = None
+    sort: str = "created"  # created, updated, comments
+    direction: str = "desc"  # asc, desc
+    since: str | None = None  # ISO datetime
+    assignee: str | None = None  # login, 'none', '*'
+    creator: str | None = None  # login
+    milestone: str | None = None  # title, 'none', '*'
+    limit: int = 10
+    detail: str = "brief"  # brief, normal, full
+
+
+class ListIssuesOutput(SkillOutput):
+    issues: list[dict]
+
+
+class ListIssuesAction(Skill[ListIssuesInput, ListIssuesOutput]):
+    name = "github_list_issues"
+    version = "1.0.0"
+    description = (
+        "List issues in a GitHub repository (excludes pull requests). "
+        "Use when user asks about bugs, feature requests, or open issues. "
+        "Requires repo in 'owner/repo' format. "
+        "Filters: state (open/closed/all), labels, assignee, creator, milestone, since (ISO datetime). "
+        "Sort: created/updated/comments, direction: asc/desc. "
+        "Detail: 'brief' for lists, 'normal' adds body/assignees, 'full' adds reactions/comments."
+    )
+    requirements = SkillRequirement(
+        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ, external_apis=["github"]
+    )
+
+    def __init__(self, api: GitHubSkillAPI):
+        self._api = api
+
+    async def execute(self, input: ListIssuesInput) -> ListIssuesOutput:
+        issues = await self._api.list_issues(
+            input.repo, input.state, input.labels, input.sort, input.direction,
+            input.since, input.assignee, input.creator, input.milestone,
+            input.limit, input.detail,
+        )
+        return ListIssuesOutput(success=True, result=issues, issues=issues)
+
+
+# ------------------------------------------------------------------
+# Get Issue
+# ------------------------------------------------------------------
+
+
+class GetIssueInput(SkillInput):
+    repo: str  # "owner/repo"
+    issue_number: int
+    detail: str = "normal"  # brief, normal, full
+
+
+class GetIssueOutput(SkillOutput):
+    issue: dict
+
+
+class GetIssueAction(Skill[GetIssueInput, GetIssueOutput]):
+    name = "github_get_issue"
+    version = "1.0.0"
+    description = (
+        "Get details of a specific GitHub issue by number. "
+        "Detail: 'brief' for summary, 'normal' (default) adds body/assignees/milestone, "
+        "'full' adds reactions, closed_by, and recent comments. "
+        "Use when user asks about a specific issue."
+    )
+    requirements = SkillRequirement(
+        repo_types=[RepoType.CODE], min_access=AccessScope.READ, llm_required=False
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.READ, external_apis=["github"]
+    )
+
+    def __init__(self, api: GitHubSkillAPI):
+        self._api = api
+
+    async def execute(self, input: GetIssueInput) -> GetIssueOutput:
+        issue = await self._api.get_issue(input.repo, input.issue_number, input.detail)
+        return GetIssueOutput(success=True, result=issue, issue=issue)
+
+
+# ------------------------------------------------------------------
+# Create Issue
+# ------------------------------------------------------------------
+
+
+class CreateIssueInput(SkillInput):
+    repo: str  # "owner/repo"
+    title: str  # non-empty enforced by Pydantic validator
+    body: str = ""
+    labels: list[str] | None = None
+    assignees: list[str] | None = None
+
+    @field_validator("title")
+    @classmethod
+    def title_must_not_be_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("title must not be empty")
+        return v
+
+
+class CreateIssueOutput(SkillOutput):
+    issue: dict
+
+
+class CreateIssueAction(Skill[CreateIssueInput, CreateIssueOutput]):
+    name = "github_create_issue"
+    version = "1.0.0"
+    description = (
+        "Create a new GitHub issue. Use when user asks to file a bug report, "
+        "feature request, or any new issue. Requires repo ('owner/repo') and title. "
+        "Optionally set body, labels, and assignees."
+    )
+    requirements = SkillRequirement(
+        repo_types=[RepoType.CODE], min_access=AccessScope.WRITE, llm_required=False
+    )
+    side_effect_profile = SideEffectProfile(
+        category=SideEffectCategory.WRITE, external_apis=["github"]
+    )
+
+    def __init__(self, api: GitHubSkillAPI):
+        self._api = api
+
+    async def execute(self, input: CreateIssueInput) -> CreateIssueOutput:
+        issue = await self._api.create_issue(
+            input.repo, input.title, input.body, input.labels, input.assignees
+        )
+        return CreateIssueOutput(success=True, result=issue, issue=issue)
+
+
+# ------------------------------------------------------------------
+# CI Status (workflow runs)
+# ------------------------------------------------------------------
+
+
 class CIStatusAction(Skill[CIStatusInput, CIStatusOutput]):
     name = "github_ci_status"
     version = "1.0.0"
-    description = "Check CI workflow status in a GitHub repository"
+    description = (
+        "Check CI/CD workflow run status in a GitHub repository — shows recent workflow runs "
+        "with pass/fail/pending status. Use when user asks about build status or CI failures. "
+        "For checking CI on a specific PR, use get_pr_checks instead."
+    )
     requirements = SkillRequirement(
         repo_types=[RepoType.CI, RepoType.CODE], min_access=AccessScope.READ, llm_required=False
     )
