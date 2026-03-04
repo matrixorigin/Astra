@@ -1738,12 +1738,15 @@ async def chat_turn(
                 _MAX_CLOUD_LOOPS = 5
                 _current_llm_messages = llm_messages
                 _cloud_skill_failed = False
+                _cloud_skill_error_msg = ""
 
                 for _cloud_loop in range(_MAX_CLOUD_LOOPS + 1):
                     _loop_text = ""
                     _loop_tool_calls: list[dict[str, Any]] = []
                     _llm_start = time.monotonic()
 
+                    if _cloud_skill_failed:
+                        logger.info("Cloud loop: final LLM call via chat_stream (no tools)")
                     stream: AsyncIterator = (
                         llm.chat_with_tools_stream(
                             _current_llm_messages, merged_tools_schema, model=model, task_hint=task_hint,
@@ -1776,6 +1779,15 @@ async def chat_turn(
                     except (asyncio.TimeoutError, TimeoutError):
                         yield f"data: {json.dumps({'type': 'error', 'message': 'Turn exceeded server time limit', 'code': 'turn_timeout', 'retryable': False})}\n\n"
                         _timed_out = True
+                    except Exception as _stream_err:
+                        if _cloud_skill_failed:
+                            # Final LLM call failed — emit the skill error directly as text
+                            logger.warning("Final LLM call after cloud skill failure raised: %s", _stream_err)
+                            _fallback = _cloud_skill_error_msg or "The requested operation failed."
+                            _loop_text += _fallback
+                            yield f"data: {json.dumps({'type': 'text_delta', 'content': _fallback})}\n\n"
+                        else:
+                            raise
 
                     _llm_elapsed = time.monotonic() - _llm_start
                     if request.explain:
@@ -1902,6 +1914,7 @@ async def chat_turn(
                             _cr_parsed = json.loads(_cloud_result_raw) if isinstance(_cloud_result_raw, str) else _cloud_result_raw
                             if isinstance(_cr_parsed, dict) and _cr_parsed.get("success") is False:
                                 _cloud_skill_failed = True
+                                _cloud_skill_error_msg = _cr_parsed.get("result", "Operation failed.")
                                 logger.warning("Cloud skill %s returned success=False, stopping cloud loop", tc_name)
                                 _current_llm_messages = _current_llm_messages + [{
                                     "role": "system",
