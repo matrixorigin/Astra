@@ -549,6 +549,23 @@ class ChatLoop:
                     }
                 )
 
+                # If skill returned success=False, inject a hard stop to prevent LLM from
+                # retrying with different params or using bash/curl to work around the failure.
+                try:
+                    _parsed = json.loads(result_str) if isinstance(result_str, str) else result
+                    if isinstance(_parsed, dict) and _parsed.get("success") is False:
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "The skill returned success=False. "
+                                "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
+                                "Do NOT use bash, curl, grep, or any other tool to work around this. "
+                                "Report the error directly to the user and ask them to clarify."
+                            ),
+                        })
+                except Exception:
+                    pass
+
         # Exhausted rounds — ask LLM for a final answer without tools
         messages.append(
             {
@@ -750,6 +767,23 @@ class ChatLoop:
             )
             self._turn_budget.record(len(result_str))
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result_str})
+
+        # If skill returned success=False, inject a hard stop to prevent LLM from
+        # retrying with different params or using bash/curl to work around the failure.
+        try:
+            _parsed = json.loads(result_str) if isinstance(result_str, str) else result
+            if isinstance(_parsed, dict) and _parsed.get("success") is False:
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "The skill returned success=False. "
+                        "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
+                        "Do NOT use bash, curl, grep, or any other tool to work around this. "
+                        "Report the error directly to the user and ask them to clarify."
+                    ),
+                })
+        except Exception:
+            pass
 
     async def run_step_stream(
         self,
