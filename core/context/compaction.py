@@ -27,8 +27,8 @@ _PRESERVE_RECENT = 6
 # Placeholder for cleared tool results
 _TOOL_CLEARED = "[tool output cleared — already processed]"
 
-# Max chars for a single tool result in the message chain (~2K tokens)
-MAX_TOOL_RESULT_CHARS = 8000
+# Max chars for a single tool result in the message chain (~750 tokens)
+MAX_TOOL_RESULT_CHARS = 3000
 
 # Max chars for tool result stored in DB for audit/reflect (~1.2K tokens).
 # Must be large enough for reflect to reconstruct diagnostics from history.

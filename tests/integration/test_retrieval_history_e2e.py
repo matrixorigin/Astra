@@ -128,7 +128,7 @@ class TestRetrievalView:
         history = _build_history(2)
         assert len(history) < _MIN_HISTORY_FOR_RETRIEVAL
 
-        result = _build_retrieval_view(history, "test-session", [], None)
+        result, _scores = _build_retrieval_view(history, "test-session", [], None)
         assert result is history  # Same object, no transformation
 
     def test_long_history_trimmed(self, db_factory):
@@ -145,7 +145,7 @@ class TestRetrievalView:
         current_messages = [{"role": "user", "content": "What about topic 2?"}]
 
         with db_factory() as db:
-            result = _build_retrieval_view(history, "test-session", current_messages, db)
+            result, _scores = _build_retrieval_view(history, "test-session", current_messages, db)
 
         # Result should be smaller than full history
         assert len(result) < len(history), \
@@ -173,7 +173,7 @@ class TestRetrievalView:
         for num_turns in [4, 8, 12, 16]:
             history = _build_history(num_turns, tool_result_chars=500)
             with db_factory() as db:
-                result = _build_retrieval_view(history, f"test-{num_turns}", current_messages, db)
+                result, _scores = _build_retrieval_view(history, f"test-{num_turns}", current_messages, db)
             tokens = estimate_tokens(result)
             token_counts.append(tokens)
 
@@ -190,7 +190,7 @@ class TestRetrievalView:
         current_messages = [{"role": "user", "content": "hello"}]
 
         with db_factory() as db:
-            result = _build_retrieval_view(history, "test-sys", current_messages, db)
+            result, _scores = _build_retrieval_view(history, "test-sys", current_messages, db)
 
         assert result[0]["role"] == "system"
         assert "helpful assistant" in result[0]["content"]

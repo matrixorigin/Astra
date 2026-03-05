@@ -257,7 +257,7 @@ class TestRetrievalViewIntegration:
         current_messages = [{"role": "user", "content": "What about project 3?"}]
 
         with db_factory() as db:
-            result = _build_retrieval_view(history, "test-rv", current_messages, db)
+            result, _scores = _build_retrieval_view(history, "test-rv", current_messages, db)
 
         result_tokens = estimate_tokens(result)
         assert result_tokens < full_tokens, \

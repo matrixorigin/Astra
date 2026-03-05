@@ -14,6 +14,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from uuid_utils import uuid7
 
 from api.database import SessionLocal
@@ -977,15 +978,18 @@ def _build_retrieval_view(
     session_id: str,
     current_messages: list[dict[str, Any]],
     db: Session,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, float] | None]:
     """Build a trimmed history view for LLM using retrieval.
 
     For short histories (< 3 turns), returns history as-is.
     For longer histories, returns: system + retrieved context + recent messages.
     Falls back to full history if retrieval fails.
+
+    Returns (messages, relevance_scores) where relevance_scores is a dict
+    of event_id -> score from retrieval, or None if retrieval was not used.
     """
     if not history or len(history) < _MIN_HISTORY_FOR_RETRIEVAL:
-        return history
+        return history, None
 
     system_msg = history[0] if history[0].get("role") == "system" else None
     recent = history[-_RECENT_MESSAGES_KEEP:]
@@ -1001,10 +1005,10 @@ def _build_retrieval_view(
             break
 
     if not user_query:
-        return history  # No query to retrieve against
+        return history, None  # No query to retrieve against
 
     # Try retrieval from agent_events via HybridRetriever
-    retrieved_block = _retrieve_relevant_context(db, session_id, user_query, history, recent)
+    retrieved_block, scores = _retrieve_relevant_context(db, session_id, user_query, history, recent)
 
     result: list[dict[str, Any]] = []
     if system_msg:
@@ -1012,7 +1016,7 @@ def _build_retrieval_view(
     if retrieved_block:
         result.append({"role": "system", "content": retrieved_block})
     result.extend(recent)
-    return result
+    return result, scores
 
 
 def _retrieve_relevant_context(
@@ -1021,10 +1025,11 @@ def _retrieve_relevant_context(
     user_query: str,
     full_history: list[dict[str, Any]],
     recent_messages: list[dict[str, Any]],
-) -> str | None:
+) -> tuple[str | None, dict[str, float] | None]:
     """Retrieve relevant old turns from agent_events.
 
-    Returns a formatted context block, or None if retrieval unavailable.
+    Returns (formatted_context, relevance_scores) where relevance_scores
+    maps event_id -> score, or (None, None) if retrieval unavailable.
     Falls back to rule-based extraction from in-memory history if
     embeddings are not available.
     """
@@ -1050,12 +1055,13 @@ def _retrieve_relevant_context(
                 limit=10,
             )
             if events:
-                return _format_retrieved_events(events, recent_contents)
+                scores = {e.get("event_id", f"evt_{i}"): e.get("score", 0.0) for i, e in enumerate(events) if e.get("event_id")}
+                return _format_retrieved_events(events, recent_contents), scores
     except Exception:
         logger.debug("Vector retrieval unavailable, using rule-based fallback")
 
     # Fallback: extract relevant old turns from in-memory history using keyword overlap
-    return _rule_based_extraction(full_history, recent_messages, user_query)
+    return _rule_based_extraction(full_history, recent_messages, user_query), None
 
 
 def _format_retrieved_events(
@@ -1317,9 +1323,20 @@ def _build_turn_messages(
     # Instead of passing full history to LLM, construct a trimmed view:
     #   system_prompt + retrieved_relevant_old_turns + recent_messages
     # Full history stays in cache for persistence/recovery.
-    llm_messages = _build_retrieval_view(
+    llm_messages, retrieval_scores = _build_retrieval_view(
         history, session_id, messages, db,
     )
+
+    # Persist retrieval relevance scores to ctx_snapshots for introspection
+    if retrieval_scores and context_capture_id:
+        try:
+            db.execute(
+                text("UPDATE ctx_snapshots SET relevance_scores = :scores WHERE context_capture_id = :cid"),
+                {"scores": json.dumps(retrieval_scores), "cid": context_capture_id},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
 
     return llm_messages, context_capture_id, memory_stats
 
@@ -2068,6 +2085,7 @@ async def chat_turn(
                 # and feed results back to LLM. Repeat until LLM returns only
                 # edge tool_calls or a final text answer.
                 _MAX_CLOUD_LOOPS = 5
+                _CLOUD_LOOP_MAX_PROMPT_CHARS = 12000  # ~10-16K tokens (file listings are ~0.8 chars/token)
                 _current_llm_messages = llm_messages
                 _cloud_skill_failed = False
                 _cloud_skill_error_msg = ""
@@ -2081,6 +2099,23 @@ async def chat_turn(
                     _loop_text = ""
                     _loop_tool_calls: list[dict[str, Any]] = []
                     _llm_start = time.monotonic()
+
+                    # Compact old tool results in _current_llm_messages when
+                    # accumulated content exceeds the cloud loop budget.
+                    # Keeps only the most recent tool result intact; all older
+                    # ones get truncated to 200 chars so the LLM still sees
+                    # what tools were called but not the full output.
+                    if _cloud_loop > 0:
+                        _total_chars = sum(len(m.get("content") or "") for m in _current_llm_messages)
+                        if _total_chars > _CLOUD_LOOP_MAX_PROMPT_CHARS:
+                            _tool_indices = [i for i, m in enumerate(_current_llm_messages) if m.get("role") == "tool"]
+                            for idx in _tool_indices[:-1]:  # keep only last tool result
+                                c = _current_llm_messages[idx].get("content") or ""
+                                if len(c) > 200:
+                                    _current_llm_messages[idx] = {
+                                        **_current_llm_messages[idx],
+                                        "content": c[:200] + "\n...[compacted for context budget]",
+                                    }
 
                     if _cloud_skill_failed:
                         logger.warning("Cloud loop: final LLM call via chat_stream (no tools), loop=%d", _cloud_loop)
@@ -2330,6 +2365,17 @@ async def chat_turn(
                 # ConversationState.previous_skill is None and LLM can't see
                 # what tools were used in prior turns.
                 if _cloud_loop_history:
+                    # Compact old tool results before storing in session cache.
+                    # Keep last 2 tool results full; truncate older ones so
+                    # future turns don't carry bloated cloud loop history.
+                    _hist_tool_indices = [i for i, m in enumerate(_cloud_loop_history) if m.get("role") == "tool"]
+                    for idx in _hist_tool_indices[:-2]:
+                        c = _cloud_loop_history[idx].get("content") or ""
+                        if len(c) > 500:
+                            _cloud_loop_history[idx] = {
+                                **_cloud_loop_history[idx],
+                                "content": c[:500] + "\n...[compacted]",
+                            }
                     _entry.setdefault("history", []).extend(_cloud_loop_history)
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text}
                 if tool_calls:

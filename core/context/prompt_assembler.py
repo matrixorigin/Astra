@@ -423,7 +423,9 @@ class PromptAssembler(DbConsumer):
         "Rules:\n"
         "- Think step-by-step before acting\n"
         "- If uncertain, say so rather than guess\n"
-        "- NEVER fabricate data — if unavailable, say so explicitly"
+        "- NEVER fabricate data — if unavailable, say so explicitly\n"
+        "- Do ONLY what the user asked — do not expand scope, run extra commands, or start follow-up tasks without being asked\n"
+        "- When a task is done, STOP and report the result — do not look for more things to do"
     )
 
     # Task-specific rule blocks

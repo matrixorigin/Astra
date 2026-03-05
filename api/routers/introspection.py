@@ -580,11 +580,17 @@ def get_context_trend(
     """Token usage trend across the last N turns — uses real LLM token counts."""
     _verify_session_owner(db, session_id, current_user["user_id"])
 
+    # Take only the FIRST llm_response per causal chain to exclude
+    # cloud-loop intermediate calls that inflate token counts.
     rows = db.execute(
         text("""
-            SELECT token_usage FROM agent_events
-            WHERE session_id = :sid AND event_type = 'llm_response'
-              AND token_usage IS NOT NULL
+            SELECT token_usage FROM (
+                SELECT token_usage, causal_chain_id, created_at,
+                       ROW_NUMBER() OVER (PARTITION BY causal_chain_id ORDER BY created_at) AS rn
+                FROM agent_events
+                WHERE session_id = :sid AND event_type = 'llm_response'
+                  AND token_usage IS NOT NULL
+            ) t WHERE rn = 1
             ORDER BY created_at DESC
             LIMIT :n
         """),
