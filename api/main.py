@@ -24,8 +24,9 @@ from api.routers import (
     skills,
     streaming,
 )
-from core.logging_config import get_logger
+from core.logging_config import get_logger, setup_logging
 
+setup_logging(level="INFO", json_format=False)
 logger = get_logger(__name__)
 
 

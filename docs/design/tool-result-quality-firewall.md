@@ -761,7 +761,7 @@ if assessment.score < 0.5 and assessment.grade in ("degraded", "empty"):
         missing_fields=assessment.missing_fields,
     )
 
-# Over time, SelfImprovingSelector learns:
+# Over time, ToolRegistry learns:
 # "stock_assistant with analysis_type='advice' returns degraded data 80% of the time"
 # → Procedural memory: "Use analysis_type='overview' for comprehensive stock queries"
 ```
@@ -844,7 +844,7 @@ def attribute_degradation_cause(
 
 | Cause | Automated Response |
 |-------|-------------------|
-| `parameter_combination` | `LOW_DATA_QUALITY` signal → SelfImprovingSelector learns to avoid this arg combo |
+| `parameter_combination` | `LOW_DATA_QUALITY` signal → ToolRegistry learns to avoid this arg combo |
 | `upstream_dependency` | Alert skill owner + temporary quality warning in annotation ("upstream service may be degraded") |
 | `skill_bug` | Alert skill owner + flag skill for review in `skills_registry` |
 | `unknown` | Log only, no automated action |
@@ -1011,7 +1011,7 @@ alerts = {
 | `chat_turn` handler (chat.py) | Call `assess_tool_result()` + `annotate_tool_result()` before history merge | Pre-LLM quality gate |
 | `HallucinationFirewall` | Add `tool_result_quality` as 5th confidence dimension | Quality-aware confidence scoring |
 | `auto_scorer` | Add `data_quality_acknowledged` metric | Measure LLM honesty about data gaps |
-| `SelfImprovingSelector` | Accept `LOW_DATA_QUALITY` signal type | Learn from degraded results |
+| `ToolRegistry` | Accept `LOW_DATA_QUALITY` signal type | Learn from degraded results |
 | Session cache | Store `tool_result_assessments` per turn | Pass quality signals to downstream components |
 
 ### What Does NOT Change
@@ -1054,7 +1054,7 @@ No schema changes needed. Works with all existing skills.
 
 - [x] Add `tool_result_quality` dimension to `HallucinationFirewall`
 - [x] Add `data_quality_acknowledged` to auto-scorer
-- [x] Add `LOW_DATA_QUALITY` signal to `SelfImprovingSelector`
+- [x] Add `LOW_DATA_QUALITY` signal to `ToolRegistry`
 - [ ] Wire quality signals to procedural memory creation — deferred to Phase 5 (depends on memory governance refactor)
 
 **Success criteria**: Degraded tool results → lower confidence → learning signal → better future parameter selection. ✅ Core pipeline verified.

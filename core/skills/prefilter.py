@@ -302,12 +302,13 @@ def pre_filter(
             logger.info("Pre-filter: history+analytical → prefer historical scope")
             return reordered, True
 
-    # Rule 2: Fetch intent without history reference → prefer external + local.
-    # "show me the file" should boost read_file (local), not just GitHub skills.
+    # Rule 2: Fetch intent without history reference → prefer external, then local.
+    # "show me PRs" should boost list_prs (external) above git_log (local).
     if state.is_fetch and not state.references_history:
         reordered = _prefer(
             skills,
-            include_scopes={"external", "local"},
+            include_scopes={"external"},
+            secondary_scopes={"local"},
         )
         if _order_changed(skills, reordered):
             logger.info("Pre-filter: fetch → prefer external+local scope")
@@ -327,9 +328,11 @@ def _prefer(
     skills: list[HasTags],
     include_scopes: set[str] | None = None,
     deprioritize_scopes: set[str] | None = None,
+    secondary_scopes: set[str] | None = None,
 ) -> list[HasTags]:
     """Reorder skills by scope tags. Skills without tags go to normal bucket."""
     preferred: list[Any] = []
+    secondary: list[Any] = []
     normal: list[Any] = []
     deprioritized: list[Any] = []
 
@@ -341,12 +344,14 @@ def _prefer(
 
         if include_scopes and tags.scope in include_scopes:
             preferred.append(skill)
+        elif secondary_scopes and tags.scope in secondary_scopes:
+            secondary.append(skill)
         elif deprioritize_scopes and tags.scope in deprioritize_scopes:
             deprioritized.append(skill)
         else:
             normal.append(skill)
 
-    return preferred + normal + deprioritized
+    return preferred + secondary + normal + deprioritized
 
 
 def _prefer_by_intent(

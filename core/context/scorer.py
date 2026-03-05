@@ -155,7 +155,7 @@ class RelevanceScorer(DbConsumer):
         """Load TopicShiftConfig from configs table with TTL cache.
 
         Same pattern as ContextManager._load_budget_ratios and
-        SelfImprovingSelector._load_runtime_config.
+        ToolRegistry selection.
         """
         now = time.monotonic()
         if self._topic_shift_config is not None and (now - self._topic_shift_config_ts) < self._TOPIC_SHIFT_CONFIG_TTL:

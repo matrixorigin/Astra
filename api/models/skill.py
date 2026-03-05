@@ -128,6 +128,11 @@ class SkillSelectionEvent(Base):
 
 
 class SkillSelectionLearning(Base):
+    """Learned correction rules: query_pattern → boost/penalize specific skills.
+
+    Reserved for future use by ToolRegistry.select() as a score adjustment step.
+    Table kept in DB; not actively written to yet.
+    """
     __tablename__ = "skill_selection_learnings"
     learning_id = Column(String(36), primary_key=True)
     query_pattern = Column(String(255), nullable=False, index=True)
@@ -145,15 +150,6 @@ class SkillSelectionLearning(Base):
     is_active = Column(SmallInteger, default=1, server_default="1", index=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
-
-
-class SkillLearningSignal(Base):
-    __tablename__ = "skill_learning_signals"
-    signal_id = Column(String(36), primary_key=True)
-    selection_event_id = Column(String(36), index=True, nullable=False)
-    signal_type = Column(String(50), nullable=False, index=True)
-    signal_data = Column(JSON, nullable=False)
-    created_at = Column(DateTime, default=func.now(), index=True)
 
 
 class SkillSetting(Base):

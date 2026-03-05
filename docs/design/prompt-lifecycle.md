@@ -14,7 +14,7 @@ The current codebase has two prompt paths that diverged during evolution:
 |---|---|---|
 | System prompt | DB `agents` table → versioned | Hardcoded string |
 | Context enrichment | ContextManager (5 sections, budget-capped) | Simplified `_enrich_system_prompt` |
-| Skill selection | SkillPipeline (semantic + budget) | Edge tools passed through, no selection |
+| Skill selection | ToolRegistry (pinned/dynamic + embedding) | Edge tools passed through, no selection |
 | Cross-session memory | Continuity + Observer | Observer only |
 | Scratchpad | ✅ | ❌ |
 | Prompt versioning | PromptManager (DB, rollback, feedback) | None |
@@ -170,7 +170,7 @@ For detailed runtime state (token usage, memory contents, session stats),
 use the `get_agent_info` tool.
 ```
 
-The "What I've Learned" subsection is the breakthrough: it comes from **procedural memory** — the `SelfImprovingSelector`'s historical accuracy data and the `Observer`'s behavioral pattern extraction. The agent literally knows its own strengths and weaknesses, backed by data.
+The "What I've Learned" subsection is the breakthrough: it comes from **procedural memory** — the `ToolRegistry`'s historical accuracy data and the `Observer`'s behavioral pattern extraction. The agent literally knows its own strengths and weaknesses, backed by data.
 
 > **Evolution note (2026-03-01)**: Session analysis revealed that general insights in §2 are insufficient — the LLM ignores them when making tool-call decisions. Skill-specific procedural memories are now also injected directly into tool descriptions at runtime (not stored in base schema). See [context-window-management.md](context-window-management.md) §1 "Procedural Memory at Point of Use" for the complete design.
 >
@@ -201,7 +201,7 @@ The self-model section is assembled at session start and cached for the session.
 | **Session start** | Full rebuild | `PromptAssembler.assemble()` called on first turn |
 | **MCP server connect/disconnect** | Capabilities list | `MCPBridge.set_on_tools_changed()` callback invalidates cached self-model; next turn rebuilds |
 | **Skill registry update** | Cloud skills list | `GateTrigger.on_skill_change()` invalidates; next session picks up |
-| **Procedural memory update** | "What I've Learned" | Updated by `SelfImprovingSelector` learning cycle; next session picks up |
+| **Procedural memory update** | "What I've Learned" | Updated by `ToolRegistry` learning cycle; next session picks up |
 | **Explicit refresh** | Full rebuild | Edge sends `refresh_self_model: true` in `/chat/turn` request (for mid-session tool changes) |
 
 Mid-session changes (MCP server added) are handled by invalidation + rebuild on next turn, not by re-injecting the system prompt (which would break conversation continuity). The LLM sees the updated self-model in the next turn's system message.
@@ -257,7 +257,7 @@ Output:
     cache_prefix_tokens: int      # How many tokens are cacheable
 ```
 
-Both paths call the same assembler. Path A passes `edge_context=None` (cloud-only mode, tools from SkillPipeline). Path B passes the edge context from the request.
+Both paths call the same assembler. Path A passes `edge_context=None` (cloud-only mode, tools from ToolRegistry). Path B passes the edge context from the request.
 
 ---
 
@@ -338,7 +338,7 @@ This enables the **ContextBudgetTuner** (already designed) to make data-driven d
 
 Edge tools and cloud skills are two separate worlds:
 - Edge sends `edge_tools` (OpenAI schemas) → cloud passes them through to LLM unchanged
-- Cloud has `SkillPipeline` (semantic retrieval, budget control) → only for cloud skills
+- Cloud has `ToolRegistry` (semantic retrieval, budget control) → only for cloud skills
 - The LLM sees both, but the platform doesn't know the relationship
 
 ### Design: Unified Tool Catalog with Edge/Cloud Annotations
@@ -360,15 +360,15 @@ Edge tools and cloud skills are two separate worlds:
 │         │                  │                │               │
 │         └──────────────────┼────────────────┘               │
 │                            ▼                                │
-│              SkillPipeline.get_tools_schema()                │
+│              ToolRegistry.get_tools_schema()                │
 │              (semantic retrieve from ALL tools,              │
 │               budget-controlled, unified audit)              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 Key changes:
-1. Edge tools are **registered into SkillPipeline** on first turn (not passed through)
-2. SkillPipeline does semantic retrieval across **all** tools (edge + cloud + MCP)
+1. Edge tools are **registered into ToolRegistry** on first turn (not passed through)
+2. ToolRegistry does semantic retrieval across **all** tools (edge + cloud + MCP)
 3. Budget control applies to the **merged** set
 4. Audit trail covers **all** tool selections, not just cloud skills
 
@@ -596,7 +596,7 @@ Each step is independently deployable and rollback-safe.
 | [Agent Introspection](agent-introspection.md) | Self-model section is the static introspection mechanism. `get_agent_info` tool is the dynamic complement. |
 | [Memory Architecture](memory-architecture.md) | PromptAssembler replaces ad-hoc context injection. Memory layers map to prompt sections. |
 | [Edge-Cloud Execution](edge-cloud-execution.md) | Edge contributes structured `EdgeContext` instead of raw strings. Cloud assembles. |
-| [Skills and Tools](skills-and-tools.md) | Edge tools registered into SkillPipeline for unified selection. |
+| [Skills and Tools](skills-and-tools.md) | Edge tools registered into ToolRegistry for unified selection. |
 | [Evaluation and Evolution](evaluation-and-evolution.md) | Context snapshots capture full assembled prompt for replay. Prompt A/B via branching. |
 | [Data Versioning](data-versioning.md) | Time travel enables prompt reconstruction at any historical point. Branching enables prompt experimentation. |
 | [Trust and Safety](trust-and-safety.md) | Every assembled prompt is snapshotted. Hallucination firewall verifies against snapshot. |

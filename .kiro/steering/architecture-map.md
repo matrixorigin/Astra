@@ -29,8 +29,8 @@ inclusion: always
 │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬──────┘  │
 │       │             │             │               │          │
 │  ┌────▼─────┐  ┌────▼─────┐  ┌────▼─────┐  ┌─────▼──────┐  │
-│  │ Context  │  │ Learning │  │ Sandbox  │  │ Evaluation │  │
-│  │ Window   │  │ Selector │  │ Branch   │  │ Gate       │  │
+│  │ Context  │  │   Tool   │  │ Sandbox  │  │ Evaluation │  │
+│  │ Window   │  │ Registry │  │ Branch   │  │ Gate       │  │
 │  └──────────┘  └──────────┘  └──────────┘  └────────────┘  │
 │                                                             │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
@@ -133,24 +133,14 @@ mo-dev-agent/
 │   │   └── consistency.py      # Cross-agent consistency
 │   │
 │   ├── skills/             # 🔧 Skill system (LARGEST module)
-│   │   ├── registry.py         # Skill version registry
+│   │   ├── tool_registry.py    # Unified tool selection (pinned/dynamic/embedding)
 │   │   ├── catalog.py          # Skill catalog & discovery
 │   │   ├── loader.py           # Load skills from disk/DB
 │   │   ├── skill_md.py         # Markdown skill definitions
-│   │   ├── skill_manager.py    # Install/uninstall lifecycle
 │   │   ├── skill_index.py      # Skill search index
-│   │   ├── selector.py         # Skill selection logic
-│   │   ├── modern_selector.py  # Improved selector
-│   │   ├── self_improving_selector.py # Learning selector
-│   │   ├── learning_signals.py # Learning signal types
-│   │   ├── learning_config.py  # Learning configuration
-│   │   ├── learning_similarity.py # Similarity matching
-│   │   ├── resolver.py         # Dependency resolution
-│   │   ├── dependencies.py     # Skill dependencies
-│   │   ├── version.py          # Version management
+│   │   ├── config_center.py    # Skill configuration + credential encryption
+│   │   ├── prefilter.py        # Context-aware pre-filtering
 │   │   ├── runner.py           # Skill execution
-│   │   ├── pipeline.py         # Skill pipeline
-│   │   ├── scaffold.py         # Skill scaffolding
 │   │   ├── base.py             # Base skill class
 │   │   ├── builtin.py          # Built-in skills
 │   │   ├── extended.py         # Extended skills
@@ -158,10 +148,9 @@ mo-dev-agent/
 │   │   ├── mocking.py          # Side-effect isolation
 │   │   ├── mcp_bridge.py       # MCP protocol bridge
 │   │   ├── data_bridge.py      # Data bridge for skills
-│   │   ├── credential_manager.py # Skill credentials
 │   │   ├── github_client.py    # GitHub API client
 │   │   ├── markdown_skill.py   # Markdown-based skills
-│   │   └── procedural_memory.py # Procedural memory
+│   │   └── data_bridge.py      # Data bridge for skills
 │   │
 │   ├── events/             # 📝 Event sourcing system
 │   │   ├── event_logger.py     # Create events (write path)
@@ -398,8 +387,8 @@ core/agent/run_engine.py     # Create run, orchestrate
     │       ├── core/context/scorer.py       # Score relevance
     │       └── core/context/prompt_assembler.py # Assemble prompt
     │
-    ├──▶ core/skills/selector.py        # Select skill
-    │       └── core/skills/self_improving_selector.py # Learn
+    ├──▶ core/skills/tool_registry.py  # Select tools (pinned + dynamic)
+    │       └── core/skills/prefilter.py     # Context-aware reorder
     │
     ├──▶ core/llm/client.py             # Call LLM
     │       └── core/llm/router.py           # Route to provider
@@ -450,7 +439,7 @@ core/events/event_reader.py     # Query events:
 ### Agent → Skills → LLM
 ```
 core/agent/chat_loop.py
-    → core/skills/selector.py (choose skill)
+    → core/skills/catalog.py (get tools schema)
     → core/skills/runner.py (execute skill)
     → core/llm/client.py (call LLM)
     → core/agent/execution_backend.py (execute tools)
@@ -496,7 +485,7 @@ core/evaluation/regression_gate.py
 - `skill_installations` - Installed skills per user
 - `skill_permissions` - Skill permissions
 - `skill_selection_events` - Selection audit trail
-- `skill_selection_learnings` - Learning data
+- `skill_selection_learnings` - Learned correction rules (reserved for ToolRegistry score adjustment)
 
 ### Memory Tables
 - `memory_entries` - Long-term memory

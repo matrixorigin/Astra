@@ -217,7 +217,7 @@ class ListPRsSkill(Skill[ListPRsInput, ListPRsOutput]):
     config_namespace = "github"
     version = "1.0.0"
     description = (
-        "List pull requests. "
+        "List pull requests from a GitHub repository via the GitHub API. "
         "detail: brief=number/title/author/state/date; normal adds body+labels+reviewers+files. "
         + _GITHUB_BOILERPLATE
     )

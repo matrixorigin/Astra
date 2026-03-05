@@ -12,7 +12,7 @@ Real reflection requires server-side data the edge can't access.
 ## Architecture Decision: Edge Tool + Server Endpoint
 
 Reflect cannot be a pure cloud skill because `/chat/turn` only exposes edge tools
-to the LLM. Cloud skills (`SkillPipeline`) are only used in the `/chat` endpoint.
+to the LLM. Cloud skills (`ToolRegistry`) are only used in the `/chat` endpoint.
 
 The proven pattern is **edge tool + server endpoint** — same as `GetAgentInfoTool`
 which calls `/introspection/memory` and `/introspection/skills` for cloud data.

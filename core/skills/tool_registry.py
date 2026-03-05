@@ -67,6 +67,17 @@ _MAX_DYNAMIC_TOOLS = 8
 _MAX_TOOL_TOKENS = 2500
 
 
+def _default_tags_for_source(source: ToolSource):
+    """Fallback SkillTags when a tool has no category. Ensures edge tools
+    get scope='local' so the prefilter can deprioritize them for fetch queries."""
+    from core.skills.prefilter import SkillTags
+    if source in (ToolSource.CLOUD, ToolSource.MCP):
+        return SkillTags(scope="external", data_source="external_api",
+                         intent_type=("fetch",), requires_history=False)
+    return SkillTags(scope="local", data_source="local_filesystem",
+                     intent_type=("fetch",), requires_history=False)
+
+
 class ToolRegistry:
     """Unified registry for all tools. Handles selection per request.
 
@@ -256,7 +267,8 @@ class ToolRegistry:
             wrappers = [
                 ToolWrapper(
                     name=t.name,
-                    tags=SkillTags.infer_from_category(t.category) if t.category else None,
+                    tags=(SkillTags.infer_from_category(t.category) if t.category
+                          else _default_tags_for_source(t.source)),
                     schema=t.schema,
                 )
                 for t in pool

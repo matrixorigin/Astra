@@ -317,7 +317,7 @@ RECORD: Store the learning signal for future pattern matching
 
 ### Already Implemented
 
-- **Self-Improving Skill Selection**: SkillPipeline learns from historical failures via closed-loop (observe → diagnose → gate → deploy). See [Skills and Tools §3](skills-and-tools.md#3-skill-selection-pipeline) for full architecture.
+- **Self-Improving Skill Selection**: ToolRegistry provides unified tool selection (pinned/dynamic split + embedding retrieval).
 - **RegressionGate (ChangeType.SELECTOR)**: Validates selector changes before deployment via unified gate
 - **InputFaceLearner**: ✅ Unified meta-learning loop for prompt, context budget, and knowledge input faces (`core/learning/input_face_learner.py`)
 
@@ -327,7 +327,7 @@ Meta-learning generalizes self-improving skill selection to ALL versioned inputs
 
 | Input | Current | Meta-Learning |
 |-------|---------|---------------|
-| Skill selection | SkillPipeline | ✅ Already learning ([details](skills-and-tools.md#3-skill-selection-pipeline)) |
+| Skill selection | ToolRegistry | ✅ Pinned/dynamic selection
 | Prompt | PromptOptimizer | ✅ Auto-diagnose + improve via InputFaceLearner |
 | Context budget | _BUDGET_RATIOS | ✅ Task-aware dynamic adjustment via InputFaceLearner |
 | Knowledge | MemoryGovernanceEngine | ✅ Stale detection + targeted quarantine via InputFaceLearner |

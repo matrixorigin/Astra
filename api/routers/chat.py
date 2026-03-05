@@ -343,25 +343,25 @@ def _build_chat_loop(db_factory):
         from core.evaluation.gate_trigger import GateTrigger
         gate_trigger = GateTrigger(db_factory=db_factory)
 
-    skill_registry = SkillCatalog(db_factory, gate_trigger=gate_trigger)
+    skill_catalog = SkillCatalog(db_factory, gate_trigger=gate_trigger)
     code_executor = CodeExecutor(
         runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
         db_factory=db_factory,
     )
-    register_builtin_skills(skill_registry, db_factory, code_executor=code_executor)
+    register_builtin_skills(skill_catalog, db_factory, code_executor=code_executor)
     context_manager = ContextManager(db_factory, gate_trigger=gate_trigger)
-    # Removed: SkillPipeline module deleted - using SkillCatalog directly
-    selector = skill_registry  # SkillCatalog implements get_tools_schema()
 
-    # Removed: credential_manager and skill_manager modules deleted
-    # Removed: skill_manager module deleted
-    skill_mgr = None  # Stubbed out
-    executor = AgentExecutor(db_factory, skill_registry, skill_manager=skill_mgr)
+    # Build ToolRegistry from SkillCatalog's registered skills
+    from core.skills.tool_registry import ToolRegistry, ToolSource
+    tool_registry = ToolRegistry()
+    for skill in skill_catalog.list_skills():
+        tool_registry.register_skill(skill, source=ToolSource.CLOUD, category="builtin")
 
+    executor = AgentExecutor(db_factory, skill_catalog)
     firewall = HallucinationFirewall(db_factory, context_manager)
 
     loop = ChatLoop(
-        selector=selector,
+        selector=tool_registry,
         executor=executor,
         llm_client=llm_client,
         event_logger=event_logger,

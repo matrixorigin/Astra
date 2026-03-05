@@ -422,7 +422,7 @@ Add `get_agent_info` as a platform tool (always available, not subject to skill 
 - Cloud implementation: extend `/chat/turn` to resolve cloud aspects
 - Merge logic: edge resolves local, cloud enriches with DB state
 - Available to all agents by default (platform capability, not a skill)
-- **Basic confidence signals**: Include knowledge freshness timestamps and skill selection accuracy from `SelfImprovingSelector` history. Full confidence calibration remains Phase 4, but basic signals (last validation date, historical accuracy %) are available here.
+- **Basic confidence signals**: Include knowledge freshness timestamps and skill selection accuracy from `ToolRegistry` history. Full confidence calibration remains Phase 4, but basic signals (last validation date, historical accuracy %) are available here.
 - **Introspection audit**: Every `get_agent_info` call is logged as a `conversation_event` with `event_type=introspection_query`. This enables tracking introspection usage patterns and measuring intent classification accuracy.
 
 ### Phase 3: Cross-Agent Introspection
@@ -439,7 +439,7 @@ The agent learns its own strengths and weaknesses from historical data.
 
 - "I'm good at Go code review but struggle with Python async patterns"
 - "I tend to over-read files — I should search first"
-- Stored as procedural memory, updated by `SelfImprovingSelector`
+- Stored as procedural memory, updated by `ToolRegistry`
 - Injected into self-awareness block as learned behavioral insights
 
 ---
@@ -455,6 +455,6 @@ The agent learns its own strengths and weaknesses from historical data.
 | `AgentProfile` / `AgentRegistry` | Provides identity and delegation graph |
 | `ContextManager` | Provides state (budget, turn count) |
 | `memory/observer.py` | Provides learned behavioral patterns (Phase 4) |
-| `SelfImprovingSelector` | Provides skill selection accuracy history (Phase 4) |
+| `ToolRegistry` | Provides skill selection accuracy history (Phase 4) |
 | `confidence_scorer.py` | Provides confidence dimension |
 | `EdgeChatLoop` | Executes edge-side introspection tool calls |

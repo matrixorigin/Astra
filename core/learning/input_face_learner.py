@@ -2,7 +2,7 @@
 
 Design doc: docs/design/evaluation-and-evolution.md §5
 
-Generalizes SelfImprovingSelector's learning pattern to cover:
+Generalizes learning patterns to cover:
 - Prompt quality (delegates to PromptOptimizer)
 - Context budget allocation (adjusts per-task-type ratios)
 - Knowledge freshness (triggers targeted decay/revalidation)

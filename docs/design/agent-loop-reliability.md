@@ -209,7 +209,7 @@ def route(state: TurnState) -> None:
 
 Only two categories that restrict. Everything else passes through unchanged. This is deliberately minimal — the self-improving selector can learn more categories over time.
 
-**Relationship to ModernSkillSelector**: The router operates on the tool schema list *after* ModernSkillSelector has already selected candidates. It's a post-filter, not a replacement. ModernSkillSelector does semantic retrieval; the router does intent-based scoping.
+**Relationship to ToolRegistry**: The router operates on the tool schema list *after* ToolRegistry has already selected candidates. It's a post-filter, not a replacement. ToolRegistry does semantic retrieval; the router does intent-based scoping.
 
 ---
 
@@ -593,7 +593,7 @@ async def run_step_stream(self, user_input, session_id, user_id, context=None, *
 | `ChatLoop.run_step_with_planning` | **Unchanged** | PAOR loop is a separate concern |
 | `tool_output_handler.py` | **Unchanged** | Already well-designed; just remove the guard |
 | `compaction.py` | **Unchanged** | Already well-designed; called from `CallLLMStage` |
-| `modern_selector.py` | **Unchanged** | `RouteStage` post-filters its output, doesn't replace it |
+| `tool_registry.py` | **Replaced** | `ToolRegistry` replaces old selector modules |
 | `_build_messages()` | **Unchanged** | Prompt composition is orthogonal |
 | Firewall verification | **Future stage** `VerificationStage` | Append to `loop_body`, zero invasion |
 | Event logging | **Moved** into `_to_stream_event()` | Same events, single location |

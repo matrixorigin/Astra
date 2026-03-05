@@ -35,7 +35,7 @@ class TestScratchpadToolsSchema:
         sel = Mock()
         sel.tools = [{"type": "function", "function": {"name": "existing_tool"}}]
         sel.event_id = "evt-1"
-        loop._pipeline.get_tools_schema = Mock(return_value=sel)
+        loop._tool_registry.select = Mock(return_value=sel.tools)
 
         # Simulate what run_step does
         tools = list(sel.tools) + _SCRATCHPAD_TOOLS

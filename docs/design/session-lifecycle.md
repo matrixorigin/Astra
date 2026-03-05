@@ -27,7 +27,7 @@ HTTP request
        ├─ SkillRegistry(db)
        ├─ CodeExecutor(db)
        ├─ ContextManager(db)
-       ├─ SkillPipeline(db)
+       ├─ ToolRegistry()
        ├─ AgentExecutor(db)
        ├─ HallucinationFirewall(db)
        └─ ChatLoop(selector, executor, ...)
@@ -152,7 +152,7 @@ block encompassing all steps:
 | `Sandbox.create()` | DROP DB → CREATE DB → CREATE PITR → INSERT metadata | Partial failure cleanup needs same connection |
 | `SessionManager.close_session()` | update status + commit → score → extract knowledge → callback | Steps 2-4 depend on step 1's commit, but step 1 already commits explicitly. Safe to split: step 1 gets its own session, steps 2-4 get independent sessions. Listed here as reminder to verify during migration |
 | `RunEngine._cancel_workflow()` | UPDATE workflow_runs + commit via `self.db` | `self.db` resolves via contextvar — may point to `bg_db` or `_default_db` depending on call context. Must use independent session to avoid polluting caller's transaction |
-| `GovernanceTaskRunner._run_eval_daily()` | Receives outer lock-holding session; Phase 2-4 use it for ConfidenceCalibrator, InputFaceLearner, SelfImprovingSelector | If a phase rollbacks, it affects subsequent phases and the lock. Migration should give Phase 2-4 independent sessions (like Phase 1 already does) |
+| `GovernanceTaskRunner._run_eval_daily()` | Receives outer lock-holding session; Phase 2-4 use it for ConfidenceCalibrator, InputFaceLearner, ToolRegistry | If a phase rollbacks, it affects subsequent phases and the lock. Migration should give Phase 2-4 independent sessions (like Phase 1 already does) |
 | `_trigger_loop` (api/main.py) | `get_due_triggers` → loop `claim_and_advance` + `fire_trigger` on same session | If one trigger's `fire_trigger` fails and rollbacks, it corrupts claim state of subsequent triggers. Migration should use session-per-trigger |
 
 ## Migration Strategy
@@ -191,7 +191,7 @@ Priority order (by connection hold time × frequency):
    `_is_cancelled_in_db` use `_db()`. `_append_event` stays in-memory.
 2. **`EventLogger`** — used everywhere, short operations, easy win.
 3. **`ChatLoop` internals** — `run_step` / `run_step_stream` DB access.
-4. **`_build_chat_loop` components** — SkillPipeline, ContextManager,
+4. **`_build_chat_loop` components** — ToolRegistry, ContextManager,
    AgentExecutor, HallucinationFirewall, etc.
 5. **`_trigger_loop`** — change to session-per-trigger.
 6. **`_run_eval_daily`** — give Phase 2-4 independent sessions.
@@ -394,7 +394,7 @@ Post-migration, monitor these metrics to validate the design:
 | `EventLogger` | 2 | ✅ Done | Extends DbConsumer; `from_session()` for legacy callers |
 | `ChatLoop` | 2 | ✅ Done | `_build_chat_loop` already receives db_factory; fixed `streaming.py` raw-Session caller |
 | `_run_eval_daily` Phase 2-4 | 2 | ✅ Done | Each phase gets independent session from db_factory |
-| `SkillPipeline` | 3 | ✅ Done | Uses `db_factory()` with manual close |
+| `ToolRegistry` | 3 | ✅ Done | Uses `db_factory()` with manual close |
 | `ContextManager` | 3 | ✅ Done | Extends DbConsumer; uses `_db()` context manager |
 | `AgentExecutor` | 3 | ✅ Done | Extends DbConsumer; uses `_db()` context manager |
 | `HallucinationFirewall` | 3 | ✅ Done | Extends DbConsumer; uses `_db()` context manager |

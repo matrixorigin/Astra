@@ -148,17 +148,18 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
         from core.events.event_logger import EventLogger
         from core.verification.firewall import HallucinationFirewall
         from core.skills.catalog import SkillCatalog
+        from core.skills.tool_registry import ToolRegistry, ToolSource
 
         db = db_factory()
         event_logger = EventLogger(db_factory)
         skill_catalog = SkillCatalog(lambda: db)
         context_manager = ContextManager(db_factory)
-        selector = skill_catalog
+        tool_registry = ToolRegistry()
         executor = AgentExecutor(db_factory, skill_catalog)
         firewall = HallucinationFirewall(db_factory, context_manager)
 
         loop = ChatLoop(
-            selector=selector,
+            selector=tool_registry,
             executor=executor,
             llm_client=llm,
             event_logger=event_logger,
@@ -192,12 +193,15 @@ def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
         )
         register_builtin_skills(skill_catalog, db_factory, code_executor=code_executor)
         context_manager = ContextManager(db_factory)
-        selector = skill_catalog
+        from core.skills.tool_registry import ToolRegistry, ToolSource
+        tool_registry = ToolRegistry()
+        for skill in skill_catalog.list_skills():
+            tool_registry.register_skill(skill, source=ToolSource.CLOUD, category="builtin")
         executor = AgentExecutor(db_factory, skill_catalog)
         firewall = HallucinationFirewall(db_factory, context_manager)
 
         loop = ChatLoop(
-            selector=selector,
+            selector=tool_registry,
             executor=executor,
             llm_client=llm,
             event_logger=event_logger,

@@ -97,33 +97,6 @@ class SkillCatalog(DbConsumer):
         """Return a snapshot of all registered in-memory skills (thread-safe)."""
         return list(self._skills.values())
 
-    # ── Pipeline-compatible interface (used by ChatLoop) ──────────
-
-    def get_tools_schema(self, user_input: str, session_id: str, **kwargs) -> Any:
-        """Return all registered skill schemas as a ToolsResult-like object."""
-        from dataclasses import dataclass, field as dc_field
-
-        @dataclass
-        class _ToolsResult:
-            tools: list = dc_field(default_factory=list)
-            event_id: str | None = None
-            high_confidence_skill: str | None = None
-            scores: list = dc_field(default_factory=list)
-            catalog: str = ""
-
-        schemas = []
-        for name, skill in self._skills.items():
-            if "@" in name:
-                continue
-            schema = skill.to_openai_schema()
-            if schema:
-                schemas.append(schema)
-        return _ToolsResult(tools=schemas)
-
-    def record_feedback(self, event_id: str, signal_type: Any, data: dict) -> None:
-        """No-op — feedback recording removed with SkillPipeline."""
-        pass
-
     # ── Registration (builtin / marketplace Python skills) ────────
 
     def register(

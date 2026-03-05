@@ -17,7 +17,7 @@ Three high-risk areas require immediate attention before production deployment:
 
 1. **Hybrid Reference Tracking** (§2): Pure heuristics have >2% false negative risk. Add lightweight async LLM verification for borderline cases. **CRITICAL**: Must run as background task (`asyncio.create_task`) to avoid blocking SSE stream. Cost: <0.1% token increase. Benefit: False negative rate <0.5%.
 
-2. **Dynamic Exploration Thresholds** (§3): Fixed thresholds (3/5/8) are too rigid. Learn from `SelfImprovingSelector` satisfaction data with **SQL performance optimization** (`COALESCE` fallback + recommended indexes). Add per-agent-type config. Change Tier 3 to soft block (allow user override).
+2. **Dynamic Exploration Thresholds** (§3): Fixed thresholds (3/5/8) are too rigid. Learn from `ToolRegistry` satisfaction data with **SQL performance optimization** (`COALESCE` fallback + recommended indexes). Add per-agent-type config. Change Tier 3 to soft block (allow user override).
 
 3. **Procedural Hint Conflict Resolution** (§1): Add explicit priority system with **zero-cost implementation** (pure regex, no LLM). Includes `extract_parameter_values()` and `extract_user_specified_value()` helper functions. Prevents "agent ignored my instruction" complaints.
 
@@ -587,7 +587,7 @@ The agent made 10 consecutive `read_file`/`grep` calls exploring source code to 
 
 Soft hints don't work — LLMs ignore them. We need **structural intervention** that forces strategic thinking.
 
-**Dynamic Thresholds** (learned from `SelfImprovingSelector`):
+**Dynamic Thresholds** (learned from `ToolRegistry`):
 ```python
 # Base thresholds per agent type
 EXPLORATION_THRESHOLDS = {
@@ -600,7 +600,7 @@ def get_dynamic_thresholds(agent_type: str, session_id: str) -> dict[str, int]:
     """
     Adjust thresholds based on learned patterns from edge_tool_patterns view.
     
-    Uses LOW_SATISFACTION signal from SelfImprovingSelector:
+    Uses LOW_SATISFACTION signal from ToolRegistry:
     - If exploration sessions have low satisfaction → lower thresholds
     - If exploration sessions have high satisfaction → raise thresholds
     
@@ -758,7 +758,7 @@ This provides:
 - Execution time patterns
 - No schema pollution, no redundant data
 
-**Learning Integration**: The `SelfImprovingSelector` can query this view to learn:
+**Learning Integration**: The `ToolRegistry` can query this view to learn:
 ```python
 # Find sessions where exploration was inefficient
 inefficient_exploration = db.query("""
@@ -1197,7 +1197,7 @@ compliance_rate = (
 **Tasks**:
 - [ ] Implement `ExplorationPlan` dataclass and storage
 - [ ] Add exploration counter to session cache
-- [ ] **P0: Implement `get_dynamic_thresholds()` learning from SelfImprovingSelector**
+- [ ] **P0: Implement `get_dynamic_thresholds()` learning from ToolRegistry**
 - [ ] **P0: Add per-agent-type threshold configuration**
 - [ ] Implement 3-tier intervention (plan required → memory extraction → soft block + guidance)
 - [ ] **P0: Change Tier 3 from hard block to soft block with user override**

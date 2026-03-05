@@ -227,7 +227,7 @@ Pipeline Phase 3 (PollutionDetector) quarantines entries
 ### Skill Regression Detection
 
 Separate from knowledge regression, skill-level regressions are detected via
-`skill_selection_events` — the audit table written by `SkillPipeline._record_selection`.
+`skill_selection_events` — the audit table for skill selection decisions.
 
 **Denormalized columns** (indexed for direct queries, no JSON extraction):
 

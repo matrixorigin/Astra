@@ -21,7 +21,6 @@ from api.models.memory import MemoryRecord  # noqa: F401
 from api.models.skill import (  # noqa: F401
     SkillExecutionMetric,
     SkillInstallation,
-    SkillLearningSignal,
     SkillPermission,
     SkillRegistry,
     SkillResourceBinding,

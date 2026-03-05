@@ -105,6 +105,7 @@ class ChatLoop:
 
     def __init__(
         self,
+        selector,  # ToolRegistry instance
         executor: AgentExecutor,
         llm_client,
         event_logger: EventLogger,
@@ -114,12 +115,11 @@ class ChatLoop:
         scratchpad=None,
         firewall_mode: str = "warn",
         hitl_policy=None,
-        selector: Any = None,  # Deprecated: was SkillPipeline
     ):
         """Initialize ChatLoop.
         
         Args:
-            selector: Unified skill pipeline
+            selector: ToolRegistry for tool selection
             executor: Skill executor
             llm_client: LLM client
             event_logger: Event logger
@@ -131,7 +131,7 @@ class ChatLoop:
             hitl_policy: HITLPolicyEngine instance for human-in-the-loop supervision (optional)
         """
         self.selector = selector
-        self._pipeline = selector
+        self._tool_registry = selector
         self.executor = executor
         self.llm = llm_client
         self.event_logger = event_logger
@@ -170,42 +170,6 @@ class ChatLoop:
             self._budget_manager = ContextBudgetManager(max_context_tokens=max_tokens)
         except Exception:
             pass
-
-    async def _select_tool_from_catalog(
-        self,
-        query: str,
-        catalog: str,
-        available_tools: list[str],
-    ) -> str | None:
-        """Use LLM to select a tool from lightweight catalog.
-        
-        Two-phase selection: catalog (~150 tokens) instead of full schemas (~1000 tokens).
-        Returns selected tool name, or None to fall back to full schema mode.
-        """
-        prompt = f"""Given this user query, select the most appropriate tool from the catalog.
-Reply with ONLY the tool name, nothing else.
-
-Query: {query}
-
-Available tools:
-{catalog}
-
-Tool name:"""
-        
-        try:
-            response = self.llm.chat([
-                {"role": "user", "content": prompt}
-            ], max_tokens=20)
-            selected = response.get("content", "").strip().lower()
-            # Validate selection
-            for tool in available_tools:
-                if tool.lower() == selected or tool.lower() in selected:
-                    return tool
-            logger.debug("Catalog selection '%s' not in available tools", selected)
-            return None
-        except Exception as e:
-            logger.warning("Catalog selection failed: %s", e)
-            return None
 
     def _extract_params_from_query(self, query: str) -> dict[str, Any]:
         """Extract common parameters from query using simple patterns.
@@ -413,7 +377,7 @@ Tool name:"""
                                 params=params,
                                 session_id=session_id,
                                 parent_event_id=user_event.event_id,
-                                selection_event_id=self._last_selection_event_id,
+                                selection_event_id=None,
                             ),
                             timeout=TOOL_TIMEOUT_SECONDS,
                         )
@@ -428,13 +392,7 @@ Tool name:"""
             if self.hitl_policy:
                 self.hitl_policy.record_outcome(fn_name, success=False)
         finally:
-            if fn_name == "delegate_task" and self._last_selection_event_id:
-                _elapsed_ms = (time.monotonic() - _t0) * 1000
-                self._pipeline.record_feedback(
-                    self._last_selection_event_id,
-                    SignalType.EXECUTION_TIME,
-                    {"ms": _elapsed_ms, "skill": fn_name},
-                )
+            pass
 
         _tool_elapsed_ms = (time.monotonic() - _t0) * 1000
         _result_size_bytes = len(result_str.encode("utf-8", errors="replace")) if result_str else 0
@@ -552,42 +510,8 @@ Tool name:"""
                 messages[-1]["content"] += f"\n\n[{hint}]"
             logger.debug("Parameter extraction: %s", extracted_params)
 
-        # 5. Get available tools schema (with audit + learning)
-        conv_state = ConversationState.from_messages(messages)
-        _sel = self._pipeline.get_tools_schema(
-            user_input, session_id, max_candidates=max_candidates,
-            conversation_state=conv_state,
-        )
-        tools_schema = _sel.tools
-        self._last_selection_event_id = _sel.event_id
-
-        # High-confidence optimization: if semantic retrieval is very confident,
-        # only pass the top skill's schema to LLM (saves ~800 tokens)
-        if _sel.high_confidence_skill and tools_schema:
-            top_tool = next(
-                (t for t in tools_schema if t["function"]["name"] == _sel.high_confidence_skill),
-                None,
-            )
-            if top_tool:
-                logger.info(
-                    "High-confidence mode: using only %s (score=%.2f)",
-                    _sel.high_confidence_skill,
-                    _sel.scores[0][1] if _sel.scores else 0,
-                )
-                tools_schema = [top_tool]
-        # Low-confidence: two-phase selection using catalog (always try if catalog available)
-        elif _sel.catalog and len(tools_schema) > 1:
-            selected_name = await self._select_tool_from_catalog(
-                user_input, _sel.catalog, [t["function"]["name"] for t in tools_schema]
-            )
-            if selected_name:
-                selected_tool = next(
-                    (t for t in tools_schema if t["function"]["name"] == selected_name),
-                    None,
-                )
-                if selected_tool:
-                    logger.info("Catalog selection: %s", selected_name)
-                    tools_schema = [selected_tool]
+        # 5. Get available tools schema
+        tools_schema = self._tool_registry.select(user_input, messages)
 
         if self.scratchpad:
             tools_schema = list(tools_schema) + _SCRATCHPAD_TOOLS
@@ -990,14 +914,7 @@ Tool name:"""
                         if tc["id"] not in results:
                             results[tc["id"]] = f"Error: Parallel execution failed - {e!s}"
                 finally:
-                    # Record feedback for parallel execution
-                    _elapsed_ms = (time.monotonic() - _t0) * 1000
-                    if self._last_selection_event_id:
-                        self._pipeline.record_feedback(
-                            self._last_selection_event_id,
-                            SignalType.EXECUTION_TIME,
-                            {"ms": _elapsed_ms, "skill": "delegate_task", "parallel": True, "count": len(delegation_calls)},
-                        )
+                    pass
 
                 # Emit TOOL_RESULT for each delegation
                 for tc in delegation_calls:
@@ -1047,14 +964,6 @@ Tool name:"""
             # Task 1.2: Check if all tools are blocked after this round
             if self._all_tools_blocked(tools_schema):
                 failure_report = self._build_failure_report()
-                # Task 4.1: Record routing failure for self-improving selector
-                if self._last_selection_event_id:
-                    self._pipeline.record_feedback(
-                        self._last_selection_event_id,
-                        SignalType.TOOL_ROUTING_FAILURE,
-                        {"query": user_input, "blocked_tools": sorted(self._blocked_tools),
-                         "failures": {k: v[-1] for k, v in self._tool_failures.items()}},
-                    )
                 yield StreamEvent(
                     event_type=StreamEventType.TEXT_DELTA,
                     data={"chunk": failure_report},
@@ -1570,7 +1479,7 @@ Tool name:"""
                         params=params,
                         session_id=session_id,
                         parent_event_id=user_event.event_id,
-                        selection_event_id=self._last_selection_event_id,
+                        selection_event_id=None,
                     ),
                     timeout=TOOL_TIMEOUT_SECONDS,
                 )

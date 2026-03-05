@@ -22,25 +22,18 @@ class AgentExecutor(DbConsumer):
         db_factory: DbFactory,
         registry: SkillCatalog,
         mode: MockMode = MockMode.PRODUCTION,
-        pipeline: "SkillPipeline | None" = None,
-        skill_manager: "SkillManager | None" = None,
     ):
         super().__init__(db_factory)
         self.registry = registry
         self.mode = mode
         self.mock_layer = ToolMockingLayer(mode, db_factory)
-        self._pipeline = pipeline
-        self._skill_manager = skill_manager
 
         from core.agent.execution_backend import BackendRouter
         self._backend_router = BackendRouter()
 
     def _enforce_runtime_checks(self, skill_name: str, params: dict[str, Any]) -> None:
         """Enforce installation + permission + dependency checks for marketplace skills."""
-        if not self._skill_manager:
-            return
-        user_id = params.get("user_id", "system")
-        self._skill_manager.require_executable(user_id, skill_name)
+        pass  # SkillManager removed; marketplace checks not yet reimplemented
 
     def execute_skill(
         self,
@@ -190,13 +183,6 @@ class AgentExecutor(DbConsumer):
                 self._backfill_selection_event(
                     selection_event_id, int(_elapsed_ms), _cost, _success,
                 )
-
-            # Buffer feedback signal (existing path)
-            if self._pipeline and selection_event_id:
-                # Learning signals removed in skill system cleanup
-                pass
-                # Learning signals removed in skill system cleanup
-                pass
     
     def _inject_user_credentials(self, skill: Any, skill_name: str, user_id: str) -> None:
         """Inject per-user credentials into skills that use external APIs.

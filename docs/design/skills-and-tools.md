@@ -4,13 +4,13 @@
 > **Last Updated**: 2026-03-05
 > **Related**: [agent-loop-reliability.md](agent-loop-reliability.md) (pre-LLM task routing and tool scoping)
 >
-> 🔵 **Implementation Status**: `SkillManager` (install/uninstall/upgrade/rollback with full dependency validation, credential CRUD) and `SkillPipeline` (unified selection) are implemented.
+> 🔵 **Implementation Status**: `SkillCatalog` (register/lifecycle/versioning) and `ToolRegistry` (unified tool selection with pinned/dynamic split) are implemented.
 > Marketplace discovery, publishing, RBAC, and MatrixOne Publication distribution are Design Targets.
 > Skill Configuration Center (§13) — P0 (ORM models, config_center core, manifest parsing, require_executable validation, migration), P1 (REST API + CLI commands) are implemented. P2 (tenant-scope admin, config change events) remains.
 > Sandbox Mode (§11) promoted to P1 — mandatory for third-party skills before marketplace opens.
-> Skill Table Registry (§14), Historical Code Replay (§2), and Self-Learning Upgrade Path (§3) are Design Targets.
+> Skill Table Registry (§14), Historical Code Replay (§2) are Design Targets.
 >
-> ⚠️ **2026-03-05 Update**: §3 Skill Selection Pipeline rewritten. Added Context-Aware Pre-Filtering (§3.5) and Conversation State Signals (§3.6) to address skill disambiguation failures. Pre-filtering uses structured skill tags and conversation state to narrow candidates before vector retrieval — zero LLM cost, zero additional context tokens. Intent-based tool scoping (ROUTE stage in ChatLoop's execution pipeline) post-filters `ModernSkillSelector` output. See [agent-loop-reliability.md](agent-loop-reliability.md). The selector does semantic retrieval; the router does intent-based scoping on the result.
+> ⚠️ **2026-03-05 Update**: §3 Skill Selection Pipeline rewritten. The old `SkillPipeline`, `ModernSkillSelector`, `SelfImprovingSelector`, `selector.py`, `learning_signals.py`, `learning_config.py`, `learning_similarity.py` have been **deleted** and replaced by `ToolRegistry` (`core/skills/tool_registry.py`). ToolRegistry provides a unified pinned/dynamic tool split with embedding retrieval, intent filtering, and prefilter reordering. Context-Aware Pre-Filtering (§3.5) and Conversation State Signals (§3.6) remain. The self-improving learning loop (§3.9) is removed — the learning API endpoints are stubs.
 
 ---
 
@@ -455,10 +455,11 @@ This ensures replay never silently runs newer code against historical sessions.
 
 ## 3. Skill Selection Pipeline
 
-> **Implementation**: `core/skills/pipeline.py` — `SkillPipeline` is the single public interface.
-> Internal components (`selector.py`, `modern_selector.py`, `self_improving_selector.py`) are implementation details — external code must use `SkillPipeline` only.
+> **Implementation**: `core/skills/tool_registry.py` — `ToolRegistry` is the single public interface for tool selection.
+> `core/skills/catalog.py` — `SkillCatalog` handles skill registration, lifecycle, and DB persistence.
+> `core/skills/prefilter.py` — Context-aware pre-filtering (conversation state signals + skill tags).
 >
-> ⚠️ **2026-03-05 Update**: Added Context-Aware Pre-Filtering (§3.5) to address skill misselection caused by semantic overlap between skills. Pre-filtering uses structured skill tags and conversation state signals to narrow candidates before vector retrieval — zero LLM cost, zero additional context tokens. Also added Conversation State Signals (§3.6) for history-aware selection.
+> ⚠️ **2026-03-05 Update**: The old `SkillPipeline`, `selector.py`, `modern_selector.py`, `self_improving_selector.py`, `learning_signals.py`, `learning_config.py`, `learning_similarity.py` have been deleted. `ToolRegistry` replaces them with a simpler pinned/dynamic split + embedding retrieval model.
 
 ### 3.1 The Problem
 
@@ -469,101 +470,79 @@ With 50+ skills, the LLM can't efficiently choose from a flat list. Selection mu
 1. **Retrieval failure** — the correct skill isn't in the candidate set. Solved by semantic retrieval (implemented).
 2. **Disambiguation failure** — multiple skills match semantically, but only one is correct for the user's actual intent. Example: "分析前一个上下文" matches both `introspection` (session metadata snapshot) and event analysis (historical event data). Semantic similarity alone cannot distinguish them because their descriptions overlap. **This is the harder problem and requires context-aware pre-filtering (§3.5).**
 
-### 3.2 Unified Pipeline: Pre-Filter → Retrieve → Audit → Feedback
+### 3.2 Unified Pipeline: ToolRegistry (Pinned + Dynamic)
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                       SkillPipeline                          │
+│                       ToolRegistry                           │
 │                                                              │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │ Stage 0: PRE-FILTER (deterministic, 0 tokens)         │  │
-│  │  Conversation state signals → Skill tag matching       │  │
-│  │  → Narrow candidate pool before retrieval              │  │
-│  │  Output: filtered skill set (or full set on no match)  │  │
+│  │ PINNED TOOLS (always included)                         │  │
+│  │  bash, read_file, write_file, grep, glob, list_dir     │  │
+│  │  → Always in LLM context, no selection needed          │  │
 │  └────────────────────────────────────────────────────────┘  │
-│                           │                                  │
-│  ┌────────────────────────▼───────────────────────────────┐  │
-│  │ Stage 1: RETRIEVE + RANK                               │  │
-│  │  Semantic vector search (<50ms, 0 prompt tokens)       │  │
-│  │  → Budget-controlled full schema loading               │  │
-│  │  → Apply learned corrections                           │  │
-│  │  Output: tools_schema + candidate metadata             │  │
+│                           +                                  │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │ DYNAMIC TOOLS (selected per-request)                   │  │
+│  │  Step 1: Intent filter (conversational → skip)         │  │
+│  │  Step 2: Prefilter reorder by conversation state       │  │
+│  │  Step 3: Embedding retrieval top-K (or truncate)       │  │
+│  │  Step 4: Token budget enforcement                      │  │
 │  └────────────────────────────────────────────────────────┘  │
-│                           │                                  │
-│  ┌────────────────────────▼───────────────────────────────┐  │
-│  │ Stage 2: AUDIT                                         │  │
-│  │  Snapshot context → Record selection event              │  │
-│  │  Output: event_id (for feedback linkage)                │  │
-│  └────────────────────────────────────────────────────────┘  │
-│                           │                                  │
-│  ┌────────────────────────▼───────────────────────────────┐  │
-│  │ Stage 3: FEEDBACK (post-execution, async)              │  │
-│  │  Collect signals → Batch write                          │  │
-│  │  Learning cycle runs periodically, not inline           │  │
-│  └────────────────────────────────────────────────────────┘  │
+│                           =                                  │
+│  Final tool schemas for LLM                                  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 **Key design decisions**:
 
-1. **`get_tools_schema()` remains the primary interface** — ChatLoop needs tools schema for LLM function calling. The pipeline enriches this call with pre-filtering + audit + learning, not replaces it.
-2. **Pre-filtering is deterministic and zero-cost** — No LLM calls, no embedding computation. Uses structured tags on skills and rule-based conversation state signals. Runs before vector retrieval to narrow the candidate pool.
-3. **Pre-filter is conservative** — When no signals match, the full skill set passes through. Pre-filtering only narrows, never blocks the fallback path.
-4. **Learning is separate from selection** — `SkillPipeline.get_tools_schema()` applies learned corrections synchronously. Learning cycle (`learn()`) runs asynchronously via scheduler or API call.
-5. **Feedback is batched** — `record_feedback()` writes to an in-memory buffer, flushed periodically. No synchronous DB write per tool execution.
-6. **No internal implementation leaks** — Callers never see `ModernSkillSelector` or `SelfImprovingSelector`. The pipeline is the only public interface.
+1. **Pinned/dynamic split** — Core coding tools (bash, grep, file ops) are always available. Cloud skills (GitHub, CI, etc.) are selected dynamically per request.
+2. **`select()` is the single interface** — ChatLoop calls `registry.select(user_query, messages)` and gets back a list of OpenAI tool schemas.
+3. **Pre-filtering is deterministic and zero-cost** — No LLM calls, no embedding computation. Uses structured tags on skills and rule-based conversation state signals.
+4. **Token budget is the hard constraint** — Pinned tools are never dropped. Dynamic tools are included until the budget is exhausted.
+5. **No learning loop** — The self-improving selector has been removed. Selection relies on embedding similarity + prefilter rules.
 
 ### 3.3 Interface
 
 ```python
-class SkillPipeline:
-    """Unified skill selection: pre-filter → retrieve → audit → feedback."""
+class ToolRegistry:
+    """Unified registry for all tools. Handles selection per request."""
 
-    def __init__(self, db, llm_client, *, audit=True, learning=True): ...
+    def __init__(
+        self,
+        pinned_names: frozenset[str] | None = None,
+        max_dynamic: int = 8,
+        max_tokens: int = 2500,
+        embed_fn: Callable | None = None,
+    ): ...
 
-    def get_tools_schema(
-        self, query, session_id, *,
-        max_candidates=5,
-        conversation_state: ConversationState | None = None,  # NEW: for pre-filtering
-    ) -> ToolsResult:
-        """Select skills and return tools schema for LLM."""
+    def register_skill(self, skill, source: ToolSource, pinned: bool | None = None) -> None:
+        """Register a Skill instance (has to_openai_schema())."""
 
-    def record_feedback(self, event_id, signal, data) -> None:
-        """Buffer a feedback signal (async flush)."""
+    def register_schema(self, schema: dict, source: ToolSource) -> None:
+        """Register a raw OpenAI tool schema dict."""
 
-    def learn(self, *, days=7) -> LearningResult:
-        """Run learning cycle. Called by scheduler, not by ChatLoop."""
+    def select(self, user_query: str = "", messages: list[dict] | None = None) -> list[dict]:
+        """Select tools for one LLM request. Returns list of OpenAI tool schemas."""
 
-    def stats(self) -> dict: ...
-
-@dataclass
-class ToolsResult:
-    tools: list[dict]                    # OpenAI tools schema, ready for LLM
-    event_id: str | None                 # Audit event ID (None if audit disabled)
-    candidates: int                      # Number of candidates considered
-    retrieval_method: str | None         # "semantic" or "keyword"
-    high_confidence_skill: str | None    # If set, can skip LLM tool selection
-    scores: list[tuple[str, float]]      # (name, score) pairs
-    catalog: str | None                  # Lightweight tool list for two-phase selection
-    pre_filter_applied: bool = False     # Whether pre-filtering narrowed candidates
+    def get_all_schemas(self) -> list[dict]:
+        """Return all tool schemas (no filtering). For backward compat."""
 ```
 
 ### 3.4 ChatLoop Integration
 
 ```python
-# Build conversation state from turn history (zero-cost extraction)
-conv_state = ConversationState.from_messages(messages)
+# In ChatLoop.run_step_stream():
+tools_schema = self._tool_registry.select(user_input, messages)
 
-result = self.pipeline.get_tools_schema(
-    query=user_input,
-    session_id=session_id,
-    max_candidates=max_candidates,
-    conversation_state=conv_state,
-)
-tools_schema = result.tools
+# Append scratchpad tools if enabled
+if self.scratchpad:
+    tools_schema = list(tools_schema) + _SCRATCHPAD_TOOLS
 
-# After each tool execution:
-self.pipeline.record_feedback(result.event_id, SignalType.EXECUTION_TIME, {"ms": elapsed})
+# Append MCP tools
+if self.mcp_bridge and self.mcp_bridge.tool_count > 0:
+    mcp_tools = await self.mcp_bridge.get_tools_schema()
+    tools_schema = list(tools_schema) + mcp_tools
 ```
 
 ### 3.5 Context-Aware Pre-Filtering (NEW)
@@ -726,7 +705,7 @@ tags:
   requires_history: false
 ```
 
-For existing skills without manifest tags, `SkillPipeline` infers defaults:
+For existing skills without manifest tags, `SkillCatalog` infers defaults:
 - Skills with `category: "github"` → `scope: external, data_source: external_api`
 - Skills with `category: "analysis"` → `scope: historical, data_source: event_store`
 - Unknown → no tags → pre-filter passes them through unchanged
@@ -827,145 +806,30 @@ Prompt token cost stays **constant** regardless of total skill count — only th
 
 ### 3.8 Auditable Selection
 
-Every selection is recorded:
+Selection events are still recorded in `skill_selection_events` for audit purposes. The `ToolRegistry` itself does not write audit events — this is handled by the ChatLoop's event logger.
 
-```json
-{
-  "event_id": "sel_01...",
-  "session_id": "sess_01...",
-  "user_query": "Review PR #123",
-  "selected_skills": ["code_review", "summarize_pr"],
-  "selection_method": "semantic",
-  "pre_filter_applied": true,
-  "conversation_signals": {"references_history": false, "is_fetch": true},
-  "created_at": "2026-02-20T12:00:00Z"
-}
-```
+### ~~3.9 Self-Improving Selection~~ (REMOVED)
 
-After selection, the executor enforces approval gates based on each skill's `SideEffectCategory` (Read/Write/Destructive). See [§1 Skill Types](#skill-types) for the approval matrix.
+> **Deleted**: The `SelfImprovingSelector`, `learning_signals.py`, `learning_config.py`, `learning_similarity.py` modules have been removed. The learning API endpoints (`/learning/trigger`, `/learning/signals`, `/learning/stats`) are stubs returning empty data. The `submit_feedback` endpoint still works for recording user feedback on selection events.
 
-### 3.9 Self-Improving Selection
+### ~~3.10 Procedural Memory Bridge~~ (REMOVED)
 
-The `SelfImprovingSelector` (internal to `SkillPipeline`) learns from historical failures via a closed-loop:
+> **Deleted**: `core/skills/procedural_memory.py` was removed along with the learning system.
 
-```
-PRODUCTION USAGE:
-  User query → SkillPipeline.get_tools_schema()
-    → Stage 0: Pre-filter by conversation state + skill tags
-    → Stage 1: Semantic retrieval + LLM ranking
-    → Stage 2: Apply learned corrections (boost/penalize skills by pattern)
-    → Stage 3: Record audit event (including pre-filter signals)
-  → Execution & feedback signals recorded
+### ~~3.11 Self-Learning Upgrade Path~~ (REMOVED)
 
-LEARNING CYCLE (triggered manually or scheduled):
-  1. OBSERVE: Get recent failures from skill_selection_events
-  2. DIAGNOSE: Extract patterns (query_pattern → wrong_skills → correct_skills)
-  3. LEARN PRE-FILTER RULES: Analyze misclassifications where pre-filter
-     could have prevented the error → generate new signal patterns or tag updates
-  4. VALIDATE: Regression gate replays golden sessions, compares old vs new scores
-  5. DEPLOY: If improvement confirmed, activate learnings (confidence-gated)
-```
-
-**Five signal types drive learning**:
-
-| Signal | Trigger | Example |
-|--------|---------|---------|
-| `WRONG_SKILL` | User corrects skill choice | "I wanted create_pr, not list_prs" |
-| `SLOW_EXECUTION` | Execution > 5000ms | Skill took too long |
-| `HIGH_COST` | Cost > $0.10 | Expensive LLM calls in skill (carries `actual_tokens` + `actual_usd`) |
-| `LOW_SATISFACTION` | User rating < 3 | Poor result quality |
-| `LOW_DATA_QUALITY` | Tool quality score below threshold | Degraded or empty tool results |
-
-**Multi-factor scoring** combines dimensions with configurable weights:
-
-```
-score = accuracy_weight × accuracy_score + speed_weight × speed_score
-      + cost_weight × cost_score + satisfaction_weight × satisfaction_score
-```
-
-**Pre-filter learning loop** (NEW): When a `WRONG_SKILL` signal is recorded, the learning cycle also checks whether the error could have been prevented by pre-filtering:
-
-```
-WRONG_SKILL signal recorded
-  │
-  ├─ Was the correct skill in the candidate pool? (retrieval OK?)
-  │    └─ Yes → disambiguation failure → check pre-filter
-  │
-  ├─ Would conversation state signals have distinguished them?
-  │    ├─ Yes → add/update pre-filter rule
-  │    └─ No → check if new signal markers needed
-  │
-  └─ Would skill tags have distinguished them?
-       ├─ Yes → verify tags are correct
-       └─ No → suggest tag refinement
-```
-
-This means pre-filter rules improve automatically from the same feedback loop that drives skill selection learning. No separate learning system needed.
-
-**Safety mechanisms**:
-- **Regression Gate**: Tests on golden queries before deployment, requires improvement ≥ threshold
-- **Confidence Threshold**: Only applies learnings with confidence ≥ 50 (increases with evidence, capped at 99)
-- **Full Audit Trail**: Every selection, learning, and gate validation logged
-- **Reversibility**: Can disable learning per pipeline, reset learnings in database
-- **Pre-filter conservatism**: Pre-filter rules only reorder, never remove. Even a bad rule cannot cause retrieval failure.
-
-**Database tables**:
-- `skill_selection_events` — every selection decision with query, selected skills, method, pre-filter signals
-- `skill_selection_learnings` — learned correction rules with confidence and evidence count (capped at 200 active; lowest-confidence evicted)
-- `skill_learning_signals` — raw feedback signals per execution
-- `gate_results` — regression gate verdicts for learning changes
-
-**Reliability**:
-- Feedback buffer: in-memory with `max_buffer_size=10,000`, oldest signals evicted on overflow
-- Retry limit: 3 retries per signal on flush failure, then dropped with warning
-- Process crash = buffered signals lost (acceptable: feedback is optimization data, not correctness-critical)
-
-**Cost signal closed-loop**: `record_feedback(signal_type=HIGH_COST)` now carries `actual_tokens` and `actual_usd` in its payload. These flow into two consumers:
-1. **Agent Loop budget gate** — `ChatLoop` reads per-skill cost from `skill_learning_signals` to enforce session-level budget caps before the next skill call.
-2. **Learning weight adjustment** — `SelfImprovingSelector` uses actual cost to dynamically adjust `SignalWeights.cost` relative to other dimensions, so expensive skills are penalized proportionally rather than by a fixed threshold.
-
-**Performance**:
-| Operation | Latency | Storage |
-|-----------|---------|---------|
-| Pre-filter (Stage 0) | <1ms | 0 (in-memory) |
-| `get_tools_schema()` | ~10ms | 1KB/event |
-| `learn()` | 1-5s | 500B/learning |
-
-**Observability**: `SkillPipeline.stats()` exposes per-skill selection rate, success rate, average token cost, and pre-filter hit rate. These metrics are exported to Prometheus via the standard `/metrics` endpoint. An optional `LLM-as-Judge` pass periodically evaluates high-confidence successful executions and promotes them into the golden set for regression gate testing — automating golden session curation.
-
-For usage guide (weights configuration, selective learning, troubleshooting), see [Multi-Dimensional Learning Guide](../guides/multi-dimensional-learning-guide.md).
-
-### 3.10 Procedural Memory Bridge
-
-`core/skills/procedural_memory.py` provides a type-layer adapter that converts `skill_selection_learnings` rows into `Memory` domain objects. This enables the Skill Selector to use memory-system APIs (governance, confidence decay, trust tiers) without duplicating data.
-
-**Design boundary**: skill selection learnings are Skill Selector internal correction rules, NOT general-purpose procedural memory. The bridge is consumed only during skill selection — it is NOT injected into `MemoryRetriever`.
-
-### 3.11 Self-Learning Upgrade Path (Design Target)
-
-Three planned enhancements to the learning cycle:
-
-1. **Test-Time Self-Improvement (TT-SI)**: At inference time, the selector generates multiple candidate skill rankings, scores them against recent feedback, and picks the best — a lightweight search over its own output space. No model fine-tuning required; works with any LLM backend.
-2. **Lightweight RL for weight tuning**: Replace static `SignalWeights` with a bandit that adjusts `accuracy_weight`, `speed_weight`, `cost_weight`, `satisfaction_weight` per-skill based on reward signal (composite score delta). Exploration via ε-greedy with decay.
-3. **Tool Maps**: An abstraction layer mapping logical operations (e.g., "create issue") to multiple skill implementations (GitHub Issues, Jira, Linear). The selector picks the skill; the Tool Map ensures the correct operation binding. Enables skill substitution without retraining learnings.
-4. **Pre-filter rule evolution**: Automatically discover new conversation state markers from misclassification patterns. When the learning cycle detects a cluster of `WRONG_SKILL` signals that share a common query pattern not covered by existing markers, it proposes new markers for human review.
+> **Deleted**: Design target removed along with the learning system.
 
 ### 3.12 Relationship to RouteStage (agent-loop-reliability.md)
 
-The `RouteStage` in the ChatLoop pipeline (see [agent-loop-reliability.md](agent-loop-reliability.md)) is a **post-filter** that operates on the tool schema list *after* `SkillPipeline` has selected candidates. It handles a different concern: restricting tools based on intent category (e.g., block local-only tools for external data fetch queries).
+The `RouteStage` in the ChatLoop pipeline (see [agent-loop-reliability.md](agent-loop-reliability.md)) is a **post-filter** that operates on the tool schema list *after* `ToolRegistry` has selected candidates.
 
 ```
-SkillPipeline (pre-filter → retrieve → rank)
+ToolRegistry.select() (pinned + intent filter + prefilter + embedding retrieval)
   → produces tools_schema
     → RouteStage (post-filter: intent-based tool scoping)
       → produces final tools_schema for LLM
 ```
-
-**Division of responsibility**:
-- **Pre-filter (§3.5)**: Narrows candidate pool *before* retrieval based on conversation state + skill tags. Addresses disambiguation between semantically similar skills.
-- **RouteStage**: Removes inappropriate tools *after* retrieval based on intent classification. Addresses tool category mismatches (e.g., local tools for remote queries).
-
-Both are deterministic, zero-token, and composable. Neither replaces the other.
 
 ### 3.13 Maintainability: Tag and Marker Lifecycle
 
@@ -1006,7 +870,7 @@ VALID_INTENT_TYPES = {"analytical", "fetch", "mutate", "introspect"}
 
 1. **Markers are intentionally small** — Each set has 5-10 entries. This is not a growing dictionary; it's a fixed set of high-signal patterns.
 
-2. **Coverage monitoring** — `SkillPipeline.stats()` reports `pre_filter_hit_rate`: the percentage of queries where at least one signal fired. If hit rate drops below 30%, markers may need expansion. If hit rate exceeds 80%, markers may be too aggressive.
+2. **Coverage monitoring** — The system reports `pre_filter_hit_rate`: the percentage of queries where at least one signal fired. If hit rate drops below 30%, markers may need expansion. If hit rate exceeds 80%, markers may be too aggressive.
 
 3. **Learning-driven expansion** — When the learning cycle (§3.9) identifies `WRONG_SKILL` clusters that share a query pattern not covered by existing markers, it logs a `marker_gap` event. Platform developers review and add markers. This is a low-frequency event (new markers needed maybe once per quarter as usage patterns stabilize).
 
@@ -1093,7 +957,7 @@ def test_register_skill_default_tags():
 ```python
 def test_pipeline_prefilter_improves_selection(db_factory):
     """The actual failure case from session 019cbb9e."""
-    pipeline = SkillPipeline(db_factory, llm_client, learning=False)
+    registry = ToolRegistry(embed_fn=embed_fn, max_tokens=50000)
 
     # Register two skills with overlapping descriptions but different tags
     register_skill(db_factory, "introspection",
@@ -1124,7 +988,7 @@ def test_pipeline_prefilter_improves_selection(db_factory):
 | Zero retrieval regression | 0 cases where pre-filter causes correct skill to be missed | Pre-filter reorders, never removes — structurally guaranteed |
 | Token overhead | 0 additional prompt tokens | Structural — tags never enter LLM context |
 | Latency overhead | <1ms per selection | Benchmark `pre_filter()` on 100-skill pool |
-| Pre-filter hit rate | 30-70% of queries trigger at least one signal | `SkillPipeline.stats()["pre_filter_hit_rate"]` |
+| Pre-filter hit rate | 30-70% of queries trigger at least one signal | monitoring dashboard |
 | Marker maintenance frequency | <1 update per quarter after stabilization | Track `marker_gap` events over time |
 
 #### Backtest Validation (Before Deployment)
@@ -1519,11 +1383,11 @@ Comparison focuses on **stateful skill management** — persistent data, lifecyc
 | Marketplace + RBAC | ❌ | ❌ | ❌ | ✅ |
 | Per-user credentials | ❌ env vars | ❌ env vars | ❌ | ✅ encrypted, scoped, per-resource (§13) |
 | Skill-local models | ❌ | ❌ | ❌ | ✅ `skills/{name}/models.py` |
-| Self-improving selection | ❌ | ❌ | ❌ | ✅ closed-loop learning |
-| Unified selection pipeline | ❌ | ❌ | ❌ | ✅ pre-filter → retrieve → audit → feedback |
+| Self-improving selection | ❌ | ❌ | ❌ | ~~Removed~~ |
+| Unified selection pipeline | ❌ | ❌ | ❌ | ✅ ToolRegistry (pinned/dynamic + embedding) |
 | Context-aware pre-filtering | ❌ | ❌ | ❌ | ✅ skill tags + conversation state (§3.5) |
-| Learning rollback | ❌ | ❌ | ❌ | ✅ soft-delete with regression gate |
-| Regression gate for learnings | ❌ | ❌ | ❌ | ✅ golden session validation |
+| Learning rollback | ❌ | ❌ | ❌ | ~~Removed~~ |
+| Regression gate for learnings | ❌ | ❌ | ❌ | ~~Removed~~ (regression gate still exists for other uses) |
 
 ---
 

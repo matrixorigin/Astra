@@ -90,18 +90,20 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
         from core.context.manager import ContextManager
         from core.events.event_logger import EventLogger
         from core.verification.firewall import HallucinationFirewall
-        from core.skills.pipeline import SkillPipeline
-        from core.skills.registry import SkillRegistry
+        from core.skills.catalog import SkillCatalog
+        from core.skills.tool_registry import ToolRegistry, ToolSource
 
         event_logger = EventLogger.from_session(db)
-        skill_registry = SkillRegistry(lambda: db)
+        catalog = SkillCatalog(lambda: db)
         context_manager = ContextManager(lambda: db)
-        selector = SkillPipeline(lambda: db, llm, audit=True, learning=True)
-        executor = AgentExecutor(lambda: db, skill_registry)
+        registry = ToolRegistry(max_tokens=50000)
+        for skill in catalog.list_skills():
+            registry.register_skill(skill, source=ToolSource.CLOUD)
+        executor = AgentExecutor(lambda: db, catalog)
         firewall = HallucinationFirewall(lambda: db, context_manager)
 
         loop = ChatLoop(
-            selector=selector,
+            selector=registry,
             executor=executor,
             llm_client=llm,
             event_logger=event_logger,

@@ -348,7 +348,7 @@ def run_closed_loop(
     Phase 2 — Calibration: measure confidence calibration, compute adjustment.
     Phase 3 — Learner: diagnose input-face bottlenecks, propose + validate + deploy fixes.
               If drift found template-level issues, learner targets PROMPT face specifically.
-    Phase 4 — Skill selection: learn from recent skill selection failures.
+    Phase 4 — Skill selection: (removed — learning pipeline deleted).
     Record — Persist loop execution as auditable event.
     """
     from core.evaluation.confidence_calibrator import ConfidenceCalibrator
@@ -426,18 +426,8 @@ def run_closed_loop(
     finally:
         db.close()
 
-    # Phase 4: Skill selection learning
-    # Separate from InputFaceLearner — SelfImprovingSelector has its own
-    # signal extraction, multi-factor scoring, and sandbox-based validation
+    # Phase 4: Skill selection learning (removed — SkillPipeline deleted)
     skill_learning_resp: dict[str, Any] | None = None
-    db = SessionLocal()
-    try:
-        raise NotImplementedError('Module removed in skill system cleanup')
-    except Exception as e:
-        logger.error("Closed loop skill learning phase failed: %s", e)
-        skill_learning_resp = {"learned": 0, "error": str(e)}
-    finally:
-        db.close()
 
     # Record — audit trail for the loop execution itself
     _record_loop_event(
