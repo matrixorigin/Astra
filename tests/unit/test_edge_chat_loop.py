@@ -842,3 +842,43 @@ class TestPingAndTimeout:
         assert result.error is not None
         assert result.error["code"] == "CLIENT_TIMEOUT"
         assert len(renderer.errors) == 1
+
+
+class TestCloudSkillInjection:
+    """Cloud skill descriptions must NOT be duplicated into project_context.
+
+    tool_schemas already carries skill names + descriptions + parameters.
+    Duplicating them wastes ~700-1000 tokens every Turn 0.
+    """
+
+    # TODO: Replace source-scanning tests with behavioral tests
+    # after extracting skill-injection logic into a testable function.
+
+    def test_prefetch_function_deleted(self):
+        """_prefetch_cloud_skills must not exist — it's dead code after removal."""
+        import cli.mo_agent_api as m
+
+        assert not hasattr(m, "_prefetch_cloud_skills"), (
+            "_prefetch_cloud_skills is dead code with zero callers — delete it"
+        )
+
+    def test_prefetch_not_called_in_run_edge_turn(self):
+        """_run_edge_turn must not call _prefetch_cloud_skills."""
+        import inspect
+        import cli.mo_agent_api as m
+
+        source = inspect.getsource(m._run_edge_turn)
+        assert "_prefetch_cloud_skills" not in source, (
+            "_prefetch_cloud_skills duplicates tool_schemas (~700-1000 wasted tokens)"
+        )
+
+    def test_only_behavioural_rules_injected(self):
+        """extra_rules in _run_edge_turn must be small behavioural rules only."""
+        import inspect
+        import cli.mo_agent_api as m
+
+        source = inspect.getsource(m._run_edge_turn)
+        assert "skill_rules" in source, "Must still inject skill usage rules"
+        assert "cloud_hint" not in source, (
+            "cloud_hint (prefetched descriptions) must not appear"
+        )

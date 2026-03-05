@@ -1231,30 +1231,6 @@ SLASH_COMMANDS = {
 # Edge turn runner
 # ============================================================================
 
-async def _prefetch_cloud_skills(api_client) -> str | None:
-    """Fetch cloud skill summaries from server for system prompt injection."""
-    try:
-        data = await api_client.get_introspection_skills()
-        skills = data.get("cloud", []) + data.get("installed", [])
-        if not skills:
-            return None
-        lines = ["# Available Cloud Skills (server-side, call directly by name)"]
-        for s in skills[:10]:
-            name = s.get("skill_name", s.get("name", ""))
-            desc = s.get("description", "")
-            if name:
-                lines.append(f"- **{name}**: {desc}")
-
-        # Inject config namespace rule so LLM sets token once, not per-skill
-        lines.append(
-            "\n# Skill Config Rules\n"
-            "- GitHub skills share ONE token. Always use skill_name='github' with skill_config_wizard and set_skill_setting."
-        )
-        return "\n".join(lines) if len(lines) > 1 else None
-    except Exception:
-        return None
-
-
 async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False, session_info=None):
     """Run one edge chat loop turn using the provided APIClient."""
     import os
@@ -1297,18 +1273,15 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
     from cli.tools.skill_discovery import FindSkillsTool
     router.register(FindSkillsTool())
 
-    # Prefetch cloud skill summaries so LLM knows about them on turn 0.
-    cloud_hint = await _prefetch_cloud_skills(api_client)
-
-    # Always inject skill usage rules regardless of prefetch success.
+    # Cloud skill descriptions are already in tool_schemas — no need to duplicate here.
+    # Only inject the usage rules (small, behavioural, not in schemas).
     skill_rules = (
         "\n# Skill Usage Rules\n"
         "- When a skill exists for a task, call it directly. "
         "If a required parameter is missing, ask the user — do NOT explore the filesystem to infer it.\n"
         "- GitHub skills share ONE token: use skill_name='github' with skill_config_wizard and set_skill_setting."
     )
-    hint = (cloud_hint + skill_rules) if cloud_hint else skill_rules
-    extra_rules = (extra_rules + "\n\n" + hint) if extra_rules else hint
+    extra_rules = (extra_rules + "\n\n" + skill_rules) if extra_rules else skill_rules
 
     return await edge_chat_loop(
         user_input, api_client, router, perms,

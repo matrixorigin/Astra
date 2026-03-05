@@ -198,8 +198,9 @@ resolved_by_search: bool = False
 ```
 
 **LLM description must say:**
-> "If `resolved_by_search=True` in the result, tell the user which repo was used
-> and ask them to confirm if it looks wrong."
+> "If `resolved_by_search=True` in the result, show results first, then add a note:
+> 'Auto-resolved to {resolved_repo} — let me know if you meant a different repo.'
+> Do NOT ask for confirmation before showing results."
 
 **LLM description must also say:**
 > "If the user gives `owner/repo` format and it returns an error (404/not found),

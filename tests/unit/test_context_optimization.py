@@ -1087,48 +1087,290 @@ class TestHighConfidenceBeforeBuildMessages:
         )
 
     def test_uses_llm_not_embedding_for_tool_selection(self):
-        """Tool selection must use LLM (not embedding) for cross-lingual support."""
-        import inspect
-        import api.routers.chat as chat_module
+        """Tool selection must use LLM chat (not embedding similarity) for cross-lingual support."""
+        from api.routers.chat import select_tools_for_turn
+        from core.llm.models import LLMResponse, LLMProvider
 
-        source = inspect.getsource(chat_module.chat_turn)
-        hc_start = source.find("Tool selection optimization")
-        build_sync_start = source.find("def _build_sync()")
-        hc_block = source[hc_start:build_sync_start]
+        calls: list[dict] = []
 
-        assert "catalog_prompt" in hc_block, "Must build catalog prompt for LLM selection"
-        assert "embed_fn(" not in hc_block, "Must not use embed_fn for tool selection"
-        assert "np.dot(" not in hc_block, "Must not use numpy dot product"
+        class SpyLLM:
+            def chat(self, messages, **kwargs):
+                calls.append({"messages": messages, **kwargs})
+                return LLMResponse(
+                    content="tool_a", model="test", provider=LLMProvider.OPENAI,
+                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
+                    latency_ms=0, cost_usd=0.0,
+                )
+
+        tools = [
+            {"function": {"name": "tool_a", "description": "A"}},
+            {"function": {"name": "tool_b", "description": "B"}},
+        ]
+        messages = [{"role": "user", "content": "do something"}]
+
+        select_tools_for_turn(tools, messages, None, "u1", SpyLLM())
+
+        # Must use LLM .chat() with a catalog prompt, not embedding similarity
+        assert len(calls) == 1
+        prompt_content = calls[0]["messages"][0]["content"]
+        assert "select the single most appropriate tool" in prompt_content
+        assert "tool_a" in prompt_content
+        assert "tool_b" in prompt_content
 
     def test_no_full_tools_fallback(self):
         """On selection failure, fallback to all tools (not empty) to avoid broken turns."""
-        import inspect
-        import api.routers.chat as chat_module
+        from api.routers.chat import select_tools_for_turn
+        from core.llm.models import LLMResponse, LLMProvider
 
-        source = inspect.getsource(chat_module.chat_turn)
-        hc_start = source.find("Tool selection optimization")
-        build_sync_start = source.find("def _build_sync()")
-        hc_block = source[hc_start:build_sync_start]
+        class GarbageLLM:
+            def chat(self, messages, **kwargs):
+                return LLMResponse(
+                    content="???completely_wrong???", model="test",
+                    provider=LLMProvider.OPENAI,
+                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
+                    latency_ms=0, cost_usd=0.0,
+                )
 
-        # Must NOT set effective_tools_schema = [] (causes no-tool broken turns)
-        assert "effective_tools_schema = []" not in hc_block, (
-            "Must never set effective_tools_schema to empty — causes broken turns"
-        )
-        # Must have fuzzy matching for LLM output
-        assert "strip(" in hc_block, "Must strip LLM output for fuzzy matching"
+        tools = [
+            {"function": {"name": "tool_a", "description": "A"}},
+            {"function": {"name": "tool_b", "description": "B"}},
+            {"function": {"name": "tool_c", "description": "C"}},
+        ]
+        messages = [{"role": "user", "content": "hello"}]
+
+        result = select_tools_for_turn(tools, messages, None, "u1", GarbageLLM())
+
+        # Must return ALL tools, never empty
+        assert len(result.tools) == 3, "Fallback must return all tools, not empty"
+        assert result.selected_tool is None
 
     def test_tool_result_turn_keeps_only_used_tools(self):
         """When tool_results arrive, only keep the tool(s) already in use."""
-        import inspect
-        import api.routers.chat as chat_module
+        from api.routers.chat import select_tools_for_turn
 
-        source = inspect.getsource(chat_module.chat_turn)
-        hc_start = source.find("Tool selection optimization")
-        build_sync_start = source.find("def _build_sync()")
-        hc_block = source[hc_start:build_sync_start]
+        tools = [
+            {"function": {"name": "read_file", "description": "Read"}},
+            {"function": {"name": "search_code", "description": "Search"}},
+            {"function": {"name": "run_shell", "description": "Shell"}},
+        ]
+        messages = [{"role": "assistant", "content": ""}]
+        tool_results = [
+            {"name": "search_code", "result": "found 3"},
+            {"name": "read_file", "result": "content..."},
+        ]
 
-        assert "tool_results" in hc_block, "Must handle tool_result turns"
-        assert "used_names" in hc_block, "Must track which tools are in use"
+        result = select_tools_for_turn(tools, messages, tool_results, "u1", None)
+
+        kept_names = {t["function"]["name"] for t in result.tools}
+        assert kept_names == {"search_code", "read_file"}, (
+            f"Must keep only used tools, got {kept_names}"
+        )
+        assert "run_shell" not in kept_names
+
+    def test_llm_chat_called_with_user_id(self):
+        """select_tools_for_turn must pass user_id to LLMClient.chat()."""
+        from api.routers.chat import select_tools_for_turn
+        from core.llm.models import LLMResponse, LLMProvider
+
+        calls: list[dict] = []
+
+        class FakeLLM:
+            def chat(self, messages, **kwargs):
+                calls.append(kwargs)
+                return LLMResponse(
+                    content="tool_a", model="test", provider=LLMProvider.OPENAI,
+                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
+                    latency_ms=0, cost_usd=0.0,
+                )
+
+        tools = [
+            {"function": {"name": "tool_a", "description": "A"}},
+            {"function": {"name": "tool_b", "description": "B"}},
+        ]
+        messages = [{"role": "user", "content": "do something"}]
+
+        select_tools_for_turn(tools, messages, None, "alice", FakeLLM())
+
+        assert len(calls) == 1, "LLM should be called exactly once"
+        assert calls[0].get("user_id") == "alice", (
+            "user_id must be passed to LLMClient.chat() — "
+            "omitting it causes TypeError at runtime"
+        )
+
+    def test_llm_response_accessed_as_pydantic_model(self):
+        """select_tools_for_turn must use resp.content (attribute), not resp.get()."""
+        from api.routers.chat import select_tools_for_turn
+        from core.llm.models import LLMResponse, LLMProvider
+
+        class StrictLLMResponse(LLMResponse):
+            """LLMResponse that raises on dict-style access."""
+            def get(self, *args, **kwargs):
+                raise AssertionError(
+                    "LLMResponse is a Pydantic model — use .content, not .get('content')"
+                )
+            def __getitem__(self, key):
+                raise AssertionError(
+                    "LLMResponse is a Pydantic model — use .content, not ['content']"
+                )
+
+        class FakeLLM:
+            def chat(self, messages, **kwargs):
+                return StrictLLMResponse(
+                    content="tool_a", model="test", provider=LLMProvider.OPENAI,
+                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
+                    latency_ms=0, cost_usd=0.0,
+                )
+
+        tools = [
+            {"function": {"name": "tool_a", "description": "A"}},
+            {"function": {"name": "tool_b", "description": "B"}},
+        ]
+        messages = [{"role": "user", "content": "do something"}]
+
+        # If code uses resp.get("content") this will raise AssertionError
+        result = select_tools_for_turn(tools, messages, None, "alice", FakeLLM())
+        assert result.selected_tool == "tool_a"
+
+    def test_exact_match_selects_single_tool(self):
+        """When LLM returns an exact tool name, only that tool is selected."""
+        from api.routers.chat import select_tools_for_turn
+        from core.llm.models import LLMResponse, LLMProvider
+
+        class FakeLLM:
+            def chat(self, messages, **kwargs):
+                return LLMResponse(
+                    content="search_code", model="test", provider=LLMProvider.OPENAI,
+                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
+                    latency_ms=0, cost_usd=0.0,
+                )
+
+        tools = [
+            {"function": {"name": "read_file", "description": "Read a file"}},
+            {"function": {"name": "search_code", "description": "Search code"}},
+            {"function": {"name": "run_shell", "description": "Run shell cmd"}},
+        ]
+        messages = [{"role": "user", "content": "find all TODO comments"}]
+
+        result = select_tools_for_turn(tools, messages, None, "u1", FakeLLM())
+
+        assert len(result.tools) == 1
+        assert result.tools[0]["function"]["name"] == "search_code"
+        assert result.selected_tool == "search_code"
+
+    def test_fuzzy_match_selects_tool(self):
+        """When LLM returns a substring match, the tool is still selected."""
+        from api.routers.chat import select_tools_for_turn
+        from core.llm.models import LLMResponse, LLMProvider
+
+        class FakeLLM:
+            def chat(self, messages, **kwargs):
+                return LLMResponse(
+                    content="I think search_code is best", model="test",
+                    provider=LLMProvider.OPENAI,
+                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
+                    latency_ms=0, cost_usd=0.0,
+                )
+
+        tools = [
+            {"function": {"name": "read_file", "description": "Read"}},
+            {"function": {"name": "search_code", "description": "Search"}},
+        ]
+        messages = [{"role": "user", "content": "find TODOs"}]
+
+        result = select_tools_for_turn(tools, messages, None, "u1", FakeLLM())
+
+        assert result.selected_tool == "search_code"
+        assert len(result.tools) == 1
+
+    def test_unmatched_llm_response_returns_all_tools(self):
+        """When LLM returns garbage, all tools are returned as fallback."""
+        from api.routers.chat import select_tools_for_turn
+        from core.llm.models import LLMResponse, LLMProvider
+
+        class FakeLLM:
+            def chat(self, messages, **kwargs):
+                return LLMResponse(
+                    content="nonexistent_tool", model="test",
+                    provider=LLMProvider.OPENAI,
+                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
+                    latency_ms=0, cost_usd=0.0,
+                )
+
+        tools = [
+            {"function": {"name": "tool_a", "description": "A"}},
+            {"function": {"name": "tool_b", "description": "B"}},
+        ]
+        messages = [{"role": "user", "content": "hello"}]
+
+        result = select_tools_for_turn(tools, messages, None, "u1", FakeLLM())
+
+        assert result.selected_tool is None
+        assert len(result.tools) == 2
+
+    def test_llm_exception_returns_all_tools(self):
+        """When LLM raises, all tools are returned as fallback."""
+        from api.routers.chat import select_tools_for_turn
+
+        class BrokenLLM:
+            def chat(self, messages, **kwargs):
+                raise ConnectionError("LLM down")
+
+        tools = [
+            {"function": {"name": "tool_a", "description": "A"}},
+            {"function": {"name": "tool_b", "description": "B"}},
+        ]
+        messages = [{"role": "user", "content": "hello"}]
+
+        result = select_tools_for_turn(tools, messages, None, "u1", BrokenLLM())
+
+        assert result.selected_tool is None
+        assert len(result.tools) == 2
+
+    def test_tool_result_turn_keeps_active_tools(self):
+        """On tool-result turns, only the tools already in use are kept."""
+        from api.routers.chat import select_tools_for_turn
+
+        tools = [
+            {"function": {"name": "read_file", "description": "Read"}},
+            {"function": {"name": "search_code", "description": "Search"}},
+            {"function": {"name": "run_shell", "description": "Shell"}},
+        ]
+        # No user message — this is a tool-result turn
+        messages = [{"role": "assistant", "content": ""}]
+        tool_results = [{"name": "search_code", "result": "found 3 matches"}]
+
+        result = select_tools_for_turn(tools, messages, tool_results, "u1", None)
+
+        assert len(result.tools) == 1
+        assert result.tools[0]["function"]["name"] == "search_code"
+
+    def test_single_tool_skips_selection(self):
+        """When only 1 tool exists, skip LLM selection entirely."""
+        from api.routers.chat import select_tools_for_turn
+
+        call_count = 0
+
+        class SpyLLM:
+            def chat(self, messages, **kwargs):
+                nonlocal call_count
+                call_count += 1
+
+        tools = [{"function": {"name": "only_tool", "description": "Only"}}]
+        messages = [{"role": "user", "content": "hello"}]
+
+        result = select_tools_for_turn(tools, messages, None, "u1", SpyLLM())
+
+        assert call_count == 0, "LLM should not be called for single-tool case"
+        assert len(result.tools) == 1
+
+    def test_empty_tools_returns_empty(self):
+        """Empty tool list returns empty result without calling LLM."""
+        from api.routers.chat import select_tools_for_turn
+
+        result = select_tools_for_turn([], [{"role": "user", "content": "hi"}], None, "u1", None)
+
+        assert result.tools == []
+        assert result.selected_tool is None
 
 
     """Integration tests for tool/non-tool token separation in DB and APIs."""

@@ -61,8 +61,9 @@ logger = logging.getLogger(__name__)
 #       resolved_by_search = isinstance(repo, str) and "/" not in repo
 #       resolved = self.github.resolve_repo(repo) if resolved_by_search else repo
 #   - Output must include: resolved_repo: str | None, resolved_by_search: bool
-#   - LLM description must say: "If resolved_by_search=True, tell user which
-#     repo was used and ask to confirm if it looks wrong."
+#   - LLM description must say: "If resolved_by_search=True, show results first,
+#     then add a note: 'Auto-resolved to {resolved_repo} — let me know if you
+#     meant a different repo.' Do NOT ask for confirmation before showing results."
 #
 # SKILL DESCRIPTION must cover (in order):
 #   1. What it does (one sentence)
@@ -99,7 +100,7 @@ logger = logging.getLogger(__name__)
 _GITHUB_BOILERPLATE = (
     "repo: 'owner/repo' or bare name (auto-resolved by stars). "
     "On 'owner/repo' error, report not found — do NOT retry bare. "
-    "If resolved_by_search=True, confirm repo with user. "
+    "If resolved_by_search=True, show results then note which repo was used. "
     "On success=False, report error — no bash/curl fallback."
 )
 

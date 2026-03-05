@@ -1668,6 +1668,131 @@ async def decision_trace(
     )
 
 
+# ---------------------------------------------------------------------------
+# Tool selection — extracted for testability (DI on llm_client).
+# ---------------------------------------------------------------------------
+
+class ToolSelectionResult(BaseModel):
+    """Result of selecting the most relevant tool(s) for a turn."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    tools: list[dict[str, Any]]
+    selected_tool: str | None = None
+
+
+def select_tools_for_turn(
+    tools_schema: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]] | None,
+    user_id: str,
+    llm_client: Any,
+) -> ToolSelectionResult:
+    """Pick the most relevant tool(s) for a chat turn.
+
+    For user-query turns: asks the LLM to pick the single best tool from a
+    catalog, falling back to all tools on mismatch or error.
+
+    For tool-result turns: keeps only the tool(s) already in use.
+
+    Args:
+        tools_schema: Full merged tool schemas (edge + cloud).
+        messages: Chat messages for this turn.
+        tool_results: Tool results from previous turn, if any.
+        user_id: Current user ID (required by LLMClient.chat).
+        llm_client: LLMClient instance (injected for testability).
+
+    Returns:
+        ToolSelectionResult with the filtered tools and optional selected name.
+    """
+    if not tools_schema or len(tools_schema) <= 1:
+        return ToolSelectionResult(tools=tools_schema)
+
+    user_query = next(
+        (m.get("content", "") for m in messages if m.get("role") == "user"), ""
+    )
+
+    if user_query:
+        return _select_tool_by_llm(tools_schema, user_query, user_id, llm_client)
+
+    if tool_results:
+        return _keep_active_tools(tools_schema, tool_results)
+
+    return ToolSelectionResult(tools=tools_schema)
+
+
+def _select_tool_by_llm(
+    tools_schema: list[dict[str, Any]],
+    user_query: str,
+    user_id: str,
+    llm_client: Any,
+) -> ToolSelectionResult:
+    """Ask LLM to pick the single best tool from a catalog."""
+    try:
+        tool_names_map = {
+            t.get("function", {}).get("name", ""): t for t in tools_schema
+        }
+        catalog = "\n".join(
+            f"- {name}: {t.get('function', {}).get('description', '')[:80]}"
+            for name, t in tool_names_map.items()
+        )
+        catalog_prompt = (
+            f"Given this user query, select the single most appropriate tool.\n"
+            f"Query: {user_query}\n\nAvailable tools:\n{catalog}\n\n"
+            f"Reply with ONLY the tool name, nothing else."
+        )
+        resp = llm_client.chat(
+            [{"role": "user", "content": catalog_prompt}], user_id=user_id
+        )
+        raw = resp.content.strip().strip("`\"'")
+        # Fuzzy match: exact first, then substring
+        matched = tool_names_map.get(raw)
+        if not matched:
+            for name, t in tool_names_map.items():
+                if name in raw or raw in name:
+                    matched = t
+                    raw = name
+                    break
+        if matched:
+            logger.info("LLM tool selection: %s", raw)
+            return ToolSelectionResult(tools=[matched], selected_tool=raw)
+        logger.warning(
+            "LLM tool selection returned unmatched '%s', using all %d tools",
+            raw, len(tools_schema),
+        )
+    except Exception as e:
+        logger.warning(
+            "Tool selection failed, using all %d tools: %s",
+            len(tools_schema), e,
+        )
+    return ToolSelectionResult(tools=tools_schema)
+
+
+def _keep_active_tools(
+    tools_schema: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]],
+) -> ToolSelectionResult:
+    """For tool-result turns, keep only the tool(s) already in use."""
+    used_names: set[str] = set()
+    for tr in tool_results:
+        name = tr.get("name") or ""
+        if not name and isinstance(tr.get("result"), str):
+            try:
+                parsed = json.loads(tr["result"])
+                name = parsed.get("name", "")
+            except Exception:
+                pass
+        if name:
+            used_names.add(name)
+    if used_names:
+        filtered = [
+            t for t in tools_schema
+            if t.get("function", {}).get("name", "") in used_names
+        ]
+        logger.info("Tool result turn: keeping %s", used_names)
+        return ToolSelectionResult(tools=filtered)
+    return ToolSelectionResult(tools=tools_schema)
+
+
 @router.post("/chat/turn")
 async def chat_turn(
     request: ChatTurnRequest,
@@ -1742,65 +1867,13 @@ async def chat_turn(
             import asyncio
 
             # ── Tool selection optimization ──────────────────────────────
-            # Use LLM catalog selection to pick the most relevant tool(s).
-            # This reduces tool_schemas from ~5000 tokens to ~500.
-            effective_tools_schema = merged_tools_schema
-            _high_confidence_skill: str | None = None
-
-            if merged_tools_schema and len(merged_tools_schema) > 1:
-                user_query = next((m.get("content", "") for m in request.messages if m.get("role") == "user"), "")
-                if user_query:
-                    try:
-                        tool_names_map = {
-                            t.get("function", {}).get("name", ""): t
-                            for t in merged_tools_schema
-                        }
-                        catalog = "\n".join(
-                            f"- {name}: {t.get('function', {}).get('description', '')[:80]}"
-                            for name, t in tool_names_map.items()
-                        )
-                        catalog_prompt = (
-                            f"Given this user query, select the single most appropriate tool.\n"
-                            f"Query: {user_query}\n\nAvailable tools:\n{catalog}\n\n"
-                            f"Reply with ONLY the tool name, nothing else."
-                        )
-                        resp = _get_shared_llm_client().chat([{"role": "user", "content": catalog_prompt}])
-                        raw = resp.get("content", "").strip().strip("`\"'")
-                        # Fuzzy match: exact first, then substring
-                        matched = tool_names_map.get(raw)
-                        if not matched:
-                            for name, t in tool_names_map.items():
-                                if name in raw or raw in name:
-                                    matched = t
-                                    raw = name
-                                    break
-                        if matched:
-                            effective_tools_schema = [matched]
-                            _high_confidence_skill = raw
-                            logger.info("LLM tool selection: %s", raw)
-                        else:
-                            logger.warning("LLM tool selection returned unmatched '%s', using all %d tools", raw, len(merged_tools_schema))
-                    except Exception as e:
-                        logger.warning("Tool selection failed, using all %d tools: %s", len(merged_tools_schema), e)
-                elif request.tool_results:
-                    # tool_result turn: keep only the tool(s) already in use
-                    used_names = set()
-                    for tr in request.tool_results:
-                        name = tr.get("name") or ""
-                        if not name and isinstance(tr.get("result"), str):
-                            try:
-                                parsed = json.loads(tr["result"])
-                                name = parsed.get("name", "")
-                            except Exception:
-                                pass
-                        if name:
-                            used_names.add(name)
-                    if used_names:
-                        effective_tools_schema = [
-                            t for t in merged_tools_schema
-                            if t.get("function", {}).get("name", "") in used_names
-                        ]
-                        logger.info("Tool result turn: keeping %s", used_names)
+            # Delegates to select_tools_for_turn() (extracted for testability).
+            _sel = select_tools_for_turn(
+                merged_tools_schema, request.messages, request.tool_results,
+                user_id, _get_shared_llm_client(),
+            )
+            effective_tools_schema = _sel.tools
+            _high_confidence_skill = _sel.selected_tool
 
             def _build_sync():
                 db = SessionLocal()
