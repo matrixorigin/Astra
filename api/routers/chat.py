@@ -1772,6 +1772,7 @@ def select_tools_for_turn(
         return _select_tool_by_llm(
             tools_schema, user_query, user_id, llm_client,
             previous_skill=state.previous_skill,
+            turn_count=state.turn_count,
         )
 
     if tool_results:
@@ -1842,6 +1843,7 @@ def _select_tool_by_llm(
     user_id: str,
     llm_client: ChatCapable,
     previous_skill: str | None = None,
+    turn_count: int = 0,
 ) -> ToolSelectionResult:
     """Ask LLM to pick the single best tool from a catalog."""
     try:
@@ -1882,17 +1884,15 @@ def _select_tool_by_llm(
             "LLM tool selection returned unmatched '%s', falling back to keyword",
             raw,
         )
-        return _keyword_fallback(tools_schema, user_query, f"llm_unmatched:{raw}")
+        return _keyword_fallback(tools_schema, user_query, f"llm_unmatched:{raw}",
+                                 previous_skill=previous_skill, turn_count=turn_count)
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as e:
-        # Catch broadly here because LLM providers raise diverse exception
-        # types (RateLimitError, APITimeoutError, PermissionError, etc.)
-        # that don't share a common base class.  Tool selection is
-        # best-effort — a failure here should never block the chat turn.
         logger.warning("Tool selection LLM failed (%s): %s, falling back to keyword",
                         type(e).__name__, e)
-        return _keyword_fallback(tools_schema, user_query, f"llm_error:{type(e).__name__}")
+        return _keyword_fallback(tools_schema, user_query, f"llm_error:{type(e).__name__}",
+                                 previous_skill=previous_skill, turn_count=turn_count)
 
 
 # ── Keyword-based tool fallback (zero LLM cost) ─────────────────
@@ -1921,8 +1921,16 @@ def _keyword_fallback(
     tools_schema: list[dict[str, Any]],
     user_query: str,
     reason: str,
+    previous_skill: str | None = None,
+    turn_count: int = 0,
 ) -> ToolSelectionResult:
-    """Zero-cost keyword matching when LLM tool selection is unavailable."""
+    """Zero-cost keyword matching when LLM tool selection is unavailable.
+
+    Fallback chain (first match wins):
+      1. Keyword match from _KEYWORD_TOOL_MAP
+      2. previous_skill (only when turn_count > 1 — multi-turn continuity)
+      3. All tools (last resort)
+    """
     query_lower = user_query.lower()
     tool_names_map = {
         t.get("function", {}).get("name", ""): t for t in tools_schema
@@ -1935,6 +1943,15 @@ def _keyword_fallback(
                 selected_tool=tool_name,
                 fallback_reason=reason,
             )
+    # Stage 2: previous_skill for multi-turn continuity
+    if previous_skill and turn_count > 1 and previous_skill in tool_names_map:
+        fb_reason = f"{reason}→prev_skill"
+        logger.info("Previous skill fallback: %s (reason: %s)", previous_skill, fb_reason)
+        return ToolSelectionResult(
+            tools=[tool_names_map[previous_skill]],
+            selected_tool=previous_skill,
+            fallback_reason=fb_reason,
+        )
     # No keyword match — return all tools as last resort
     logger.warning("Keyword fallback: no match for '%s', using all %d tools (reason: %s)",
                     user_query[:60], len(tools_schema), reason)

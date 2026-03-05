@@ -863,3 +863,146 @@ class TestReflectOutputQuality:
             assert "parameters" not in s, (
                 f"cloud_skill {s['name']} should not have parameters"
             )
+
+
+# ── _get_tag_map + _prefilter_tools DB integration ───────────────
+
+
+class TestGetTagMapAndPrefilterFromDB:
+    """Verify _get_tag_map loads tags from DB and _prefilter_tools reorders tools."""
+
+    def test_tag_map_loads_from_db(self, db_session):
+        """_get_tag_map returns tags for skills stored in skills_registry."""
+        import api.routers.chat as chat_mod
+
+        # Insert a skill with explicit tags
+        db_session.query(SkillModel).filter(
+            SkillModel.skill_id == "pf_hist@1.0.0"
+        ).delete()
+        db_session.add(SkillModel(
+            skill_id="pf_hist@1.0.0", skill_name="pf_hist", version="1.0.0",
+            description="Historical skill", is_active=1, status="active",
+            category="test",
+            tags={"scope": "historical", "data_source": "event_store",
+                  "intent_type": ["analytical"], "requires_history": True},
+        ))
+        db_session.commit()
+
+        # Invalidate module-level cache so _get_tag_map hits DB
+        chat_mod._tag_cache.clear()
+        chat_mod._tag_cache_ts = 0.0
+
+        tag_map = chat_mod._get_tag_map()
+
+        assert "pf_hist" in tag_map, f"pf_hist not in tag_map: {list(tag_map.keys())[:10]}"
+        assert tag_map["pf_hist"] is not None
+        assert tag_map["pf_hist"].scope == "historical"
+
+    def test_prefilter_tools_reorders_via_db_tags(self, db_session):
+        """_prefilter_tools uses DB tags to reorder: historical before current_session."""
+        import api.routers.chat as chat_mod
+
+        # Insert two skills with different scopes
+        for sid, name, scope in [
+            ("pf_current@1.0.0", "pf_current", "current_session"),
+            ("pf_historical@1.0.0", "pf_historical", "historical"),
+        ]:
+            db_session.query(SkillModel).filter(SkillModel.skill_id == sid).delete()
+            db_session.add(SkillModel(
+                skill_id=sid, skill_name=name, version="1.0.0",
+                description=f"Test {name}", is_active=1, status="active",
+                category="test",
+                tags={"scope": scope, "data_source": "event_store",
+                      "intent_type": ["analytical"], "requires_history": scope == "historical"},
+            ))
+        db_session.commit()
+
+        # Invalidate cache
+        chat_mod._tag_cache.clear()
+        chat_mod._tag_cache_ts = 0.0
+
+        # Tools in wrong order: current before historical
+        tools = [
+            {"function": {"name": "pf_current", "description": "Current state"}},
+            {"function": {"name": "pf_historical", "description": "Past events"}},
+        ]
+        # History+analytical query triggers Rule 1: historical first
+        messages = [{"role": "user", "content": "分析一下之前的历史记录"}]
+
+        result = chat_mod._prefilter_tools(tools, messages)
+
+        names = [t["function"]["name"] for t in result]
+        assert names.index("pf_historical") < names.index("pf_current"), (
+            f"historical should come before current_session, got: {names}"
+        )
+
+    def test_prefilter_tools_no_tags_no_crash(self, db_session):
+        """Skills without tags in DB don't crash _prefilter_tools."""
+        import api.routers.chat as chat_mod
+
+        db_session.query(SkillModel).filter(
+            SkillModel.skill_id == "pf_notags@1.0.0"
+        ).delete()
+        db_session.add(SkillModel(
+            skill_id="pf_notags@1.0.0", skill_name="pf_notags", version="1.0.0",
+            description="No tags", is_active=1, status="active",
+            category="test", tags=None,
+        ))
+        db_session.commit()
+
+        chat_mod._tag_cache.clear()
+        chat_mod._tag_cache_ts = 0.0
+
+        tools = [
+            {"function": {"name": "pf_notags", "description": "No tags"}},
+            {"function": {"name": "pf_other", "description": "Other"}},
+        ]
+        messages = [{"role": "user", "content": "hello"}]
+
+        # Must not crash — returns tools in original order
+        result = chat_mod._prefilter_tools(tools, messages)
+        assert len(result) == 2
+
+    def test_tag_map_cache_hit(self, db_session):
+        """Second call within TTL returns cached result without DB query."""
+        import api.routers.chat as chat_mod
+
+        # Prime the cache
+        chat_mod._tag_cache.clear()
+        chat_mod._tag_cache_ts = 0.0
+        first = chat_mod._get_tag_map()
+
+        # Second call should hit cache (no DB query)
+        second = chat_mod._get_tag_map()
+        assert second is first  # Same dict object = cache hit
+
+    def test_tag_map_db_failure_returns_empty(self, db_session, monkeypatch):
+        """When SkillSelector raises, _get_tag_map returns empty dict."""
+        import api.routers.chat as chat_mod
+
+        chat_mod._tag_cache.clear()
+        chat_mod._tag_cache_ts = 0.0
+
+        # Make SkillSelector raise
+        monkeypatch.setattr(
+            "api.routers.chat.SkillSelector",
+            lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("DB down")),
+        )
+
+        result = chat_mod._get_tag_map()
+        assert result == {}
+
+    def test_prefilter_tools_exception_returns_original(self, db_session, monkeypatch):
+        """When _get_tag_map raises inside _prefilter_tools, original order preserved."""
+        import api.routers.chat as chat_mod
+
+        monkeypatch.setattr(
+            chat_mod, "_get_tag_map", lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+
+        tools = [
+            {"function": {"name": "a", "description": "A"}},
+            {"function": {"name": "b", "description": "B"}},
+        ]
+        result = chat_mod._prefilter_tools(tools, [{"role": "user", "content": "hello"}])
+        assert [t["function"]["name"] for t in result] == ["a", "b"]
