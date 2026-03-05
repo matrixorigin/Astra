@@ -57,6 +57,7 @@ class Event(Base):
         Index("idx_events_session_time", "session_id", "created_at"),
         Index("idx_events_parent_type", "parent_event_id", "event_type"),
         Index("idx_events_chain_time", "causal_chain_id", "created_at"),
+        Index("idx_events_run_type", "run_id", "event_type"),
     )
 
     event_id = Column(String(36), primary_key=True)
@@ -85,8 +86,8 @@ class Event(Base):
     skill_name = Column(String(255))
     skill_version = Column(String(32))
     skill_result = Column(JSON)
-    run_id = Column(String(255), index=True)
-    parent_run_id = Column(String(255), index=True)
+    run_id = Column(String(36), index=True)
+    parent_run_id = Column(String(36), index=True)
     waiting_for = Column(String(255), index=True)
     dedup_key = Column(String(255), index=True)
 
@@ -120,10 +121,10 @@ class RunEvent(Base):
         UniqueConstraint("run_id", "idx", name="uq_run_event_run_idx"),
     )
     id = Column(Integer, primary_key=True, autoincrement=True)
-    run_id = Column(String(255), nullable=False, index=True)
+    run_id = Column(String(36), nullable=False, index=True)
     idx = Column(Integer, nullable=False)
     event_type = Column(String(64), nullable=False)
     data = Column(JSON, nullable=False)
-    event_id = Column(String(255))
+    event_id = Column(String(36))
     agent_id = Column(String(64))
     created_at = Column(DateTime, default=func.now())

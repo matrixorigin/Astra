@@ -420,8 +420,7 @@ class ContextManager(DbConsumer):
         top = results[:limit]
 
         if top:
-            with self._db() as db:
-                _update_access_tracking(db, [r["entry_id"] for r in top])
+            _update_access_tracking(self._db, [r["entry_id"] for r in top])
 
         logger.debug("Keyword knowledge fallback: %d entries for: %s", len(top), query[:50])
         return top

@@ -33,7 +33,13 @@ class DbConsumer:
         try:
             yield db
         except Exception:
-            db.rollback()
+            try:
+                db.rollback()
+            except Exception:
+                pass
             raise
         finally:
-            db.close()
+            try:
+                db.close()
+            except Exception:
+                pass

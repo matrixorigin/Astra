@@ -6,8 +6,20 @@ Provides methods to retrieve and query events from the database.
 import json
 
 from sqlalchemy import text
+from sqlalchemy.orm import Query
+
+from api.models.agent import Event
 from core.events.models import ContextSnapshot, ConversationEvent, TokenUsage
 from core.db_consumer import DbConsumer, DbFactory
+
+# Columns to load for list queries — excludes embedding (~6KB/row),
+# context_snapshot, token_usage, skills_snapshot, llm_params (heavy JSON).
+_LIST_COLUMNS = [
+    Event.event_id, Event.user_id, Event.session_id,
+    Event.agent_id, Event.agent_version, Event.event_type,
+    Event.content, Event.event_metadata, Event.created_at,
+    Event.parent_event_id, Event.causal_chain_id,
+]
 
 
 class EventReader(DbConsumer):
@@ -70,6 +82,15 @@ class EventReader(DbConsumer):
             llm_params=llm_params,
         )
 
+    @staticmethod
+    def _orm_row_to_dict(row) -> dict:
+        """Convert ORM keyed-tuple row to dict with 'metadata' key."""
+        d = row._asdict()
+        # ORM column is 'event_metadata' but _row_to_event expects 'metadata'
+        if "event_metadata" in d:
+            d["metadata"] = d.pop("event_metadata")
+        return d
+
     def get_event(self, event_id: str) -> ConversationEvent | None:
         """Get a single event by ID.
 
@@ -102,26 +123,14 @@ class EventReader(DbConsumer):
         Returns:
             list[ConversationEvent]: List of events
         """
-        # Select only needed columns
         with self._db() as db:
-            columns = """
-                event_id, user_id, session_id, agent_id, agent_version,
-                event_type, content, metadata, created_at,
-                parent_event_id, causal_chain_id
-            """
-
-            sql = f"""
-                SELECT {columns} FROM agent_events
-                WHERE session_id = :session_id
-                ORDER BY created_at DESC
-            """
+            q = db.query(*_LIST_COLUMNS).filter(
+                Event.session_id == session_id,
+            ).order_by(Event.created_at.desc())
             if limit:
-                sql += f" LIMIT {limit}"
-
-            result = db.execute(text(sql), {"session_id": session_id})
-            rows = result.fetchall()
-        
-            return [self._row_to_event(dict(row._mapping)) for row in rows]
+                q = q.limit(limit)
+            rows = q.all()
+            return [self._row_to_event(self._orm_row_to_dict(r)) for r in rows]
 
     def get_user_events(self, user_id: str, limit: int | None = 100) -> list[ConversationEvent]:
         """Get all events for a user across sessions.
@@ -134,24 +143,13 @@ class EventReader(DbConsumer):
             list[ConversationEvent]: List of events
         """
         with self._db() as db:
-            columns = """
-                event_id, user_id, session_id, agent_id, agent_version,
-                event_type, content, metadata, created_at,
-                parent_event_id, causal_chain_id
-            """
-
-            sql = f"""
-                SELECT {columns} FROM agent_events
-                WHERE user_id = :user_id
-                ORDER BY created_at DESC
-            """
+            q = db.query(*_LIST_COLUMNS).filter(
+                Event.user_id == user_id,
+            ).order_by(Event.created_at.desc())
             if limit:
-                sql += f" LIMIT {limit}"
-
-            result = db.execute(text(sql), {"user_id": user_id})
-            rows = result.fetchall()
-        
-            return [self._row_to_event(dict(row._mapping)) for row in rows]
+                q = q.limit(limit)
+            rows = q.all()
+            return [self._row_to_event(self._orm_row_to_dict(r)) for r in rows]
 
     def get_causal_chain(self, causal_chain_id: str) -> list[ConversationEvent]:
         """Get all events in a causal chain.
@@ -163,13 +161,7 @@ class EventReader(DbConsumer):
             list[ConversationEvent]: List of events in chronological order
         """
         with self._db() as db:
-            query = text("""
-                SELECT * FROM agent_events
-                WHERE causal_chain_id = :causal_chain_id
-                ORDER BY created_at ASC
-            """)
-        
-            result = db.execute(query, {"causal_chain_id": causal_chain_id})
-            rows = result.fetchall()
-        
-            return [self._row_to_event(dict(row._mapping)) for row in rows]
+            rows = db.query(*_LIST_COLUMNS).filter(
+                Event.causal_chain_id == causal_chain_id,
+            ).order_by(Event.created_at.asc()).all()
+            return [self._row_to_event(self._orm_row_to_dict(r)) for r in rows]

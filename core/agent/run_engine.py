@@ -26,6 +26,7 @@ _agent_run_events: dict[str, list[dict]] = {}  # local buffer, also persisted to
 _run_waiters: dict[str, asyncio.Event] = {}
 _run_tasks: dict[str, asyncio.Task] = {}
 _child_runs: dict[str, set[str]] = {}  # parent_run_id → {child_run_ids}
+_run_notifiers: dict[str, asyncio.Event] = {}  # wake stream_agent_run_events
 _fan_in_tasks: set[asyncio.Task] = set()  # Track fan-in tasks for cleanup
 _cancel_pending: set[asyncio.Task] = set()  # Hold refs to cancelled tasks until done
 
@@ -69,6 +70,7 @@ def cleanup_run_tasks() -> None:
     _active_runs.clear()
     _agent_run_events.clear()
     _run_waiters.clear()
+    _run_notifiers.clear()
     _child_runs.clear()
     _cancel_pending.clear()
 
@@ -527,39 +529,60 @@ class RunEngine(DbConsumer):
     async def stream_agent_run_events(self, run_id: str, last_index: int = 0) -> AsyncIterator[dict]:
         """Yield events as they arrive. Cross-worker safe via DB polling."""
         idx = last_index
-        max_idle_polls = 3000  # ~5 min at 0.1s interval
-        idle_count = 0
-        db_check_interval = 20  # Check DB every ~2s, not every 0.1s
-        keepalive_interval = 150  # Send keepalive every ~15s (150 * 0.1s)
+        local = run_id in _agent_run_events
+        db_poll_interval = 1.0  # Cross-worker: poll DB every 1s
+        max_idle_s = 300.0  # 5 min timeout
+        keepalive_s = 15.0
+        elapsed_idle = 0.0
+        since_keepalive = 0.0
 
-        while idle_count < max_idle_polls:
-            # Re-check each iteration (run may be GC'd mid-stream)
-            local = run_id in _agent_run_events
-            if local:
-                events = _agent_run_events.get(run_id, [])
-            else:
-                events = self._load_events_from_db(run_id, 0)
+        # Local mode: use asyncio.Event for instant wake-up, no polling
+        notifier: asyncio.Event | None = None
+        if local:
+            notifier = _run_notifiers.setdefault(run_id, asyncio.Event())
 
-            if idx < len(events):
-                for i in range(idx, len(events)):
-                    yield events[i]
-                idx = len(events)
-                idle_count = 0  # Reset on activity
-            else:
-                idle_count += 1
-                if idle_count % keepalive_interval == 0:
-                    yield {"event_type": "keepalive", "data": {}}
+        try:
+            while elapsed_idle < max_idle_s:
+                if local:
+                    events = _agent_run_events.get(run_id, [])
+                else:
+                    events = self._load_events_from_db(run_id, 0)
 
-            # Check if run is done (DB check only every db_check_interval polls)
-            run = _active_runs.get(run_id)
-            if run and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
-                return
-            if not run and idle_count % db_check_interval == 0:
-                db_run = self.restore_run(run_id)
-                if not db_run or db_run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                if idx < len(events):
+                    for i in range(idx, len(events)):
+                        yield events[i]
+                    idx = len(events)
+                    elapsed_idle = 0.0
+                    since_keepalive = 0.0
+
+                # Check if run is done
+                run = _active_runs.get(run_id)
+                if run and run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
                     return
+                if not run and elapsed_idle >= 2.0 and int(elapsed_idle) % 2 == 0:
+                    db_run = self.restore_run(run_id)
+                    if not db_run or db_run.status in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED):
+                        return
 
-            await asyncio.sleep(0.1)
+                # Wait: event-driven for local, interval for cross-worker
+                if notifier:
+                    notifier.clear()
+                    try:
+                        await asyncio.wait_for(notifier.wait(), timeout=keepalive_s)
+                        since_keepalive = 0.0
+                    except asyncio.TimeoutError:
+                        elapsed_idle += keepalive_s
+                        since_keepalive = 0.0
+                        yield {"event_type": "keepalive", "data": {}}
+                else:
+                    await asyncio.sleep(db_poll_interval)
+                    elapsed_idle += db_poll_interval
+                    since_keepalive += db_poll_interval
+                    if since_keepalive >= keepalive_s:
+                        since_keepalive = 0.0
+                        yield {"event_type": "keepalive", "data": {}}
+        finally:
+            _run_notifiers.pop(run_id, None)
 
     # ── Event persistence ─────────────────────────────────────
 
@@ -584,8 +607,13 @@ class RunEngine(DbConsumer):
         if len(self._pending_inserts) >= _RUN_EVENT_FLUSH_SIZE:
             self._flush_agent_run_events()
 
+        # Wake up any local stream_agent_run_events waiters
+        notifier = _run_notifiers.get(run_id)
+        if notifier:
+            notifier.set()
+
     def _flush_agent_run_events(self, *, _retried: bool = False) -> None:
-        """Commit all pending run_event INSERTs using a short-lived session.
+        """Commit all pending run_event INSERTs in a single batch.
 
         On failure, retries once with a fresh session (handles transient
         connection errors).  If the retry also fails, the events are dropped
@@ -597,14 +625,13 @@ class RunEngine(DbConsumer):
         self._pending_inserts = []
         try:
             with self._db() as db:
-                for row in batch:
-                    db.execute(
-                        text(
-                            "INSERT INTO agent_run_events (run_id, idx, event_type, data, event_id, agent_id) "
-                            "VALUES (:run_id, :idx, :event_type, :data, :event_id, :agent_id)"
-                        ),
-                        row,
-                    )
+                db.execute(
+                    text(
+                        "INSERT INTO agent_run_events (run_id, idx, event_type, data, event_id, agent_id) "
+                        "VALUES (:run_id, :idx, :event_type, :data, :event_id, :agent_id)"
+                    ),
+                    batch,
+                )
                 db.commit()
         except Exception as e:
             if not _retried:
@@ -871,6 +898,7 @@ class RunEngine(DbConsumer):
             _active_runs.pop(rid, None)
             _agent_run_events.pop(rid, None)
             _run_waiters.pop(rid, None)
+            _run_notifiers.pop(rid, None)
 
     @staticmethod
     def _stream_event_to_dict(event: StreamEvent, run_id: str) -> dict:

@@ -64,29 +64,36 @@ def _normalize_value(v: str) -> str:
 
 # ── Access tracking ───────────────────────────────────────────────────────────
 
-def update_access_tracking(db: Session, entry_ids: list[str]) -> None:
+def update_access_tracking(db_factory, entry_ids: list[str], *, _done: "threading.Event | None" = None) -> None:
     """Bump access_count and last_accessed_at for retrieved entries.
 
-    Single UPDATE — no N+1.  Safe to call with empty list.
+    Runs in a background thread to avoid blocking the read path.
+    Safe to call with empty list.  Pass _done (threading.Event) for tests.
     """
     if not entry_ids:
         return
-    try:
-        db.execute(
-            text(
-                "UPDATE sk_knowledge_entries "
-                "SET access_count = access_count + 1, last_accessed_at = NOW() "
-                "WHERE entry_id IN :ids"
-            ),
-            {"ids": tuple(entry_ids)},
-        )
-        db.commit()
-    except Exception as e:
-        logger.warning("Access tracking update failed: %s", e)
+
+    import threading
+
+    def _do_update():
         try:
-            db.rollback()
-        except Exception:
-            pass
+            with db_factory() as db:
+                db.execute(
+                    text(
+                        "UPDATE sk_knowledge_entries "
+                        "SET access_count = access_count + 1, last_accessed_at = NOW() "
+                        "WHERE entry_id IN :ids"
+                    ),
+                    {"ids": tuple(entry_ids)},
+                )
+                db.commit()
+        except Exception as e:
+            logger.warning("Access tracking update failed: %s", e)
+        finally:
+            if _done:
+                _done.set()
+
+    threading.Thread(target=_do_update, daemon=True).start()
 
 
 # ── Knowledge Graph (relations) ───────────────────────────────────────────────
@@ -269,6 +276,12 @@ class KnowledgeExtractor:
             Event.user_id == user_id,
         ).order_by(Event.created_at).all()
 
+        return self.extract_from_events(causal_chain_id, user_id, events)
+
+    def extract_from_events(
+        self, causal_chain_id: str, user_id: str, events: list,
+    ) -> list[dict[str, Any]]:
+        """Extract knowledge from pre-loaded events (avoids extra DB query)."""
         if not events:
             return []
 

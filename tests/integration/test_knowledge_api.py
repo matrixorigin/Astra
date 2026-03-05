@@ -51,21 +51,33 @@ def _insert_entry(db, user_id, *, key_name="lang", value="python", confidence=0.
 
 class TestAccessTracking:
     def test_bumps_access_count(self, db, user_id):
+        import threading
+        from api.database import SessionLocal
         eid = _insert_entry(db, user_id)
-        update_access_tracking(db, [eid])
+        done = threading.Event()
+        update_access_tracking(SessionLocal, [eid], _done=done)
+        done.wait(timeout=5)
+        db.expire_all()
         row = db.get(KnowledgeEntry, eid)
         assert row.access_count == 1
         assert row.last_accessed_at is not None
 
     def test_multiple_bumps(self, db, user_id):
+        import threading
+        from api.database import SessionLocal
         eid = _insert_entry(db, user_id)
-        update_access_tracking(db, [eid])
-        update_access_tracking(db, [eid])
+        d1 = threading.Event()
+        update_access_tracking(SessionLocal, [eid], _done=d1)
+        d1.wait(timeout=5)
+        d2 = threading.Event()
+        update_access_tracking(SessionLocal, [eid], _done=d2)
+        d2.wait(timeout=5)
+        db.expire_all()
         row = db.get(KnowledgeEntry, eid)
         assert row.access_count == 2
 
     def test_empty_list_noop(self, db):
-        update_access_tracking(db, [])  # should not raise
+        update_access_tracking(lambda: db, [])  # should not raise
 
 
 # ── Knowledge Graph ───────────────────────────────────────────────────────────

@@ -99,6 +99,8 @@ class SkillPermission(Base):
 
 
 class SkillSelectionEvent(Base):
+    # TODO(perf): Add TTL/archival — this table grows with every LLM tool call.
+    #   Consider partitioning by created_at or periodic archival to cold storage.
     __tablename__ = "skill_selection_events"
     __table_args__ = (
         Index("ix_sse_skill_created", "skill_name", "created_at"),

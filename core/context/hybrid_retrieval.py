@@ -157,6 +157,7 @@ class HybridRetriever(DbConsumer):
         from skills.knowledge.models import SkKnowledgeEntry as K
 
         entries: list[dict[str, Any]] = []
+        tracked_ids: list[str] = []
 
         with self._db() as db:
             # Vector + confidence scoring
@@ -217,6 +218,10 @@ class HybridRetriever(DbConsumer):
                             }
                 except Exception as e:
                     logger.warning("Knowledge fulltext search failed (non-fatal): %s", e)
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
 
                 entries = sorted(entries_by_id.values(), key=lambda x: x["relevance_score"], reverse=True)[:limit]
                 if entries:
@@ -224,10 +229,9 @@ class HybridRetriever(DbConsumer):
             except Exception as e:
                 logger.error("Knowledge retrieval failed: %s", e)
 
-            # Access tracking
+            # Access tracking — collect IDs, fire-and-forget after read session
             if entries:
-                from skills.knowledge.api import update_access_tracking
-                update_access_tracking(db, [e["entry_id"] for e in entries])
+                tracked_ids = [e["entry_id"] for e in entries]
 
             # 1-hop graph expansion
             if entries:
@@ -255,8 +259,13 @@ class HybridRetriever(DbConsumer):
                                     "source": "graph_expansion",
                                 })
                             if graph_rows:
-                                update_access_tracking(db, [r.entry_id for r in graph_rows])
+                                tracked_ids.extend(r.entry_id for r in graph_rows)
                 except Exception as e:
                     logger.warning("Knowledge graph expansion failed (non-fatal): %s", e)
+
+        # Fire-and-forget access tracking outside the read session
+        if tracked_ids:
+            from skills.knowledge.api import update_access_tracking
+            update_access_tracking(self._db, tracked_ids)
 
         return entries

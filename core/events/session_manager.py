@@ -140,23 +140,30 @@ class SessionManager:
             except Exception as e:
                 logger.warning("Session-level scoring failed (non-fatal): %s", e)
 
-            # Auto-trigger knowledge extraction
+            # Single query: fetch conversation events for both knowledge extraction and summary.
+            # Avoids N+1: previous code queried distinct chain_ids then per-chain events,
+            # plus a second scan for summary — now one query serves both.
+            from api.models import Event
+            events = db.query(Event).filter(
+                Event.session_id == session_id,
+                Event.event_type.in_(["user_query", "llm_response"]),
+            ).order_by(Event.created_at).limit(200).all()
+
+            # Auto-trigger knowledge extraction (batch by chain)
             try:
                 from skills.knowledge.api import KnowledgeExtractor
                 from core.events.event_logger import EventLogger
-                from api.models import Event
-                
+
                 event_logger = EventLogger.from_session(db)
                 extractor = KnowledgeExtractor(db, event_logger=event_logger)
-                
-                # Get all unique causal chains in this session
-                chains = db.query(Event.causal_chain_id).filter(
-                    Event.session_id == session_id
-                ).distinct().all()
-                
-                for (chain_id,) in chains:
-                    extractor.extract_from_chain(chain_id, db_session.user_id)
-                
+
+                chains: dict[str, list] = {}
+                for e in events:
+                    chains.setdefault(e.causal_chain_id, []).append(e)
+
+                for chain_id, chain_events in chains.items():
+                    extractor.extract_from_events(chain_id, db_session.user_id, chain_events)
+
                 logger.info(f"Extracted knowledge from {len(chains)} chains in session {session_id}")
             except Exception as e:
                 logger.error(f"Knowledge extraction failed for session {session_id}: {e}")
@@ -168,17 +175,12 @@ class SessionManager:
                 except Exception as e:
                     logger.error(f"on_close callback failed for session {session_id}: {e}")
 
-            # Generate full session summary (memories table)
+            # Generate full session summary (memories table) — reuse events already loaded
             try:
                 from api.database import SessionLocal
                 from core.memory.store import MemoryStore
                 from core.memory.session_summary import SessionSummarizer
-                from api.models import Event
 
-                events = db.query(Event).filter(
-                    Event.session_id == session_id,
-                    Event.event_type.in_(["user_query", "llm_response"]),
-                ).order_by(Event.created_at).limit(200).all()
                 messages = [
                     {"role": "user" if e.event_type == "user_query" else "assistant",
                      "content": e.content or ""}

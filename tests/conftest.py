@@ -157,17 +157,32 @@ def db_session(test_session_factory):
     session = test_session_factory()
     try:
         yield session
-        # Commit if test succeeded
-        session.commit()
+        # Commit if test succeeded (may fail if session is in bad state)
+        try:
+            session.commit()
+        except Exception:
+            try:
+                session.rollback()
+            except Exception:
+                pass
     except Exception:
         # Rollback on error
-        session.rollback()
+        try:
+            session.rollback()
+        except Exception:
+            pass
         raise
     finally:
         # Expire all to prevent stale data in next test
-        session.expire_all()
+        try:
+            session.expire_all()
+        except Exception:
+            pass
         # Always close to release locks
-        session.close()
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 @pytest.fixture(scope="session", autouse=True)

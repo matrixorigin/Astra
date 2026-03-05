@@ -26,7 +26,7 @@ class WorkflowRun(Base):
     __tablename__ = "wf_runs"
     run_id = Column(String(255), primary_key=True)
     workflow_id = Column(String(255), nullable=False, index=True)
-    agent_run_id = Column(String(255), index=True)
+    agent_run_id = Column(String(36), index=True)
     status = Column(String(32), nullable=False, default="pending")
     waiting_for = Column(String(255))
     waiting_step_id = Column(String(255))

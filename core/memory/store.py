@@ -117,6 +117,7 @@ class MemoryStore(DbConsumer):
             )
             if memory_type:
                 q = q.filter(MemoryRecord.memory_type == memory_type.value)
+            q = q.order_by(MemoryRecord.updated_at.desc())
             if limit is not None:
                 q = q.limit(limit)
             if load_embedding:

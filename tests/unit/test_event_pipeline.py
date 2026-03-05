@@ -213,12 +213,12 @@ class TestDoFlush:
         e1 = _make_event(EventType.STREAM_TEXT_DELTA, metadata={"run_id": "r1"})
         e2 = _make_event(EventType.STREAM_TEXT_DELTA, metadata={"run_id": "r1"})
         pipeline._do_flush(db, [e1, e2])
-        # Two RE inserts with idx 0 and 1
-        assert len(db.executed) == 2
-        params0 = db.executed[0][1]
-        params1 = db.executed[1][1]
-        assert params0["idx"] == 0
-        assert params1["idx"] == 1
+        # Single batch execute with list of 2 rows
+        assert len(db.executed) == 1
+        rows = db.executed[0][1]
+        assert isinstance(rows, list) and len(rows) == 2
+        assert rows[0]["idx"] == 0
+        assert rows[1]["idx"] == 1
 
 
 # --- Background flush loop tests ---

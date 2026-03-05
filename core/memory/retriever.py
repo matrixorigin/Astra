@@ -124,12 +124,13 @@ class MemoryRetriever(DbConsumer):
         }
 
         with Timer("retriever_retrieve", self._metrics):
-            # Phase 1
-            p1_start = time.time() if explain else 0
-            phase1, p1_stats = self._phase1(
-                query_text, base_params, weights,
-                limit * 2 if query_embedding else limit,
-            )
+            with self._db() as db:
+                # Phase 1
+                p1_start = time.time() if explain else 0
+                phase1, p1_stats = self._phase1(
+                    db, query_text, base_params, weights,
+                    limit * 2 if query_embedding else limit,
+                )
             if stats:
                 stats.keyword_attempted = p1_stats.keyword_attempted
                 stats.keyword_hit = p1_stats.keyword_hit
@@ -146,7 +147,7 @@ class MemoryRetriever(DbConsumer):
 
             # Phase 2
             p2_start = time.time() if explain else 0
-            phase2, p2_stats = self._phase2(query_embedding, base_params, limit * 2)
+            phase2, p2_stats = self._phase2(db, query_embedding, base_params, limit * 2)
             if stats:
                 stats.vector_attempted = p2_stats.vector_attempted
                 stats.vector_hit = p2_stats.vector_hit
@@ -166,7 +167,7 @@ class MemoryRetriever(DbConsumer):
             return memories, stats
 
     def _phase1(
-        self, query_text: str, base_params: dict,
+        self, db, query_text: str, base_params: dict,
         weights: RetrievalWeights, limit: int,
     ) -> tuple[list[_Candidate], _PhaseStats]:
         total = weights.temporal + weights.confidence
@@ -182,44 +183,43 @@ class MemoryRetriever(DbConsumer):
         session_id = base_params["session_id"]
         include_cross = base_params["include_cross"]
 
-        with self._db() as db:
-            def _base_query():
-                q = (
-                    db.query(M.memory_id, M.content, M.memory_type, M.initial_confidence,
-                             M.observed_at, M.session_id, M.trust_tier, rel)
-                    .filter(M.user_id == uid, M.is_active == 1, M.memory_type.in_(type_values))
-                )
-                if include_cross:
-                    from sqlalchemy import or_
-                    q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
-                else:
-                    q = q.filter(M.session_id == session_id)
-                return q
+        def _base_query():
+            q = (
+                db.query(M.memory_id, M.content, M.memory_type, M.initial_confidence,
+                         M.observed_at, M.session_id, M.trust_tier, rel)
+                .filter(M.user_id == uid, M.is_active == 1, M.memory_type.in_(type_values))
+            )
+            if include_cross:
+                from sqlalchemy import or_
+                q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
+            else:
+                q = q.filter(M.session_id == session_id)
+            return q
 
-            if query_text and query_text.strip():
-                stats.keyword_attempted = True
-                try:
-                    from matrixone.sqlalchemy_ext import boolean_match
-                    ft = boolean_match("content").must(query_text)
-                    rows = _base_query().filter(ft).order_by(rel.desc()).limit(limit).all()
-                    if rows:
-                        self._metrics.increment("retrieval_keyword_hits")
-                        stats.keyword_hit = True
-                        return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
-                                           r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3",
-                                           keyword_matched=True) for r in rows], stats
-                except Exception as e:
-                    logger.debug("Keyword search failed: %s", e)
-                    self._metrics.increment("retrieval_keyword_errors")
-                    stats.keyword_error = str(e)
+        if query_text and query_text.strip():
+            stats.keyword_attempted = True
+            try:
+                from matrixone.sqlalchemy_ext import boolean_match
+                ft = boolean_match("content").must(query_text)
+                rows = _base_query().filter(ft).order_by(rel.desc()).limit(limit).all()
+                if rows:
+                    self._metrics.increment("retrieval_keyword_hits")
+                    stats.keyword_hit = True
+                    return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
+                                       r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3",
+                                       keyword_matched=True) for r in rows], stats
+            except Exception as e:
+                logger.debug("Keyword search failed: %s", e)
+                self._metrics.increment("retrieval_keyword_errors")
+                stats.keyword_error = str(e)
 
-            rows = _base_query().order_by(rel.desc()).limit(limit).all()
-            self._metrics.increment("retrieval_fallback_hits")
-            return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
-                               r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3") for r in rows], stats
+        rows = _base_query().order_by(rel.desc()).limit(limit).all()
+        self._metrics.increment("retrieval_fallback_hits")
+        return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
+                           r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3") for r in rows], stats
 
     def _phase2(
-        self, query_embedding: list[float], base_params: dict, limit: int,
+        self, db, query_embedding: list[float], base_params: dict, limit: int,
     ) -> tuple[list[_Candidate], _PhaseStats]:
         stats = _PhaseStats(vector_attempted=True)
 
@@ -233,30 +233,29 @@ class MemoryRetriever(DbConsumer):
         session_id = base_params["session_id"]
         include_cross = base_params["include_cross"]
 
-        with self._db() as db:
-            try:
-                q = (
-                    db.query(M.memory_id, M.content, M.memory_type, M.initial_confidence,
-                             M.observed_at, M.session_id, M.trust_tier, dist_expr)
-                    .filter(M.user_id == uid, M.is_active == 1,
-                            M.memory_type.in_(type_values), M.embedding.isnot(None))
-                )
-                if include_cross:
-                    from sqlalchemy import or_
-                    q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
-                else:
-                    q = q.filter(M.session_id == session_id)
-                rows = q.order_by("l2_dist").limit(limit).all()
-                self._metrics.increment("retrieval_vector_hits")
-                stats.vector_hit = bool(rows)
-                return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
-                                   r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3",
-                                   l2_dist=float(r.l2_dist)) for r in rows], stats
-            except Exception as e:
-                logger.warning("Vector search failed: %s", e)
-                self._metrics.increment("retrieval_vector_errors")
-                stats.vector_error = str(e)
-                return [], stats
+        try:
+            q = (
+                db.query(M.memory_id, M.content, M.memory_type, M.initial_confidence,
+                         M.observed_at, M.session_id, M.trust_tier, dist_expr)
+                .filter(M.user_id == uid, M.is_active == 1,
+                        M.memory_type.in_(type_values), M.embedding.isnot(None))
+            )
+            if include_cross:
+                from sqlalchemy import or_
+                q = q.filter(or_(M.session_id == session_id, M.session_id.is_(None)))
+            else:
+                q = q.filter(M.session_id == session_id)
+            rows = q.order_by("l2_dist").limit(limit).all()
+            self._metrics.increment("retrieval_vector_hits")
+            stats.vector_hit = bool(rows)
+            return [_Candidate(r.memory_id, r.content, r.memory_type, r.initial_confidence,
+                               r.observed_at, r.session_id, trust_tier=r.trust_tier or "T3",
+                               l2_dist=float(r.l2_dist)) for r in rows], stats
+        except Exception as e:
+            logger.warning("Vector search failed: %s", e)
+            self._metrics.increment("retrieval_vector_errors")
+            stats.vector_error = str(e)
+            return [], stats
 
     def _merge(
         self, phase1: list[_Candidate], phase2: list[_Candidate],

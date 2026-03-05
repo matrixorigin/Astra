@@ -3,8 +3,7 @@
 Manages causal chains and parent-child relationships between events.
 """
 
-from sqlalchemy import text
-from core.events.event_reader import EventReader
+from core.events.event_reader import EventReader, _LIST_COLUMNS
 from core.events.models import ConversationEvent
 from core.db_consumer import DbConsumer, DbFactory
 
@@ -53,17 +52,13 @@ class CausalChainManager(DbConsumer):
         Returns:
             list[ConversationEvent]: Child events
         """
+        from api.models.agent import Event
+
         with self._db() as db:
-            query = text("""
-                SELECT * FROM agent_events
-                WHERE parent_event_id = :event_id
-                ORDER BY created_at ASC
-            """)
-        
-            result = db.execute(query, {"event_id": event_id})
-            rows = result.fetchall()
-        
-            return [self.reader._row_to_event(dict(row._mapping)) for row in rows]
+            rows = db.query(*_LIST_COLUMNS).filter(
+                Event.parent_event_id == event_id,
+            ).order_by(Event.created_at.asc()).all()
+            return [self.reader._row_to_event(self.reader._orm_row_to_dict(r)) for r in rows]
 
     def get_chain_summary(self, causal_chain_id: str) -> dict:
         """Get summary statistics for a causal chain.

@@ -8,7 +8,6 @@ Embedding: completely decoupled — not in this pipeline.
 import asyncio
 import atexit
 import logging
-import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -127,7 +126,6 @@ class EventPipeline:
         self._flush_task: asyncio.Task | None = None
         self._closed = False
         self._run_event_counters: dict[str, int] = {}  # run_id → next idx
-        self._lock = threading.Lock()
 
         # Stats
         self.stats = {"emitted": 0, "flushed": 0, "dropped": 0}
@@ -300,17 +298,18 @@ class EventPipeline:
             # agent_run_events: anything with run_id (orthogonal to tier)
             run_id = (ev.metadata or {}).get("run_id")
             if run_id:
-                with self._lock:
-                    idx = self._run_event_counters.get(run_id, 0)
-                    self._run_event_counters[run_id] = idx + 1
+                idx = self._run_event_counters.get(run_id, 0)
+                self._run_event_counters[run_id] = idx + 1
                 re_rows.append(_to_re_values(ev, run_id, idx))
 
+                # Clean up counter on terminal events to prevent unbounded growth
+                if et_enum in (EventType.RUN_COMPLETED, EventType.RUN_FAILED, EventType.RUN_CANCELLED):
+                    self._run_event_counters.pop(run_id, None)
+
         if ce_rows:
-            for row in ce_rows:
-                db.execute(_CE_INSERT, row)
+            db.execute(_CE_INSERT, ce_rows)
         if re_rows:
-            for row in re_rows:
-                db.execute(_RE_INSERT, row)
+            db.execute(_RE_INSERT, re_rows)
         if ce_rows or re_rows:
             db.commit()
 
