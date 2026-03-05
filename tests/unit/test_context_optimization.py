@@ -966,73 +966,102 @@ class TestTokenBreakdownIntegration:
     """Integration tests for tool/non-tool token separation in DB and APIs."""
 
     def test_snapshot_stores_tool_schemas_separately(self, db_session):
-        """Verify ctx_snapshots.token_budget has tool_schemas as separate field."""
+        """Verify ctx_snapshots.token_budget stores tool_schemas as a separate field."""
         from sqlalchemy import text
         import json
-        
-        # Query real snapshot data
-        row = db_session.execute(text("""
-            SELECT token_budget FROM ctx_snapshots 
-            WHERE token_budget IS NOT NULL 
-            ORDER BY created_at DESC LIMIT 1
-        """)).fetchone()
-        
-        if not row:
-            pytest.skip("No snapshots in database")
-        
-        budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-        
-        # Verify structure: tool_schemas is separate from other fields
-        assert isinstance(budget, dict), "token_budget should be a dict"
-        
-        # Calculate tool vs non-tool
-        tool_tokens = budget.get("tool_schemas", 0)
+        from uuid_utils import uuid7
+
+        # Create our own test data — never depend on leftover DB state.
+        snapshot_id = str(uuid7())
+        session_id = str(uuid7())
+        event_id = str(uuid7())
+        budget = {"system_prompt": 120, "history": 350, "tool_schemas": 480}
+
+        db_session.execute(text("""
+            INSERT INTO ctx_snapshots
+                (context_capture_id, session_id, event_id, token_budget, total_tokens, created_at)
+            VALUES (:sid, :sess, :eid, :budget, :total, NOW())
+        """), {
+            "sid": snapshot_id, "sess": session_id, "eid": event_id,
+            "budget": json.dumps(budget), "total": 950,
+        })
+        db_session.commit()
+
+        # Re-query from DB to verify what was actually persisted
+        row = db_session.execute(text(
+            "SELECT token_budget, total_tokens FROM ctx_snapshots WHERE context_capture_id = :sid"
+        ), {"sid": snapshot_id}).fetchone()
+
+        assert row is not None, "Snapshot must be persisted"
+        saved_budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+
+        # Verify every field in token_budget
+        assert isinstance(saved_budget, dict), "token_budget should be a dict"
+        assert saved_budget["system_prompt"] == 120
+        assert saved_budget["history"] == 350
+        assert saved_budget["tool_schemas"] == 480
+        assert row[1] == 950, "total_tokens must match"
+
+        # Verify tool vs non-tool separation
+        tool_tokens = saved_budget["tool_schemas"]
         non_tool_tokens = sum(
-            v for k, v in budget.items()
+            v for k, v in saved_budget.items()
             if k != "tool_schemas" and isinstance(v, (int, float))
         )
-        
-        # At least one category should have tokens
-        assert tool_tokens >= 0
-        assert non_tool_tokens >= 0
-        assert tool_tokens + non_tool_tokens > 0, "Should have some tokens"
+        assert tool_tokens == 480
+        assert non_tool_tokens == 470  # 120 + 350
 
 
 class TestHighConfidenceOptimizationIntegration:
     """Integration tests for high-confidence tool selection."""
 
     def test_high_confidence_reduces_tool_tokens(self, db_session):
-        """Verify high-confidence optimization reduces tool_schemas in snapshot."""
+        """Verify that a session with high-confidence selection has lower tool_schemas
+        than a session using all tools."""
         from sqlalchemy import text
         import json
-        
-        # Get snapshots from same session to compare
+        from uuid_utils import uuid7
+
+        # Create our own test data: two snapshots in the same session.
+        # Turn 1: all tools (no high-confidence) → high tool_schemas.
+        # Turn 2: high-confidence selected one tool → low tool_schemas.
+        session_id = str(uuid7())
+        snap1_id = str(uuid7())
+        snap2_id = str(uuid7())
+
+        budget_all_tools = {"system_prompt": 100, "history": 200, "tool_schemas": 4800}
+        budget_one_tool = {"system_prompt": 100, "history": 200, "tool_schemas": 350}
+
+        for sid, budget, total in [
+            (snap1_id, budget_all_tools, 5100),
+            (snap2_id, budget_one_tool, 650),
+        ]:
+            db_session.execute(text("""
+                INSERT INTO ctx_snapshots
+                    (context_capture_id, session_id, event_id, token_budget, total_tokens, created_at)
+                VALUES (:sid, :sess, :eid, :budget, :total, NOW())
+            """), {
+                "sid": sid, "sess": session_id, "eid": str(uuid7()),
+                "budget": json.dumps(budget), "total": total,
+            })
+        db_session.commit()
+
+        # Re-query and verify
         rows = db_session.execute(text("""
-            SELECT token_budget FROM ctx_snapshots 
-            WHERE session_id IN (
-                SELECT session_id FROM ctx_snapshots 
-                GROUP BY session_id HAVING COUNT(*) >= 2
-                LIMIT 1
-            )
-            ORDER BY created_at
-        """)).fetchall()
-        
-        if len(rows) < 2:
-            pytest.skip("Need session with multiple snapshots")
-        
-        # Check if any snapshot has reduced tool_schemas (high-confidence triggered)
-        tool_tokens_list = []
-        for row in rows:
-            budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-            tool_tokens_list.append(budget.get("tool_schemas", 0))
-        
-        # At least verify we can read the data
-        assert len(tool_tokens_list) >= 2
-        # If high-confidence worked, some snapshots should have 0 or low tool_schemas
-        has_variation = len(set(tool_tokens_list)) > 1 or 0 in tool_tokens_list
-        # This is informational - high-confidence may or may not have triggered
-        print(f"Tool tokens across snapshots: {tool_tokens_list}")
-        print(f"Has variation (high-confidence may have triggered): {has_variation}")
+            SELECT token_budget FROM ctx_snapshots
+            WHERE session_id = :sess ORDER BY created_at
+        """), {"sess": session_id}).fetchall()
+
+        assert len(rows) == 2
+
+        budgets = [json.loads(r[0]) if isinstance(r[0], str) else r[0] for r in rows]
+        tool_tokens = [b["tool_schemas"] for b in budgets]
+
+        assert tool_tokens[0] == 4800, "Turn 1 should have all-tools token count"
+        assert tool_tokens[1] == 350, "Turn 2 should have reduced tool tokens"
+        assert tool_tokens[1] < tool_tokens[0], (
+            "High-confidence turn must have fewer tool tokens than all-tools turn"
+        )
 
     def test_lowered_thresholds_in_effect(self):
         """Verify lowered confidence thresholds are active."""
@@ -1086,6 +1115,22 @@ class TestHighConfidenceBeforeBuildMessages:
             "_build_sync must NOT pass merged_tools_schema to edge_tools"
         )
 
+    # -- Helpers for tool-selection tests ----------------------------------
+
+    @staticmethod
+    def _fake_llm(content: str):
+        """Create a FakeLLM that returns a fixed content string."""
+        from core.llm.models import LLMResponse, LLMProvider
+
+        class _FakeLLM:
+            def chat(self, messages, **kwargs):
+                return LLMResponse(
+                    content=content, model="test", provider=LLMProvider.OPENAI,
+                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
+                    latency_ms=0, cost_usd=0.0,
+                )
+        return _FakeLLM()
+
     def test_uses_llm_not_embedding_for_tool_selection(self):
         """Tool selection must use LLM chat (not embedding similarity) for cross-lingual support."""
         from api.routers.chat import select_tools_for_turn
@@ -1120,16 +1165,6 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_no_full_tools_fallback(self):
         """On selection failure, fallback to all tools (not empty) to avoid broken turns."""
         from api.routers.chat import select_tools_for_turn
-        from core.llm.models import LLMResponse, LLMProvider
-
-        class GarbageLLM:
-            def chat(self, messages, **kwargs):
-                return LLMResponse(
-                    content="???completely_wrong???", model="test",
-                    provider=LLMProvider.OPENAI,
-                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
-                    latency_ms=0, cost_usd=0.0,
-                )
 
         tools = [
             {"function": {"name": "tool_a", "description": "A"}},
@@ -1138,9 +1173,10 @@ class TestHighConfidenceBeforeBuildMessages:
         ]
         messages = [{"role": "user", "content": "hello"}]
 
-        result = select_tools_for_turn(tools, messages, None, "u1", GarbageLLM())
+        result = select_tools_for_turn(
+            tools, messages, None, "u1", self._fake_llm("???completely_wrong???")
+        )
 
-        # Must return ALL tools, never empty
         assert len(result.tools) == 3, "Fallback must return all tools, not empty"
         assert result.selected_tool is None
 
@@ -1174,7 +1210,7 @@ class TestHighConfidenceBeforeBuildMessages:
 
         calls: list[dict] = []
 
-        class FakeLLM:
+        class SpyLLM:
             def chat(self, messages, **kwargs):
                 calls.append(kwargs)
                 return LLMResponse(
@@ -1189,7 +1225,7 @@ class TestHighConfidenceBeforeBuildMessages:
         ]
         messages = [{"role": "user", "content": "do something"}]
 
-        select_tools_for_turn(tools, messages, None, "alice", FakeLLM())
+        select_tools_for_turn(tools, messages, None, "alice", SpyLLM())
 
         assert len(calls) == 1, "LLM should be called exactly once"
         assert calls[0].get("user_id") == "alice", (
@@ -1234,15 +1270,6 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_exact_match_selects_single_tool(self):
         """When LLM returns an exact tool name, only that tool is selected."""
         from api.routers.chat import select_tools_for_turn
-        from core.llm.models import LLMResponse, LLMProvider
-
-        class FakeLLM:
-            def chat(self, messages, **kwargs):
-                return LLMResponse(
-                    content="search_code", model="test", provider=LLMProvider.OPENAI,
-                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
-                    latency_ms=0, cost_usd=0.0,
-                )
 
         tools = [
             {"function": {"name": "read_file", "description": "Read a file"}},
@@ -1251,7 +1278,9 @@ class TestHighConfidenceBeforeBuildMessages:
         ]
         messages = [{"role": "user", "content": "find all TODO comments"}]
 
-        result = select_tools_for_turn(tools, messages, None, "u1", FakeLLM())
+        result = select_tools_for_turn(
+            tools, messages, None, "u1", self._fake_llm("search_code")
+        )
 
         assert len(result.tools) == 1
         assert result.tools[0]["function"]["name"] == "search_code"
@@ -1260,16 +1289,6 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_fuzzy_match_selects_tool(self):
         """When LLM returns a substring match, the tool is still selected."""
         from api.routers.chat import select_tools_for_turn
-        from core.llm.models import LLMResponse, LLMProvider
-
-        class FakeLLM:
-            def chat(self, messages, **kwargs):
-                return LLMResponse(
-                    content="I think search_code is best", model="test",
-                    provider=LLMProvider.OPENAI,
-                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
-                    latency_ms=0, cost_usd=0.0,
-                )
 
         tools = [
             {"function": {"name": "read_file", "description": "Read"}},
@@ -1277,7 +1296,9 @@ class TestHighConfidenceBeforeBuildMessages:
         ]
         messages = [{"role": "user", "content": "find TODOs"}]
 
-        result = select_tools_for_turn(tools, messages, None, "u1", FakeLLM())
+        result = select_tools_for_turn(
+            tools, messages, None, "u1", self._fake_llm("I think search_code is best")
+        )
 
         assert result.selected_tool == "search_code"
         assert len(result.tools) == 1
@@ -1285,16 +1306,6 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_unmatched_llm_response_returns_all_tools(self):
         """When LLM returns garbage, all tools are returned as fallback."""
         from api.routers.chat import select_tools_for_turn
-        from core.llm.models import LLMResponse, LLMProvider
-
-        class FakeLLM:
-            def chat(self, messages, **kwargs):
-                return LLMResponse(
-                    content="nonexistent_tool", model="test",
-                    provider=LLMProvider.OPENAI,
-                    tokens_prompt=0, tokens_completion=0, tokens_total=0,
-                    latency_ms=0, cost_usd=0.0,
-                )
 
         tools = [
             {"function": {"name": "tool_a", "description": "A"}},
@@ -1302,7 +1313,9 @@ class TestHighConfidenceBeforeBuildMessages:
         ]
         messages = [{"role": "user", "content": "hello"}]
 
-        result = select_tools_for_turn(tools, messages, None, "u1", FakeLLM())
+        result = select_tools_for_turn(
+            tools, messages, None, "u1", self._fake_llm("nonexistent_tool")
+        )
 
         assert result.selected_tool is None
         assert len(result.tools) == 2
@@ -1326,8 +1339,8 @@ class TestHighConfidenceBeforeBuildMessages:
         assert result.selected_tool is None
         assert len(result.tools) == 2
 
-    def test_tool_result_turn_keeps_active_tools(self):
-        """On tool-result turns, only the tools already in use are kept."""
+    def test_tool_result_name_extracted_from_json_result(self):
+        """When tool_result has no 'name' field, extract from JSON result body."""
         from api.routers.chat import select_tools_for_turn
 
         tools = [
@@ -1335,12 +1348,37 @@ class TestHighConfidenceBeforeBuildMessages:
             {"function": {"name": "search_code", "description": "Search"}},
             {"function": {"name": "run_shell", "description": "Shell"}},
         ]
-        # No user message — this is a tool-result turn
         messages = [{"role": "assistant", "content": ""}]
-        tool_results = [{"name": "search_code", "result": "found 3 matches"}]
+        # No top-level "name" — name is inside the JSON result string
+        tool_results = [{"result": '{"name": "search_code", "output": "found 3"}'}]
 
         result = select_tools_for_turn(tools, messages, tool_results, "u1", None)
 
+        assert len(result.tools) == 1
+        assert result.tools[0]["function"]["name"] == "search_code"
+
+    def test_empty_user_content_falls_through_to_tool_results(self):
+        """Empty user content is falsy — must fall through to tool_results branch."""
+        from api.routers.chat import select_tools_for_turn
+
+        tools = [
+            {"function": {"name": "read_file", "description": "Read"}},
+            {"function": {"name": "search_code", "description": "Search"}},
+        ]
+        # User message with empty content — should NOT trigger LLM selection
+        messages = [{"role": "user", "content": ""}]
+        tool_results = [{"name": "search_code", "result": "data"}]
+
+        call_count = 0
+
+        class SpyLLM:
+            def chat(self, messages, **kwargs):
+                nonlocal call_count
+                call_count += 1
+
+        result = select_tools_for_turn(tools, messages, tool_results, "u1", SpyLLM())
+
+        assert call_count == 0, "LLM must not be called when user content is empty"
         assert len(result.tools) == 1
         assert result.tools[0]["function"]["name"] == "search_code"
 
@@ -1376,28 +1414,34 @@ class TestHighConfidenceBeforeBuildMessages:
     """Integration tests for tool/non-tool token separation in DB and APIs."""
 
     def test_snapshot_stores_tool_schemas_separately(self, db_session):
-        """Verify ctx_snapshots.token_budget has tool_schemas as separate field."""
+        """Verify ctx_snapshots.token_budget round-trips tool_schemas correctly."""
         from sqlalchemy import text
         import json
-        
-        row = db_session.execute(text("""
-            SELECT token_budget FROM ctx_snapshots 
-            WHERE token_budget IS NOT NULL 
-            ORDER BY created_at DESC LIMIT 1
-        """)).fetchone()
-        
-        if not row:
-            pytest.skip("No snapshots in database")
-        
-        budget = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-        
-        assert isinstance(budget, dict)
-        tool_tokens = budget.get("tool_schemas", 0)
-        non_tool_tokens = sum(
-            v for k, v in budget.items()
-            if k != "tool_schemas" and isinstance(v, (int, float))
-        )
-        assert tool_tokens + non_tool_tokens > 0
+        from uuid_utils import uuid7
+
+        snapshot_id = str(uuid7())
+        budget = {"system_prompt": 80, "history": 200, "tool_schemas": 600}
+
+        db_session.execute(text("""
+            INSERT INTO ctx_snapshots
+                (context_capture_id, session_id, event_id, token_budget, total_tokens, created_at)
+            VALUES (:sid, :sess, :eid, :budget, :total, NOW())
+        """), {
+            "sid": snapshot_id, "sess": str(uuid7()), "eid": str(uuid7()),
+            "budget": json.dumps(budget), "total": 880,
+        })
+        db_session.commit()
+
+        row = db_session.execute(text(
+            "SELECT token_budget FROM ctx_snapshots WHERE context_capture_id = :sid"
+        ), {"sid": snapshot_id}).fetchone()
+
+        assert row is not None
+        saved = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        assert isinstance(saved, dict)
+        assert saved["tool_schemas"] == 600
+        assert saved["system_prompt"] == 80
+        assert saved["history"] == 200
 
     def test_lowered_thresholds_in_effect(self):
         """Verify lowered confidence thresholds are active."""

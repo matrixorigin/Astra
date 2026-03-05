@@ -7,7 +7,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -1672,9 +1672,16 @@ async def decision_trace(
 # Tool selection — extracted for testability (DI on llm_client).
 # ---------------------------------------------------------------------------
 
+
+@runtime_checkable
+class ChatCapable(Protocol):
+    """Minimal interface for LLM clients used by tool selection."""
+
+    def chat(self, messages: list[dict[str, Any]], *, user_id: str, **kwargs: Any) -> Any: ...
+
+
 class ToolSelectionResult(BaseModel):
     """Result of selecting the most relevant tool(s) for a turn."""
-    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     tools: list[dict[str, Any]]
     selected_tool: str | None = None
@@ -1685,7 +1692,7 @@ def select_tools_for_turn(
     messages: list[dict[str, Any]],
     tool_results: list[dict[str, Any]] | None,
     user_id: str,
-    llm_client: Any,
+    llm_client: ChatCapable | None,
 ) -> ToolSelectionResult:
     """Pick the most relevant tool(s) for a chat turn.
 
@@ -1724,7 +1731,7 @@ def _select_tool_by_llm(
     tools_schema: list[dict[str, Any]],
     user_query: str,
     user_id: str,
-    llm_client: Any,
+    llm_client: ChatCapable,
 ) -> ToolSelectionResult:
     """Ask LLM to pick the single best tool from a catalog."""
     try:

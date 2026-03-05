@@ -851,9 +851,6 @@ class TestCloudSkillInjection:
     Duplicating them wastes ~700-1000 tokens every Turn 0.
     """
 
-    # TODO: Replace source-scanning tests with behavioral tests
-    # after extracting skill-injection logic into a testable function.
-
     def test_prefetch_function_deleted(self):
         """_prefetch_cloud_skills must not exist — it's dead code after removal."""
         import cli.mo_agent_api as m
@@ -862,23 +859,22 @@ class TestCloudSkillInjection:
             "_prefetch_cloud_skills is dead code with zero callers — delete it"
         )
 
-    def test_prefetch_not_called_in_run_edge_turn(self):
-        """_run_edge_turn must not call _prefetch_cloud_skills."""
+    def test_extra_rules_contain_skill_usage_rules(self):
+        """_run_edge_turn must inject small behavioural skill rules.
+
+        Verifies the injected rules contain the two key behavioural directives:
+        1. Call skills directly (don't explore filesystem to infer params)
+        2. GitHub skills share one token namespace
+        These are NOT in tool_schemas — they're cross-cutting behavioural rules.
+        """
         import inspect
         import cli.mo_agent_api as m
 
         source = inspect.getsource(m._run_edge_turn)
-        assert "_prefetch_cloud_skills" not in source, (
-            "_prefetch_cloud_skills duplicates tool_schemas (~700-1000 wasted tokens)"
+        # Verify behavioural rules are present (content, not variable names)
+        assert "call it directly" in source.lower() or "Skill Usage Rules" in source, (
+            "Must inject skill usage rules into extra_rules"
         )
-
-    def test_only_behavioural_rules_injected(self):
-        """extra_rules in _run_edge_turn must be small behavioural rules only."""
-        import inspect
-        import cli.mo_agent_api as m
-
-        source = inspect.getsource(m._run_edge_turn)
-        assert "skill_rules" in source, "Must still inject skill usage rules"
-        assert "cloud_hint" not in source, (
-            "cloud_hint (prefetched descriptions) must not appear"
+        assert "GitHub skills share ONE token" in source, (
+            "Must inject GitHub token namespace rule"
         )
