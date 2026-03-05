@@ -565,7 +565,13 @@ class ContextManager(DbConsumer):
             return fallbacks.get(task_type, fallbacks[TaskType.GENERAL])
 
     def _get_skill_definitions(self, token_budget: int) -> list[dict[str, Any]]:
-        """Get active skill definitions from DB within token budget."""
+        """Get active skill definitions from DB within token budget (cached 60s)."""
+        import time as _time
+        now = _time.monotonic()
+        cache = getattr(self, '_skill_def_cache', None)
+        if cache and now - cache[0] < 60:
+            return cache[1][:] if cache[1] else []
+
         from api.models import SkillRegistry as SkillModel
 
         try:
@@ -595,6 +601,7 @@ class ContextManager(DbConsumer):
             result.append(defn)
             tokens_used += entry_tokens
 
+        self._skill_def_cache = (now, result)
         return result
 
     def _get_code_context(

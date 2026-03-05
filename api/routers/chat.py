@@ -304,24 +304,78 @@ def _ensure_session(db: Session, user_id: str, session_id: str | None, agent_id:
     return session.session_id
 
 
+# ---------------------------------------------------------------------------
+# Shared singletons — initialised once per worker, reused across runs.
+# SkillCatalog + register_builtin_skills + ToolRegistry are expensive
+# (~10 DB upserts) but stateless across runs.
+# ---------------------------------------------------------------------------
+_shared_skill_catalog = None
+_shared_tool_registry = None
+_shared_context_manager = None
+_shared_executor = None
+_shared_firewall = None
+_shared_gate_trigger = _UNSET_GATE = object()
+_shared_code_executor = None
+_shared_init_lock = threading.Lock()
+
+
+def _get_shared_components(db_factory):
+    """Lazy-init shared components (once per worker)."""
+    global _shared_skill_catalog, _shared_tool_registry, _shared_context_manager
+    global _shared_executor, _shared_firewall, _shared_gate_trigger, _shared_code_executor
+
+    if _shared_skill_catalog is not None:
+        return
+
+    with _shared_init_lock:
+        if _shared_skill_catalog is not None:
+            return  # double-check after lock
+
+        from core.agent.executor import AgentExecutor
+        from core.code_executor import CodeExecutor
+        from core.context.manager import ContextManager
+        from core.runtime import IsolationLevel, create_runtime
+        from core.skills.builtin import register_builtin_skills
+        from core.skills.catalog import SkillCatalog
+        from core.skills.tool_registry import ToolRegistry, ToolSource
+        from core.verification.firewall import HallucinationFirewall
+
+        if os.environ.get('DISABLE_GATE_TRIGGER'):
+            _shared_gate_trigger = None
+        else:
+            from core.evaluation.gate_trigger import GateTrigger
+            _shared_gate_trigger = GateTrigger(db_factory=db_factory)
+
+        _shared_skill_catalog = SkillCatalog(db_factory, gate_trigger=_shared_gate_trigger)
+        _shared_code_executor = CodeExecutor(
+            runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
+            db_factory=db_factory,
+        )
+        register_builtin_skills(_shared_skill_catalog, db_factory, code_executor=_shared_code_executor)
+        _shared_context_manager = ContextManager(db_factory, gate_trigger=_shared_gate_trigger)
+
+        _shared_tool_registry = ToolRegistry()
+        for skill in _shared_skill_catalog.list_skills():
+            _shared_tool_registry.register_skill(skill, source=ToolSource.CLOUD, category="builtin")
+
+        _shared_executor = AgentExecutor(db_factory, _shared_skill_catalog)
+        _shared_firewall = HallucinationFirewall(db_factory, _shared_context_manager)
+
+
 def _build_chat_loop(db_factory):
     """Build ChatLoop with all dependencies.
 
-    Accepts a db_factory (Callable → Session). All components receive the
-    factory and create their own short-lived sessions.
+    Shared components (SkillCatalog, ToolRegistry, ContextManager, etc.)
+    are initialised once per worker.  Per-run components (EventLogger,
+    EventPipeline, TypedObserver) are created fresh each call.
     """
     from core.agent.chat_loop import ChatLoop
-    from core.agent.executor import AgentExecutor
-    from core.code_executor import CodeExecutor
-    from core.context.manager import ContextManager
     from core.events.event_logger import EventLogger
     from core.llm.client import LLMClient
-    from core.runtime import IsolationLevel, create_runtime
-    from core.skills.builtin import register_builtin_skills
-    from core.skills.catalog import SkillCatalog
-    from core.verification.firewall import HallucinationFirewall
 
-    # Create EventPipeline for async writes (feature-flagged)
+    _get_shared_components(db_factory)
+
+    # Per-run: EventPipeline + EventLogger
     pipeline = None
     try:
         from core.events.event_logger import _PIPELINE_ENABLED
@@ -335,39 +389,13 @@ def _build_chat_loop(db_factory):
     event_logger = EventLogger(db_factory, pipeline=pipeline)
     llm_client = LLMClient(db_factory=db_factory)
 
-    # Wire GateTrigger so skill/prompt changes auto-trigger regression gate
-    # Disable in tests to avoid DB session conflicts
-    import os
-    if os.environ.get('DISABLE_GATE_TRIGGER'):
-        gate_trigger = None
-    else:
-        from core.evaluation.gate_trigger import GateTrigger
-        gate_trigger = GateTrigger(db_factory=db_factory)
-
-    skill_catalog = SkillCatalog(db_factory, gate_trigger=gate_trigger)
-    code_executor = CodeExecutor(
-        runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
-        db_factory=db_factory,
-    )
-    register_builtin_skills(skill_catalog, db_factory, code_executor=code_executor)
-    context_manager = ContextManager(db_factory, gate_trigger=gate_trigger)
-
-    # Build ToolRegistry from SkillCatalog's registered skills
-    from core.skills.tool_registry import ToolRegistry, ToolSource
-    tool_registry = ToolRegistry()
-    for skill in skill_catalog.list_skills():
-        tool_registry.register_skill(skill, source=ToolSource.CLOUD, category="builtin")
-
-    executor = AgentExecutor(db_factory, skill_catalog)
-    firewall = HallucinationFirewall(db_factory, context_manager)
-
     loop = ChatLoop(
-        selector=tool_registry,
-        executor=executor,
+        selector=_shared_tool_registry,
+        executor=_shared_executor,
         llm_client=llm_client,
         event_logger=event_logger,
-        context_manager=context_manager,
-        firewall=firewall,
+        context_manager=_shared_context_manager,
+        firewall=_shared_firewall,
     )
 
     from core.memory.typed_observer import TypedObserver
@@ -890,18 +918,19 @@ def _gather_history(
         result["related_history"] = []
         return
 
-    # Build AND filter: every keyword must appear in the query content.
-    # Escape LIKE wildcards to prevent user input from altering match semantics.
-    q = db.query(EventModel.session_id, EventModel.content, EventModel.created_at).filter(
-        EventModel.user_id == user_id,
-        EventModel.event_type == "user_query",
-        EventModel.session_id != session_id,
-    )
-    for kw in keywords:
-        escaped = _escape_like(kw)
-        q = q.filter(EventModel.content.like(f"%{escaped}%", escape="\\"))
-
-    past_rows = q.order_by(EventModel.created_at.desc()).limit(5).all()
+    # Use fulltext index (ft_content_session) instead of LIKE %kw% per keyword.
+    # MATCH ... AGAINST in boolean mode supports +word for AND semantics.
+    match_expr = " ".join(f"+{kw}" for kw in keywords)
+    past_rows = db.execute(
+        text(
+            "SELECT session_id, content, created_at FROM agent_events "
+            "WHERE user_id = :uid AND event_type = 'user_query' "
+            "AND session_id != :sid "
+            "AND MATCH(content, session_id) AGAINST(:q IN BOOLEAN MODE) "
+            "ORDER BY created_at DESC LIMIT 5"
+        ),
+        {"uid": user_id, "sid": session_id, "q": match_expr},
+    ).fetchall()
     result["related_history"] = [
         {"session_id": r[0], "query": (r[1] or "")[:200], "ts": str(r[2])}
         for r in past_rows
@@ -1039,12 +1068,9 @@ def _retrieve_relevant_context(
     # Try vector retrieval first
     try:
         from core.context.hybrid_retrieval import HybridRetriever
-        from api.database import SessionLocal
-        retriever = HybridRetriever(SessionLocal)
-
-        # Generate query embedding
         from core.context.embeddings import EmbeddingService
-        svc = EmbeddingService(SessionLocal)
+        retriever = _get_shared_retriever()
+        svc = _get_shared_embed_svc()
         query_embedding = svc.embed_text(user_query)
 
         if query_embedding:
@@ -1700,24 +1726,31 @@ def _persist_turn_events(
     except Exception as e:
         logger.warning("Phase 4 (TurnHooks) failed: %s", e)
 
-    # Phase 5: update session activity (event_count, last_active_at)
+    # Phase 5: update session activity (last_active_at + atomic increment)
+    # Count events produced: user_query + tool_results + tool_calls + cloud_tool_results + llm_response
+    _n_events = 0
+    if user_content:
+        _n_events += 1
+    _n_events += len(tool_results or [])
+    _n_events += len(tool_calls or [])
+    _n_events += len(cloud_tool_results or [])
+    if full_text or tool_calls:
+        _n_events += 1  # llm_response
+    if _n_events < 1:
+        _n_events = 1  # at least 1 event per turn
     try:
         _sdb = SessionLocal()
         try:
             from datetime import datetime, timezone
 
             from sqlalchemy import text as _text
-            _count = _sdb.execute(
-                _text("SELECT COUNT(*) FROM agent_events WHERE session_id = :sid"),
-                {"sid": session_id},
-            ).scalar() or 0
             _sdb.execute(
                 _text("""
                     UPDATE agent_sessions
-                    SET event_count = :cnt, last_active_at = :now, updated_at = :now
+                    SET event_count = event_count + :n, last_active_at = :now, updated_at = :now
                     WHERE session_id = :sid
                 """),
-                {"cnt": _count, "sid": session_id, "now": datetime.now(timezone.utc)},
+                {"n": _n_events, "sid": session_id, "now": datetime.now(timezone.utc)},
             )
             _sdb.commit()
         finally:
@@ -1762,29 +1795,36 @@ def _get_shared_llm_client():
     return _shared_llm_client
 
 
-# Lazy-initialized shared SkillCatalog for cloud skill execution in /chat/turn.
-_shared_skill_registry = None
-_shared_skill_registry_lock = threading.Lock()
-
-
 def _get_shared_skill_registry():
     """Get or create a shared SkillCatalog with builtin cloud skills."""
-    global _shared_skill_registry
-    if _shared_skill_registry is None:
-        with _shared_skill_registry_lock:
-            if _shared_skill_registry is None:
-                from core.code_executor import CodeExecutor
-                from core.runtime import IsolationLevel, create_runtime
-                from core.skills.builtin import register_builtin_skills
-                from core.skills.catalog import SkillCatalog
-                registry = SkillCatalog(SessionLocal)
-                code_executor = CodeExecutor(
-                    runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
-                    db_factory=SessionLocal,
-                )
-                register_builtin_skills(registry, SessionLocal, code_executor=code_executor)
-                _shared_skill_registry = registry
-    return _shared_skill_registry
+    _get_shared_components(SessionLocal)
+    return _shared_skill_catalog
+
+
+# Shared HybridRetriever + EmbeddingService (avoid per-call construction)
+_shared_retriever = None
+_shared_embed_svc = None
+_shared_retriever_lock = threading.Lock()
+
+
+def _get_shared_retriever():
+    global _shared_retriever
+    if _shared_retriever is None:
+        with _shared_retriever_lock:
+            if _shared_retriever is None:
+                from core.context.hybrid_retrieval import HybridRetriever
+                _shared_retriever = HybridRetriever(SessionLocal)
+    return _shared_retriever
+
+
+def _get_shared_embed_svc():
+    global _shared_embed_svc
+    if _shared_embed_svc is None:
+        with _shared_retriever_lock:
+            if _shared_embed_svc is None:
+                from core.context.embeddings import EmbeddingService
+                _shared_embed_svc = EmbeddingService(SessionLocal)
+    return _shared_embed_svc
 
 
 def _update_snapshot_tool_tokens(snapshot_id: str, actual_tool_tokens: int) -> None:
