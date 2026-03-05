@@ -2068,6 +2068,11 @@ async def chat_turn(
                 _current_llm_messages = llm_messages
                 _cloud_skill_failed = False
                 _cloud_skill_error_msg = ""
+                # Collect cloud loop intermediate messages for session history.
+                # These are assistant+tool_calls and tool results that happen
+                # server-side. Without them, future turns can't see what tools
+                # were used (e.g. list_prs), causing tool selection failures.
+                _cloud_loop_history: list[dict[str, Any]] = []
 
                 for _cloud_loop in range(_MAX_CLOUD_LOOPS + 1):
                     _loop_text = ""
@@ -2187,6 +2192,7 @@ async def chat_turn(
                         for tc in cloud_tcs
                     ]
                     _current_llm_messages = _current_llm_messages + [assistant_msg_loop]
+                    _cloud_loop_history.append(assistant_msg_loop)
 
                     yield f"data: {json.dumps({'type': 'cloud_loop_progress', 'loop': _cloud_loop, 'cloud_skills': len(cloud_tcs), 'edge_skills': len(edge_tcs)})}\n\n"
 
@@ -2233,6 +2239,7 @@ async def chat_turn(
                         # Append tool result to messages for next LLM call.
                         _tool_msg: dict[str, Any] = {"role": "tool", "tool_call_id": tc_id, "content": truncate_tool_result(cloud_result)}
                         _current_llm_messages = _current_llm_messages + [_tool_msg]
+                        _cloud_loop_history.append(_tool_msg)
 
                         # If skill returned success=False, inject a hard stop to prevent LLM from
                         # retrying with different params or using bash/curl to work around the failure.
@@ -2302,6 +2309,13 @@ async def chat_turn(
 
                 # Update session cache
                 _entry = _get_or_create_session_entry(session_id)
+                # Inject cloud skill intermediate messages (assistant+tool_calls,
+                # tool results) so future turns see the full tool usage history.
+                # This is critical for multi-turn continuity: without it,
+                # ConversationState.previous_skill is None and LLM can't see
+                # what tools were used in prior turns.
+                if _cloud_loop_history:
+                    _entry.setdefault("history", []).extend(_cloud_loop_history)
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": full_text}
                 if tool_calls:
                     assistant_msg["tool_calls"] = tool_calls
