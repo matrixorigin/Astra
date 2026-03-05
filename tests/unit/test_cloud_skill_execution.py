@@ -329,3 +329,85 @@ class TestCloudLoopStopsOnFailure:
         # Final call uses chat_stream (no tools) to prevent LLM from returning tool_calls
         assert llm_call_count["tools"] == 1, "chat_with_tools_stream should be called once"
         assert llm_call_count["stream"] == 1, "chat_stream should be called once for final reply"
+
+
+# ── Cloud loop history does not duplicate preamble text ───────────────────
+
+class TestCloudLoopHistoryNoDuplicateText:
+    """Regression test for session 019cbcb7: when LLM returns text + tool_call
+    in the same cloud loop iteration, the preamble text must NOT appear twice
+    in session history (once in cloud_loop_history assistant+tool_calls, once
+    in final assistant_msg).  Duplication causes the LLM to repeat itself with
+    increasing severity on subsequent turns.
+    """
+
+    def test_preamble_not_duplicated_in_session_history(self, client, db):
+        headers = get_auth_headers(client, db, username="dup_user", user_id="dup_uid", email="dup@t.com")
+
+        preamble = "Let me check the PRs for you."
+
+        # LLM call 1: returns preamble text + tool_call (cloud loop iteration)
+        call_stream = fake_llm_stream([
+            {"type": "text", "content": preamble},
+            {"type": "tool_call", "data": {
+                "id": "tc1", "function": {"name": "list_prs",
+                                           "arguments": '{"repo":"o/r"}'}}},
+        ])
+        # LLM call 2: final answer after tool result
+        answer_stream = fake_llm_stream([
+            {"type": "text", "content": "Here are the PRs:\n- PR #1"},
+        ])
+
+        call_count = {"n": 0}
+        def llm_side_effect(*a, **kw):
+            call_count["n"] += 1
+            return call_stream if call_count["n"] == 1 else answer_stream
+
+        mock_skill_output = MagicMock()
+        mock_skill_output.model_dump.return_value = {"success": True, "prs": [{"number": 1}]}
+
+        async def fake_execute(inp):
+            return mock_skill_output
+
+        with patch("core.llm.client.LLMClient.chat_with_tools_stream", side_effect=llm_side_effect), \
+             patch("core.llm.client.LLMClient.chat_stream", side_effect=llm_side_effect), \
+             patch("api.routers.chat._get_shared_skill_registry") as mock_reg_fn, \
+             patch("api.routers.chat._get_cloud_skill_schemas", return_value=[
+                 {"type": "function", "function": {"name": "list_prs", "description": "list prs", "parameters": {}}}
+             ]):
+            mock_reg = MagicMock()
+            mock_skill = MagicMock()
+            mock_skill.name = "list_prs"
+            mock_skill.validate_input.return_value = MagicMock()
+            mock_skill.execute = fake_execute
+            mock_skill._input_cls = MagicMock()
+            mock_reg.get.return_value = mock_skill
+            mock_reg._skills = {"list_prs": mock_skill}
+            mock_reg_fn.return_value = mock_reg
+
+            resp = client.post("/chat/turn", json={
+                "messages": [{"role": "user", "content": "show prs"}],
+                "edge_tools": [],
+            }, headers=headers)
+            assert resp.status_code == 200
+
+            events = parse_sse_events(resp.text)
+            session_id = next((e["session_id"] for e in events if e.get("type") == "session_info"), None)
+            assert session_id
+
+        # Inspect session cache history
+        from api.routers.chat import _session_cache
+        entry = _session_cache.get(session_id, {})
+        history = entry.get("history", [])
+
+        # Count how many times the preamble appears across all assistant messages
+        preamble_count = sum(
+            (m.get("content") or "").count(preamble)
+            for m in history
+            if m and m.get("role") == "assistant"
+        )
+        assert preamble_count == 1, (
+            f"Preamble appears {preamble_count}x in history (expected 1). "
+            f"Cloud loop assistant+tool_calls should NOT store text content. "
+            f"History: {json.dumps([m for m in history if m and m.get('role') == 'assistant'], indent=2, ensure_ascii=False)}"
+        )

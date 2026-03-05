@@ -1719,6 +1719,7 @@ class ToolSelectionResult(BaseModel):
 
     tools: list[dict[str, Any]]
     selected_tool: str | None = None
+    fallback_reason: str | None = None
 
 
 def select_tools_for_turn(
@@ -1878,15 +1879,66 @@ def _select_tool_by_llm(
             logger.info("LLM tool selection: %s", raw)
             return ToolSelectionResult(tools=[matched], selected_tool=raw)
         logger.warning(
-            "LLM tool selection returned unmatched '%s', using all %d tools",
-            raw, len(tools_schema),
+            "LLM tool selection returned unmatched '%s', falling back to keyword",
+            raw,
         )
+        return _keyword_fallback(tools_schema, user_query, f"llm_unmatched:{raw}")
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception as e:
-        logger.warning(
-            "Tool selection failed, using all %d tools: %s",
-            len(tools_schema), e,
-        )
-    return ToolSelectionResult(tools=tools_schema)
+        # Catch broadly here because LLM providers raise diverse exception
+        # types (RateLimitError, APITimeoutError, PermissionError, etc.)
+        # that don't share a common base class.  Tool selection is
+        # best-effort — a failure here should never block the chat turn.
+        logger.warning("Tool selection LLM failed (%s): %s, falling back to keyword",
+                        type(e).__name__, e)
+        return _keyword_fallback(tools_schema, user_query, f"llm_error:{type(e).__name__}")
+
+
+# ── Keyword-based tool fallback (zero LLM cost) ─────────────────
+
+# Maps query keywords to tool names.
+# IMPORTANT: multi-word patterns MUST come before single-word patterns.
+# Matching is first-match-wins with substring `in`, so "pr" would shadow
+# "summarize pr" if it appeared earlier.  Longest/most-specific first.
+_KEYWORD_TOOL_MAP: list[tuple[list[str], str]] = [
+    # Multi-word (specific) — must be before single-word entries
+    (["summarize pr", "总结pr", "review pr", "评审pr"], "summarize_pr"),
+    (["create issue", "创建issue", "提issue", "新建issue"], "create_issue"),
+    (["pull request", "合并请求"], "list_prs"),
+    (["run code", "运行代码", "执行代码"], "execute_code"),
+    # Single-word — checked only after multi-word patterns fail.
+    # Only include words that unambiguously refer to one tool.
+    # Removed: "bug" (matches "debug"), "问题" (means generic "question"),
+    #          "execute" (matches "execute SQL", "execution plan").
+    (["pr"], "list_prs"),
+    (["ci", "workflow", "pipeline", "构建"], "ci_status"),
+    (["issue", "缺陷"], "list_issues"),
+]
+
+
+def _keyword_fallback(
+    tools_schema: list[dict[str, Any]],
+    user_query: str,
+    reason: str,
+) -> ToolSelectionResult:
+    """Zero-cost keyword matching when LLM tool selection is unavailable."""
+    query_lower = user_query.lower()
+    tool_names_map = {
+        t.get("function", {}).get("name", ""): t for t in tools_schema
+    }
+    for keywords, tool_name in _KEYWORD_TOOL_MAP:
+        if tool_name in tool_names_map and any(kw in query_lower for kw in keywords):
+            logger.info("Keyword fallback matched: %s (reason: %s)", tool_name, reason)
+            return ToolSelectionResult(
+                tools=[tool_names_map[tool_name]],
+                selected_tool=tool_name,
+                fallback_reason=reason,
+            )
+    # No keyword match — return all tools as last resort
+    logger.warning("Keyword fallback: no match for '%s', using all %d tools (reason: %s)",
+                    user_query[:60], len(tools_schema), reason)
+    return ToolSelectionResult(tools=tools_schema, fallback_reason=reason)
 
 
 def _keep_active_tools(
@@ -2184,15 +2236,27 @@ async def chat_turn(
 
                     # Execute cloud skills server-side.
                     # Build assistant message with tool_calls for conversation history.
-                    assistant_msg_loop: dict[str, Any] = {"role": "assistant"}
-                    if _loop_text:
-                        assistant_msg_loop["content"] = _loop_text
-                    assistant_msg_loop["tool_calls"] = [
+                    # _current_llm_messages gets the full message (LLM needs content
+                    # for coherent conversation), but _cloud_loop_history omits the
+                    # text content because it will already appear in the final
+                    # assistant_msg via full_text.  Storing it in both places causes
+                    # the preamble to appear twice in session history, which makes
+                    # the LLM repeat itself with increasing severity each turn.
+                    _tc_entries = [
                         {"id": tc.get("id", ""), "type": "function", "function": tc.get("function", {})}
                         for tc in cloud_tcs
                     ]
+                    assistant_msg_loop: dict[str, Any] = {"role": "assistant"}
+                    if _loop_text:
+                        assistant_msg_loop["content"] = _loop_text
+                    assistant_msg_loop["tool_calls"] = _tc_entries
                     _current_llm_messages = _current_llm_messages + [assistant_msg_loop]
-                    _cloud_loop_history.append(assistant_msg_loop)
+                    # History copy: tool_calls only, no text (avoids duplication).
+                    # _loop_text is already accumulated into full_text (line above)
+                    # which goes into the final assistant_msg at session cache persist
+                    # time, so omitting content here is safe and intentional.
+                    _history_msg_loop: dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": _tc_entries}
+                    _cloud_loop_history.append(_history_msg_loop)
 
                     yield f"data: {json.dumps({'type': 'cloud_loop_progress', 'loop': _cloud_loop, 'cloud_skills': len(cloud_tcs), 'edge_skills': len(edge_tcs)})}\n\n"
 
@@ -2391,6 +2455,7 @@ async def chat_turn(
                     "tools_selected": _tool_count,
                     "tools_available": _all_count,
                     "tool_selection": _high_confidence_skill,
+                    "tool_selection_fallback": _sel.fallback_reason,
                     "steps": _explain_steps,
                 }
                 if _memory_stats:

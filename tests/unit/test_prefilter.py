@@ -603,3 +603,99 @@ class TestRealFailureCase:
         assert applied is True
         assert result[0].name == "event_reader"
         assert result[1].name == "introspection"
+
+
+# ── Keyword Fallback Tests ───────────────────────────────────────
+
+class TestKeywordFallback:
+    """When LLM tool selection fails, keyword matching picks the right tool."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_env(self, monkeypatch):
+        monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", "test-key-" + "x" * 32)
+        monkeypatch.setenv("JWT_SECRET_KEY", "test-jwt-secret-" + "x" * 32)
+
+    @pytest.fixture
+    def tools(self):
+        return [
+            {"type": "function", "function": {"name": "list_prs", "description": "x", "parameters": {}}},
+            {"type": "function", "function": {"name": "ci_status", "description": "x", "parameters": {}}},
+            {"type": "function", "function": {"name": "list_issues", "description": "x", "parameters": {}}},
+            {"type": "function", "function": {"name": "summarize_pr", "description": "x", "parameters": {}}},
+            {"type": "function", "function": {"name": "create_issue", "description": "x", "parameters": {}}},
+            {"type": "function", "function": {"name": "execute_code", "description": "x", "parameters": {}}},
+            {"type": "function", "function": {"name": "bash", "description": "x", "parameters": {}}},
+        ]
+
+    def test_pr_keyword_matches(self, tools):
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "matrixone 最新的两个pr情况？", "test")
+        assert r.selected_tool == "list_prs"
+        assert r.fallback_reason == "test"
+
+    def test_ci_keyword_matches(self, tools):
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "ci怎么样", "test")
+        assert r.selected_tool == "ci_status"
+
+    def test_issue_keyword_matches(self, tools):
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "查看issue", "test")
+        assert r.selected_tool == "list_issues"
+
+    def test_no_match_returns_all(self, tools):
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "ragflow?", "test")
+        assert r.selected_tool is None
+        assert len(r.tools) == len(tools)
+        assert r.fallback_reason == "test"
+
+    def test_reproduces_session_019cbcd3(self, tools):
+        """Session 019cbcd3: 'matrixone 最新的两个pr情况？' with failed LLM selection."""
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "matrixone 最新的两个pr情况？", "llm_error:PermissionError")
+        assert r.selected_tool == "list_prs"
+        assert len(r.tools) == 1
+
+    # ── Multi-word patterns must not be shadowed by single-word ──
+
+    def test_summarize_pr_not_shadowed_by_list_prs(self, tools):
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "summarize pr #42", "test")
+        assert r.selected_tool == "summarize_pr"
+
+    def test_review_pr_not_shadowed(self, tools):
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "review pr changes", "test")
+        assert r.selected_tool == "summarize_pr"
+
+    def test_create_issue_not_shadowed_by_list_issues(self, tools):
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "create issue about login", "test")
+        assert r.selected_tool == "create_issue"
+
+    # ── False-positive resistance ────────────────────────────────
+
+    def test_debug_does_not_match_list_issues(self, tools):
+        """'bug' was removed — 'debug' must not trigger list_issues."""
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "debug this code", "test")
+        assert r.selected_tool is None
+
+    def test_generic_question_does_not_match_list_issues(self, tools):
+        """'问题' was removed — generic Chinese 'question' must not trigger list_issues."""
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "这个问题怎么解决", "test")
+        assert r.selected_tool is None
+
+    def test_execute_sql_does_not_match_execute_code(self, tools):
+        """'execute' single-word was removed — 'execute SQL' must not trigger execute_code."""
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "execute this SQL query", "test")
+        assert r.selected_tool is None
+
+    def test_run_code_multiword_still_matches(self, tools):
+        """Multi-word 'run code' still works even though single-word 'execute' was removed."""
+        from api.routers.chat import _keyword_fallback
+        r = _keyword_fallback(tools, "run code to parse the file", "test")
+        assert r.selected_tool == "execute_code"

@@ -284,6 +284,9 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
         tool_info = f"  tools: {ts}/{ta}"
         if sel:
             tool_info += f" → {sel}"
+        fb = t.get("tool_selection_fallback")
+        if fb:
+            tool_info += f" ⚠fallback:{fb}"
         w(f"{dim}Turn {t['turn']}  {ms}ms  tokens: {p}→{c}{tool_info}{reset}\n")
 
         # Memory stats (new flat structure: l0, l1, retrieval)
