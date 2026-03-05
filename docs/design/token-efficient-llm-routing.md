@@ -132,10 +132,10 @@ Prompt cache amplifies savings: turn 2+ prefix (~750 tok) cached → only variab
 | Memory compression | ✅ | `core/context/prompt_assembler.py` |
 | History hard-cap (70%→25%) | ✅ | `core/context/prompt_assembler.py` |
 | ReAct `<think>/<reflect>` | ✅ | `core/context/prompt_assembler.py` |
-| Tier 0 dual engine | 📋 | `core/context/prompt_assembler.py` |
-| Tier 1 parallel (classify ∥ compress ∥ prune) | 📋 | `core/context/prompt_assembler.py` |
-| Adaptive threshold | 📋 | `core/context/prompt_assembler.py` |
-| User correction fallback | 📋 | `api/routers/chat.py` |
+| Tier 0 dual engine | ✅ | `core/context/intent_routing.py` |
+| Tier 1 parallel (classify ∥ compress ∥ prune) | ✅ | `core/context/intent_routing.py` |
+| Adaptive threshold | ✅ | `core/context/routing_metrics.py` |
+| User correction fallback | ✅ | `core/context/intent_routing.py` |
 
 ---
 

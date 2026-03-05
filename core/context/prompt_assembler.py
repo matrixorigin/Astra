@@ -167,6 +167,8 @@ class AssembledPrompt:
     memory_stats: dict[str, Any] | None = None  # Populated when explain=True
     assembly_duration_ms: float = 0.0  # Total prompt assembly wall-clock time
     memory_duration_ms: float = 0.0  # Time spent in _build_memory
+    routing_intent: str | None = None  # Intent from routing (preference/command/feedback/question)
+    routing_confidence: float = 0.0  # Routing confidence score
 
 
 class PromptAssembler(DbConsumer):
@@ -189,6 +191,7 @@ class PromptAssembler(DbConsumer):
         username: str | None = None,
         explain: bool = False,
         verbose: bool = False,
+        routing_decision: Any | None = None,
     ) -> AssembledPrompt:
         """
         Assemble system prompt with zone-based budget tracking.
@@ -199,12 +202,17 @@ class PromptAssembler(DbConsumer):
         Args:
             explain: If True, collect memory retrieval stats in result.memory_stats.
             verbose: If True (requires explain), include content previews in stats.
+            routing_decision: RoutingDecision from IntentRouter — controls which sections to build.
         """
         sections: dict[str, str] = {}
         breakdown: dict[str, int] = {}
         memory_stats: dict[str, Any] | None = None
         _t0 = time.monotonic()
         _mem_duration_ms = 0.0
+
+        # Extract routing plan (if provided)
+        _plan = routing_decision.plan if routing_decision else None
+        _tier1 = routing_decision.tier1_result if routing_decision else None
 
         # Phase 1: Compute zone budgets based on model context size
         # This provides the foundation for measuring compression effectiveness
@@ -252,8 +260,21 @@ class PromptAssembler(DbConsumer):
             breakdown["project_context"] = _estimate_tokens(project_ctx)
 
         # §4 Memory (continuity + observations + few-shot)
+        # Routing: skip if plan.load_memory is False, L0-only if "profile"
+        _skip_memory = _plan and _plan.load_memory is False
+        _profile_only = _plan and _plan.load_memory == "profile"
         _mem_t0 = time.monotonic()
-        memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain, verbose=verbose)
+        if _skip_memory:
+            memory, memory_stats = None, None
+        elif _tier1 and _tier1.compressed_memory:
+            # Use Tier 1 pre-compressed memory
+            memory = _tier1.compressed_memory
+            memory_stats = {"source": "tier1_compressed"} if explain else None
+        elif _profile_only:
+            # L0 profile only — skip L1 semantic retrieval
+            memory, memory_stats = self._build_memory_profile_only(user_id, explain=explain)
+        else:
+            memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain, verbose=verbose)
         _mem_duration_ms = (time.monotonic() - _mem_t0) * 1000
         if memory:
             sections["memory"] = memory
@@ -266,7 +287,14 @@ class PromptAssembler(DbConsumer):
             breakdown["working_memory"] = _estimate_tokens(working)
 
         # §6 History
-        history = self._build_history(session_id, max_tokens)
+        # Routing: skip if plan.load_history is False, limit if int
+        _skip_history = _plan and _plan.load_history is False
+        if _skip_history:
+            history = None
+        elif _plan and isinstance(_plan.load_history, int):
+            history = self._build_history(session_id, max_tokens, max_turns=_plan.load_history)
+        else:
+            history = self._build_history(session_id, max_tokens)
         if history:
             sections["history"] = history
             breakdown["history"] = _estimate_tokens(history)
@@ -332,6 +360,13 @@ class PromptAssembler(DbConsumer):
         # Tools schema (edge tools passed through for now; unified catalog in Phase 4)
         tools_schema = (edge_context.edge_tools or []) if edge_context else []
 
+        # Routing: skip tools if plan says so, or prune via Tier 1
+        if _plan and not _plan.load_tools:
+            tools_schema = []
+        elif _tier1 and _tier1.pruned_tools is not None:
+            pruned_set = set(_tier1.pruned_tools)
+            tools_schema = [t for t in tools_schema if t.get("function", {}).get("name", "") in pruned_set]
+
         # Build snapshot_breakdown = breakdown + tool_schemas + user_query
         # so ctx_snapshots.token_budget has a complete picture of the prompt.
         # These are NOT added to token_breakdown (returned to caller) because
@@ -345,6 +380,9 @@ class PromptAssembler(DbConsumer):
         # Persist snapshot
         snapshot_id = self._save_snapshot(session_id, sections, snapshot_breakdown)
 
+        _routing_intent = routing_decision.routing_result.intent if routing_decision else None
+        _routing_conf = routing_decision.routing_result.confidence if routing_decision else 0.0
+
         return AssembledPrompt(
             system_message=system_message,
             tools_schema=tools_schema,
@@ -355,6 +393,8 @@ class PromptAssembler(DbConsumer):
             memory_stats=memory_stats,
             assembly_duration_ms=(time.monotonic() - _t0) * 1000,
             memory_duration_ms=_mem_duration_ms,
+            routing_intent=_routing_intent,
+            routing_confidence=_routing_conf,
         )
 
     # ------------------------------------------------------------------
@@ -941,6 +981,21 @@ class PromptAssembler(DbConsumer):
         except Exception as e:
             logger.debug("Memory compression skipped: %s", e)
         return text
+    def _build_memory_profile_only(
+        self, user_id: str, explain: bool = False,
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """L0 profile memory only — used by preference intent routing."""
+        stats: dict[str, Any] | None = {"source": "profile_only"} if explain else None
+        try:
+            from core.memory.tiered_loader import TieredMemoryLoader
+            loader = TieredMemoryLoader(self._db_factory)
+            l0_text = loader.load_l0(user_id)
+            if l0_text:
+                return l0_text, stats
+        except Exception as e:
+            logger.debug("Profile-only memory skipped: %s", e)
+        return None, stats
+
     def _build_working_memory(self, session_id: str) -> str | None:
         """§5: Scratchpad notes."""
         try:
@@ -954,7 +1009,7 @@ class PromptAssembler(DbConsumer):
             logger.debug("Scratchpad skipped: %s", e)
         return None
 
-    def _build_history(self, session_id: str, max_tokens: int) -> str | None:
+    def _build_history(self, session_id: str, max_tokens: int, max_turns: int | None = None) -> str | None:
         """§6: Budget-capped conversation history with tiered compression.
 
         Compression is enabled by default for token efficiency:
@@ -963,9 +1018,15 @@ class PromptAssembler(DbConsumer):
         - Tier 3: Synopsis for very long histories (>6 turns)
 
         Set ENABLE_HISTORY_COMPRESSION=false to disable.
+
+        Args:
+            max_turns: If set, limit to last N user_query events (for feedback intent).
         """
         # Default: compression enabled for token efficiency
         enable_compression = os.getenv("ENABLE_HISTORY_COMPRESSION", "true").lower() != "false"
+
+        # Routing may request fewer turns (e.g. feedback intent → last 2)
+        event_limit = min(max_turns * 2, _MAX_HISTORY_EVENTS) if max_turns else _MAX_HISTORY_EVENTS
 
         with self._db() as db:
             budget_chars = int(max_tokens * _MAX_HISTORY_RATIO) * 4
@@ -974,7 +1035,7 @@ class PromptAssembler(DbConsumer):
                     text(f"""
                         SELECT event_id, event_type, content, metadata FROM agent_events
                         WHERE session_id = :sid AND event_type IN ('user_query', 'llm_response', 'tool_result')
-                        ORDER BY created_at DESC LIMIT {_MAX_HISTORY_EVENTS}
+                        ORDER BY created_at DESC LIMIT {event_limit}
                     """),
                     {"sid": session_id},
                 ).fetchall()

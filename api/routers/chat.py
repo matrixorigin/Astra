@@ -1194,6 +1194,7 @@ def _build_turn_messages(
     username: str | None = None,
     explain: bool = False,
     verbose: bool = False,
+    routing_decision: Any | None = None,
 ) -> tuple[list[dict[str, Any]], str | None, dict[str, Any] | None]:
     """Build LLM messages from edge turn data + server-side history.
 
@@ -1237,6 +1238,7 @@ def _build_turn_messages(
             username=username,
             explain=explain,
             verbose=verbose,
+            routing_decision=routing_decision,
         )
         system = assembled.system_message
         context_capture_id = assembled.snapshot_id
@@ -2065,6 +2067,55 @@ async def chat_turn(
                 )
             _high_confidence_skill = None
 
+            # ── Intent Routing (Tier 0 → Tier 1 → fallback) ─────────────
+            _routing_decision = None
+            if request.model:
+                # model_override → bypass routing entirely (design doc §Error Handling)
+                logger.debug("Model override '%s' → skip intent routing", request.model)
+            else:
+                try:
+                    from core.context.intent_routing import IntentRouter, detect_correction
+                    from core.context.routing_metrics import active_request_context
+                    from core.metrics import (
+                        adaptive_threshold_value, intent_correction_total,
+                        routing_cache_hit_total, routing_confidence,
+                        routing_efficiency_ratio, routing_fallback_total,
+                        routing_requests_total,
+                    )
+
+                    _ir = IntentRouter(SessionLocal)
+                    _force = "question" if (user_query and detect_correction(user_query)) else None
+                    _history_len = len((_cached_entry or {}).get("history") or []) if _cached_entry else 0
+                    _routing_tool_names = [t.get("function", {}).get("name", "") for t in (tools_schema or [])]
+
+                    _routing_decision = await _ir.route(
+                        query=user_query or "",
+                        history_len=_history_len,
+                        tool_names=_routing_tool_names if _routing_tool_names else None,
+                        force_intent=_force,
+                    )
+
+                    # Record Prometheus metrics
+                    routing_requests_total.inc()
+                    routing_confidence.observe(_routing_decision.routing_result.confidence)
+                    adaptive_threshold_value.set(_routing_decision.threshold_used)
+                    if _routing_decision.routing_result.matched_by == "fallback":
+                        routing_fallback_total.inc()
+                    if _routing_decision.routing_result.tier == 0 and _routing_decision.tier1_result is None:
+                        routing_cache_hit_total.inc()
+                    if _force == "question":
+                        intent_correction_total.inc()
+
+                    # routing_efficiency_ratio: 1 - (routed / full) tokens
+                    if _routing_decision.routing_result.intent and _routing_decision.routing_result.intent != "question":
+                        from core.context.intent_routing import INTENT_PLANS
+                        _routed_est = _routing_decision.plan.estimated_tokens
+                        _full_est = INTENT_PLANS["question"].estimated_tokens
+                        if _full_est > 0:
+                            routing_efficiency_ratio.observe(1.0 - _routed_est / _full_est)
+                except Exception as _routing_err:
+                    logger.debug("Intent routing skipped: %s", _routing_err)
+
             def _build_sync():
                 db = SessionLocal()
                 try:
@@ -2080,6 +2131,7 @@ async def chat_turn(
                         username=current_user.get("username"),
                         explain=_explain_on,
                         verbose=_verbose_on,
+                        routing_decision=_routing_decision,
                     )
                 finally:
                     db.close()
@@ -2500,6 +2552,14 @@ async def chat_turn(
                 }
                 if _memory_stats:
                     explain_event["memory"] = _memory_stats
+                if _routing_decision:
+                    explain_event["routing"] = {
+                        "intent": _routing_decision.routing_result.intent,
+                        "confidence": _routing_decision.routing_result.confidence,
+                        "tier": _routing_decision.routing_result.tier,
+                        "matched_by": _routing_decision.routing_result.matched_by,
+                        "threshold": _routing_decision.threshold_used,
+                    }
                 yield f"data: {json.dumps(explain_event)}\n\n"
 
             # Task 4.4: Include execution_state for edge-cloud breaker sync.

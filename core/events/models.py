@@ -37,6 +37,9 @@ class EventType(str, Enum):
     # Tool quality assessment
     TOOL_RESULT_QUALITY = "tool_result_quality"
 
+    # Intent routing
+    INTENT_CORRECTION = "intent_correction"
+
     # Agent run lifecycle
     RUN_STARTED = "run_started"
     RUN_WAITING = "run_waiting"
