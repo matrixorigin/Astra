@@ -23,6 +23,7 @@ VALID_SCOPES = frozenset({
     "historical",
     "cross_session",
     "external",
+    "local",           # local filesystem / runtime / VCS
 })
 
 VALID_DATA_SOURCES = frozenset({
@@ -30,6 +31,9 @@ VALID_DATA_SOURCES = frozenset({
     "event_store",
     "memory_store",
     "external_api",
+    "local_filesystem",
+    "local_runtime",
+    "local_vcs",
 })
 
 VALID_INTENT_TYPES = frozenset({
@@ -45,9 +49,14 @@ _CATEGORY_TAG_DEFAULTS: dict[str, dict[str, Any]] = {
     "github": {"scope": "external", "data_source": "external_api", "intent_type": ["fetch", "mutate"], "requires_history": False},
     "jira": {"scope": "external", "data_source": "external_api", "intent_type": ["fetch", "mutate"], "requires_history": False},
     "external": {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
-    "code_execution": {"scope": "current_session", "data_source": "session_metadata", "intent_type": ["mutate"], "requires_history": False},
+    "code_execution": {"scope": "current_session", "data_source": "local_runtime", "intent_type": ["mutate"], "requires_history": False},
     "system": {"scope": "current_session", "data_source": "session_metadata", "intent_type": ["introspect"], "requires_history": False},
     "multi_agent": {"scope": "current_session", "data_source": "session_metadata", "intent_type": ["mutate"], "requires_history": False},
+    "file_ops": {"scope": "local", "data_source": "local_filesystem", "intent_type": ["fetch", "mutate"], "requires_history": False},
+    "search": {"scope": "local", "data_source": "local_filesystem", "intent_type": ["fetch"], "requires_history": False},
+    "shell": {"scope": "local", "data_source": "local_runtime", "intent_type": ["mutate"], "requires_history": False},
+    "vcs": {"scope": "local", "data_source": "local_vcs", "intent_type": ["fetch"], "requires_history": False},
+    "diagnostics": {"scope": "historical", "data_source": "event_store", "intent_type": ["analytical"], "requires_history": True},
 }
 
 
@@ -119,6 +128,19 @@ class HasTags(Protocol):
 
     name: str
     tags: SkillTags | None
+
+
+@dataclass
+class ToolWrapper:
+    """Lightweight wrapper that pairs a tool schema with pre-filter tags.
+
+    Used by _prefilter_tools() in chat.py to bridge raw OpenAI tool dicts
+    with the pre_filter() pipeline that expects HasTags objects.
+    """
+
+    name: str
+    tags: SkillTags | None
+    schema: dict[str, Any]
 
 
 # ── ConversationState ────────────────────────────────────────────
@@ -266,14 +288,15 @@ def pre_filter(
             logger.info("Pre-filter: history+analytical → prefer historical scope")
             return reordered, True
 
-    # Rule 2: Fetch intent without history reference → prefer external
+    # Rule 2: Fetch intent without history reference → prefer external + local.
+    # "show me the file" should boost read_file (local), not just GitHub skills.
     if state.is_fetch and not state.references_history:
         reordered = _prefer(
             skills,
-            include_scopes={"external"},
+            include_scopes={"external", "local"},
         )
         if _order_changed(skills, reordered):
-            logger.info("Pre-filter: fetch → prefer external scope")
+            logger.info("Pre-filter: fetch → prefer external+local scope")
             return reordered, True
 
     # Rule 3: Mutate intent → prefer mutate skills

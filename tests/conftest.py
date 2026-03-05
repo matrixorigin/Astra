@@ -83,6 +83,20 @@ def test_engine():
                         c.commit()
                 except Exception:
                     pass  # Column already DATETIME(6), or table created with correct type
+
+            # Register edge tool metadata so tests can verify DB state.
+            try:
+                from api.database import SessionLocal
+                from core.skills.catalog import SkillCatalog
+                from core.skills.builtin import register_builtin_skills
+                catalog = SkillCatalog(SessionLocal)
+                register_builtin_skills(catalog, SessionLocal)
+            except Exception as e:
+                import warnings
+                warnings.warn(
+                    f"Edge tool registration failed in conftest: {e}",
+                    stacklevel=1,
+                )
             break
         except Exception:
             if attempt == 4:

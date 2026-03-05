@@ -33,6 +33,14 @@ from core.verification.tool_quality import (
     assess_tool_result as _assess_tool_result,
 )
 
+from core.skills.prefilter import (
+    ConversationState,
+    SkillTags,
+    ToolWrapper,
+    pre_filter,
+)
+from core.skills.selector import SkillSelector
+
 logger = get_logger(__name__)
 router = APIRouter()
 
@@ -1251,6 +1259,7 @@ def _persist_turn_events(
     agent_id: str | None = None,
     turn_chain_id: str | None = None,
     user_query_event_id: str | None = None,
+    cloud_tool_results: list[dict[str, Any]] | None = None,
 ) -> None:
     """Persist events for this turn: user query, tool results, LLM response.
 
@@ -1372,6 +1381,26 @@ def _persist_turn_events(
 
         # Track LLM response event_id for snapshot linking
         llm_response_event_id: str | None = None
+
+        # Persist cloud tool results (server-side skill execution results)
+        if cloud_tool_results:
+            for ctr in cloud_tool_results:
+                ctr_name = ctr.get("name", "")
+                el.create_stream_event(
+                    user_id=user_id, session_id=session_id,
+                    event_type="tool_result",
+                    content=json.dumps({"name": ctr_name, "result": ctr.get("result", "")[:2000]}),
+                    parent_event_id=parent_event_id,
+                    causal_chain_id=causal_chain_id,
+                    metadata={
+                        "source": "cloud",
+                        "tool_call_id": ctr.get("tool_call_id"),
+                        "name": ctr_name,
+                    },
+                    skill_name=ctr_name,
+                    skill_version=skill_versions.get(ctr_name),
+                )
+
         if full_text or tool_calls:
             llm_resp_ev = el.create_llm_response(
                 user_id=user_id, session_id=session_id,
@@ -1696,9 +1725,8 @@ def select_tools_for_turn(
 ) -> ToolSelectionResult:
     """Pick the most relevant tool(s) for a chat turn.
 
-    For user-query turns: asks the LLM to pick the single best tool from a
-    catalog, falling back to all tools on mismatch or error.
-
+    Stage 0: Pre-filter by conversation state + skill tags (0 tokens).
+    Stage 1: For user-query turns, ask LLM to pick the single best tool.
     For tool-result turns: keeps only the tool(s) already in use.
 
     Args:
@@ -1714,17 +1742,81 @@ def select_tools_for_turn(
     if not tools_schema or len(tools_schema) <= 1:
         return ToolSelectionResult(tools=tools_schema)
 
-    user_query = next(
-        (m.get("content", "") for m in messages if m.get("role") == "user"), ""
-    )
+    # Use the LAST user message — earlier messages reflect prior intents.
+    # Consistent with ConversationState.from_messages() which also uses last.
+    user_query = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_query = m.get("content", "")
+            break
 
+    # Stage 0: pre-filter reorder
     if user_query:
-        return _select_tool_by_llm(tools_schema, user_query, user_id, llm_client)
+        tools_schema = _prefilter_tools(tools_schema, messages)
+        return _select_tool_by_llm(
+            tools_schema, user_query, user_id, llm_client,
+        )
 
     if tool_results:
         return _keep_active_tools(tools_schema, tool_results)
 
     return ToolSelectionResult(tools=tools_schema)
+
+
+# Module-level tag cache.  SkillSelector loads all active skills from DB;
+# caching avoids a full SELECT on every user message turn.  Invalidated
+# by TTL (60s) — acceptable staleness for a reorder-only optimisation.
+_tag_cache: dict[str, SkillTags | None] = {}
+_tag_cache_ts: float = 0.0
+_TAG_CACHE_TTL = 60.0
+
+
+def _get_tag_map() -> dict[str, SkillTags | None]:
+    """Return skill-name → SkillTags map, refreshed every _TAG_CACHE_TTL seconds."""
+    global _tag_cache, _tag_cache_ts  # noqa: PLW0603
+    now = time.monotonic()
+    if _tag_cache and (now - _tag_cache_ts) < _TAG_CACHE_TTL:
+        return _tag_cache
+    try:
+        selector = SkillSelector(SessionLocal)
+        _tag_cache = {n: s.tags for n, s in selector.skills.items()}
+        _tag_cache_ts = now
+    except Exception as e:
+        logger.debug("Tag cache refresh failed: %s", e)
+        # Return stale cache if available, empty dict otherwise
+        if not _tag_cache:
+            _tag_cache = {}
+    return _tag_cache
+
+
+def _prefilter_tools(
+    tools_schema: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reorder tools_schema using pre-filter tags. Zero LLM cost."""
+    try:
+        state = ConversationState.from_messages(messages)
+        tag_map = _get_tag_map()
+
+        wrappers = [
+            ToolWrapper(
+                name=t.get("function", {}).get("name", ""),
+                tags=tag_map.get(t.get("function", {}).get("name", "")),
+                schema=t,
+            )
+            for t in tools_schema
+        ]
+
+        reordered, applied = pre_filter(wrappers, state)
+        if applied:
+            logger.info(
+                "Edge pre-filter applied: %s",
+                [w.name for w in reordered[:3]],
+            )
+            return [w.schema for w in reordered]
+    except Exception as e:
+        logger.debug("Edge pre-filter skipped: %s", e)
+    return tools_schema
 
 
 def _select_tool_by_llm(
@@ -1858,6 +1950,7 @@ async def chat_turn(
             cloud_registry = None
             merged_tools_schema = tools_schema
             _cloud_tool_calls_for_persist: list[dict[str, Any]] = []
+            _cloud_tool_results_for_persist: list[dict[str, Any]] = []
             if tools_schema:
                 try:
                     cloud_registry = _get_shared_skill_registry()
@@ -2091,6 +2184,11 @@ async def chat_turn(
                             "id": tc_id, "function": {"name": tc_name, "arguments": json.dumps(tc_args)},
                             "_source": "cloud",
                         })
+                        _cloud_tool_results_for_persist.append({
+                            "tool_call_id": tc_id,
+                            "name": tc_name,
+                            "result": cloud_result[:2000],
+                        })
                         yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': cloud_result[:500]})}\n\n"
                         # Truncate before quality assessment (assess full, truncate for LLM)
                         from core.context.compaction import truncate_tool_result
@@ -2196,6 +2294,7 @@ async def chat_turn(
                 tool_results=copy.deepcopy(request.tool_results or []),
                 full_text=full_text,
                 tool_calls=copy.deepcopy(_cloud_tool_calls_for_persist + tool_calls),
+                cloud_tool_results=copy.deepcopy(_cloud_tool_results_for_persist) or None,
                 context_capture_id=snapshot_id, model_used=resolved_model,
                 token_usage=usage if usage else None,
                 llm_params=llm_params,

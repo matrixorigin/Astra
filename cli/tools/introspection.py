@@ -38,21 +38,15 @@ class GetAgentInfoTool(EdgeTool):
     @property
     def description(self) -> str:
         return (
-            "Query your CURRENT runtime state and context usage. "
-            "Use this when the user asks about: "
-            "context window usage (上下文使用详情), token consumption (token 用量/消耗), "
-            "how much context was used for a question (这个问题用了多少上下文), "
-            "memory contents or stats (记忆/memory), "
-            "available tools right now, session id, turn count, or active permissions. "
-            "Examples: 'what tools do you have?', 'how many tokens did that use?', "
-            "'show me context usage', '上下文用了多少', 'token 用了多少', "
-            "'what's in your memory?', 'what's your session id?'. "
-            "IMPORTANT: The response contains llm_prompt_tokens (total tokens sent to LLM) "
-            "and health.zones (complete breakdown of ALL llm_prompt_tokens, including "
-            "conversation_history_and_tools). "
-            "Always present llm_prompt_tokens as the primary token count to the user, "
-            "then show health.zones as the full distribution of that total. "
-            "For diagnosing WHY token usage was high or responses were slow, use reflect instead."
+            "Query CURRENT runtime state: live token counts, context window "
+            "breakdown, session info, turn count, available tools, and memory "
+            "stats. Use when user asks: 'how many tokens' (token 用了多少), "
+            "'context usage' (上下文用量), 'what tools do you have', "
+            "'session id', or 'what model'. "
+            "For token usage, present llm_prompt_tokens as the primary total "
+            "and health.zones as the complete distribution of that total. "
+            "NOT for analyzing past decisions or event history — "
+            "those are in reflect."
         )
 
     @property

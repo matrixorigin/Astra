@@ -224,29 +224,28 @@ class ReflectService(DbConsumer):
                         hints.append(f"Tool '{evt['tool_name']}' result has no data_source provenance")
                         break
 
-            # 6. Tool selection
-            if focus in ("tool_selection", "auto"):
-                self._gather_tool_selection(session_id, question, db, hints, result)
+            # 6. Tool selection — always collected (focus only affects hints)
+            self._gather_tool_selection(session_id, question, db, hints, result)
 
-            # 7. Cross-session history
-            if focus in ("history", "auto"):
-                self._gather_history(session_id, user_id, question, db, result)
+            # 7. Cross-session history — always collected
+            self._gather_history(session_id, user_id, question, db, result)
 
             # 8. Token summary with tool vs non-tool breakdown
             # Query ctx_snapshots for token budget breakdown
             tool_tokens_total = 0
             non_tool_tokens_total = 0
+            context_budgets: list[dict[str, Any]] = []
             try:
                 from sqlalchemy import text as sql_text
                 budget_rows = db.execute(
                     sql_text("""
-                        SELECT token_budget FROM ctx_snapshots
+                        SELECT token_budget, created_at FROM ctx_snapshots
                         WHERE session_id = :sid
                         ORDER BY created_at DESC LIMIT :n
                     """),
                     {"sid": session_id, "n": last_n},
                 ).fetchall()
-                for (budget_json,) in budget_rows:
+                for budget_json, snap_ts in budget_rows:
                     if budget_json:
                         budget = json.loads(budget_json) if isinstance(budget_json, str) else budget_json
                         tool_tokens_total += budget.get("tool_schemas", 0)
@@ -254,6 +253,7 @@ class ReflectService(DbConsumer):
                             v for k, v in budget.items()
                             if k != "tool_schemas" and isinstance(v, (int, float))
                         )
+                        context_budgets.append({"ts": str(snap_ts), **budget})
             except Exception:
                 pass
 
@@ -271,6 +271,8 @@ class ReflectService(DbConsumer):
                     for model, v in cost_by_model.items()
                 },
             }
+            if context_budgets:
+                result["context_budgets"] = context_budgets
             if total_managed > 0 and tool_tokens_total / total_managed > 0.6:
                 hints.append(f"Tool schemas consuming {tool_tokens_total / total_managed:.0%} of managed context — consider enabling high-confidence selection")
 
@@ -327,6 +329,43 @@ class ReflectService(DbConsumer):
                 result["diagnosis_hints"] = hints
             except Exception:
                 logger.debug("Session analysis failed", exc_info=True)
+
+        return self._compact_output(result)
+
+    # ------------------------------------------------------------------
+    # Output compaction
+    # ------------------------------------------------------------------
+
+    _OUTPUT_BUDGET_CHARS = 3000
+
+    @staticmethod
+    def _compact_output(result: dict[str, Any]) -> dict[str, Any]:
+        """Reduce output size to fit token budget.
+
+        Structural rules (not ad-hoc trimming):
+        1. event_summary: exclude reflect's own events (prevent recursion bloat)
+        2. cloud_skills: drop parameters, truncate description
+        3. edge_tools: names only
+        4. session_report_markdown: drop (redundant with session_report)
+        """
+        # 1. Filter out reflect's own events from event_summary
+        evts = result.get("event_summary", [])
+        result["event_summary"] = [
+            e for e in evts
+            if e.get("skill") != "reflect" and e.get("tool_name") != "reflect"
+        ]
+
+        # 2. Compact cloud_skills: name + short description only
+        for skill in result.get("cloud_skills", []):
+            skill.pop("parameters", None)
+            desc = skill.get("description", "")
+            if len(desc) > 80:
+                skill["description"] = desc[:80] + "…"
+
+        # 3. Compact edge_tools: names only
+        tools = result.get("edge_tools", [])
+        if tools:
+            result["edge_tools"] = [t.get("name", "?") for t in tools]
 
         return result
 

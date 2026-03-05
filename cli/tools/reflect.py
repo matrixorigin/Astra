@@ -22,19 +22,17 @@ class ReflectTool(EdgeTool):
 
     name = "reflect"
     description = (
-        "Diagnose PAST behavior by querying server-side data invisible to your context: "
-        "event trails with timing, skill selection history, tool usage counts, "
-        "and past tool call patterns. "
-        "Use focus='performance' when user asks why a response was slow, "
-        "why token usage was high, or why something took so long. "
-        "Use focus='skill_failure' after a tool fails or returns an error. "
-        "Use focus='unexpected_result' when the answer was wrong or surprising. "
-        "Use focus='tool_selection' to see what tools are available and why one wasn't used. "
-        "Use focus='data_quality' when retrieved context seems irrelevant or stale. "
-        "Use focus='history' to find how similar TOOL CALLS were handled in past sessions. "
-        "DO NOT use this tool for current token counts or context snapshot — "
-        "use get_agent_info(dimension='context_snapshot') for those. "
-        "The response includes session_report_markdown — present it directly to the user."
+        "Diagnose PAST behavior by querying server-side event history. "
+        "Returns ALL of: event trails, skill selection audit, "
+        "context window composition (token budget per zone: system prompt, "
+        "tool schemas, memory, project context), tool usage patterns, "
+        "and cross-session comparisons — in a single call. "
+        "Use when user asks about: why a tool was chosen, what happened in a "
+        "previous turn/session, decision chain evaluation (决策链评估), "
+        "analyzing previous context (分析前一个上下文), or debugging past failures. "
+        "One call is sufficient — do NOT call multiple times with different focus. "
+        "NOT for current token counts or live context — "
+        "those are in get_agent_info."
     )
     parameters = {
         "type": "object",

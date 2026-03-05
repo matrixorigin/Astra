@@ -51,11 +51,10 @@ class TestBuildSkillCategories:
             result = pa._build_skill_categories(db_session, exclude_names=set())
 
             assert result is not None
-            # Should have category counts
-            assert "github (3)" in result or "github" in result
-            assert "aws (2)" in result or "aws" in result
-            assert "monitoring (1)" in result or "monitoring" in result
-            # Should have skill examples
+            # github (3) and aws (2) have enough skills to appear in top-10 categories
+            assert "github" in result
+            assert "aws" in result
+            # Should have skill examples from our seeded data
             assert f"{prefix}_pr" in result or f"{prefix}_ci" in result
         finally:
             self._cleanup(db_session, prefix)
@@ -507,9 +506,9 @@ class TestHighConfidenceSkillSelection:
     def test_high_confidence_detected_when_gap_large(self):
         """When top score >> second score, high_confidence_skill is set."""
         from core.skills.modern_selector import (
-            SkillSelectionResult,
             _HIGH_CONFIDENCE_GAP,
             _HIGH_CONFIDENCE_SCORE,
+            SkillSelectionResult,
         )
         
         # Simulate scores with large gap
@@ -537,8 +536,8 @@ class TestHighConfidenceSkillSelection:
     def test_no_high_confidence_when_scores_close(self):
         """When scores are close, high_confidence_skill is None."""
         from core.skills.modern_selector import (
-            SkillSelectionResult,
             _HIGH_CONFIDENCE_GAP,
+            SkillSelectionResult,
         )
         
         # Simulate close scores
@@ -608,6 +607,7 @@ class TestToolCatalog:
     def test_catalog_uses_prompt_description(self):
         """Catalog prefers prompt_description over full description."""
         from unittest.mock import Mock
+
         from core.skills.modern_selector import ModernSkillSelector, SkillSelectionResult
         
         # Create mock skill with prompt_description
@@ -688,49 +688,48 @@ class TestParameterExtraction:
 
 
 class TestEdgeToolFiltering:
-    """Test edge tool filtering by relevance."""
+    """Test that edge tool filtering is now handled server-side via pre_filter."""
 
-    def test_core_tools_always_included(self):
-        """Core tools (reflect, get_agent_info) are always included."""
-        from cli.edge_chat_loop import _filter_relevant_tools
-        
+    def test_all_tools_sent_to_server(self):
+        """All edge tools are sent to server (no client-side filtering)."""
+        # After unification, edge_chat_loop sends all schemas.
+        # Server-side select_tools_for_turn handles pre_filter + LLM selection.
+        # Verify _filter_relevant_tools no longer exists.
+        import cli.edge_chat_loop as ecl
+        assert not hasattr(ecl, "_filter_relevant_tools")
+        assert not hasattr(ecl, "_CORE_TOOLS")
+
+    def test_prefilter_reorders_tools_for_history_query(self):
+        """Pre-filter reorders tools when tags are available."""
+        from core.skills.prefilter import ConversationState, SkillTags, ToolWrapper, pre_filter
+
         tools = [
-            {"function": {"name": "reflect", "description": "Reflect on actions"}},
-            {"function": {"name": "get_agent_info", "description": "Get agent info"}},
-            {"function": {"name": "grep", "description": "Search files"}},
-            {"function": {"name": "bash", "description": "Run commands"}},
+            ToolWrapper("get_agent_info",
+                        SkillTags("current_session", "session_metadata",
+                                  ("introspect",), False),
+                        {"function": {"name": "get_agent_info"}}),
+            ToolWrapper("reflect",
+                        SkillTags("historical", "event_store",
+                                  ("analytical",), True),
+                        {"function": {"name": "reflect"}}),
+            ToolWrapper("grep", None, {"function": {"name": "grep"}}),
         ]
-        
-        result = _filter_relevant_tools("what is event sourcing", tools, max_tools=2)
-        names = [t["function"]["name"] for t in result]
-        
-        # Core tools should be included even with low max_tools
-        assert "reflect" in names or "get_agent_info" in names
+        state = ConversationState(
+            references_history=True, is_analytical=True,
+        )
+        reordered, applied = pre_filter(tools, state)
+        names = [w.name for w in reordered]
+        assert applied is True
+        assert names.index("reflect") < names.index("get_agent_info")
 
-    def test_keyword_matching(self):
-        """Tools matching query keywords are prioritized."""
-        from cli.edge_chat_loop import _filter_relevant_tools
-        
-        tools = [
-            {"function": {"name": "grep", "description": "Search for patterns"}},
-            {"function": {"name": "bash", "description": "Run shell commands"}},
-            {"function": {"name": "read_file", "description": "Read file content"}},
-            {"function": {"name": "write_file", "description": "Write to file"}},
-        ]
-        
-        result = _filter_relevant_tools("search for TODO in files", tools, max_tools=2)
-        names = [t["function"]["name"] for t in result]
-        
-        assert "grep" in names  # "search" keyword matches
+    def test_prefilter_no_change_for_neutral_query(self):
+        """Pre-filter doesn't change order for neutral queries."""
+        from core.skills.prefilter import ConversationState, ToolWrapper, pre_filter
 
-    def test_max_tools_limit(self):
-        """Result is limited to max_tools."""
-        from cli.edge_chat_loop import _filter_relevant_tools
-        
-        tools = [{"function": {"name": f"tool_{i}", "description": ""}} for i in range(20)]
-        
-        result = _filter_relevant_tools("test query", tools, max_tools=5)
-        assert len(result) == 5
+        tools = [ToolWrapper("grep", None, {}), ToolWrapper("bash", None, {})]
+        state = ConversationState()  # all False
+        _reordered, applied = pre_filter(tools, state)
+        assert applied is False
 
 
 class TestDynamicConstraints:
@@ -810,8 +809,8 @@ class TestLoweredConfidenceThresholds:
     def test_threshold_values(self):
         """Verify thresholds are lowered from original 0.85/0.25."""
         from core.skills.modern_selector import (
-            _HIGH_CONFIDENCE_SCORE,
             _HIGH_CONFIDENCE_GAP,
+            _HIGH_CONFIDENCE_SCORE,
         )
         
         assert _HIGH_CONFIDENCE_SCORE == 0.75, "Score threshold should be 0.75"
@@ -820,8 +819,8 @@ class TestLoweredConfidenceThresholds:
     def test_moderate_confidence_now_triggers(self):
         """Score 0.78 with gap 0.22 should now trigger high-confidence."""
         from core.skills.modern_selector import (
-            _HIGH_CONFIDENCE_SCORE,
             _HIGH_CONFIDENCE_GAP,
+            _HIGH_CONFIDENCE_SCORE,
         )
         
         top_score = 0.78
@@ -921,10 +920,12 @@ class TestChatTurnHighConfidence:
 
     def test_update_snapshot_tool_tokens(self, db_session):
         """Verify _update_snapshot_tool_tokens updates token_budget correctly."""
-        from api.routers.chat import _update_snapshot_tool_tokens
-        from sqlalchemy import text
         import json
+
+        from sqlalchemy import text
         from uuid_utils import uuid7
+
+        from api.routers.chat import _update_snapshot_tool_tokens
         
         # Create a test snapshot
         snapshot_id = str(uuid7())
@@ -967,8 +968,9 @@ class TestTokenBreakdownIntegration:
 
     def test_snapshot_stores_tool_schemas_separately(self, db_session):
         """Verify ctx_snapshots.token_budget stores tool_schemas as a separate field."""
-        from sqlalchemy import text
         import json
+
+        from sqlalchemy import text
         from uuid_utils import uuid7
 
         # Create our own test data — never depend on leftover DB state.
@@ -1018,8 +1020,9 @@ class TestHighConfidenceOptimizationIntegration:
     def test_high_confidence_reduces_tool_tokens(self, db_session):
         """Verify that a session with high-confidence selection has lower tool_schemas
         than a session using all tools."""
-        from sqlalchemy import text
         import json
+
+        from sqlalchemy import text
         from uuid_utils import uuid7
 
         # Create our own test data: two snapshots in the same session.
@@ -1066,8 +1069,8 @@ class TestHighConfidenceOptimizationIntegration:
     def test_lowered_thresholds_in_effect(self):
         """Verify lowered confidence thresholds are active."""
         from core.skills.modern_selector import (
-            _HIGH_CONFIDENCE_SCORE,
             _HIGH_CONFIDENCE_GAP,
+            _HIGH_CONFIDENCE_SCORE,
         )
         
         # These should be the lowered values
@@ -1085,6 +1088,7 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_high_confidence_block_before_build_sync(self):
         """High-confidence selection block must appear before _build_sync definition."""
         import inspect
+
         import api.routers.chat as chat_module
 
         source = inspect.getsource(chat_module.chat_turn)
@@ -1101,6 +1105,7 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_build_sync_uses_effective_tools_schema(self):
         """_build_sync must pass effective_tools_schema (not merged) to edge_tools."""
         import inspect
+
         import api.routers.chat as chat_module
 
         source = inspect.getsource(chat_module.chat_turn)
@@ -1120,7 +1125,7 @@ class TestHighConfidenceBeforeBuildMessages:
     @staticmethod
     def _fake_llm(content: str):
         """Create a FakeLLM that returns a fixed content string."""
-        from core.llm.models import LLMResponse, LLMProvider
+        from core.llm.models import LLMProvider, LLMResponse
 
         class _FakeLLM:
             def chat(self, messages, **kwargs):
@@ -1134,7 +1139,7 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_uses_llm_not_embedding_for_tool_selection(self):
         """Tool selection must use LLM chat (not embedding similarity) for cross-lingual support."""
         from api.routers.chat import select_tools_for_turn
-        from core.llm.models import LLMResponse, LLMProvider
+        from core.llm.models import LLMProvider, LLMResponse
 
         calls: list[dict] = []
 
@@ -1206,7 +1211,7 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_llm_chat_called_with_user_id(self):
         """select_tools_for_turn must pass user_id to LLMClient.chat()."""
         from api.routers.chat import select_tools_for_turn
-        from core.llm.models import LLMResponse, LLMProvider
+        from core.llm.models import LLMProvider, LLMResponse
 
         calls: list[dict] = []
 
@@ -1236,7 +1241,7 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_llm_response_accessed_as_pydantic_model(self):
         """select_tools_for_turn must use resp.content (attribute), not resp.get()."""
         from api.routers.chat import select_tools_for_turn
-        from core.llm.models import LLMResponse, LLMProvider
+        from core.llm.models import LLMProvider, LLMResponse
 
         class StrictLLMResponse(LLMResponse):
             """LLMResponse that raises on dict-style access."""
@@ -1415,8 +1420,9 @@ class TestHighConfidenceBeforeBuildMessages:
 
     def test_snapshot_stores_tool_schemas_separately(self, db_session):
         """Verify ctx_snapshots.token_budget round-trips tool_schemas correctly."""
-        from sqlalchemy import text
         import json
+
+        from sqlalchemy import text
         from uuid_utils import uuid7
 
         snapshot_id = str(uuid7())
@@ -1446,8 +1452,8 @@ class TestHighConfidenceBeforeBuildMessages:
     def test_lowered_thresholds_in_effect(self):
         """Verify lowered confidence thresholds are active."""
         from core.skills.modern_selector import (
-            _HIGH_CONFIDENCE_SCORE,
             _HIGH_CONFIDENCE_GAP,
+            _HIGH_CONFIDENCE_SCORE,
         )
         
         assert _HIGH_CONFIDENCE_SCORE == 0.75

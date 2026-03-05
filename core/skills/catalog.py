@@ -30,7 +30,8 @@ logger = get_logger(__name__)
 SOURCE_BUILTIN = "builtin"
 SOURCE_MARKETPLACE = "marketplace"
 SOURCE_USER = "user"
-_VALID_SOURCES = {SOURCE_BUILTIN, SOURCE_MARKETPLACE, SOURCE_USER}
+SOURCE_EDGE = "edge"
+_VALID_SOURCES = {SOURCE_BUILTIN, SOURCE_MARKETPLACE, SOURCE_USER, SOURCE_EDGE}
 
 # Valid status values
 _VALID_STATUSES = {"draft", "active", "deprecated", "archived"}
@@ -245,6 +246,43 @@ class SkillCatalog(DbConsumer):
 
         return result
 
+    def register_edge_metadata(
+        self,
+        *,
+        name: str,
+        version: str,
+        description: str,
+        category: str,
+        subcategory: str,
+        triggers: list[str],
+        tags: dict[str, Any],
+    ) -> None:
+        """Register metadata-only entry for an edge tool (no Skill instance).
+
+        Edge tools execute on the CLI side but need tags in skills_registry
+        so the unified pre-filter pipeline can rank them alongside cloud skills.
+        """
+        self._upsert_skill_row(
+            skill_id=f"{name}@{version}",
+            skill_name=name,
+            version=version,
+            description=description,
+            skill_definition={},
+            code_hash=None,
+            is_active=True,
+            status="active",
+            source=SOURCE_EDGE,
+            created_by=None,
+            category=category,
+            subcategory=subcategory,
+            triggers=triggers,
+            dependencies=[],
+            priority=5,
+            cost_estimate="low",
+            side_effect_profile=None,
+            tags=tags,
+        )
+
     def _upsert_skill_row(
         self,
         *,
@@ -253,7 +291,7 @@ class SkillCatalog(DbConsumer):
         version: str,
         description: str,
         skill_definition: dict,
-        code_hash: str,
+        code_hash: str | None,
         is_active: bool,
         status: str,
         source: str,
