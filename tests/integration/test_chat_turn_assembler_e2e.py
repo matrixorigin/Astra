@@ -102,8 +102,7 @@ class TestAssemblerIsDefault:
         assert captured_messages
         system_msg = next(m["content"] for m in captured_messages if m["role"] == "system")
         assert "Self-Model" in system_msg
-        assert "Boundaries" in system_msg
-        assert "Rules:" in system_msg  # §7 Constraints
+        assert "Core Rules" in system_msg
 
     def test_system_prompt_contains_constraints(self, client, auth_headers):
         """§7 Constraints section always present."""
@@ -200,10 +199,10 @@ class TestEdgeContextIntegration:
 
         assert resp.status_code == 200
         system_msg = next(m["content"] for m in captured_messages if m["role"] == "system")
-        # All three tool categories should be present (read_file → file ops, bash → shell, grep → search)
-        assert "file operations" in system_msg
-        assert "shell commands" in system_msg
-        assert "code search" in system_msg
+        # Edge tools listed directly by name in compact Self-Model
+        assert "read_file" in system_msg
+        assert "bash" in system_msg
+        assert "grep" in system_msg
 
     def test_injection_stripped_from_project_rules(self, client, auth_headers):
         """Prompt injection in project_rules is sanitized before reaching LLM."""

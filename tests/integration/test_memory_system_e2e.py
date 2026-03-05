@@ -25,7 +25,7 @@ class TestL0ProfileInPrompt:
     """L0 profile always in assembled prompt."""
 
     def test_profile_section_always_present(self):
-        """TieredMemoryLoader always returns a section (even default)."""
+        """TieredMemoryLoader returns empty string when no memories exist."""
         mock_db = MagicMock()
         mock_db.execute.return_value.fetchall.return_value = []
         db_factory = lambda: mock_db
@@ -33,9 +33,9 @@ class TestL0ProfileInPrompt:
         loader = TieredMemoryLoader(db_factory)
         section, _ = loader.build_section(uid(), session_id="test_session", query="test")
 
-        # Should always return something (profile or default)
+        # No memories → empty section (don't waste tokens on filler)
         assert section is not None
-        assert len(section) > 0
+        assert isinstance(section, str)
 
 
 class TestTaskWeights:

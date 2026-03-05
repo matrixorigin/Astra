@@ -11,7 +11,7 @@ from core.memory.types import Memory, MemoryType
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PROFILE = "No profile information available yet."
+_DEFAULT_PROFILE = ""
 
 
 class ProfileManager:

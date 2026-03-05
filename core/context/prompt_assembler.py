@@ -302,6 +302,25 @@ class PromptAssembler(DbConsumer):
         if total > max_tokens:
             sections, breakdown = self._compress(sections, breakdown, max_tokens)
 
+        # Hard cap: if history alone exceeds 70% of budget, force-summarize to 25%
+        _HISTORY_HARD_CAP_RATIO = 0.70
+        _HISTORY_TARGET_RATIO = 0.25
+        history_tokens = breakdown.get("history", 0)
+        if history_tokens > max_tokens * _HISTORY_HARD_CAP_RATIO:
+            target = int(max_tokens * _HISTORY_TARGET_RATIO)
+            keep_chars = target * 4
+            truncated = sections["history"][:keep_chars]
+            last_nl = truncated.rfind("\n")
+            if last_nl > 0:
+                truncated = truncated[:last_nl]
+            sections["history"] = truncated + "\n[compressed — older history auto-summarized]"
+            breakdown["history"] = _estimate_tokens(sections["history"])
+            logger.warning(
+                "History hard-cap triggered: %d → %d tokens (%.0f%% of %d budget)",
+                history_tokens, breakdown["history"],
+                history_tokens / max_tokens * 100, max_tokens,
+            )
+
         # Assemble in cache-friendly order (see _SECTION_ORDER)
         parts = [sections[k] for k in _SECTION_ORDER if k in sections]
         system_message = "\n\n".join(parts)
@@ -418,14 +437,32 @@ class PromptAssembler(DbConsumer):
     # Section builders
     # ------------------------------------------------------------------
 
-    # Core rules always included (~150 tokens)
+    # Core rules always included (~200 tokens)
     _CORE_RULES = (
-        "Rules:\n"
-        "- Think step-by-step before acting\n"
-        "- If uncertain, say so rather than guess\n"
-        "- NEVER fabricate data — if unavailable, say so explicitly\n"
-        "- Do ONLY what the user asked — do not expand scope, run extra commands, or start follow-up tasks without being asked\n"
-        "- When a task is done, STOP and report the result — do not look for more things to do"
+        "## Core Rules\n"
+        "1. Think step-by-step, then act.\n"
+        "2. If uncertain → say so explicitly. NEVER fabricate data.\n"
+        "3. Do ONLY what the user asked. When done → STOP and report.\n"
+        "4. User preference statement (e.g. 'tests need -n auto', 'I use vim') "
+        "→ acknowledge and remember it as profile memory. Do NOT explain the concept back."
+    )
+
+    # Reasoning protocol — injected after core rules
+    _REASONING_PROTOCOL = (
+        "\n\n## Reasoning Protocol\n"
+        "Use this structure for non-trivial tasks:\n"
+        "<think>\n"
+        "[Goal] What does the user want?\n"
+        "[Plan] What steps are needed?\n"
+        "[Tool] Which tool fits best?\n"
+        "</think>\n"
+        "Then act. After tool results:\n"
+        "<reflect>\n"
+        "[Result] Did it work? [Next] Continue or report?\n"
+        "</reflect>\n"
+        "Critical tasks (PR create/merge, CI trigger, file delete): "
+        "verify intent with user before executing. "
+        "If result looks wrong, re-check before reporting."
     )
 
     # Task-specific rule blocks
@@ -472,7 +509,7 @@ class PromptAssembler(DbConsumer):
         - Query keywords
         - Available tools (file editing rules only if file tools present)
         """
-        parts = [self._CORE_RULES]
+        parts = [self._CORE_RULES, self._REASONING_PROTOCOL]
         
         if not query:
             # No query context — include all rules
@@ -526,7 +563,7 @@ class PromptAssembler(DbConsumer):
                     logger.warning("Failed to load agent %s (%s): %s", agent_id, type(e).__name__, e)
                 except SQLAlchemyError as e:
                     logger.warning("DB error loading agent %s (%s): %s", agent_id, type(e).__name__, e)
-            return "You are a development assistant. Use the available tools to help the user."
+            return "You are a development assistant. Use tools to solve tasks exactly as asked."
 
     def _get_agent_type(self, agent_id: str | None) -> str:
         with self._db() as db:
@@ -553,21 +590,15 @@ class PromptAssembler(DbConsumer):
         """
         with self._db() as db:
             parts = ["## Self-Model"]
-            parts.append("When users ask about YOUR skills, capabilities, or what you can do, answer from this section — do not explore the filesystem.")
 
-            # Capabilities — list actual tool names so LLM knows exactly what it has
-            parts.append("\n### My Skills & Tools")
+            # Capabilities — compact tool list
             if edge_context and edge_context.edge_tools:
                 tool_names = [t.get("function", {}).get("name", "unknown") for t in edge_context.edge_tools]
-                parts.append(f"- Available tools: {', '.join(tool_names)}")
-                # Also show categories for context
-                categories = _categorize_tools(tool_names)
-                if categories:
-                    parts.append(f"- Categories: {', '.join(categories)}")
+                parts.append(f"Tools: {', '.join(tool_names)}")
             else:
-                parts.append("- Local tools: file operations, shell commands, git, search")
+                parts.append("Tools: file ops, shell, git, search")
 
-            # User-installed skills — only show names, not full descriptions
+            # User-installed skills — only show names
             installed_names: set[str] = set()
             if user_id:
                 try:
@@ -580,14 +611,14 @@ class PromptAssembler(DbConsumer):
                     )
                     if installed:
                         installed_names = {r[0] for r in installed}
-                        parts.append(f"- My installed skills: {', '.join(installed_names)}")
+                        parts.append(f"Installed: {', '.join(installed_names)}")
                 except SQLAlchemyError:
                     pass
 
-            # Cloud skills — category summary instead of full list (O(categories) not O(skills))
-            skill_summary = self._build_skill_categories(db, installed_names)
-            if skill_summary:
-                parts.append(skill_summary)
+            # Cloud skills — single-line count + use find_skills
+            skill_count = self._count_cloud_skills(db, installed_names)
+            if skill_count:
+                parts.append(f"+{skill_count} cloud skills (use `find_skills` or `get_agent_info` to discover)")
 
             # Delegation
             if agent_id:
@@ -598,35 +629,16 @@ class PromptAssembler(DbConsumer):
                         config = row[0] if isinstance(row[0], dict) else json.loads(row[0])
                         delegates = config.get("delegate_to") or config.get("allowed_delegates")
                         if delegates:
-                            parts.append(f"- Can delegate to: {', '.join(delegates)}")
+                            parts.append(f"Delegates: {', '.join(delegates)}")
                 except (SQLAlchemyError, json.JSONDecodeError, KeyError, TypeError):
                     pass
 
-            # Boundaries
-            parts.append("\n### Boundaries")
-            parts.append("- You need user permission for: shell commands, file writes")
-            parts.append("- If uncertain, say so rather than guess")
-
-            # Learned insights (or cold start baseline)
+            # Learned insights — only if data-driven (skip cold-start filler)
             insight = self._get_learned_insight(agent_id, agent_type)
-            parts.append(f"\n### What I've Learned\n{insight}")
+            if insight != _DEFAULT_INSIGHT:
+                parts.append(insight)
 
-            # Introspection hint
-            parts.append("\nFor detailed runtime state, use the `get_agent_info` tool.")
-
-            result = "\n".join(parts)
-            # Hard cap: drop learned insights if self-model exceeds token budget
-            if _estimate_tokens(result) > _FIXED_SELF_MODEL:
-                # Compress: keep header + capabilities + boundaries, drop learned insights
-                keep = []
-                drop_after = "### What I've Learned"
-                for p in parts:
-                    if p.strip().startswith(drop_after):
-                        break
-                    keep.append(p)
-                result = "\n".join(keep)
-                result += "\nFor full details, use `get_agent_info`."
-            return result
+            return "\n".join(parts)
 
     _LEARNED_INSIGHT_THRESHOLD = 50
     _INSIGHT_WINDOW_DAYS = 30
@@ -694,6 +706,21 @@ class PromptAssembler(DbConsumer):
             if info:
                 parts.append("# Project Profile\n" + "\n".join(info))
         return "\n\n".join(parts) if parts else None
+
+    def _count_cloud_skills(self, db, exclude_names: set[str] | None = None) -> int | None:
+        """Count distinct active cloud skills (O(1) query, no category breakdown)."""
+        try:
+            from api.models import SkillRegistry
+            from sqlalchemy import func as sa_func
+            query = db.query(sa_func.count(SkillRegistry.skill_name.distinct())).filter(
+                SkillRegistry.is_active == 1,
+            )
+            if exclude_names:
+                query = query.filter(~SkillRegistry.skill_name.in_(exclude_names))
+            count = query.scalar()
+            return count if count and count > 0 else None
+        except SQLAlchemyError:
+            return None
 
     def _build_skill_categories(self, db, exclude_names: set[str] | None = None) -> str | None:
         """Build skill category summary for Self-Model section.
@@ -805,6 +832,9 @@ class PromptAssembler(DbConsumer):
         Primary: TieredMemoryLoader (new memory system)
         Fallback: continuity + observations + few-shot (legacy)
 
+        When memory exceeds 300 tokens, compresses via cheapest LLM model
+        to reduce downstream token cost on the main model.
+
         Returns:
             (section_text, stats) — stats is None when explain=False, otherwise a dict
             with flat keys: l0, retrieval, few_shot. verbose adds content previews.
@@ -873,8 +903,44 @@ class PromptAssembler(DbConsumer):
                 stats["few_shot"] = {"error": str(e)}
 
         # Return None for stats when explain=False, otherwise the populated dict
-        return "\n\n".join(parts) if parts else None, stats if explain else None
+        section = "\n\n".join(parts) if parts else None
 
+        # Compress memory via cheapest LLM when section is large enough
+        # to save tokens on the expensive main model call.
+        _COMPRESS_THRESHOLD = 300  # tokens; below this, overhead > savings
+        if section and _estimate_tokens(section) > _COMPRESS_THRESHOLD:
+            section = self._compress_memory_with_llm(section)
+
+        return section, stats if explain else None
+
+
+    _COMPRESS_PROMPT = (
+        "Compress this context. Keep all facts, preferences, and key details. "
+        "Remove filler and redundancy. Output ONLY the compressed text."
+    )
+
+    def _compress_memory_with_llm(self, text: str) -> str:
+        """Compress memory using cheapest available model. Falls back to original on error."""
+        try:
+            from core.llm.client import LLMClient
+            llm = LLMClient(self._db_factory)
+            resp = llm.chat(
+                messages=[
+                    {"role": "system", "content": self._COMPRESS_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                user_id="system",
+                model="cheapest",
+                temperature=0.0,
+                task_hint="compression",
+            )
+            compressed = resp.content.strip()
+            if compressed and len(compressed) < len(text):
+                logger.info("Memory compressed: %d → %d chars", len(text), len(compressed))
+                return compressed
+        except Exception as e:
+            logger.debug("Memory compression skipped: %s", e)
+        return text
     def _build_working_memory(self, session_id: str) -> str | None:
         """§5: Scratchpad notes."""
         try:

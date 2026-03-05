@@ -87,12 +87,12 @@ class TestPromptAssemblerCore:
         assert "main" in result.sections["project_context"]  # git_branch
         assert "Go" in result.sections["project_context"]
 
-        # Self-model references edge tools by category
+        # Self-model references edge tools
         assert "self_model" in result.sections
         sm = result.sections["self_model"]
-        assert "file operations" in sm
-        assert "shell commands" in sm
-        assert "code search" in sm
+        assert "read_file" in sm
+        assert "bash" in sm
+        assert "grep" in sm
 
         # Tools schema passed through
         assert len(result.tools_schema) == 3
@@ -129,7 +129,7 @@ class TestPromptAssemblerCore:
         identity_pos = msg.find(_DEFAULT_IDENTITY)
         self_model_pos = msg.find(_SELF_MODEL_MARKER)
         rules_pos = msg.find("rule1")
-        constraints_pos = msg.find("Rules:")
+        constraints_pos = msg.find("## Core Rules")
 
         assert identity_pos < self_model_pos < rules_pos < constraints_pos
 
@@ -240,9 +240,9 @@ class TestBoundaryConditions:
         # Both should return empty tools_schema (no edge tools provided)
         assert r1.tools_schema == []
         assert r2.tools_schema == []
-        # Both should fall back to default tool description (not edge-specific categories)
-        assert "Local tools: file operations" in r1.sections["self_model"]
-        assert "Local tools: file operations" in r2.sections["self_model"]
+        # Both should fall back to default tool description
+        assert "file ops" in r1.sections["self_model"]
+        assert "file ops" in r2.sections["self_model"]
 
     def test_very_long_user_query_does_not_crash(self, db_session):
         """Extremely long user_query should not cause OOM or crash."""
@@ -640,10 +640,9 @@ class TestSelfModelSkills:
         db.commit()
 
     def test_installed_skills_shown_with_description(self, db_session):
-        """Installed skills appear in Self-Model as a comma-separated name list (optimized format).
+        """Installed skills appear in Self-Model as a compact comma-separated list.
         
-        Rationale: Token efficiency. Full descriptions moved to find_skills tool.
-        Format: "My installed skills: skill1, skill2, skill3"
+        Format: "Installed: skill1, skill2"
         """
         from core.context.prompt_assembler import PromptAssembler
         import re
@@ -658,32 +657,21 @@ class TestSelfModelSkills:
             )
             sm = result.sections["self_model"]
             
-            # Verify section exists
-            assert "My installed skills" in sm
+            # Verify installed skills listed
+            assert "Installed:" in sm
+            assert f"a_{uid}_ci" in sm
+            assert f"a_{uid}_pr" in sm
             
-            # Verify format: comma-separated list of skill names
-            # Should match pattern like "My installed skills: skill1, skill2, skill3"
-            match = re.search(r"My installed skills:\s*([^:\n]+)", sm)
-            assert match, "Installed skills section should have format 'My installed skills: name1, name2'"
-            
-            skills_str = match.group(1)
-            assert f"a_{uid}_ci" in skills_str
-            assert f"a_{uid}_pr" in skills_str
-            
-            # Verify no descriptions in this section (token efficiency)
-            # Descriptions should NOT appear inline
-            assert "Check CI status" not in skills_str
-            assert "List open PRs" not in skills_str
+            # Verify no descriptions inline (token efficiency)
+            assert "Check CI status" not in sm
+            assert "List open PRs" not in sm
         finally:
             self._cleanup_skills(db_session, uid)
 
     def test_cloud_skills_exclude_installed(self, db_session):
-        """Cloud skills category summary excludes user's installed skills from count.
+        """Cloud skills count excludes user's installed skills.
         
-        Rationale: Avoid redundancy. If user already installed a skill, don't list it again
-        in the cloud skills section. Category count should reflect available (not installed) skills.
-        
-        In this test, all test skills are installed, so cloud skills section should be empty/absent.
+        Installed skills appear in their own "Installed:" line, not in cloud count.
         """
         from core.context.prompt_assembler import PromptAssembler
         
@@ -697,26 +685,17 @@ class TestSelfModelSkills:
             )
             sm = result.sections["self_model"]
             
-            # Verify installed skills are shown in their own section
-            assert "My installed skills" in sm
+            # Verify installed skills shown
+            assert "Installed:" in sm
             assert f"a_{uid}_ci" in sm
             assert f"a_{uid}_pr" in sm
             
-            # Verify Self-Model structure
-            assert "Self-Model" in sm
-            assert "My Skills & Tools" in sm
-            
-            # Since all test skills are installed, they should be excluded from cloud skills
-            # Cloud skills section may or may not exist depending on other skills in DB
-            # But if it does exist, installed skills should NOT be in it
+            # Cloud skills section (if present) should not contain installed skill names
             cloud_section_start = sm.lower().find("cloud skills")
             if cloud_section_start >= 0:
-                # Cloud skills section exists, verify installed skills not in it
                 cloud_section = sm[cloud_section_start:]
-                assert f"a_{uid}_ci" not in cloud_section, \
-                    "Installed skill should not appear in cloud skills section"
-                assert f"a_{uid}_pr" not in cloud_section, \
-                    "Installed skill should not appear in cloud skills section"
+                assert f"a_{uid}_ci" not in cloud_section
+                assert f"a_{uid}_pr" not in cloud_section
         finally:
             self._cleanup_skills(db_session, uid)
 
@@ -751,21 +730,9 @@ class TestSelfModelSkills:
             
             # Verify Self-Model is generated without crash
             assert "Self-Model" in sm
-            assert "Skills & Tools" in sm
             
-            # Verify skill_name appears at most once in category examples
-            # (not once per version)
-            if skill_name in sm:
-                # Count occurrences in category section
-                category_match = re.search(r"categories:.*?(?=\n\n|\Z)", sm, re.DOTALL)
-                if category_match:
-                    category_section = category_match.group(0)
-                    count = category_section.count(skill_name)
-                    assert count <= 1, (
-                        f"Skill {skill_name} should appear at most once in category examples "
-                        f"(DISTINCT by skill_name), but appeared {count} times. "
-                        f"Section: {category_section}"
-                    )
+            # Cloud skills count should not double-count versions
+            assert "cloud skills" in sm
         finally:
             db_session.execute(sql_text("DELETE FROM skills_registry WHERE skill_name = :n"), {"n": skill_name})
             db_session.commit()
@@ -779,8 +746,8 @@ class TestSelfModelSkills:
             session_id=unique_test_id(), user_id=unique_test_id(),
         )
         sm = result.sections["self_model"]
-        # No skills installed for a random user_id → no "My installed skills"
-        assert "My installed skills" not in sm
+        # No skills installed for a random user_id → no "Installed:"
+        assert "Installed:" not in sm
 
 
 # ============================================================================

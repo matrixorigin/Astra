@@ -356,10 +356,11 @@ class TestProfileSynthesisFromGolden:
             cleanup_memories.append(mem.memory_id)
             store.create(mem)
         
-        # Get profile (will use default if no profile memories exist)
+        # Get profile — no PROFILE-type memories exist, only SEMANTIC
+        # So profile should be empty (no filler text)
         profile = profile_mgr.get_profile(user_id)
         assert profile is not None
-        assert len(profile) > 0
+        assert isinstance(profile, str)
 
 
 class TestTieredLoaderWithRealDB:
