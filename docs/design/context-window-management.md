@@ -570,6 +570,28 @@ Summarization triggers when elastic zone usage exceeds 70% of budget. It is appl
 
 History summarization runs **server-side** in `chat_turn` before prompt assembly. The server owns the canonical history (session cache + DB events). The edge sends only the current turn's messages and tool results.
 
+### Retrieval-Based History (Turn 3+)
+
+**Added 2026-03-05.** Observation: session `019cbdc4` showed prompt tokens growing linearly (3870 → 7750 in 6 turns) because `_session_cache["history"]` passes all messages verbatim to LLM. The compression system above only applies to §6 in the system prompt, not to the actual messages array.
+
+**Solution**: On Turn 3+, construct LLM messages from **recent turns + retrieved relevant old turns** instead of full history.
+
+```
+LLM messages (Turn 3+):
+  [system_prompt]                    §1-§7 unchanged
+  [retrieved_old_turns]              HybridRetriever → agent_events (budget: ~2000 tokens)
+  [recent_2_turns]                   last 2 complete turns from session cache
+  [current_user_message]
+```
+
+Key design decisions:
+- `_session_cache["history"]` still stores full history (needed for snapshot persistence, recovery, reflect tool)
+- Only the **LLM input view** is trimmed — the source of truth is unchanged
+- `HybridRetriever.retrieve_events()` uses vector + fulltext search on `agent_events`
+- Requires `EmbeddingWorker` running to embed `user_query`, `llm_response`, `tool_result` events
+- Fallback: if embeddings unavailable, use full history with compaction (threshold lowered to 16K tokens)
+- Result: prompt tokens stay constant (~5000-7000) regardless of turn count
+
 ---
 
 ## 3. Structured Exploration with Planning

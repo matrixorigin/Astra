@@ -144,9 +144,24 @@ async def lifespan(app: FastAPI):
                 logger.warning(f"Trigger loop error: {e}")
     trigger_task = asyncio.create_task(_trigger_loop())
 
+    # Start embedding worker — generates embeddings for agent_events
+    # so HybridRetriever can do retrieval-based history on Turn 3+.
+    embedding_worker = None
+    try:
+        from core.events.embedding_worker import EmbeddingWorker
+        embedding_worker = EmbeddingWorker(SessionLocal)
+        embedding_worker.start()
+        logger.info("EmbeddingWorker started")
+    except Exception as e:
+        logger.warning(f"EmbeddingWorker start failed (non-fatal): {e}")
+
     yield
 
     # Shutdown
+    if embedding_worker:
+        stop_task = embedding_worker.stop()
+        if stop_task:
+            stop_task.cancel()
     cleanup_task.cancel()
     trigger_task.cancel()
     await scheduler.stop()

@@ -550,6 +550,8 @@ When context approaches the window limit:
 2. **Conversation compaction**: Summarize old turns, preserve recent ones and key decisions
 3. **Structured note-taking**: Agent writes notes to persistent storage (working memory → episodic/semantic promotion)
 
+**Retrieval-based history (added 2026-03-05)**: For Turn 3+, the messages array sent to LLM uses recent 2 turns (full) + relevant old turns retrieved via `HybridRetriever` from `agent_events`. This keeps prompt tokens constant (~5000-7000) regardless of session length. The full history remains in `_session_cache` for persistence and recovery. See `context-window-management.md` §2 "Retrieval-Based History" for details.
+
 ### Cross-Session Continuity
 
 When a user returns after hours/days:

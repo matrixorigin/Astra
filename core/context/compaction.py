@@ -35,7 +35,7 @@ MAX_TOOL_RESULT_CHARS = 8000
 MAX_TOOL_RESULT_AUDIT_CHARS = 4000
 
 
-_COMPACT_HISTORY_THRESHOLD = 60000  # chars; trigger lightweight compaction above this
+_COMPACT_HISTORY_THRESHOLD = 16000  # chars; trigger lightweight compaction above this
 _COMPACT_TOOL_KEEP_CHARS = 500     # chars to keep from old tool results
 
 

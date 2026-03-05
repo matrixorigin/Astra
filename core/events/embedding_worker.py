@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 # Event types worth embedding (content is semantically meaningful)
-EMBED_EVENT_TYPES = ("user_query", "llm_response", "plan_created", "knowledge_extracted")
+EMBED_EVENT_TYPES = ("user_query", "llm_response", "tool_result", "plan_created", "knowledge_extracted")
 
 # Poll interval and batch size
 _POLL_INTERVAL_S = 1.0

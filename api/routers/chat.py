@@ -52,7 +52,7 @@ SERVER_TURN_TIMEOUT_S = 240
 # 100K tokens works for 128K models (DeepSeek, GPT-4), leaves 28K for response.
 # For smaller models (64K), the LLM client's _check_context_overflow will catch
 # overflow before the API call.
-_HISTORY_COMPACTION_LIMIT = 100000
+_HISTORY_COMPACTION_LIMIT = 16000
 
 _HEARTBEAT_SENTINEL = object()
 
@@ -962,6 +962,190 @@ def _classify_task(messages: list[dict[str, Any]]) -> str | None:
     return None
 
 
+# ── Retrieval-Based History View ─────────────────────────────────────
+# On Turn 3+, instead of passing full history to LLM, construct:
+#   [system] + [retrieved relevant old turns] + [recent N messages]
+# This keeps prompt tokens roughly constant regardless of session length.
+
+_RECENT_MESSAGES_KEEP = 8  # ~2 complete turns (user + assistant(tc) + tool + assistant)
+_RETRIEVAL_BUDGET_CHARS = 8000  # ~2000 tokens for retrieved context
+_MIN_HISTORY_FOR_RETRIEVAL = 14  # ~3 turns; below this, pass full history
+
+
+def _build_retrieval_view(
+    history: list[dict[str, Any]],
+    session_id: str,
+    current_messages: list[dict[str, Any]],
+    db: Session,
+) -> list[dict[str, Any]]:
+    """Build a trimmed history view for LLM using retrieval.
+
+    For short histories (< 3 turns), returns history as-is.
+    For longer histories, returns: system + retrieved context + recent messages.
+    Falls back to full history if retrieval fails.
+    """
+    if not history or len(history) < _MIN_HISTORY_FOR_RETRIEVAL:
+        return history
+
+    system_msg = history[0] if history[0].get("role") == "system" else None
+    recent = history[-_RECENT_MESSAGES_KEEP:]
+    # Ensure we don't include system in recent (it's added separately)
+    if recent and recent[0].get("role") == "system":
+        recent = recent[1:]
+
+    # Extract current user query for retrieval
+    user_query = ""
+    for m in reversed(current_messages):
+        if m.get("role") == "user" and m.get("content"):
+            user_query = m["content"]
+            break
+
+    if not user_query:
+        return history  # No query to retrieve against
+
+    # Try retrieval from agent_events via HybridRetriever
+    retrieved_block = _retrieve_relevant_context(db, session_id, user_query, history, recent)
+
+    result: list[dict[str, Any]] = []
+    if system_msg:
+        result.append(system_msg)
+    if retrieved_block:
+        result.append({"role": "system", "content": retrieved_block})
+    result.extend(recent)
+    return result
+
+
+def _retrieve_relevant_context(
+    db: Session,
+    session_id: str,
+    user_query: str,
+    full_history: list[dict[str, Any]],
+    recent_messages: list[dict[str, Any]],
+) -> str | None:
+    """Retrieve relevant old turns from agent_events.
+
+    Returns a formatted context block, or None if retrieval unavailable.
+    Falls back to rule-based extraction from in-memory history if
+    embeddings are not available.
+    """
+    # Collect event_ids/content already in recent messages to avoid duplication
+    recent_contents = {(m.get("content") or "")[:100] for m in recent_messages if m.get("content")}
+
+    # Try vector retrieval first
+    try:
+        from core.context.hybrid_retrieval import HybridRetriever
+        from api.database import SessionLocal
+        retriever = HybridRetriever(SessionLocal)
+
+        # Generate query embedding
+        from core.context.embeddings import EmbeddingService
+        svc = EmbeddingService(SessionLocal)
+        query_embedding = svc.embed_text(user_query)
+
+        if query_embedding:
+            events = retriever.retrieve_events(
+                query_text=user_query,
+                query_embedding=query_embedding,
+                session_id=session_id,
+                limit=10,
+            )
+            if events:
+                return _format_retrieved_events(events, recent_contents)
+    except Exception:
+        logger.debug("Vector retrieval unavailable, using rule-based fallback")
+
+    # Fallback: extract relevant old turns from in-memory history using keyword overlap
+    return _rule_based_extraction(full_history, recent_messages, user_query)
+
+
+def _format_retrieved_events(
+    events: list[dict[str, Any]],
+    recent_contents: set[str],
+) -> str | None:
+    """Format retrieved events into a context block for LLM."""
+    parts: list[str] = []
+    used_chars = 0
+
+    for ev in events:
+        content = ev.get("content", "")
+        if not content:
+            continue
+        # Skip if already in recent messages
+        if content[:100] in recent_contents:
+            continue
+        event_type = ev.get("event_type", "")
+        if event_type == "user_query":
+            line = f"User: {content[:200]}"
+        elif event_type == "llm_response":
+            line = f"Assistant: {content[:300]}"
+        elif event_type == "tool_result":
+            line = f"Tool result: {content[:300]}"
+        else:
+            continue
+
+        if used_chars + len(line) > _RETRIEVAL_BUDGET_CHARS:
+            break
+        parts.append(line)
+        used_chars += len(line)
+
+    if not parts:
+        return None
+    return "[Earlier relevant context from this session]\n" + "\n".join(parts)
+
+
+def _rule_based_extraction(
+    full_history: list[dict[str, Any]],
+    recent_messages: list[dict[str, Any]],
+    user_query: str,
+) -> str | None:
+    """Fallback: extract relevant old messages using keyword overlap."""
+    query_words = set(user_query.lower().split())
+    if not query_words:
+        return None
+
+    recent_set = {id(m) for m in recent_messages}
+    # Skip system message (index 0) and recent messages
+    old_messages = [m for m in full_history[1:] if id(m) not in recent_set]
+    if not old_messages:
+        return None
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for m in old_messages:
+        content = (m.get("content") or "").lower()
+        if not content:
+            continue
+        content_words = set(content.split())
+        overlap = len(query_words & content_words)
+        if overlap > 0:
+            scored.append((overlap, m))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: -x[0])
+    parts: list[str] = []
+    used_chars = 0
+    for _, m in scored[:6]:
+        role = m.get("role", "?")
+        content = m.get("content") or ""
+        if role == "user":
+            line = f"User: {content[:200]}"
+        elif role == "assistant":
+            line = f"Assistant: {content[:300]}"
+        elif role == "tool":
+            line = f"Tool result: {content[:300]}"
+        else:
+            continue
+        if used_chars + len(line) > _RETRIEVAL_BUDGET_CHARS:
+            break
+        parts.append(line)
+        used_chars += len(line)
+
+    if not parts:
+        return None
+    return "[Earlier relevant context from this session]\n" + "\n".join(parts)
+
+
 def _build_turn_messages(
     db: Session,
     user_id: str,
@@ -1118,7 +1302,7 @@ def _build_turn_messages(
 
     # ── History Compaction ──────────────────────────────────────────────
     # Compact history to avoid context overflow. See _HISTORY_COMPACTION_LIMIT
-    # at file top for rationale on the 100K limit.
+    # at file top for rationale on the 16K limit.
     from core.context.compaction import compact, needs_compaction
     if needs_compaction(history, _HISTORY_COMPACTION_LIMIT):
         history = compact(history, _HISTORY_COMPACTION_LIMIT)
@@ -1128,7 +1312,16 @@ def _build_turn_messages(
     if cached_sections:
         entry["sections"] = cached_sections
     _session_cache[session_id] = entry
-    return history, context_capture_id, memory_stats
+
+    # ── Retrieval-Based History View (Turn 3+) ──────────────────────────
+    # Instead of passing full history to LLM, construct a trimmed view:
+    #   system_prompt + retrieved_relevant_old_turns + recent_messages
+    # Full history stays in cache for persistence/recovery.
+    llm_messages = _build_retrieval_view(
+        history, session_id, messages, db,
+    )
+
+    return llm_messages, context_capture_id, memory_stats
 
 
 # Max conversation events to recover on server restart.
