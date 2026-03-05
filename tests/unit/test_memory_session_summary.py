@@ -63,9 +63,13 @@ class TestFullSummary:
         config = MemoryGovernanceConfig(session_summary_turn_threshold=2)
         s = SessionSummarizer(mock_store, config=config)
 
-        # Generate incrementals
+        # Generate incrementals — second call must have new messages
         s.check_and_summarize("u1", "s1", messages, turn_count=2, session_start=datetime.now(timezone.utc))
-        s.check_and_summarize("u1", "s1", messages, turn_count=4, session_start=datetime.now(timezone.utc))
+        messages2 = messages + [
+            {"role": "user", "content": "What about error handling?"},
+            {"role": "assistant", "content": "Use try/except blocks..."},
+        ]
+        s.check_and_summarize("u1", "s1", messages2, turn_count=4, session_start=datetime.now(timezone.utc))
         assert len(s._incremental_ids.get("s1", [])) == 2
 
         # Full summary supersedes

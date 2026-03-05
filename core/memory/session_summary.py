@@ -37,6 +37,8 @@ class SessionSummarizer:
         self.embed_fn = embed_fn
         self.config = config or DEFAULT_CONFIG
         self._incremental_ids: dict[str, list[str]] = {}  # session_id -> [memory_ids]
+        self._last_summary_idx: dict[str, int] = {}  # session_id -> last summarized msg index
+        self._last_summary_time: dict[str, datetime] = {}  # session_id -> last summary time
 
     def check_and_summarize(
         self,
@@ -55,11 +57,10 @@ class SessionSummarizer:
         if turn_count > 0 and turn_count % threshold == 0:
             return self._generate_incremental(user_id, session_id, messages)
 
-        # Check time threshold
-        hours_elapsed = (_utcnow() - session_start).total_seconds() / 3600.0
-        time_threshold = self.config.session_summary_time_threshold_hours
-        # Only trigger at first crossing (approximate via turn_count)
-        if hours_elapsed >= time_threshold and turn_count == 1:
+        # Check time threshold — trigger if enough time since last summary (or session start)
+        last_time = self._last_summary_time.get(session_id, session_start)
+        hours_since = (_utcnow() - last_time).total_seconds() / 3600.0
+        if hours_since >= self.config.session_summary_time_threshold_hours:
             return self._generate_incremental(user_id, session_id, messages)
 
         return None
@@ -109,7 +110,13 @@ class SessionSummarizer:
     def _generate_incremental(
         self, user_id: str, session_id: str, messages: list[dict[str, Any]],
     ) -> Optional[Memory]:
-        content = self._summarize(messages, full=False)
+        # Only summarize messages since last summary
+        start_idx = self._last_summary_idx.get(session_id, 0)
+        new_messages = messages[start_idx:]
+        if not new_messages:
+            return None
+
+        content = self._summarize(new_messages, full=False)
         if not content:
             return None
 
@@ -131,6 +138,8 @@ class SessionSummarizer:
 
         mem = self.store.create(mem)
         self._incremental_ids.setdefault(session_id, []).append(mem.memory_id)
+        self._last_summary_idx[session_id] = len(messages)
+        self._last_summary_time[session_id] = _utcnow()
         return mem
 
     def _summarize(self, messages: list[dict[str, Any]], full: bool) -> Optional[str]:

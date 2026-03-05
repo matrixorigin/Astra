@@ -170,6 +170,10 @@ class TestCloudSkillEventRecording:
             session_id = next((e["session_id"] for e in events if e.get("type") == "session_info"), None)
             assert session_id
 
+        # Wait for background persist thread to finish writing events
+        from api.routers.chat import _flush_persist_threads
+        _flush_persist_threads()
+
         # Now check decision-trace
         dt_resp = client.get(f"/chat/session/{session_id}/decision-trace?question=pr", headers=headers)
         assert dt_resp.status_code == 200

@@ -272,7 +272,7 @@ class TestObserverReceivesMessages:
             mock_el_cls.return_value = mock_el
 
             mock_hooks = MagicMock()
-            mock_hooks.run_observer.side_effect = lambda sid, uid, msgs: observer_messages.extend(msgs)
+            mock_hooks.run_observer.side_effect = lambda sid, uid, msgs, **kw: observer_messages.extend(msgs)
             mock_hooks_cls.return_value = mock_hooks
 
             from api.routers.chat import _persist_turn_events
@@ -327,7 +327,7 @@ class TestObserverReceivesMessages:
             mock_el_cls.return_value = mock_el
 
             mock_hooks = MagicMock()
-            mock_hooks.run_observer.side_effect = lambda sid, uid, msgs: observer_messages.extend(msgs)
+            mock_hooks.run_observer.side_effect = lambda sid, uid, msgs, **kw: observer_messages.extend(msgs)
             mock_hooks_cls.return_value = mock_hooks
 
             from api.routers.chat import _persist_turn_events

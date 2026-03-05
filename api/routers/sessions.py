@@ -220,9 +220,27 @@ async def close_session(
             status="closed"
         )
         # Evict from in-memory cache so closed sessions don't consume RAM.
+        # But first, generate full session summary from cached history.
         try:
             from api.routers.chat import _session_cache
-            _session_cache.pop(session_id, None)
+            _entry = _session_cache.pop(session_id, None)
+            if _entry and _entry.get("history"):
+                import threading
+                _hist = list(_entry["history"])
+                _uid = current_user["user_id"]
+                _sid = session_id
+
+                def _bg_summary():
+                    try:
+                        from core.memory.store import MemoryStore
+                        from core.memory.session_summary import SessionSummarizer
+                        store = MemoryStore(SessionLocal)
+                        summarizer = SessionSummarizer(store)
+                        summarizer.generate_full_summary(_uid, _sid, _hist)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_bg_summary, daemon=True).start()
         except Exception:
             pass
         return result

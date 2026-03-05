@@ -29,8 +29,8 @@ class MemoryGovernanceConfig:
     working_memory_stale_hours: int = 2
 
     # Session summary thresholds
-    session_summary_turn_threshold: int = 50
-    session_summary_time_threshold_hours: float = 2.0
+    session_summary_turn_threshold: int = 10
+    session_summary_time_threshold_hours: float = 10 / 60  # 10 minutes
 
 
 # Default config instance

@@ -138,7 +138,11 @@ class PermissionManager:
         return f"⚡ {tool_name}: {detail}"
 
     def prompt_user(self, tool_name: str, side_effect: SideEffect, args: dict[str, Any]) -> Decision:
-        """Interactive permission prompt with rich formatting when available."""
+        """Interactive permission prompt with rich formatting when available.
+
+        Raises KeyboardInterrupt on Ctrl-C so the caller can cancel the
+        entire turn instead of silently treating it as "deny".
+        """
         import sys
         if sys.stdin.isatty():
             try:
@@ -154,14 +158,18 @@ class PermissionManager:
                     "[cyan]\\[A]lways[/cyan]  [red]\\[D]eny always[/red]",
                 )
                 choice = console.input("[dim]  >[/dim] ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
                 return Decision.DENY
+            except KeyboardInterrupt:
+                raise
         else:
             prompt = self.format_prompt_plain(tool_name, args)
             try:
                 choice = input(f"{prompt}\n[Y/n/a/d] > ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
                 return Decision.DENY
+            except KeyboardInterrupt:
+                raise
 
         if choice in ("y", "yes", ""):
             return Decision.ALLOW

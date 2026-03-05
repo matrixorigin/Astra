@@ -573,6 +573,14 @@ class TestPermissions:
         monkeypatch.setattr("builtins.input", lambda _: (_ for _ in ()).throw(EOFError))
         assert pm.prompt_user("bash", PermSideEffect.EXECUTE, {"command": "ls"}) == Decision.DENY
 
+    def test_prompt_user_ctrl_c_raises_keyboard_interrupt(self, monkeypatch):
+        """Ctrl-C at permission prompt must propagate KeyboardInterrupt
+        so the entire turn is cancelled, not silently treated as deny."""
+        pm = PermissionManager()
+        monkeypatch.setattr("builtins.input", lambda _: (_ for _ in ()).throw(KeyboardInterrupt))
+        with pytest.raises(KeyboardInterrupt):
+            pm.prompt_user("bash", PermSideEffect.EXECUTE, {"command": "ls"})
+
 
 # ============================================================================
 # Integration: realistic multi-tool scenario

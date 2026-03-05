@@ -7,6 +7,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, Protocol, runtime_checkable
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -959,7 +960,8 @@ def _get_or_create_session_entry(session_id: str) -> dict[str, Any]:
     entry = _session_cache.get(session_id)
     if entry is None:
         entry = {"history": None, "tools": [], "sections": None,
-                 "spend_usd": 0.0, "turn_count": 0}
+                 "spend_usd": 0.0, "turn_count": 0,
+                 "created_at": datetime.now(timezone.utc)}
         _session_cache[session_id] = entry
     return entry
 
@@ -1491,6 +1493,7 @@ def _persist_turn_events(
     turn_chain_id: str | None = None,
     user_query_event_id: str | None = None,
     cloud_tool_results: list[dict[str, Any]] | None = None,
+    session_start: datetime | None = None,
 ) -> None:
     """Persist events for this turn: user query, tool results, LLM response.
 
@@ -1717,7 +1720,8 @@ def _persist_turn_events(
             if user_content:
                 observer_messages.append({"role": "user", "content": user_content})
             observer_messages.append({"role": "assistant", "content": full_text})
-            hooks.run_observer(session_id, user_id, observer_messages)
+            hooks.run_observer(session_id, user_id, observer_messages,
+                               turn_count=turn_count, session_start=session_start)
 
         if user_content:
             hooks.detect_implicit_feedback(user_content, messages, parent_event_id)
@@ -1741,8 +1745,6 @@ def _persist_turn_events(
     try:
         _sdb = SessionLocal()
         try:
-            from datetime import datetime, timezone
-
             from sqlalchemy import text as _text
             _sdb.execute(
                 _text("""
@@ -2449,6 +2451,7 @@ async def chat_turn(
                 agent_id=request.agent_id,
                 turn_chain_id=_turn_chain_id,
                 user_query_event_id=_user_query_event_id,
+                session_start=_entry.get("created_at"),
             )
             _t = threading.Thread(target=_persist_turn_events, kwargs=_persist_args, daemon=True)
             _persist_threads.append(_t)

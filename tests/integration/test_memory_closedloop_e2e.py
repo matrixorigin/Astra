@@ -619,9 +619,13 @@ class TestSessionSummaryRealDB:
             {"role": "assistant", "content": "Use pytest for Python testing..."},
         ]
 
-        # Generate 2 incrementals
+        # Generate 2 incrementals — second call needs new messages
         inc1 = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=2, session_start=datetime.now(timezone.utc))
-        inc2 = summarizer.check_and_summarize(user_id, session_id, messages, turn_count=4, session_start=datetime.now(timezone.utc))
+        messages2 = messages + [
+            {"role": "user", "content": "What about mocking?"},
+            {"role": "assistant", "content": "Use unittest.mock for mocking..."},
+        ]
+        inc2 = summarizer.check_and_summarize(user_id, session_id, messages2, turn_count=4, session_start=datetime.now(timezone.utc))
         memory_cleanup.extend([inc1.memory_id, inc2.memory_id])
 
         # Generate full

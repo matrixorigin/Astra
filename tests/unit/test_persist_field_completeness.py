@@ -529,11 +529,8 @@ class TestSessionActivityUpdate:
     """Phase 5: _persist_turn_events updates session event_count."""
 
     def test_event_count_updated_after_persist(self):
-        """session event_count is set to actual event count in DB."""
+        """session event_count is atomically incremented by events produced."""
         mock_db = MagicMock()
-        # First execute = SELECT COUNT(*), second = UPDATE
-        mock_scalar = MagicMock(return_value=7)
-        mock_db.execute.return_value.scalar.return_value = 7
 
         with patch("api.routers.chat.SessionLocal", return_value=mock_db), \
              patch("core.events.event_logger.EventLogger") as mock_el_cls, \
@@ -553,10 +550,10 @@ class TestSessionActivityUpdate:
                 "response", [],
             )
 
-        # Phase 5 issues a SELECT COUNT + UPDATE via execute()
+        # Phase 5 issues UPDATE event_count = event_count + :n
+        # 1 user_query + 1 llm_response = 2 events
         all_calls = mock_db.execute.call_args_list
-        # The last two execute calls should be the count query and the update
         update_call = all_calls[-1]
         update_params = update_call[1][0] if update_call[1] else update_call[0][1]
-        assert update_params["cnt"] == 7
+        assert update_params["n"] == 2
         assert update_params["sid"] == "s1"
