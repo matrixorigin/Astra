@@ -77,22 +77,3 @@ class TestGithubManifestFormat:
         token = next(s for s in manifest["secrets"] if s["name"] == "github_token")
         assert token.get("required") is True
 
-    def test_manifest_parsed_by_config_center(self, db_factory):
-        """Config center must find github_token as a required secret."""
-        from core.skills.config_center import SkillConfigCenter
-        from core.skills.credential_manager import CredentialManager
-        from core.skills.loader import load_manifests
-
-        manifests = {m.name: m for m in load_manifests()}
-        github_manifest = manifests.get("github")
-        assert github_manifest is not None, "github manifest not loaded"
-
-        cred_mgr = CredentialManager("test-key")
-        center = SkillConfigCenter(
-            db_factory, cred_mgr,
-            manifest_loader=lambda n: vars(github_manifest) if n == "github" else None,
-        )
-        errors = center.validate("github", "test-user")
-        error_names = {e.name for e in errors}
-        assert "github_token" in error_names, \
-            "github_token not flagged as missing — manifest format not recognized"

@@ -3,9 +3,7 @@
 import pytest
 
 from core.llm import LLMClient
-from core.skills import (
-    SkillRegistry,
-)
+from core.skills.catalog import SkillCatalog as SkillRegistry
 from core.skills.builtin import CIStatusSkill, ListPRsSkill, SummarizePRSkill
 from core.skills.github_client import GitHubClient
 

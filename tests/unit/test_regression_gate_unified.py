@@ -466,32 +466,6 @@ class TestSelectorChangeValidation:
         )
 
 
-class TestRollbackMechanism:
-    """Test rollback mechanism for failed gates."""
-    
-    def test_rollback_learnings_deletes_recent_records(self, setup_tables):
-        """Test that _rollback_learnings() soft-deletes recent learnings via SelfImprovingSelector."""
-        from core.skills.pipeline import SkillPipeline
-        from unittest.mock import Mock, patch
-        from datetime import timedelta
-
-        mock_improver = Mock()
-        mock_improver.rollback_learnings.return_value = 2
-
-        mock_llm = Mock()
-        pipeline = SkillPipeline(lambda: setup_tables, mock_llm, learning=False)
-        pipeline._improver = mock_improver
-
-        pipeline._rollback_learnings(days=7)
-
-        mock_improver.rollback_learnings.assert_called_once()
-        call_kwargs = mock_improver.rollback_learnings.call_args
-        since = call_kwargs[1]["since"]
-        # since should be ~7 days ago
-        expected = datetime.now(timezone.utc) - timedelta(days=7)
-        assert abs((since - expected).total_seconds()) < 5
-
-
 class TestSandboxCleanup:
     """Test sandbox cleanup on gate failure."""
     

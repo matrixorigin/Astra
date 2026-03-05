@@ -29,9 +29,9 @@ def main() -> None:
         from core.code_executor import CodeExecutor
         from core.runtime import IsolationLevel, create_runtime
         from core.skills.builtin import register_builtin_skills
-        from core.skills.registry import SkillRegistry
+        from core.skills.catalog import SkillCatalog
 
-        registry = SkillRegistry(SessionLocal)
+        registry = SkillCatalog(SessionLocal)
         code_executor = CodeExecutor(
             runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
             db_factory=SessionLocal,

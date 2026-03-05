@@ -175,58 +175,6 @@ class TestRunGate:
         release.assert_called_once()
 
 
-class TestSkillRegistryIntegration:
-    def test_gate_triggered_on_active_skill_register(self):
-        from sqlalchemy.orm import Session
-        from core.skills.registry import SkillRegistry
-
-        session = Mock(spec=Session)
-        session.query.return_value.filter.return_value.update.return_value = None
-        session.query.return_value.filter.return_value.first.return_value = None
-
-        gate_trigger = Mock()
-        registry = SkillRegistry(db_factory=lambda: session, gate_trigger=gate_trigger)
-
-        skill = Mock()
-        skill.name = "test_skill"
-        skill.version = "1.0.0"
-        skill.description = "test"
-        skill.requirements = Mock()
-        skill.requirements.model_dump.return_value = {}
-
-        with patch.object(registry, "_compute_code_hash", return_value="abc123"):
-            registry.register(skill, is_active=True)
-
-        gate_trigger.on_skill_change.assert_called_once_with(
-            skill_name="test_skill",
-            version="1.0.0",
-            definition={},
-        )
-
-    def test_gate_not_triggered_on_inactive_skill(self):
-        from sqlalchemy.orm import Session
-        from core.skills.registry import SkillRegistry
-
-        session = Mock(spec=Session)
-        session.query.return_value.filter.return_value.update.return_value = None
-        session.query.return_value.filter.return_value.first.return_value = None
-
-        gate_trigger = Mock()
-        registry = SkillRegistry(db_factory=lambda: session, gate_trigger=gate_trigger)
-
-        skill = Mock()
-        skill.name = "test_skill"
-        skill.version = "1.0.0"
-        skill.description = "test"
-        skill.requirements = Mock()
-        skill.requirements.model_dump.return_value = {}
-
-        with patch.object(registry, "_compute_code_hash", return_value="abc123"):
-            registry.register(skill, is_active=False)
-
-        gate_trigger.on_skill_change.assert_not_called()
-
-
 class TestPromptManagerIntegration:
     def test_gate_triggered_on_active_prompt_register(self):
         from core.context.prompts import PromptManager

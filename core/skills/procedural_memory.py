@@ -22,7 +22,11 @@ from sqlalchemy.orm import Session
 
 from api.models import SkillSelectionLearning
 from core.memory.types import Memory, MemoryType, TrustTier
-from core.skills.learning_similarity import normalize_confidence
+
+
+def normalize_confidence(value: float) -> float:
+    """Clamp confidence to [0.0, 1.0]."""
+    return max(0.0, min(1.0, value))
 
 
 def learning_to_memory(row: SkillSelectionLearning) -> Memory:

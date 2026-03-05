@@ -12,7 +12,7 @@ from api.services.replay_service import ReplayService
 from core.events.event_logger import EventLogger
 from core.llm import LLMClient
 from core.llm.models import LLMProvider, LLMResponse
-from core.skills import SkillRegistry
+from core.skills.catalog import SkillCatalog as SkillRegistry
 from core.skills.builtin import SummarizePRSkill
 from core.skills.github_client import GitHubClient
 

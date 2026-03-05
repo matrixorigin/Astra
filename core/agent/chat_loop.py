@@ -12,8 +12,6 @@ from core.events.event_logger import EventLogger
 from core.events.models import StreamEvent, StreamEventType
 from core.llm.models import LLMMessage
 from core.logging_config import get_logger
-from core.skills.learning_signals import SignalType
-from core.skills.pipeline import SkillPipeline
 from core.skills.prefilter import ConversationState
 
 logger = get_logger(__name__)
@@ -107,7 +105,6 @@ class ChatLoop:
 
     def __init__(
         self,
-        selector: SkillPipeline,
         executor: AgentExecutor,
         llm_client,
         event_logger: EventLogger,
@@ -117,6 +114,7 @@ class ChatLoop:
         scratchpad=None,
         firewall_mode: str = "warn",
         hitl_policy=None,
+        selector: Any = None,  # Deprecated: was SkillPipeline
     ):
         """Initialize ChatLoop.
         
@@ -1328,18 +1326,12 @@ Tool name:"""
                     data={"step": step.step_id},
                 )
 
-                # Execute step through SkillPipeline to enable learning
+                # Execute step — tool selection handled by LLM native FC
                 skill_name = step.skill_hint
 
                 if skill_name:
-                    # Get tools schema through pipeline (includes selector/auditor/validator)
-                    _sel = self._pipeline.get_tools_schema(
-                        query=step.description,
-                        session_id=session_id,
-                        max_candidates=max_candidates,
-                    )
-                    tools_schema = _sel.tools
-                    selection_event_id = _sel.event_id
+                    tools_schema = []  # LLM selects tools via native FC
+                    selection_event_id = None
 
                     # Find the tool in schema
                     tool_found = any(t["function"]["name"] == skill_name for t in tools_schema)
@@ -1884,40 +1876,8 @@ Tool name:"""
             self._sync_mcp_tools()
 
     def _sync_mcp_tools(self) -> None:
-        """Sync MCP tool metadata into rule_selector.skills for selection/audit."""
-        if not self.mcp_bridge:
-            return
-        from core.skills.selector import SkillMetadata
-        # Walk selector chain to find the skills dict:
-        # SkillPipeline._modern.rule_selector.skills
-        # ModernSkillSelector.rule_selector.skills
-        # SkillSelector.skills
-        skills = None
-        obj = self.selector
-        for attr in ("_modern", "rule_selector"):
-            nxt = getattr(obj, attr, None)
-            if nxt is not None:
-                obj = nxt
-        skills = getattr(obj, "skills", None)
-        if not isinstance(skills, dict):
-            return
-        # Remove stale MCP entries
-        stale = [k for k, v in skills.items() if getattr(v, "category", "") == "mcp"]
-        for k in stale:
-            del skills[k]
-        # Add current MCP tools
-        for meta in self.mcp_bridge.tool_metadata_list():
-            skills[meta["name"]] = SkillMetadata(
-                name=meta["name"],
-                version=meta["version"],
-                description=meta["description"],
-                category="mcp",
-                subcategory=meta.get("server", "external"),
-                triggers=[],
-                dependencies=[],
-                priority=5,
-                cost_estimate="unknown",
-            )
+        """Sync MCP tool metadata — no-op after skill system cleanup."""
+        pass
 
     def _evaluate_hitl(self, fn_name: str, params: dict, **ctx_overrides) -> tuple[bool, str | None]:
         """Check HITL policy before tool execution.

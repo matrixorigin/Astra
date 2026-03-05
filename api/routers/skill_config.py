@@ -20,8 +20,7 @@ from pydantic import BaseModel
 from api.database import SessionLocal, get_db_session
 from api.dependencies import get_current_user
 from core.auth.permission_checker import PermissionChecker
-from core.skills.config_center import SkillConfigCenter
-from core.skills.credential_manager import CredentialManager
+from core.skills.config_center import CredentialManager, SkillConfigCenter
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session

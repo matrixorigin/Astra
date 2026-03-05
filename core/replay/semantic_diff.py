@@ -10,7 +10,7 @@ from collections import Counter
 from core.events.event_reader import EventReader
 from core.db_consumer import DbConsumer, DbFactory
 from core.context.embeddings import EmbeddingService, get_embedding_client
-from core.skills.learning_similarity import cosine_similarity
+from core.skills.tool_registry import _cosine_similarity as cosine_similarity
 
 _SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 

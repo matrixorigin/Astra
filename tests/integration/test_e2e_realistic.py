@@ -147,17 +147,14 @@ def _build_patched_chat_loop(llm: ScriptedLLM):
         from core.context.manager import ContextManager
         from core.events.event_logger import EventLogger
         from core.verification.firewall import HallucinationFirewall
-        from core.skills.pipeline import SkillPipeline
-        from core.skills.registry import SkillRegistry
+        from core.skills.catalog import SkillCatalog
 
         db = db_factory()
         event_logger = EventLogger(db_factory)
-        skill_registry = SkillRegistry(lambda: db)
-        # Skip register_builtin_skills — saves ~200ms per call.
-        # Tests that need specific skills (B, E) register execute_code explicitly.
+        skill_catalog = SkillCatalog(lambda: db)
         context_manager = ContextManager(db_factory)
-        selector = SkillPipeline(db_factory, llm, audit=True, learning=True)
-        executor = AgentExecutor(db_factory, skill_registry)
+        selector = skill_catalog
+        executor = AgentExecutor(db_factory, skill_catalog)
         firewall = HallucinationFirewall(db_factory, context_manager)
 
         loop = ChatLoop(
@@ -182,23 +179,21 @@ def _build_patched_chat_loop_with_skills(llm: ScriptedLLM):
         from core.context.manager import ContextManager
         from core.events.event_logger import EventLogger
         from core.verification.firewall import HallucinationFirewall
-        from core.skills.pipeline import SkillPipeline
-        from core.skills.registry import SkillRegistry
+        from core.skills.catalog import SkillCatalog
         from core.skills.builtin import register_builtin_skills
         from core.runtime import create_runtime, IsolationLevel
         from core.code_executor import CodeExecutor
 
         db = db_factory()
         event_logger = EventLogger(db_factory)
-        skill_registry = SkillRegistry(lambda: db)
+        skill_catalog = SkillCatalog(lambda: db)
         code_executor = CodeExecutor(
             runtime=create_runtime(min_isolation=IsolationLevel.PROCESS), db_factory=db_factory,
         )
-        register_builtin_skills(skill_registry, db_factory, code_executor=code_executor)
+        register_builtin_skills(skill_catalog, db_factory, code_executor=code_executor)
         context_manager = ContextManager(db_factory)
-        selector = SkillPipeline(db_factory, llm, audit=True, learning=True)
-        selector.reload_skills(registry=skill_registry)
-        executor = AgentExecutor(db_factory, skill_registry)
+        selector = skill_catalog
+        executor = AgentExecutor(db_factory, skill_catalog)
         firewall = HallucinationFirewall(db_factory, context_manager)
 
         loop = ChatLoop(

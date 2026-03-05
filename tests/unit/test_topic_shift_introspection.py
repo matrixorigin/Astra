@@ -289,104 +289,6 @@ class TestTopicShiftScoring:
         )
 
 
-# ============================================================================
-# Cost savings: introspection skill avoids full context + LLM
-# ============================================================================
-
-
-class TestIntrospectionSkillSelection:
-    """Verify introspection skill is selected for self-queries, saving tokens."""
-
-    def test_trigger_match_chinese(self):
-        """Chinese introspection queries should match triggers."""
-        from core.skills.selector import SkillSelector, SkillMetadata
-
-        selector = SkillSelector.__new__(SkillSelector)
-        selector.skills = {
-            "introspection": SkillMetadata(
-                name="introspection",
-                version="1.0.0",
-                description="Answer questions about the agent itself",
-                category="system",
-                subcategory="introspection",
-                triggers=[
-                    "上下文", "context", "token", "多大", "多少轮",
-                    "capabilities", "能力", "状态", "status", "model",
-                ],
-                dependencies=[],
-                priority=8,
-                cost_estimate="low",
-            ),
-            "summarize_pr": SkillMetadata(
-                name="summarize_pr",
-                version="1.0.0",
-                description="Summarize a GitHub PR",
-                category="github",
-                subcategory="pr_management",
-                triggers=["summarize", "summary", "pr", "pull request"],
-                dependencies=[],
-                priority=8,
-                cost_estimate="medium",
-            ),
-        }
-
-        # "上下文积累到多大了" should match introspection
-        results = selector.select_skills("上下文积累到多大了", max_skills=3)
-        names = [s.name for s in results]
-        assert "introspection" in names, f"Expected introspection in {names}"
-
-    def test_trigger_match_english(self):
-        """English introspection queries should match triggers."""
-        from core.skills.selector import SkillSelector, SkillMetadata
-
-        selector = SkillSelector.__new__(SkillSelector)
-        selector.skills = {
-            "introspection": SkillMetadata(
-                name="introspection",
-                version="1.0.0",
-                description="Answer questions about the agent itself",
-                category="system",
-                subcategory="introspection",
-                triggers=["context", "token", "status", "model", "capabilities"],
-                dependencies=[],
-                priority=8,
-                cost_estimate="low",
-            ),
-        }
-
-        results = selector.select_skills("how big is my context window", max_skills=3)
-        names = [s.name for s in results]
-        assert "introspection" in names
-
-    def test_introspection_not_selected_for_code_query(self):
-        """Code queries should NOT match introspection."""
-        from core.skills.selector import SkillSelector, SkillMetadata
-
-        selector = SkillSelector.__new__(SkillSelector)
-        selector.skills = {
-            "introspection": SkillMetadata(
-                name="introspection",
-                version="1.0.0",
-                description="Answer questions about the agent itself",
-                category="system",
-                subcategory="introspection",
-                triggers=["上下文", "context", "token", "status"],
-                dependencies=[],
-                priority=8,
-                cost_estimate="low",
-            ),
-        }
-
-        results = selector.select_skills("write a Python decorator", max_skills=3)
-        names = [s.name for s in results]
-        assert "introspection" not in names
-
-
-# ============================================================================
-# Introspection skill execution
-# ============================================================================
-
-
 class TestIntrospectionSkillExecution:
     """Test the introspection skill returns correct data."""
 
@@ -768,18 +670,6 @@ class TestSelfEvolution:
 
     def test_stale_context_signal_type_exists(self):
         """STALE_CONTEXT is a valid signal type for the learning system."""
-        from core.skills.learning_signals import SignalType
-        assert SignalType.STALE_CONTEXT == "stale_context"
-
-    def test_stale_context_can_be_recorded_as_feedback(self):
-        """SkillPipeline.record_feedback accepts STALE_CONTEXT signal."""
-        from core.skills.learning_signals import SignalType
-        # Just verify the enum value is usable — actual recording
-        # requires DB, tested in integration tests
-        signal = SignalType.STALE_CONTEXT
-        assert signal.value == "stale_context"
-
-    def test_topic_shift_config_loaded_from_db(self):
         """RelevanceScorer loads TopicShiftConfig from configs table."""
         mock_db = MagicMock()
         # Simulate DB returning a custom config

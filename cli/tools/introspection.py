@@ -38,15 +38,8 @@ class GetAgentInfoTool(EdgeTool):
     @property
     def description(self) -> str:
         return (
-            "Query CURRENT runtime state: live token counts, context window "
-            "breakdown, session info, turn count, available tools, and memory "
-            "stats. Use when user asks: 'how many tokens' (token 用了多少), "
-            "'context usage' (上下文用量), 'what tools do you have', "
-            "'session id', or 'what model'. "
-            "For token usage, present llm_prompt_tokens as the primary total "
-            "and health.zones as the complete distribution of that total. "
-            "NOT for analyzing past decisions or event history — "
-            "those are in reflect."
+            "Query current runtime state: token counts, context breakdown, "
+            "session info, available tools, memory stats."
         )
 
     @property

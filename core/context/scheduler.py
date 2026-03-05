@@ -209,10 +209,8 @@ class GovernanceTaskRunner:
 
         # Phase 4: Skill selection learning
         try:
-            from core.skills.self_improving_selector import SelfImprovingSelector
-            selector = SelfImprovingSelector(db_factory=db_factory)
-            skill_result = selector.learn_from_failures(days=7)
-            results["skills_learned"] = skill_result.get("learned", 0)
+            # Self-improving selector removed in skill system cleanup
+            results["skills_learned"] = 0
         except Exception as e:
             logger.error("eval_daily skill learning failed: %s", e)
 

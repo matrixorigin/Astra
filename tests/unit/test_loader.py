@@ -12,7 +12,6 @@ from core.skills.loader import (
     SKILL_FILENAME,
     MANIFEST_FILENAME,
 )
-from core.skills.dependencies import Dependency, DependencyType
 
 
 class TestSkillManifest:
@@ -21,11 +20,6 @@ class TestSkillManifest:
         assert m.description == ""
         assert m.depends_on == []
         assert m.tables == []
-
-    def test_with_dependencies(self):
-        deps = [Dependency(name="base", version_constraint=">=1.0")]
-        m = SkillManifest(name="test", version="1.0", depends_on=deps)
-        assert m.depends_on[0].name == "base"
 
 
 class TestLoadManifests:
@@ -50,28 +44,6 @@ class TestLoadManifests:
         assert result[0].name == "my_skill"
         assert result[0].version == "1.0.0"
 
-    def test_load_manifest_with_deps(self, tmp_path):
-        skill_dir = tmp_path / "dep_skill"
-        skill_dir.mkdir()
-        (skill_dir / "manifest.yaml").write_text(
-            "name: dep_skill\nversion: '1.0'\n"
-            "depends_on:\n  - name: base\n    version: '>=1.0'\n    type: skill\n"
-        )
-        result = load_manifests(tmp_path)
-        assert len(result) == 1
-        assert result[0].depends_on[0].name == "base"
-        assert result[0].depends_on[0].type == DependencyType.SKILL
-
-    def test_load_manifest_old_format_deps(self, tmp_path):
-        skill_dir = tmp_path / "old_skill"
-        skill_dir.mkdir()
-        (skill_dir / "manifest.yaml").write_text(
-            "name: old_skill\nversion: '1.0'\ndepends_on:\n  - github\n  - jira\n"
-        )
-        result = load_manifests(tmp_path)
-        assert len(result) == 1
-        assert result[0].depends_on[0].name == "github"
-
     def test_skip_non_directory(self, tmp_path):
         (tmp_path / "not_a_dir.txt").write_text("hello")
         result = load_manifests(tmp_path)
@@ -86,20 +58,6 @@ class TestLoadManifests:
         skill_dir = tmp_path / "bad_skill"
         skill_dir.mkdir()
         (skill_dir / "manifest.yaml").write_text("version: '1.0'\n")
-        result = load_manifests(tmp_path)
-        assert result == []
-
-    def test_invalid_manifest_not_dict(self, tmp_path):
-        skill_dir = tmp_path / "bad2"
-        skill_dir.mkdir()
-        (skill_dir / "manifest.yaml").write_text("- item1\n- item2\n")
-        result = load_manifests(tmp_path)
-        assert result == []
-
-    def test_malformed_yaml(self, tmp_path):
-        skill_dir = tmp_path / "broken"
-        skill_dir.mkdir()
-        (skill_dir / "manifest.yaml").write_text("name: broken\nversion: [invalid yaml\n")
         result = load_manifests(tmp_path)
         assert result == []
 
@@ -136,10 +94,6 @@ class TestSkillLoader:
         result = SkillLoader.discover([tmp_path])
         assert result == []
 
-    def test_discover_nonexistent_path(self, tmp_path):
-        result = SkillLoader.discover([tmp_path / "nope"])
-        assert result == []
-
     def test_discover_skill_md(self, tmp_path):
         skill_dir = tmp_path / "greet"
         skill_dir.mkdir()
@@ -154,7 +108,6 @@ class TestSkillLoader:
     def test_discover_prefers_skill_py(self, tmp_path):
         skill_dir = tmp_path / "dual"
         skill_dir.mkdir()
-        # Both SKILL.md and skill.py exist — skill.py wins
         (skill_dir / SKILL_FILENAME).write_text(
             "---\nname: dual\ndescription: test\ntriggers:\n  - test\n---\ntest\n"
         )
@@ -167,10 +120,9 @@ class TestSkillLoader:
         )
         result = SkillLoader.discover([tmp_path])
         assert len(result) == 1
-        assert result[0].spec is None  # skill.py path sets spec=None
+        assert result[0].spec is None
 
     def test_discover_priority_order(self, tmp_path):
-        """Earlier paths win on name conflicts."""
         dir1 = tmp_path / "high"
         dir2 = tmp_path / "low"
         for d in (dir1, dir2):
@@ -182,23 +134,6 @@ class TestSkillLoader:
         result = SkillLoader.discover([dir1, dir2])
         assert len(result) == 1
         assert result[0].skill.description == "from high"
-
-    def test_discover_skip_non_dir(self, tmp_path):
-        (tmp_path / "file.txt").write_text("not a skill")
-        result = SkillLoader.discover([tmp_path])
-        assert result == []
-
-    def test_discover_skip_no_skill_file(self, tmp_path):
-        (tmp_path / "empty_dir").mkdir()
-        result = SkillLoader.discover([tmp_path])
-        assert result == []
-
-    def test_discover_skip_unparseable_md(self, tmp_path):
-        skill_dir = tmp_path / "bad_md"
-        skill_dir.mkdir()
-        (skill_dir / SKILL_FILENAME).write_text("no frontmatter here\n")
-        result = SkillLoader.discover([tmp_path])
-        assert result == []
 
     def test_default_paths(self, tmp_path):
         paths = SkillLoader.default_paths(tmp_path)

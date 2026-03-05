@@ -11,7 +11,7 @@ from typing import Any
 from core.context.manager import TaskType
 from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
-from core.skills.learning_similarity import cosine_similarity as _cosine_similarity
+from core.skills.tool_registry import _cosine_similarity
 
 logger = get_logger(__name__)
 
@@ -242,14 +242,17 @@ class RelevanceScorer(DbConsumer):
         if not event_id:
             return None
         try:
-            from core.skills.learning_similarity import parse_embedding
             from api.models.context import EventEmbedding
             with self._db() as db:
                 row = db.query(EventEmbedding.embedding).filter(
                     EventEmbedding.event_id == event_id
                 ).first()
-            if row:
-                return parse_embedding(row[0])
+            if row and row[0]:
+                import json
+                raw = row[0]
+                if isinstance(raw, str):
+                    return json.loads(raw)
+                return list(raw)
         except Exception:
             pass
         return None

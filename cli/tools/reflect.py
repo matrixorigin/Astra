@@ -22,17 +22,8 @@ class ReflectTool(EdgeTool):
 
     name = "reflect"
     description = (
-        "Diagnose PAST behavior by querying server-side event history. "
-        "Returns ALL of: event trails, skill selection audit, "
-        "context window composition (token budget per zone: system prompt, "
-        "tool schemas, memory, project context), tool usage patterns, "
-        "and cross-session comparisons — in a single call. "
-        "Use when user asks about: why a tool was chosen, what happened in a "
-        "previous turn/session, decision chain evaluation (决策链评估), "
-        "analyzing previous context (分析前一个上下文), or debugging past failures. "
-        "One call is sufficient — do NOT call multiple times with different focus. "
-        "NOT for current token counts or live context — "
-        "those are in get_agent_info."
+        "Diagnose past behavior: event trails, skill selection audit, "
+        "context composition, tool usage patterns, cross-session comparisons."
     )
     parameters = {
         "type": "object",

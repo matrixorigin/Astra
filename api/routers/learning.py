@@ -10,8 +10,7 @@ from api.database import SessionLocal
 from api.dependencies import get_current_user
 from core.llm.client import LLMClient
 from core.logging_config import get_logger
-from core.skills.learning_signals import SignalType, SignalWeights
-from core.skills.pipeline import SkillPipeline
+# Removed: learning_signals and pipeline modules deleted
 
 logger = get_logger(__name__)
 
@@ -102,89 +101,26 @@ async def trigger_learning(
     request: LearningTriggerRequest,
     current_user: dict = Depends(get_current_user),
 ) -> LearningTriggerResponse:
-    """Trigger learning cycle from recent failures.
-    
-    This endpoint initiates a learning cycle that:
-    1. Analyzes recent selection failures
-    2. Extracts learning patterns (multi-dimensional)
-    3. Validates through regression gate
-    4. Deploys if gate passes
-    
-    Args:
-        request: Learning trigger parameters
-        db: Database session
-        
-    Returns:
-        Learning cycle results
-    """
-    try:
-        # Parse signal types
-        signal_types = [SignalType(st) for st in request.signal_types]
-
-        # Parse weights if provided
-        weights = None
-        if request.weights:
-            weights = SignalWeights(**request.weights)
-
-        llm_client = LLMClient(SessionLocal)
-        pipeline = SkillPipeline(
-            SessionLocal, llm_client,
-            audit=False,
-            learning=True,
-            learning_weights=weights,
-        )
-
-        # Trigger learning
-        learn_result = pipeline.learn(days=request.days)
-        result = {
-            "learned": learn_result.learned,
-            "total_failures": learn_result.total_failures,
-            "signals_by_type": learn_result.signals_by_type,
-        }
-        if learn_result.error:
-            result["error"] = learn_result.error
-
-        # Handle errors
-        if result.get("error"):
-            return LearningTriggerResponse(
-                status="error",
-                learned=result.get("learned", 0),
-                signals_by_type=result.get("signals_by_type"),
-                error=result["error"],
-                message=result.get("message"),
-            )
-
-        # Success
-        return LearningTriggerResponse(
-            status="success",
-            learned=result["learned"],
-            signals_by_type=result.get("signals_by_type"),
-            gate_verdict=result.get("gate_verdict"),
-            improvement_pct=result.get("improvement_pct"),
-            test_count=result.get("test_count"),
-        )
-
-    except Exception as e:
-        logger.error(f"Learning trigger failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Trigger learning cycle — disabled after skill pipeline removal."""
+    return LearningTriggerResponse(
+        status="error",
+        learned=0,
+        error="Learning pipeline removed in skill system cleanup",
+    )
 
 
 @router.get("/signals", response_model=SignalTypesResponse)
 async def get_signal_types(
     current_user: dict = Depends(get_current_user),
 ) -> SignalTypesResponse:
-    """Get available learning signal types.
-    
-    Returns:
-        List of signal types with descriptions
-    """
+    """Get available learning signal types — stub after pipeline removal."""
     return SignalTypesResponse(
-        signal_types=[st.value for st in SignalType],
+        signal_types=["wrong_skill", "slow_execution", "high_cost", "low_satisfaction"],
         descriptions={
-            SignalType.WRONG_SKILL.value: "Incorrect skill selection",
-            SignalType.SLOW_EXECUTION.value: "Execution time exceeds threshold",
-            SignalType.HIGH_COST.value: "Execution cost exceeds budget",
-            SignalType.LOW_SATISFACTION.value: "User satisfaction below threshold",
+            "wrong_skill": "Incorrect skill selection",
+            "slow_execution": "Execution time exceeds threshold",
+            "high_cost": "Execution cost exceeds budget",
+            "low_satisfaction": "User satisfaction below threshold",
         }
     )
 
@@ -193,46 +129,14 @@ async def get_signal_types(
 async def get_learning_stats(
     current_user: dict = Depends(get_current_user),
 ) -> LearningStatsResponse:
-    """Get learning statistics.
-    
-    Returns comprehensive statistics about:
-    - Total learnings and confidence distribution
-    - Regression gate results
-    - Learning effectiveness
-    
-    Args:
-        db: Database session
-        
-    Returns:
-        Learning statistics
-    """
-    try:
-        llm_client = LLMClient(SessionLocal)
-        pipeline = SkillPipeline(SessionLocal, llm_client, audit=False, learning=True)
-
-        stats = pipeline.stats()
-        learning = stats["learning"]
-
-        return LearningStatsResponse(
-            total_learnings=learning["total_learnings"],
-            high_confidence=learning["high_confidence"],
-            low_confidence=learning["low_confidence"],
-            avg_confidence=learning["avg_confidence"],
-            by_signal_type=learning["by_signal_type"],
-            weights=learning["learnings"]["weights"],
-            weights_per_signal=learning["learnings"]["weights_per_signal"],
-            decay=learning["learnings"]["decay"],
-            total_gates=learning["regression_gates"]["total_gates"],
-            passed_gates=learning["regression_gates"]["passed"],
-            failed_gates=learning["regression_gates"]["failed"],
-            pass_rate=learning["regression_gates"]["pass_rate"],
-            avg_improvement_pct=learning["regression_gates"]["avg_improvement_pct"],
-            per_skill=stats.get("per_skill", {}),
-        )
-
-    except Exception as e:
-        logger.error(f"Get stats failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Get learning statistics — stub after pipeline removal."""
+    return LearningStatsResponse(
+        total_learnings=0, high_confidence=0, low_confidence=0,
+        avg_confidence=0.0, by_signal_type={},
+        weights={}, weights_per_signal={}, decay={},
+        total_gates=0, passed_gates=0, failed_gates=0,
+        pass_rate=0.0, avg_improvement_pct=0.0,
+    )
 
 
 @router.post("/feedback", response_model=FeedbackResponse)

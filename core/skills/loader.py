@@ -6,8 +6,6 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-
-from core.skills.dependencies import Dependency, parse_depends_on
 from core.skills.markdown_skill import MarkdownSkill
 from core.skills.skill_md import SkillMd, parse_skill_md
 
@@ -30,7 +28,7 @@ class SkillManifest:
     secrets: list[dict[str, Any]] = field(default_factory=list)
     resources: dict[str, Any] = field(default_factory=dict)
     requires: list[str] = field(default_factory=list)
-    depends_on: list[Dependency] = field(default_factory=list)
+    depends_on: list[str] = field(default_factory=list)
     author: str = ""
     path: Path = field(default_factory=lambda: Path("."))
 
@@ -74,7 +72,7 @@ def load_manifests(skills_root: Path | None = None) -> list[SkillManifest]:
                 secrets=data.get("secrets", []),
                 resources=data.get("resources", {}),
                 requires=data.get("requires", []),
-                depends_on=parse_depends_on(data.get("depends_on", [])),
+                depends_on=data.get("depends_on", []),
                 author=data.get("author", ""),
                 path=skill_dir,
             ))

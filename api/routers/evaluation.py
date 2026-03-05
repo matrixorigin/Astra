@@ -432,10 +432,7 @@ def run_closed_loop(
     skill_learning_resp: dict[str, Any] | None = None
     db = SessionLocal()
     try:
-        from core.skills.self_improving_selector import SelfImprovingSelector
-
-        selector = SelfImprovingSelector(SessionLocal)
-        skill_learning_resp = selector.learn_from_failures(days=days)
+        raise NotImplementedError('Module removed in skill system cleanup')
     except Exception as e:
         logger.error("Closed loop skill learning phase failed: %s", e)
         skill_learning_resp = {"learned": 0, "error": str(e)}

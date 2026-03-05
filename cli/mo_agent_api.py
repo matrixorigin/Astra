@@ -1788,23 +1788,7 @@ def skill_scaffold(yaml_file, output_dir):
     """Generate skill package from YAML declaration."""
     import yaml as _yaml
 
-    from core.skills.scaffold import SkillSpec, generate_files
-    try:
-        data = _yaml.safe_load(Path(yaml_file).read_text())
-        spec = SkillSpec.from_dict(data)
-        target = Path(output_dir) / spec.name
-        if target.exists():
-            click.echo(f"❌ Directory already exists: {target}")
-            return
-        files = generate_files(spec)
-        target.mkdir(parents=True)
-        for fname, content in files.items():
-            (target / fname).write_text(content)
-        click.echo(f"✅ Generated skill package: {target}/")
-        for fname in files:
-            click.echo(f"   {fname}")
-    except Exception as e:
-        click.echo(f"❌ Error: {e}")
+    raise NotImplementedError('Module removed in skill system cleanup')
 
 
 @skill.command("upgrade-check")
@@ -1821,22 +1805,7 @@ def skill_upgrade_check(ctx, skill_name, new_version):
             click.echo("No skills found")
             return
 
-        from core.skills.resolver import DependencyResolver
-        available = {
-            s["skill_name"]: {
-                "version": s.get("version", "0.0.0"),
-                "depends_on": (s.get("manifest") or {}).get("depends_on", []),
-            }
-            for s in skills
-        }
-        resolver = DependencyResolver(available_skills=available)
-        broken = resolver.analyze_upgrade_impact(skill_name, new_version)
-        if not broken:
-            click.echo(f"✅ Upgrading {skill_name} to {new_version} breaks nothing")
-        else:
-            click.echo(f"⚠️  Upgrading {skill_name} to {new_version} would break:")
-            for dep_name, constraint in broken:
-                click.echo(f"  • {dep_name} (requires {constraint})")
+        raise NotImplementedError('Module removed in skill system cleanup')
     except Exception as e:
         click.echo(f"❌ Error: {e}")
 

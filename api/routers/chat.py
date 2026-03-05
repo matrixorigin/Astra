@@ -33,14 +33,6 @@ from core.verification.tool_quality import (
     assess_tool_result as _assess_tool_result,
 )
 
-from core.skills.prefilter import (
-    ConversationState,
-    SkillTags,
-    ToolWrapper,
-    pre_filter,
-)
-from core.skills.selector import SkillSelector
-
 logger = get_logger(__name__)
 router = APIRouter()
 
@@ -325,8 +317,7 @@ def _build_chat_loop(db_factory):
     from core.llm.client import LLMClient
     from core.runtime import IsolationLevel, create_runtime
     from core.skills.builtin import register_builtin_skills
-    from core.skills.pipeline import SkillPipeline
-    from core.skills.registry import SkillRegistry
+    from core.skills.catalog import SkillCatalog
     from core.verification.firewall import HallucinationFirewall
 
     # Create EventPipeline for async writes (feature-flagged)
@@ -352,20 +343,19 @@ def _build_chat_loop(db_factory):
         from core.evaluation.gate_trigger import GateTrigger
         gate_trigger = GateTrigger(db_factory=db_factory)
 
-    skill_registry = SkillRegistry(db_factory, gate_trigger=gate_trigger)
+    skill_registry = SkillCatalog(db_factory, gate_trigger=gate_trigger)
     code_executor = CodeExecutor(
         runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
         db_factory=db_factory,
     )
     register_builtin_skills(skill_registry, db_factory, code_executor=code_executor)
     context_manager = ContextManager(db_factory, gate_trigger=gate_trigger)
-    selector = SkillPipeline(db_factory, llm_client, audit=True, learning=True)
-    selector.reload_skills(registry=skill_registry)
+    # Removed: SkillPipeline module deleted - using SkillCatalog directly
+    selector = skill_registry  # SkillCatalog implements get_tools_schema()
 
-    from config.settings import get_settings
-    from core.skills.credential_manager import CredentialManager
-    from core.skills.skill_manager import SkillManager
-    skill_mgr = SkillManager(db_factory, CredentialManager(get_settings().secret_key))
+    # Removed: credential_manager and skill_manager modules deleted
+    # Removed: skill_manager module deleted
+    skill_mgr = None  # Stubbed out
     executor = AgentExecutor(db_factory, skill_registry, skill_manager=skill_mgr)
 
     firewall = HallucinationFirewall(db_factory, context_manager)
@@ -1534,6 +1524,23 @@ _shared_embed_fn = _UNSET = object()
 _shared_embed_lock = threading.Lock()
 
 
+def _get_session_tool_registry(
+    session_id: str,
+    edge_tools: list[dict[str, Any]],
+) -> "ToolRegistry":
+    """Build a ToolRegistry for one session, populated with edge tools.
+
+    Cloud skills are added by the caller after this returns.
+    The registry is rebuilt per-turn (cheap — just dict inserts).
+    """
+    from core.skills.tool_registry import ToolRegistry, ToolSource
+    embed_fn = _get_shared_embed_fn()
+    registry = ToolRegistry(embed_fn=embed_fn)
+    for schema in (edge_tools or []):
+        registry.register_schema(schema, ToolSource.EDGE)
+    return registry
+
+
 def _get_shared_llm_client():
     """Get or create a shared LLMClient for background tasks."""
     global _shared_llm_client
@@ -1545,13 +1552,13 @@ def _get_shared_llm_client():
     return _shared_llm_client
 
 
-# Lazy-initialized shared SkillRegistry for cloud skill execution in /chat/turn.
+# Lazy-initialized shared SkillCatalog for cloud skill execution in /chat/turn.
 _shared_skill_registry = None
 _shared_skill_registry_lock = threading.Lock()
 
 
 def _get_shared_skill_registry():
-    """Get or create a shared SkillRegistry with builtin cloud skills."""
+    """Get or create a shared SkillCatalog with builtin cloud skills."""
     global _shared_skill_registry
     if _shared_skill_registry is None:
         with _shared_skill_registry_lock:
@@ -1559,8 +1566,8 @@ def _get_shared_skill_registry():
                 from core.code_executor import CodeExecutor
                 from core.runtime import IsolationLevel, create_runtime
                 from core.skills.builtin import register_builtin_skills
-                from core.skills.registry import SkillRegistry
-                registry = SkillRegistry(SessionLocal)
+                from core.skills.catalog import SkillCatalog
+                registry = SkillCatalog(SessionLocal)
                 code_executor = CodeExecutor(
                     runtime=create_runtime(min_isolation=IsolationLevel.PROCESS),
                     db_factory=SessionLocal,
@@ -1702,288 +1709,6 @@ async def decision_trace(
     )
 
 
-# ---------------------------------------------------------------------------
-# Tool selection — extracted for testability (DI on llm_client).
-# ---------------------------------------------------------------------------
-
-
-@runtime_checkable
-class ChatCapable(Protocol):
-    """Minimal interface for LLM clients used by tool selection."""
-
-    def chat(self, messages: list[dict[str, Any]], *, user_id: str, **kwargs: Any) -> Any: ...
-
-
-class ToolSelectionResult(BaseModel):
-    """Result of selecting the most relevant tool(s) for a turn."""
-
-    tools: list[dict[str, Any]]
-    selected_tool: str | None = None
-    fallback_reason: str | None = None
-
-
-def select_tools_for_turn(
-    tools_schema: list[dict[str, Any]],
-    messages: list[dict[str, Any]],
-    tool_results: list[dict[str, Any]] | None,
-    user_id: str,
-    llm_client: ChatCapable | None,
-    session_history: list[dict[str, Any]] | None = None,
-) -> ToolSelectionResult:
-    """Pick the most relevant tool(s) for a chat turn.
-
-    Stage 0: Pre-filter by conversation state + skill tags (0 tokens).
-    Stage 1: For user-query turns, ask LLM to pick the single best tool.
-    For tool-result turns: keeps only the tool(s) already in use.
-
-    Args:
-        tools_schema: Full merged tool schemas (edge + cloud).
-        messages: Chat messages for this turn (from edge).
-        tool_results: Tool results from previous turn, if any.
-        user_id: Current user ID (required by LLMClient.chat).
-        llm_client: LLMClient instance (injected for testability).
-        session_history: Server-side conversation history (from session cache).
-            Used to extract previous_skill context for multi-turn continuity.
-
-    Returns:
-        ToolSelectionResult with the filtered tools and optional selected name.
-    """
-    if not tools_schema or len(tools_schema) <= 1:
-        return ToolSelectionResult(tools=tools_schema)
-
-    # Use session_history for ConversationState when available — it has the
-    # full conversation including previous tool_calls. Fall back to edge
-    # messages (turn 0 or cache miss).
-    context_messages = session_history if session_history else messages
-
-    # Use the LAST user message — earlier messages reflect prior intents.
-    user_query = ""
-    for m in reversed(context_messages):
-        if m.get("role") == "user":
-            user_query = m.get("content", "")
-            break
-
-    # Extract previous_skill from full history for LLM hint
-    state = ConversationState.from_messages(context_messages)
-
-    # Stage 0: pre-filter reorder
-    if user_query:
-        tools_schema = _prefilter_tools(tools_schema, context_messages)
-        return _select_tool_by_llm(
-            tools_schema, user_query, user_id, llm_client,
-            previous_skill=state.previous_skill,
-            turn_count=state.turn_count,
-        )
-
-    if tool_results:
-        return _keep_active_tools(tools_schema, tool_results)
-
-    return ToolSelectionResult(tools=tools_schema)
-
-
-# Module-level tag cache.  SkillSelector loads all active skills from DB;
-# caching avoids a full SELECT on every user message turn.  Invalidated
-# by TTL (60s) — acceptable staleness for a reorder-only optimisation.
-_tag_cache: dict[str, SkillTags | None] = {}
-_tag_cache_ts: float = 0.0
-_TAG_CACHE_TTL = 60.0
-
-
-def _get_tag_map() -> dict[str, SkillTags | None]:
-    """Return skill-name → SkillTags map, refreshed every _TAG_CACHE_TTL seconds."""
-    global _tag_cache, _tag_cache_ts  # noqa: PLW0603
-    now = time.monotonic()
-    if _tag_cache and (now - _tag_cache_ts) < _TAG_CACHE_TTL:
-        return _tag_cache
-    try:
-        selector = SkillSelector(SessionLocal)
-        _tag_cache = {n: s.tags for n, s in selector.skills.items()}
-        _tag_cache_ts = now
-    except Exception as e:
-        logger.debug("Tag cache refresh failed: %s", e)
-        # Return stale cache if available, empty dict otherwise
-        if not _tag_cache:
-            _tag_cache = {}
-    return _tag_cache
-
-
-def _prefilter_tools(
-    tools_schema: list[dict[str, Any]],
-    messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Reorder tools_schema using pre-filter tags. Zero LLM cost."""
-    try:
-        state = ConversationState.from_messages(messages)
-        tag_map = _get_tag_map()
-
-        wrappers = [
-            ToolWrapper(
-                name=t.get("function", {}).get("name", ""),
-                tags=tag_map.get(t.get("function", {}).get("name", "")),
-                schema=t,
-            )
-            for t in tools_schema
-        ]
-
-        reordered, applied = pre_filter(wrappers, state)
-        if applied:
-            logger.info(
-                "Edge pre-filter applied: %s",
-                [w.name for w in reordered[:3]],
-            )
-            return [w.schema for w in reordered]
-    except Exception as e:
-        logger.debug("Edge pre-filter skipped: %s", e)
-    return tools_schema
-
-
-def _select_tool_by_llm(
-    tools_schema: list[dict[str, Any]],
-    user_query: str,
-    user_id: str,
-    llm_client: ChatCapable,
-    previous_skill: str | None = None,
-    turn_count: int = 0,
-) -> ToolSelectionResult:
-    """Ask LLM to pick the single best tool from a catalog."""
-    try:
-        tool_names_map = {
-            t.get("function", {}).get("name", ""): t for t in tools_schema
-        }
-        catalog = "\n".join(
-            f"- {name}: {t.get('function', {}).get('description', '')[:80]}"
-            for name, t in tool_names_map.items()
-        )
-        # Add previous_skill hint for multi-turn continuity (~10 tokens).
-        # This tells the LLM that a follow-up like "tidb呢" after using
-        # list_prs on matrixone should likely use the same tool.
-        context_hint = ""
-        if previous_skill and previous_skill in tool_names_map:
-            context_hint = f"\nPrevious turn used: {previous_skill}\n"
-        catalog_prompt = (
-            f"Given this user query, select the single most appropriate tool.\n"
-            f"Query: {user_query}\n{context_hint}\nAvailable tools:\n{catalog}\n\n"
-            f"Reply with ONLY the tool name, nothing else."
-        )
-        resp = llm_client.chat(
-            [{"role": "user", "content": catalog_prompt}], user_id=user_id
-        )
-        raw = resp.content.strip().strip("`\"'")
-        # Fuzzy match: exact first, then substring
-        matched = tool_names_map.get(raw)
-        if not matched:
-            for name, t in tool_names_map.items():
-                if name in raw or raw in name:
-                    matched = t
-                    raw = name
-                    break
-        if matched:
-            logger.info("LLM tool selection: %s", raw)
-            return ToolSelectionResult(tools=[matched], selected_tool=raw)
-        logger.warning(
-            "LLM tool selection returned unmatched '%s', falling back to keyword",
-            raw,
-        )
-        return _keyword_fallback(tools_schema, user_query, f"llm_unmatched:{raw}",
-                                 previous_skill=previous_skill, turn_count=turn_count)
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except Exception as e:
-        logger.warning("Tool selection LLM failed (%s): %s, falling back to keyword",
-                        type(e).__name__, e)
-        return _keyword_fallback(tools_schema, user_query, f"llm_error:{type(e).__name__}",
-                                 previous_skill=previous_skill, turn_count=turn_count)
-
-
-# ── Keyword-based tool fallback (zero LLM cost) ─────────────────
-
-# Maps query keywords to tool names.
-# IMPORTANT: multi-word patterns MUST come before single-word patterns.
-# Matching is first-match-wins with substring `in`, so "pr" would shadow
-# "summarize pr" if it appeared earlier.  Longest/most-specific first.
-_KEYWORD_TOOL_MAP: list[tuple[list[str], str]] = [
-    # Multi-word (specific) — must be before single-word entries
-    (["summarize pr", "总结pr", "review pr", "评审pr"], "summarize_pr"),
-    (["create issue", "创建issue", "提issue", "新建issue"], "create_issue"),
-    (["pull request", "合并请求"], "list_prs"),
-    (["run code", "运行代码", "执行代码"], "execute_code"),
-    # Single-word — checked only after multi-word patterns fail.
-    # Only include words that unambiguously refer to one tool.
-    # Removed: "bug" (matches "debug"), "问题" (means generic "question"),
-    #          "execute" (matches "execute SQL", "execution plan").
-    (["pr"], "list_prs"),
-    (["ci", "workflow", "pipeline", "构建"], "ci_status"),
-    (["issue", "缺陷"], "list_issues"),
-]
-
-
-def _keyword_fallback(
-    tools_schema: list[dict[str, Any]],
-    user_query: str,
-    reason: str,
-    previous_skill: str | None = None,
-    turn_count: int = 0,
-) -> ToolSelectionResult:
-    """Zero-cost keyword matching when LLM tool selection is unavailable.
-
-    Fallback chain (first match wins):
-      1. Keyword match from _KEYWORD_TOOL_MAP
-      2. previous_skill (only when turn_count > 1 — multi-turn continuity)
-      3. All tools (last resort)
-    """
-    query_lower = user_query.lower()
-    tool_names_map = {
-        t.get("function", {}).get("name", ""): t for t in tools_schema
-    }
-    for keywords, tool_name in _KEYWORD_TOOL_MAP:
-        if tool_name in tool_names_map and any(kw in query_lower for kw in keywords):
-            logger.info("Keyword fallback matched: %s (reason: %s)", tool_name, reason)
-            return ToolSelectionResult(
-                tools=[tool_names_map[tool_name]],
-                selected_tool=tool_name,
-                fallback_reason=reason,
-            )
-    # Stage 2: previous_skill for multi-turn continuity
-    if previous_skill and turn_count > 1 and previous_skill in tool_names_map:
-        fb_reason = f"{reason}→prev_skill"
-        logger.info("Previous skill fallback: %s (reason: %s)", previous_skill, fb_reason)
-        return ToolSelectionResult(
-            tools=[tool_names_map[previous_skill]],
-            selected_tool=previous_skill,
-            fallback_reason=fb_reason,
-        )
-    # No keyword match — return all tools as last resort
-    logger.warning("Keyword fallback: no match for '%s', using all %d tools (reason: %s)",
-                    user_query[:60], len(tools_schema), reason)
-    return ToolSelectionResult(tools=tools_schema, fallback_reason=reason)
-
-
-def _keep_active_tools(
-    tools_schema: list[dict[str, Any]],
-    tool_results: list[dict[str, Any]],
-) -> ToolSelectionResult:
-    """For tool-result turns, keep only the tool(s) already in use."""
-    used_names: set[str] = set()
-    for tr in tool_results:
-        name = tr.get("name") or ""
-        if not name and isinstance(tr.get("result"), str):
-            try:
-                parsed = json.loads(tr["result"])
-                name = parsed.get("name", "")
-            except Exception:
-                pass
-        if name:
-            used_names.add(name)
-    if used_names:
-        filtered = [
-            t for t in tools_schema
-            if t.get("function", {}).get("name", "") in used_names
-        ]
-        logger.info("Tool result turn: keeping %s", used_names)
-        return ToolSelectionResult(tools=filtered)
-    return ToolSelectionResult(tools=tools_schema)
-
-
 @router.post("/chat/turn")
 async def chat_turn(
     request: ChatTurnRequest,
@@ -2023,7 +1748,10 @@ async def chat_turn(
                 _turn_chain_id = str(uuid7())
                 _user_query_event_id = str(uuid7())
 
-            # Detect tool changes: compare new edge_tools with cached set.
+            # ── Unified Tool Registry ────────────────────────────────────
+            # All tools (edge + cloud) go into one registry. Selection is
+            # handled by the registry: pinned tools always included, dynamic
+            # tools selected via intent/prefilter/embedding per request.
             tools_changed = False
             existing = _peek_session_entry(session_id)
             if request.edge_tools:
@@ -2033,44 +1761,57 @@ async def chat_turn(
                 entry = _get_or_create_session_entry(session_id)
                 entry["tools"] = request.edge_tools
                 _session_cache[session_id] = entry
+
             tools_schema = (existing or {}).get("tools", []) if not request.edge_tools else request.edge_tools
 
-            # Merge cloud skill schemas into tools_schema so LLM can call them.
-            # Cloud skills are executed server-side (not sent to edge).
-            # Only inject when edge is in tool-calling mode (sent edge_tools).
             cloud_skill_names: set[str] = set()
             cloud_registry = None
-            merged_tools_schema = tools_schema
             _cloud_tool_calls_for_persist: list[dict[str, Any]] = []
             _cloud_tool_results_for_persist: list[dict[str, Any]] = []
+
+            # Build unified registry from all sources
+            from core.skills.tool_registry import ToolRegistry, ToolSource
+            _turn_registry = _get_session_tool_registry(session_id, tools_schema)
+
+            # Add cloud skills
             if tools_schema:
                 try:
                     cloud_registry = _get_shared_skill_registry()
                     cloud_schemas = _get_cloud_skill_schemas(cloud_registry)
                     edge_tool_names = _tool_names(tools_schema)
-                    cloud_schemas = [s for s in cloud_schemas
-                                    if s.get("function", {}).get("name", "") not in edge_tool_names]
-                    cloud_skill_names = {s.get("function", {}).get("name", "") for s in cloud_schemas}
-                    if cloud_schemas:
-                        merged_tools_schema = tools_schema + cloud_schemas
+                    for cs in cloud_schemas:
+                        cs_name = cs.get("function", {}).get("name", "")
+                        if cs_name and cs_name not in edge_tool_names:
+                            cloud_skill_names.add(cs_name)
+                            _turn_registry.register_schema(
+                                cs, ToolSource.CLOUD, pinned=False,
+                            )
                 except Exception as e:
                     logger.debug("Cloud skill loading skipped: %s", e)
 
             import asyncio
 
-            # ── Tool selection optimization ──────────────────────────────
-            # Delegates to select_tools_for_turn() (extracted for testability).
-            # Pass server-side history so ConversationState can see previous
-            # tool_calls (e.g. list_prs in turn 1) for multi-turn continuity.
+            # ── Tool selection via unified registry ──────────────────────
+            user_query = next(
+                (m.get("content", "") for m in request.messages if m.get("role") == "user"),
+                "",
+            )
             _cached_entry = _peek_session_entry(session_id)
             _cached_history = (_cached_entry or {}).get("history") if _cached_entry else None
-            _sel = select_tools_for_turn(
-                merged_tools_schema, request.messages, request.tool_results,
-                user_id, _get_shared_llm_client(),
-                session_history=_cached_history,
-            )
-            effective_tools_schema = _sel.tools
-            _high_confidence_skill = _sel.selected_tool
+
+            if request.tool_results and not user_query:
+                # Tool-result turn: keep only tools already in use
+                used_names = {tr.get("name", "") for tr in request.tool_results if tr.get("name")}
+                effective_tools_schema = [
+                    t.schema for t in _turn_registry.all_tools()
+                    if t.name in used_names
+                ] or _turn_registry.get_all_schemas()
+            else:
+                effective_tools_schema = _turn_registry.select(
+                    user_query=user_query,
+                    messages=_cached_history or request.messages,
+                )
+            _high_confidence_skill = None
 
             def _build_sync():
                 db = SessionLocal()
@@ -2463,7 +2204,7 @@ async def chat_turn(
             if request.explain:
                 _total_ms = round((time.monotonic() - _turn_start) * 1000)
                 _tool_count = len(effective_tools_schema) if effective_tools_schema else 0
-                _all_count = len(merged_tools_schema) if merged_tools_schema else 0
+                _all_count = _turn_registry.size if _turn_registry else _tool_count
                 explain_event: dict[str, Any] = {
                     "type": "explain",
                     "total_ms": _total_ms,
@@ -2472,7 +2213,7 @@ async def chat_turn(
                     "tools_selected": _tool_count,
                     "tools_available": _all_count,
                     "tool_selection": _high_confidence_skill,
-                    "tool_selection_fallback": _sel.fallback_reason,
+                    "tool_selection_fallback": None,
                     "steps": _explain_steps,
                 }
                 if _memory_stats:

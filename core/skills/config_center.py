@@ -5,6 +5,8 @@ Design doc: docs/design/skills-and-tools.md §13
 
 from __future__ import annotations
 
+import base64
+import hashlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -16,9 +18,22 @@ from core.logging_config import get_logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from core.skills.credential_manager import CredentialManager
-
 logger = get_logger(__name__)
+
+
+class CredentialManager:
+    """Encrypt/decrypt skill credentials using Fernet (AES-128-CBC)."""
+
+    def __init__(self, secret_key: str):
+        from cryptography.fernet import Fernet
+        key = hashlib.sha256(secret_key.encode()).digest()
+        self._fernet = Fernet(base64.urlsafe_b64encode(key))
+
+    def encrypt(self, plaintext: str) -> str:
+        return self._fernet.encrypt(plaintext.encode()).decode()
+
+    def decrypt(self, ciphertext: str) -> str:
+        return self._fernet.decrypt(ciphertext.encode()).decode()
 
 ScopeType = Literal["user", "tenant", "global"]
 _SCOPE_CHAIN: list[ScopeType] = ["user", "tenant", "global"]

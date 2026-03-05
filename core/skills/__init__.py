@@ -9,10 +9,7 @@ from .base import (
     SkillRequirement,
 )
 from .catalog import NameConflictError, SkillCatalog
-
-# Backward-compat alias lives in registry.py (the canonical shim).
-# Re-export here so ``from core.skills import SkillRegistry`` works.
-from .registry import SkillRegistry
+from .tool_registry import ToolEntry, ToolRegistry, ToolSource
 
 __all__ = [
     "AccessScope",
@@ -22,6 +19,8 @@ __all__ = [
     "SkillCatalog",
     "SkillInput",
     "SkillOutput",
-    "SkillRegistry",
     "SkillRequirement",
+    "ToolEntry",
+    "ToolRegistry",
+    "ToolSource",
 ]

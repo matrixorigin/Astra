@@ -44,8 +44,7 @@ class DummySkill(Skill[DummyInput, DummyOutput]):
 
 @pytest.fixture
 def registry():
-    from core.skills.registry import SkillRegistry
-    reg = MagicMock(spec=SkillRegistry)
+    reg = MagicMock()
     skill = DummySkill()
     reg.get.return_value = skill
     reg._skills = {"dummy_skill": skill}

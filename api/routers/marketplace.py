@@ -6,28 +6,32 @@ from pydantic import BaseModel
 from api.database import SessionLocal
 from api.dependencies import get_current_user
 from config.settings import get_settings
-from core.skills.credential_manager import CredentialManager
-from core.skills.resolver import CircularDependencyError, DependencyConflictError
-from core.skills.skill_manager import (
-    PermissionDeniedError,
-    SkillManager,
-    SkillNotFoundError,
-    SkillNotInstalledError,
-)
+# Removed: credential_manager, resolver, skill_manager modules deleted
+
+# Exception stubs for deleted modules
+class PermissionDeniedError(Exception):
+    pass
+
+class SkillNotFoundError(Exception):
+    pass
+
+class SkillNotInstalledError(Exception):
+    pass
+
+class CircularDependencyError(Exception):
+    pass
+
+class DependencyConflictError(Exception):
+    pass
 
 router = APIRouter()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _mgr() -> SkillManager:
-    """Build SkillManager with SessionLocal factory.
-
-    Each SkillManager method creates its own short-lived session via the
-    factory, so this helper is stateless and safe to call per-request.
-    """
-    settings = get_settings()
-    return SkillManager(SessionLocal, CredentialManager(settings.secret_key))
+def _mgr():
+    """Stubbed out - SkillManager module deleted."""
+    raise NotImplementedError('Module removed in skill system cleanup')
 
 
 # ── request / response models ────────────────────────────────────────────────
@@ -195,8 +199,8 @@ def publish_skill(
     _user: dict = Depends(get_current_user),
 ):
     """Publish a skill: draft → active. Triggers regression gate if configured."""
-    from core.skills.registry import SkillRegistry
-    registry = SkillRegistry(SessionLocal)
+    from core.skills.catalog import SkillCatalog
+    registry = SkillCatalog(SessionLocal)
     try:
         registry.publish(skill_name)
     except ValueError as e:
@@ -210,8 +214,8 @@ def deprecate_skill(
     _user: dict = Depends(get_current_user),
 ):
     """Deprecate a skill: active → deprecated."""
-    from core.skills.registry import SkillRegistry
-    registry = SkillRegistry(SessionLocal)
+    from core.skills.catalog import SkillCatalog
+    registry = SkillCatalog(SessionLocal)
     try:
         registry.deprecate(skill_name)
     except ValueError as e:

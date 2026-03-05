@@ -65,11 +65,7 @@ class WriteFileTool(EdgeTool):
         self._root = project_root
 
     name = "write_file"
-    description = (
-        "Create a NEW file with the given content. "
-        "For editing existing files, use str_replace instead — "
-        "write_file on large existing files will fail due to output token limits."
-    )
+    description = "Create a new file. Use str_replace to edit existing files."
     parameters = {
         "type": "object",
         "properties": {
@@ -98,10 +94,8 @@ class StrReplaceTool(EdgeTool):
 
     name = "str_replace"
     description = (
-        "The primary tool for editing files. Replaces an exact string occurrence in a file. "
-        "old_str must match exactly one location in the file (include enough context lines to be unique). "
-        "To delete code, set new_str to empty string. "
-        "For multiple edits to the same file, call this tool multiple times."
+        "Edit files by replacing an exact string. old_str must match exactly once. "
+        "Use empty new_str to delete."
     )
     parameters = {
         "type": "object",
@@ -145,10 +139,7 @@ class ListDirTool(EdgeTool):
         self._ignore_spec = load_gitignore(project_root)
 
     name = "list_dir"
-    description = (
-        "List directory contents. Directories show (N files) count. "
-        "Use depth>1 to expand subdirectories. Set include_ignored=true to include gitignored files."
-    )
+    description = "List directory contents. Use depth>1 to expand subdirectories."
     parameters = {
         "type": "object",
         "properties": {

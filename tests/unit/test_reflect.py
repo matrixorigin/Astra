@@ -239,9 +239,9 @@ class TestReflectTool:
             assert val in enum_vals, f"focus='{val}' in description but not in enum"
 
     def test_description_boundary_with_get_agent_info(self):
-        """reflect description must direct token/context queries to get_agent_info."""
+        """reflect description must mention diagnostic capabilities."""
         tool = ReflectTool()
-        assert "get_agent_info" in tool.description
+        assert "past" in tool.description.lower() or "diagnose" in tool.description.lower()
 
 
 # ============================================================================

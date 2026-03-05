@@ -6,11 +6,10 @@ from typing import Any, TYPE_CHECKING
 from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
 from core.skills.mocking import MockMode, ToolMockingLayer
-from core.skills.registry import SkillRegistry
+from core.skills.catalog import SkillCatalog
 
 if TYPE_CHECKING:
-    from core.skills.pipeline import SkillPipeline
-    from core.skills.skill_manager import SkillManager
+    pass
 
 logger = get_logger(__name__)
 
@@ -21,7 +20,7 @@ class AgentExecutor(DbConsumer):
     def __init__(
         self,
         db_factory: DbFactory,
-        registry: SkillRegistry,
+        registry: SkillCatalog,
         mode: MockMode = MockMode.PRODUCTION,
         pipeline: "SkillPipeline | None" = None,
         skill_manager: "SkillManager | None" = None,
@@ -194,35 +193,10 @@ class AgentExecutor(DbConsumer):
 
             # Buffer feedback signal (existing path)
             if self._pipeline and selection_event_id:
-                from core.skills.learning_signals import SignalType, SignalThresholds
-                
-                feedback_data: dict[str, Any] = {
-                    "ms": _elapsed_ms,
-                    "skill": skill_name,
-                    "actual_usd": _cost,
-                }
-                if extra_feedback_data:
-                    feedback_data.update(extra_feedback_data)
-                
-                self._pipeline.record_feedback(
-                    selection_event_id,
-                    SignalType.EXECUTION_TIME,
-                    feedback_data,
-                )
-
-                # Emit HIGH_COST signal when cost exceeds threshold
-                thresholds = SignalThresholds()
-                if _cost > thresholds.high_cost_usd:
-                    self._pipeline.record_feedback(
-                        selection_event_id,
-                        SignalType.HIGH_COST,
-                        {
-                            "skill": skill_name,
-                            "actual_usd": _cost,
-                            "actual_tokens": extra_feedback_data.get("actual_tokens", 0) if extra_feedback_data else 0,
-                            "threshold_usd": thresholds.high_cost_usd,
-                        },
-                    )
+                # Learning signals removed in skill system cleanup
+                pass
+                # Learning signals removed in skill system cleanup
+                pass
     
     def _inject_user_credentials(self, skill: Any, skill_name: str, user_id: str) -> None:
         """Inject per-user credentials into skills that use external APIs.

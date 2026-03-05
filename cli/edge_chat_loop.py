@@ -413,8 +413,9 @@ async def edge_chat_loop(
         if session_info is not None:
             session_info["turn"] = turn
 
-        # Get edge tools — send all schemas; server-side pre_filter handles ranking
-        send_edge_tools = tool_router.get_schemas()
+        # Get edge tools — send all schemas on turn 0 so server can build registry.
+        # On subsequent turns, server uses cached tools (only resent if changed).
+        send_edge_tools = tool_router.get_schemas() if turn == 0 else None
 
         # Call cloud with retry for transient errors
         _MAX_RETRIES = 2

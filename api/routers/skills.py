@@ -199,13 +199,7 @@ async def publish_skill(
 @router.post("/scaffold")
 async def scaffold_skill(spec_data: dict[str, Any]):
     """Generate skill package from YAML spec. Returns file contents as JSON."""
-    from core.skills.scaffold import SkillSpec, generate_files
-
-    try:
-        spec = SkillSpec.from_dict(spec_data)
-        return generate_files(spec)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    raise NotImplementedError('Module removed in skill system cleanup')
 
 
 # Parameterized routes AFTER static routes.
