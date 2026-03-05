@@ -1,6 +1,7 @@
-"""Tests for Tier 0 dual engine + dataclasses + correction detection.
+"""Tests for Tier 0 dual engine + dataclasses + correction detection + router registry.
 
-Covers: RoutingResult, ContextLoadingPlan, INTENT_PLANS, Tier0Engine, detect_correction.
+Covers: RoutingResult, ContextLoadingPlan, INTENT_PLANS, Tier0Engine, detect_correction,
+        RoutingStrategy, register_router, get_router, list_routers.
 """
 
 import pytest
@@ -8,9 +9,11 @@ import pytest
 from core.context.intent_routing import (
     INTENT_PLANS,
     ContextLoadingPlan,
+    RoutingDecision,
     RoutingResult,
     Tier0Engine,
     detect_correction,
+    list_routers,
 )
 
 
@@ -191,3 +194,84 @@ class TestCorrectionDetection:
     ])
     def test_no_correction(self, query):
         assert detect_correction(query) is False
+
+
+# ============================================================================
+# Router Registry
+# ============================================================================
+
+class TestRouterRegistry:
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        """Ensure custom routers registered in tests don't leak to other tests."""
+        from core.context.intent_routing import _reset_registry_for_testing
+        yield
+        _reset_registry_for_testing()
+
+    def test_default_registered(self):
+        assert "default" in list_routers()
+
+    def test_get_default_returns_intent_router(self):
+        from core.context.intent_routing import get_router, IntentRouter
+        from unittest.mock import MagicMock
+        r = get_router("default", db_factory=MagicMock())
+        assert isinstance(r, IntentRouter)
+
+    def test_get_unknown_raises_key_error(self):
+        from core.context.intent_routing import get_router
+        from unittest.mock import MagicMock
+        with pytest.raises(KeyError):
+            get_router("nonexistent", db_factory=MagicMock())
+
+    def test_duplicate_registration_raises_value_error(self):
+        from core.context.intent_routing import register_router
+        @register_router("dup_test")
+        class First:
+            def __init__(self, db_factory): pass
+        with pytest.raises(ValueError, match="already registered"):
+            @register_router("dup_test")
+            class Second:
+                def __init__(self, db_factory): pass
+
+    def test_register_and_instantiate_custom_router(self):
+        from core.context.intent_routing import register_router, get_router, RoutingStrategy
+        from unittest.mock import MagicMock
+
+        @register_router("test_custom")
+        class CustomRouter:
+            def __init__(self, db_factory):
+                self.db_factory = db_factory
+            async def route(self, query, history_len=0, memory_text=None,
+                          tool_names=None, force_intent=None):
+                return RoutingDecision(
+                    plan=INTENT_PLANS["question"],
+                    routing_result=RoutingResult(
+                        intent="question", confidence=1.0, tier=0, matched_by="custom",
+                    ),
+                )
+
+        assert "test_custom" in list_routers()
+        r = get_router("test_custom", db_factory=MagicMock())
+        assert isinstance(r, RoutingStrategy)
+        assert r.db_factory is not None  # verify db_factory was passed
+
+    def test_list_routers_sorted(self):
+        from core.context.intent_routing import register_router
+        @register_router("zzz_last")
+        class Z:
+            def __init__(self, db_factory): pass
+        @register_router("aaa_first")
+        class A:
+            def __init__(self, db_factory): pass
+        names = list_routers()
+        assert names == sorted(names)
+
+    def test_reset_preserves_default_only(self):
+        from core.context.intent_routing import register_router, _reset_registry_for_testing
+        @register_router("ephemeral")
+        class E:
+            def __init__(self, db_factory): pass
+        assert "ephemeral" in list_routers()
+        _reset_registry_for_testing()
+        assert "ephemeral" not in list_routers()
+        assert "default" in list_routers()

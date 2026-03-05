@@ -220,6 +220,7 @@ class ChatTurnRequest(BaseModel):
     edge_tools: list[dict[str, Any]] | None = Field(default=None, description="Edge tool schemas (OpenAI format)")
     edge_profile: EdgeProfileModel | None = Field(default=None, description="Edge project profile (cwd, git_branch, languages, project_type)")
     explain: bool | str = Field(default=False, description="Execution trace: true for normal, 'verbose' for detailed with content previews")
+    router: str | None = Field(default=None, description="Routing strategy name (default: env ROUTING_STRATEGY or 'default')")
 
 
 class ChatResponse(BaseModel):
@@ -2074,7 +2075,7 @@ async def chat_turn(
                 logger.debug("Model override '%s' → skip intent routing", request.model)
             else:
                 try:
-                    from core.context.intent_routing import IntentRouter, detect_correction
+                    from core.context.intent_routing import IntentRouter, detect_correction, get_router
                     from core.context.routing_metrics import active_request_context
                     from core.metrics import (
                         adaptive_threshold_value, intent_correction_total,
@@ -2083,7 +2084,12 @@ async def chat_turn(
                         routing_requests_total,
                     )
 
-                    _ir = IntentRouter(SessionLocal)
+                    _router_name = request.router or os.environ.get("ROUTING_STRATEGY", "default")
+                    try:
+                        _ir = get_router(_router_name, SessionLocal)
+                    except KeyError:
+                        logger.warning("Unknown router '%s', falling back to default", _router_name)
+                        _ir = IntentRouter(SessionLocal)
                     _force = "question" if (user_query and detect_correction(user_query)) else None
                     _history_len = len((_cached_entry or {}).get("history") or []) if _cached_entry else 0
                     _routing_tool_names = [t.get("function", {}).get("name", "") for t in (tools_schema or [])]

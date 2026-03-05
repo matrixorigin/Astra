@@ -446,6 +446,7 @@ class APIClient:
         edge_tools: list[dict[str, Any]] | None = None,
         edge_profile: dict[str, Any] | None = None,
         explain: bool | str = False,
+        router: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Call /chat/turn — one LLM turn in the edge-cloud loop (with auto-refresh).
 
@@ -468,6 +469,8 @@ class APIClient:
             payload["edge_profile"] = edge_profile
         if explain:
             payload["explain"] = explain if isinstance(explain, str) else True
+        if router:
+            payload["router"] = router
 
         async for event in self._sse_stream("POST", "/chat/turn", json=payload):
             yield event

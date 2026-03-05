@@ -386,6 +386,7 @@ async def edge_chat_loop(
     session_info: dict[str, Any] | None = None,
     extra_rules: str | None = None,
     explain: bool | str = False,
+    routing_strategy: str | None = None,
 ) -> ChatLoopResult:
     """Run the edge-cloud agentic loop until final answer or MAX_TURNS.
 
@@ -433,6 +434,7 @@ async def edge_chat_loop(
                     edge_tools=send_edge_tools,
                     edge_profile=edge_profile if turn == 0 else None,
                     explain=explain,
+                    router=routing_strategy,
                 )
                 result = await _consume_turn(sse_stream, renderer, suppress_prefix=prev_turn_text)
                 if result.error and result.error.get("retryable") and attempt < _MAX_RETRIES:

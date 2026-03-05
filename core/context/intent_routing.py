@@ -16,7 +16,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from core.db_consumer import DbFactory
 
@@ -71,6 +71,84 @@ INTENT_PLANS: dict[str, ContextLoadingPlan] = {
 
 # Full-context fallback plan (same as question)
 _FALLBACK_PLAN = INTENT_PLANS["question"]
+
+
+# ---------------------------------------------------------------------------
+# Router Protocol + Registry
+#
+# Routers are registered at import time via @register_router("name").
+# All implementations must accept (db_factory: DbFactory) as sole __init__ arg.
+# For strategies needing extra config, read from env vars or DB in __init__.
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class RoutingStrategy(Protocol):
+    """Interface for pluggable routing strategies.
+
+    Implement this to create custom routers for A/B experiments,
+    regression testing, or parameter tuning.
+
+    Contract:
+        - __init__(self, db_factory: DbFactory) — sole constructor signature
+        - route() must return RoutingDecision (runtime_checkable only verifies
+          method existence, not return type — enforce via integration tests)
+    """
+
+    async def route(
+        self,
+        query: str,
+        history_len: int = 0,
+        memory_text: str | None = None,
+        tool_names: list[str] | None = None,
+        force_intent: str | None = None,
+    ) -> RoutingDecision: ...
+
+
+_ROUTER_REGISTRY: dict[str, type] = {}
+_registry_lock = __import__("threading").Lock()
+
+
+def register_router(name: str):
+    """Decorator to register a routing strategy by name.
+
+    Raises ValueError if name is already registered (prevents silent override).
+    """
+    def _wrap(cls: type) -> type:
+        with _registry_lock:
+            if name in _ROUTER_REGISTRY:
+                raise ValueError(
+                    f"Router '{name}' already registered by {_ROUTER_REGISTRY[name].__name__}; "
+                    f"cannot re-register with {cls.__name__}"
+                )
+            _ROUTER_REGISTRY[name] = cls
+        return cls
+    return _wrap
+
+
+def get_router(name: str, db_factory: DbFactory) -> RoutingStrategy:
+    """Instantiate a registered router by name.
+
+    Raises KeyError if name is not registered.
+    """
+    with _registry_lock:
+        cls = _ROUTER_REGISTRY[name]
+    return cls(db_factory=db_factory)
+
+
+def list_routers() -> list[str]:
+    """Return sorted names of all registered routers."""
+    with _registry_lock:
+        return sorted(_ROUTER_REGISTRY.keys())
+
+
+def _reset_registry_for_testing() -> None:
+    """Remove all non-default routers. Test-only — never call in production."""
+    with _registry_lock:
+        default_cls = _ROUTER_REGISTRY.get("default")
+        _ROUTER_REGISTRY.clear()
+        if default_cls:
+            _ROUTER_REGISTRY["default"] = default_cls
+
 
 # ---------------------------------------------------------------------------
 # Tier 0: Regex + Heuristic Dual Engine
@@ -252,6 +330,7 @@ class Tier1Engine:
 # IntentRouter — Full Cascade Orchestrator
 # ---------------------------------------------------------------------------
 
+@register_router("default")
 class IntentRouter:
     """Tier 0 → adaptive threshold → Tier 1 → threshold → fallback."""
 

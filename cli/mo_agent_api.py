@@ -1240,7 +1240,7 @@ SLASH_COMMANDS = {
 # Edge turn runner
 # ============================================================================
 
-async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False, session_info=None):
+async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, auto_approve, renderer=None, extra_rules=None, explain=False, session_info=None, routing_strategy=None):
     """Run one edge chat loop turn using the provided APIClient."""
     import os
 
@@ -1300,6 +1300,7 @@ async def _run_edge_turn(user_input, api_client, session_id, model, agent_id, au
         renderer=renderer,
         extra_rules=extra_rules,
         explain=explain,
+        routing_strategy=routing_strategy,
     )
 
 
@@ -1373,12 +1374,13 @@ def logout(ctx):
 @click.option("--user-id", default="cli_user")
 @click.option("--session-id", default=None)
 @click.option("--model", default=None, help="Model to use for chat")
+@click.option("--router", "routing_strategy", default=None, help="Routing strategy (e.g. 'default', 'experiment_v2')")
 @click.option("--resume", is_flag=True, help="Resume last session")
 @click.option("--auto-approve", is_flag=True, help="Auto-approve tool execution")
 @click.option("--debug", is_flag=True, help="Print full traceback on errors")
 @click.option("--explain", is_flag=True, help="Show per-turn execution trace (like EXPLAIN ANALYZE)")
 @click.pass_context
-def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
+def chat(ctx, user_id, session_id, model, routing_strategy, resume, auto_approve, debug, explain):
     """Start interactive chat with edge tool execution."""
     from rich.console import Console
     from rich.panel import Panel
@@ -1591,6 +1593,7 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                     extra_rules=skill_dev_rules,
                     explain=should_explain,
                     session_info=state["session_info"],
+                    routing_strategy=routing_strategy,
                 ))
                 result_text = loop_result.text
                 if hasattr(renderer, "end_response"):
