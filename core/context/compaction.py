@@ -30,6 +30,10 @@ _TOOL_CLEARED = "[tool output cleared — already processed]"
 # Max chars for a single tool result in the message chain (~2K tokens)
 MAX_TOOL_RESULT_CHARS = 8000
 
+# Max chars for tool result stored in DB for audit/reflect (~1.2K tokens).
+# Must be large enough for reflect to reconstruct diagnostics from history.
+MAX_TOOL_RESULT_AUDIT_CHARS = 4000
+
 
 _COMPACT_HISTORY_THRESHOLD = 60000  # chars; trigger lightweight compaction above this
 _COMPACT_TOOL_KEEP_CHARS = 500     # chars to keep from old tool results

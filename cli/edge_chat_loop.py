@@ -223,7 +223,9 @@ async def _consume_turn(
                     result.session_id = event.get("session_id")
                     result.run_id = event.get("run_id")
                 elif etype == "usage":
-                    result.usage = {k: v for k, v in event.items() if k != "type"}
+                    for k, v in event.items():
+                        if k != "type" and isinstance(v, int):
+                            result.usage[k] = result.usage.get(k, 0) + v
                 elif etype == "turn_complete":
                     result.has_tool_calls = event.get("has_tool_calls", False)
                 elif etype == "explain":

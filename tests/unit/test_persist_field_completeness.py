@@ -230,14 +230,15 @@ class TestPersistFieldCompleteness:
         assert meta["name"] == "read_file"
         assert tr_events[0]["skill_name"] == "read_file"
 
-    def test_tool_result_content_truncated_at_2000(self):
-        """tool_result content should truncate result to 2000 chars."""
-        long_result = "x" * 3000
+    def test_tool_result_content_truncated_at_audit_limit(self):
+        """tool_result content should truncate result to audit limit."""
+        from core.context.compaction import MAX_TOOL_RESULT_AUDIT_CHARS
+        long_result = "x" * (MAX_TOOL_RESULT_AUDIT_CHARS + 1000)
         tr = [{"tool_call_id": "tc1", "name": "bash", "result": long_result}]
         c = self._run_persist(tool_results=tr, messages=[])
         tr_events = [e for e in c["stream_events"] if e["event_type"] == "tool_result"]
         content = json.loads(tr_events[0]["content"])
-        assert len(content["result"]) == 2000
+        assert len(content["result"]) == MAX_TOOL_RESULT_AUDIT_CHARS
 
     def test_introspection_tool_result_flagged(self):
         """get_agent_info tool_result should have introspection=True in metadata."""

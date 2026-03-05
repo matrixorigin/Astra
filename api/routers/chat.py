@@ -718,6 +718,8 @@ class _LRUDict(OrderedDict):
 _SESSION_TTL = 86400  # 24 hours in seconds
 # Persist a full history snapshot every N turns (reduces DB write volume).
 _SNAPSHOT_TURN_INTERVAL = 3
+# Max chars for tool result stored in DB for audit/reflect diagnostics.
+from core.context.compaction import MAX_TOOL_RESULT_AUDIT_CHARS as _AUDIT_CHARS
 
 
 class _SessionCache(_LRUDict):
@@ -1318,7 +1320,7 @@ def _persist_turn_events(
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
                     event_type="tool_result",
-                    content=json.dumps({"name": tr_name, "result": tr.get("result", "")[:2000]}),
+                    content=json.dumps({"name": tr_name, "result": tr.get("result", "")[:_AUDIT_CHARS]}),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
                     metadata=meta,
@@ -1389,7 +1391,7 @@ def _persist_turn_events(
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
                     event_type="tool_result",
-                    content=json.dumps({"name": ctr_name, "result": ctr.get("result", "")[:2000]}),
+                    content=json.dumps({"name": ctr_name, "result": ctr.get("result", "")[:_AUDIT_CHARS]}),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
                     metadata={
@@ -2187,7 +2189,7 @@ async def chat_turn(
                         _cloud_tool_results_for_persist.append({
                             "tool_call_id": tc_id,
                             "name": tc_name,
-                            "result": cloud_result[:2000],
+                            "result": cloud_result[:_AUDIT_CHARS],
                         })
                         yield f"data: {json.dumps({'type': 'cloud_tool_result', 'name': tc_name, 'result': cloud_result[:500]})}\n\n"
                         # Truncate before quality assessment (assess full, truncate for LLM)
