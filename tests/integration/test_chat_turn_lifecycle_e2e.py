@@ -222,7 +222,7 @@ class TestChatTurnMultiTurnE2E:
 
         # ── Turn 2: new query triggers refresh_memory with different memory ──
         # Mock _build_memory to return distinctive content for the new query
-        def _mock_build_memory(self_pa, user_id, session_id, query, explain=False):
+        def _mock_build_memory(self_pa, user_id, session_id, query, explain=False, verbose=False):
             if "explain" in query:
                 return "## Refreshed Memory\nUser previously asked about main.py and got tool results.", None
             return None, None
@@ -294,7 +294,7 @@ class TestChatTurnMultiTurnE2E:
         memory_queries: list[str] = []
         original_build_memory = None
 
-        def _tracking_build_memory(self_pa, user_id, session_id, query, explain=False):
+        def _tracking_build_memory(self_pa, user_id, session_id, query, explain=False, verbose=False):
             memory_queries.append(query)
             return f"## Memory for: {query}", None
 

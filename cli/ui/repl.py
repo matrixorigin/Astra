@@ -19,7 +19,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/skill new", "Create a new skill"),
     ("/skill test", "Test a skill"),
     ("/skill dev", "AI-assisted skill development"),
-    ("/explain", "Toggle explain mode (shows stats after each turn)"),
+    ("/explain", "Toggle explain mode: off → on → verbose → off"),
     ("/verbose", "Show status bar"),
     ("/compact", "Hide status bar"),
     ("/history", "Show recent turns"),

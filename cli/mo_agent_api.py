@@ -122,7 +122,7 @@ def cmd_help(console, **_):
         ("/skill dev <name>", "Enter AI-assisted skill dev mode"),
         ("/skill doctor", "Check skill health (orphaned, broken, mismatched)"),
         ("/skill config <name>", "Show/manage skill configuration"),
-        ("/explain", "Toggle explain mode (auto-show stats after each turn)"),
+        ("/explain", "Toggle explain mode: off → on → verbose → off"),
         ("/verbose", "Show status bar"),
         ("/compact", "Hide status bar"),
         ("/history", "Show recent turns"),
@@ -1187,26 +1187,35 @@ def cmd_explain(console, state=None, cmd_arg=None, **_):
         /explain        - Toggle explain mode on/off
         /explain on     - Enable explain mode
         /explain off    - Disable explain mode
+        /explain verbose - Enable verbose mode (includes content previews)
 
     When enabled, shows stats after each response:
-        - Memory retrieval: keyword/vector hits, candidates, timing
+        - Memory retrieval: L0 profile, L1 keyword/vector hits, candidates, timing
         - LLM: tokens in/out, tool calls
         - Cloud skills: bytes in/out
+    Verbose adds: profile preview, memory content previews, per-phase timing.
     """
     if cmd_arg in ("on", "1", "true"):
         state["explain_mode"] = True
         console.print("[green]✓[/green] Explain mode [bold]ON[/bold] — will show stats after each turn")
+    elif cmd_arg == "verbose":
+        state["explain_mode"] = "verbose"
+        console.print("[green]✓[/green] Explain mode [bold]VERBOSE[/bold] — will show detailed stats + content previews")
     elif cmd_arg in ("off", "0", "false"):
         state["explain_mode"] = False
         console.print("[dim]Explain mode OFF[/dim]")
     else:
-        # Toggle
+        # Toggle: off → on → verbose → off
         current = state.get("explain_mode", False)
-        state["explain_mode"] = not current
-        if state["explain_mode"]:
+        if not current:
+            state["explain_mode"] = True
             console.print("[green]✓[/green] Explain mode [bold]ON[/bold] — will show stats after each turn")
-        else:
+        elif current == "verbose":
+            state["explain_mode"] = False
             console.print("[dim]Explain mode OFF[/dim]")
+        else:
+            state["explain_mode"] = "verbose"
+            console.print("[green]✓[/green] Explain mode [bold]VERBOSE[/bold] — will show detailed stats + content previews")
 
 
 SLASH_COMMANDS = {
@@ -1557,7 +1566,16 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                     skill_dev_rules = state.get("skill_dev_context")
 
                 # Determine if explain is enabled (CLI flag or interactive toggle)
-                should_explain = explain or state.get("explain_mode", False)
+                # explain_mode can be: False, True, or "verbose"
+                _explain_mode = state.get("explain_mode", False)
+                should_explain = explain or _explain_mode
+                # Resolve to the value edge_chat_loop expects: False, True, or "verbose"
+                if _explain_mode == "verbose":
+                    should_explain = "verbose"
+                elif explain or _explain_mode:
+                    should_explain = True
+                else:
+                    should_explain = False
 
                 # Sync mutable fields from state into session_info before each turn,
                 # so /model and /clear changes are visible to GetAgentInfoTool.
@@ -1583,7 +1601,7 @@ def chat(ctx, user_id, session_id, model, resume, auto_approve, debug, explain):
                 # Auto-print explain after stats
                 if should_explain and loop_result.explain_turns:
                     from cli.edge_chat_loop import _print_explain
-                    _print_explain(loop_result.explain_turns)
+                    _print_explain(loop_result.explain_turns, verbose=(should_explain == "verbose"))
 
                 # Post-turn: auto-validate if skill.py was modified
                 if state.get("skill_dev_dir") and skill_py_mtime_before is not None:

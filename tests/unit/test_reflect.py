@@ -668,6 +668,117 @@ class TestPrintExplain:
         finally:
             sys.stderr = old_stderr
 
+    def test_memory_l0_l1_shown(self):
+        """New flat structure: l0 and l1 stats rendered separately."""
+        import io
+        from cli.edge_chat_loop import _print_explain
+
+        buf = io.StringIO()
+        _print_explain([{
+            "turn": 0, "total_ms": 300,
+            "prompt_tokens": 100, "completion_tokens": 50,
+            "memory": {
+                "l0": {"loaded": True, "tokens": 20, "ms": 5},
+                "l1": {"loaded": True, "count": 2, "tokens": 50, "ms": 15},
+                "retrieval": {
+                    "keyword_hit": True, "phase1_candidates": 3,
+                    "vector_hit": False, "phase2_candidates": 0,
+                    "merged_candidates": 3, "final_count": 2, "total_ms": 12,
+                },
+                "total_ms": 20,
+            },
+            "steps": [],
+        }], file=buf)
+
+        output = buf.getvalue()
+        assert "L0 profile" in output
+        assert "✓" in output  # l0 loaded
+        assert "20 tokens" in output
+        assert "L1 retrieval" in output
+        assert "kw=✓(3)" in output
+        assert "50 tokens" in output
+
+    def test_memory_l0_not_loaded(self):
+        import io
+        from cli.edge_chat_loop import _print_explain
+
+        buf = io.StringIO()
+        _print_explain([{
+            "turn": 0, "total_ms": 100,
+            "prompt_tokens": 50, "completion_tokens": 20,
+            "memory": {
+                "l0": {"loaded": False, "tokens": 0, "ms": 1},
+                "retrieval": {"keyword_hit": False, "phase1_candidates": 0,
+                              "vector_hit": False, "phase2_candidates": 0,
+                              "merged_candidates": 0, "final_count": 0, "total_ms": 5},
+                "total_ms": 6,
+            },
+            "steps": [],
+        }], file=buf)
+
+        output = buf.getvalue()
+        assert "L0 profile  ✗" in output
+
+    def test_verbose_shows_previews(self):
+        import io
+        from cli.edge_chat_loop import _print_explain
+
+        buf = io.StringIO()
+        _print_explain([{
+            "turn": 0, "total_ms": 300,
+            "prompt_tokens": 100, "completion_tokens": 50,
+            "memory": {
+                "l0": {"loaded": True, "tokens": 20, "ms": 5,
+                       "preview": "- User prefers concise responses"},
+                "l1": {"loaded": True, "count": 2, "tokens": 50, "ms": 15,
+                       "previews": ["[semantic] Uses Python for data analysis",
+                                    "[procedural] Always run tests before commit"]},
+                "retrieval": {
+                    "keyword_hit": True, "phase1_candidates": 3,
+                    "vector_hit": False, "phase2_candidates": 0,
+                    "merged_candidates": 3, "final_count": 2, "total_ms": 12,
+                    "phase1_ms": 8, "phase2_ms": 0, "merge_ms": 4,
+                },
+                "total_ms": 20,
+            },
+            "steps": [],
+        }], file=buf, verbose=True)
+
+        output = buf.getvalue()
+        assert "VERBOSE" in output
+        assert "User prefers concise" in output
+        assert "Uses Python" in output
+        assert "phase1=" in output
+
+    def test_verbose_false_hides_previews(self):
+        import io
+        from cli.edge_chat_loop import _print_explain
+
+        buf = io.StringIO()
+        _print_explain([{
+            "turn": 0, "total_ms": 300,
+            "prompt_tokens": 100, "completion_tokens": 50,
+            "memory": {
+                "l0": {"loaded": True, "tokens": 20, "ms": 5,
+                       "preview": "- User prefers concise responses"},
+                "l1": {"loaded": True, "count": 2, "tokens": 50, "ms": 15,
+                       "previews": ["[semantic] Uses Python"]},
+                "retrieval": {
+                    "keyword_hit": True, "phase1_candidates": 3,
+                    "vector_hit": False, "phase2_candidates": 0,
+                    "merged_candidates": 3, "final_count": 2, "total_ms": 12,
+                    "phase1_ms": 8, "phase2_ms": 0, "merge_ms": 4,
+                },
+                "total_ms": 20,
+            },
+            "steps": [],
+        }], file=buf, verbose=False)
+
+        output = buf.getvalue()
+        assert "User prefers concise" not in output
+        assert "Uses Python" not in output
+        assert "phase1=" not in output
+
 
 class TestEscapeLike:
 

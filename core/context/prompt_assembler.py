@@ -188,6 +188,7 @@ class PromptAssembler(DbConsumer):
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         username: str | None = None,
         explain: bool = False,
+        verbose: bool = False,
     ) -> AssembledPrompt:
         """
         Assemble system prompt with zone-based budget tracking.
@@ -197,6 +198,7 @@ class PromptAssembler(DbConsumer):
 
         Args:
             explain: If True, collect memory retrieval stats in result.memory_stats.
+            verbose: If True (requires explain), include content previews in stats.
         """
         sections: dict[str, str] = {}
         breakdown: dict[str, int] = {}
@@ -251,7 +253,7 @@ class PromptAssembler(DbConsumer):
 
         # §4 Memory (continuity + observations + few-shot)
         _mem_t0 = time.monotonic()
-        memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain)
+        memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain, verbose=verbose)
         _mem_duration_ms = (time.monotonic() - _mem_t0) * 1000
         if memory:
             sections["memory"] = memory
@@ -348,6 +350,7 @@ class PromptAssembler(DbConsumer):
         current_sections: dict[str, str],
         max_tokens: int = _DEFAULT_MAX_TOKENS,
         explain: bool = False,
+        verbose: bool = False,
     ) -> AssembledPrompt:
         """Refresh §4 (memory) and §5 (working memory) for turn 2+.
 
@@ -361,12 +364,13 @@ class PromptAssembler(DbConsumer):
 
         Args:
             explain: If True, collect memory retrieval stats in result.memory_stats.
+            verbose: If True (requires explain), include content previews in stats.
         """
         sections = dict(current_sections)
         breakdown: dict[str, int] = {}
 
         # Refresh memory
-        memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain)
+        memory, memory_stats = self._build_memory(user_id, session_id, user_query, explain=explain, verbose=verbose)
         if memory:
             sections["memory"] = memory
         else:
@@ -791,7 +795,8 @@ class PromptAssembler(DbConsumer):
             return None
 
     def _build_memory(
-        self, user_id: str, session_id: str, query: str, explain: bool = False,
+        self, user_id: str, session_id: str, query: str,
+        explain: bool = False, verbose: bool = False,
     ) -> tuple[str | None, dict[str, Any] | None]:
         """§4: Tiered memory (L0 profile + L1 query-relevant) + legacy fallbacks.
 
@@ -800,28 +805,55 @@ class PromptAssembler(DbConsumer):
 
         Returns:
             (section_text, stats) — stats is None when explain=False, otherwise a dict
-            containing only the fields that were actually populated (no None values).
+            with flat keys: l0, retrieval, few_shot. verbose adds content previews.
         """
         parts = []
-        # Only collect stats when explain=True. Build incrementally to avoid empty fields.
         stats: dict[str, Any] = {} if explain else {}
 
         # Primary: tiered memory system (L0 + L1)
         try:
             from core.memory.tiered_loader import TieredMemoryLoader
             loader = TieredMemoryLoader(self._db_factory)
-            tiered_section, retrieval_stats = loader.build_section(
+            tiered_section, tiered_stats = loader.build_section(
                 user_id, session_id, query, explain=explain,
             )
             if tiered_section:
                 parts.append(tiered_section)
-            if explain and retrieval_stats:
+            if explain and tiered_stats:
                 from dataclasses import asdict
-                stats["retrieval"] = asdict(retrieval_stats)
+                # Flatten: L0 stats at top level, retrieval nested properly
+                stats["l0"] = {
+                    "loaded": tiered_stats.l0_loaded,
+                    "tokens": tiered_stats.l0_tokens,
+                    "ms": round(tiered_stats.l0_ms, 1),
+                }
+                stats["l1"] = {
+                    "loaded": tiered_stats.l1_loaded,
+                    "count": tiered_stats.l1_count,
+                    "tokens": tiered_stats.l1_tokens,
+                    "ms": round(tiered_stats.l1_ms, 1),
+                }
+                if tiered_stats.retrieval:
+                    stats["retrieval"] = asdict(tiered_stats.retrieval)
+                stats["total_ms"] = round(tiered_stats.total_ms, 1)
+                # Verbose: add content previews
+                if verbose:
+                    l0_text = loader.load_l0(user_id)
+                    stats["l0"]["preview"] = l0_text[:200] if l0_text else None
+                    if tiered_stats.retrieval and tiered_stats.retrieval.final_count > 0:
+                        # Re-retrieve to get content (already cached in loader)
+                        memories, _ = loader.load_l1(
+                            user_id, session_id, query, explain=False,
+                        )
+                        if memories:
+                            stats["l1"]["previews"] = [
+                                line.strip() for line in memories.split("\n")
+                                if line.strip() and line.strip() != "Relevant Memories:"
+                            ][:5]
         except Exception as e:
             logger.debug("TieredMemoryLoader skipped: %s", e)
             if explain:
-                stats["retrieval"] = {"error": str(e)}
+                stats["error"] = str(e)
 
         # Few-shot examples
         try:

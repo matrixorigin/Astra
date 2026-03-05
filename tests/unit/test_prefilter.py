@@ -481,6 +481,96 @@ class TestPreFilterRules:
 # ── Real Failure Case Test ───────────────────────────────────────
 
 
+class TestMultiTurnContinuity:
+    """Rule 0: previous_skill boosted to front for multi-turn follow-ups."""
+
+    def test_previous_skill_boosted_to_front(self):
+        """When previous_skill exists and turn_count > 1, boost it."""
+        find_skills = MockSkill("find_skills", SkillTags(
+            scope="current_session", data_source="session_metadata",
+            intent_type=("introspect",), requires_history=False))
+        list_prs = MockSkill("list_prs", SkillTags(
+            scope="external", data_source="external_api",
+            intent_type=("fetch",), requires_history=False))
+        read_file = MockSkill("read_file", SkillTags(
+            scope="local", data_source="local_filesystem",
+            intent_type=("fetch",), requires_history=False))
+
+        state = ConversationState(previous_skill="list_prs", turn_count=2)
+        result, applied = pre_filter([find_skills, list_prs, read_file], state)
+
+        assert applied is True
+        assert result[0].name == "list_prs"
+        assert len(result) == 3  # never removes
+
+    def test_previous_skill_already_first_no_reorder(self):
+        """If previous_skill is already first, no reorder needed."""
+        list_prs = MockSkill("list_prs", SkillTags(
+            scope="external", data_source="external_api",
+            intent_type=("fetch",), requires_history=False))
+        other = MockSkill("other", tags=None)
+
+        state = ConversationState(previous_skill="list_prs", turn_count=2)
+        result, applied = pre_filter([list_prs, other], state)
+
+        # Already first — no change
+        assert applied is False
+
+    def test_turn_1_no_continuity(self):
+        """On turn 1, previous_skill should not trigger continuity."""
+        a = MockSkill("a", tags=None)
+        b = MockSkill("b", tags=None)
+
+        state = ConversationState(previous_skill="a", turn_count=1)
+        result, applied = pre_filter([b, a], state)
+
+        assert applied is False
+
+    def test_previous_skill_not_in_list(self):
+        """If previous_skill is not in the skill list, no crash."""
+        a = MockSkill("a", tags=None)
+        b = MockSkill("b", tags=None)
+
+        state = ConversationState(previous_skill="nonexistent", turn_count=2)
+        result, applied = pre_filter([a, b], state)
+
+        assert applied is False
+
+    def test_reproduces_session_019cbc98(self):
+        """Reproduce: 'tidb呢' after list_prs on matrixone.
+
+        Turn 1: user asks 'matrixone 最新的两个pr情况？' → list_prs succeeds.
+        Turn 2: user asks 'tidb呢' → should still prefer list_prs.
+        """
+        list_prs = MockSkill("list_prs", SkillTags(
+            scope="external", data_source="external_api",
+            intent_type=("fetch",), requires_history=False))
+        find_skills = MockSkill("find_skills", SkillTags(
+            scope="current_session", data_source="session_metadata",
+            intent_type=("introspect",), requires_history=False))
+
+        # Simulate full server-side history
+        history = [
+            {"role": "system", "content": "You are..."},
+            {"role": "user", "content": "matrixone 最新的两个pr情况？"},
+            {"role": "assistant", "content": "...", "tool_calls": [
+                {"function": {"name": "list_prs", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "content": "...", "tool_call_id": "x"},
+            {"role": "assistant", "content": "根据查询结果..."},
+            {"role": "user", "content": "tidb呢"},
+        ]
+        state = ConversationState.from_messages(history)
+
+        assert state.previous_skill == "list_prs"
+        assert state.turn_count == 2
+
+        result, applied = pre_filter([find_skills, list_prs], state)
+
+        assert applied is True
+        assert result[0].name == "list_prs"
+
+
 class TestRealFailureCase:
     """Reproduce the actual failure from session 019cbb9e."""
 

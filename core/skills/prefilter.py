@@ -277,6 +277,20 @@ def pre_filter(
     if not state or not skills:
         return skills, False
 
+    # Rule 0: Multi-turn continuity — boost previous_skill to front.
+    # When user says "tidb呢" after using list_prs on matrixone,
+    # the same tool should be preferred. This is a reorder, not a filter.
+    if state.previous_skill and state.turn_count > 1:
+        prev_idx = None
+        for i, s in enumerate(skills):
+            if s.name == state.previous_skill:
+                prev_idx = i
+                break
+        if prev_idx is not None and prev_idx > 0:
+            boosted = [skills[prev_idx]] + skills[:prev_idx] + skills[prev_idx + 1:]
+            logger.info("Pre-filter: continuity → boost %s to front", state.previous_skill)
+            return boosted, True
+
     # Rule 1: History reference + analytical → prefer historical scope
     if state.references_history and state.is_analytical:
         reordered = _prefer(

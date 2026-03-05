@@ -251,11 +251,12 @@ async def _consume_turn(
     return result
 
 
-def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
+def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool = False) -> None:
     """Print EXPLAIN ANALYZE style execution trace.
 
     Args:
         file: writable file object (default: sys.stderr).
+        verbose: show content previews and per-phase timing.
     """
     f = file or sys.stderr
     # Only use ANSI codes if output is a TTY
@@ -264,7 +265,8 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
     reset = "\033[0m" if use_color else ""
 
     w = f.write
-    w(f"\n{dim}── EXPLAIN ──────────────────────────────────{reset}\n")
+    label = "EXPLAIN VERBOSE" if verbose else "EXPLAIN"
+    w(f"\n{dim}── {label} {'─' * (44 - len(label))}{reset}\n")
     total_ms = 0
     total_in = 0
     total_out = 0
@@ -284,9 +286,22 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
             tool_info += f" → {sel}"
         w(f"{dim}Turn {t['turn']}  {ms}ms  tokens: {p}→{c}{tool_info}{reset}\n")
 
-        # Memory retrieval stats
+        # Memory stats (new flat structure: l0, l1, retrieval)
         mem = t.get("memory")
         if mem:
+            # L0 profile
+            l0 = mem.get("l0")
+            if l0:
+                loaded = "✓" if l0.get("loaded") else "✗"
+                tok = l0.get("tokens", 0)
+                l0_ms = l0.get("ms", 0)
+                w(f"{dim}  ├─ L0 profile  {loaded}  {tok} tokens  {l0_ms:.0f}ms{reset}\n")
+                if verbose and l0.get("preview"):
+                    preview = l0["preview"].replace("\n", " ")[:120]
+                    w(f"{dim}  │    {preview}{reset}\n")
+
+            # L1 retrieval
+            l1 = mem.get("l1")
             ret = mem.get("retrieval")
             if ret and not ret.get("error"):
                 kw_hit = "✓" if ret.get("keyword_hit") else "✗"
@@ -296,9 +311,31 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None) -> None:
                 merged = ret.get("merged_candidates", 0)
                 final = ret.get("final_count", 0)
                 ret_ms = ret.get("total_ms", 0)
-                w(f"{dim}  └─ memory  {ret_ms:.0f}ms  kw={kw_hit}({p1}) vec={vec_hit}({p2}) → {merged} → {final}{reset}\n")
+                l1_tok = l1.get("tokens", 0) if l1 else 0
+                w(f"{dim}  ├─ L1 retrieval  {ret_ms:.0f}ms  kw={kw_hit}({p1}) vec={vec_hit}({p2}) → {merged} → {final}  {l1_tok} tokens{reset}\n")
+                if verbose:
+                    if ret.get("phase1_ms"):
+                        w(f"{dim}  │    phase1={ret['phase1_ms']:.0f}ms  phase2={ret.get('phase2_ms', 0):.0f}ms  merge={ret.get('merge_ms', 0):.0f}ms{reset}\n")
+                    if l1 and l1.get("previews"):
+                        for preview in l1["previews"][:3]:
+                            w(f"{dim}  │    {preview[:100]}{reset}\n")
             elif ret and ret.get("error"):
-                w(f"{dim}  └─ memory  error: {ret.get('error')}{reset}\n")
+                w(f"{dim}  ├─ L1 retrieval  error: {ret.get('error')}{reset}\n")
+            elif mem.get("error"):
+                w(f"{dim}  ├─ memory  error: {mem['error']}{reset}\n")
+
+            # Few-shot
+            fs = mem.get("few_shot")
+            if fs:
+                count = fs.get("count", 0)
+                if count or fs.get("error"):
+                    label = f"few_shot={count}" if not fs.get("error") else f"few_shot error: {fs['error']}"
+                    w(f"{dim}  └─ {label}{reset}\n")
+            else:
+                # Total timing line
+                mem_ms = mem.get("total_ms", 0)
+                if mem_ms:
+                    w(f"{dim}  └─ memory total  {mem_ms:.0f}ms{reset}\n")
 
         for s in t.get("steps", []):
             step = s.get("step", "?")
@@ -345,7 +382,7 @@ async def edge_chat_loop(
     model: str | None = None,
     session_info: dict[str, Any] | None = None,
     extra_rules: str | None = None,
-    explain: bool = False,
+    explain: bool | str = False,
 ) -> ChatLoopResult:
     """Run the edge-cloud agentic loop until final answer or MAX_TURNS.
 

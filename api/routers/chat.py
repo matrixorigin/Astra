@@ -225,7 +225,7 @@ class ChatTurnRequest(BaseModel):
     model: str | None = Field(default=None, description="Model override")
     edge_tools: list[dict[str, Any]] | None = Field(default=None, description="Edge tool schemas (OpenAI format)")
     edge_profile: EdgeProfileModel | None = Field(default=None, description="Edge project profile (cwd, git_branch, languages, project_type)")
-    explain: bool = Field(default=False, description="Return per-step execution trace (like EXPLAIN ANALYZE)")
+    explain: bool | str = Field(default=False, description="Execution trace: true for normal, 'verbose' for detailed with content previews")
 
 
 class ChatResponse(BaseModel):
@@ -985,6 +985,7 @@ def _build_turn_messages(
     force_rebuild_system: bool = False,
     username: str | None = None,
     explain: bool = False,
+    verbose: bool = False,
 ) -> tuple[list[dict[str, Any]], str | None, dict[str, Any] | None]:
     """Build LLM messages from edge turn data + server-side history.
 
@@ -1027,6 +1028,7 @@ def _build_turn_messages(
             edge_context=edge_ctx,
             username=username,
             explain=explain,
+            verbose=verbose,
         )
         system = assembled.system_message
         context_capture_id = assembled.snapshot_id
@@ -1062,6 +1064,7 @@ def _build_turn_messages(
                         user_query=refresh_query,
                         current_sections=cached_sections,
                         explain=explain,
+                        verbose=verbose,
                     )
                     history[0] = {"role": "system", "content": refreshed.system_message}
                     context_capture_id = refreshed.snapshot_id
@@ -1724,6 +1727,7 @@ def select_tools_for_turn(
     tool_results: list[dict[str, Any]] | None,
     user_id: str,
     llm_client: ChatCapable | None,
+    session_history: list[dict[str, Any]] | None = None,
 ) -> ToolSelectionResult:
     """Pick the most relevant tool(s) for a chat turn.
 
@@ -1733,10 +1737,12 @@ def select_tools_for_turn(
 
     Args:
         tools_schema: Full merged tool schemas (edge + cloud).
-        messages: Chat messages for this turn.
+        messages: Chat messages for this turn (from edge).
         tool_results: Tool results from previous turn, if any.
         user_id: Current user ID (required by LLMClient.chat).
         llm_client: LLMClient instance (injected for testability).
+        session_history: Server-side conversation history (from session cache).
+            Used to extract previous_skill context for multi-turn continuity.
 
     Returns:
         ToolSelectionResult with the filtered tools and optional selected name.
@@ -1744,19 +1750,27 @@ def select_tools_for_turn(
     if not tools_schema or len(tools_schema) <= 1:
         return ToolSelectionResult(tools=tools_schema)
 
+    # Use session_history for ConversationState when available — it has the
+    # full conversation including previous tool_calls. Fall back to edge
+    # messages (turn 0 or cache miss).
+    context_messages = session_history if session_history else messages
+
     # Use the LAST user message — earlier messages reflect prior intents.
-    # Consistent with ConversationState.from_messages() which also uses last.
     user_query = ""
-    for m in reversed(messages):
+    for m in reversed(context_messages):
         if m.get("role") == "user":
             user_query = m.get("content", "")
             break
 
+    # Extract previous_skill from full history for LLM hint
+    state = ConversationState.from_messages(context_messages)
+
     # Stage 0: pre-filter reorder
     if user_query:
-        tools_schema = _prefilter_tools(tools_schema, messages)
+        tools_schema = _prefilter_tools(tools_schema, context_messages)
         return _select_tool_by_llm(
             tools_schema, user_query, user_id, llm_client,
+            previous_skill=state.previous_skill,
         )
 
     if tool_results:
@@ -1826,6 +1840,7 @@ def _select_tool_by_llm(
     user_query: str,
     user_id: str,
     llm_client: ChatCapable,
+    previous_skill: str | None = None,
 ) -> ToolSelectionResult:
     """Ask LLM to pick the single best tool from a catalog."""
     try:
@@ -1836,9 +1851,15 @@ def _select_tool_by_llm(
             f"- {name}: {t.get('function', {}).get('description', '')[:80]}"
             for name, t in tool_names_map.items()
         )
+        # Add previous_skill hint for multi-turn continuity (~10 tokens).
+        # This tells the LLM that a follow-up like "tidb呢" after using
+        # list_prs on matrixone should likely use the same tool.
+        context_hint = ""
+        if previous_skill and previous_skill in tool_names_map:
+            context_hint = f"\nPrevious turn used: {previous_skill}\n"
         catalog_prompt = (
             f"Given this user query, select the single most appropriate tool.\n"
-            f"Query: {user_query}\n\nAvailable tools:\n{catalog}\n\n"
+            f"Query: {user_query}\n{context_hint}\nAvailable tools:\n{catalog}\n\n"
             f"Reply with ONLY the tool name, nothing else."
         )
         resp = llm_client.chat(
@@ -1970,9 +1991,14 @@ async def chat_turn(
 
             # ── Tool selection optimization ──────────────────────────────
             # Delegates to select_tools_for_turn() (extracted for testability).
+            # Pass server-side history so ConversationState can see previous
+            # tool_calls (e.g. list_prs in turn 1) for multi-turn continuity.
+            _cached_entry = _peek_session_entry(session_id)
+            _cached_history = (_cached_entry or {}).get("history") if _cached_entry else None
             _sel = select_tools_for_turn(
                 merged_tools_schema, request.messages, request.tool_results,
                 user_id, _get_shared_llm_client(),
+                session_history=_cached_history,
             )
             effective_tools_schema = _sel.tools
             _high_confidence_skill = _sel.selected_tool
@@ -1980,6 +2006,8 @@ async def chat_turn(
             def _build_sync():
                 db = SessionLocal()
                 try:
+                    _explain_on = bool(request.explain)
+                    _verbose_on = request.explain == "verbose"
                     return _build_turn_messages(
                         db, user_id, session_id,
                         request.messages, request.tool_results, request.project_rules,
@@ -1988,7 +2016,8 @@ async def chat_turn(
                         edge_profile=request.edge_profile.model_dump(exclude_none=True) if request.edge_profile else None,
                         force_rebuild_system=tools_changed,
                         username=current_user.get("username"),
-                        explain=request.explain,
+                        explain=_explain_on,
+                        verbose=_verbose_on,
                     )
                 finally:
                     db.close()
