@@ -115,6 +115,7 @@ This is the index. Each document is the **single source of truth** for its domai
 | [Agent Introspection](agent-introspection.md) | Agent self-awareness: metacognition model, static/dynamic introspection, intent classification, cross-agent capability query, system prompt enrichment |
 | [Prompt Lifecycle](prompt-lifecycle.md) | Prompt assembly pipeline, unified prompt path, edge-cloud tool merging, prompt versioning via time travel, prompt A/B testing via branching, self-model section |
 | [Context Window Management](context-window-management.md) | Context as managed resource: procedural memory at point of use, history sliding window, exploration guardrails, zone-based token budgets |
+| [Token-Efficient Hierarchical LLM Routing](token-efficient-llm-routing.md) | Hierarchical Confidence Cascade: Tier 0 regex → Tier 1 cheapest LLM → Tier 2 main, intent-based context pruning, 45-60% cost reduction |
 | [Tool Result Quality Firewall](tool-result-quality-firewall.md) | Pre-LLM tool result quality assessment: schema-driven completeness checks, structural inference, quality annotation injection, trust pipeline integration |
 
 ### Supporting Documents (Implementation)

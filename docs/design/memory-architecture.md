@@ -4,7 +4,7 @@
 > **Last Updated**: 2026-03-01  
 > **Scope**: Conceptual architecture, design decisions, and design-level specifications  
 > **Implementation**: See [memory-system-status.md](../implementation/memory-system-status.md) for engineering status, module mapping, and known issues  
-> **Related**: [context-window-management.md](context-window-management.md) (runtime context optimization with procedural memory injection at point of use, reference-aware history compression)
+> **Related**: [context-window-management.md](context-window-management.md) (runtime context optimization with procedural memory injection at point of use, reference-aware history compression), [intent-driven-memory-loading.md](intent-driven-memory-loading.md) (route-driven L0/L1 loading strategy)
 
 ---
 
