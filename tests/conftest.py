@@ -75,6 +75,7 @@ def test_engine():
                 "ALTER TABLE agent_events MODIFY COLUMN created_at DATETIME(6) NOT NULL",
                 "ALTER TABLE ctx_snapshots MODIFY COLUMN created_at DATETIME(6) NOT NULL",
                 "ALTER TABLE skill_selection_events MODIFY COLUMN created_at DATETIME(6)",
+                "ALTER TABLE skills_registry ADD COLUMN tags JSON",
             ]:
                 try:
                     with engine.connect() as c:

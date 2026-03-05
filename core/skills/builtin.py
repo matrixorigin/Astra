@@ -655,6 +655,7 @@ def register_builtin_skills(
             [],
             8,
             "medium",
+            {"scope": "external", "data_source": "external_api", "intent_type": ["analytical", "fetch"], "requires_history": False},
         ),
         (
             ListPRsSkill(github),
@@ -664,6 +665,7 @@ def register_builtin_skills(
             [],
             5,
             "low",
+            {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
         ),
         (
             CIStatusSkill(github),
@@ -673,6 +675,7 @@ def register_builtin_skills(
             [],
             7,
             "low",
+            {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
         ),
         (
             ListIssuesSkill(github),
@@ -682,6 +685,7 @@ def register_builtin_skills(
             [],
             5,
             "low",
+            {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
         ),
         (
             GetIssueSkill(github),
@@ -691,6 +695,7 @@ def register_builtin_skills(
             [],
             5,
             "low",
+            {"scope": "external", "data_source": "external_api", "intent_type": ["fetch"], "requires_history": False},
         ),
         (
             CreateIssueSkill(github),
@@ -700,10 +705,11 @@ def register_builtin_skills(
             [],
             7,
             "low",
+            {"scope": "external", "data_source": "external_api", "intent_type": ["mutate"], "requires_history": False},
         ),
     ]
 
-    for skill, category, subcategory, triggers, dependencies, priority, cost in skills:
+    for skill, category, subcategory, triggers, dependencies, priority, cost, tags in skills:
         try:
             # Pass github manifest so SkillConfigCenter can find required secrets
             # without needing the skills/ directory on the deployment server.
@@ -718,6 +724,7 @@ def register_builtin_skills(
                 priority=priority,
                 cost_estimate=cost,
                 manifest=skill_manifest,
+                tags=tags,
             )
             logger.info(f"Registered {skill.name}@{skill.version}")
         except Exception as e:
@@ -736,6 +743,7 @@ def register_builtin_skills(
                 dependencies=[],
                 priority=9,
                 cost_estimate="medium",
+                tags={"scope": "current_session", "data_source": "session_metadata", "intent_type": ["mutate"], "requires_history": False},
             )
             logger.info(f"Registered {exec_skill.name}@{exec_skill.version}")
         except Exception as e:
@@ -762,6 +770,7 @@ def register_builtin_skills(
             dependencies=[],
             priority=8,
             cost_estimate="low",
+            tags={"scope": "current_session", "data_source": "session_metadata", "intent_type": ["introspect"], "requires_history": False},
         )
         logger.info(f"Registered {introspection_skill.name}@{introspection_skill.version}")
     except Exception as e:
@@ -784,6 +793,7 @@ def register_builtin_skills(
             dependencies=[],
             priority=7,
             cost_estimate="low",
+            tags={"scope": "current_session", "data_source": "session_metadata", "intent_type": ["introspect"], "requires_history": False},
         )
         logger.info(f"Registered {wizard_skill.name}@{wizard_skill.version}")
     except Exception as e:
@@ -804,6 +814,7 @@ def register_builtin_skills(
                 dependencies=[],
                 priority=10,
                 cost_estimate="low",
+                tags={"scope": "current_session", "data_source": "session_metadata", "intent_type": ["mutate"], "requires_history": False},
             )
             logger.info(f"Registered {delegation_skill.name}@{delegation_skill.version}")
         except Exception as e:

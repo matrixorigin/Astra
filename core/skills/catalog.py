@@ -114,12 +114,22 @@ class SkillCatalog(DbConsumer):
         git_commit_hash: str | None = None,
         status: str = "active",
         manifest: dict | None = None,
+        tags: dict | None = None,
     ) -> None:
-        """Register a Python skill (builtin or marketplace)."""
+        """Register a Python skill (builtin or marketplace).
+
+        Args:
+            tags: Optional skill tags dict for pre-filtering.
+                  Validated against VALID_SCOPES/VALID_DATA_SOURCES/VALID_INTENT_TYPES.
+                  If None, tags are inferred from category at load time.
+        """
         if status not in _VALID_STATUSES:
             raise ValueError(f"Invalid status: {status}")
         if source not in _VALID_SOURCES:
             raise ValueError(f"Invalid source: {source}")
+        if tags is not None:
+            from core.skills.prefilter import validate_tags
+            validate_tags(tags)  # Raises ValueError on invalid
         if status == "draft":
             is_active = False
 
@@ -147,6 +157,7 @@ class SkillCatalog(DbConsumer):
             cost_estimate=cost_estimate,
             side_effect_profile=se_profile,
             manifest=manifest,
+            tags=tags,
         )
 
         # In-memory cache
@@ -256,6 +267,7 @@ class SkillCatalog(DbConsumer):
         side_effect_profile: dict | None,
         git_commit_hash: str | None = None,
         manifest: dict | None = None,
+        tags: dict | None = None,
     ) -> None:
         """Shared DB upsert logic for register() and register_from_api().
 
@@ -291,6 +303,8 @@ class SkillCatalog(DbConsumer):
                 existing.side_effect_profile = side_effect_profile
                 if manifest is not None:
                     existing.manifest = manifest
+                if tags is not None:
+                    existing.tags = tags
                 if embedding_val is not None:
                     existing.embedding = embedding_val
             else:
@@ -314,6 +328,7 @@ class SkillCatalog(DbConsumer):
                     cost_estimate=cost_estimate,
                     side_effect_profile=side_effect_profile,
                     manifest=manifest,
+                    tags=tags,
                     embedding=embedding_val,
                 ))
             db.commit()

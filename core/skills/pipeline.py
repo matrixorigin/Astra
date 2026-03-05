@@ -48,6 +48,7 @@ class ToolsResult:
     high_confidence_skill: str | None = None  # If set, can skip LLM tool selection
     scores: list[tuple[str, float]] = field(default_factory=list)  # (name, score) pairs
     catalog: str | None = None           # Lightweight tool list for two-phase selection
+    pre_filter_applied: bool = False     # Whether pre-filtering narrowed candidates
 
 
 @dataclass
@@ -220,7 +221,7 @@ class SkillPipeline(DbConsumer):
             self._modern._registry = registry
 
     # ------------------------------------------------------------------
-    # Stage 1 + 2: retrieve → rank → (apply corrections) → audit
+    # Stage 1 + 1.5 + 2: retrieve → pre-filter → (corrections) → audit
     # ------------------------------------------------------------------
 
     def get_tools_schema(
@@ -230,20 +231,50 @@ class SkillPipeline(DbConsumer):
         *,
         max_candidates: int = 5,
         context_budget: int = 2000,
+        conversation_state: Any = None,
     ) -> ToolsResult:
         """Select skills and return tools schema for LLM.
 
         Stage 1: Retrieve candidates via semantic/keyword + confidence scoring.
                  Apply learned corrections if learning is enabled.
+        Stage 1.5: Post-retrieval pre-filter — reorder candidates by conversation
+                   state + skill tags (0 tokens, no shared state mutation).
         Stage 2: Record audit event with selection metadata.
-        
+
+        Args:
+            conversation_state: Optional ConversationState for pre-filtering.
+
         If high_confidence_skill is set in result, caller can skip LLM tool selection.
         """
+        from core.skills.prefilter import pre_filter
+
         t0 = time.monotonic()
+
         # Stage 1a: retrieve + rank with confidence scoring
         selection = self._modern.select_tools(
             query, max_candidates=max_candidates, context_budget=context_budget,
         )
+
+        # Stage 1.5: post-retrieval pre-filter — reorder tools by conversation
+        # state + skill tags.  Operates on the retrieved tools list (a local copy),
+        # never mutates shared rule_selector.skills.
+        pre_filter_applied = False
+        if conversation_state is not None and selection.tools:
+            skills_lookup = self._modern.rule_selector.skills  # read-only lookup
+            tool_names = [t["function"]["name"] for t in selection.tools]
+            # Resolve SkillMetadata for each retrieved tool (pre_filter needs .tags)
+            metadata_list = [
+                skills_lookup[n] for n in tool_names if n in skills_lookup
+            ]
+            if metadata_list:
+                reordered, pre_filter_applied = pre_filter(metadata_list, conversation_state)
+                if pre_filter_applied:
+                    # Reorder tools to match pre_filter output
+                    tool_by_name = {t["function"]["name"]: t for t in selection.tools}
+                    selection.tools[:] = [
+                        tool_by_name[m.name] for m in reordered if m.name in tool_by_name
+                    ]
+
         tools = selection.tools
         skill_names = [t["function"]["name"] for t in tools]
 
@@ -280,7 +311,7 @@ class SkillPipeline(DbConsumer):
         self._feedback.maybe_flush()
 
         latency_ms = int((time.monotonic() - t0) * 1000)
-        logger.debug("select_tools latency=%dms tools=%d", latency_ms, len(tools))
+        logger.debug("select_tools latency=%dms tools=%d pre_filter=%s", latency_ms, len(tools), pre_filter_applied)
         return ToolsResult(
             tools=tools,
             event_id=event_id,
@@ -290,6 +321,7 @@ class SkillPipeline(DbConsumer):
             high_confidence_skill=selection.high_confidence_skill,
             scores=selection.scores,
             catalog=selection.catalog,
+            pre_filter_applied=pre_filter_applied,
         )
 
     # ------------------------------------------------------------------

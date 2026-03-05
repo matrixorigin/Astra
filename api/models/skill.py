@@ -44,6 +44,7 @@ class SkillRegistry(Base):
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
     embedding = Column(VectorType(EMBEDDING_DIM, VectorPrecision.F32))
+    tags = Column(JSON)  # SkillTags: scope, data_source, intent_type, requires_history
 
 
 class SkillInstallation(Base):

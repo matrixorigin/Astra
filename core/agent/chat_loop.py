@@ -14,6 +14,7 @@ from core.llm.models import LLMMessage
 from core.logging_config import get_logger
 from core.skills.learning_signals import SignalType
 from core.skills.pipeline import SkillPipeline
+from core.skills.prefilter import ConversationState
 
 logger = get_logger(__name__)
 
@@ -554,8 +555,10 @@ Tool name:"""
             logger.debug("Parameter extraction: %s", extracted_params)
 
         # 5. Get available tools schema (with audit + learning)
+        conv_state = ConversationState.from_messages(messages)
         _sel = self._pipeline.get_tools_schema(
             user_input, session_id, max_candidates=max_candidates,
+            conversation_state=conv_state,
         )
         tools_schema = _sel.tools
         self._last_selection_event_id = _sel.event_id

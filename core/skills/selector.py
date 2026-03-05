@@ -12,11 +12,12 @@ External code should use SkillPipeline from core.skills.pipeline.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from api.database import get_db_session
 from api.models import SkillRegistry as SkillModel
 from core.logging_config import get_logger
+from core.skills.prefilter import SkillTags
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,6 +46,7 @@ class SkillMetadata:
     dependencies: list[str]
     priority: int
     cost_estimate: str
+    tags: SkillTags | None = None
 
 
 class SkillSelector:
@@ -62,7 +64,6 @@ class SkillSelector:
 
         db = self._db_factory()
         try:
-            # Projection: only load fields needed for SkillMetadata (skip embedding, definition, etc.)
             skills_data = db.query(
                 SkillModel.skill_name,
                 SkillModel.version,
@@ -73,11 +74,13 @@ class SkillSelector:
                 SkillModel.dependencies,
                 SkillModel.priority,
                 SkillModel.cost_estimate,
+                SkillModel.tags,
             ).filter(
                 SkillModel.is_active == 1
             ).limit(self._MAX_SKILLS).all()
 
             for skill in skills_data:
+                tags = self._parse_tags(skill.tags, skill.category)
                 metadata = SkillMetadata(
                     name=skill.skill_name,
                     version=skill.version,
@@ -88,6 +91,7 @@ class SkillSelector:
                     dependencies=skill.dependencies or [],
                     priority=skill.priority or 5,
                     cost_estimate=skill.cost_estimate or "medium",
+                    tags=tags,
                 )
                 self.skills[metadata.name] = metadata
 
@@ -97,6 +101,18 @@ class SkillSelector:
             db.close()
 
         logger.info(f"Loaded {len(self.skills)} skills from database")
+
+    @staticmethod
+    def _parse_tags(tags_json: dict[str, Any] | None, category: str | None) -> SkillTags | None:
+        """Parse tags from DB JSON, falling back to category-based inference."""
+        if tags_json:
+            try:
+                return SkillTags.from_dict(tags_json)
+            except (ValueError, TypeError) as e:
+                logger.warning("Invalid tags in DB, falling back to category inference: %s", e)
+        if category:
+            return SkillTags.infer_from_category(category)
+        return None
 
     def select_skills(self, query: str, max_skills: int = 3) -> list[SkillMetadata]:
         """Select relevant skills based on query.
