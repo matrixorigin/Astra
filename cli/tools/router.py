@@ -93,6 +93,16 @@ class ToolRouter:
                 return ToolResult(
                     tool_call_id=tc.id, name=tc.name, result=msg, error=True,
                 )
+            # Warn on unknown parameters so LLM gets feedback instead of
+            # silent default-value fallback (e.g. dir_path vs path).
+            known = set(tool.parameters.get("properties", {}).keys())
+            unknown = [k for k in tc.arguments if k not in known]
+            if unknown:
+                valid = ", ".join(sorted(known)) if known else "(none)"
+                msg = f"Unknown parameter(s): {', '.join(unknown)}. Valid: {valid}"
+                return ToolResult(
+                    tool_call_id=tc.id, name=tc.name, result=msg, error=True,
+                )
         t0 = time.monotonic()
         try:
             # EdgeTool: execute(**kwargs) -> str

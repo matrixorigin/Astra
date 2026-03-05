@@ -1497,6 +1497,7 @@ def _persist_turn_events(
     user_query_event_id: str | None = None,
     cloud_tool_results: list[dict[str, Any]] | None = None,
     session_start: datetime | None = None,
+    routing_meta: dict[str, Any] | None = None,
 ) -> None:
     """Persist events for this turn: user query, tool results, LLM response.
 
@@ -1543,6 +1544,20 @@ def _persist_turn_events(
             causal_chain_id = user_ev.causal_chain_id
     except Exception as e:
         logger.warning("Phase 1 (user_query) failed: %s", e)
+
+    # Phase 1b: persist routing decision (enables learning, reflection, A/B analysis)
+    try:
+        if routing_meta and not routing_meta.get("skipped"):
+            el.create_stream_event(
+                user_id=user_id, session_id=session_id,
+                event_type="routing_decision",
+                content=json.dumps(routing_meta),
+                parent_event_id=parent_event_id,
+                causal_chain_id=causal_chain_id,
+                metadata={"intent": routing_meta.get("intent"), "tier": routing_meta.get("tier")},
+            )
+    except Exception as e:
+        logger.warning("Phase 1b (routing_decision) failed: %s", e)
 
     # Phase 2: persist tool results from edge + backfill selection metrics
     try:
@@ -2070,9 +2085,11 @@ async def chat_turn(
 
             # ── Intent Routing (Tier 0 → Tier 1 → fallback) ─────────────
             _routing_decision = None
+            _routing_meta: dict[str, Any] = {}  # persisted as event + explain
             if request.model:
                 # model_override → bypass routing entirely (design doc §Error Handling)
                 logger.debug("Model override '%s' → skip intent routing", request.model)
+                _routing_meta = {"skipped": True, "reason": "model_override"}
             else:
                 try:
                     from core.context.intent_routing import IntentRouter, detect_correction, get_router
@@ -2090,30 +2107,59 @@ async def chat_turn(
                     except KeyError:
                         logger.warning("Unknown router '%s', falling back to default", _router_name)
                         _ir = IntentRouter(SessionLocal)
+                        _router_name = "default"
                     _force = "question" if (user_query and detect_correction(user_query)) else None
                     _history_len = len((_cached_entry or {}).get("history") or []) if _cached_entry else 0
                     _routing_tool_names = [t.get("function", {}).get("name", "") for t in (tools_schema or [])]
 
+                    _routing_t0 = time.monotonic()
                     _routing_decision = await _ir.route(
                         query=user_query or "",
                         history_len=_history_len,
                         tool_names=_routing_tool_names if _routing_tool_names else None,
                         force_intent=_force,
                     )
+                    _routing_ms = round((time.monotonic() - _routing_t0) * 1000, 1)
+
+                    # Build routing metadata for event persistence + explain
+                    _rr = _routing_decision.routing_result
+                    _routing_meta = {
+                        "router": _router_name,
+                        "intent": _rr.intent,
+                        "confidence": _rr.confidence,
+                        "tier": _rr.tier,
+                        "matched_by": _rr.matched_by,
+                        "threshold": _routing_decision.threshold_used,
+                        "latency_ms": _routing_ms,
+                        "forced": _force,
+                        "skipped_sections": [
+                            s for s, skip in [
+                                ("tools", not _routing_decision.plan.load_tools),
+                                ("history", _routing_decision.plan.load_history is False),
+                                ("memory", _routing_decision.plan.load_memory is False),
+                            ] if skip
+                        ],
+                        "estimated_tokens": _routing_decision.plan.estimated_tokens,
+                    }
+                    if _routing_decision.tier1_result:
+                        _routing_meta["tier1"] = {
+                            "compressed": _routing_decision.tier1_result.compressed_memory is not None,
+                            "pruned_tools": _routing_decision.tier1_result.pruned_tools,
+                        }
 
                     # Record Prometheus metrics
                     routing_requests_total.inc()
-                    routing_confidence.observe(_routing_decision.routing_result.confidence)
+                    routing_confidence.observe(_rr.confidence)
                     adaptive_threshold_value.set(_routing_decision.threshold_used)
-                    if _routing_decision.routing_result.matched_by == "fallback":
+                    if _rr.matched_by == "fallback":
                         routing_fallback_total.inc()
-                    if _routing_decision.routing_result.tier == 0 and _routing_decision.tier1_result is None:
+                    if _rr.tier == 0 and _routing_decision.tier1_result is None:
                         routing_cache_hit_total.inc()
                     if _force == "question":
                         intent_correction_total.inc()
 
                     # routing_efficiency_ratio: 1 - (routed / full) tokens
-                    if _routing_decision.routing_result.intent and _routing_decision.routing_result.intent != "question":
+                    if _rr.intent and _rr.intent != "question":
                         from core.context.intent_routing import INTENT_PLANS
                         _routed_est = _routing_decision.plan.estimated_tokens
                         _full_est = INTENT_PLANS["question"].estimated_tokens
@@ -2121,6 +2167,7 @@ async def chat_turn(
                             routing_efficiency_ratio.observe(1.0 - _routed_est / _full_est)
                 except Exception as _routing_err:
                     logger.debug("Intent routing skipped: %s", _routing_err)
+                    _routing_meta = {"skipped": True, "reason": str(_routing_err)}
 
             def _build_sync():
                 db = SessionLocal()
@@ -2510,6 +2557,7 @@ async def chat_turn(
                 turn_chain_id=_turn_chain_id,
                 user_query_event_id=_user_query_event_id,
                 session_start=_entry.get("created_at"),
+                routing_meta=_routing_meta or None,
             )
             _t = threading.Thread(target=_persist_turn_events, kwargs=_persist_args, daemon=True)
             _persist_threads.append(_t)
@@ -2558,14 +2606,8 @@ async def chat_turn(
                 }
                 if _memory_stats:
                     explain_event["memory"] = _memory_stats
-                if _routing_decision:
-                    explain_event["routing"] = {
-                        "intent": _routing_decision.routing_result.intent,
-                        "confidence": _routing_decision.routing_result.confidence,
-                        "tier": _routing_decision.routing_result.tier,
-                        "matched_by": _routing_decision.routing_result.matched_by,
-                        "threshold": _routing_decision.threshold_used,
-                    }
+                if _routing_meta:
+                    explain_event["routing"] = _routing_meta
                 yield f"data: {json.dumps(explain_event)}\n\n"
 
             # Task 4.4: Include execution_state for edge-cloud breaker sync.

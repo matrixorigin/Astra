@@ -39,6 +39,7 @@ class EventType(str, Enum):
 
     # Intent routing
     INTENT_CORRECTION = "intent_correction"
+    ROUTING_DECISION = "routing_decision"
 
     # Agent run lifecycle
     RUN_STARTED = "run_started"

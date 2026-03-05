@@ -16,7 +16,7 @@ class BashTool(EdgeTool):
         self._root = project_root
 
     name = "bash"
-    description = "Execute a shell command. Working directory is the project root."
+    description = "Execute a shell command in the project root. Use for builds, tests, installs, or any CLI task."
     parameters = {
         "type": "object",
         "properties": {

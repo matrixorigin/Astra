@@ -22,8 +22,10 @@ class ReflectTool(EdgeTool):
 
     name = "reflect"
     description = (
-        "Diagnose past behavior: event trails, skill selection audit, "
-        "context composition, tool usage patterns, cross-session comparisons."
+        "Inspect my own internal state and decision-making for previous turns: "
+        "what I remember about the user, why I chose certain tools, what context I saw. "
+        "Use when user asks about memories, what I know about them, "
+        "decision process, why I did something, or wants to understand my past behavior."
     )
     parameters = {
         "type": "object",

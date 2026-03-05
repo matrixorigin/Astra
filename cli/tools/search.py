@@ -19,7 +19,7 @@ class GrepTool(EdgeTool):
         self._ignore_spec = load_gitignore(project_root)
 
     name = "grep"
-    description = "Search for a regex pattern in files. Returns matching lines with file paths and line numbers."
+    description = "Search for a regex pattern in files. Use to find usages, definitions, or text across the codebase."
     parameters = {
         "type": "object",
         "properties": {
@@ -109,7 +109,7 @@ class GlobTool(EdgeTool):
         self._ignore_spec = load_gitignore(project_root)
 
     name = "glob"
-    description = "Find files matching a glob pattern."
+    description = "Find files by glob pattern. Use to locate files by name or extension."
     parameters = {
         "type": "object",
         "properties": {

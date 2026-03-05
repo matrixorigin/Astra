@@ -289,6 +289,33 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
             tool_info += f" ⚠fallback:{fb}"
         w(f"{dim}Turn {t['turn']}  {ms}ms  tokens: {p}→{c}{tool_info}{reset}\n")
 
+        # Routing decision
+        rt = t.get("routing")
+        if rt and not rt.get("skipped"):
+            intent = rt.get("intent", "?")
+            conf = rt.get("confidence", 0)
+            tier = rt.get("tier", "?")
+            rt_ms = rt.get("latency_ms", 0)
+            router = rt.get("router", "default")
+            skipped = rt.get("skipped_sections", [])
+            est = rt.get("estimated_tokens", "?")
+            w(f"{dim}  ├─ routing  {intent}  conf={conf:.2f}  tier={tier}  {rt_ms}ms  ~{est}tok{reset}\n")
+            if verbose:
+                matched = rt.get("matched_by", "?")
+                threshold = rt.get("threshold", "?")
+                w(f"{dim}  │    router={router}  matched_by={matched}  threshold={threshold}{reset}\n")
+                if skipped:
+                    w(f"{dim}  │    skipped: {', '.join(skipped)}{reset}\n")
+                t1 = rt.get("tier1")
+                if t1:
+                    parts = []
+                    if t1.get("compressed"): parts.append("compressed_memory")
+                    if t1.get("pruned_tools"): parts.append(f"pruned→{t1['pruned_tools']}")
+                    if parts:
+                        w(f"{dim}  │    tier1: {', '.join(parts)}{reset}\n")
+        elif rt and rt.get("skipped"):
+            w(f"{dim}  ├─ routing  skipped ({rt.get('reason', '?')}){reset}\n")
+
         # Memory stats (new flat structure: l0, l1, retrieval)
         mem = t.get("memory")
         if mem:

@@ -1,7 +1,7 @@
 # Memory Architecture
 
 > **Status**: Core Design — single source of truth for memory architecture  
-> **Last Updated**: 2026-03-01  
+> **Last Updated**: 2026-03-06  
 > **Scope**: Conceptual architecture, design decisions, and design-level specifications  
 > **Implementation**: See [memory-system-status.md](../implementation/memory-system-status.md) for engineering status, module mapping, and known issues  
 > **Related**: [context-window-management.md](context-window-management.md) (runtime context optimization with procedural memory injection at point of use, reference-aware history compression), [intent-driven-memory-loading.md](intent-driven-memory-loading.md) (route-driven L0/L1 loading strategy)
@@ -1069,6 +1069,119 @@ Pre-compute likely next queries based on conversation flow. Pre-load relevant me
 ### LLM-Native KV Cache Optimization
 
 Separate static context (system prompt, skill definitions) from dynamic context (history, current task) to maximize provider-side KV cache hits. Can reduce cost by 90% for cached tokens.
+
+---
+
+## 11. Module Independence & Interface Design
+
+### Current State
+
+The memory module is **architecturally isolated** — it has only two external dependencies:
+
+| Dependency | Purpose | Files |
+|---|---|---|
+| `core.db_consumer` (DbFactory/DbConsumer) | Database access abstraction | 9 |
+| `api.models.memory` (MemoryRecord) | SQLAlchemy ORM model | 3 |
+
+It does **not** depend on core.context, core.events, core.llm, core.agent, core.skills, or core.embedding. The dependency graph is strictly one-directional: other modules depend on memory, never the reverse.
+
+### Problem: Consumers Bypass Abstraction
+
+Despite clean internal architecture, external consumers import internal classes directly:
+
+```
+core/context/prompt_assembler.py  → imports TieredMemoryLoader
+core/agent/chat_loop.py           → imports MemoryStore, MemoryRetriever
+api/routers/chat.py               → imports TypedObserver
+api/routers/sessions.py           → imports MemoryStore, SessionSummarizer
+core/context/scheduler.py         → imports GovernanceScheduler
+skills/knowledge/                 → imports TypedObserver, trust_tier_defaults
+```
+
+This treats internal implementation as public API — any refactoring of memory internals breaks consumers.
+
+### Problem: TieredMemoryLoader Is a Consumer, Not a Provider
+
+`TieredMemoryLoader` decides "how much memory to load into the prompt based on memory_mode". This is **context assembly logic** (a consumer concern), not memory's core capability (store/retrieve/govern). It currently lives in `core/memory/` but belongs in `core/context/`.
+
+### Target: Protocol-Based Interface
+
+```
+┌──────────────────────────────────────────────────────┐
+│                Memory Module (independent)            │
+│                                                      │
+│  Public Interface (Protocol):                        │
+│    MemoryReader  — retrieve(), get_profile()         │
+│    MemoryWriter  — store(), observe_turn()           │
+│    MemoryAdmin   — run_governance(), health_check()  │
+│                                                      │
+│  Facade:                                             │
+│    MemoryService — single entry point for consumers  │
+│                                                      │
+│  Internal (not exposed):                             │
+│    MemoryStore, MemoryRetriever, ProfileManager      │
+│    GovernanceScheduler, TypedObserver, etc.           │
+└──────────────────────┬───────────────────────────────┘
+                       │ Protocol interface only
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+   Context Module   Agent Module   API Layer
+   (prompt assembly) (chat loop)   (routers)
+```
+
+### Interface Definition
+
+```python
+# core/memory/interfaces.py
+
+class MemoryReader(Protocol):
+    def retrieve(self, user_id: str, query: str, *,
+                 top_k: int = 10,
+                 weights: RetrievalWeights | None = None,
+                 ) -> list[Memory]: ...
+    def get_profile(self, user_id: str) -> str | None: ...
+
+class MemoryWriter(Protocol):
+    def store(self, user_id: str, content: str, *,
+              memory_type: MemoryType, source: str,
+              ) -> Memory: ...
+    def observe_turn(self, user_id: str, messages: list[dict],
+                     ) -> list[Memory]: ...
+
+class MemoryAdmin(Protocol):
+    def run_governance(self, user_id: str) -> GovernanceReport: ...
+    def health_check(self, user_id: str) -> HealthReport: ...
+
+class MemoryService:
+    """Single entry point. All external consumers use this."""
+    reader: MemoryReader
+    writer: MemoryWriter
+    admin: MemoryAdmin
+```
+
+### Migration: TieredMemoryLoader → Context Module
+
+TieredMemoryLoader moves to `core/context/` and consumes memory through `MemoryReader`:
+
+```
+Router → context_plan.memory_mode → TieredMemoryLoader (in core/context/)
+    → calls MemoryService.reader.retrieve() / .get_profile()
+    → assembles prompt section
+```
+
+Memory module has no knowledge of memory_mode, router, or prompt assembly. Intent-driven memory loading (see [intent-driven-memory-loading.md](intent-driven-memory-loading.md)) becomes a **context-layer consumption strategy**, not a memory-internal change.
+
+### Migration Plan
+
+| Step | Change | Risk |
+|---|---|---|
+| 1 | Add `core/memory/interfaces.py` with Protocol definitions | None — additive |
+| 2 | Add `MemoryService` facade implementing the Protocols | None — additive |
+| 3 | Move `TieredMemoryLoader` to `core/context/tiered_loader.py` | Medium — update imports |
+| 4 | Migrate consumers to use `MemoryService` instead of direct imports | Medium — incremental |
+| 5 | Mark internal classes as `_internal` or remove from `__init__.py` | Low — after step 4 |
+
+Step 1-2 are prerequisites for intent-driven memory loading (Phase 2 in [intent-driven-memory-loading.md](intent-driven-memory-loading.md)).
 
 ---
 

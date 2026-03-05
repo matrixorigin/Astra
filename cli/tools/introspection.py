@@ -38,8 +38,9 @@ class GetAgentInfoTool(EdgeTool):
     @property
     def description(self) -> str:
         return (
-            "Query current runtime state: token counts, context breakdown, "
-            "session info, available tools, memory stats."
+            "Query agent runtime state: token usage, context breakdown, "
+            "session info, available tools, memory stats. "
+            "Use when user asks about context size, token budget, what model, or agent capabilities."
         )
 
     @property
@@ -52,9 +53,9 @@ class GetAgentInfoTool(EdgeTool):
                     "enum": ["capability", "state", "memory", "identity", "context_snapshot", "context_trend", "retrieval_quality", "all"],
                     "description": (
                         "Which dimension to query. "
-                        "'context_snapshot': token usage, zone balance, relevance, pollution for a specific turn (上下文使用详情/某个问题用了多少上下文). "
-                        "'context_trend': token growth trend across recent turns (token趋势/上下文增长). "
-                        "'retrieval_quality': how well memory retrieval is working (检索质量). "
+                        "'context_snapshot': token usage, zone balance, relevance for a specific turn. "
+                        "'context_trend': token growth across recent turns. "
+                        "'retrieval_quality': memory retrieval effectiveness. "
                         "'all' returns everything except raw context content."
                     ),
                 },

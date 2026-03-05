@@ -24,10 +24,8 @@ class FindSkillsTool(EdgeTool):
 
     name = "find_skills"
     description = (
-        "Search for skills that can help with a task. "
-        "Use when you need capabilities not in your current tool set, "
-        "or when user asks 'what can you do with X?'. "
-        "Returns skill names, descriptions, and relevance scores."
+        "Search for additional skills by task description. "
+        "Use when current tools can't handle the request."
     )
     parameters: ClassVar[dict[str, Any]] = {
         "type": "object",

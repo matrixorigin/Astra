@@ -88,7 +88,7 @@ class DiagnoseSkillsSkill(Skill[DiagnoseSkillsInput, DiagnoseSkillsOutput]):
 
     name = "diagnose_skills"
     version = "1.1.0"
-    description = "Check skill health: find orphaned, broken, or mismatched skills"
+    description = "Check skill health: find broken, misconfigured, or orphaned skills. Use when skills fail unexpectedly."
     requirements = SkillRequirement(
         runtime=[RuntimeRequirement.DATABASE],
         llm_required=False,

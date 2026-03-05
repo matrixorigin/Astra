@@ -30,7 +30,7 @@ class ReadFileTool(EdgeTool):
         self._root = project_root
 
     name = "read_file"
-    description = "Read file contents. Supports optional line range."
+    description = "Read file contents. Use to inspect code, configs, or any text file."
     parameters = {
         "type": "object",
         "properties": {
@@ -139,7 +139,7 @@ class ListDirTool(EdgeTool):
         self._ignore_spec = load_gitignore(project_root)
 
     name = "list_dir"
-    description = "List directory contents. Use depth>1 to expand subdirectories."
+    description = "List directory contents. Use to explore project structure or find files."
     parameters = {
         "type": "object",
         "properties": {

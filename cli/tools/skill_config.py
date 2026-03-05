@@ -108,12 +108,9 @@ class SkillConfigWizardTool(EdgeTool):
 
     name = "skill_config_wizard"
     description = (
-        "Show what configuration a skill needs and what's already set. "
-        "Call this when the user explicitly asks to configure a skill, or when a skill call fails due to missing config. "
-        "Do NOT call this proactively before using a skill — just call the skill directly. "
-        "For GitHub skills (summarize_pr, list_prs, ci_status, list_issues, get_issue, create_issue), "
-        "use skill_name='github' — they all share one token. "
-        "Returns missing required fields and instructions for what to set."
+        "Show what configuration a skill needs. "
+        "Call when user asks to configure a skill or when a skill fails due to missing config. "
+        "For GitHub skills, use skill_name='github'."
     )
     parameters = {
         "type": "object",
