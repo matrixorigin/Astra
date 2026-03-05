@@ -11,8 +11,9 @@ from unittest.mock import MagicMock, patch
 from core.context.manager import ContextManager, TaskType
 from core.context.scorer import (
     ScoringWeights, RelevanceScorer, TASK_WEIGHTS,
-    TopicShiftConfig, _DEFAULT_TOPIC_SHIFT_CONFIG, _cosine_similarity,
+    TopicShiftConfig, _DEFAULT_TOPIC_SHIFT_CONFIG,
 )
+from core.utils.similarity import cosine_similarity as _cosine_similarity
 
 
 def _scorer_with_defaults(db_factory, embeddings) -> RelevanceScorer:

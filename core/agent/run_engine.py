@@ -27,6 +27,7 @@ _run_waiters: dict[str, asyncio.Event] = {}
 _run_tasks: dict[str, asyncio.Task] = {}
 _child_runs: dict[str, set[str]] = {}  # parent_run_id → {child_run_ids}
 _run_notifiers: dict[str, asyncio.Event] = {}  # wake stream_agent_run_events
+_agent_config_cache: dict[str, dict | None] = {}  # agent_id → config (module-level, survives across runs)
 _fan_in_tasks: set[asyncio.Task] = set()  # Track fan-in tasks for cleanup
 _cancel_pending: set[asyncio.Task] = set()  # Hold refs to cancelled tasks until done
 
@@ -210,15 +211,20 @@ class RunEngine(DbConsumer):
         return config.get("system_prompt") if config else None
 
     def _load_agent_config(self, agent_id: str) -> dict | None:
-        """Load agent_config from agent_agents table."""
+        """Load agent_config from agent_agents table (cached)."""
+        if agent_id in _agent_config_cache:
+            return _agent_config_cache[agent_id]
         try:
             with self._db() as db:
                 from api.models import Agent
                 row = db.query(Agent.agent_config).filter(Agent.agent_id == agent_id).first()
                 if row and row[0]:
-                    return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                    config = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                    _agent_config_cache[agent_id] = config
+                    return config
         except Exception as e:
             logger.warning(f"Failed to load agent config for {agent_id}: {e}")
+        _agent_config_cache[agent_id] = None
         return None
 
     def _apply_agent_config(self, agent_id: str, ctx: dict) -> None:

@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
+from core.utils.similarity import cosine_similarity
+
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -297,7 +299,7 @@ class ToolRegistry:
                 if vec is None:
                     scored.append((entry, 0.0))
                     continue
-                sim = _cosine_similarity(q_vec, vec)
+                sim = cosine_similarity(q_vec, vec)
                 scored.append((entry, sim))
 
             scored.sort(key=lambda x: x[1], reverse=True)
@@ -340,13 +342,4 @@ class ToolRegistry:
         return schemas
 
 
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Compute cosine similarity between two vectors."""
-    if len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
+

@@ -7,8 +7,8 @@ from core.skills.tool_registry import (
     ToolRegistry,
     ToolSource,
     _DEFAULT_PINNED,
-    _cosine_similarity,
 )
+from core.utils.similarity import cosine_similarity as _cosine_similarity
 
 
 # ── Fixtures ─────────────────────────────────────────────────────

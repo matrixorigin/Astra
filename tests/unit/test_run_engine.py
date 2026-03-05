@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from core.agent.run import AgentRun, RunStatus, RunTrigger
 from core.agent.run_engine import (
     RunEngine, _active_runs, _agent_run_events, _run_waiters, _run_tasks,
-    _child_runs, _MAX_RESUME_INPUT_CHARS,
+    _child_runs, _agent_config_cache, _MAX_RESUME_INPUT_CHARS,
     _MAX_COMPLETED_RUNS, cleanup_fan_in_tasks,
 )
 from core.events.models import EventType
@@ -50,6 +50,7 @@ def clean_state():
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
+    _agent_config_cache.clear()
     cleanup_fan_in_tasks()
     yield
     _active_runs.clear()
@@ -57,6 +58,7 @@ def clean_state():
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
+    _agent_config_cache.clear()
     cleanup_fan_in_tasks()
 
 

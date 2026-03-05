@@ -11,7 +11,7 @@ from typing import Any
 from core.context.manager import TaskType
 from core.db_consumer import DbConsumer, DbFactory
 from core.logging_config import get_logger
-from core.skills.tool_registry import _cosine_similarity
+from core.utils.similarity import cosine_similarity
 
 logger = get_logger(__name__)
 
@@ -229,7 +229,7 @@ class RelevanceScorer(DbConsumer):
         dim = len(recent_embs[0])
         mean_emb = [sum(e[i] for e in recent_embs) / len(recent_embs) for i in range(dim)]
 
-        similarity = _cosine_similarity(query_emb, mean_emb)
+        similarity = cosine_similarity(query_emb, mean_emb)
         shift = max(0.0, 1.0 - similarity)
         logger.debug("Topic shift score: %.3f (similarity=%.3f, %d recent events)", shift, similarity, len(recent_embs))
         return shift

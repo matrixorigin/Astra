@@ -119,15 +119,16 @@ class GovernanceScheduler(DbConsumer):
         """Daily governance for ALL users. Used by scheduler."""
         combined = GovernanceCycleResult()
         batch_size = 2000
-        offset = 0
+        last_uid = ""
         with self._db() as db:
             while True:
                 rows = db.execute(
                     text(
                         "SELECT DISTINCT user_id FROM mem_memories "
-                        "WHERE is_active = 1 LIMIT :limit OFFSET :offset"
+                        "WHERE is_active = 1 AND user_id > :last "
+                        "ORDER BY user_id LIMIT :limit"
                     ),
-                    {"limit": batch_size, "offset": offset},
+                    {"last": last_uid, "limit": batch_size},
                 ).fetchall()
                 if not rows:
                     break
@@ -136,9 +137,9 @@ class GovernanceScheduler(DbConsumer):
                     combined.cleaned_stale += r.cleaned_stale
                     combined.quarantined += r.quarantined
                     combined.errors.extend(r.errors)
+                last_uid = rows[-1][0]
                 if len(rows) < batch_size:
                     break
-                offset += batch_size
         return combined
 
     def run_daily(self, user_id: str) -> GovernanceCycleResult:
@@ -185,17 +186,23 @@ class GovernanceScheduler(DbConsumer):
 
     def _cleanup_tool_results(self) -> int:
         ttl = self.config.tool_result_ttl_hours
+        total = 0
+        batch_limit = 5000
         with self._db() as db:
-            result = db.execute(text("""
-                DELETE FROM mem_memories
-                WHERE memory_type = :mtype
-                  AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :ttl
-            """), {"mtype": "tool_result", "ttl": ttl})
-            db.commit()
-            count = result.rowcount
-        if count > 0:
-            logger.info("Cleaned %d expired TOOL_RESULT memories (TTL=%dh)", count, ttl)
-        return count
+            while True:
+                result = db.execute(text("""
+                    DELETE FROM mem_memories
+                    WHERE memory_type = :mtype
+                      AND TIMESTAMPDIFF(HOUR, observed_at, NOW()) > :ttl
+                    LIMIT :batch
+                """), {"mtype": "tool_result", "ttl": ttl, "batch": batch_limit})
+                db.commit()
+                total += result.rowcount
+                if result.rowcount < batch_limit:
+                    break
+        if total > 0:
+            logger.info("Cleaned %d expired TOOL_RESULT memories (TTL=%dh)", total, ttl)
+        return total
 
     def _archive_stale_working(self) -> int:
         """Archive working memories from sessions inactive > threshold hours."""

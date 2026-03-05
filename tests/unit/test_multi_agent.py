@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from core.agent.run import RunStatus
 from core.agent.run_engine import (
     RunEngine, _active_runs, _agent_run_events, _run_waiters, _run_tasks, _child_runs,
-    _MAX_RESUME_INPUT_CHARS, cleanup_fan_in_tasks,
+    _MAX_RESUME_INPUT_CHARS, cleanup_fan_in_tasks, _agent_config_cache,
 )
 from core.events.models import StreamEvent, StreamEventType
 
@@ -25,6 +25,7 @@ def clean_state():
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
+    _agent_config_cache.clear()
     cleanup_fan_in_tasks()
     yield
     _active_runs.clear()
@@ -32,6 +33,7 @@ def clean_state():
     _run_waiters.clear()
     _run_tasks.clear()
     _child_runs.clear()
+    _agent_config_cache.clear()
     cleanup_fan_in_tasks()
 
 

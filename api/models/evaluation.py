@@ -69,7 +69,7 @@ class LLMCallLog(Base):
     latency_ms = Column(Integer)
     status = Column(String(20))
     error_message = Column(Text)
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime, default=func.now(), index=True)
     call_metadata = Column("metadata", JSON)
 
 

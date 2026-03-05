@@ -41,7 +41,7 @@ class RefreshToken(Base):
     user_id = Column(String(36), nullable=False, index=True)
     token_hash = Column(String(255), nullable=False)
     token_prefix = Column(String(16), nullable=True, index=True)
-    expires_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
     is_revoked = Column(SmallInteger, default=0, server_default="0", nullable=False)
     created_at = Column(DateTime, default=func.now(), nullable=False)
 
@@ -55,7 +55,7 @@ class AuditLog(Base):
     resource_id = Column(String(64))
     details = Column(JSON)
     ip_address = Column(String(45))
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime, default=func.now(), index=True)
 
 
 class Token(Base):

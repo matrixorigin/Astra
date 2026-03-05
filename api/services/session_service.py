@@ -324,12 +324,12 @@ class SessionService:
             raise
 
     def increment_event_count(self, session_id: str, user_id: str) -> None:
-        """增加事件计数
-        
+        """Atomically increment event count.
+
         Args:
             session_id: Session ID
             user_id: 用户ID
-            
+
         Raises:
             ValueError: Session不存在或无权限
         """
@@ -338,17 +338,20 @@ class SessionService:
         if not session:
             raise ValueError(f"Session {session_id} 不存在")
 
-        # 权限检查
         if session.user_id != user_id:
             raise ValueError(f"无权限修改 Session {session_id}")
 
         try:
-            self.session_repo.update(session_id, {
-                "event_count": session.event_count + 1
-            })
-
+            from sqlalchemy import text
+            self.session_repo.db.execute(
+                text(
+                    "UPDATE agent_sessions SET event_count = event_count + 1 "
+                    "WHERE session_id = :sid"
+                ),
+                {"sid": session_id},
+            )
+            self.session_repo.db.commit()
         except Exception:
-            # 静默失败，不影响主流程
             pass
 
     def _cleanup_sandbox(self, session_id: str) -> None:
