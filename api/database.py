@@ -147,6 +147,28 @@ def init_db():
                     except Exception as e:
                         logger.warning("Migration: failed to add column %s: %s", col, e)
 
+    # Migrate: upgrade DATETIME(0) → DATETIME(6) on existing tables.
+    # Earlier code used SQLAlchemy's generic DateTime(timezone=6) which silently
+    # dropped fractional-second precision in DDL.  Models now use DateTime6
+    # (MySQL DATETIME(fsp=6)) so new tables are correct, but existing tables
+    # need an ALTER.  The loop is idempotent — MODIFY to the same type is a no-op.
+    _datetime6_columns = [
+        ("agent_events", "created_at", "NOT NULL"),
+        ("agent_sessions", "created_at", "NOT NULL"),
+        ("agent_sessions", "updated_at", "NOT NULL"),
+        ("agent_sessions", "ended_at", ""),
+        ("agent_sessions", "last_active_at", "NOT NULL"),
+        ("ctx_snapshots", "created_at", "NOT NULL"),
+        ("skill_selection_events", "created_at", ""),
+    ]
+    for tbl, col, extra in _datetime6_columns:
+        if tbl in existing:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE {tbl} MODIFY COLUMN {col} DATETIME(6) {extra}"))
+            except Exception as e:
+                logger.debug("DATETIME(6) migration %s.%s skipped: %s", tbl, col, e)
+
     # Create IVF-flat vector indexes for L2_DISTANCE queries.
     # MatrixOne SDK handles SET experimental_ivf_index=1 and SQL generation.
     # lists=10 is safe default for early-stage data (up to ~10K rows).

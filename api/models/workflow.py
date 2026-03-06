@@ -1,12 +1,12 @@
 """Workflow, trigger models."""
 
 from sqlalchemy import (
-    Column, DateTime, Integer, SmallInteger, String, Text,
+    Column, Integer, SmallInteger, String, Text,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
-from api.models._types import NullableJSON as JSON
+from api.models._types import DateTime6, NullableJSON as JSON
 
 
 class WorkflowDefinition(Base):
@@ -18,8 +18,8 @@ class WorkflowDefinition(Base):
     definition = Column(JSON, nullable=False)
     created_by = Column(String(255))
     is_active = Column(SmallInteger, default=1, server_default="1")
-    created_at = Column(DateTime(6), default=func.now())
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now())
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
 
 
 class WorkflowRun(Base):
@@ -35,9 +35,9 @@ class WorkflowRun(Base):
     inputs = Column(JSON, default=dict)
     error = Column(Text)
     created_by = Column(String(255))
-    started_at = Column(DateTime(6), default=func.now())
-    completed_at = Column(DateTime(6))
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    started_at = Column(DateTime6, default=func.now())
+    completed_at = Column(DateTime6)
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
 
 
 class Trigger(Base):
@@ -52,6 +52,6 @@ class Trigger(Base):
     cron_expr = Column(String(128))
     secret = Column(String(255))
     session_id = Column(String(36))
-    next_fire_at = Column(DateTime(6))
+    next_fire_at = Column(DateTime6)
     is_active = Column(SmallInteger, default=1, server_default="1")
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())

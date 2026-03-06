@@ -1,12 +1,12 @@
 """Evaluation, quality, feedback, and training models."""
 
 from sqlalchemy import (
-    Column, DateTime, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
-from api.models._types import NullableJSON as JSON
+from api.models._types import DateTime6, NullableJSON as JSON
 
 
 class QualityAssessment(Base):
@@ -24,8 +24,8 @@ class QualityAssessment(Base):
     step_count = Column(Integer, nullable=False, default=0)
     failure_count = Column(Integer, nullable=False, default=0)
     details = Column(JSON)
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
 
 
 class GateResult(Base):
@@ -40,7 +40,7 @@ class GateResult(Base):
     score_delta = Column(Float, default=0.0)
     passed = Column(SmallInteger, nullable=False)
     metrics = Column(Text)
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())
 
 
 class LLMFeedback(Base):
@@ -52,7 +52,7 @@ class LLMFeedback(Base):
     rating = Column(Integer)
     comment = Column(Text)
     feedback_metadata = Column("metadata", JSON)
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())
 
 
 class LLMCallLog(Base):
@@ -69,7 +69,7 @@ class LLMCallLog(Base):
     latency_ms = Column(Integer)
     status = Column(String(20))
     error_message = Column(Text)
-    created_at = Column(DateTime(6), default=func.now(), index=True)
+    created_at = Column(DateTime6, default=func.now(), index=True)
     call_metadata = Column("metadata", JSON)
 
 
@@ -86,7 +86,7 @@ class UserFeedback(Base):
     rating = Column(Integer)
     feedback_type = Column(String(32))
     comment = Column(Text)
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())
 
 
 class TrainingData(Base):
@@ -98,4 +98,4 @@ class TrainingData(Base):
     quality = Column(String(20), nullable=False)
     contamination_score = Column(Float, nullable=False, default=0.0)
     content_hash = Column(String(64), unique=True, nullable=False)
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())

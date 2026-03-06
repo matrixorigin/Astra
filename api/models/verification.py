@@ -1,9 +1,10 @@
 """Hallucination firewall verification models."""
 
-from sqlalchemy import Column, DateTime, Float, Integer, SmallInteger, String, Text
+from sqlalchemy import Column, Float, Integer, SmallInteger, String, Text
 from sqlalchemy.sql import func
 
 from api.base import Base
+from api.models._types import DateTime6
 
 
 class HallucinationCheck(Base):
@@ -18,7 +19,7 @@ class HallucinationCheck(Base):
     confidence_score = Column(Float, nullable=False, default=0.0)
     safe_to_deliver = Column(SmallInteger, nullable=False, default=1, server_default="1")
     evidence_count = Column(Integer, nullable=False, default=0)
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())
 
 
 class ClaimEvidence(Base):
@@ -32,4 +33,4 @@ class ClaimEvidence(Base):
     content = Column(Text, nullable=False)
     location = Column(String(500), nullable=False)
     confidence = Column(Float, nullable=False, default=0.0)
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())

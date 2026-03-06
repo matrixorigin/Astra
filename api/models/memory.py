@@ -3,13 +3,13 @@
 from matrixone import VectorPrecision, VectorType
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy import (
-    Column, DateTime, Float, Index, Integer, SmallInteger, String, Text,
+    Column, Float, Index, Integer, SmallInteger, String, Text,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
 from api.models._constants import EMBEDDING_DIM
-from api.models._types import NullableJSON as JSON
+from api.models._types import DateTime6, NullableJSON as JSON
 
 
 class MemoryRecord(Base):
@@ -35,6 +35,6 @@ class MemoryRecord(Base):
     source_event_ids = Column(JSON, nullable=False, default=list)
     superseded_by = Column(String(64), nullable=True)
     is_active = Column(SmallInteger, server_default="1", nullable=False)
-    observed_at = Column(DateTime(6), nullable=False)
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    observed_at = Column(DateTime6, nullable=False)
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())

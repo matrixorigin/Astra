@@ -3,14 +3,14 @@
 from matrixone import VectorPrecision, VectorType
 from matrixone.sqlalchemy_ext import FulltextIndex, FulltextParserType
 from sqlalchemy import (
-    Column, DateTime, Float, Index, Integer, SmallInteger, String, Text,
+    Column, Float, Index, Integer, SmallInteger, String, Text,
     UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
 from api.models._constants import EMBEDDING_DIM
-from api.models._types import NullableJSON as JSON
+from api.models._types import DateTime6, NullableJSON as JSON
 
 
 class Agent(Base):
@@ -22,8 +22,8 @@ class Agent(Base):
     agent_config = Column("agent_config", JSON)
     data_source = Column(JSON)
     is_active = Column(SmallInteger, server_default="1", nullable=False)
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
 
 
 class Session(Base):
@@ -42,10 +42,10 @@ class Session(Base):
     summary_status = Column(String(20), nullable=True)
     summary_job_id = Column(String(36), nullable=True)
     vector_db_snapshot_id = Column(String(64), nullable=True)
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
-    ended_at = Column(DateTime(6), nullable=True)
-    last_active_at = Column(DateTime(6), default=func.now(), nullable=False)
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
+    ended_at = Column(DateTime6, nullable=True)
+    last_active_at = Column(DateTime6, default=func.now(), nullable=False)
     session_metadata = Column("metadata", JSON)
 
 
@@ -70,7 +70,7 @@ class Event(Base):
     parent_event_id = Column(String(36), nullable=True)
     causal_chain_id = Column(String(36), nullable=False)
     desensitized_content = Column(Text)
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
     event_metadata = Column("metadata", JSON)
     context_snapshot = Column(JSON)
     token_usage = Column(JSON)
@@ -110,8 +110,8 @@ class AgentScratchpad(Base):
     status = Column(String(20), default="active")
     related_event_ids = Column(JSON)
     related_note_ids = Column(JSON)
-    created_at = Column(DateTime(6), default=func.now())
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now())
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
 
 
 class RunEvent(Base):
@@ -127,4 +127,4 @@ class RunEvent(Base):
     data = Column(JSON, nullable=False)
     event_id = Column(String(36))
     agent_id = Column(String(64))
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())

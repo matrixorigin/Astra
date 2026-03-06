@@ -1617,8 +1617,12 @@ def _persist_turn_events(
                 tc_id = tc.get("id", "")
                 tc_func = tc.get("function", {})
                 tc_name = tc_func.get("name", "")
+                # Normalise source: cloud skills carry _source="cloud", edge tools default to "edge".
+                # Written to metadata (not content) for consistent querying — tool_result events
+                # already use metadata.source, so tool_call must match.
+                tc_source = tc.get("_source", "edge")
                 tc_content: dict[str, Any] = {"tool_call_id": tc_id, "name": tc_name, "arguments": tc_func.get("arguments", "{}")}
-                if tc.get("_source") == "cloud":
+                if tc_source == "cloud":
                     tc_content["source"] = "cloud"
                 el.create_stream_event(
                     user_id=user_id, session_id=session_id,
@@ -1626,7 +1630,7 @@ def _persist_turn_events(
                     content=json.dumps(tc_content),
                     parent_event_id=parent_event_id,
                     causal_chain_id=causal_chain_id,
-                    metadata={"tool_call_id": tc_id, "name": tc_name},
+                    metadata={"tool_call_id": tc_id, "name": tc_name, "source": tc_source},
                     skill_name=tc_name,
                     skill_version=skill_versions.get(tc_name),
                 )
@@ -1653,10 +1657,18 @@ def _persist_turn_events(
                     skill_version=skill_versions.get(ctr_name),
                 )
 
-        if full_text or tool_calls:
+        # Always write llm_response when the LLM was called (indicated by
+        # full_text or tool_calls being present).  When the LLM only emits
+        # tool_calls, full_text is often whitespace-only preamble — strip it
+        # so the event content is clean, but still persist the event because:
+        #   1. token_usage must be recorded (tokens were consumed)
+        #   2. snapshot linking needs llm_response_event_id
+        #   3. audit trail requires a response event per LLM call
+        _content = full_text.strip() if full_text else ""
+        if _content or tool_calls:
             llm_resp_ev = el.create_llm_response(
                 user_id=user_id, session_id=session_id,
-                content=full_text,
+                content=_content,
                 agent_id="dev-agent", agent_version="0.1.0",
                 parent_event_id=parent_event_id,
                 causal_chain_id=causal_chain_id,
@@ -1666,7 +1678,12 @@ def _persist_turn_events(
             )
             llm_response_event_id = llm_resp_ev.event_id
 
-        if history and turn_count > 0 and turn_count % _SNAPSHOT_TURN_INTERVAL == 0:
+        # Only snapshot on turns with a new user query — continuation turns
+        # (edge returning tool_results) don't change the conversation shape,
+        # so snapshotting them wastes storage without aiding recovery.
+        _is_new_user_turn = user_content is not None
+        if (history and _is_new_user_turn
+                and turn_count > 0 and turn_count % _SNAPSHOT_TURN_INTERVAL == 0):
             # Compact snapshot: strip verbose tool result content to reduce storage.
             # Recovery only needs message structure (roles, tool_call_ids), not full results.
             compact_history = []

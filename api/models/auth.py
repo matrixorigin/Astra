@@ -1,10 +1,10 @@
 """Auth & identity models."""
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, SmallInteger, String
+from sqlalchemy import Column, ForeignKey, Integer, SmallInteger, String
 from sqlalchemy.sql import func
 
 from api.base import Base
-from api.models._types import NullableJSON as JSON
+from api.models._types import DateTime6, NullableJSON as JSON
 
 
 class User(Base):
@@ -15,8 +15,8 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     display_name = Column(String(100))
     is_active = Column(SmallInteger, server_default="1", nullable=False)
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
-    last_login_at = Column(DateTime(6))
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
+    last_login_at = Column(DateTime6)
 
 
 class Role(Base):
@@ -24,7 +24,7 @@ class Role(Base):
     role_id = Column(String(36), primary_key=True)
     role_name = Column(String(50), unique=True, nullable=False)
     description = Column(String(255))
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())
 
 
 class UserRole(Base):
@@ -32,7 +32,7 @@ class UserRole(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(36), ForeignKey("auth_users.user_id"), nullable=False, index=True)
     role_id = Column(String(36), ForeignKey("auth_roles.role_id"), nullable=False, index=True)
-    created_at = Column(DateTime(6), default=func.now())
+    created_at = Column(DateTime6, default=func.now())
 
 
 class RefreshToken(Base):
@@ -41,9 +41,9 @@ class RefreshToken(Base):
     user_id = Column(String(36), nullable=False, index=True)
     token_hash = Column(String(255), nullable=False)
     token_prefix = Column(String(16), nullable=True, index=True)
-    expires_at = Column(DateTime(6), nullable=False, index=True)
+    expires_at = Column(DateTime6, nullable=False, index=True)
     is_revoked = Column(SmallInteger, default=0, server_default="0", nullable=False)
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
 
 
 class AuditLog(Base):
@@ -55,7 +55,7 @@ class AuditLog(Base):
     resource_id = Column(String(64))
     details = Column(JSON)
     ip_address = Column(String(45))
-    created_at = Column(DateTime(6), default=func.now(), index=True)
+    created_at = Column(DateTime6, default=func.now(), index=True)
 
 
 class Token(Base):
@@ -68,6 +68,6 @@ class Token(Base):
     is_active = Column(SmallInteger, default=1, server_default="1")
     scope_user_id = Column(String(36), index=True)
     scope_repo = Column(String(255), index=True)
-    created_at = Column(DateTime(6), default=func.now())
-    expires_at = Column(DateTime(6), nullable=True)
+    created_at = Column(DateTime6, default=func.now())
+    expires_at = Column(DateTime6, nullable=True)
     token_metadata = Column("metadata", JSON)

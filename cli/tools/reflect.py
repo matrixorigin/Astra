@@ -22,10 +22,10 @@ class ReflectTool(EdgeTool):
 
     name = "reflect"
     description = (
-        "Inspect my own internal state and decision-making for previous turns: "
-        "what I remember about the user, why I chose certain tools, what context I saw. "
-        "Use when user asks about memories, what I know about them, "
-        "decision process, why I did something, or wants to understand my past behavior."
+        "Diagnose past tool execution: why a tool failed, why results were unexpected, "
+        "why a specific tool was or wasn't selected, performance bottlenecks. "
+        "Analyzes the event trail (tool calls, results, errors) from previous turns. "
+        "For LLM context/token analysis, use get_agent_info(dimension='context_snapshot') instead."
     )
     parameters = {
         "type": "object",

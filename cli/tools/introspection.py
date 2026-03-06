@@ -38,9 +38,11 @@ class GetAgentInfoTool(EdgeTool):
     @property
     def description(self) -> str:
         return (
-            "Query agent runtime state: token usage, context breakdown, "
+            "Query agent runtime state: token usage, context window breakdown, "
             "session info, available tools, memory stats. "
-            "Use when user asks about context size, token budget, what model, or agent capabilities."
+            "Use when user asks about LLM context, token budget, what the model saw, "
+            "context analysis, what model is being used, or agent capabilities. "
+            "For tool execution diagnostics (why a tool failed/wasn't used), use reflect instead."
         )
 
     @property

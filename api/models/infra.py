@@ -1,12 +1,12 @@
 """Infrastructure models: LLM, config, repo, sandbox, locks."""
 
 from sqlalchemy import (
-    Column, DateTime, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column, Integer, SmallInteger, String, Text, UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
-from api.models._types import NullableJSON as JSON
+from api.models._types import DateTime6, NullableJSON as JSON
 
 
 class LLMModel(Base):
@@ -30,8 +30,8 @@ class LLMModel(Base):
     description = Column(Text, nullable=True)
     tags = Column(JSON, default=list)
     created_by = Column(String(36), nullable=True)
-    created_at = Column(DateTime(6), default=func.now())
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now())
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
 
 
 class Config(Base):
@@ -45,8 +45,8 @@ class Config(Base):
     scope_user_id = Column(String(64), nullable=True, index=True)
     value = Column(Text, nullable=False)
     description = Column(Text)
-    created_at = Column(DateTime(6), default=func.now())
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now())
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
 
 
 class Repo(Base):
@@ -60,10 +60,10 @@ class Repo(Base):
     access_scope = Column(String(50), default="user")
     branch = Column(String(100), default="main")
     status = Column(String(20), default="active")
-    last_synced_at = Column(DateTime(6))
+    last_synced_at = Column(DateTime6)
     repo_metadata = Column("metadata", JSON)
-    created_at = Column(DateTime(6), default=func.now())
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now())
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
 
 
 class SandboxMetadata(Base):
@@ -73,8 +73,8 @@ class SandboxMetadata(Base):
     data_source = Column(JSON)
     description = Column(String(255))
     created_by = Column(String(36))
-    created_at = Column(DateTime(6))
-    updated_at = Column(DateTime(6))
+    created_at = Column(DateTime6)
+    updated_at = Column(DateTime6)
     tags = Column(JSON)
     source_database = Column(String(64))
     source_snapshot = Column(String(64))
@@ -82,13 +82,13 @@ class SandboxMetadata(Base):
     session_id = Column(String(36), index=True, nullable=True)
     repo_id = Column(String(36), nullable=True)
     container_id = Column(String(64), nullable=True)
-    terminated_at = Column(DateTime(6), nullable=True)
+    terminated_at = Column(DateTime6, nullable=True)
 
 
 class DistributedLock(Base):
     __tablename__ = "infra_distributed_locks"
     lock_name = Column(String(64), primary_key=True)
     instance_id = Column(String(64), nullable=False)
-    acquired_at = Column(DateTime(6), default=func.now(), nullable=False)
-    expires_at = Column(DateTime(6), nullable=False)
+    acquired_at = Column(DateTime6, default=func.now(), nullable=False)
+    expires_at = Column(DateTime6, nullable=False)
     task_name = Column(String(64), nullable=False, index=True)

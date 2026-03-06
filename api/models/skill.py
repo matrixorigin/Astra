@@ -2,13 +2,13 @@
 
 from matrixone import VectorPrecision, VectorType
 from sqlalchemy import (
-    Column, DateTime, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
+    Column, Float, Index, Integer, SmallInteger, String, Text, UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
 from api.base import Base
 from api.models._constants import EMBEDDING_DIM
-from api.models._types import NullableJSON as JSON
+from api.models._types import DateTime6, NullableJSON as JSON
 
 
 class SkillRegistry(Base):
@@ -41,8 +41,8 @@ class SkillRegistry(Base):
     manifest = Column(JSON)
     is_public = Column(SmallInteger, default=0, server_default="0")
     created_by = Column(String(36))
-    created_at = Column(DateTime(6), default=func.now())
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now())
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
     embedding = Column(VectorType(EMBEDDING_DIM, VectorPrecision.F32))
     tags = Column(JSON)  # SkillTags: scope, data_source, intent_type, requires_history
 
@@ -60,8 +60,8 @@ class SkillInstallation(Base):
     skill_version = Column(String(20), nullable=False)
     previous_version = Column(String(20))
     status = Column(String(20), default="installed")
-    installed_at = Column(DateTime(6), default=func.now(), nullable=False)
-    updated_at = Column(DateTime(6), onupdate=func.now())
+    installed_at = Column(DateTime6, default=func.now(), nullable=False)
+    updated_at = Column(DateTime6, onupdate=func.now())
 
 
 class SkillUserCredential(Base):
@@ -76,8 +76,8 @@ class SkillUserCredential(Base):
     skill_name = Column(String(100), nullable=False)
     credential_name = Column(String(100), nullable=False)
     value_encrypted = Column(Text, nullable=False)
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
-    rotated_at = Column(DateTime(6))
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
+    rotated_at = Column(DateTime6)
 
 
 class SkillPermission(Base):
@@ -94,8 +94,8 @@ class SkillPermission(Base):
     permission_type = Column(String(10), nullable=False, default="install")
     tenant_id = Column(String(36), nullable=True)
     granted_by = Column(String(36), nullable=False)
-    granted_at = Column(DateTime(6), default=func.now(), nullable=False)
-    expires_at = Column(DateTime(6), nullable=True)
+    granted_at = Column(DateTime6, default=func.now(), nullable=False)
+    expires_at = Column(DateTime6, nullable=True)
 
 
 class SkillSelectionEvent(Base):
@@ -126,7 +126,7 @@ class SkillSelectionEvent(Base):
     user_feedback_score = Column(Integer)
     selection_correctness = Column(SmallInteger)
     correction_suggestion = Column(JSON)
-    created_at = Column(DateTime(6), default=func.now(), index=True)
+    created_at = Column(DateTime6, default=func.now(), index=True)
 
 
 class SkillSelectionLearning(Base):
@@ -145,13 +145,13 @@ class SkillSelectionLearning(Base):
     confidence = Column(Float)
     evidence_count = Column(Integer, default=1)
     applied_count = Column(Integer, default=0)
-    last_applied_at = Column(DateTime(6))
+    last_applied_at = Column(DateTime6)
     signal_type = Column(String(50), default="wrong_skill", index=True)
     target_metrics = Column(JSON)
     context_features = Column(JSON)
     is_active = Column(SmallInteger, default=1, server_default="1", index=True)
-    created_at = Column(DateTime(6), default=func.now())
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now())
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
 
 
 class SkillSetting(Base):
@@ -175,8 +175,8 @@ class SkillSetting(Base):
     is_secret = Column(SmallInteger, nullable=False, default=0)
     scope_type = Column(String(20), nullable=False)   # "global" | "tenant" | "user"
     scope_id = Column(String(36), nullable=True)      # NULL for global
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
     updated_by = Column(String(36), nullable=False)
 
 
@@ -202,8 +202,8 @@ class SkillResourceBinding(Base):
     binding_name = Column(String(100), nullable=False)
     binding_value = Column(Text, nullable=False)
     is_secret = Column(SmallInteger, nullable=False, default=0)
-    created_at = Column(DateTime(6), default=func.now(), nullable=False)
-    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime6, default=func.now(), nullable=False)
+    updated_at = Column(DateTime6, default=func.now(), onupdate=func.now())
     updated_by = Column(String(36), nullable=False)
 
 
@@ -216,4 +216,4 @@ class SkillExecutionMetric(Base):
     execution_cost = Column(Float, default=0.0)
     success = Column(SmallInteger, nullable=False)
     error_message = Column(Text)
-    created_at = Column(DateTime(6), default=func.now(), index=True)
+    created_at = Column(DateTime6, default=func.now(), index=True)

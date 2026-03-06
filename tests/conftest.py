@@ -69,7 +69,9 @@ def test_engine():
             if missing:
                 raise RuntimeError(f"Tables missing after init_db: {missing}")
             # Ensure microsecond precision on timestamp columns (idempotent).
-            # init_db only CREATEs — existing tables keep old DATETIME(0).
+            # Models now use DateTime6 (MySQL DATETIME(fsp=6)) so new tables are
+            # correct.  init_db also runs ALTER for existing tables, but we keep
+            # this as a safety net for test DBs that predate the migration.
             from sqlalchemy import text as sa_text
             for ddl in [
                 "ALTER TABLE agent_events MODIFY COLUMN created_at DATETIME(6) NOT NULL",
