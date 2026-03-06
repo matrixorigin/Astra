@@ -5,7 +5,7 @@ Each action wraps a GitHubSkillAPI method with typed input/output.
 
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import BaseModel, field_validator
 
 from core.skills.base import (
     AccessScope,
@@ -185,10 +185,23 @@ class SummarizePRAction(Skill[SummarizePRInput, SummarizePROutput]):
 class CIStatusInput(SkillInput):
     repo: str  # "owner/repo"
     limit: int = 5
+    detail: str = "brief"  # brief, normal, detailed, full
+
+
+class WorkflowRun(BaseModel):
+    """Fixed-schema workflow run — every field always present."""
+
+    workflow: str
+    conclusion: str  # success / failure / pending / skipped / cancelled / unknown
+    branch: str | None = None
+    pr_number: int | None = None
+    actor: str | None = None
+    triggered_at: str | None = None  # YYYY-MM-DD HH:MM
+    url: str | None = None
 
 
 class CIStatusOutput(SkillOutput):
-    workflows: list[dict]
+    workflows: list[WorkflowRun]
 
 
 # ------------------------------------------------------------------
@@ -343,6 +356,14 @@ class CIStatusAction(Skill[CIStatusInput, CIStatusOutput]):
     description = (
         "Check CI/CD workflow run status in a GitHub repository — shows recent workflow runs "
         "with pass/fail/pending status. Use when user asks about build status or CI failures. "
+        "repo can be 'owner/repo' or just a project name (auto-resolved by star count). "
+        "detail: 'brief' (default) = workflow/conclusion/branch/actor/triggered_at; "
+        "'normal' adds PR title + commit message + duration; "
+        "'detailed' adds per-job status + failed job names; "
+        "'full' adds failed step annotations. "
+        "If resolved_by_search=True, tell user which repo was used. "
+        "If result is an empty list, it means the repository has NO CI workflows configured — "
+        "tell the user directly, do NOT retry with other tools. "
         "For checking CI on a specific PR, use get_pr_checks instead."
     )
     requirements = SkillRequirement(
@@ -356,15 +377,17 @@ class CIStatusAction(Skill[CIStatusInput, CIStatusOutput]):
         self._api = api
 
     async def execute(self, input: CIStatusInput) -> CIStatusOutput:
-        runs = await self._api.list_wf_runs(input.repo, input.limit)
+        runs = await self._api.list_wf_runs(input.repo, input.limit, input.detail)
         workflows = [
-            {
-                "workflow": r["name"],
-                "status": r["status"],
-                "conclusion": r["conclusion"],
-                "url": r["html_url"],
-                "created_at": r["created_at"],
-            }
+            WorkflowRun(
+                workflow=r["workflow"],
+                conclusion=r["conclusion"],
+                branch=r.get("branch"),
+                pr_number=r.get("pr_number"),
+                actor=r.get("actor"),
+                triggered_at=r.get("triggered_at"),
+                url=r.get("url"),
+            )
             for r in runs
         ]
         return CIStatusOutput(success=True, result=workflows, workflows=workflows)

@@ -62,11 +62,15 @@ class ModelRouter(DbConsumer):
         # Try LLM classification first if available
         if self.llm_client:
             try:
-                result = self.llm_client.chat([{
-                    "role": "user",
-                    "content": f"Classify complexity (simple/medium/complex/critical):\n{query}"
-                }])
-                response = result.get("content", "").lower()
+                result = self.llm_client.chat(
+                    messages=[{
+                        "role": "user",
+                        "content": f"Classify complexity (simple/medium/complex/critical):\n{query}"
+                    }],
+                    user_id="routing",
+                    task_hint="routing",
+                )
+                response = (result.content or "").lower()
                 for complexity in TaskComplexity:
                     if complexity.value in response:
                         return complexity

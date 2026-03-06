@@ -295,6 +295,7 @@ class PromptEvolver(DbConsumer):
                 messages=[{"role": "user", "content": prompt}],
                 user_id="prompt_evolver",
                 temperature=0.0,
+                task_hint="prompt_evolution",
             )
             text = (response.content or "").strip()
             match = re.search(r"[1-5]", text)

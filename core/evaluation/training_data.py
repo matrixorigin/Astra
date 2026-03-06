@@ -258,6 +258,7 @@ class TrainingDataPipeline(DbConsumer):
                 messages=[{"role": "user", "content": prompt}],
                 user_id="training_data_pipeline",
                 temperature=0.0,
+                task_hint="training_data",
             )
             text = (response.content or "").strip()
             # Extract first digit

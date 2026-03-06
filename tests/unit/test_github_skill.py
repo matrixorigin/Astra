@@ -717,13 +717,34 @@ class TestActions:
         from skills.github.actions import CIStatusAction, CIStatusInput
         mock_api = AsyncMock(spec=GitHubSkillAPI)
         mock_api.list_wf_runs.return_value = [
-            {"name": "Build", "status": "completed", "conclusion": "success",
-             "html_url": "u", "created_at": "t"}
+            {"workflow": "Build", "conclusion": "success",
+             "branch": "main", "pr_number": None, "actor": "bot",
+             "triggered_at": "2026-03-06 12:00", "url": "u"}
         ]
         action = CIStatusAction(api=mock_api)
         result = await action.execute(CIStatusInput(repo="o/r"))
         assert result.success
         assert len(result.workflows) == 1
+        wf = result.workflows[0]
+        assert wf.workflow == "Build"
+        assert wf.conclusion == "success"
+        assert wf.branch == "main"
+        assert wf.pr_number is None
+        assert wf.actor == "bot"
+        assert wf.triggered_at == "2026-03-06 12:00"
+        # Verify detail is passed through to API
+        mock_api.list_wf_runs.assert_called_once_with("o/r", 5, "brief")
+
+    @pytest.mark.asyncio
+    async def test_ci_status_action_empty_runs(self):
+        from skills.github.actions import CIStatusAction, CIStatusInput
+        mock_api = AsyncMock(spec=GitHubSkillAPI)
+        mock_api.list_wf_runs.return_value = []
+        action = CIStatusAction(api=mock_api)
+        result = await action.execute(CIStatusInput(repo="o/r"))
+        assert result.success is True
+        assert result.workflows == []
+        assert result.result == []
 
     @pytest.mark.asyncio
     async def test_list_issues_action(self):

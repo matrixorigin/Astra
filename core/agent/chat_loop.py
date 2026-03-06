@@ -153,6 +153,7 @@ class ChatLoop:
         # Stall detector: tracks per-round tool call signatures to detect
         # repeated unsuccessful search patterns (e.g. same query rephrased).
         self._round_tool_sigs: list[set[str]] = []
+        self._round_text_lens: list[int] = []
         try:
             from core.context.few_shot import FewShotRetriever
             if hasattr(llm_client, '_db_factory'):
@@ -728,8 +729,12 @@ class ChatLoop:
             if isinstance(max_tokens, int) and needs_compaction(messages, max_tokens):
                 def llm_summarize(text: str) -> str:
                     try:
-                        result = self.llm.chat([{"role": "user", "content": f"Summarize concisely:\n{text}"}])
-                        return result.get("content", text[:1000])
+                        result = self.llm.chat(
+                            messages=[{"role": "user", "content": f"Summarize concisely:\n{text}"}],
+                            user_id=user_id,
+                            task_hint="compaction",
+                        )
+                        return result.content or text[:1000]
                     except Exception:
                         return text[:1000]
 
@@ -999,7 +1004,7 @@ class ChatLoop:
 
             # Stall detection: if the agent keeps calling the same tools
             # across consecutive rounds, nudge it to stop and answer directly.
-            self._record_round_tools(tool_calls)
+            self._record_round_tools(tool_calls, full_text)
             if self._detect_stall():
                 logger.info("Stall detected at round %d — nudging LLM to conclude", _round)
                 messages.append({
@@ -1432,8 +1437,12 @@ class ChatLoop:
 
             def _summarize(text: str) -> str:
                 try:
-                    result = self.llm.chat([{"role": "user", "content": f"Summarize concisely:\n{text}"}])
-                    return result.get("content", text[:1000])
+                    result = self.llm.chat(
+                        messages=[{"role": "user", "content": f"Summarize concisely:\n{text}"}],
+                        user_id="pipeline",
+                        task_hint="compaction",
+                    )
+                    return result.content or text[:1000]
                 except Exception:
                     return text[:1000]
 
@@ -1444,6 +1453,7 @@ class ChatLoop:
             if not tools:
                 response = self.llm.chat(
                     messages=[LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages],
+                    user_id="pipeline",
                     model=model,
                 )
                 return {"content": response.content or "", "tool_calls": []}
@@ -1520,6 +1530,7 @@ class ChatLoop:
         async def final_answer_call(messages, **kw):
             response = self.llm.chat(
                 messages=[LLMMessage(role=m["role"], content=m.get("content", "")) for m in messages],
+                user_id=state.user_id,
                 model=model,
             )
             return response.content or ""
@@ -1550,6 +1561,7 @@ class ChatLoop:
         self._tool_failures = {}
         self._blocked_tools = set()
         self._round_tool_sigs = []
+        self._round_text_lens = []
         self._breaker_records: dict[str, Any] = {}  # Actually dict[str, BreakerRecord]
         try:
             if hasattr(self.event_logger, '_db_factory'):
@@ -1652,31 +1664,43 @@ class ChatLoop:
     # not flagged, while identical retries are.
 
     _STALL_WINDOW = 3  # consecutive rounds to compare
+    _NO_PROGRESS_WINDOW = 3  # rounds with no meaningful text → stall
+    _MIN_PROGRESS_CHARS = 20  # text shorter than this counts as "no progress"
 
-    def _record_round_tools(self, tool_calls: list[dict]) -> None:
-        """Record normalised call signatures for this round."""
+    def _record_round_tools(self, tool_calls: list[dict], text: str = "") -> None:
+        """Record normalised call signatures and text length for this round."""
         sigs: set[str] = set()
         for tc in tool_calls:
             name = tc["function"]["name"]
             args = tc["function"].get("arguments", "")
-            # arguments is a JSON string from the LLM; use it verbatim
-            # as the identity key so different args ≠ same signature.
             sigs.add(f"{name}:{args}")
         self._round_tool_sigs.append(sigs)
+        self._round_text_lens.append(len(text.strip()))
 
     def _detect_stall(self) -> bool:
-        """Return True if the last ``_STALL_WINDOW`` rounds have identical call signatures.
+        """Return True if the agent is stuck.
 
-        Only fires when every round in the window produced the exact same set
-        of (tool_name, arguments) pairs — meaning the agent is literally
-        repeating itself with no variation.
+        Two complementary heuristics:
+        1. Identical call signatures for ``_STALL_WINDOW`` consecutive rounds.
+        2. No meaningful text output (< ``_MIN_PROGRESS_CHARS``) for
+           ``_NO_PROGRESS_WINDOW`` consecutive rounds — catches "different tool
+           each round" thrashing.
         """
-        w = self._STALL_WINDOW
         sigs = self._round_tool_sigs
-        if len(sigs) < w:
-            return False
-        recent = sigs[-w:]
-        return all(s == recent[0] for s in recent[1:])
+        window = self._STALL_WINDOW
+        if len(sigs) >= window:
+            recent = sigs[-window:]
+            if all(s == recent[0] for s in recent[1:]):
+                return True
+
+        lens = self._round_text_lens
+        np_window = self._NO_PROGRESS_WINDOW
+        if len(lens) >= np_window:
+            threshold = self._MIN_PROGRESS_CHARS
+            if all(length < threshold for length in lens[-np_window:]):
+                return True
+
+        return False
 
     # Helpers
     # ------------------------------------------------------------------

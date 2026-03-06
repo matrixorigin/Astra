@@ -168,6 +168,7 @@ Files changed: {pr["changed_files"]}
             messages=[{"role": "user", "content": prompt}],
             user_id=input.user_id,
             session_id=input.session_id,
+            task_hint="builtin_skill",
             metadata={
                 "skill": self.name,
                 "skill_version": self.version,

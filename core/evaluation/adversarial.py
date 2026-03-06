@@ -229,6 +229,7 @@ class AdversarialEvaluator(DbConsumer):
                 messages=[{"role": "user", "content": attack_prompt}],
                 user_id="adversarial_eval",
                 session_id=session_id,
+                task_hint="adversarial_eval",
             )
             return response.content or ""
         except Exception as e:

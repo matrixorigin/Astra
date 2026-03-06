@@ -103,8 +103,12 @@ Reply with ONE of:
 - DONE: <conclusion>
 """
         try:
-            response = self.llm.chat([{"role": "user", "content": prompt}])
-            return response.content[:200] if hasattr(response, 'content') else str(response)[:200]
+            response = self.llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                user_id="summary_quality_evaluator",
+                task_hint="summary_quality_eval",
+            )
+            return (response.content or "")[:200]
         except Exception:
             return "ERROR"
     

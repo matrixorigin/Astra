@@ -277,6 +277,7 @@ class ConsistencyVerifier(DbConsumer):
                 messages=[{"role": "user", "content": prompt}],
                 user_id="consistency_verifier",
                 temperature=0.0,
+                task_hint="consistency_check",
             )
             answer = (response.content or "").strip().lower()
             return answer.startswith("yes")
