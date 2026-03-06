@@ -173,7 +173,7 @@ Output format (JSON):
             response = self.llm.chat(
                 messages=messages,
                 user_id="system",
-                session_id="planning",
+                session_id="planning", task_hint="planning",
             )
 
             # Parse JSON from response
@@ -312,7 +312,7 @@ Output format (JSON):
             response = self.llm.chat(
                 messages=messages,
                 user_id="system",
-                session_id="planning",
+                session_id="planning", task_hint="planning",
             )
 
             content = response.content.strip()
@@ -415,7 +415,7 @@ Sub-steps format:
         ]
 
         try:
-            response = self.llm.chat(messages=messages, user_id="system", session_id="planning")
+            response = self.llm.chat(messages=messages, user_id="system", session_id="planning", task_hint="planning")
 
             content = response.content.strip()
             if content.startswith("```json"):

@@ -95,7 +95,7 @@ class SummaryQualityEvaluator:
 Task: {task_context}
 
 Tool output:
-{content[:8000]}
+{content[:3000]}
 
 Reply with ONE of:
 - FOUND: <specific file/line to examine>

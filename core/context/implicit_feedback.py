@@ -251,6 +251,7 @@ For each case, respond with ONE line: "Case N: <category> <confidence 0.0-1.0>"
             response = self.llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 user_id="system", temperature=0.1,
+                task_hint="feedback_analysis",
             )
             content = response.content if hasattr(response, "content") else str(response)
 

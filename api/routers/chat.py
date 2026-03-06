@@ -2204,7 +2204,7 @@ async def chat_turn(
                         yield f"data: {json.dumps({'type': 'tool_result_quality', 'tool_name': qa['tool_name'], 'grade': qa['grade'], 'score': qa['score'], 'signals': qa['signals']})}\n\n"
 
             llm = _get_shared_llm_client()
-            with llm.request_context(user_id=user_id):
+            with llm.request_context(user_id=user_id), llm.track_auxiliary_calls() as _aux_calls:
 
                 full_text = ""
                 tool_calls: list[dict[str, Any]] = []
@@ -2608,6 +2608,8 @@ async def chat_turn(
                     explain_event["memory"] = _memory_stats
                 if _routing_meta:
                     explain_event["routing"] = _routing_meta
+                if _aux_calls:
+                    explain_event["auxiliary_llm_calls"] = _aux_calls
                 yield f"data: {json.dumps(explain_event)}\n\n"
 
             # Task 4.4: Include execution_state for edge-cloud breaker sync.

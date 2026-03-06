@@ -159,6 +159,7 @@ class StreamingVerifier:
                 messages=[LLMMessage(role="user", content=prompt)],
                 user_id="system",
                 session_id="stream_verify",
+                task_hint="entailment_verify",
             )
             return self._parse_batch_verdicts(
                 response.content or "", sentences,
@@ -181,6 +182,7 @@ class StreamingVerifier:
                 messages=[LLMMessage(role="user", content=prompt)],
                 user_id="system",
                 session_id="stream_verify",
+                task_hint="entailment_verify",
             )
             verdict = (response.content or "").strip().upper()
             if "CONTRADICTED" in verdict:

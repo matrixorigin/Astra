@@ -84,6 +84,34 @@ class LLMClient(DbConsumer):
 
     # ── Per-request context (concurrency-safe) ─────────────────────
 
+    # Auxiliary LLM call tracker — collects stats for non-chat calls
+    # (memory extraction, verification, etc.) within a turn for EXPLAIN.
+    _ctx_aux_calls: ContextVar[list[dict] | None] = ContextVar(
+        "_ctx_aux_calls", default=None,
+    )
+
+    @contextmanager
+    def track_auxiliary_calls(self):
+        """Context manager that collects auxiliary LLM call stats for EXPLAIN."""
+        calls: list[dict] = []
+        tok = self._ctx_aux_calls.set(calls)
+        try:
+            yield calls
+        finally:
+            self._ctx_aux_calls.reset(tok)
+
+    def _record_auxiliary(self, task_hint: str, tokens_prompt: int, tokens_completion: int,
+                          cost_usd: float, latency_ms: int) -> None:
+        bucket = self._ctx_aux_calls.get()
+        if bucket is not None:
+            bucket.append({
+                "purpose": task_hint,
+                "tokens_in": tokens_prompt,
+                "tokens_out": tokens_completion,
+                "cost_usd": round(cost_usd, 6),
+                "ms": latency_ms,
+            })
+
     @contextmanager
     def request_context(self, user_id: str | None = None):
         """Bind user_id + router for the current execution context.
@@ -528,6 +556,10 @@ class LLMClient(DbConsumer):
         self._check_budget(model, msg_dicts)
         self._check_context_overflow(model, msg_dicts)
 
+        # Enrich metadata with task_hint for cost attribution / explain.
+        if task_hint:
+            metadata = {**(metadata or {}), "task_hint": task_hint}
+
         try:
             response, model_cfg = self._dispatch(
                 model,
@@ -549,6 +581,11 @@ class LLMClient(DbConsumer):
             self._log_call(
                 event_id, user_id, model_cfg.provider, response, "success", metadata=metadata
             )
+            if task_hint:
+                self._record_auxiliary(
+                    task_hint, response.tokens_prompt, response.tokens_completion,
+                    response.cost_usd, response.latency_ms,
+                )
             return (
                 LLMResponse(**response.model_dump())
                 if isinstance(response, LLMResponse)
@@ -611,6 +648,7 @@ class LLMClient(DbConsumer):
         self._check_context_overflow(model, messages)
         temp = self.config.get("temperature", 0.7)
         max_tok = self.config.get("max_tokens")
+        _meta = {"task_hint": task_hint} if task_hint else None
 
         chain = self._resolve_chain(model, task_hint=task_hint)
 
@@ -669,6 +707,7 @@ class LLMClient(DbConsumer):
                         cache_creation_tokens=usage["cache_creation"],
                     ),
                     "success",
+                    metadata=_meta,
                 )
                 return
             except (BudgetExceededError, ContextOverflowError, PermissionError):
@@ -697,6 +736,7 @@ class LLMClient(DbConsumer):
         self._check_context_overflow(model, messages)
         temp = self.config.get("temperature", 0.7)
         max_tok = self.config.get("max_tokens")
+        _meta = {"task_hint": task_hint} if task_hint else None
 
         chain = self._resolve_chain(model, task_hint=task_hint)
 
@@ -748,6 +788,7 @@ class LLMClient(DbConsumer):
                         cache_creation_tokens=usage["cache_creation"],
                     ),
                     "success",
+                    metadata=_meta,
                 )
                 yield {"type": "usage", "prompt": usage["prompt"], "completion": usage["completion"],
                        "cache_read": usage["cache_read"], "cache_creation": usage["cache_creation"]}
@@ -789,7 +830,7 @@ class LLMClient(DbConsumer):
                         tokens_total=response.tokens_total,
                         cost_usd=response.cost_usd, latency_ms=response.latency_ms,
                         status=status,
-                        metadata=json.dumps(metadata) if metadata else None,
+                        call_metadata=json.dumps(metadata) if metadata else None,
                         created_at=datetime.now(timezone.utc),
                     ))
                 else:
@@ -799,7 +840,7 @@ class LLMClient(DbConsumer):
                         tokens_prompt=0, tokens_completion=0, tokens_total=0,
                         cost_usd=0.0, latency_ms=latency_ms, status=status,
                         error_message=error_message,
-                        metadata=json.dumps(metadata) if metadata else None,
+                        call_metadata=json.dumps(metadata) if metadata else None,
                         created_at=datetime.now(timezone.utc),
                     ))
                 db.commit()

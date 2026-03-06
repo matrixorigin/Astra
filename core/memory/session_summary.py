@@ -157,7 +157,7 @@ class SessionSummarizer:
                 result = self.llm.chat_with_tools(messages=[
                     {"role": "system", "content": prompt},
                     {"role": "user", "content": concat[:4000]},
-                ])
+                ], task_hint="session_summary")
                 return result.get("content") or concat[:500]
             except Exception:
                 pass

@@ -88,6 +88,7 @@ def audit_tool_call(
                 messages=[LLMMessage(role="user", content=prompt)],
                 user_id="system",
                 session_id="cot_audit",
+                task_hint="cot_audit",
             )
             verdict = (response.content or "").strip().upper()
             if "MISALIGNED" in verdict:

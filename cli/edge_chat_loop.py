@@ -374,7 +374,6 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
                 label = "LLM"
                 tok_in = s.get("in")
                 tok_out = s.get("out")
-                # None means no usage data from provider; 0 means actual zero.
                 io = f"in={tok_in if tok_in is not None else '?'} out={tok_out if tok_out is not None else '?'}"
                 tc = s.get("tool_calls", 0)
                 if tc:
@@ -386,6 +385,16 @@ def _print_explain(turns: list[dict[str, Any]], file: Any = None, verbose: bool 
                 label = step
                 io = ""
             w(f"{dim}  └─ {label}  {dur}ms  {io}{reset}\n")
+
+        # Auxiliary LLM calls (memory extraction, verification, etc.)
+        aux = t.get("auxiliary_llm_calls")
+        if aux:
+            aux_tok = sum(a.get("tokens_in", 0) + a.get("tokens_out", 0) for a in aux)
+            aux_cost = sum(a.get("cost_usd", 0) for a in aux)
+            w(f"{dim}  ├─ auxiliary LLM  {len(aux)} calls  {aux_tok} tokens  ${aux_cost:.4f}{reset}\n")
+            if verbose:
+                for a in aux:
+                    w(f"{dim}  │    {a.get('purpose', '?')}  {a.get('ms', 0)}ms  {a.get('tokens_in', 0)}→{a.get('tokens_out', 0)}{reset}\n")
     w(f"{dim}Total: {total_ms}ms  tokens: {total_in}→{total_out}{reset}\n")
     w(f"{dim}─────────────────────────────────────────────{reset}\n")
 

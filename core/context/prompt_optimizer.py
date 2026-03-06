@@ -207,6 +207,7 @@ IMPROVED_PROMPT:
                 messages=[{"role": "user", "content": analysis_prompt}],
                 user_id="system",
                 temperature=0.3,
+                task_hint="prompt_optimization",
             )
             content = response.content if hasattr(response, "content") else str(response)
             return self._parse_improvement(content)

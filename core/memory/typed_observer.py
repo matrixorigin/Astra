@@ -168,11 +168,18 @@ class TypedObserver:
 
         return self._store_with_contradiction_check(mem, explain)
 
+    # Only send the most recent messages to the extraction LLM.
+    # Older context is already captured in prior memory entries.
+    _MAX_EXTRACT_MESSAGES = 20
+    _MAX_EXTRACT_CHARS = 6000
+
     def _extract_via_llm(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        recent = messages[-self._MAX_EXTRACT_MESSAGES:]
         conv_text = "\n".join(
             f"[{m.get('role', 'unknown')}]: {m.get('content', '')[:500]}"
-            for m in messages if m.get("content")
+            for m in recent if m.get("content")
         )
+        conv_text = conv_text[-self._MAX_EXTRACT_CHARS:]
         try:
             result = self.llm.chat_with_tools(
                 messages=[
@@ -180,6 +187,7 @@ class TypedObserver:
                     {"role": "user", "content": conv_text},
                 ],
                 tools=[], tool_choice="none",
+                task_hint="memory_extraction",
             )
             return _parse_json_array(result.get("content", ""))
         except Exception as e:
