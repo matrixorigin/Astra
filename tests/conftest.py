@@ -189,12 +189,31 @@ def db_session(test_session_factory):
 
 @pytest.fixture(scope="session", autouse=True)
 def patch_db_engine(test_engine):
-    """Ensure database module uses test engine throughout the session."""
+    """Ensure database module uses test engine throughout the session.
+
+    Also patches SessionLocal in all router/service modules that imported it
+    at module load time (before the test engine was available), so their
+    direct `SessionLocal()` calls use the test DB.
+    """
+    import sys
     from api import database
-    database.engine = test_engine
-    database.SessionLocal = sessionmaker(
+    test_session_local = sessionmaker(
         autocommit=False, autoflush=False, bind=test_engine, expire_on_commit=False
     )
+    original_session_local = database.SessionLocal
+    database.engine = test_engine
+    database.SessionLocal = test_session_local
+
+    # Patch any already-imported module that holds a local reference to the
+    # *original* SessionLocal.  Only replace exact matches to avoid clobbering
+    # unrelated attributes that happen to share the name.
+    for mod in sys.modules.values():
+        if mod is not database and getattr(mod, "SessionLocal", None) is original_session_local:
+            try:
+                mod.SessionLocal = test_session_local
+            except (AttributeError, TypeError):
+                pass
+
     yield
 
 

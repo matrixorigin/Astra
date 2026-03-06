@@ -30,14 +30,14 @@ def client():
 def auth_headers_e2e(client):
     """Get auth headers with admin role for E2E tests."""
     import uuid
-    from api.database import get_db_session
+    from api.database import SessionLocal
     from core.auth.seed_roles import seed_roles
     from sqlalchemy import text
 
     username = f"e2e_user_{uuid.uuid4().hex}"
-    
+
     # Ensure roles exist (parallel workers may not have seeded yet)
-    db = next(get_db_session())
+    db = SessionLocal()
     seed_roles(db)
     db.close()
 
@@ -50,21 +50,21 @@ def auth_headers_e2e(client):
         }
     )
     user_id = resp.json()["user_id"]
-    
+
     # Grant admin role
-    db = next(get_db_session())
+    db = SessionLocal()
     role = db.execute(text("SELECT role_id FROM auth_roles WHERE role_name = 'mo_agent_admin' LIMIT 1")).fetchone()
     if role:
         db.execute(text("INSERT INTO auth_user_roles (user_id, role_id) VALUES (:uid, :rid)"), {"uid": user_id, "rid": role[0]})
         db.commit()
     db.close()
-    
+
     # Login
     response = client.post(
         "/auth/login",
         json={"username": username, "password": "testpass123"}
     )
-    
+
     token = response.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
 

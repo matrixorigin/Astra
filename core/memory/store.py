@@ -97,7 +97,6 @@ class MemoryStore(DbConsumer):
             row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
             if row:
                 row.content = content
-                row.updated_at = _utcnow()
                 db.commit()
 
     def list_active(
@@ -176,6 +175,5 @@ class MemoryStore(DbConsumer):
             if not row:
                 return False
             row.is_active = 0
-            row.updated_at = _utcnow()
             db.commit()
             return True

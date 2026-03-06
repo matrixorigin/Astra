@@ -84,9 +84,18 @@ class SessionManager:
         db = self._get_session()
         db.add(db_session)
         db.commit()
-        db.refresh(db_session)
-        
-        return self._model_to_session(db_session)
+        # Build return value before any lazy-load issues (expire_on_commit or detachment)
+        result = Session(
+            session_id=session_id,
+            user_id=user_id,
+            created_at=now,
+            updated_at=now,
+            last_active_at=now,
+            status=SessionStatus.ACTIVE,
+            event_count=0,
+            metadata=metadata,
+        )
+        return result
 
     def get_session(self, session_id: str) -> Session | None:
         """Get a session by ID.
