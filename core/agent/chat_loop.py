@@ -150,6 +150,9 @@ class ChatLoop:
         # Circuit breaker state (per-turn, reset on each run_step call)
         self._tool_failures: dict[str, list[str]] = {}
         self._blocked_tools: set[str] = set()
+        # Stall detector: tracks per-round tool call signatures to detect
+        # repeated unsuccessful search patterns (e.g. same query rephrased).
+        self._round_tool_sigs: list[set[str]] = []
         try:
             from core.context.few_shot import FewShotRetriever
             if hasattr(llm_client, '_db_factory'):
@@ -994,6 +997,23 @@ class ChatLoop:
                 )
                 return
 
+            # Stall detection: if the agent keeps calling the same tools
+            # across consecutive rounds, nudge it to stop and answer directly.
+            self._record_round_tools(tool_calls)
+            if self._detect_stall():
+                logger.info("Stall detected at round %d — nudging LLM to conclude", _round)
+                messages.append({
+                    "role": "system",
+                    "content": (
+                        "You have already tried similar tool calls multiple times without "
+                        "making progress. Stop calling tools and give the user your best "
+                        "answer based on what you have so far. If you could not find what "
+                        "the user asked for, say so directly."
+                    ),
+                })
+                # Remove tools for the next LLM call so it must produce text
+                tools_schema = []
+
         # Exhausted rounds — ask LLM for a final answer without tools
         messages.append(
             {
@@ -1529,6 +1549,7 @@ class ChatLoop:
         """
         self._tool_failures = {}
         self._blocked_tools = set()
+        self._round_tool_sigs = []
         self._breaker_records: dict[str, Any] = {}  # Actually dict[str, BreakerRecord]
         try:
             if hasattr(self.event_logger, '_db_factory'):
@@ -1620,6 +1641,42 @@ class ChatLoop:
                 lines.append(f"- **{tool}**: {last_err}")
         lines.append("\nPlease check the tool configuration or try a different approach.")
         return "\n".join(lines)
+
+    # Stall detection
+    # ------------------------------------------------------------------
+    # Detects when the agent repeatedly calls the same tool(s) with the
+    # same arguments across consecutive rounds — a sign it's stuck in a
+    # search loop that won't converge.  We compare *normalised call
+    # signatures* (tool name + sorted argument keys+values) so that
+    # genuinely different queries (e.g. grep "foo" vs grep "bar") are
+    # not flagged, while identical retries are.
+
+    _STALL_WINDOW = 3  # consecutive rounds to compare
+
+    def _record_round_tools(self, tool_calls: list[dict]) -> None:
+        """Record normalised call signatures for this round."""
+        sigs: set[str] = set()
+        for tc in tool_calls:
+            name = tc["function"]["name"]
+            args = tc["function"].get("arguments", "")
+            # arguments is a JSON string from the LLM; use it verbatim
+            # as the identity key so different args ≠ same signature.
+            sigs.add(f"{name}:{args}")
+        self._round_tool_sigs.append(sigs)
+
+    def _detect_stall(self) -> bool:
+        """Return True if the last ``_STALL_WINDOW`` rounds have identical call signatures.
+
+        Only fires when every round in the window produced the exact same set
+        of (tool_name, arguments) pairs — meaning the agent is literally
+        repeating itself with no variation.
+        """
+        w = self._STALL_WINDOW
+        sigs = self._round_tool_sigs
+        if len(sigs) < w:
+            return False
+        recent = sigs[-w:]
+        return all(s == recent[0] for s in recent[1:])
 
     # Helpers
     # ------------------------------------------------------------------
