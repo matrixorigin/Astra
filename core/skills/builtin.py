@@ -316,6 +316,11 @@ class CIStatusSkill(Skill[CIStatusInput, CIStatusOutput]):
             workflows=runs,
             resolved_repo=resolved if resolved_by_search else None,
             resolved_by_search=resolved_by_search,
+            guidance=(
+                "No CI workflows found for this repository. "
+                "Do NOT retry with bash, curl, or any other tool."
+            ) if not runs else None,
+            user_message="No GitHub Actions CI workflows are configured for this repository." if not runs else None,
         )
 
 

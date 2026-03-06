@@ -96,7 +96,13 @@ class SkillInput(BaseModel):
 
 
 class SkillOutput(BaseModel):
-    """Base class for skill outputs."""
+    """Base class for skill outputs.
+
+    The ``guidance`` field lets a skill attach an authoritative instruction
+    that the chat loop injects as a system message right after the tool
+    result.  This is *structural* — the LLM sees it as a system directive,
+    not as part of the tool output it might choose to ignore.
+    """
 
     success: bool
     result: Any = None
@@ -104,6 +110,8 @@ class SkillOutput(BaseModel):
     cost: float = 0.0
     data_source: str = ""       # Origin of data, e.g. "alpha_vantage_api". Empty string means not set.
     data_timestamp: str = ""    # ISO 8601 when data was fetched. Empty string means not set.
+    guidance: str | None = None  # Authoritative post-result instruction injected as system message
+    user_message: str | None = None  # Human-facing message shown directly to user when guidance fires
 
 
 # ---------------------------------------------------------------------------

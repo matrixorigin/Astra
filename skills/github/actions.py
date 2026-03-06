@@ -390,4 +390,15 @@ class CIStatusAction(Skill[CIStatusInput, CIStatusOutput]):
             )
             for r in runs
         ]
-        return CIStatusOutput(success=True, result=workflows, workflows=workflows)
+        # Authoritative guidance: empty list means no CI configured.
+        # Injected as system message so LLM cannot ignore it.
+        guidance = None
+        if not workflows:
+            guidance = (
+                "No CI workflows found for this repository. "
+                "Do NOT retry with bash, curl, or any other tool."
+            )
+        return CIStatusOutput(
+            success=True, result=workflows, workflows=workflows, guidance=guidance,
+            user_message="No GitHub Actions CI workflows are configured for this repository." if not workflows else None,
+        )

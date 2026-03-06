@@ -745,6 +745,26 @@ class TestActions:
         assert result.success is True
         assert result.workflows == []
         assert result.result == []
+        # Empty workflows must set authoritative guidance
+        assert result.guidance is not None
+        assert "no ci workflows" in result.guidance.lower()
+        # user_message must be set for direct display to user
+        assert result.user_message is not None
+        assert len(result.user_message) > 0
+
+    @pytest.mark.asyncio
+    async def test_ci_status_action_nonempty_no_guidance(self):
+        """Non-empty workflows should NOT set guidance or user_message."""
+        from skills.github.actions import CIStatusAction, CIStatusInput
+        mock_api = AsyncMock(spec=GitHubSkillAPI)
+        mock_api.list_wf_runs.return_value = [
+            {"workflow": "CI", "conclusion": "success", "branch": "main",
+             "pr_number": None, "actor": "bot", "triggered_at": "t", "url": "u"}
+        ]
+        action = CIStatusAction(api=mock_api)
+        result = await action.execute(CIStatusInput(repo="o/r"))
+        assert result.guidance is None
+        assert result.user_message is None
 
     @pytest.mark.asyncio
     async def test_list_issues_action(self):

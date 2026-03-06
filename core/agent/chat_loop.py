@@ -445,16 +445,35 @@ class ChatLoop:
         # retrying with different params or using bash/curl to work around the failure.
         try:
             _parsed = json.loads(result_str) if isinstance(result_str, str) else result
-            if isinstance(_parsed, dict) and _parsed.get("success") is False:
-                messages.append({
-                    "role": "system",
-                    "content": (
-                        "The skill returned success=False. "
-                        "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
-                        "Do NOT use bash, curl, grep, or any other tool to work around this. "
-                        "Report the error directly to the user and ask them to clarify."
-                    ),
-                })
+            if isinstance(_parsed, dict):
+                if _parsed.get("success") is False:
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "The skill returned success=False. "
+                            "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
+                            "Do NOT use bash, curl, grep, or any other tool to work around this. "
+                            "Report the error directly to the user and ask them to clarify."
+                        ),
+                    })
+                # Skill-provided authoritative guidance — injected as system
+                # message so the LLM treats it as a directive, not a suggestion.
+                # Also emit user_message as a text event so the CLI can display
+                # it directly if the LLM returns empty after seeing the guidance.
+                elif _parsed.get("guidance"):
+                    messages.append({
+                        "role": "system",
+                        "content": _parsed["guidance"],
+                    })
+                    _user_msg = _parsed.get("user_message")
+                    if _user_msg:
+                        yield StreamEvent(
+                            event_type=StreamEventType.TEXT_DELTA,
+                            data={"chunk": f"\n\n{_user_msg}"},
+                            event_id=tool_result_event.event_id,
+                            causal_chain_id=user_event.causal_chain_id,
+                            agent_id=self.agent_id,
+                        )
         except Exception:
             pass
 

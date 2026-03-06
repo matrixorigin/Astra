@@ -1872,12 +1872,27 @@ def _update_snapshot_tool_tokens(snapshot_id: str, actual_tool_tokens: int) -> N
         db.close()
 
 
+# Cache cloud skill schemas — registry is process-global and skills don't
+# change at runtime, so we compute schemas once and reuse across all turns.
+# Invalidated when the set of registered skill names changes.
+_cloud_schema_cache: list[dict[str, Any]] | None = None
+_cloud_schema_cache_key: frozenset[str] = frozenset()
+
+
 def _get_cloud_skill_schemas(registry) -> list[dict[str, Any]]:
     """Get OpenAI tool schemas for all in-memory cloud skills.
+
+    Cached: schemas are computed once per registry state.  Invalidated when
+    the set of skill names changes (add, remove, or replace).
 
     Accesses registry._skills directly — SkillCatalog has no public iterator
     for in-memory Skill instances.  Read-only traversal.
     """
+    global _cloud_schema_cache, _cloud_schema_cache_key
+    current_key = frozenset(registry._skills.keys())
+    if _cloud_schema_cache is not None and _cloud_schema_cache_key == current_key:
+        return _cloud_schema_cache
+
     schemas = []
     seen: set[str] = set()
     for key, skill in registry._skills.items():
@@ -1890,6 +1905,8 @@ def _get_cloud_skill_schemas(registry) -> list[dict[str, Any]]:
             schemas.append(skill.to_openai_schema())
         except Exception as e:
             logger.debug("Failed to get schema for cloud skill %s: %s", skill.name, e)
+    _cloud_schema_cache = schemas
+    _cloud_schema_cache_key = current_key
     return schemas
 
 
@@ -2039,43 +2056,76 @@ async def chat_turn(
             _cloud_tool_calls_for_persist: list[dict[str, Any]] = []
             _cloud_tool_results_for_persist: list[dict[str, Any]] = []
 
+            # Extract user query early — needed by both cloud skill pre-filter
+            # and tool selection below.
+            user_query = next(
+                (m.get("content", "") for m in request.messages if m.get("role") == "user"),
+                "",
+            )
+
             # Build unified registry from all sources
             from core.skills.tool_registry import ToolRegistry, ToolSource
             _turn_registry = _get_session_tool_registry(session_id, tools_schema)
 
-            # Add cloud skills
+            # Add cloud skills — pre-filter to avoid registering thousands of
+            # schemas into the per-turn registry.  Only register candidates that
+            # are likely relevant (name/description keyword match against query).
+            # The ToolRegistry.select() will further narrow via embedding + budget.
+            _MAX_CLOUD_CANDIDATES = 50  # generous upper bound; select() trims to 8
             if tools_schema:
                 try:
                     cloud_registry = _get_shared_skill_registry()
                     cloud_schemas = _get_cloud_skill_schemas(cloud_registry)
                     edge_tool_names = _tool_names(tools_schema)
+
+                    # Cheap keyword pre-filter: score each cloud skill by query token overlap
+                    _query_lower = (user_query or "").lower()
+                    _query_tokens = set(_query_lower.split()) if _query_lower else set()
+
+                    _candidates = []
                     for cs in cloud_schemas:
                         cs_name = cs.get("function", {}).get("name", "")
-                        if cs_name and cs_name not in edge_tool_names:
-                            cloud_skill_names.add(cs_name)
-                            _turn_registry.register_schema(
-                                cs, ToolSource.CLOUD, pinned=False,
-                            )
+                        if not cs_name or cs_name in edge_tool_names:
+                            continue
+                        cloud_skill_names.add(cs_name)
+                        # Inline relevance score — number of query tokens found in name+description
+                        _text = (cs.get("function", {}).get("name", "") + " "
+                                 + cs.get("function", {}).get("description", "")).lower()
+                        _score = sum(1 for t in _query_tokens if t in _text)
+                        _candidates.append((cs, _score))
+
+                    # Take top candidates by relevance, then fill with unmatched up to limit.
+                    # Note: cloud_skill_names contains ALL cloud skills (for tool_call
+                    # partitioning), but only the top candidates are registered in
+                    # _turn_registry (for LLM schema selection).  If the LLM somehow
+                    # calls an unregistered cloud skill, _execute_cloud_skill still
+                    # works because it uses cloud_registry directly.
+                    _candidates.sort(key=lambda x: x[1], reverse=True)
+                    for cs, _score in _candidates[:_MAX_CLOUD_CANDIDATES]:
+                        _turn_registry.register_schema(
+                            cs, ToolSource.CLOUD, pinned=False,
+                        )
                 except Exception as e:
                     logger.debug("Cloud skill loading skipped: %s", e)
 
             import asyncio
 
             # ── Tool selection via unified registry ──────────────────────
-            user_query = next(
-                (m.get("content", "") for m in request.messages if m.get("role") == "user"),
-                "",
-            )
             _cached_entry = _peek_session_entry(session_id)
             _cached_history = (_cached_entry or {}).get("history") if _cached_entry else None
 
             if request.tool_results and not user_query:
-                # Tool-result turn: keep only tools already in use
+                # Tool-result turn: keep only tools already in use.
+                # Fallback to select() (budget-enforced) — never get_all_schemas()
+                # which would leak all 10k+ cloud skills into the LLM context.
                 used_names = {tr.get("name", "") for tr in request.tool_results if tr.get("name")}
                 effective_tools_schema = [
                     t.schema for t in _turn_registry.all_tools()
                     if t.name in used_names
-                ] or _turn_registry.get_all_schemas()
+                ] or _turn_registry.select(
+                    user_query=user_query,
+                    messages=_cached_history or request.messages,
+                )
             else:
                 effective_tools_schema = _turn_registry.select(
                     user_query=user_query,
@@ -2236,11 +2286,13 @@ async def chat_turn(
                 _current_llm_messages = llm_messages
                 _cloud_skill_failed = False
                 _cloud_skill_error_msg = ""
+                _guidance_injected = False
                 # Collect cloud loop intermediate messages for session history.
                 # These are assistant+tool_calls and tool results that happen
                 # server-side. Without them, future turns can't see what tools
                 # were used (e.g. list_prs), causing tool selection failures.
                 _cloud_loop_history: list[dict[str, Any]] = []
+                _guidance_user_msg: str = ""  # user-facing message extracted from guidance
 
                 for _cloud_loop in range(_MAX_CLOUD_LOOPS + 1):
                     _loop_text = ""
@@ -2443,23 +2495,53 @@ async def chat_turn(
                         _cloud_skill_failed = False
                         try:
                             _cr_parsed = json.loads(_cloud_result_raw) if isinstance(_cloud_result_raw, str) else _cloud_result_raw
-                            if isinstance(_cr_parsed, dict) and _cr_parsed.get("success") is False:
-                                _cloud_skill_failed = True
-                                _cloud_skill_error_msg = _cr_parsed.get("result", "Operation failed.")
-                                logger.warning("Cloud skill %s returned success=False, stopping cloud loop", tc_name)
-                                _current_llm_messages = _current_llm_messages + [{
-                                    "role": "system",
-                                    "content": (
-                                        "The skill returned success=False. "
-                                        "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
-                                        "Do NOT use bash, curl, grep, or any other tool to work around this. "
-                                        "Report the error directly to the user and ask them to clarify."
-                                    ),
-                                }]
+                            if isinstance(_cr_parsed, dict):
+                                if _cr_parsed.get("success") is False:
+                                    _cloud_skill_failed = True
+                                    _cloud_skill_error_msg = _cr_parsed.get("result", "Operation failed.")
+                                    logger.warning("Cloud skill %s returned success=False, stopping cloud loop", tc_name)
+                                    _current_llm_messages = _current_llm_messages + [{
+                                        "role": "system",
+                                        "content": (
+                                            "The skill returned success=False. "
+                                            "STOP. Do NOT call any more tools. Do NOT retry with different parameters. "
+                                            "Do NOT use bash, curl, grep, or any other tool to work around this. "
+                                            "Report the error directly to the user and ask them to clarify."
+                                        ),
+                                    }]
+                                elif _cr_parsed.get("guidance"):
+                                    # Skill-provided authoritative guidance — injected as system
+                                    # message so the LLM treats it as a directive, not a suggestion.
+                                    # Also set _guidance_injected so the loop breaks
+                                    # immediately after processing all cloud tool results,
+                                    # emitting user_message directly without a second LLM call.
+                                    _current_llm_messages = _current_llm_messages + [{
+                                        "role": "system",
+                                        "content": _cr_parsed["guidance"],
+                                    }]
+                                    _cloud_loop_history.append({
+                                        "role": "system",
+                                        "content": _cr_parsed["guidance"],
+                                    })
+                                    _guidance_injected = True
+                                    # user_message is the human-facing text shown directly.
+                                    # If the skill didn't set it, use a safe generic fallback
+                                    # — never parse guidance text, which is an LLM instruction.
+                                    _guidance_user_msg = _cr_parsed.get("user_message") or ""
                         except Exception:
                             logger.exception("Failed to parse cloud_result for success check")
                         if _cloud_skill_failed:
                             break
+
+                    # If guidance was injected, emit the user-facing message directly and stop.
+                    # A second LLM call is unreliable here — the model already emitted a preamble
+                    # in loop 0 and tends to return empty text when called again with tool_choice=none.
+                    if _guidance_injected:
+                        if _guidance_user_msg:
+                            _reply = f"\n\n{_guidance_user_msg}"
+                            full_text += _reply
+                            yield f"data: {json.dumps({'type': 'text_delta', 'content': _reply})}\n\n"
+                        break
 
                     # If a cloud skill failed, stop the entire cloud loop — do not call LLM again.
                     # Instead, do one final LLM call with the hard-stop message to get a text reply.

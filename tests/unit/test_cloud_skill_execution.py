@@ -113,6 +113,44 @@ class TestGetCloudSkillSchemas:
         schemas = _get_cloud_skill_schemas(registry)
         assert len(schemas) == 1  # no duplicate
 
+    def test_cache_invalidates_on_skill_change(self, registry):
+        """Cache must invalidate when skills are added or removed."""
+        import api.routers.chat as chat_mod
+        # Clear any existing cache
+        chat_mod._cloud_schema_cache = None
+        chat_mod._cloud_schema_cache_key = frozenset()
+
+        from api.routers.chat import _get_cloud_skill_schemas
+        schemas1 = _get_cloud_skill_schemas(registry)
+        assert len(schemas1) == 1
+
+        # Same call returns cached result (same object)
+        schemas2 = _get_cloud_skill_schemas(registry)
+        assert schemas2 is schemas1
+
+        # Add a new skill — cache must invalidate
+        from unittest.mock import MagicMock
+        new_skill = MagicMock()
+        new_skill.name = "new_skill"
+        new_skill.to_openai_schema.return_value = {
+            "type": "function",
+            "function": {"name": "new_skill", "description": "new", "parameters": {}},
+        }
+        registry._skills["new_skill"] = new_skill
+        schemas3 = _get_cloud_skill_schemas(registry)
+        assert schemas3 is not schemas1
+        assert len(schemas3) == 2
+
+        # Remove the new skill — cache must invalidate again
+        del registry._skills["new_skill"]
+        schemas4 = _get_cloud_skill_schemas(registry)
+        assert schemas4 is not schemas3
+        assert len(schemas4) == 1
+
+        # Cleanup
+        chat_mod._cloud_schema_cache = None
+        chat_mod._cloud_schema_cache_key = frozenset()
+
 
 # ── Cloud skill event recording ───────────────────────────────────────────
 
