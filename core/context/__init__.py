@@ -13,6 +13,7 @@ from core.context.scheduler import (
     SchedulerBackend,
 )
 from core.context.scorer import RelevanceScorer
+from core.context.tiered_loader import TieredMemoryLoader
 
 __all__ = [
     "AsyncIOBackend",
@@ -29,4 +30,5 @@ __all__ = [
     "RelevanceScorer",
     "SchedulerBackend",
     "TaskType",
+    "TieredMemoryLoader",
 ]

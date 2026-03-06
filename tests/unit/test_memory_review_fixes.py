@@ -538,35 +538,23 @@ class TestObserverExtractVsObserve:
 
 class TestTieredLoaderFallbackMetrics:
 
-    def test_init_failure_increments_counter(self):
-        from core.memory.tiered_loader import TieredMemoryLoader
-        metrics = MemoryMetrics()
-        with patch("core.memory.tiered_loader.MemoryStore") as MockStore:
-            MockStore.side_effect = Exception("DB connection failed")
-            loader = TieredMemoryLoader(lambda: MagicMock(), metrics=metrics)
-            result = loader._ensure_initialized()
-        assert result is False
-        assert metrics._counters["tiered_loader_init_errors"] >= 1
-
     def test_l0_failure_increments_counter(self):
-        from core.memory.tiered_loader import TieredMemoryLoader
+        from core.context.tiered_loader import TieredMemoryLoader
         metrics = MemoryMetrics()
-        loader = TieredMemoryLoader(lambda: MagicMock(), metrics=metrics)
-        with patch.object(loader, "_ensure_initialized", return_value=True):
-            loader._profile_mgr = MagicMock()
-            loader._profile_mgr.get_profile.side_effect = Exception("Profile load failed")
-            result = loader.load_l0("u1")
+        mock_svc = MagicMock()
+        mock_svc.get_profile.side_effect = Exception("Profile load failed")
+        loader = TieredMemoryLoader(mock_svc, metrics=metrics)
+        result = loader.load_l0("u1")
         assert result == ""
         assert metrics._counters["tiered_loader_l0_errors"] >= 1
 
     def test_l1_failure_increments_counter(self):
-        from core.memory.tiered_loader import TieredMemoryLoader
+        from core.context.tiered_loader import TieredMemoryLoader
         metrics = MemoryMetrics()
-        loader = TieredMemoryLoader(lambda: MagicMock(), metrics=metrics)
-        with patch.object(loader, "_ensure_initialized", return_value=True):
-            loader._retriever = MagicMock()
-            loader._retriever.retrieve.side_effect = Exception("Retrieval failed")
-            result, _ = loader.load_l1("u1", "s1", "query")
+        mock_svc = MagicMock()
+        mock_svc.retrieve.side_effect = Exception("Retrieval failed")
+        loader = TieredMemoryLoader(mock_svc, metrics=metrics)
+        result, _ = loader.load_l1("u1", "s1", "query")
         assert result == ""
         assert metrics._counters["tiered_loader_l1_errors"] >= 1
 

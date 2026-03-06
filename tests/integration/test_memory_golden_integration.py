@@ -21,7 +21,8 @@ from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever
 from core.memory.typed_observer import TypedObserver, _parse_json_array
 from core.memory.profile import ProfileManager
-from core.memory.tiered_loader import TieredMemoryLoader
+from core.context.tiered_loader import TieredMemoryLoader
+from core.memory.service import MemoryService
 from core.memory.types import Memory, MemoryType
 
 FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "golden_sessions"
@@ -369,7 +370,7 @@ class TestTieredLoaderWithRealDB:
     def test_build_section_with_memories(self, db_factory, cleanup_memories):
         """TieredMemoryLoader builds prompt section from real memories."""
         store = MemoryStore(db_factory)
-        loader = TieredMemoryLoader(db_factory)
+        loader = TieredMemoryLoader(MemoryService(db_factory))
         user_id = _uid()
         
         # Create a profile memory

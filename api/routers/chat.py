@@ -400,8 +400,8 @@ def _build_chat_loop(db_factory):
         firewall=_shared_firewall,
     )
 
-    from core.memory.typed_observer import TypedObserver
-    loop.set_observer(TypedObserver(db_factory, llm_client=llm_client))
+    from core.memory.service import MemoryService
+    loop.set_observer(MemoryService(db_factory, llm_client=llm_client))
 
     return loop
 

@@ -30,8 +30,8 @@ class LLMModel(Base):
     description = Column(Text, nullable=True)
     tags = Column(JSON, default=list)
     created_by = Column(String(36), nullable=True)
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(6), default=func.now())
+    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
 
 
 class Config(Base):
@@ -45,8 +45,8 @@ class Config(Base):
     scope_user_id = Column(String(64), nullable=True, index=True)
     value = Column(Text, nullable=False)
     description = Column(Text)
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(6), default=func.now())
+    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
 
 
 class Repo(Base):
@@ -60,10 +60,10 @@ class Repo(Base):
     access_scope = Column(String(50), default="user")
     branch = Column(String(100), default="main")
     status = Column(String(20), default="active")
-    last_synced_at = Column(DateTime)
+    last_synced_at = Column(DateTime(6))
     repo_metadata = Column("metadata", JSON)
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(6), default=func.now())
+    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
 
 
 class SandboxMetadata(Base):
@@ -82,13 +82,13 @@ class SandboxMetadata(Base):
     session_id = Column(String(36), index=True, nullable=True)
     repo_id = Column(String(36), nullable=True)
     container_id = Column(String(64), nullable=True)
-    terminated_at = Column(DateTime, nullable=True)
+    terminated_at = Column(DateTime(6), nullable=True)
 
 
 class DistributedLock(Base):
     __tablename__ = "infra_distributed_locks"
     lock_name = Column(String(64), primary_key=True)
     instance_id = Column(String(64), nullable=False)
-    acquired_at = Column(DateTime, default=func.now(), nullable=False)
-    expires_at = Column(DateTime, nullable=False)
+    acquired_at = Column(DateTime(6), default=func.now(), nullable=False)
+    expires_at = Column(DateTime(6), nullable=False)
     task_name = Column(String(64), nullable=False, index=True)

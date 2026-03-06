@@ -1,5 +1,6 @@
 """Session API Router - 使用服务层"""
 
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -8,6 +9,8 @@ from pydantic import BaseModel
 from api.database import SessionLocal
 from api.dependencies import get_current_user
 from api.services.session_service import SessionService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -232,17 +235,15 @@ async def close_session(
 
                 def _bg_summary():
                     try:
-                        from core.memory.store import MemoryStore
-                        from core.memory.session_summary import SessionSummarizer
-                        store = MemoryStore(SessionLocal)
-                        summarizer = SessionSummarizer(store)
-                        summarizer.generate_full_summary(_uid, _sid, _hist)
-                    except Exception:
-                        pass
+                        from core.memory.service import MemoryService
+                        svc = MemoryService(SessionLocal)
+                        svc.generate_session_summary(_uid, _sid, _hist)
+                    except Exception as e:
+                        logger.debug("Session summary generation failed (non-fatal): %s", e)
 
                 threading.Thread(target=_bg_summary, daemon=True).start()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Session cache eviction failed (non-fatal): %s", e)
         return result
     except ValueError as e:
         raise HTTPException(

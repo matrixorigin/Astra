@@ -145,7 +145,7 @@ class ChatLoop:
         self.mcp_bridge = None  # Set via set_mcp_bridge()
         self._few_shot = None  # Initialized lazily on first use
         self._escalated_model: str | None | object = _UNSET  # SLO escalation cache
-        self._memory_store = None  # For tool output storage
+        self._memory_service: Any = None  # MemoryService facade
         self._budget_manager = None  # Global context budget manager
         # Circuit breaker state (per-turn, reset on each run_step call)
         self._tool_failures: dict[str, list[str]] = {}
@@ -156,11 +156,11 @@ class ChatLoop:
                 self._few_shot = FewShotRetriever(llm_client._db_factory)
         except Exception:
             pass
-        # Initialize memory store for tool output handling
+        # Initialize memory service for tool output handling
         try:
-            from core.memory.store import MemoryStore
+            from core.memory.service import MemoryService
             if hasattr(event_logger, '_db_factory'):
-                self._memory_store = MemoryStore(event_logger._db_factory)
+                self._memory_service = MemoryService(event_logger._db_factory)
         except Exception:
             pass
         # Initialize global context budget manager
@@ -430,7 +430,7 @@ class ChatLoop:
             tool_name=fn_name,
             session_id=session_id,
             user_id=user_id,
-            memory_store=getattr(self, '_memory_store', None),
+            memory_service=getattr(self, '_memory_service', None),
             turn_event_id=user_event.event_id,
             remaining_tokens=remaining,
         )

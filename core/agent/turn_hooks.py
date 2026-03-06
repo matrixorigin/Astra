@@ -7,8 +7,8 @@ observer, implicit feedback) so both code paths stay in sync.
 from __future__ import annotations
 
 import logging
-import time
 import threading
+import time
 from typing import Any
 
 from core.db_consumer import DbConsumer, DbFactory
@@ -51,8 +51,9 @@ class TurnHooks(DbConsumer):
         model_used: str | None = None,
     ) -> None:
         """Record a decision audit entry."""
-        from api.models import DecisionAudit
         from uuid_utils import uuid7
+
+        from api.models import DecisionAudit
 
         tc_names = [tc.get("function", {}).get("name", "") for tc in tool_calls] if tool_calls else []
         try:
@@ -85,8 +86,9 @@ class TurnHooks(DbConsumer):
         if not tc_names:
             return None
 
-        from api.models import SkillSelectionEvent
         from uuid_utils import uuid7
+
+        from api.models import SkillSelectionEvent
 
         event_id = str(uuid7())
         try:
@@ -144,32 +146,23 @@ class TurnHooks(DbConsumer):
         session_start: Any = None,
     ) -> None:
         """Run TypedObserver in a background thread."""
-        from core.memory.typed_pipeline import run_typed_memory_pipeline
-
         llm = self._llm_client
         db_factory = self._db_factory
         embed_fn = self._embed_fn
 
         def _bg():
+            from core.memory.service import MemoryService
+            svc = MemoryService(db_factory, llm_client=llm, embed_fn=embed_fn)
+
             try:
-                run_typed_memory_pipeline(
-                    db_factory=db_factory,
-                    user_id=user_id,
-                    messages=messages,
-                    llm_client=llm,
-                    embed_fn=embed_fn,
-                )
+                svc.run_pipeline(user_id=user_id, messages=messages)
             except Exception as e:
                 logger.debug("Observer failed (non-fatal): %s", e)
 
             # Check incremental summary thresholds
             if turn_count > 0 and session_start is not None:
                 try:
-                    from core.memory.store import MemoryStore
-                    from core.memory.session_summary import SessionSummarizer
-                    store = MemoryStore(db_factory)
-                    summarizer = SessionSummarizer(store, llm_client=llm, embed_fn=embed_fn)
-                    summarizer.check_and_summarize(
+                    svc.check_and_summarize(
                         user_id, session_id, messages, turn_count, session_start,
                     )
                 except Exception as e:
@@ -263,17 +256,16 @@ class TurnHooks(DbConsumer):
             f"Context: {reflect_evidence[:200]}"
         )
         try:
-            from core.memory.store import MemoryStore
-            from core.memory.types import Memory, MemoryType, TrustTier
-            store = MemoryStore(self._db_factory)
-            store.create(Memory(
-                memory_id="",
+            from core.memory.service import MemoryService
+            from core.memory.types import MemoryType, TrustTier
+            svc = MemoryService(self._db_factory)
+            svc.store(
                 user_id=user_id,
-                memory_type=MemoryType.PROCEDURAL,
                 content=lesson,
+                memory_type=MemoryType.PROCEDURAL,
                 trust_tier=TrustTier.T3_INFERRED,
                 session_id=session_id,
-            ))
+            )
             logger.info("Persisted reflection lesson for session %s", session_id[:8])
         except Exception as e:
             logger.debug("Reflection learning persistence failed: %s", e)

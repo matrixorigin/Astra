@@ -12,7 +12,7 @@ class TestCumulativeToolOutputOverflow:
     """Test that cumulative tool outputs are controlled."""
 
     def test_turn_budget_tracker_initialized(self):
-        """ChatLoop initializes _memory_store for tool output handling."""
+        """ChatLoop initializes _memory_service for tool output handling."""
         from core.agent.chat_loop import ChatLoop
         
         mock_db_factory = MagicMock()
@@ -30,8 +30,8 @@ class TestCumulativeToolOutputOverflow:
             firewall=MagicMock(),
         )
         
-        # _memory_store should be initialized
-        assert loop._memory_store is not None
+        # _memory_service should be initialized
+        assert loop._memory_service is not None
 
     def test_turn_budget_limits_cumulative_output(self):
         """TurnBudgetTracker limits cumulative tool output."""

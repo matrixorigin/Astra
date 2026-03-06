@@ -1,66 +1,67 @@
-"""Unit tests for TieredMemoryLoader."""
+"""Unit tests for TieredMemoryLoader (context-layer, MemoryService-based)."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from core.memory.tiered_loader import TieredMemoryLoader
+from core.context.tiered_loader import TieredMemoryLoader
 from core.memory.types import Memory, MemoryType
 
 
 @pytest.fixture
-def mock_db():
+def mock_svc():
     return MagicMock()
 
 
 @pytest.fixture
-def loader(mock_db):
-    return TieredMemoryLoader(db_factory=lambda: mock_db)
+def loader(mock_svc):
+    return TieredMemoryLoader(memory_service=mock_svc)
 
 
 class TestLoadL0:
-    def test_returns_profile(self, loader):
-        with patch.object(loader, '_ensure_initialized', return_value=True):
-            loader._profile_mgr = MagicMock()
-            loader._profile_mgr.get_profile.return_value = "User Profile:\n- likes Go"
-            result = loader.load_l0("u1")
-            assert "likes Go" in result
+    def test_returns_profile(self, loader, mock_svc):
+        mock_svc.get_profile.return_value = "User Profile:\n- likes Go"
+        result = loader.load_l0("u1")
+        assert "likes Go" in result
 
-    def test_returns_empty_on_failure(self, loader):
-        with patch.object(loader, '_ensure_initialized', return_value=False):
-            assert loader.load_l0("u1") == ""
+    def test_returns_empty_on_failure(self, loader, mock_svc):
+        mock_svc.get_profile.side_effect = Exception("fail")
+        assert loader.load_l0("u1") == ""
+
+    def test_returns_empty_when_none(self, loader, mock_svc):
+        mock_svc.get_profile.return_value = None
+        assert loader.load_l0("u1") == ""
 
 
 class TestLoadL1:
-    def test_returns_memories(self, loader):
-        with patch.object(loader, '_ensure_initialized', return_value=True):
-            loader._retriever = MagicMock()
-            loader._retriever.retrieve.return_value = ([
-                Memory(memory_id="m1", user_id="u1", memory_type=MemoryType.SEMANTIC,
-                       content="discussed testing", initial_confidence=0.8),
-            ], None)
-            result, _ = loader.load_l1("u1", "s1", "testing")
-            assert "discussed testing" in result
-            assert "[semantic]" in result
+    def test_returns_memories(self, loader, mock_svc):
+        mock_svc.retrieve.return_value = [
+            Memory(memory_id="m1", user_id="u1", memory_type=MemoryType.SEMANTIC,
+                   content="discussed testing", initial_confidence=0.8),
+        ]
+        result, _ = loader.load_l1("u1", "s1", "testing")
+        assert "discussed testing" in result
+        assert "[semantic]" in result
 
-    def test_returns_empty_when_no_memories(self, loader):
-        with patch.object(loader, '_ensure_initialized', return_value=True):
-            loader._retriever = MagicMock()
-            loader._retriever.retrieve.return_value = ([], None)
-            result, _ = loader.load_l1("u1", "s1", "query")
-            assert result == ""
+    def test_returns_empty_when_no_memories(self, loader, mock_svc):
+        mock_svc.retrieve.return_value = []
+        result, _ = loader.load_l1("u1", "s1", "query")
+        assert result == ""
 
-    def test_no_episodic_in_retrieval_types(self, loader):
-        """L1 retrieval should not request EPISODIC — type eliminated."""
-        with patch.object(loader, '_ensure_initialized', return_value=True):
-            loader._retriever = MagicMock()
-            loader._retriever.retrieve.return_value = ([], None)
-            loader.load_l1("u1", "s1", "query")
-            call_kwargs = loader._retriever.retrieve.call_args[1]
-            for mt in call_kwargs["memory_types"]:
-                assert mt != MemoryType.WORKING  # WORKING excluded
-            assert MemoryType.SEMANTIC in call_kwargs["memory_types"]
-            assert MemoryType.PROCEDURAL in call_kwargs["memory_types"]
+    def test_no_episodic_in_retrieval_types(self, loader, mock_svc):
+        """L1 retrieval should not request WORKING type."""
+        mock_svc.retrieve.return_value = []
+        loader.load_l1("u1", "s1", "query")
+        call_kwargs = mock_svc.retrieve.call_args[1]
+        for mt in call_kwargs["memory_types"]:
+            assert mt != MemoryType.WORKING
+        assert MemoryType.SEMANTIC in call_kwargs["memory_types"]
+        assert MemoryType.PROCEDURAL in call_kwargs["memory_types"]
+
+    def test_returns_empty_on_failure(self, loader, mock_svc):
+        mock_svc.retrieve.side_effect = Exception("fail")
+        result, _ = loader.load_l1("u1", "s1", "query")
+        assert result == ""
 
 
 class TestBuildSection:
@@ -94,7 +95,6 @@ class TestBuildSection:
 
 
 class TestInvalidateProfile:
-    def test_invalidates_cache(self, loader):
-        loader._profile_mgr = MagicMock()
+    def test_invalidates_cache(self, loader, mock_svc):
         loader.invalidate_profile("u1")
-        loader._profile_mgr.invalidate.assert_called_once_with("u1")
+        mock_svc.invalidate_profile.assert_called_once_with("u1")

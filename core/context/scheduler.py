@@ -146,20 +146,20 @@ class GovernanceTaskRunner:
         except Exception as e:
             logger.error("Knowledge governance [%s] failed: %s", task_name, e)
 
-        # 2. Memories table governance (governance.py)
+        # 2. Memories table governance (via MemoryService facade)
         try:
-            from core.memory.governance import GovernanceScheduler
-            scheduler = GovernanceScheduler(db_factory)
+            from core.memory.service import MemoryService
+            svc = MemoryService(db_factory)
             if task_name == "hourly":
-                r = scheduler.run_hourly()
+                r = svc.run_hourly()
                 results["mem_cleaned_tool_results"] = r.cleaned_tool_results
                 results["mem_archived_working"] = r.archived_working
             elif task_name == "daily":
-                r = scheduler.run_daily_all()
+                r = svc.run_daily_all()
                 results["mem_cleaned_stale"] = r.cleaned_stale
                 results["mem_quarantined"] = r.quarantined
             elif task_name == "weekly":
-                r = scheduler.run_weekly()
+                r = svc.run_weekly()
                 results["mem_cleaned_branches"] = r.cleaned_branches
                 results["mem_cleaned_snapshots"] = r.cleaned_snapshots
             results.update({f"mem_{k}": v for k, v in r.__dict__.items() if k == "errors" and v})

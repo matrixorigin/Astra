@@ -22,7 +22,7 @@ class PromptFragment(Base):
     content = Column(Text, nullable=False)
     token_count = Column(Integer, nullable=False)
     fragment_type = Column(String(32), nullable=False, index=True)  # identity, self_model, etc.
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime(6), default=func.now())
 
 
 class ContextSnapshot(Base):
@@ -44,7 +44,7 @@ class ContextSnapshot(Base):
     skills_used = Column(JSON)
     llm_request_id = Column(String(64))
     llm_response_id = Column(String(64))
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime(6), default=func.now())
 
 
 class DecisionAudit(Base):
@@ -59,7 +59,7 @@ class DecisionAudit(Base):
     model_used = Column(String(50))
     model_params = Column(JSON)
     confidence_score = Column(String(10))
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime(6), default=func.now())
     context_capture_id = Column(String(36))
 
 
@@ -68,7 +68,7 @@ class PromptFeedback(Base):
     feedback_id = Column(String(36), primary_key=True)
     llm_request_id = Column(String(36), nullable=False, index=True)
     user_comment = Column(Text)
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime(6), default=func.now())
 
 
 class EventEmbedding(Base):
@@ -78,8 +78,8 @@ class EventEmbedding(Base):
     model_name = Column(String(50))
     model_version = Column(String(32))
     embedding_metadata = Column("metadata", JSON)
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(6), default=func.now())
+    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
 
 
 class PromptTemplate(Base):
@@ -90,8 +90,8 @@ class PromptTemplate(Base):
     input_variables = Column(JSON)
     description = Column(String(255))
     is_active = Column(SmallInteger, default=1, server_default="1")
-    created_at = Column(DateTime, default=func.now())
-    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime(6), default=func.now())
+    updated_at = Column(DateTime(6), default=func.now(), onupdate=func.now())
 
 
 class PromptVariant(Base):
@@ -105,4 +105,4 @@ class PromptVariant(Base):
     content = Column(Text, nullable=False)
     quality_score = Column(Float)
     description = Column(String(255))
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime(6), default=func.now())

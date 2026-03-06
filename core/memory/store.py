@@ -4,10 +4,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
-from typing import Optional
-
-from sqlalchemy.orm import Session
 
 from api.models.memory import MemoryRecord
 from core.db_consumer import DbConsumer, DbFactory
@@ -59,7 +55,7 @@ def _to_domain_light(row) -> Memory:
 class MemoryStore(DbConsumer):
     """CRUD operations on the memories table."""
 
-    def __init__(self, db_factory: DbFactory, metrics: Optional[MemoryMetrics] = None):
+    def __init__(self, db_factory: DbFactory, metrics: MemoryMetrics | None = None):
         super().__init__(db_factory)
         self._metrics = metrics or MemoryMetrics()
 
@@ -70,38 +66,45 @@ class MemoryStore(DbConsumer):
         if not memory.observed_at:
             memory.observed_at = now
 
-        with Timer("store_create", self._metrics):
-            with self._db() as db:
-                row = MemoryRecord(
-                    memory_id=memory.memory_id,
-                    user_id=memory.user_id,
-                    session_id=memory.session_id,
-                    memory_type=memory.memory_type.value,
-                    content=memory.content,
-                    initial_confidence=memory.initial_confidence,
-                    trust_tier=memory.trust_tier.value,
-                    embedding=memory.embedding,
-                    source_event_ids=memory.source_event_ids,
-                    is_active=1,
-                    observed_at=memory.observed_at,
-                )
-                db.add(row)
-                db.commit()
-                memory.created_at = row.created_at
+        with Timer("store_create", self._metrics), self._db() as db:
+            row = MemoryRecord(
+                memory_id=memory.memory_id,
+                user_id=memory.user_id,
+                session_id=memory.session_id,
+                memory_type=memory.memory_type.value,
+                content=memory.content,
+                initial_confidence=memory.initial_confidence,
+                trust_tier=memory.trust_tier.value,
+                embedding=memory.embedding,
+                source_event_ids=memory.source_event_ids,
+                is_active=1,
+                observed_at=memory.observed_at,
+            )
+            db.add(row)
+            db.commit()
+            memory.created_at = row.created_at
         self._metrics.increment("memories_created")
         return memory
 
-    def get(self, memory_id: str) -> Optional[Memory]:
-        with Timer("store_get", self._metrics):
-            with self._db() as db:
-                row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
-                return _to_domain(row) if row else None
+    def get(self, memory_id: str) -> Memory | None:
+        with Timer("store_get", self._metrics), self._db() as db:
+            row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
+            return _to_domain(row) if row else None
+
+    def update_content(self, memory_id: str, content: str) -> None:
+        """Update content of an existing memory (e.g. streaming accumulation)."""
+        with self._db() as db:
+            row = db.query(MemoryRecord).filter_by(memory_id=memory_id).first()
+            if row:
+                row.content = content
+                row.updated_at = _utcnow()
+                db.commit()
 
     def list_active(
         self,
         user_id: str,
-        memory_type: Optional[MemoryType] = None,
-        limit: Optional[int] = None,
+        memory_type: MemoryType | None = None,
+        limit: int | None = None,
         load_embedding: bool = True,
     ) -> list[Memory]:
         with self._db() as db:

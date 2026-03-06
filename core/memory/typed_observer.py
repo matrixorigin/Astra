@@ -8,9 +8,7 @@ Includes sensitivity filter — blocks PII/credentials from long-term storage.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +16,7 @@ from typing import Any, Optional
 
 from core.db_consumer import DbFactory
 from core.memory.explain import ContradictionStats, ObserverStats
+from core.memory.json_utils import parse_json_array
 from core.memory.metrics import MemoryMetrics
 from core.memory.prompts import OBSERVER_EXTRACTION_PROMPT
 from core.memory.sensitivity import check_sensitivity
@@ -31,28 +30,8 @@ _VALID_TYPES = {t.value for t in MemoryType if t != MemoryType.WORKING}
 _DEFAULT_L2_THRESHOLD = 0.55
 
 
-def _parse_json_array(text_str: str) -> list[dict[str, Any]]:
-    """Robustly extract a JSON array from LLM output."""
-    text_str = text_str.strip()
-    try:
-        result = json.loads(text_str)
-        if isinstance(result, list):
-            return result
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"```(?:json)?\s*(\[.*?])\s*```", text_str, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    m = re.search(r"\[.*]", text_str, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
-    return []
+# Backward-compatible alias for external callers that imported the private name.
+_parse_json_array = parse_json_array
 
 
 class TypedObserver:
@@ -159,6 +138,7 @@ class TypedObserver:
         initial_confidence: float = 0.9,
         source_event_ids: Optional[list[str]] = None,
         trust_tier: TrustTier = TrustTier.T3_INFERRED,
+        session_id: Optional[str] = None,
         explain: bool = False,
     ) -> tuple[Memory, Optional[ContradictionStats]]:
         """Directly write a memory (from MemoryWriteTool), skipping LLM extraction."""
@@ -177,6 +157,7 @@ class TypedObserver:
             initial_confidence=initial_confidence,
             trust_tier=trust_tier,
             source_event_ids=source_event_ids or [],
+            session_id=session_id,
             observed_at=_utcnow(),
         )
         if self.embed_fn:

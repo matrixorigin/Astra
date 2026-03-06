@@ -16,7 +16,8 @@ from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever
 from core.memory.types import Memory, MemoryType, TrustTier
 from core.memory.profile import ProfileManager
-from core.memory.tiered_loader import TieredMemoryLoader
+from core.context.tiered_loader import TieredMemoryLoader
+from core.memory.service import MemoryService
 from core.memory.typed_observer import TypedObserver
 from core.memory.governance import GovernanceScheduler
 from core.memory.health import MemoryHealth
@@ -297,7 +298,7 @@ class TestProfileAndL0:
         user_id = _uid()
         session_id = _sid()
         store = MemoryStore(db_factory)
-        loader = TieredMemoryLoader(db_factory)
+        loader = TieredMemoryLoader(MemoryService(db_factory))
         
         mem = Memory(
             memory_id=str(uuid7()),

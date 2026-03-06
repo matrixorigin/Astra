@@ -16,8 +16,7 @@ from typing import TYPE_CHECKING
 from core.memory.types import MemoryType
 
 if TYPE_CHECKING:
-    from core.memory.retriever import MemoryRetriever
-    from core.memory.store import MemoryStore
+    from core.memory.service import MemoryService
 
 SUMMARY_THRESHOLD = 10 * 1024  # 10KB default
 MIN_THRESHOLD = 2 * 1024      # 2KB minimum (always summarize if larger)
@@ -233,7 +232,7 @@ def process_tool_output(
     tool_name: str,
     session_id: str,
     user_id: str,
-    memory_store: MemoryStore | None,
+    memory_service: MemoryService | None,
     turn_event_id: str | None = None,
     remaining_tokens: int | None = None,
     force_full: bool = False,  # Force return full content (no summarization)
@@ -245,7 +244,7 @@ def process_tool_output(
         tool_name: Name of the tool (grep, shell, etc.)
         session_id: Current session ID
         user_id: Current user ID
-        memory_store: mo-trustmem MemoryStore instance (None = truncation-only fallback)
+        memory_service: MemoryService instance (None = truncation-only fallback)
         turn_event_id: Optional event ID for provenance tracking
         remaining_tokens: Optional remaining context budget for dynamic threshold
         force_full: Force return full content (skip summarization check)
@@ -264,8 +263,8 @@ def process_tool_output(
         record_tool_output(tool_name, len(output), len(output), was_summarized=False)
         return output
 
-    # No memory store — fall back to rule-based summary + truncation
-    if memory_store is None:
+    # No memory service — fall back to rule-based summary + truncation
+    if memory_service is None:
         summary = generate_structured_summary(output, tool_name)
         result = f"{summary}\n\n[Full output ({len(output)} bytes) — truncated, no memory store]"
         record_tool_output(tool_name, len(output), len(result), was_summarized=True)
@@ -285,7 +284,7 @@ def process_tool_output(
             session_id=session_id,
             source_event_ids=source_events,
         )
-        memory = memory_store.create(mem_obj)
+        memory = memory_service.create_memory(mem_obj)
     except Exception as e:
         # Fallback: truncate if mo-trustmem write fails
         record_tool_output(tool_name, len(output), threshold, was_summarized=True)
@@ -308,7 +307,7 @@ def find_similar_result(
     params: dict,
     session_id: str,
     user_id: str,
-    retriever: MemoryRetriever,
+    memory_service: MemoryService,
     cross_session: bool = False,
     max_age_seconds: int = 300,  # 5 minutes default
 ) -> str | None:
@@ -319,14 +318,14 @@ def find_similar_result(
         params: Tool parameters (pattern, path, etc.)
         session_id: Current session ID
         user_id: Current user ID
-        retriever: mo-trustmem MemoryRetriever instance
+        memory_service: MemoryService instance
         cross_session: If True, search across all sessions
         max_age_seconds: Maximum age of result to consider (staleness check)
     
     Returns:
         Memory reference if similar result found, None otherwise
     """
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
     # Build query from tool name + key params
     query_parts = [tool_name]
@@ -335,12 +334,12 @@ def find_similar_result(
             query_parts.append(str(params[key]))
     query = ' '.join(query_parts)
 
-    results, _ = retriever.retrieve(
+    results = memory_service.retrieve(
         user_id=user_id,
-        query_text=query,
+        query=query,
         session_id=session_id if not cross_session else "global",
         memory_types=[MemoryType.TOOL_RESULT],
-        limit=1,
+        top_k=1,
     )
 
     if not results:
@@ -348,10 +347,11 @@ def find_similar_result(
 
     result = results[0]
 
-    # Staleness check: reject if too old
+    # Staleness check: reject if too old.
+    # ref_time is UTC-aware (set via _utcnow()), so we must compare with UTC.
     ref_time = result.observed_at or result.created_at
     if ref_time:
-        age = datetime.now() - ref_time
+        age = datetime.now(timezone.utc) - ref_time
         if age > timedelta(seconds=max_age_seconds):
             return None
 
@@ -367,7 +367,7 @@ def find_similar_result(
 
 def expand_memory_reference(
     memory_id: str,
-    memory_store: MemoryStore,
+    memory_service: MemoryService,
     start_line: int | None = None,
     end_line: int | None = None,
     query: str | None = None,
@@ -377,7 +377,7 @@ def expand_memory_reference(
     
     Args:
         memory_id: The memory ID to expand (from [memory:xxx] reference)
-        memory_store: mo-trustmem MemoryStore instance
+        memory_service: MemoryService instance
         start_line: Optional start line for partial expansion
         end_line: Optional end line for partial expansion
         query: Optional query to filter content (grep-like)
@@ -386,7 +386,7 @@ def expand_memory_reference(
     Returns:
         Expanded content (full or filtered), truncated if exceeds max_chars
     """
-    memory = memory_store.get(memory_id)
+    memory = memory_service.get_memory(memory_id)
     if not memory:
         return f"Error: Memory {memory_id} not found"
 

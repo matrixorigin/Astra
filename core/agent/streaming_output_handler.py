@@ -12,16 +12,19 @@ Strategy:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, AsyncIterator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from core.memory.store import MemoryStore
+    from collections.abc import AsyncIterator
+
+    from core.memory.service import MemoryService
 
 
 @dataclass
 class StreamAccumulatorState:
     """State of streaming accumulator."""
+
     buffer: str = ""
     total_bytes: int = 0
     switched_to_storage: bool = False
@@ -31,139 +34,122 @@ class StreamAccumulatorState:
 
 class StreamingOutputAccumulator:
     """Accumulate streaming output and switch to storage mode when needed."""
-    
+
     def __init__(
         self,
         tool_name: str,
         session_id: str,
         user_id: str,
-        memory_store: "MemoryStore",
-        threshold: int = 10 * 1024,  # 10KB default
+        memory_service: MemoryService,
+        threshold: int = 10 * 1024,
     ):
         self.tool_name = tool_name
         self.session_id = session_id
         self.user_id = user_id
-        self.memory_store = memory_store
+        self.memory_service = memory_service
         self.threshold = threshold
         self.state = StreamAccumulatorState()
-    
+
     def accumulate(self, chunk: str) -> str | None:
         """Accumulate a chunk of output.
-        
-        Args:
-            chunk: New output chunk
-        
-        Returns:
-            None if still accumulating, or summary+reference if switched to storage
+
+        Returns None if still accumulating, or summary+reference if switched.
+        Handles both pre-switch buffering and post-switch storage updates.
         """
         self.state.buffer += chunk
         self.state.total_bytes += len(chunk)
-        self.state.line_count += chunk.count('\n')
-        
-        # Check if should switch to storage mode
+        self.state.line_count += chunk.count("\n")
+
         if not self.state.switched_to_storage and len(self.state.buffer) > self.threshold:
             self._switch_to_storage()
-        
+        elif self.state.switched_to_storage:  # noqa: SIM102
+            # Post-switch: periodically flush buffer to storage (every 10KB)
+            if len(self.state.buffer) % (10 * 1024) < len(chunk):
+                self._update_storage()
+
         return None
-    
+
     def _switch_to_storage(self) -> None:
         """Switch to storage mode - store buffer in mo-trustmem."""
-        from core.memory.types import MemoryType
-        
+        import uuid
+
+        from core.memory.types import Memory, MemoryType
+
         self.state.switched_to_storage = True
-        
-        # Store current buffer
-        memory = self.memory_store.create(
+
+        # Prefix content with tool provenance header so downstream consumers
+        # (retrieval, audit) can identify which tool produced this output.
+        header = f"[tool:{self.tool_name}] [streaming]\n"
+        mem_obj = Memory(
+            memory_id=uuid.uuid4().hex,
             user_id=self.user_id,
-            content=self.state.buffer,
             memory_type=MemoryType.TOOL_RESULT,
+            content=header + self.state.buffer,
             session_id=self.session_id,
-            source=f"tool:{self.tool_name}:streaming",
-            metadata={
-                "tool": self.tool_name,
-                "streaming": True,
-                "partial": True,  # Will be updated on finalize
-            },
+            source_event_ids=[],
         )
+        memory = self.memory_service.create_memory(mem_obj)
         self.state.memory_id = memory.memory_id
-    
+
     def append_to_storage(self, chunk: str) -> None:
-        """Append chunk to stored content (after switching to storage mode)."""
-        if not self.state.switched_to_storage or not self.state.memory_id:
-            return
-        
-        self.state.buffer += chunk
-        self.state.total_bytes += len(chunk)
-        self.state.line_count += chunk.count('\n')
-        
-        # Update stored content periodically (every 10KB)
-        if len(self.state.buffer) % (10 * 1024) < len(chunk):
-            self._update_storage()
-    
+        """Append chunk to stored content (after switching to storage mode).
+
+        .. deprecated:: Use accumulate() instead — it handles post-switch
+           buffering and periodic flush internally.  Kept for backward compat.
+        """
+        # No-op: accumulate() now handles post-switch chunks.
+        # Callers that still call both accumulate() + append_to_storage()
+        # won't double-count bytes/lines.
+
     def _update_storage(self) -> None:
         """Update stored content with current buffer."""
         if not self.state.memory_id:
             return
-        
-        try:
-            # Update content in place
-            self.memory_store.update_content(
+
+        try:  # noqa: SIM105
+            self.memory_service.update_memory_content(
                 self.state.memory_id,
                 self.state.buffer,
             )
         except Exception:
-            pass  # Non-critical, will finalize at end
-    
+            # Non-critical: finalize() will do a final update.
+            # Avoid logging per-chunk to prevent log spam during streaming.
+            pass
+
     def finalize(self) -> str:
         """Finalize accumulation and return result.
-        
-        Returns:
-            Full output if under threshold, or summary+reference if stored
+
+        Returns full output if under threshold, or summary+reference if stored.
         """
         if not self.state.switched_to_storage:
-            # Under threshold - return full output
             return self.state.buffer
-        
-        # Update final content
+
         self._update_storage()
-        
-        # Update metadata to mark as complete
-        try:
-            self.memory_store.update_metadata(
-                self.state.memory_id,
-                {"partial": False, "final_size": self.state.total_bytes},
-            )
-        except Exception:
-            pass
-        
-        # Generate summary
         summary = self._generate_summary()
-        
+
         return f"{summary}\n\n[Full output ({self.state.total_bytes} bytes): memory:{self.state.memory_id}]"
-    
+
     def _generate_summary(self) -> str:
         """Generate summary of accumulated output."""
-        lines = self.state.buffer.split('\n')
-        
-        # Head + tail + stats
-        head = '\n'.join(lines[:10])
-        tail = '\n'.join(lines[-5:]) if len(lines) > 15 else ""
-        
+        lines = self.state.buffer.split("\n")
+
+        head = "\n".join(lines[:10])
+        tail = "\n".join(lines[-5:]) if len(lines) > 15 else ""
+
         summary_parts = [
             f"Streaming output: {self.state.line_count} lines, {self.state.total_bytes} bytes",
             f"\nFirst 10 lines:\n{head}",
         ]
-        
+
         if tail:
             summary_parts.append(f"\n...\nLast 5 lines:\n{tail}")
-        
-        # Check for errors
-        error_lines = [l for l in lines if 'error' in l.lower() or 'fail' in l.lower()]
+
+        error_lines = [line for line in lines if "error" in line.lower() or "fail" in line.lower()]
         if error_lines:
             summary_parts.append(f"\n⚠️ {len(error_lines)} error/fail lines detected")
-            summary_parts.append('\n'.join(error_lines[:3]))
-        
-        return '\n'.join(summary_parts)
+            summary_parts.append("\n".join(error_lines[:3]))
+
+        return "\n".join(summary_parts)
 
 
 async def process_streaming_output(
@@ -171,38 +157,28 @@ async def process_streaming_output(
     tool_name: str,
     session_id: str,
     user_id: str,
-    memory_store: "MemoryStore",
+    memory_service: MemoryService,
     threshold: int = 10 * 1024,
 ) -> AsyncIterator[tuple[str, str | None]]:
     """Process streaming output, yielding chunks and final result.
-    
-    Args:
-        stream: Async iterator of output chunks
-        tool_name: Name of the tool
-        session_id: Current session ID
-        user_id: Current user ID
-        memory_store: mo-trustmem MemoryStore
-        threshold: Size threshold for switching to storage
-    
-    Yields:
-        (chunk, None) for each chunk while streaming
-        (final_chunk, result) when stream ends, where result is full output or summary+ref
+
+    Yields (chunk, None) for each chunk while streaming,
+    then (final_chunk, result) when stream ends.
     """
     accumulator = StreamingOutputAccumulator(
-        tool_name, session_id, user_id, memory_store, threshold
+        tool_name, session_id, user_id, memory_service, threshold
     )
-    
+
     last_chunk = ""
     async for chunk in stream:
         if last_chunk:
             yield (last_chunk, None)
-        
+
         accumulator.accumulate(chunk)
         if accumulator.state.switched_to_storage:
             accumulator.append_to_storage(chunk)
-        
+
         last_chunk = chunk
-    
-    # Finalize and yield last chunk with result
+
     result = accumulator.finalize()
     yield (last_chunk, result)

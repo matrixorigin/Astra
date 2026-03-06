@@ -1,13 +1,16 @@
-"""Tiered memory loader for PromptAssembler §4.
+"""Backward-compatible re-export.
 
-L0: Profile (always loaded, ~200 tokens)
-L1: Query-aware retrieval (per-turn, ~800 tokens)
+TieredMemoryLoader has moved to core.context.tiered_loader.
+This shim preserves existing imports during migration.
+
+See docs/design/memory-architecture.md §11 "Module Independence".
 """
 
 from __future__ import annotations
 
 import logging
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -36,9 +39,19 @@ class TieredLoaderStats:
 
 
 class TieredMemoryLoader:
-    """Load L0 (profile) + L1 (query-relevant) memories for prompt §4."""
+    """Legacy shim — delegates to internal components directly.
+
+    New code should use core.context.tiered_loader.TieredMemoryLoader
+    with MemoryService instead.
+    """
 
     def __init__(self, db_factory: DbFactory, metrics: Optional[MemoryMetrics] = None):
+        warnings.warn(
+            "core.memory.tiered_loader.TieredMemoryLoader is deprecated. "
+            "Use core.context.tiered_loader.TieredMemoryLoader with MemoryService.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self._db_factory = db_factory
         self._metrics = metrics or MemoryMetrics()
         self._store: Optional[MemoryStore] = None

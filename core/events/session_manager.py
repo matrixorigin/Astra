@@ -178,8 +178,7 @@ class SessionManager:
             # Generate full session summary (memories table) — reuse events already loaded
             try:
                 from api.database import SessionLocal
-                from core.memory.store import MemoryStore
-                from core.memory.session_summary import SessionSummarizer
+                from core.memory.service import MemoryService
 
                 messages = [
                     {"role": "user" if e.event_type == "user_query" else "assistant",
@@ -187,9 +186,8 @@ class SessionManager:
                     for e in events
                 ]
                 if messages:
-                    store = MemoryStore(SessionLocal)
-                    summarizer = SessionSummarizer(store)
-                    summarizer.generate_full_summary(db_session.user_id, session_id, messages)
+                    svc = MemoryService(SessionLocal)
+                    svc.generate_session_summary(db_session.user_id, session_id, messages)
             except Exception as e:
                 logger.debug("Session summary generation failed (non-fatal): %s", e)
 

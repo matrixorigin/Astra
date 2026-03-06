@@ -13,7 +13,8 @@ from core.memory.store import MemoryStore
 from core.memory.retriever import MemoryRetriever
 from core.memory.typed_observer import TypedObserver
 from core.memory.typed_pipeline import run_typed_memory_pipeline
-from core.memory.tiered_loader import TieredMemoryLoader
+from core.context.tiered_loader import TieredMemoryLoader
+from core.memory.service import MemoryService
 from core.memory.types import Memory, MemoryType
 
 
@@ -217,7 +218,7 @@ class TestExplainE2E:
     def test_tiered_loader_explain_shows_l0_l1(self, db_factory, cleanup_memories):
         """TieredLoader explain shows L0 and L1 loading stats."""
         store = MemoryStore(db_factory)
-        loader = TieredMemoryLoader(db_factory)
+        loader = TieredMemoryLoader(MemoryService(db_factory))
         user_id = _uid()
         session_id = f"sess_{uuid4().hex}"
 

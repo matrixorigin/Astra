@@ -1,39 +1,88 @@
 """Memory subsystem — typed memory with tiered retrieval.
 
-Components:
-- TypedObserver: extracts typed memories (profile/semantic/procedural/working/tool_result)
-- MemoryStore: CRUD with atomic contradiction resolution
-- MemoryRetriever: query-aware hybrid retrieval
-- ProfileManager: L0 profile synthesis
-- MemorySandbox: write-ahead validation
-- MemoryProvenance: PITR queries and rollback
-- MemoryHealth: pollution detection
-- SensitivityFilter: PII/credential blocking
+Public Interface (for external consumers):
+- MemoryService: single entry point (facade)
+- MemoryReader, MemoryWriter, MemoryAdmin: Protocol interfaces
+- GovernanceReport, HealthReport: result types
+- parse_json_array: utility for parsing LLM JSON output
 
-All components support explain=True for EXPLAIN ANALYZE style execution stats.
+Internal Components (use MemoryService instead):
+- TypedObserver, MemoryStore, MemoryRetriever, ProfileManager
+  Still exported for backward compatibility and tests.
+  Production code should use MemoryService.
+
+See docs/design/memory-architecture.md §11 "Module Independence".
 """
 
-from core.memory.types import Memory, MemoryType, RetrievalWeights, TrustTier, TRUST_TIER_HALF_LIVES, TRUST_TIER_INITIAL_CONFIDENCE, trust_tier_defaults
-from core.memory.store import MemoryStore
-from core.memory.retriever import MemoryRetriever
-from core.memory.typed_observer import TypedObserver
-from core.memory.profile import ProfileManager
-from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
-from core.memory.sensitivity import check_sensitivity, SensitivityResult
+# ── Public interface ──────────────────────────────────────────────────
+from core.memory.config import DEFAULT_CONFIG, MemoryGovernanceConfig
 from core.memory.explain import (
-    RetrievalStats, ContradictionStats, ObserverStats,
-    SandboxStats, GovernanceStats, PipelineStats,
-    MemoryStats, ExplainResult,
+    ContradictionStats,
+    ExplainResult,
+    GovernanceStats,
+    MemoryStats,
+    ObserverStats,
+    PipelineStats,
+    RetrievalStats,
+    SandboxStats,
+)
+from core.memory.interfaces import (
+    GovernanceReport,
+    HealthReport,
+    MemoryAdmin,
+    MemoryReader,
+    MemoryWriter,
+)
+from core.memory.json_utils import parse_json_array
+
+# ── Internal components (backward compat — prefer MemoryService) ─────
+from core.memory.profile import ProfileManager
+from core.memory.retriever import MemoryRetriever
+from core.memory.sensitivity import SensitivityResult, check_sensitivity
+from core.memory.service import MemoryService
+from core.memory.store import MemoryStore
+from core.memory.typed_observer import TypedObserver
+
+# Types — shared vocabulary
+from core.memory.types import (
+    TRUST_TIER_HALF_LIVES,
+    TRUST_TIER_INITIAL_CONFIDENCE,
+    Memory,
+    MemoryType,
+    RetrievalWeights,
+    TrustTier,
+    trust_tier_defaults,
 )
 
 __all__ = [
-    "Memory", "MemoryType", "RetrievalWeights", "TrustTier", "TRUST_TIER_HALF_LIVES",
-    "TRUST_TIER_INITIAL_CONFIDENCE", "trust_tier_defaults",
-    "MemoryStore", "MemoryRetriever", "TypedObserver",
-    "ProfileManager", "MemoryGovernanceConfig", "DEFAULT_CONFIG",
-    "check_sensitivity", "SensitivityResult",
-    # Explain stats
-    "RetrievalStats", "ContradictionStats", "ObserverStats",
-    "SandboxStats", "GovernanceStats", "PipelineStats",
-    "MemoryStats", "ExplainResult",
+    "DEFAULT_CONFIG",
+    "TRUST_TIER_HALF_LIVES",
+    "TRUST_TIER_INITIAL_CONFIDENCE",
+    "ContradictionStats",
+    "ExplainResult",
+    "GovernanceReport",
+    "GovernanceStats",
+    "HealthReport",
+    "Memory",
+    "MemoryAdmin",
+    "MemoryGovernanceConfig",
+    "MemoryReader",
+    "MemoryRetriever",
+    "MemoryService",
+    "MemoryStats",
+    "MemoryStore",
+    "MemoryType",
+    "MemoryWriter",
+    "ObserverStats",
+    "PipelineStats",
+    "ProfileManager",
+    "RetrievalStats",
+    "RetrievalWeights",
+    "SandboxStats",
+    "SensitivityResult",
+    "TrustTier",
+    "TypedObserver",
+    "check_sensitivity",
+    "parse_json_array",
+    "trust_tier_defaults",
 ]

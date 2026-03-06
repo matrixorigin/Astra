@@ -57,34 +57,34 @@ class TestStructuredSummary:
 
 
 class TestProcessToolOutput:
-    """Tests for process_tool_output with mo-trustmem integration."""
+    """Tests for process_tool_output with MemoryService integration."""
 
     @pytest.fixture
-    def mock_store(self):
-        store = MagicMock()
-        store.create.return_value = MagicMock(memory_id="mem_123")
-        return store
+    def mock_service(self):
+        svc = MagicMock()
+        svc.create_memory.return_value = MagicMock(memory_id="mem_123")
+        return svc
 
-    def test_small_output_returned_directly(self, mock_store):
+    def test_small_output_returned_directly(self, mock_service):
         """Output under threshold returned without storing."""
         output = "small result"
         result = process_tool_output(
-            output, "grep", "sess1", "user1", mock_store
+            output, "grep", "sess1", "user1", mock_service
         )
         
         assert result == output
-        mock_store.create.assert_not_called()
+        mock_service.create_memory.assert_not_called()
 
-    def test_large_output_stored_and_summarized(self, mock_store):
+    def test_large_output_stored_and_summarized(self, mock_service):
         """Large output stored in mo-trustmem with summary returned."""
         output = "x" * 20000  # > 10KB
         result = process_tool_output(
-            output, "grep", "sess1", "user1", mock_store
+            output, "grep", "sess1", "user1", mock_service
         )
         
-        # Should store
-        mock_store.create.assert_called_once()
-        mem_arg = mock_store.create.call_args[0][0]
+        # Should store via create_memory
+        mock_service.create_memory.assert_called_once()
+        mem_arg = mock_service.create_memory.call_args[0][0]
         assert mem_arg.memory_type == MemoryType.TOOL_RESULT
         assert mem_arg.session_id == "sess1"
         
@@ -92,15 +92,15 @@ class TestProcessToolOutput:
         assert "memory:mem_123" in result
         assert "20000 bytes" in result
 
-    def test_provenance_tracking(self, mock_store):
+    def test_provenance_tracking(self, mock_service):
         """Turn event ID passed for provenance."""
         output = "x" * 20000
         process_tool_output(
-            output, "grep", "sess1", "user1", mock_store,
+            output, "grep", "sess1", "user1", mock_service,
             turn_event_id="event_456"
         )
         
-        mem_arg = mock_store.create.call_args[0][0]
+        mem_arg = mock_service.create_memory.call_args[0][0]
         assert "event_456" in mem_arg.source_event_ids
 
 
@@ -108,63 +108,63 @@ class TestFindSimilarResult:
     """Tests for historical result reuse."""
 
     @pytest.fixture
-    def mock_retriever(self):
+    def mock_service(self):
         return MagicMock()
 
-    def test_no_results_returns_none(self, mock_retriever):
+    def test_no_results_returns_none(self, mock_service):
         """No similar results returns None."""
-        mock_retriever.retrieve.return_value = ([], None)
+        mock_service.retrieve.return_value = []
         
         result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_service
         )
         
         assert result is None
 
-    def test_matching_result_returns_reference(self, mock_retriever):
+    def test_matching_result_returns_reference(self, mock_service):
         """Matching result returns memory reference."""
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         mock_memory = MagicMock()
         mock_memory.memory_id = "mem_old"
         mock_memory.content = "test pattern found in file.py"
-        mock_memory.observed_at = datetime.now() - timedelta(seconds=60)
-        mock_memory.created_at = datetime.now() - timedelta(seconds=60)
-        mock_retriever.retrieve.return_value = ([mock_memory], None)
+        mock_memory.observed_at = datetime.now(timezone.utc) - timedelta(seconds=60)
+        mock_memory.created_at = datetime.now(timezone.utc) - timedelta(seconds=60)
+        mock_service.retrieve.return_value = [mock_memory]
         
         result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_service
         )
         
         assert "memory:mem_old" in result
         assert "Reusing" in result
 
-    def test_stale_result_returns_none(self, mock_retriever):
+    def test_stale_result_returns_none(self, mock_service):
         """Result older than max_age_seconds returns None."""
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         mock_memory = MagicMock()
         mock_memory.memory_id = "mem_old"
         mock_memory.content = "test pattern found"
-        mock_memory.observed_at = datetime.now() - timedelta(seconds=600)
-        mock_memory.created_at = datetime.now() - timedelta(seconds=600)
-        mock_retriever.retrieve.return_value = ([mock_memory], None)
+        mock_memory.observed_at = datetime.now(timezone.utc) - timedelta(seconds=600)
+        mock_memory.created_at = datetime.now(timezone.utc) - timedelta(seconds=600)
+        mock_service.retrieve.return_value = [mock_memory]
         
         result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
             max_age_seconds=300,
         )
         
         assert result is None
 
-    def test_cross_session_search(self, mock_retriever):
+    def test_cross_session_search(self, mock_service):
         """Cross-session search passes global session_id."""
-        mock_retriever.retrieve.return_value = ([], None)
+        mock_service.retrieve.return_value = []
         
         find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
             cross_session=True
         )
         
-        call_kwargs = mock_retriever.retrieve.call_args[1]
+        call_kwargs = mock_service.retrieve.call_args[1]
         assert call_kwargs["session_id"] == "global"
 
 
@@ -252,27 +252,25 @@ class TestMemoryExpand:
     def test_expand_full_content(self):
         """Expand returns full content."""
         from core.agent.tool_output_handler import expand_memory_reference
-        from unittest.mock import MagicMock
         
-        mock_store = MagicMock()
+        mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.content = "line1\nline2\nline3"
-        mock_store.get.return_value = mock_memory
+        mock_service.get_memory.return_value = mock_memory
         
-        result = expand_memory_reference("mem_123", mock_store)
+        result = expand_memory_reference("mem_123", mock_service)
         assert result == "line1\nline2\nline3"
 
     def test_expand_with_line_range(self):
         """Expand with line range returns subset."""
         from core.agent.tool_output_handler import expand_memory_reference
-        from unittest.mock import MagicMock
         
-        mock_store = MagicMock()
+        mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.content = "line1\nline2\nline3\nline4\nline5"
-        mock_store.get.return_value = mock_memory
+        mock_service.get_memory.return_value = mock_memory
         
-        result = expand_memory_reference("mem_123", mock_store, start_line=2, end_line=4)
+        result = expand_memory_reference("mem_123", mock_service, start_line=2, end_line=4)
         assert "line2" in result
         assert "line3" in result
         assert "line4" in result
@@ -281,14 +279,13 @@ class TestMemoryExpand:
     def test_expand_with_query_filter(self):
         """Expand with query filters matching lines."""
         from core.agent.tool_output_handler import expand_memory_reference
-        from unittest.mock import MagicMock
         
-        mock_store = MagicMock()
+        mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.content = "error: something\ninfo: ok\nerror: another"
-        mock_store.get.return_value = mock_memory
+        mock_service.get_memory.return_value = mock_memory
         
-        result = expand_memory_reference("mem_123", mock_store, query="error")
+        result = expand_memory_reference("mem_123", mock_service, query="error")
         assert "2 of 3 lines matching" in result
         assert "error: something" in result
         assert "info: ok" not in result
@@ -296,12 +293,11 @@ class TestMemoryExpand:
     def test_expand_not_found(self):
         """Expand returns error for missing memory."""
         from core.agent.tool_output_handler import expand_memory_reference
-        from unittest.mock import MagicMock
         
-        mock_store = MagicMock()
-        mock_store.get.return_value = None
+        mock_service = MagicMock()
+        mock_service.get_memory.return_value = None
         
-        result = expand_memory_reference("mem_missing", mock_store)
+        result = expand_memory_reference("mem_missing", mock_service)
         assert "not found" in result
 
 
@@ -310,39 +306,35 @@ class TestStalenessCheck:
 
     def test_old_result_rejected(self):
         """Results older than max_age are rejected."""
-        from core.agent.tool_output_handler import find_similar_result
-        from unittest.mock import MagicMock
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         
-        mock_retriever = MagicMock()
+        mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.content = "test pattern"
-        mock_memory.observed_at = datetime.now() - timedelta(seconds=600)  # 10 min old
-        mock_memory.created_at = datetime.now() - timedelta(seconds=600)
-        mock_retriever.retrieve.return_value = ([mock_memory], None)
+        mock_memory.observed_at = datetime.now(timezone.utc) - timedelta(seconds=600)  # 10 min old
+        mock_memory.created_at = datetime.now(timezone.utc) - timedelta(seconds=600)
+        mock_service.retrieve.return_value = [mock_memory]
         
         result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
             max_age_seconds=300  # 5 min max
         )
         assert result is None  # Rejected due to staleness
 
     def test_fresh_result_accepted(self):
         """Fresh results are accepted."""
-        from core.agent.tool_output_handler import find_similar_result
-        from unittest.mock import MagicMock
-        from datetime import datetime, timedelta
+        from datetime import datetime, timedelta, timezone
         
-        mock_retriever = MagicMock()
+        mock_service = MagicMock()
         mock_memory = MagicMock()
         mock_memory.memory_id = "mem_fresh"
         mock_memory.content = "test pattern found"
-        mock_memory.observed_at = datetime.now() - timedelta(seconds=60)  # 1 min old
-        mock_memory.created_at = datetime.now() - timedelta(seconds=60)
-        mock_retriever.retrieve.return_value = ([mock_memory], None)
+        mock_memory.observed_at = datetime.now(timezone.utc) - timedelta(seconds=60)  # 1 min old
+        mock_memory.created_at = datetime.now(timezone.utc) - timedelta(seconds=60)
+        mock_service.retrieve.return_value = [mock_memory]
         
         result = find_similar_result(
-            "grep", {"pattern": "test"}, "sess1", "user1", mock_retriever,
+            "grep", {"pattern": "test"}, "sess1", "user1", mock_service,
             max_age_seconds=300
         )
         assert result is not None
@@ -382,15 +374,12 @@ class TestFailureModes:
 
     def test_mo_trustmem_failure_fallback(self):
         """Falls back to truncation when mo-trustmem fails."""
-        from core.agent.tool_output_handler import process_tool_output
-        from unittest.mock import MagicMock
-        
-        mock_store = MagicMock()
-        mock_store.create.side_effect = Exception("DB connection failed")
+        mock_service = MagicMock()
+        mock_service.create_memory.side_effect = Exception("DB connection failed")
         
         output = "x" * 50000
         result = process_tool_output(
-            output, "grep", "sess1", "user1", mock_store
+            output, "grep", "sess1", "user1", mock_service
         )
         
         assert "truncated" in result

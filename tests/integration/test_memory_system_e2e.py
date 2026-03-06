@@ -11,7 +11,8 @@ from unittest.mock import MagicMock
 
 from core.memory.retriever import TASK_WEIGHTS
 from core.memory.typed_observer import TypedObserver
-from core.memory.tiered_loader import TieredMemoryLoader
+from core.context.tiered_loader import TieredMemoryLoader
+from core.memory.service import MemoryService
 from core.memory.health import MemoryHealth
 from core.memory.config import MemoryGovernanceConfig, DEFAULT_CONFIG
 from core.memory.types import Memory, MemoryType
@@ -26,11 +27,11 @@ class TestL0ProfileInPrompt:
 
     def test_profile_section_always_present(self):
         """TieredMemoryLoader returns empty string when no memories exist."""
-        mock_db = MagicMock()
-        mock_db.execute.return_value.fetchall.return_value = []
-        db_factory = lambda: mock_db
+        mock_svc = MagicMock()
+        mock_svc.get_profile.return_value = None
+        mock_svc.retrieve.return_value = []
 
-        loader = TieredMemoryLoader(db_factory)
+        loader = TieredMemoryLoader(mock_svc)
         section, _ = loader.build_section(uid(), session_id="test_session", query="test")
 
         # No memories → empty section (don't waste tokens on filler)

@@ -179,11 +179,13 @@ class ReflectService(DbConsumer):
 
             # 3. Past lessons
             try:
-                from core.memory.store import MemoryStore
+                from core.memory.service import MemoryService
                 from core.memory.types import MemoryType
 
-                store = MemoryStore(self._db_factory)
-                memories = store.list_active(user_id, MemoryType.PROCEDURAL, limit=5, load_embedding=False)
+                svc = MemoryService(self._db_factory)
+                # Only list_active() is called — no llm_client/embed_fn needed
+                # (those are only required for observe/pipeline paths).
+                memories = svc.list_active(user_id, MemoryType.PROCEDURAL, limit=5, load_embedding=False)
                 result["past_lessons"] = [m.content for m in memories]
                 for m in memories:
                     for name in fail_counts:
