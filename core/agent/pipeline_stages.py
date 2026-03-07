@@ -18,16 +18,11 @@ from core.agent.turn_state import (
     TurnState,
     TurnStatus,
 )
+from core.context.intent_routing import LOCAL_TOOLS
+
 from core.logging_config import get_logger
 
 logger = get_logger(__name__)
-
-# Tools considered "local" — blocked when intent is EXTERNAL_FETCH
-_LOCAL_TOOLS = frozenset({
-    "grep", "shell", "execute_bash", "file_read", "file_write",
-    "git", "search", "reflect", "introspection",
-    "scratchpad_write", "scratchpad_read", "scratchpad_close",
-})
 
 # Breaker thresholds
 _MAX_ANY_FAILURES = 3
@@ -84,7 +79,11 @@ def _wall_clock_exceeded(state: TurnState) -> bool:
 # ---------------------------------------------------------------------------
 
 class RouteStage:
-    """Pre-loop: classify intent, filter tools, set max_rounds."""
+    """Pre-loop: classify intent, filter tools, set max_rounds.
+
+    Accepts either a classify_intent callable (returns IntentClassification or str)
+    or a RoutingDecision object directly.
+    """
 
     def __init__(self, classify_intent: Callable | None = None):
         self._classify = classify_intent
@@ -99,14 +98,31 @@ class RouteStage:
         if hasattr(result, "__await__"):
             result = await result
 
-        # Normalize: classify_intent returns IntentClassification with .intent attr,
-        # but callers may also pass a simple string-returning callable.
+        # Handle RoutingDecision from unified router
+        if hasattr(result, "tool_filter"):
+            from core.context.intent_routing import ToolFilter
+            if result.tool_filter == ToolFilter.ALL_BLOCKED:
+                state.tools_schema = []
+                state.max_rounds = 0
+                classification = "CONVERSATIONAL"
+            elif result.tool_filter == ToolFilter.LOCAL_BLOCKED:
+                state.tools_schema = [
+                    t for t in state.tools_schema
+                    if t.get("function", {}).get("name") not in LOCAL_TOOLS
+                ]
+                state.max_rounds = min(state.max_rounds, result.max_tool_rounds)
+                classification = "EXTERNAL_FETCH"
+            else:
+                classification = "DEFAULT"
+            yield TurnEvent(event_type="stage_complete", data={"stage": "route", "classification": classification})
+            return
+
+        # Legacy: normalize IntentClassification or string
         if hasattr(result, "intent"):
             classification = result.intent
         elif isinstance(result, str):
             classification = result
         else:
-            # Unknown type (e.g., dict) — fall back to DEFAULT
             logger.warning("classify_intent returned unexpected type %s, using DEFAULT", type(result))
             classification = "DEFAULT"
 
@@ -116,7 +132,7 @@ class RouteStage:
         elif classification == "EXTERNAL_FETCH":
             state.tools_schema = [
                 t for t in state.tools_schema
-                if t.get("function", {}).get("name") not in _LOCAL_TOOLS
+                if t.get("function", {}).get("name") not in LOCAL_TOOLS
             ]
             state.max_rounds = min(state.max_rounds, 3)
 

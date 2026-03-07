@@ -596,7 +596,8 @@ class TestScenarioF_ErrorRecovery:
 
         with mock_llm_for_chat(_build_patched_chat_loop(crashing_llm)):
             # Turn 1: LLM crashes → run should fail
-            resp = client.post("/chat", json={"message": "Hello"}, headers=h)
+            # Use a non-conversational query so it goes through the tool loop
+            resp = client.post("/chat", json={"message": "Run the tests"}, headers=h)
             assert resp.status_code == 200
             run_id = resp.json()["run_id"]
             sid = resp.json()["session_id"]

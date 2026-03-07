@@ -244,11 +244,12 @@ class ToolRegistry:
         if not user_query:
             return pool
         try:
-            from core.skills.intent_router import classify_intent
-            result = classify_intent(user_query)
-            if result.intent == "CONVERSATIONAL":
+            from core.context.intent_routing import Tier0Engine, ToolFilter
+            engine = Tier0Engine()
+            tool_filter, _ = engine.classify_tool_filter(user_query)
+            if tool_filter == ToolFilter.ALL_BLOCKED:
                 return []  # No dynamic tools needed for chitchat
-            # EXTERNAL_FETCH and DEFAULT: keep all dynamic tools
+            # LOCAL_BLOCKED and NONE: keep all dynamic tools
             # (prefilter will reorder them)
         except Exception as e:
             logger.debug("Intent filter skipped: %s", e)

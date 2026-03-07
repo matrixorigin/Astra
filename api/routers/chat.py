@@ -422,6 +422,50 @@ def _get_engine():
 # Endpoints
 # ---------------------------------------------------------------------------
 
+from core.context.intent_routing import Tier0Engine as _Tier0Engine
+
+# Module-level singleton — Tier0Engine is stateless (pure regex/keyword matching)
+_tier0_engine = _Tier0Engine()
+
+
+@router.post("/chat/route")
+async def route_query(
+    request: dict,
+    current_user: Annotated[dict, Depends(get_current_user)],
+):
+    """Route a query to determine the appropriate agent type (unified routing)."""
+    query = request.get("query", "")
+
+    try:
+        intent_result = _tier0_engine.classify(query)
+        tool_filter, max_rounds = _tier0_engine.classify_tool_filter(query)
+        task_type = _tier0_engine.classify_task_type(query)
+
+        return {
+            "query": query,
+            "intent": intent_result.intent,
+            "confidence": intent_result.confidence,
+            "tier": intent_result.tier,
+            "matched_by": intent_result.matched_by,
+            "tool_filter": tool_filter.value,
+            "max_tool_rounds": max_rounds,
+            "task_type": task_type.value,
+        }
+    except Exception as e:
+        logger.error(f"Routing failed: {e}")
+        return {
+            "query": query,
+            "intent": "question",
+            "confidence": 0.0,
+            "tier": 0,
+            "matched_by": "error",
+            "tool_filter": "none",
+            "max_tool_rounds": 10,
+            "task_type": "general",
+            "error": str(e),
+        }
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,

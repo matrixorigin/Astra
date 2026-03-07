@@ -11,9 +11,12 @@ import logging as _logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
+# TaskType is defined in intent_routing (single source of truth) and re-exported
+# here so existing `from core.context.manager import TaskType` imports keep working.
+# No circular import risk: intent_routing does not import from manager.
+from core.context.intent_routing import TaskType
 from core.db_consumer import DbConsumer, DbFactory
 from core.exceptions import ContextError
 from core.logging_config import get_logger
@@ -26,15 +29,6 @@ logger = get_logger(__name__)
 _write_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ctx_snapshot")
 
 
-class TaskType(str, Enum):
-    """Task types for context optimization."""
-
-    CODE_REVIEW = "code_review"
-    PLANNING = "planning"
-    DEBUGGING = "debugging"
-    GENERAL = "general"
-
-
 # Budget ratios per task type — aligned with design doc §2
 # Each maps section → fraction of available tokens (after fixed allocations)
 _BUDGET_RATIOS: dict[TaskType, dict[str, float]] = {
@@ -42,13 +36,6 @@ _BUDGET_RATIOS: dict[TaskType, dict[str, float]] = {
     TaskType.DEBUGGING:   {"logs": 0.40, "code": 0.30, "history": 0.20, "docs": 0.10},
     TaskType.PLANNING:    {"history": 0.50, "code": 0.20, "docs": 0.20, "logs": 0.10},
     TaskType.GENERAL:     {"history": 0.40, "code": 0.30, "docs": 0.20, "logs": 0.10},
-}
-
-# Keywords for auto-classification
-_TASK_KEYWORDS: dict[TaskType, list[str]] = {
-    TaskType.CODE_REVIEW: ["review", "code review", "PR", "pull request", "refactor", "clean up"],
-    TaskType.DEBUGGING:   ["debug", "error", "bug", "fix", "traceback", "exception", "crash", "fail"],
-    TaskType.PLANNING:    ["plan", "design", "architect", "roadmap", "strategy", "proposal"],
 }
 
 
@@ -140,15 +127,6 @@ class ContextManager(DbConsumer):
 
         logger.info(f"ContextManager initialized (embeddings={embedding_provider})")
 
-    @staticmethod
-    def classify_task(query: str) -> TaskType:
-        """Auto-classify task type from query text using keyword matching."""
-        q = query.lower()
-        for task_type, keywords in _TASK_KEYWORDS.items():
-            if any(kw in q for kw in keywords):
-                return task_type
-        return TaskType.GENERAL
-
     def build_context(
         self,
         session_id: str,
@@ -176,9 +154,9 @@ class ContextManager(DbConsumer):
         start_time = time.time()
 
         try:
-            # 0. Auto-classify if not specified
+            # 0. Use provided task_type or default to GENERAL
             if task_type is None:
-                task_type = self.classify_task(query)
+                task_type = TaskType.GENERAL
 
             # 1. Allocate token budget
             budget = self._allocate_budget(max_tokens, task_type)

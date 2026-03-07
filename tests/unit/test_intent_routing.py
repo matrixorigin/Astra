@@ -1,7 +1,7 @@
 """Tests for Tier 0 dual engine + dataclasses + correction detection + router registry.
 
 Covers: RoutingResult, ContextLoadingPlan, INTENT_PLANS, Tier0Engine, detect_correction,
-        RoutingStrategy, register_router, get_router, list_routers.
+        RoutingStrategy, register_router, get_router, list_routers, TaskType, ToolFilter.
 """
 
 import pytest
@@ -275,3 +275,37 @@ class TestRouterRegistry:
         _reset_registry_for_testing()
         assert "ephemeral" not in list_routers()
         assert "default" in list_routers()
+
+
+# ============================================================================
+# RoutingDecision — new unified fields
+# ============================================================================
+
+class TestRoutingDecisionFields:
+    """Verify RoutingDecision carries tool_filter, max_tool_rounds, task_type."""
+
+    def test_defaults(self):
+        from core.context.intent_routing import ToolFilter, TaskType, MAX_TOOL_ROUNDS
+        rd = RoutingDecision(
+            plan=INTENT_PLANS["question"],
+            routing_result=RoutingResult(intent="question", confidence=0.9, tier=0, matched_by="regex"),
+        )
+        assert rd.tool_filter == ToolFilter.NONE
+        assert rd.max_tool_rounds == MAX_TOOL_ROUNDS
+        assert rd.task_type == TaskType.GENERAL
+        assert rd.topic_shift_score == 0.0
+
+    def test_explicit_fields(self):
+        from core.context.intent_routing import ToolFilter, TaskType
+        rd = RoutingDecision(
+            plan=INTENT_PLANS["command"],
+            routing_result=RoutingResult(intent="command", confidence=0.95, tier=0, matched_by="both"),
+            tool_filter=ToolFilter.LOCAL_BLOCKED,
+            max_tool_rounds=3,
+            task_type=TaskType.DEBUGGING,
+            topic_shift_score=0.5,
+        )
+        assert rd.tool_filter == ToolFilter.LOCAL_BLOCKED
+        assert rd.max_tool_rounds == 3
+        assert rd.task_type == TaskType.DEBUGGING
+        assert rd.topic_shift_score == 0.5

@@ -53,38 +53,6 @@ class TestTaskType:
         assert TaskType("planning") == TaskType.PLANNING
 
 
-class TestClassifyTask:
-    """Tests for auto task classification."""
-
-    def test_code_review_keywords(self):
-        assert ContextManager.classify_task("Please review this PR") == TaskType.CODE_REVIEW
-        assert ContextManager.classify_task("code review for auth module") == TaskType.CODE_REVIEW
-        assert ContextManager.classify_task("refactor the parser") == TaskType.CODE_REVIEW
-
-    def test_debugging_keywords(self):
-        assert ContextManager.classify_task("debug this error") == TaskType.DEBUGGING
-        assert ContextManager.classify_task("fix the crash in login") == TaskType.DEBUGGING
-        assert ContextManager.classify_task("there's a traceback here") == TaskType.DEBUGGING
-
-    def test_planning_keywords(self):
-        assert ContextManager.classify_task("plan the migration") == TaskType.PLANNING
-        assert ContextManager.classify_task("design a new API") == TaskType.PLANNING
-        assert ContextManager.classify_task("create a roadmap") == TaskType.PLANNING
-
-    def test_general_fallback(self):
-        assert ContextManager.classify_task("hello world") == TaskType.GENERAL
-        assert ContextManager.classify_task("what is this?") == TaskType.GENERAL
-
-    def test_case_insensitive(self):
-        assert ContextManager.classify_task("DEBUG this") == TaskType.DEBUGGING
-        assert ContextManager.classify_task("REVIEW my code") == TaskType.CODE_REVIEW
-
-    def test_first_match_wins(self):
-        """When multiple keywords match, first TaskType in iteration order wins."""
-        result = ContextManager.classify_task("review and debug this")
-        assert result in (TaskType.CODE_REVIEW, TaskType.DEBUGGING)
-
-
 class TestContextFragment:
     """Tests for ContextFragment dataclass."""
 

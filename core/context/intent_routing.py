@@ -1,13 +1,14 @@
-"""Adaptive Hierarchical LLM Routing — Tier 0/1 intent classification for context loading.
+"""Unified Intent Routing — single-pass classification for context, tools, and budgets.
 
-Design doc: docs/design/token-efficient-llm-routing.md (v3)
+Design doc: docs/design/intent-unification.md
 
-Intents here (preference/command/feedback/question) control **context loading strategy**
-(which prompt sections to build). This is separate from core/skills/intent_router.py
-which controls **tool filtering** (EXTERNAL_FETCH/CONVERSATIONAL).
+Three formerly separate systems are now unified into one RoutingDecision:
+  1. Tool filtering (EXTERNAL_FETCH / CONVERSATIONAL) → tool_filter, max_tool_rounds
+  2. Context loading (preference / command / feedback / question) → plan
+  3. Task type (CODE_REVIEW / DEBUGGING / PLANNING / GENERAL) → task_type
 
 Architecture:
-  Tier 0 (<1ms, regex+heuristic) → adaptive threshold → Tier 1 (~180ms, cheapest LLM) → fallback
+  Tier 0 (<1ms, 3 independent KeywordRegistries) → adaptive threshold → Tier 1 (~180ms, cheapest LLM) → fallback
 """
 
 from __future__ import annotations
@@ -33,6 +34,14 @@ class ToolFilter(str, Enum):
     NONE = "none"                # DEFAULT — no filtering
     LOCAL_BLOCKED = "local_blocked"  # EXTERNAL_FETCH — block local tools
     ALL_BLOCKED = "all_blocked"      # CONVERSATIONAL — block all tools
+
+
+class TaskType(str, Enum):
+    """Task types for context optimization (absorbed from ContextManager)."""
+    CODE_REVIEW = "code_review"
+    PLANNING = "planning"
+    DEBUGGING = "debugging"
+    GENERAL = "general"
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +92,7 @@ class RoutingDecision:
     tool_filter: ToolFilter = ToolFilter.NONE
     max_tool_rounds: int = MAX_TOOL_ROUNDS
     # Task type + topic shift (absorbed from ContextManager.classify_task)
-    task_type: str = "general"  # code_review / debugging / planning / general
+    task_type: TaskType = TaskType.GENERAL
     topic_shift_score: float = 0.0
 
 
@@ -101,24 +110,11 @@ _FALLBACK_PLAN = INTENT_PLANS["question"]
 
 # ---------------------------------------------------------------------------
 # Router Protocol + Registry
-#
-# Routers are registered at import time via @register_router("name").
-# All implementations must accept (db_factory: DbFactory) as sole __init__ arg.
-# For strategies needing extra config, read from env vars or DB in __init__.
 # ---------------------------------------------------------------------------
 
 @runtime_checkable
 class RoutingStrategy(Protocol):
-    """Interface for pluggable routing strategies.
-
-    Implement this to create custom routers for A/B experiments,
-    regression testing, or parameter tuning.
-
-    Contract:
-        - __init__(self, db_factory: DbFactory) — sole constructor signature
-        - route() must return RoutingDecision (runtime_checkable only verifies
-          method existence, not return type — enforce via integration tests)
-    """
+    """Interface for pluggable routing strategies."""
 
     async def route(
         self,
@@ -135,10 +131,7 @@ _registry_lock = __import__("threading").Lock()
 
 
 def register_router(name: str):
-    """Decorator to register a routing strategy by name.
-
-    Raises ValueError if name is already registered (prevents silent override).
-    """
+    """Decorator to register a routing strategy by name."""
     def _wrap(cls: type) -> type:
         with _registry_lock:
             if name in _ROUTER_REGISTRY:
@@ -152,10 +145,7 @@ def register_router(name: str):
 
 
 def get_router(name: str, db_factory: DbFactory) -> RoutingStrategy:
-    """Instantiate a registered router by name.
-
-    Raises KeyError if name is not registered.
-    """
+    """Instantiate a registered router by name."""
     with _registry_lock:
         cls = _ROUTER_REGISTRY[name]
     return cls(db_factory=db_factory)
@@ -168,7 +158,7 @@ def list_routers() -> list[str]:
 
 
 def _reset_registry_for_testing() -> None:
-    """Remove all non-default routers. Test-only — never call in production."""
+    """Remove all non-default routers. Test-only."""
     with _registry_lock:
         default_cls = _ROUTER_REGISTRY.get("default")
         _ROUTER_REGISTRY.clear()
@@ -177,21 +167,137 @@ def _reset_registry_for_testing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tier 0: Regex + Heuristic Dual Engine
+# KeywordRegistry — single-dimension keyword matcher
 # ---------------------------------------------------------------------------
 
-# Engine A: Regex keyword patterns (Chinese + English)
-_REGEX_PATTERNS: dict[str, list[re.Pattern]] = {
+@dataclass(frozen=True)
+class RegistryMatch:
+    """Result of a single KeywordRegistry.match() call."""
+    label: str | None   # matched label (e.g. "CONVERSATIONAL") or None
+    score: float        # 0.0 - 1.0
+    matched_keywords: list[str] = field(default_factory=list)
+
+
+def _compile_pattern(keyword: str) -> re.Pattern[str]:
+    """Compile a word-boundary regex. CJK chars don't require word boundaries."""
+    if any("\u4e00" <= ch <= "\u9fff" for ch in keyword):
+        return re.compile(re.escape(keyword), re.IGNORECASE)
+    return re.compile(r"\b" + re.escape(keyword) + r"\b", re.IGNORECASE)
+
+
+class KeywordRegistry:
+    """Single-dimension keyword matcher with word-boundary-aware matching.
+
+    Each registry maps labels → keyword lists. match() returns the best-scoring label.
+    """
+
+    def __init__(self, name: str, keywords: dict[str, list[str]], negative_keywords: dict[str, list[str]] | None = None):
+        self.name = name
+        self._patterns: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
+        for label, words in keywords.items():
+            self._patterns[label] = [(w, _compile_pattern(w)) for w in words]
+        self._negative: dict[str, list[tuple[str, re.Pattern[str]]]] = {}
+        if negative_keywords:
+            for label, words in negative_keywords.items():
+                self._negative[label] = [(w, _compile_pattern(w)) for w in words]
+
+    def match(self, query: str) -> RegistryMatch:
+        """Return the best-scoring label for the query."""
+        query_stripped = query.strip()
+        if not query_stripped:
+            return RegistryMatch(label=None, score=0.0)
+
+        best_label: str | None = None
+        best_score = 0.0
+        best_matched: list[str] = []
+
+        for label, patterns in self._patterns.items():
+            matched = [kw for kw, pat in patterns if pat.search(query_stripped)]
+            if not matched:
+                continue
+            # Negative keywords suppress this label (e.g. code-context suppresses EXTERNAL_FETCH).
+            # `neg` is [] when no negatives are configured — short-circuits the `any()` check.
+            neg = self._negative.get(label, [])
+            if neg and any(pat.search(query_stripped) for _, pat in neg):
+                continue
+            score = min(sum(len(kw) for kw in matched) / max(len(query_stripped), 1), 1.0)
+            if score > best_score:
+                best_score = score
+                best_label = label
+                best_matched = matched
+
+        return RegistryMatch(label=best_label, score=best_score, matched_keywords=best_matched)
+
+
+# ---------------------------------------------------------------------------
+# Keyword registries for each dimension
+# ---------------------------------------------------------------------------
+
+# Dimension 1: Tool filtering (from old classify_intent)
+_TOOL_FILTER_REGISTRY = KeywordRegistry(
+    name="tool_filter",
+    keywords={
+        "CONVERSATIONAL": [
+            "hello", "hi", "hey", "thanks", "thank you", "bye", "goodbye",
+            "good morning", "good evening", "how are you", "what's up",
+            "who are you", "what can you do", "help me",
+            "yes", "no", "ok", "okay", "sure", "great", "nice",
+            "please", "sorry", "excuse me",
+            "你好", "您好", "谢谢", "感谢", "再见", "拜拜",
+            "早上好", "晚上好", "你是谁", "你能做什么",
+            "好的", "可以", "是的", "不是", "没问题",
+            "请", "抱歉", "对不起",
+        ],
+        "EXTERNAL_FETCH": [
+            "search online", "look up", "find online", "web search",
+            "what is the latest", "current price", "today's",
+            "fetch from", "download", "api call", "http",
+            "weather", "news", "stock price",
+            "check the website", "browse",
+            "搜索", "查找", "查一下", "网上找",
+            "最新的", "当前价格", "今天的",
+            "下载", "获取", "抓取",
+            "天气", "新闻", "股价",
+        ],
+    },
+    negative_keywords={
+        # Code-context keywords suppress EXTERNAL_FETCH
+        "EXTERNAL_FETCH": [
+            "file", "code", "class", "function", "method", "variable",
+            "refactor", "implement", "debug", "fix", "bug", "test",
+            "import", "module", "package", "repository", "repo",
+            "algorithm", "sort", "tree", "array", "list", "dict",
+        ],
+    },
+)
+
+# Dimension 2: Intent (existing Tier 0 regex patterns)
+_INTENT_PATTERNS: dict[str, list[re.Pattern]] = {
     "preference": [re.compile(r"记住|remember|I prefer|I use|需要|always use", re.I)],
     "command":    [re.compile(r"^(run|execute|delete|create|list)\b", re.I)],
     "feedback":   [re.compile(r"^(不对|wrong|no,|actually)", re.I)],
 }
 
+# Dimension 3: Task type (from old classify_task)
+_TASK_TYPE_REGISTRY = KeywordRegistry(
+    name="task_type",
+    keywords={
+        "code_review": ["review", "code review", "PR", "pull request", "refactor", "clean up"],
+        "debugging":   ["debug", "error", "bug", "fix", "traceback", "exception", "crash", "fail"],
+        "planning":    ["plan", "design", "architect", "roadmap", "strategy", "proposal"],
+    },
+)
+
+
+# ---------------------------------------------------------------------------
+# Tier 0: Unified three-dimension engine
+# ---------------------------------------------------------------------------
 
 class Tier0Engine:
-    """<1ms regex + heuristic dual engine."""
+    """<1ms regex + heuristic + keyword engine across three dimensions."""
 
     def classify(self, query: str, history_len: int = 0) -> RoutingResult:
+        """Classify intent dimension (preference/command/feedback/question)."""
         regex_intent = self._regex_classify(query)
         heuristic_intent = self._heuristic_classify(query, history_len)
 
@@ -203,8 +309,33 @@ class Tier0Engine:
             return RoutingResult(intent=heuristic_intent, confidence=0.80, tier=0, matched_by="heuristic")
         return RoutingResult(intent=None, confidence=0.0, tier=0, matched_by="none")
 
+    def classify_tool_filter(self, query: str) -> tuple[ToolFilter, int]:
+        """Classify tool filtering dimension. Returns (filter, max_rounds).
+
+        Short queries (<20 chars) with CONVERSATIONAL match get boosted confidence.
+        CONVERSATIONAL > EXTERNAL_FETCH > NONE (most restrictive wins).
+        """
+        match = _TOOL_FILTER_REGISTRY.match(query)
+        if match.label == "CONVERSATIONAL":
+            score = match.score
+            if len(query.strip()) < 20 and score > 0:
+                score = min(score * 2, 1.0)
+            if score >= 0.25:
+                return ToolFilter.ALL_BLOCKED, 0
+        elif match.label == "EXTERNAL_FETCH" and match.score >= 0.25:
+            return ToolFilter.LOCAL_BLOCKED, 3
+        return ToolFilter.NONE, MAX_TOOL_ROUNDS
+
+    def classify_task_type(self, query: str) -> TaskType:
+        """Classify task type dimension."""
+        match = _TASK_TYPE_REGISTRY.match(query)
+        if match.label:
+            # Defensive: TaskType values are lowercase; guard against registry misconfiguration
+            return TaskType(match.label.lower())
+        return TaskType.GENERAL
+
     def _regex_classify(self, query: str) -> str | None:
-        for intent, patterns in _REGEX_PATTERNS.items():
+        for intent, patterns in _INTENT_PATTERNS.items():
             for pat in patterns:
                 if pat.search(query):
                     return intent
@@ -215,10 +346,8 @@ class Tier0Engine:
         if not stripped:
             return None
         words = stripped.split()
-        # Very short question → ambiguous, let Tier 1 handle
         if len(words) <= 3 and stripped.endswith("?"):
             return None
-        # First turn, no question mark → likely command
         if history_len == 0 and not stripped.endswith("?"):
             return "command"
         return None
@@ -235,7 +364,7 @@ _CORRECTION_PATTERN = re.compile(
 
 
 def detect_correction(query: str) -> bool:
-    """Detect user correction patterns (reuses signals from implicit_feedback.py)."""
+    """Detect user correction patterns."""
     return bool(_CORRECTION_PATTERN.search(query.strip()))
 
 
@@ -263,7 +392,7 @@ _PRUNE_PROMPT = (
     "Query: {query}\nTools: {tools}\nRelevant tools:"
 )
 
-_TIER1_TIMEOUT = 2.0  # seconds per sub-task
+_TIER1_TIMEOUT = 2.0
 
 
 class Tier1Engine:
@@ -337,7 +466,7 @@ class Tier1Engine:
                 return [t for t in parsed if t in tool_names]
         except Exception:
             pass
-        return tool_names  # fallback: keep all
+        return tool_names
 
     def _llm_call(self, prompt: str) -> str:
         from core.llm.client import LLMClient
@@ -356,9 +485,21 @@ class Tier1Engine:
 # IntentRouter — Full Cascade Orchestrator
 # ---------------------------------------------------------------------------
 
+# Tools considered "local" — blocked when tool_filter is LOCAL_BLOCKED
+LOCAL_TOOLS = frozenset({
+    "grep", "shell", "execute_bash", "file_read", "file_write",
+    "git", "search", "reflect", "introspection",
+    "scratchpad_write", "scratchpad_read", "scratchpad_close",
+})
+
+
 @register_router("default")
 class IntentRouter:
-    """Tier 0 → adaptive threshold → Tier 1 → threshold → fallback."""
+    """Tier 0 → adaptive threshold → Tier 1 → threshold → fallback.
+
+    Single entry point for all intent classification. Returns a fully-populated
+    RoutingDecision with tool_filter, max_tool_rounds, task_type, and plan.
+    """
 
     def __init__(self, db_factory: DbFactory):
         self._db_factory = db_factory
@@ -377,21 +518,40 @@ class IntentRouter:
 
         threshold = adaptive_threshold()
 
-        # Force intent (e.g. user correction → question)
+        # Dimensions that are always computed by Tier 0 (independent of intent)
+        tool_filter, max_tool_rounds = self._tier0.classify_tool_filter(query)
+        task_type = self._tier0.classify_task_type(query)
+
+        # Override: preference and conversational both block tools
+        # preference intent → ALL_BLOCKED (no tools needed, just memory write)
+
+        # Force intent (e.g. user correction → feedback)
         if force_intent and force_intent in INTENT_PLANS:
             result = RoutingResult(intent=force_intent, confidence=1.0, tier=0, matched_by="forced")
+            # preference forces ALL_BLOCKED
+            if force_intent == "preference":
+                tool_filter = ToolFilter.ALL_BLOCKED
+                max_tool_rounds = 0
             return RoutingDecision(
                 plan=INTENT_PLANS[force_intent], routing_result=result,
                 threshold_used=threshold,
+                tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+                task_type=task_type,
             )
 
-        # Tier 0
+        # Tier 0: intent dimension
         tier0 = self._tier0.classify(query, history_len)
         if tier0.intent and tier0.confidence >= threshold:
             logger.info("Tier 0 routed: intent=%s conf=%.2f threshold=%.2f", tier0.intent, tier0.confidence, threshold)
+            # preference intent → ALL_BLOCKED
+            if tier0.intent == "preference":
+                tool_filter = ToolFilter.ALL_BLOCKED
+                max_tool_rounds = 0
             return RoutingDecision(
                 plan=INTENT_PLANS[tier0.intent], routing_result=tier0,
                 threshold_used=threshold,
+                tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+                task_type=task_type,
             )
 
         # Tier 1
@@ -402,14 +562,21 @@ class IntentRouter:
             fallback = RoutingResult(intent="question", confidence=0.0, tier=1, matched_by="fallback")
             return RoutingDecision(
                 plan=_FALLBACK_PLAN, routing_result=fallback, threshold_used=threshold,
+                tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+                task_type=task_type,
             )
 
         if tier1.routing and tier1.routing.intent and tier1.routing.confidence >= threshold:
             plan = INTENT_PLANS.get(tier1.routing.intent, _FALLBACK_PLAN)
             logger.info("Tier 1 routed: intent=%s conf=%.2f", tier1.routing.intent, tier1.routing.confidence)
+            if tier1.routing.intent == "preference":
+                tool_filter = ToolFilter.ALL_BLOCKED
+                max_tool_rounds = 0
             return RoutingDecision(
                 plan=plan, routing_result=tier1.routing,
                 tier1_result=tier1, threshold_used=threshold,
+                tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+                task_type=task_type,
             )
 
         # Fallback — full context
@@ -417,6 +584,8 @@ class IntentRouter:
         return RoutingDecision(
             plan=_FALLBACK_PLAN, routing_result=fallback,
             tier1_result=tier1, threshold_used=threshold,
+            tool_filter=tool_filter, max_tool_rounds=max_tool_rounds,
+            task_type=task_type,
         )
 
     def route_sync(self, **kwargs) -> RoutingDecision:

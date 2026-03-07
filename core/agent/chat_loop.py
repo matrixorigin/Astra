@@ -704,33 +704,53 @@ class ChatLoop:
         self._turn_budget = None
         self._reset_breaker()
 
-        # Task 2.2: Intent routing — classify and potentially restrict tools/rounds
-        # Only restrict when the skill pipeline already selected tools.
-        # CONVERSATIONAL: only override if no tools were selected by pipeline
-        # (the existing `not tools_schema` path already handles plain chat).
-        # EXTERNAL_FETCH: filter local tools from the selected set.
-        _effective_max_rounds = MAX_TOOL_ROUNDS
-        from core.skills.intent_router import classify_intent
-        _intent = classify_intent(user_input)
-        if _intent.intent == "EXTERNAL_FETCH" and tools_schema:
-            from core.agent.pipeline_stages import _LOCAL_TOOLS
+        # Unified intent routing — single pass for tool filtering + task type + intent
+        # Edge path uses Tier 0 only (<1ms, no LLM call) for tool filtering and task type.
+        # The full Tier 0→1 cascade runs in the cloud path (api/routers/chat.py).
+        from core.context.intent_routing import Tier0Engine, ToolFilter, LOCAL_TOOLS, RoutingDecision, RoutingResult, INTENT_PLANS, _FALLBACK_PLAN
+        # Tier0Engine is stateless — reuse a single instance across calls
+        if not hasattr(self, '_tier0'):
+            self._tier0 = Tier0Engine()
+        _tier0 = self._tier0
+        _tool_filter, _max_rounds = _tier0.classify_tool_filter(user_input)
+        _task_type = _tier0.classify_task_type(user_input)
+        _tier0_result = _tier0.classify(user_input)
+        _routing = RoutingDecision(
+            plan=INTENT_PLANS.get(_tier0_result.intent, _FALLBACK_PLAN) if _tier0_result.intent else _FALLBACK_PLAN,
+            routing_result=_tier0_result,
+            tool_filter=_tool_filter,
+            max_tool_rounds=_max_rounds,
+            task_type=_task_type,
+        )
+
+        _effective_max_rounds = _routing.max_tool_rounds
+        # Filter tools by routing decision. This runs in the streaming path
+        # (run_step_stream). The pipeline path (execute_turn → RouteStage) has
+        # its own filtering — the two paths are mutually exclusive, not redundant.
+        # If tools_schema becomes empty after filtering, the existing
+        # `if not tools_schema:` branch above handles it (plain-chat path).
+        if _routing.tool_filter == ToolFilter.LOCAL_BLOCKED and tools_schema:
             tools_schema = [
                 t for t in tools_schema
-                if t.get("function", {}).get("name") not in _LOCAL_TOOLS
+                if t.get("function", {}).get("name") not in LOCAL_TOOLS
             ]
-            _effective_max_rounds = min(_effective_max_rounds, 3)
-            logger.info("Intent router: EXTERNAL_FETCH — filtered to %d tools, max %d rounds",
+            logger.info("Intent router: LOCAL_BLOCKED — filtered to %d tools, max %d rounds",
                         len(tools_schema), _effective_max_rounds)
 
-        # Log intent classification event for future learning
+        # Log unified routing_decision event (replaces the old stream_intent_classification
+        # event — contains all three classification dimensions in one event).
         self.event_logger.create_stream_event(
             user_id=user_id,
             session_id=session_id,
-            event_type="stream_intent_classification",
+            event_type="routing_decision",
             content=json.dumps({
-                "intent": _intent.intent,
-                "confidence": _intent.confidence,
-                "matched_keywords": _intent.matched_keywords,
+                "intent": _routing.routing_result.intent,
+                "confidence": _routing.routing_result.confidence,
+                "tier": _routing.routing_result.tier,
+                "tool_filter": _routing.tool_filter.value,
+                "max_tool_rounds": _routing.max_tool_rounds,
+                "task_type": _routing.task_type.value,
+                "threshold_used": _routing.threshold_used,
             }),
             parent_event_id=user_event.event_id,
             causal_chain_id=user_event.causal_chain_id,
@@ -1771,7 +1791,7 @@ class ChatLoop:
           [DYNAMIC] §4 Working memory (scratchpad)
           [DYNAMIC] §5 Conversation history (budget-capped)
         """
-        # §1 Role — from DB prompt template or fallback
+        # §1 Role — from context (set by ContextManager or caller), fallback to default
         role = "You are a development assistant. Use the available tools to help the user."
         sp = context.get("system_prompt") if context else None
         if isinstance(sp, str) and sp:

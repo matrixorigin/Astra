@@ -558,39 +558,55 @@ class TestRoutingExternalFetch:
 
 
 # ---------------------------------------------------------------------------
-# Routing: real IntentClassification object (not just string)
+# Routing: RoutingDecision from unified router
 # ---------------------------------------------------------------------------
 
 
-class TestRoutingWithIntentClassification:
-    """RouteStage must handle IntentClassification objects from the real classifier."""
+class TestRoutingWithRoutingDecision:
+    """RouteStage must handle RoutingDecision objects from the unified router."""
 
     @pytest.mark.asyncio
-    async def test_real_classify_intent_returns_object(self):
-        """classify_intent returns IntentClassification, not a bare string."""
-        from core.skills.intent_router import classify_intent
+    async def test_routing_decision_default(self):
+        """RoutingDecision with NONE tool_filter → no changes."""
+        from core.context.intent_routing import (
+            INTENT_PLANS, RoutingDecision, RoutingResult, ToolFilter,
+        )
+
+        decision = RoutingDecision(
+            plan=INTENT_PLANS["question"],
+            routing_result=RoutingResult(intent="question", confidence=0.9, tier=0, matched_by="regex"),
+            tool_filter=ToolFilter.NONE,
+        )
 
         async def mock_llm_call(messages, tools, **kw):
-            return {"content": "Hi!", "tool_calls": []}
+            return {"content": "Answer", "tool_calls": []}
 
         state = _make_state()
-        # Use the real sync classify_intent — RouteStage must handle it
+        original_tools = list(state.tools_schema)
         await _collect_events(
             execute_turn(
                 state,
                 llm_call=mock_llm_call,
                 tool_execute=AsyncMock(),
-                classify_intent=classify_intent,
+                classify_intent=lambda q: decision,
             )
         )
-        # "Hello" is not in the default user_input ("test query"), so DEFAULT
         assert state.outcome is not None
         assert state.outcome.status == TurnStatus.SUCCESS
 
     @pytest.mark.asyncio
-    async def test_conversational_with_real_classifier(self):
-        """Real classifier on 'hello' → CONVERSATIONAL → tools cleared."""
-        from core.skills.intent_router import classify_intent
+    async def test_routing_decision_all_blocked(self):
+        """RoutingDecision with ALL_BLOCKED → tools cleared, max_rounds=0."""
+        from core.context.intent_routing import (
+            INTENT_PLANS, RoutingDecision, RoutingResult, ToolFilter,
+        )
+
+        decision = RoutingDecision(
+            plan=INTENT_PLANS["preference"],
+            routing_result=RoutingResult(intent="preference", confidence=0.9, tier=0, matched_by="regex"),
+            tool_filter=ToolFilter.ALL_BLOCKED,
+            max_tool_rounds=0,
+        )
 
         async def mock_llm_call(messages, tools, **kw):
             return {"content": "Hi there!", "tool_calls": []}
@@ -601,7 +617,7 @@ class TestRoutingWithIntentClassification:
                 state,
                 llm_call=mock_llm_call,
                 tool_execute=AsyncMock(),
-                classify_intent=classify_intent,
+                classify_intent=lambda q: decision,
             )
         )
         assert state.tools_schema == []
